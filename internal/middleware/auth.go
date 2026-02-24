@@ -1,0 +1,91 @@
+package middleware
+
+import (
+	"context"
+	"net/http"
+
+	"github.com/google/uuid"
+
+	"github.com/jmal1/selfservice-api/internal/auth"
+	"github.com/jmal1/selfservice-api/internal/models"
+)
+
+type contextKey string
+
+const (
+	userIDKey   contextKey = "user_id"
+	usernameKey contextKey = "username"
+	roleKey     contextKey = "role"
+)
+
+// Auth returns middleware that validates the session JWT.
+func Auth(provider *auth.Provider) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			claims, err := provider.ValidateSession(r)
+			if err != nil {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+
+			uid, err := uuid.Parse(claims.UserID)
+			if err != nil {
+				http.Error(w, "invalid session", http.StatusUnauthorized)
+				return
+			}
+
+			ctx := context.WithValue(r.Context(), userIDKey, uid)
+			ctx = context.WithValue(ctx, usernameKey, claims.Username)
+			ctx = context.WithValue(ctx, roleKey, claims.Role)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// RequireRole returns middleware that requires a minimum role level.
+func RequireRole(minRole string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			role := RoleFromContext(r.Context())
+			if !hasMinRole(role, minRole) {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// UserIDFromContext extracts the user ID from the request context.
+func UserIDFromContext(ctx context.Context) uuid.UUID {
+	if v, ok := ctx.Value(userIDKey).(uuid.UUID); ok {
+		return v
+	}
+	return uuid.Nil
+}
+
+// UsernameFromContext extracts the username from the request context.
+func UsernameFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(usernameKey).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// RoleFromContext extracts the role from the request context.
+func RoleFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(roleKey).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// hasMinRole checks if the actual role meets or exceeds the minimum required role.
+func hasMinRole(actual, minimum string) bool {
+	roleLevel := map[string]int{
+		models.RoleStudent:    1,
+		models.RoleInstructor: 2,
+		models.RoleAdmin:      3,
+	}
+	return roleLevel[actual] >= roleLevel[minimum]
+}

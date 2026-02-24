@@ -1,0 +1,88 @@
+# Default values for selfservice portal
+# All secrets should come from Vault in production
+
+replicaCount:
+  api: 2
+  worker: 2
+
+image:
+  repository: ghcr.io/jmal1/selfservice-api
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+api:
+  port: 8080
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+worker:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+
+# OIDC Configuration (non-secret values)
+oidc:
+  issuerURL: "https://authentik.jmal.io/application/o/selfservice/"
+  redirectURL: "https://selfservice.lab.jmal.io/auth/callback"
+
+# Database connection (non-secret values; password from Vault)
+database:
+  host: selfservice-postgresql
+  port: 5432
+  name: selfservice
+  user: selfservice
+  sslmode: disable
+
+# NATS connection
+natsURL: "nats://selfservice-nats:4222"
+
+# Vault sidecar annotations
+vault:
+  enabled: true
+  role: selfservice
+  secretPaths:
+    oidc: "selfservice/data/oidc"
+    database: "selfservice/data/db"
+    jwt: "selfservice/data/jwt"
+
+# Traefik IngressRoute
+ingress:
+  enabled: true
+  hostname: selfservice.lab.jmal.io
+  tls:
+    enabled: true
+    secretName: selfservice-tls
+
+# PostgreSQL subchart values
+postgresql:
+  enabled: true
+  auth:
+    database: selfservice
+    username: selfservice
+    existingSecret: selfservice-db-creds
+  primary:
+    persistence:
+      enabled: true
+      storageClass: nfs-client
+      size: 10Gi
+
+# NATS subchart values
+nats:
+  enabled: true
+  config:
+    jetstream:
+      enabled: true
+      fileStore:
+        pvc:
+          enabled: true
+          storageClassName: nfs-client
+          size: 5Gi

@@ -1,0 +1,81 @@
+package routes
+
+import (
+	"github.com/go-chi/chi/v5"
+	chimiddleware "github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
+
+	"github.com/jmal1/selfservice-api/internal/api/handlers"
+	"github.com/jmal1/selfservice-api/internal/auth"
+	"github.com/jmal1/selfservice-api/internal/middleware"
+	"github.com/jmal1/selfservice-api/internal/models"
+)
+
+// Setup creates the chi router with all routes.
+func Setup(h *handlers.Handler, authProvider *auth.Provider) *chi.Mux {
+	r := chi.NewRouter()
+
+	// Global middleware
+	r.Use(chimiddleware.RequestID)
+	r.Use(chimiddleware.RealIP)
+	r.Use(chimiddleware.Logger)
+	r.Use(chimiddleware.Recoverer)
+	r.Use(chimiddleware.Compress(5))
+	r.Use(cors.Handler(cors.Options{
+		AllowedOrigins:   []string{"https://selfservice.lab.jmal.io"},
+		AllowedMethods:   []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"Accept", "Content-Type", "Authorization"},
+		AllowCredentials: true,
+		MaxAge:           300,
+	}))
+
+	// Health check (unauthenticated)
+	r.Get("/healthz", h.Health)
+	r.Get("/readyz", h.Health)
+
+	// Auth routes (unauthenticated)
+	r.Route("/auth", func(r chi.Router) {
+		r.Get("/login", authProvider.LoginHandler)
+		r.Get("/callback", authProvider.CallbackHandler)
+		r.Post("/logout", authProvider.LogoutHandler)
+
+		// Authenticated
+		r.Group(func(r chi.Router) {
+			r.Use(middleware.Auth(authProvider))
+			r.Get("/me", h.GetMe)
+		})
+	})
+
+	// API v1 (authenticated)
+	r.Route("/api/v1", func(r chi.Router) {
+		r.Use(middleware.Auth(authProvider))
+
+		// Pods
+		r.Route("/pods", func(r chi.Router) {
+			r.Get("/", h.ListPods)
+			r.Post("/", h.CreatePod)
+			r.Get("/{podID}", h.GetPod)
+			r.Delete("/{podID}", h.DeletePod)
+		})
+
+		// Templates
+		r.Get("/templates", h.ListTemplates)
+
+		// Jobs
+		r.Get("/jobs/{jobID}/status", h.GetJobStatus)
+
+		// Admin routes
+		r.Route("/admin", func(r chi.Router) {
+			r.Use(middleware.RequireRole(models.RoleAdmin))
+
+			r.Get("/users", h.AdminListUsers)
+			r.Patch("/users/{userID}/quotas", h.AdminUpdateQuotas)
+
+			r.Get("/templates", h.AdminListTemplates)
+			r.Post("/templates", h.AdminCreateTemplate)
+			r.Post("/templates/{templateID}/access", h.AdminSetTemplateAccess)
+		})
+	})
+
+	return r
+}
