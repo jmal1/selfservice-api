@@ -1,23 +1,28 @@
 {{- if .Values.ingress.enabled }}
-apiVersion: traefik.io/v1alpha1
-kind: IngressRoute
+apiVersion: networking.k8s.io/v1
+kind: Ingress
 metadata:
   name: {{ .Release.Name }}-ingress
   labels:
     app.kubernetes.io/name: selfservice-api
     app.kubernetes.io/instance: {{ .Release.Name }}
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
 spec:
-  entryPoints:
-    - web
-  routes:
-    - match: Host(`{{ .Values.ingress.hostname }}`) && (PathPrefix(`/api/`) || PathPrefix(`/auth/`) || PathPrefix(`/healthz`) || PathPrefix(`/readyz`))
-      kind: Rule
-      services:
-        - name: {{ .Release.Name }}-api
-          port: {{ .Values.api.port }}
-    - match: Host(`{{ .Values.ingress.hostname }}`)
-      kind: Rule
-      services:
-        - name: {{ .Release.Name }}-api
-          port: {{ .Values.api.port }}
+  ingressClassName: traefik
+  rules:
+    - host: {{ .Values.ingress.hostname }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ .Release.Name }}-api
+                port:
+                  number: {{ .Values.api.port }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.hostname }}
+      secretName: selfservice-tls
 {{- end }}
