@@ -1,14 +1,18 @@
 # Default values for selfservice portal
-# All secrets should come from Vault in production
+# Secrets come from K8s secrets (Vault integration deferred)
 
 replicaCount:
-  api: 2
-  worker: 2
+  api: 1
+  worker: 1
 
 image:
-  repository: ghcr.io/jmal1/selfservice-api
+  api: ghcr.io/jmal1/selfservice-api-gateway
+  worker: ghcr.io/jmal1/selfservice-provision-worker
   tag: "latest"
-  pullPolicy: IfNotPresent
+  pullPolicy: Always
+
+imagePullSecrets:
+  - name: ghcr-pull-secret
 
 api:
   port: 8080
@@ -34,7 +38,13 @@ oidc:
   issuerURL: "https://authentik.jmal.io/application/o/selfservice/"
   redirectURL: "https://selfservice.lab.jmal.io/auth/callback"
 
-# Database connection (non-secret values; password from Vault)
+# K8s secret names
+secrets:
+  db: selfservice-db-creds
+  jwt: selfservice-jwt-secret
+  oidc: selfservice-oidc
+
+# Database connection (non-secret values; password from K8s secret)
 database:
   host: selfservice-postgresql
   port: 5432
@@ -45,9 +55,9 @@ database:
 # NATS connection
 natsURL: "nats://selfservice-nats:4222"
 
-# Vault sidecar annotations
+# Vault sidecar annotations (disabled for now)
 vault:
-  enabled: true
+  enabled: false
   role: selfservice
   secretPaths:
     oidc: "selfservice/data/oidc"
@@ -58,9 +68,6 @@ vault:
 ingress:
   enabled: true
   hostname: selfservice.lab.jmal.io
-  tls:
-    enabled: true
-    secretName: selfservice-tls
 
 # PostgreSQL subchart values
 postgresql:

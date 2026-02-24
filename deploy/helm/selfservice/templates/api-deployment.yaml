@@ -27,10 +27,14 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ .Release.Name }}-api
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: api-gateway
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-          command: ["api-gateway"]
+          image: "{{ .Values.image.api }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - name: http
               containerPort: {{ .Values.api.port }}
@@ -48,17 +52,37 @@ spec:
               value: {{ .Values.database.user | quote }}
             - name: DB_SSLMODE
               value: {{ .Values.database.sslmode | quote }}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.db }}
+                  key: password
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.jwt }}
+                  key: jwt-secret
             - name: OIDC_ISSUER_URL
               value: {{ .Values.oidc.issuerURL | quote }}
             - name: OIDC_REDIRECT_URL
               value: {{ .Values.oidc.redirectURL | quote }}
+            - name: OIDC_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.oidc }}
+                  key: client-id
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.oidc }}
+                  key: client-secret
             - name: NATS_URL
               value: {{ .Values.natsURL | quote }}
           livenessProbe:
             httpGet:
               path: /healthz
               port: http
-            initialDelaySeconds: 5
+            initialDelaySeconds: 10
             periodSeconds: 10
           readinessProbe:
             httpGet:

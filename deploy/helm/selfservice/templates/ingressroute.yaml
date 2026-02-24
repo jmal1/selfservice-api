@@ -8,23 +8,16 @@ metadata:
     app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
   entryPoints:
-    - websecure
+    - web
   routes:
-    # API and auth routes → API Gateway
     - match: Host(`{{ .Values.ingress.hostname }}`) && (PathPrefix(`/api/`) || PathPrefix(`/auth/`) || PathPrefix(`/healthz`) || PathPrefix(`/readyz`))
       kind: Rule
       services:
         - name: {{ .Release.Name }}-api
           port: {{ .Values.api.port }}
-    # Everything else → Frontend (future: selfservice-ui service)
-    # For now, return 404 until frontend is deployed
     - match: Host(`{{ .Values.ingress.hostname }}`)
       kind: Rule
       services:
         - name: {{ .Release.Name }}-api
           port: {{ .Values.api.port }}
-  {{- if .Values.ingress.tls.enabled }}
-  tls:
-    secretName: {{ .Values.ingress.tls.secretName }}
-  {{- end }}
 {{- end }}

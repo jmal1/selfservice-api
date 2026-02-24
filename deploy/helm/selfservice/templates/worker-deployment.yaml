@@ -28,10 +28,14 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ .Release.Name }}-worker
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: provision-worker
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-          command: ["provision-worker"]
+          image: "{{ .Values.image.worker }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
             - name: DB_HOST
               value: {{ .Values.database.host | quote }}
@@ -43,6 +47,11 @@ spec:
               value: {{ .Values.database.user | quote }}
             - name: DB_SSLMODE
               value: {{ .Values.database.sslmode | quote }}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.db }}
+                  key: password
             - name: NATS_URL
               value: {{ .Values.natsURL | quote }}
           resources:
