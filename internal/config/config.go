@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 )
 
 // Config holds all application configuration.
@@ -13,6 +14,8 @@ type Config struct {
 	OIDC     OIDCConfig
 	NATS     NATSConfig
 	Vault    VaultConfig
+	VCenter  VCenterConfig
+	OPNsense OPNsenseConfig
 }
 
 type ServerConfig struct {
@@ -54,6 +57,29 @@ type VaultConfig struct {
 	Mount   string
 }
 
+// VCenterConfig holds vCenter connection settings.
+type VCenterConfig struct {
+	URL          string
+	User         string
+	Password     string
+	Datacenter   string
+	Datastore    string
+	VMFolder     string
+	ResourcePool string
+	Hosts        []string
+	Insecure     bool
+}
+
+// OPNsenseConfig holds OPNsense connection settings.
+type OPNsenseConfig struct {
+	BaseURL     string
+	APIKey      string
+	APISecret   string
+	SSHHost     string
+	SSHUser     string
+	SSHPassword string
+}
+
 // Load reads configuration from environment variables.
 // In production, these are injected by Vault sidecar or K8s secrets.
 func Load() (*Config, error) {
@@ -85,6 +111,25 @@ func Load() (*Config, error) {
 			Role:    getEnv("VAULT_ROLE", "selfservice"),
 			Mount:   getEnv("VAULT_MOUNT", "kubernetes"),
 		},
+		VCenter: VCenterConfig{
+			URL:          getEnv("VCENTER_URL", "https://vcenter.lab.jmal.io/sdk"),
+			User:         getEnv("VCENTER_USER", ""),
+			Password:     getEnv("VCENTER_PASSWORD", ""),
+			Datacenter:   getEnv("VCENTER_DATACENTER", "JMAL-Datacenter"),
+			Datastore:    getEnv("VCENTER_DATASTORE", "NAS-vmstore"),
+			VMFolder:     getEnv("VCENTER_VM_FOLDER", "Student-VMs"),
+			ResourcePool: getEnv("VCENTER_RESOURCE_POOL", "Student-VMs"),
+			Hosts:        splitEnv("VCENTER_HOSTS", "esxi1.lab.jmal.io,esxi2.lab.jmal.io,nuc1.lab.jmal.io,nuc2.lab.jmal.io,nuc3.lab.jmal.io"),
+			Insecure:     getEnvBool("VCENTER_INSECURE", true),
+		},
+		OPNsense: OPNsenseConfig{
+			BaseURL:     getEnv("OPNSENSE_URL", "https://10.10.10.60/api"),
+			APIKey:      getEnv("OPNSENSE_API_KEY", ""),
+			APISecret:   getEnv("OPNSENSE_API_SECRET", ""),
+			SSHHost:     getEnv("OPNSENSE_SSH_HOST", "10.10.10.60:22"),
+			SSHUser:     getEnv("OPNSENSE_SSH_USER", "root"),
+			SSHPassword: getEnv("OPNSENSE_SSH_PASSWORD", ""),
+		},
 	}
 
 	return cfg, nil
@@ -104,4 +149,30 @@ func getEnvInt(key string, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+func getEnvBool(key string, fallback bool) bool {
+	if v := os.Getenv(key); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err == nil {
+			return b
+		}
+	}
+	return fallback
+}
+
+func splitEnv(key, fallback string) []string {
+	v := getEnv(key, fallback)
+	if v == "" {
+		return nil
+	}
+	parts := strings.Split(v, ",")
+	result := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			result = append(result, p)
+		}
+	}
+	return result
 }

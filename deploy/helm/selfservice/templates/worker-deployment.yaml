@@ -54,5 +54,58 @@ spec:
                   key: password
             - name: NATS_URL
               value: {{ .Values.natsURL | quote }}
+            # vCenter configuration
+            - name: VCENTER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.vcenter }}
+                  key: vcenter-url
+            - name: VCENTER_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.vcenter }}
+                  key: vcenter-user
+            - name: VCENTER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.vcenter }}
+                  key: vcenter-password
+            - name: VCENTER_DATACENTER
+              value: {{ .Values.vcenter.datacenter | quote }}
+            - name: VCENTER_DATASTORE
+              value: {{ .Values.vcenter.datastore | quote }}
+            - name: VCENTER_VM_FOLDER
+              value: {{ .Values.vcenter.vmFolder | quote }}
+            - name: VCENTER_RESOURCE_POOL
+              value: {{ .Values.vcenter.resourcePool | quote }}
+            - name: VCENTER_HOSTS
+              value: {{ .Values.vcenter.hosts | quote }}
+            - name: VCENTER_INSECURE
+              value: {{ .Values.vcenter.insecure | quote }}
+            # OPNsense configuration
+            - name: OPNSENSE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.opnsense }}
+                  key: opnsense-url
+            - name: OPNSENSE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.opnsense }}
+                  key: opnsense-api-key
+            - name: OPNSENSE_API_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.opnsense }}
+                  key: opnsense-api-secret
+            - name: OPNSENSE_SSH_HOST
+              value: {{ .Values.opnsense.sshHost | quote }}
+            - name: OPNSENSE_SSH_USER
+              value: {{ .Values.opnsense.sshUser | quote }}
+            - name: OPNSENSE_SSH_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.opnsense }}
+                  key: opnsense-ssh-password
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}

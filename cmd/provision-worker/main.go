@@ -11,6 +11,9 @@ import (
 	"github.com/jmal1/selfservice-api/internal/config"
 	"github.com/jmal1/selfservice-api/internal/database"
 	events "github.com/jmal1/selfservice-api/internal/nats"
+	"github.com/jmal1/selfservice-api/internal/opnsense"
+	"github.com/jmal1/selfservice-api/internal/provisioner"
+	"github.com/jmal1/selfservice-api/internal/vcenter"
 )
 
 func main() {
@@ -43,18 +46,56 @@ func main() {
 	}
 	defer natsClient.Close()
 
+	// Initialize vCenter client
+	vcClient := vcenter.New(vcenter.Config{
+		URL:          cfg.VCenter.URL,
+		User:         cfg.VCenter.User,
+		Password:     cfg.VCenter.Password,
+		Datacenter:   cfg.VCenter.Datacenter,
+		Datastore:    cfg.VCenter.Datastore,
+		VMFolder:     cfg.VCenter.VMFolder,
+		ResourcePool: cfg.VCenter.ResourcePool,
+		Hosts:        cfg.VCenter.Hosts,
+		Insecure:     cfg.VCenter.Insecure,
+	}, logger)
+
+	if err := vcClient.Connect(ctx); err != nil {
+		logger.Error("vCenter connection failed", "error", err)
+		os.Exit(1)
+	}
+	defer vcClient.Disconnect(ctx)
+
+	// Initialize OPNsense clients
+	opnCfg := opnsense.Config{
+		BaseURL:     cfg.OPNsense.BaseURL,
+		APIKey:      cfg.OPNsense.APIKey,
+		APISecret:   cfg.OPNsense.APISecret,
+		SSHHost:     cfg.OPNsense.SSHHost,
+		SSHUser:     cfg.OPNsense.SSHUser,
+		SSHPassword: cfg.OPNsense.SSHPassword,
+	}
+	opnClient := opnsense.New(opnCfg, logger)
+	opnSSH := opnsense.NewSSHClient(opnCfg, logger)
+
+	// Create provisioner
+	prov := provisioner.New(queries, vcClient, opnClient, opnSSH, natsClient, logger)
+
 	// Worker ID for job claiming
 	workerID, err := os.Hostname()
 	if err != nil {
 		workerID = "worker-unknown"
 	}
 
-	logger.Info("starting provision worker", "worker_id", workerID)
+	logger.Info("starting provision worker",
+		"worker_id", workerID,
+		"vcenter", cfg.VCenter.URL,
+		"opnsense", cfg.OPNsense.BaseURL,
+	)
 
 	// Subscribe to job notifications from NATS
 	_, err = natsClient.SubscribeJobCreated(func(jobID string, jobType string) {
 		logger.Info("received job notification", "job_id", jobID, "type", jobType)
-		processJobs(ctx, queries, natsClient, workerID, logger)
+		processJobs(ctx, queries, prov, workerID, logger)
 	})
 	if err != nil {
 		logger.Error("NATS subscription failed", "error", err)
@@ -71,7 +112,7 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				processJobs(ctx, queries, natsClient, workerID, logger)
+				processJobs(ctx, queries, prov, workerID, logger)
 			}
 		}
 	}()
@@ -85,8 +126,8 @@ func main() {
 	cancel()
 }
 
-// processJobs claims and processes available jobs.
-func processJobs(ctx context.Context, queries *database.Queries, natsClient *events.Client, workerID string, logger *slog.Logger) {
+// processJobs claims and processes available jobs via the provisioner.
+func processJobs(ctx context.Context, queries *database.Queries, prov *provisioner.Provisioner, workerID string, logger *slog.Logger) {
 	for {
 		if ctx.Err() != nil {
 			return
@@ -103,26 +144,10 @@ func processJobs(ctx context.Context, queries *database.Queries, natsClient *eve
 
 		logger.Info("claimed job", "job_id", job.ID, "type", job.Type)
 
-		// Update status to in_progress
-		if err := queries.UpdateJobStatus(ctx, job.ID, "in_progress", nil); err != nil {
-			logger.Error("update job status failed", "error", err)
-			continue
+		if err := prov.ProcessJob(ctx, job); err != nil {
+			logger.Error("job failed", "job_id", job.ID, "type", job.Type, "error", err)
+		} else {
+			logger.Info("job completed", "job_id", job.ID, "type", job.Type)
 		}
-
-		// Dispatch based on job type
-		// TODO: Phase 2 — implement actual provisioning workflows
-		switch job.Type {
-		case "pod_create":
-			logger.Info("pod_create job received — provisioning not yet implemented", "job_id", job.ID)
-			queries.UpdateJobStatus(ctx, job.ID, "failed", []byte(`{"error":"provisioning worker not yet implemented"}`))
-		case "pod_destroy":
-			logger.Info("pod_destroy job received — teardown not yet implemented", "job_id", job.ID)
-			queries.UpdateJobStatus(ctx, job.ID, "failed", []byte(`{"error":"teardown worker not yet implemented"}`))
-		default:
-			logger.Warn("unknown job type", "type", job.Type, "job_id", job.ID)
-			queries.UpdateJobStatus(ctx, job.ID, "failed", []byte(`{"error":"unknown job type"}`))
-		}
-
-		natsClient.PublishJobStatus(job.ID, "completed", "job processed")
 	}
 }

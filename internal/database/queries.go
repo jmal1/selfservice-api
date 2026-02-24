@@ -432,3 +432,73 @@ func (q *Queries) InsertAuditLog(ctx context.Context, entry models.AuditLog) err
 	`, entry.UserID, entry.Action, entry.ResourceType, entry.ResourceID, entry.Details, entry.IPAddress)
 	return err
 }
+
+// --- Pod Status ---
+
+// UpdatePodStatus updates a pod's status and optional error message.
+func (q *Queries) UpdatePodStatus(ctx context.Context, id uuid.UUID, status, errMsg string) error {
+	_, err := q.pool.Exec(ctx, `
+		UPDATE pods SET status = $1, error_message = $2, updated_at = now() WHERE id = $3
+	`, status, errMsg, id)
+	return err
+}
+
+// --- Pod VMs ---
+
+// ListPodVMs returns all VMs belonging to a pod.
+func (q *Queries) ListPodVMs(ctx context.Context, podID uuid.UUID) ([]models.PodVM, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT id, pod_id, template_id, vcenter_vm_name, vcenter_vm_id, vcpus, ram_mb, disk_gb, ip_address, status, created_at
+		FROM pod_vms WHERE pod_id = $1
+	`, podID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var vms []models.PodVM
+	for rows.Next() {
+		var vm models.PodVM
+		err := rows.Scan(&vm.ID, &vm.PodID, &vm.TemplateID, &vm.VCenterVMName, &vm.VCenterVMID,
+			&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.IPAddress, &vm.Status, &vm.CreatedAt)
+		if err != nil {
+			return nil, err
+		}
+		vms = append(vms, vm)
+	}
+	return vms, nil
+}
+
+// GetPodVM returns a single pod VM by ID.
+func (q *Queries) GetPodVM(ctx context.Context, id uuid.UUID) (*models.PodVM, error) {
+	var vm models.PodVM
+	err := q.pool.QueryRow(ctx, `
+		SELECT id, pod_id, template_id, vcenter_vm_name, vcenter_vm_id, vcpus, ram_mb, disk_gb, ip_address, status, created_at
+		FROM pod_vms WHERE id = $1
+	`, id).Scan(&vm.ID, &vm.PodID, &vm.TemplateID, &vm.VCenterVMName, &vm.VCenterVMID,
+		&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.IPAddress, &vm.Status, &vm.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &vm, nil
+}
+
+// UpdatePodVM updates a pod VM's vCenter details after cloning.
+func (q *Queries) UpdatePodVM(ctx context.Context, id uuid.UUID, vcenterVMID, vcenterVMName, status string) error {
+	_, err := q.pool.Exec(ctx, `
+		UPDATE pod_vms SET vcenter_vm_id = $1, vcenter_vm_name = $2, status = $3 WHERE id = $4
+	`, vcenterVMID, vcenterVMName, status, id)
+	return err
+}
+
+// UpdatePodVMStatus updates a pod VM's status.
+func (q *Queries) UpdatePodVMStatus(ctx context.Context, id uuid.UUID, status string) error {
+	_, err := q.pool.Exec(ctx, `UPDATE pod_vms SET status = $1 WHERE id = $2`, status, id)
+	return err
+}
+
+// UpdatePodVMIP sets the IP address on a pod VM.
+func (q *Queries) UpdatePodVMIP(ctx context.Context, id uuid.UUID, ip string) error {
+	_, err := q.pool.Exec(ctx, `UPDATE pod_vms SET ip_address = $1 WHERE id = $2`, ip, id)
+	return err
+}

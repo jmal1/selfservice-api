@@ -43,6 +43,22 @@ secrets:
   db: selfservice-db-creds
   jwt: selfservice-jwt-secret
   oidc: selfservice-oidc
+  vcenter: selfservice-vcenter-creds
+  opnsense: selfservice-opnsense-creds
+
+# vCenter configuration (non-secret values; credentials from K8s secret)
+vcenter:
+  datacenter: JMAL-Datacenter
+  datastore: NAS-vmstore
+  vmFolder: Student-VMs
+  resourcePool: Student-VMs
+  hosts: "esxi1.lab.jmal.io,esxi2.lab.jmal.io,nuc1.lab.jmal.io,nuc2.lab.jmal.io,nuc3.lab.jmal.io"
+  insecure: "true"
+
+# OPNsense configuration (non-secret values; credentials from K8s secret)
+opnsense:
+  sshHost: "10.10.10.60:22"
+  sshUser: root
 
 # Database connection (non-secret values; password from K8s secret)
 database:
