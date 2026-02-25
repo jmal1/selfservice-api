@@ -180,7 +180,8 @@ func (c *Client) CloneVM(ctx context.Context, params CloneVMParams) (string, err
 		},
 	}
 
-	// Build clone spec
+	// Build clone spec — clone first without config changes to avoid
+	// vCenter disk format errors with non-admin service accounts.
 	poolRef := pool.Reference()
 	cloneSpec := types.VirtualMachineCloneSpec{
 		Location: types.VirtualMachineRelocateSpec{
@@ -189,31 +190,6 @@ func (c *Client) CloneVM(ctx context.Context, params CloneVMParams) (string, err
 		},
 		PowerOn:  false,
 		Template: false,
-		Config: &types.VirtualMachineConfigSpec{
-			NumCPUs:  params.VCPUs,
-			MemoryMB: params.RAMmb,
-		},
-	}
-
-	// Set network adapter on the first NIC
-	var templateMo mo.VirtualMachine
-	err = template.Properties(ctx, template.Reference(), []string{"config.hardware.device"}, &templateMo)
-	if err != nil {
-		return "", fmt.Errorf("get template devices: %w", err)
-	}
-
-	for _, dev := range templateMo.Config.Hardware.Device {
-		if nic, ok := dev.(types.BaseVirtualEthernetCard); ok {
-			card := nic.GetVirtualEthernetCard()
-			card.Backing = netBacking
-			cloneSpec.Location.DeviceChange = append(cloneSpec.Location.DeviceChange, types.BaseVirtualDeviceConfigSpec(
-				&types.VirtualDeviceConfigSpec{
-					Operation: types.VirtualDeviceConfigSpecOperationEdit,
-					Device:    dev,
-				},
-			))
-			break // only configure the first NIC
-		}
 	}
 
 	c.logger.Info("cloning VM",
@@ -236,6 +212,42 @@ func (c *Client) CloneVM(ctx context.Context, params CloneVMParams) (string, err
 
 	vmRef := info.Result.(types.ManagedObjectReference)
 	c.logger.Info("VM cloned", "name", params.VMName, "moref", vmRef.Value)
+
+	// Reconfigure the cloned VM: CPU, RAM, and network.
+	clonedVM := object.NewVirtualMachine(c.client.Client, vmRef)
+
+	configSpec := types.VirtualMachineConfigSpec{
+		NumCPUs:  params.VCPUs,
+		MemoryMB: params.RAMmb,
+	}
+
+	// Set network adapter on the first NIC
+	var vmMo mo.VirtualMachine
+	if err := clonedVM.Properties(ctx, vmRef, []string{"config.hardware.device"}, &vmMo); err != nil {
+		return vmRef.Value, fmt.Errorf("get cloned VM devices: %w", err)
+	}
+
+	for _, dev := range vmMo.Config.Hardware.Device {
+		if nic, ok := dev.(types.BaseVirtualEthernetCard); ok {
+			card := nic.GetVirtualEthernetCard()
+			card.Backing = netBacking
+			configSpec.DeviceChange = append(configSpec.DeviceChange, &types.VirtualDeviceConfigSpec{
+				Operation: types.VirtualDeviceConfigSpecOperationEdit,
+				Device:    dev,
+			})
+			break
+		}
+	}
+
+	reconfigTask, err := clonedVM.Reconfigure(ctx, configSpec)
+	if err != nil {
+		return vmRef.Value, fmt.Errorf("start reconfigure: %w", err)
+	}
+	if err := reconfigTask.Wait(ctx); err != nil {
+		return vmRef.Value, fmt.Errorf("reconfigure task: %w", err)
+	}
+
+	c.logger.Info("VM reconfigured", "name", params.VMName, "vcpus", params.VCPUs, "ram_mb", params.RAMmb)
 	return vmRef.Value, nil
 }
 
