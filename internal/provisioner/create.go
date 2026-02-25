@@ -276,6 +276,17 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		return err
 	}
 
+	// Add the OPNsense interface to Kea's listened interfaces BEFORE reconfigure.
+	// ReconfigureDHCP regenerates config and restarts Kea, so the interface must
+	// be in the config before that happens.
+	if err := p.opn.AddDHCPInterface(ctx, ifName); err != nil {
+		p.logger.Warn("failed to add DHCP interface", "interface", ifName, "error", err)
+	}
+
+	// Wait for interface to fully stabilize before restarting Kea.
+	// The VLAN interface needs time after interface_configure() to be kernel-ready.
+	time.Sleep(2 * time.Second)
+
 	if err := p.opn.ReconfigureDHCP(ctx); err != nil {
 		rbErrs := rb.Rollback(ctx)
 		return fmt.Errorf("reconfigure DHCP (rollback errors: %v): %w", rbErrs, err)
@@ -308,17 +319,6 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 	}
 	if err := rb.Record(ctx, "portgroup_create", map[string]string{"name": pgName, "preexisting": pgPreexStr}); err != nil {
 		return err
-	}
-
-	// Add the OPNsense interface to Kea's listened interfaces and restart.
-	// Kea only serves DHCP on explicitly configured interfaces.
-	if err := p.opn.AddDHCPInterface(ctx, ifName); err != nil {
-		p.logger.Warn("failed to add DHCP interface", "interface", ifName, "error", err)
-	}
-	time.Sleep(2 * time.Second) // give interface time to stabilize
-	if err := p.opn.RestartDHCP(ctx); err != nil {
-		p.logger.Warn("failed to restart DHCP, falling back to reconfigure", "error", err)
-		_ = p.opn.ReconfigureDHCP(ctx)
 	}
 
 	// --- Step 6: Clone VMs ---
