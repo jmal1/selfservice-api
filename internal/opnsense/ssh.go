@@ -172,13 +172,11 @@ func (s *SSHClient) UnassignInterface(ctx context.Context, ifName string) error 
 			"require_once(\"interfaces.inc\");\n"+
 			"$config = parse_config();\n"+
 			"if (isset($config['interfaces']['%s'])) {\n"+
-			"    $realif = $config['interfaces']['%s']['if'];\n"+
 			"    unset($config['interfaces']['%s']);\n"+
 			"    write_config(\"Removed interface %s for self-service pod cleanup\");\n"+
-			"    interface_bring_down($realif);\n"+
 			"}\n"+
 			"?>\n",
-		ifName, ifName, ifName, ifName,
+		ifName, ifName, ifName,
 	)
 
 	writeCmd := fmt.Sprintf("cat > /tmp/ss_unassign.php << 'PHPEOF'\n%sPHPEOF", phpScript)
@@ -239,10 +237,8 @@ func (s *SSHClient) UnassignInterfaceByVLAN(ctx context.Context, vlanTag int) er
 			"$found = false;\n"+
 			"foreach ($config['interfaces'] as $ifname => $iface) {\n"+
 			"    if (isset($iface['if']) && $iface['if'] === '%s') {\n"+
-			"        $realif = $iface['if'];\n"+
 			"        unset($config['interfaces'][$ifname]);\n"+
 			"        write_config(\"Removed interface $ifname (VLAN %d) for self-service pod cleanup\");\n"+
-			"        interface_bring_down($realif);\n"+
 			"        echo \"unassigned:$ifname\";\n"+
 			"        $found = true;\n"+
 			"        break;\n"+
