@@ -2,6 +2,7 @@ package opnsense
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -81,6 +82,15 @@ func (s *SSHClient) runCommandIgnoreError(client *ssh.Client, cmd string) {
 	_, _ = session.CombinedOutput(cmd)
 }
 
+// writePHPScript writes a PHP script to a temp file on OPNsense using base64
+// encoding to avoid heredoc/csh shell quoting issues.
+func (s *SSHClient) writePHPScript(client *ssh.Client, path, script string) error {
+	encoded := base64.StdEncoding.EncodeToString([]byte(script))
+	cmd := fmt.Sprintf("echo %s | /usr/bin/base64 -d > %s", encoded, path)
+	_, err := s.runCommand(client, cmd)
+	return err
+}
+
 // AssignInterface creates an OPT interface for a VLAN in OPNsense config.
 // This must be done via SSH because the OPNsense REST API doesn't support
 // interface creation — only VLAN and DHCP management.
@@ -140,9 +150,8 @@ func (s *SSHClient) assignInterfacePHP(client *ssh.Client, ifName, vlanDev, ipAd
 		ifName, ifName,
 	)
 
-	// Write PHP script to temp file, execute, then clean up
-	writeCmd := fmt.Sprintf("cat > /tmp/ss_assign.php << 'PHPEOF'\n%sPHPEOF", phpScript)
-	if _, err := s.runCommand(client, writeCmd); err != nil {
+	// Write PHP script to temp file using base64, execute, then clean up
+	if err := s.writePHPScript(client, "/tmp/ss_assign.php", phpScript); err != nil {
 		return ifName, fmt.Errorf("write PHP script: %w", err)
 	}
 
@@ -179,8 +188,7 @@ func (s *SSHClient) UnassignInterface(ctx context.Context, ifName string) error 
 		ifName, ifName, ifName,
 	)
 
-	writeCmd := fmt.Sprintf("cat > /tmp/ss_unassign.php << 'PHPEOF'\n%sPHPEOF", phpScript)
-	if _, err := s.runCommand(client, writeCmd); err != nil {
+	if err := s.writePHPScript(client, "/tmp/ss_unassign.php", phpScript); err != nil {
 		return fmt.Errorf("write PHP script: %w", err)
 	}
 
@@ -190,6 +198,8 @@ func (s *SSHClient) UnassignInterface(ctx context.Context, ifName string) error 
 		return fmt.Errorf("PHP interface unassign: %w (output: %s)", err, output)
 	}
 
+	// Apply config change so OPNsense releases the interface
+	s.runCommandIgnoreError(client, "configctl interface reconfigure")
 	s.logger.Info("interface unassigned", "interface", ifName)
 	return nil
 }
@@ -249,8 +259,7 @@ func (s *SSHClient) UnassignInterfaceByVLAN(ctx context.Context, vlanTag int) er
 		vlanDev, vlanTag,
 	)
 
-	writeCmd := fmt.Sprintf("cat > /tmp/ss_unassign_vlan.php << 'PHPEOF'\n%sPHPEOF", phpScript)
-	if _, err := s.runCommand(client, writeCmd); err != nil {
+	if err := s.writePHPScript(client, "/tmp/ss_unassign_vlan.php", phpScript); err != nil {
 		return fmt.Errorf("write PHP script: %w", err)
 	}
 
@@ -263,6 +272,8 @@ func (s *SSHClient) UnassignInterfaceByVLAN(ctx context.Context, vlanTag int) er
 	trimmed := strings.TrimSpace(output)
 	if strings.HasPrefix(trimmed, "unassigned:") {
 		ifName := strings.TrimPrefix(trimmed, "unassigned:")
+		// Apply config change so OPNsense releases the interface
+		s.runCommandIgnoreError(client, "configctl interface reconfigure")
 		s.logger.Info("interface unassigned by VLAN", "interface", ifName, "vlan_tag", vlanTag)
 	} else {
 		s.logger.Info("no interface found for VLAN device", "device", vlanDev)
