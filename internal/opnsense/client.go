@@ -236,6 +236,14 @@ func (c *Client) ReconfigureDHCP(ctx context.Context) error {
 	return err
 }
 
+// RestartDHCP fully restarts the Kea DHCP service.
+// Required when new interfaces are created, because Kea with raw sockets
+// only binds to interfaces that exist at startup.
+func (c *Client) RestartDHCP(ctx context.Context) error {
+	_, err := c.doRequest(ctx, "POST", "/kea/service/restart", map[string]any{})
+	return err
+}
+
 // GetDHCPSubnetByNetwork finds a DHCP subnet by its network (for idempotency).
 func (c *Client) GetDHCPSubnetByNetwork(ctx context.Context, subnet string) (*DHCPSubnet, error) {
 	resp, err := c.doRequest(ctx, "GET", "/kea/dhcpv4/searchSubnet", nil)
