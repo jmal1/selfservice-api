@@ -29,6 +29,7 @@ type VLAN struct {
 	Interface string `json:"if"`
 	Tag       string `json:"tag"`
 	Descr     string `json:"descr"`
+	VLANIf    string `json:"vlanif"` // actual kernel device name (e.g., "vlan01")
 }
 
 // DHCPSubnet represents a Kea DHCP v4 subnet.

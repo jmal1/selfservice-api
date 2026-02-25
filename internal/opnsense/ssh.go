@@ -103,8 +103,11 @@ func (s *SSHClient) AssignInterface(ctx context.Context, vlanTag int, ipAddr str
 	}
 	defer client.Close()
 
-	// Find the VLAN device name (e.g., "vmx1_vlan100")
-	vlanDev := fmt.Sprintf("vmx1_vlan%d", vlanTag)
+	// Look up the actual VLAN device name from OPNsense config
+	vlanDev, err := s.findVLANDevice(client, vlanTag)
+	if err != nil {
+		return "", fmt.Errorf("find VLAN device for tag %d: %w", vlanTag, err)
+	}
 
 	// Find next available opt interface
 	ifName, err := s.findNextInterface(client)
@@ -204,6 +207,43 @@ func (s *SSHClient) UnassignInterface(ctx context.Context, ifName string) error 
 	return nil
 }
 
+// findVLANDevice looks up the actual kernel device name for a VLAN tag
+// from OPNsense's config.xml (e.g., tag 100 → "vlan01").
+func (s *SSHClient) findVLANDevice(client *ssh.Client, vlanTag int) (string, error) {
+	phpScript := fmt.Sprintf(
+		"<?php\n"+
+			"require_once(\"config.inc\");\n"+
+			"$config = parse_config();\n"+
+			"if (isset($config['vlans']['vlan'])) {\n"+
+			"    foreach ($config['vlans']['vlan'] as $v) {\n"+
+			"        if (isset($v['tag']) && intval($v['tag']) === %d) {\n"+
+			"            echo $v['vlanif'];\n"+
+			"            exit(0);\n"+
+			"        }\n"+
+			"    }\n"+
+			"}\n"+
+			"echo 'NOT_FOUND';\n"+
+			"?>\n",
+		vlanTag,
+	)
+
+	if err := s.writePHPScript(client, "/tmp/ss_find_vlan.php", phpScript); err != nil {
+		return "", fmt.Errorf("write PHP script: %w", err)
+	}
+
+	output, err := s.runCommand(client, "/usr/local/bin/php /tmp/ss_find_vlan.php")
+	s.runCommandIgnoreError(client, "rm -f /tmp/ss_find_vlan.php")
+	if err != nil {
+		return "", fmt.Errorf("PHP find VLAN device: %w (output: %s)", err, output)
+	}
+
+	dev := strings.TrimSpace(output)
+	if dev == "" || dev == "NOT_FOUND" {
+		return "", fmt.Errorf("no VLAN device found for tag %d", vlanTag)
+	}
+	return dev, nil
+}
+
 // findNextInterface determines the next available optN name.
 func (s *SSHClient) findNextInterface(client *ssh.Client) (string, error) {
 	// List existing interfaces from config
@@ -234,21 +274,32 @@ func (s *SSHClient) UnassignInterfaceByVLAN(ctx context.Context, vlanTag int) er
 	}
 	defer client.Close()
 
-	vlanDev := fmt.Sprintf("vmx1_vlan%d", vlanTag)
-	s.logger.Info("finding OPNsense interface by VLAN device", "vlan_tag", vlanTag, "device", vlanDev)
+	s.logger.Info("finding OPNsense interface by VLAN tag", "vlan_tag", vlanTag)
 
-	// PHP script to find and remove the interface by its device name
+	// PHP script that looks up the VLAN device from config.xml's VLAN table,
+	// then finds and removes the interface using that device name.
 	phpScript := fmt.Sprintf(
 		"<?php\n"+
 			"require_once(\"config.inc\");\n"+
 			"require_once(\"util.inc\");\n"+
 			"require_once(\"interfaces.inc\");\n"+
 			"$config = parse_config();\n"+
+			"$vlan_tag = %d;\n"+
+			"$vlan_dev = '';\n"+
+			"if (isset($config['vlans']['vlan'])) {\n"+
+			"    foreach ($config['vlans']['vlan'] as $v) {\n"+
+			"        if (isset($v['tag']) && intval($v['tag']) === $vlan_tag) {\n"+
+			"            $vlan_dev = $v['vlanif'];\n"+
+			"            break;\n"+
+			"        }\n"+
+			"    }\n"+
+			"}\n"+
+			"if ($vlan_dev === '') { echo \"no_vlan\"; exit(0); }\n"+
 			"$found = false;\n"+
 			"foreach ($config['interfaces'] as $ifname => $iface) {\n"+
-			"    if (isset($iface['if']) && $iface['if'] === '%s') {\n"+
+			"    if (isset($iface['if']) && $iface['if'] === $vlan_dev) {\n"+
 			"        unset($config['interfaces'][$ifname]);\n"+
-			"        write_config(\"Removed interface $ifname (VLAN %d) for self-service pod cleanup\");\n"+
+			"        write_config(\"Removed interface $ifname (VLAN $vlan_tag) for self-service pod cleanup\");\n"+
 			"        echo \"unassigned:$ifname\";\n"+
 			"        $found = true;\n"+
 			"        break;\n"+
@@ -256,7 +307,7 @@ func (s *SSHClient) UnassignInterfaceByVLAN(ctx context.Context, vlanTag int) er
 			"}\n"+
 			"if (!$found) { echo \"not_found\"; }\n"+
 			"?>\n",
-		vlanDev, vlanTag,
+		vlanTag,
 	)
 
 	if err := s.writePHPScript(client, "/tmp/ss_unassign_vlan.php", phpScript); err != nil {
@@ -275,8 +326,10 @@ func (s *SSHClient) UnassignInterfaceByVLAN(ctx context.Context, vlanTag int) er
 		// Apply config change so OPNsense releases the interface
 		s.runCommandIgnoreError(client, "configctl interface reconfigure")
 		s.logger.Info("interface unassigned by VLAN", "interface", ifName, "vlan_tag", vlanTag)
+	} else if trimmed == "no_vlan" {
+		s.logger.Info("no VLAN found in config for tag", "vlan_tag", vlanTag)
 	} else {
-		s.logger.Info("no interface found for VLAN device", "device", vlanDev)
+		s.logger.Info("no interface found for VLAN tag", "vlan_tag", vlanTag)
 	}
 	return nil
 }
