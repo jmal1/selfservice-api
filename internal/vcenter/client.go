@@ -171,10 +171,16 @@ func (c *Client) CloneVM(ctx context.Context, params CloneVMParams) (string, err
 	}
 	dsRef := ds.Reference()
 
-	// Find network (port group)
+	// Find network (port group) — for standard vSwitches, search within the host
+	// associated with the selected resource pool's cluster
 	net, err := c.finder.Network(ctx, params.Network)
 	if err != nil {
-		return "", fmt.Errorf("find network %s: %w", params.Network, err)
+		// Standard vSwitch port groups may not appear in datacenter-level search.
+		// Try finding by full path: */host/<cluster>/<host>/port group name
+		net, err = c.findNetworkOnHosts(ctx, params.Network)
+		if err != nil {
+			return "", fmt.Errorf("find network %s: %w", params.Network, err)
+		}
 	}
 	netBacking, err := net.EthernetCardBackingInfo(ctx)
 	if err != nil {
@@ -504,6 +510,25 @@ func (c *Client) FindTemplate(ctx context.Context, name string) (*object.Virtual
 		return nil, err
 	}
 	return c.finder.VirtualMachine(ctx, name)
+}
+
+// findNetworkOnHosts searches for a port group by name on each configured host.
+func (c *Client) findNetworkOnHosts(ctx context.Context, pgName string) (object.NetworkReference, error) {
+	for _, hostName := range c.config.Hosts {
+		path := fmt.Sprintf("/%s/host/*/%s/%s", c.config.Datacenter, hostName, pgName)
+		net, err := c.finder.Network(ctx, path)
+		if err == nil {
+			c.logger.Info("found network on host", "network", pgName, "host", hostName)
+			return net, nil
+		}
+	}
+	// Try wildcard path
+	path := fmt.Sprintf("/%s/network/%s", c.config.Datacenter, pgName)
+	net, err := c.finder.Network(ctx, path)
+	if err == nil {
+		return net, nil
+	}
+	return nil, fmt.Errorf("network '%s' not found on any host", pgName)
 }
 
 // Ping verifies vCenter connectivity.
