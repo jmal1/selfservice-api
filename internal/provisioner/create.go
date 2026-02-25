@@ -206,11 +206,18 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 	}
 
 	rb.RegisterUndo("interface_assign", func(ctx context.Context, data json.RawMessage) error {
-		var d struct{ IfName string }
+		var d struct {
+			IfName  string `json:"if_name"`
+			VLANTag int    `json:"vlan_tag"`
+		}
 		json.Unmarshal(data, &d)
+		// Prefer VLAN tag lookup (more reliable) over interface name
+		if d.VLANTag > 0 {
+			return p.opnSSH.UnassignInterfaceByVLAN(ctx, d.VLANTag)
+		}
 		return p.opnSSH.UnassignInterface(ctx, d.IfName)
 	})
-	if err := rb.Record(ctx, "interface_assign", map[string]string{"if_name": ifName}); err != nil {
+	if err := rb.Record(ctx, "interface_assign", map[string]interface{}{"if_name": ifName, "vlan_tag": vlanTag}); err != nil {
 		return err
 	}
 
