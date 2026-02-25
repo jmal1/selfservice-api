@@ -20,15 +20,15 @@ import (
 
 // Config holds vCenter connection settings.
 type Config struct {
-	URL          string // e.g., "https://vcenter.lab.jmal.io/sdk"
-	User         string // e.g., "selfservice-svc@vsphere.local"
-	Password     string
-	Datacenter   string // e.g., "JMAL-Datacenter"
-	Datastore    string // e.g., "NAS-vmstore"
-	VMFolder     string // e.g., "Student-VMs"
-	ResourcePool string // e.g., "Student-VMs"
-	Hosts        []string // ESXi hosts for port group operations
-	Insecure     bool     // skip TLS verification
+	URL           string // e.g., "https://vcenter.lab.jmal.io/sdk"
+	User          string // e.g., "selfservice-svc@vsphere.local"
+	Password      string
+	Datacenter    string   // e.g., "JMAL-Datacenter"
+	Datastore     string   // e.g., "NAS-vmstore"
+	VMFolder      string   // e.g., "Student-VMs"
+	ResourcePools []string // e.g., ["AMD-Cluster/Resources/Student-VMs", "Intel-Cluster/Resources/Student-VMs"]
+	Hosts         []string // ESXi hosts for port group operations
+	Insecure      bool     // skip TLS verification
 }
 
 // Client wraps govmomi for self-service provisioning operations.
@@ -158,10 +158,10 @@ func (c *Client) CloneVM(ctx context.Context, params CloneVMParams) (string, err
 		return "", fmt.Errorf("find folder %s: %w", c.config.VMFolder, err)
 	}
 
-	// Find resource pool
-	pool, err := c.finder.ResourcePool(ctx, c.config.ResourcePool)
+	// Select best resource pool based on available resources
+	pool, err := c.selectBestPool(ctx, params.VCPUs, params.RAMmb)
 	if err != nil {
-		return "", fmt.Errorf("find resource pool %s: %w", c.config.ResourcePool, err)
+		return "", fmt.Errorf("select resource pool: %w", err)
 	}
 
 	// Find datastore
@@ -348,6 +348,76 @@ func (c *Client) GetVM(ctx context.Context, moref string) (*mo.VirtualMachine, e
 		return nil, err
 	}
 	return &props, nil
+}
+
+// ---------- Resource Pool Selection ----------
+
+// selectBestPool queries all configured resource pools and returns the one
+// with the most available memory, weighted by the requested VM size.
+func (c *Client) selectBestPool(ctx context.Context, vcpus int32, ramMB int64) (*object.ResourcePool, error) {
+	if len(c.config.ResourcePools) == 0 {
+		return nil, fmt.Errorf("no resource pools configured")
+	}
+
+	// If only one pool, use it directly
+	if len(c.config.ResourcePools) == 1 {
+		pool, err := c.finder.ResourcePool(ctx, c.config.ResourcePools[0])
+		if err != nil {
+			return nil, fmt.Errorf("find resource pool %s: %w", c.config.ResourcePools[0], err)
+		}
+		return pool, nil
+	}
+
+	type candidate struct {
+		pool      *object.ResourcePool
+		name      string
+		freeMemMB int64
+	}
+
+	var best *candidate
+	for _, poolPath := range c.config.ResourcePools {
+		pool, err := c.finder.ResourcePool(ctx, poolPath)
+		if err != nil {
+			c.logger.Warn("resource pool not found, skipping", "pool", poolPath, "error", err)
+			continue
+		}
+
+		var props mo.ResourcePool
+		err = pool.Properties(ctx, pool.Reference(), []string{"runtime.memory"}, &props)
+		if err != nil {
+			c.logger.Warn("failed to get pool stats, skipping", "pool", poolPath, "error", err)
+			continue
+		}
+
+		// Calculate free memory: reservationUsed tracks actual consumption
+		overallUsage := props.Runtime.Memory.OverallUsage
+		maxUsage := props.Runtime.Memory.MaxUsage
+		freeMem := (maxUsage - overallUsage) / (1024 * 1024) // bytes → MB
+
+		c.logger.Info("resource pool stats",
+			"pool", poolPath,
+			"free_mb", freeMem,
+			"used_mb", overallUsage/(1024*1024),
+			"max_mb", maxUsage/(1024*1024),
+		)
+
+		if best == nil || freeMem > best.freeMemMB {
+			best = &candidate{pool: pool, name: poolPath, freeMemMB: freeMem}
+		}
+	}
+
+	if best == nil {
+		return nil, fmt.Errorf("no available resource pools found")
+	}
+
+	// Check if the best pool has enough memory for the requested VM
+	if best.freeMemMB < ramMB {
+		c.logger.Warn("best pool has less free memory than requested",
+			"pool", best.name, "free_mb", best.freeMemMB, "requested_mb", ramMB)
+	}
+
+	c.logger.Info("selected resource pool", "pool", best.name, "free_mb", best.freeMemMB)
+	return best.pool, nil
 }
 
 // ---------- Port Group Operations ----------

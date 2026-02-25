@@ -48,15 +48,15 @@ func main() {
 
 	// Initialize vCenter client
 	vcClient := vcenter.New(vcenter.Config{
-		URL:          cfg.VCenter.URL,
-		User:         cfg.VCenter.User,
-		Password:     cfg.VCenter.Password,
-		Datacenter:   cfg.VCenter.Datacenter,
-		Datastore:    cfg.VCenter.Datastore,
-		VMFolder:     cfg.VCenter.VMFolder,
-		ResourcePool: cfg.VCenter.ResourcePool,
-		Hosts:        cfg.VCenter.Hosts,
-		Insecure:     cfg.VCenter.Insecure,
+		URL:           cfg.VCenter.URL,
+		User:          cfg.VCenter.User,
+		Password:      cfg.VCenter.Password,
+		Datacenter:    cfg.VCenter.Datacenter,
+		Datastore:     cfg.VCenter.Datastore,
+		VMFolder:      cfg.VCenter.VMFolder,
+		ResourcePools: cfg.VCenter.ResourcePools,
+		Hosts:         cfg.VCenter.Hosts,
+		Insecure:      cfg.VCenter.Insecure,
 	}, logger)
 
 	if err := vcClient.Connect(ctx); err != nil {

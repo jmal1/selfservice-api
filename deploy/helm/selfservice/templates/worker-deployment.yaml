@@ -76,8 +76,8 @@ spec:
               value: {{ .Values.vcenter.datastore | quote }}
             - name: VCENTER_VM_FOLDER
               value: {{ .Values.vcenter.vmFolder | quote }}
-            - name: VCENTER_RESOURCE_POOL
-              value: {{ .Values.vcenter.resourcePool | quote }}
+            - name: VCENTER_RESOURCE_POOLS
+              value: {{ .Values.vcenter.resourcePools | quote }}
             - name: VCENTER_HOSTS
               value: {{ .Values.vcenter.hosts | quote }}
             - name: VCENTER_INSECURE

@@ -59,15 +59,15 @@ type VaultConfig struct {
 
 // VCenterConfig holds vCenter connection settings.
 type VCenterConfig struct {
-	URL          string
-	User         string
-	Password     string
-	Datacenter   string
-	Datastore    string
-	VMFolder     string
-	ResourcePool string
-	Hosts        []string
-	Insecure     bool
+	URL           string
+	User          string
+	Password      string
+	Datacenter    string
+	Datastore     string
+	VMFolder      string
+	ResourcePools []string
+	Hosts         []string
+	Insecure      bool
 }
 
 // OPNsenseConfig holds OPNsense connection settings.
@@ -112,15 +112,15 @@ func Load() (*Config, error) {
 			Mount:   getEnv("VAULT_MOUNT", "kubernetes"),
 		},
 		VCenter: VCenterConfig{
-			URL:          getEnv("VCENTER_URL", "https://vcenter.lab.jmal.io/sdk"),
-			User:         getEnv("VCENTER_USER", ""),
-			Password:     getEnv("VCENTER_PASSWORD", ""),
-			Datacenter:   getEnv("VCENTER_DATACENTER", "JMAL-Datacenter"),
-			Datastore:    getEnv("VCENTER_DATASTORE", "NAS-vmstore"),
-			VMFolder:     getEnv("VCENTER_VM_FOLDER", "Student-VMs"),
-			ResourcePool: getEnv("VCENTER_RESOURCE_POOL", "Student-VMs"),
-			Hosts:        splitEnv("VCENTER_HOSTS", "esxi1.lab.jmal.io,esxi2.lab.jmal.io,nuc1.lab.jmal.io,nuc2.lab.jmal.io,nuc3.lab.jmal.io"),
-			Insecure:     getEnvBool("VCENTER_INSECURE", true),
+			URL:           getEnv("VCENTER_URL", "https://vcenter.lab.jmal.io/sdk"),
+			User:          getEnv("VCENTER_USER", ""),
+			Password:      getEnv("VCENTER_PASSWORD", ""),
+			Datacenter:    getEnv("VCENTER_DATACENTER", "JMAL-Datacenter"),
+			Datastore:     getEnv("VCENTER_DATASTORE", "NAS-vmstore"),
+			VMFolder:      getEnv("VCENTER_VM_FOLDER", "Student-VMs"),
+			ResourcePools: splitEnv("VCENTER_RESOURCE_POOLS", "*/Resources/Student-VMs"),
+			Hosts:         splitEnv("VCENTER_HOSTS", "esxi1.lab.jmal.io,esxi2.lab.jmal.io,nuc1.lab.jmal.io,nuc2.lab.jmal.io,nuc3.lab.jmal.io"),
+			Insecure:      getEnvBool("VCENTER_INSECURE", true),
 		},
 		OPNsense: OPNsenseConfig{
 			BaseURL:     getEnv("OPNSENSE_URL", "https://10.10.10.60/api"),
