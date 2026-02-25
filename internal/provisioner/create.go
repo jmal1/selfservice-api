@@ -157,8 +157,10 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 	// Idempotency: check if VLAN already exists
 	existing, _ := p.opn.GetVLANByTag(ctx, vlanTag)
 	var vlanUUID string
+	vlanPreexisting := false
 	if existing != nil {
 		vlanUUID = existing.UUID
+		vlanPreexisting = true
 		p.logger.Info("VLAN already exists", "tag", vlanTag, "uuid", vlanUUID)
 	} else {
 		vlanUUID, err = p.opn.CreateVLAN(ctx, "vmx1", vlanTag, fmt.Sprintf("Pod-%03d", podIndex))
@@ -168,14 +170,24 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 	}
 
 	rb.RegisterUndo("vlan_create", func(ctx context.Context, data json.RawMessage) error {
-		var d struct{ UUID string }
+		var d struct {
+			UUID        string `json:"uuid"`
+			Preexisting string `json:"preexisting"`
+		}
 		json.Unmarshal(data, &d)
+		if d.Preexisting == "true" {
+			return nil // don't delete pre-existing resources
+		}
 		if err := p.opn.DeleteVLAN(ctx, d.UUID); err != nil {
 			return err
 		}
 		return p.opn.ReconfigureVLANs(ctx)
 	})
-	if err := rb.Record(ctx, "vlan_create", map[string]string{"uuid": vlanUUID}); err != nil {
+	preexStr := "false"
+	if vlanPreexisting {
+		preexStr = "true"
+	}
+	if err := rb.Record(ctx, "vlan_create", map[string]string{"uuid": vlanUUID, "preexisting": preexStr}); err != nil {
 		return err
 	}
 
@@ -207,8 +219,10 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 
 	existingDHCP, _ := p.opn.GetDHCPSubnetByNetwork(ctx, subnet)
 	var dhcpUUID string
+	dhcpPreexisting := false
 	if existingDHCP != nil {
 		dhcpUUID = existingDHCP.UUID
+		dhcpPreexisting = true
 		p.logger.Info("DHCP subnet already exists", "subnet", subnet, "uuid", dhcpUUID)
 	} else {
 		poolRange := fmt.Sprintf("10.100.%d.10-10.100.%d.250", podIndex, podIndex)
@@ -220,14 +234,24 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 	}
 
 	rb.RegisterUndo("dhcp_create", func(ctx context.Context, data json.RawMessage) error {
-		var d struct{ UUID string }
+		var d struct {
+			UUID        string `json:"uuid"`
+			Preexisting string `json:"preexisting"`
+		}
 		json.Unmarshal(data, &d)
+		if d.Preexisting == "true" {
+			return nil
+		}
 		if err := p.opn.DeleteDHCPSubnet(ctx, d.UUID); err != nil {
 			return err
 		}
 		return p.opn.ReconfigureDHCP(ctx)
 	})
-	if err := rb.Record(ctx, "dhcp_create", map[string]string{"uuid": dhcpUUID}); err != nil {
+	dhcpPreexStr := "false"
+	if dhcpPreexisting {
+		dhcpPreexStr = "true"
+	}
+	if err := rb.Record(ctx, "dhcp_create", map[string]string{"uuid": dhcpUUID, "preexisting": dhcpPreexStr}); err != nil {
 		return err
 	}
 
@@ -245,11 +269,23 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 	}
 
 	rb.RegisterUndo("portgroup_create", func(ctx context.Context, data json.RawMessage) error {
-		var d struct{ Name string }
+		var d struct {
+			Name        string `json:"name"`
+			Preexisting string `json:"preexisting"`
+		}
 		json.Unmarshal(data, &d)
+		if d.Preexisting == "true" {
+			return nil
+		}
 		return p.vc.DeletePortGroupOnAllHosts(ctx, d.Name)
 	})
-	if err := rb.Record(ctx, "portgroup_create", map[string]string{"name": pgName}); err != nil {
+	// Port groups are always idempotent (already-exists is ignored), so treat as preexisting
+	// if the VLAN was preexisting (they go together)
+	pgPreexStr := "false"
+	if vlanPreexisting {
+		pgPreexStr = "true"
+	}
+	if err := rb.Record(ctx, "portgroup_create", map[string]string{"name": pgName, "preexisting": pgPreexStr}); err != nil {
 		return err
 	}
 
