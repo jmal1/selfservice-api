@@ -71,6 +71,16 @@ func (s *SSHClient) runCommand(client *ssh.Client, cmd string) (string, error) {
 	return string(output), nil
 }
 
+// runCommandIgnoreError executes a command and ignores any errors (for cleanup).
+func (s *SSHClient) runCommandIgnoreError(client *ssh.Client, cmd string) {
+	session, err := client.NewSession()
+	if err != nil {
+		return
+	}
+	defer session.Close()
+	_, _ = session.CombinedOutput(cmd)
+}
+
 // AssignInterface creates an OPT interface for a VLAN in OPNsense config.
 // This must be done via SSH because the OPNsense REST API doesn't support
 // interface creation — only VLAN and DHCP management.
@@ -139,32 +149,38 @@ func (s *SSHClient) AssignInterface(ctx context.Context, vlanTag int, ipAddr str
 // assignInterfacePHP uses PHP to edit the OPNsense config directly.
 func (s *SSHClient) assignInterfacePHP(client *ssh.Client, ifName, vlanDev, ipAddr string) (string, error) {
 	// Use OPNsense's built-in PHP config utility
-	phpScript := fmt.Sprintf(`
-<?php
-require_once("config.inc");
-require_once("interfaces.inc");
+	// Write to a temp file to avoid shell quoting issues on FreeBSD csh
+	ipOnly := strings.Split(ipAddr, "/")[0]
+	upperIfName := strings.ToUpper(ifName)
 
-$config = parse_config();
-
-// Add interface
-$config['interfaces']['%s'] = array(
-    'if' => '%s',
-    'descr' => '%s',
-    'enable' => '1',
-    'ipaddr' => '%s',
-    'subnet' => '24',
-    'spoofmac' => '',
-);
-
-write_config("Added interface %s for self-service pod");
-interface_configure(false, '%s');
-?>`,
-		ifName, vlanDev, strings.ToUpper(ifName), strings.Split(ipAddr, "/")[0],
+	phpScript := fmt.Sprintf(
+		"<?php\n"+
+			"require_once(\"config.inc\");\n"+
+			"require_once(\"interfaces.inc\");\n"+
+			"$config = parse_config();\n"+
+			"$config['interfaces']['%s'] = array(\n"+
+			"    'if' => '%s',\n"+
+			"    'descr' => '%s',\n"+
+			"    'enable' => '1',\n"+
+			"    'ipaddr' => '%s',\n"+
+			"    'subnet' => '24',\n"+
+			"    'spoofmac' => '',\n"+
+			");\n"+
+			"write_config(\"Added interface %s for self-service pod\");\n"+
+			"interface_configure(false, '%s');\n"+
+			"?>\n",
+		ifName, vlanDev, upperIfName, ipOnly,
 		ifName, ifName,
 	)
 
-	cmd := fmt.Sprintf(`echo '%s' | /usr/local/bin/php -f /dev/stdin`, phpScript)
-	output, err := s.runCommand(client, cmd)
+	// Write PHP script to temp file, execute, then clean up
+	writeCmd := fmt.Sprintf("cat > /tmp/ss_assign.php << 'PHPEOF'\n%sPHPEOF", phpScript)
+	if _, err := s.runCommand(client, writeCmd); err != nil {
+		return ifName, fmt.Errorf("write PHP script: %w", err)
+	}
+
+	output, err := s.runCommand(client, "/usr/local/bin/php /tmp/ss_assign.php")
+	s.runCommandIgnoreError(client, "rm -f /tmp/ss_assign.php")
 	if err != nil {
 		return ifName, fmt.Errorf("PHP interface assign: %w (output: %s)", err, output)
 	}
@@ -182,26 +198,28 @@ func (s *SSHClient) UnassignInterface(ctx context.Context, ifName string) error 
 
 	s.logger.Info("unassigning OPNsense interface", "interface", ifName)
 
-	// Use PHP to remove the interface
-	phpScript := fmt.Sprintf(`
-<?php
-require_once("config.inc");
-require_once("interfaces.inc");
-
-$config = parse_config();
-
-if (isset($config['interfaces']['%s'])) {
-    $realif = $config['interfaces']['%s']['if'];
-    unset($config['interfaces']['%s']);
-    write_config("Removed interface %s for self-service pod cleanup");
-    interface_bring_down($realif);
-}
-?>`,
+	phpScript := fmt.Sprintf(
+		"<?php\n"+
+			"require_once(\"config.inc\");\n"+
+			"require_once(\"interfaces.inc\");\n"+
+			"$config = parse_config();\n"+
+			"if (isset($config['interfaces']['%s'])) {\n"+
+			"    $realif = $config['interfaces']['%s']['if'];\n"+
+			"    unset($config['interfaces']['%s']);\n"+
+			"    write_config(\"Removed interface %s for self-service pod cleanup\");\n"+
+			"    interface_bring_down($realif);\n"+
+			"}\n"+
+			"?>\n",
 		ifName, ifName, ifName, ifName,
 	)
 
-	cmd := fmt.Sprintf(`echo '%s' | /usr/local/bin/php -f /dev/stdin`, phpScript)
-	output, err := s.runCommand(client, cmd)
+	writeCmd := fmt.Sprintf("cat > /tmp/ss_unassign.php << 'PHPEOF'\n%sPHPEOF", phpScript)
+	if _, err := s.runCommand(client, writeCmd); err != nil {
+		return fmt.Errorf("write PHP script: %w", err)
+	}
+
+	output, err := s.runCommand(client, "/usr/local/bin/php /tmp/ss_unassign.php")
+	s.runCommandIgnoreError(client, "rm -f /tmp/ss_unassign.php")
 	if err != nil {
 		return fmt.Errorf("PHP interface unassign: %w (output: %s)", err, output)
 	}

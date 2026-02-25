@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -402,7 +403,15 @@ func (c *Client) createPortGroup(ctx context.Context, hostName, pgName string, v
 		Policy:      types.HostNetworkPolicy{},
 	}
 
-	return ns.AddPortGroup(ctx, spec)
+	if err := ns.AddPortGroup(ctx, spec); err != nil {
+		// Idempotency: if the port group already exists, treat as success
+		if strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "AlreadyExists") {
+			c.logger.Info("port group already exists", "host", hostName, "name", pgName)
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func (c *Client) deletePortGroup(ctx context.Context, hostName, pgName string) error {
