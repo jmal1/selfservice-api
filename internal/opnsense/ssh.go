@@ -136,6 +136,8 @@ func (s *SSHClient) assignInterfacePHP(client *ssh.Client, ifName, vlanDev, ipAd
 		"<?php\n"+
 			"require_once(\"config.inc\");\n"+
 			"require_once(\"util.inc\");\n"+
+			"require_once(\"interfaces.inc\");\n"+
+			"require_once(\"system.inc\");\n"+
 			"$config = parse_config();\n"+
 			"$config['interfaces']['%s'] = array(\n"+
 			"    'if' => '%s',\n"+
@@ -146,9 +148,10 @@ func (s *SSHClient) assignInterfacePHP(client *ssh.Client, ifName, vlanDev, ipAd
 			"    'spoofmac' => '',\n"+
 			");\n"+
 			"write_config(\"Added interface %s for self-service pod\");\n"+
+			"interface_configure(false, '%s');\n"+
 			"?>\n",
 		ifName, vlanDev, upperIfName, ipOnly,
-		ifName,
+		ifName, ifName,
 	)
 
 	// Write PHP script to temp file using base64, execute, then clean up
@@ -161,10 +164,6 @@ func (s *SSHClient) assignInterfacePHP(client *ssh.Client, ifName, vlanDev, ipAd
 	if err != nil {
 		return ifName, fmt.Errorf("PHP interface assign: %w (output: %s)", err, output)
 	}
-
-	// Apply config change via configctl (safer than calling interface_configure from PHP
-	// which depends on many framework functions not loaded in standalone scripts)
-	s.runCommandIgnoreError(client, "configctl interface reconfigure")
 
 	return ifName, nil
 }
