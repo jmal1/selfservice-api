@@ -122,6 +122,7 @@ func (s *SSHClient) assignInterfacePHP(client *ssh.Client, ifName, vlanDev, ipAd
 	phpScript := fmt.Sprintf(
 		"<?php\n"+
 			"require_once(\"config.inc\");\n"+
+			"require_once(\"util.inc\");\n"+
 			"require_once(\"interfaces.inc\");\n"+
 			"$config = parse_config();\n"+
 			"$config['interfaces']['%s'] = array(\n"+
@@ -167,6 +168,7 @@ func (s *SSHClient) UnassignInterface(ctx context.Context, ifName string) error 
 	phpScript := fmt.Sprintf(
 		"<?php\n"+
 			"require_once(\"config.inc\");\n"+
+			"require_once(\"util.inc\");\n"+
 			"require_once(\"interfaces.inc\");\n"+
 			"$config = parse_config();\n"+
 			"if (isset($config['interfaces']['%s'])) {\n"+
@@ -231,6 +233,7 @@ func (s *SSHClient) UnassignInterfaceByVLAN(ctx context.Context, vlanTag int) er
 	phpScript := fmt.Sprintf(
 		"<?php\n"+
 			"require_once(\"config.inc\");\n"+
+			"require_once(\"util.inc\");\n"+
 			"require_once(\"interfaces.inc\");\n"+
 			"$config = parse_config();\n"+
 			"$found = false;\n"+
