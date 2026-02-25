@@ -84,12 +84,8 @@ func (s *SSHClient) runCommandIgnoreError(client *ssh.Client, cmd string) {
 // AssignInterface creates an OPT interface for a VLAN in OPNsense config.
 // This must be done via SSH because the OPNsense REST API doesn't support
 // interface creation — only VLAN and DHCP management.
-//
-// Steps:
-//  1. Find the next available optN interface name
-//  2. Edit /conf/config.xml to add the interface
-//  3. Run configctl interface reconfigure
-//  4. Set the IP address on the interface
+// Uses PHP to edit config.xml directly (configctl interface assign creates
+// empty entries and doesn't work correctly).
 func (s *SSHClient) AssignInterface(ctx context.Context, vlanTag int, ipAddr string) (string, error) {
 	client, err := s.dial()
 	if err != nil {
@@ -113,37 +109,7 @@ func (s *SSHClient) AssignInterface(ctx context.Context, vlanTag int, ipAddr str
 		"ip", ipAddr,
 	)
 
-	// Use OPNsense's PHP-based interface assignment via configctl
-	// This is safer than editing config.xml directly
-	assignCmd := fmt.Sprintf(
-		`configctl interface assign %s %s && `+
-			`configctl interface reconfigure`,
-		ifName, vlanDev,
-	)
-
-	output, err := s.runCommand(client, assignCmd)
-	if err != nil {
-		// Fallback: try the PHP config approach
-		s.logger.Warn("configctl assign failed, trying PHP approach", "error", err, "output", output)
-		return s.assignInterfacePHP(client, ifName, vlanDev, ipAddr)
-	}
-
-	// Set IP address
-	ipCmd := fmt.Sprintf(
-		`configctl interface address %s %s`,
-		ifName, ipAddr,
-	)
-	if _, err := s.runCommand(client, ipCmd); err != nil {
-		s.logger.Warn("configctl address failed, trying ifconfig", "error", err)
-		// Fallback to ifconfig
-		ifconfigCmd := fmt.Sprintf("ifconfig %s inet %s up", vlanDev, ipAddr)
-		if _, err := s.runCommand(client, ifconfigCmd); err != nil {
-			return ifName, fmt.Errorf("set IP on %s: %w", ifName, err)
-		}
-	}
-
-	s.logger.Info("interface assigned", "interface", ifName, "ip", ipAddr)
-	return ifName, nil
+	return s.assignInterfacePHP(client, ifName, vlanDev, ipAddr)
 }
 
 // assignInterfacePHP uses PHP to edit the OPNsense config directly.
