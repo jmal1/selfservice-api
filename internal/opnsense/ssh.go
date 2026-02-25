@@ -249,6 +249,62 @@ func (s *SSHClient) findNextInterface(client *ssh.Client) (string, error) {
 	return fmt.Sprintf("opt%d", num+1), nil
 }
 
+// UnassignInterfaceByVLAN finds and removes the interface assigned to a VLAN tag.
+// This is used by the destroy workflow which doesn't have the interface name.
+func (s *SSHClient) UnassignInterfaceByVLAN(ctx context.Context, vlanTag int) error {
+	client, err := s.dial()
+	if err != nil {
+		return fmt.Errorf("SSH connect: %w", err)
+	}
+	defer client.Close()
+
+	vlanDev := fmt.Sprintf("vmx1_vlan%d", vlanTag)
+	s.logger.Info("finding OPNsense interface by VLAN device", "vlan_tag", vlanTag, "device", vlanDev)
+
+	// PHP script to find and remove the interface by its device name
+	phpScript := fmt.Sprintf(
+		"<?php\n"+
+			"require_once(\"config.inc\");\n"+
+			"require_once(\"interfaces.inc\");\n"+
+			"$config = parse_config();\n"+
+			"$found = false;\n"+
+			"foreach ($config['interfaces'] as $ifname => $iface) {\n"+
+			"    if (isset($iface['if']) && $iface['if'] === '%s') {\n"+
+			"        $realif = $iface['if'];\n"+
+			"        unset($config['interfaces'][$ifname]);\n"+
+			"        write_config(\"Removed interface $ifname (VLAN %d) for self-service pod cleanup\");\n"+
+			"        interface_bring_down($realif);\n"+
+			"        echo \"unassigned:$ifname\";\n"+
+			"        $found = true;\n"+
+			"        break;\n"+
+			"    }\n"+
+			"}\n"+
+			"if (!$found) { echo \"not_found\"; }\n"+
+			"?>\n",
+		vlanDev, vlanTag,
+	)
+
+	writeCmd := fmt.Sprintf("cat > /tmp/ss_unassign_vlan.php << 'PHPEOF'\n%sPHPEOF", phpScript)
+	if _, err := s.runCommand(client, writeCmd); err != nil {
+		return fmt.Errorf("write PHP script: %w", err)
+	}
+
+	output, err := s.runCommand(client, "/usr/local/bin/php /tmp/ss_unassign_vlan.php")
+	s.runCommandIgnoreError(client, "rm -f /tmp/ss_unassign_vlan.php")
+	if err != nil {
+		return fmt.Errorf("PHP interface unassign by VLAN: %w (output: %s)", err, output)
+	}
+
+	trimmed := strings.TrimSpace(output)
+	if strings.HasPrefix(trimmed, "unassigned:") {
+		ifName := strings.TrimPrefix(trimmed, "unassigned:")
+		s.logger.Info("interface unassigned by VLAN", "interface", ifName, "vlan_tag", vlanTag)
+	} else {
+		s.logger.Info("no interface found for VLAN device", "device", vlanDev)
+	}
+	return nil
+}
+
 // CheckConnectivity verifies SSH access to OPNsense.
 func (s *SSHClient) CheckConnectivity(ctx context.Context) error {
 	client, err := s.dial()

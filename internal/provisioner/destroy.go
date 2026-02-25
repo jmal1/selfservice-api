@@ -94,27 +94,9 @@ func (p *Provisioner) DestroyPod(ctx context.Context, job *models.Job) error {
 
 	// --- Step 5: Remove OPNsense interface (SSH) ---
 	p.publishProgress(job.ID, "interface_delete", "Removing OPNsense interface")
-	// We need to find which optN interface corresponds to this VLAN
-	// For now, we look for the interface by its VLAN device name
-	// This is stored in the job's rollback_steps if the pod was created by us
-	if job.RollbackSteps != nil {
-		var steps []struct {
-			Name string          `json:"name"`
-			Data json.RawMessage `json:"data"`
-		}
-		if err := json.Unmarshal(job.RollbackSteps, &steps); err == nil {
-			for _, step := range steps {
-				if step.Name == "interface_assign" {
-					var d struct{ IfName string `json:"if_name"` }
-					if json.Unmarshal(step.Data, &d) == nil && d.IfName != "" {
-						if err := p.opnSSH.UnassignInterface(ctx, d.IfName); err != nil {
-							p.logger.Warn("failed to unassign interface", "interface", d.IfName, "error", err)
-							errors = append(errors, fmt.Errorf("unassign interface: %w", err))
-						}
-					}
-				}
-			}
-		}
+	if err := p.opnSSH.UnassignInterfaceByVLAN(ctx, int(vlanTag)); err != nil {
+		p.logger.Warn("failed to unassign interface", "vlan", vlanTag, "error", err)
+		errors = append(errors, fmt.Errorf("unassign interface: %w", err))
 	}
 
 	// --- Step 6: Delete VLAN ---
