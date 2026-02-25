@@ -255,11 +255,9 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		return err
 	}
 
-	// Restart (not just reconfigure) Kea DHCP so it binds to the new VLAN interface.
-	// Kea with raw sockets only opens sockets for interfaces present at startup.
-	if err := p.opn.RestartDHCP(ctx); err != nil {
+	if err := p.opn.ReconfigureDHCP(ctx); err != nil {
 		rbErrs := rb.Rollback(ctx)
-		return fmt.Errorf("restart DHCP (rollback errors: %v): %w", rbErrs, err)
+		return fmt.Errorf("reconfigure DHCP (rollback errors: %v): %w", rbErrs, err)
 	}
 
 	// --- Step 5: Create port groups on all ESXi hosts ---
@@ -289,6 +287,15 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 	}
 	if err := rb.Record(ctx, "portgroup_create", map[string]string{"name": pgName, "preexisting": pgPreexStr}); err != nil {
 		return err
+	}
+
+	// Restart Kea DHCP after port groups so the VLAN interface has time to stabilize.
+	// Kea with raw sockets only binds to interfaces present at startup, so it must
+	// be restarted after the new interface is fully configured.
+	time.Sleep(2 * time.Second) // give interface time to come up
+	if err := p.opn.RestartDHCP(ctx); err != nil {
+		p.logger.Warn("failed to restart DHCP, falling back to reconfigure", "error", err)
+		_ = p.opn.ReconfigureDHCP(ctx)
 	}
 
 	// --- Step 6: Clone VMs ---
