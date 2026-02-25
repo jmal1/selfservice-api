@@ -267,11 +267,11 @@ func (s *SSHClient) findNextInterface(client *ssh.Client) (string, error) {
 }
 
 // UnassignInterfaceByVLAN finds and removes the interface assigned to a VLAN tag.
-// This is used by the destroy workflow which doesn't have the interface name.
-func (s *SSHClient) UnassignInterfaceByVLAN(ctx context.Context, vlanTag int) error {
+// Returns the OPNsense interface name (e.g., "opt1") so callers can clean up Kea.
+func (s *SSHClient) UnassignInterfaceByVLAN(ctx context.Context, vlanTag int) (string, error) {
 	client, err := s.dial()
 	if err != nil {
-		return fmt.Errorf("SSH connect: %w", err)
+		return "", fmt.Errorf("SSH connect: %w", err)
 	}
 	defer client.Close()
 
@@ -312,13 +312,13 @@ func (s *SSHClient) UnassignInterfaceByVLAN(ctx context.Context, vlanTag int) er
 	)
 
 	if err := s.writePHPScript(client, "/tmp/ss_unassign_vlan.php", phpScript); err != nil {
-		return fmt.Errorf("write PHP script: %w", err)
+		return "", fmt.Errorf("write PHP script: %w", err)
 	}
 
 	output, err := s.runCommand(client, "/usr/local/bin/php /tmp/ss_unassign_vlan.php")
 	s.runCommandIgnoreError(client, "rm -f /tmp/ss_unassign_vlan.php")
 	if err != nil {
-		return fmt.Errorf("PHP interface unassign by VLAN: %w (output: %s)", err, output)
+		return "", fmt.Errorf("PHP interface unassign by VLAN: %w (output: %s)", err, output)
 	}
 
 	trimmed := strings.TrimSpace(output)
@@ -327,12 +327,13 @@ func (s *SSHClient) UnassignInterfaceByVLAN(ctx context.Context, vlanTag int) er
 		// Apply config change so OPNsense releases the interface
 		s.runCommandIgnoreError(client, "configctl interface reconfigure")
 		s.logger.Info("interface unassigned by VLAN", "interface", ifName, "vlan_tag", vlanTag)
+		return ifName, nil
 	} else if trimmed == "no_vlan" {
 		s.logger.Info("no VLAN found in config for tag", "vlan_tag", vlanTag)
 	} else {
 		s.logger.Info("no interface found for VLAN tag", "vlan_tag", vlanTag)
 	}
-	return nil
+	return "", nil
 }
 
 // CheckConnectivity verifies SSH access to OPNsense.

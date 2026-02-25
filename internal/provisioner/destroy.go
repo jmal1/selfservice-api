@@ -94,9 +94,17 @@ func (p *Provisioner) DestroyPod(ctx context.Context, job *models.Job) error {
 
 	// --- Step 5: Remove OPNsense interface (SSH) ---
 	p.publishProgress(job.ID, "interface_delete", "Removing OPNsense interface")
-	if err := p.opnSSH.UnassignInterfaceByVLAN(ctx, int(vlanTag)); err != nil {
+	unassignedIf, err := p.opnSSH.UnassignInterfaceByVLAN(ctx, int(vlanTag))
+	if err != nil {
 		p.logger.Warn("failed to unassign interface", "vlan", vlanTag, "error", err)
 		errors = append(errors, fmt.Errorf("unassign interface: %w", err))
+	}
+	// Remove interface from Kea's listened interfaces
+	if unassignedIf != "" {
+		if err := p.opn.RemoveDHCPInterface(ctx, unassignedIf); err != nil {
+			p.logger.Warn("failed to remove DHCP interface", "interface", unassignedIf, "error", err)
+		}
+		_ = p.opn.RestartDHCP(ctx)
 	}
 
 	// --- Step 6: Delete VLAN ---

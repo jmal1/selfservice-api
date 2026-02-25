@@ -212,10 +212,24 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		}
 		json.Unmarshal(data, &d)
 		// Prefer VLAN tag lookup (more reliable) over interface name
+		var removedIf string
 		if d.VLANTag > 0 {
-			return p.opnSSH.UnassignInterfaceByVLAN(ctx, d.VLANTag)
+			var err error
+			removedIf, err = p.opnSSH.UnassignInterfaceByVLAN(ctx, d.VLANTag)
+			if err != nil {
+				return err
+			}
+		} else {
+			if err := p.opnSSH.UnassignInterface(ctx, d.IfName); err != nil {
+				return err
+			}
+			removedIf = d.IfName
 		}
-		return p.opnSSH.UnassignInterface(ctx, d.IfName)
+		// Remove from Kea interface list
+		if removedIf != "" {
+			_ = p.opn.RemoveDHCPInterface(ctx, removedIf)
+		}
+		return nil
 	})
 	if err := rb.Record(ctx, "interface_assign", map[string]interface{}{"if_name": ifName, "vlan_tag": vlanTag}); err != nil {
 		return err
@@ -296,10 +310,12 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		return err
 	}
 
-	// Restart Kea DHCP after port groups so the VLAN interface has time to stabilize.
-	// Kea with raw sockets only binds to interfaces present at startup, so it must
-	// be restarted after the new interface is fully configured.
-	time.Sleep(2 * time.Second) // give interface time to come up
+	// Add the OPNsense interface to Kea's listened interfaces and restart.
+	// Kea only serves DHCP on explicitly configured interfaces.
+	if err := p.opn.AddDHCPInterface(ctx, ifName); err != nil {
+		p.logger.Warn("failed to add DHCP interface", "interface", ifName, "error", err)
+	}
+	time.Sleep(2 * time.Second) // give interface time to stabilize
 	if err := p.opn.RestartDHCP(ctx); err != nil {
 		p.logger.Warn("failed to restart DHCP, falling back to reconfigure", "error", err)
 		_ = p.opn.ReconfigureDHCP(ctx)

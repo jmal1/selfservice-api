@@ -244,6 +244,124 @@ func (c *Client) RestartDHCP(ctx context.Context) error {
 	return err
 }
 
+// AddDHCPInterface adds an OPNsense interface to Kea's listened interfaces list.
+// Kea only serves DHCP on explicitly configured interfaces.
+func (c *Client) AddDHCPInterface(ctx context.Context, ifName string) error {
+	// Get current settings to find which interfaces are already selected
+	resp, err := c.doRequest(ctx, "GET", "/kea/dhcpv4/get", nil)
+	if err != nil {
+		return fmt.Errorf("get DHCP settings: %w", err)
+	}
+
+	var settings struct {
+		DHCPV4 struct {
+			General struct {
+				Interfaces map[string]struct {
+					Value    string `json:"value"`
+					Selected int    `json:"selected"`
+				} `json:"interfaces"`
+			} `json:"general"`
+		} `json:"dhcpv4"`
+	}
+	if err := json.Unmarshal(resp, &settings); err != nil {
+		return fmt.Errorf("parse DHCP settings: %w", err)
+	}
+
+	// Build comma-separated list of selected interfaces + the new one
+	var selected []string
+	for key, iface := range settings.DHCPV4.General.Interfaces {
+		if iface.Selected == 1 {
+			selected = append(selected, key)
+		}
+	}
+	// Add the new interface if not already selected
+	found := false
+	for _, s := range selected {
+		if s == ifName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		selected = append(selected, ifName)
+	}
+
+	interfaces := ""
+	for i, s := range selected {
+		if i > 0 {
+			interfaces += ","
+		}
+		interfaces += s
+	}
+
+	payload := map[string]any{
+		"dhcpv4": map[string]any{
+			"general": map[string]any{
+				"interfaces": interfaces,
+			},
+		},
+	}
+	_, err = c.doRequest(ctx, "POST", "/kea/dhcpv4/set", payload)
+	if err != nil {
+		return fmt.Errorf("set DHCP interfaces: %w", err)
+	}
+
+	c.logger.Info("added DHCP interface", "interface", ifName, "all_interfaces", interfaces)
+	return nil
+}
+
+// RemoveDHCPInterface removes an OPNsense interface from Kea's listened interfaces list.
+func (c *Client) RemoveDHCPInterface(ctx context.Context, ifName string) error {
+	resp, err := c.doRequest(ctx, "GET", "/kea/dhcpv4/get", nil)
+	if err != nil {
+		return fmt.Errorf("get DHCP settings: %w", err)
+	}
+
+	var settings struct {
+		DHCPV4 struct {
+			General struct {
+				Interfaces map[string]struct {
+					Value    string `json:"value"`
+					Selected int    `json:"selected"`
+				} `json:"interfaces"`
+			} `json:"general"`
+		} `json:"dhcpv4"`
+	}
+	if err := json.Unmarshal(resp, &settings); err != nil {
+		return fmt.Errorf("parse DHCP settings: %w", err)
+	}
+
+	var selected []string
+	for key, iface := range settings.DHCPV4.General.Interfaces {
+		if iface.Selected == 1 && key != ifName {
+			selected = append(selected, key)
+		}
+	}
+
+	interfaces := ""
+	for i, s := range selected {
+		if i > 0 {
+			interfaces += ","
+		}
+		interfaces += s
+	}
+
+	payload := map[string]any{
+		"dhcpv4": map[string]any{
+			"general": map[string]any{
+				"interfaces": interfaces,
+			},
+		},
+	}
+	_, err = c.doRequest(ctx, "POST", "/kea/dhcpv4/set", payload)
+	if err != nil {
+		return fmt.Errorf("set DHCP interfaces: %w", err)
+	}
+
+	c.logger.Info("removed DHCP interface", "interface", ifName, "remaining_interfaces", interfaces)
+	return nil
+}
+
 // GetDHCPSubnetByNetwork finds a DHCP subnet by its network (for idempotency).
 func (c *Client) GetDHCPSubnetByNetwork(ctx context.Context, subnet string) (*DHCPSubnet, error) {
 	resp, err := c.doRequest(ctx, "GET", "/kea/dhcpv4/searchSubnet", nil)
