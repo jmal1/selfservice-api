@@ -138,7 +138,7 @@ func (q *Queries) CreateTemplate(ctx context.Context, req models.CreateTemplateR
 		                       default_disk_gb, min_vcpus, min_ram_mb, description, icon_url)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		RETURNING id, name, vcenter_template, os_type, default_vcpus, default_ram_mb,
-		          default_disk_gb, min_vcpus, min_ram_mb, description, icon_url, is_active, created_at
+		          default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''), is_active, created_at
 	`, req.Name, req.VCenterTemplate, req.OSType, req.DefaultVCPUs, req.DefaultRAMMB,
 		req.DefaultDiskGB, req.MinVCPUs, req.MinRAMMB, req.Description, req.IconURL,
 	).Scan(
@@ -153,7 +153,7 @@ func (q *Queries) ListTemplatesForUser(ctx context.Context, userID uuid.UUID, ro
 	rows, err := q.pool.Query(ctx, `
 		SELECT DISTINCT t.id, t.name, t.vcenter_template, t.os_type, t.default_vcpus,
 		       t.default_ram_mb, t.default_disk_gb, t.min_vcpus, t.min_ram_mb,
-		       t.description, t.icon_url, t.is_active, t.created_at
+		       COALESCE(t.description, ''), COALESCE(t.icon_url, ''), t.is_active, t.created_at
 		FROM templates t
 		LEFT JOIN template_access ta ON t.id = ta.template_id
 		WHERE t.is_active = true
@@ -185,7 +185,7 @@ func (q *Queries) ListTemplatesForUser(ctx context.Context, userID uuid.UUID, ro
 func (q *Queries) ListAllTemplates(ctx context.Context) ([]models.Template, error) {
 	rows, err := q.pool.Query(ctx, `
 		SELECT id, name, vcenter_template, os_type, default_vcpus, default_ram_mb,
-		       default_disk_gb, min_vcpus, min_ram_mb, description, icon_url, is_active, created_at
+		       default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''), is_active, created_at
 		FROM templates ORDER BY name
 	`)
 	if err != nil {
