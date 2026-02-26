@@ -119,9 +119,17 @@ func (p *Provider) CallbackHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Debug: log raw id_token shape (first 80 chars + dot count)
+	dotCount := strings.Count(rawIDToken, ".")
+	preview := rawIDToken
+	if len(preview) > 80 {
+		preview = preview[:80] + "..."
+	}
+	p.logger.Info("raw id_token debug", "length", len(rawIDToken), "dots", dotCount, "preview", preview)
+
 	idToken, err := p.verifier.Verify(r.Context(), rawIDToken)
 	if err != nil {
-		p.logger.Error("id_token verification failed", "error", err)
+		p.logger.Error("id_token verification failed", "error", err, "raw_token_length", len(rawIDToken), "dot_count", dotCount)
 		http.Error(w, "token verification failed", http.StatusInternalServerError)
 		return
 	}
