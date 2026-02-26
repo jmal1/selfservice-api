@@ -194,7 +194,7 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	// Begin transaction: checkout VLAN, create pod, create pod_vms
+	// Begin transaction: create pod, checkout VLAN, create pod_vms
 	tx, err := h.db.Pool().Begin(ctx)
 	if err != nil {
 		h.logger.Error("begin tx failed", "error", err)
@@ -203,14 +203,24 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(ctx)
 
-	// Reserve a pod ID for the VLAN checkout
-	var podID uuid.UUID
-	if err := tx.QueryRow(ctx, "SELECT gen_random_uuid()").Scan(&podID); err != nil {
-		h.logger.Error("generate pod id failed", "error", err)
+	podID := uuid.New()
+
+	// Insert pod record first (FK target for vlan_pool.pod_id)
+	var podCreatedAt, podUpdatedAt time.Time
+	err = tx.QueryRow(ctx, `
+		INSERT INTO pods (id, owner_id, name, salt, vlan_id, subnet, status, expires_at)
+		VALUES ($1, $2, $3, $4, 0, '', 'pending', $5)
+		RETURNING created_at, updated_at
+	`, podID, userID, req.Name, salt, expiresAt).Scan(
+		&podCreatedAt, &podUpdatedAt,
+	)
+	if err != nil {
+		h.logger.Error("create pod failed", "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
+	// Checkout VLAN (now the pod exists, so FK is satisfied)
 	vlanTag, subnet, err := h.db.CheckoutVLAN(ctx, tx, podID, "all")
 	if err != nil {
 		h.logger.Error("checkout VLAN failed", "error", err)
@@ -218,15 +228,10 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Insert pod record
-	var podCreatedAt, podUpdatedAt time.Time
-	err = tx.QueryRow(ctx, `
-		INSERT INTO pods (id, owner_id, name, salt, vlan_id, subnet, status, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)
-		RETURNING created_at, updated_at
-	`, podID, userID, req.Name, salt, vlanTag, subnet, expiresAt).Scan(
-		&podCreatedAt, &podUpdatedAt,
-	)
+	// Update pod with allocated VLAN info
+	_, err = tx.Exec(ctx, `
+		UPDATE pods SET vlan_id = $1, subnet = $2 WHERE id = $3
+	`, vlanTag, subnet, podID)
 	if err != nil {
 		h.logger.Error("create pod failed", "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
