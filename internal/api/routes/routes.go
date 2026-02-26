@@ -66,6 +66,7 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider) *chi.Mux {
 		r.Get("/templates", h.ListTemplates)
 
 		// Jobs
+		r.Get("/jobs", h.ListMyJobs)
 		r.Get("/jobs/{jobID}/status", h.GetJobStatus)
 
 		// Admin routes

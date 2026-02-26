@@ -594,7 +594,32 @@ func (q *Queries) GetJob(ctx context.Context, id uuid.UUID) (*models.Job, error)
 	return &j, err
 }
 
-// --- Audit ---
+// ListJobsByUser returns recent jobs for a specific user.
+func (q *Queries) ListJobsByUser(ctx context.Context, userID uuid.UUID) ([]models.Job, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT id, type, payload, status, claimed_by, claimed_at, started_at,
+		       completed_at, result, retry_count, max_retries, rollback_steps, created_at
+		FROM jobs WHERE payload->>'user_id' = $1
+		ORDER BY created_at DESC LIMIT 20
+	`, userID.String())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []models.Job
+	for rows.Next() {
+		var j models.Job
+		if err := rows.Scan(
+			&j.ID, &j.Type, &j.Payload, &j.Status, &j.ClaimedBy, &j.ClaimedAt, &j.StartedAt,
+			&j.CompletedAt, &j.Result, &j.RetryCount, &j.MaxRetries, &j.RollbackSteps, &j.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, j)
+	}
+	return jobs, nil
+}
 
 // InsertAuditLog records an action in the audit log.
 func (q *Queries) InsertAuditLog(ctx context.Context, entry models.AuditLog) error {

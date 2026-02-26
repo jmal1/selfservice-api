@@ -497,6 +497,22 @@ func (h *Handler) GetJobStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ListMyJobs returns the current user's recent jobs.
+func (h *Handler) ListMyJobs(w http.ResponseWriter, r *http.Request) {
+	userID := middleware.UserIDFromContext(r.Context())
+
+	jobs, err := h.db.ListJobsByUser(r.Context(), userID)
+	if err != nil {
+		h.logger.Error("list user jobs failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if jobs == nil {
+		jobs = []models.Job{}
+	}
+	respondJSON(w, http.StatusOK, jobs)
+}
+
 // --- Auth Handlers ---
 
 // GetMe returns the current user's profile and resource usage.
