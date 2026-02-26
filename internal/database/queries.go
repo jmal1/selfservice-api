@@ -43,7 +43,7 @@ func (q *Queries) UpsertUser(ctx context.Context, u *models.User) error {
 func (q *Queries) GetUserBySub(ctx context.Context, sub string) (*models.User, error) {
 	var u models.User
 	err := q.pool.QueryRow(ctx, `
-		SELECT id, oidc_sub, username, email, display_name, role,
+		SELECT id, oidc_sub, username, email, COALESCE(display_name, ''), role,
 		       max_vcpus, max_ram_mb, max_pods, is_active, created_at, updated_at
 		FROM users WHERE oidc_sub = $1
 	`, sub).Scan(
@@ -60,7 +60,7 @@ func (q *Queries) GetUserBySub(ctx context.Context, sub string) (*models.User, e
 func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (*models.User, error) {
 	var u models.User
 	err := q.pool.QueryRow(ctx, `
-		SELECT id, oidc_sub, username, email, display_name, role,
+		SELECT id, oidc_sub, username, email, COALESCE(display_name, ''), role,
 		       max_vcpus, max_ram_mb, max_pods, is_active, created_at, updated_at
 		FROM users WHERE id = $1
 	`, id).Scan(
@@ -76,7 +76,7 @@ func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (*models.User, 
 // ListUsers returns all users (admin).
 func (q *Queries) ListUsers(ctx context.Context) ([]models.User, error) {
 	rows, err := q.pool.Query(ctx, `
-		SELECT id, oidc_sub, username, email, display_name, role,
+		SELECT id, oidc_sub, username, email, COALESCE(display_name, ''), role,
 		       max_vcpus, max_ram_mb, max_pods, is_active, created_at, updated_at
 		FROM users ORDER BY username
 	`)
@@ -234,6 +234,88 @@ func (q *Queries) SetTemplateAccess(ctx context.Context, templateID uuid.UUID, r
 	return tx.Commit(ctx)
 }
 
+// UpdateTemplate partially updates a template by ID.
+func (q *Queries) UpdateTemplate(ctx context.Context, id uuid.UUID, req models.UpdateTemplateRequest) (*models.Template, error) {
+	var t models.Template
+	err := q.pool.QueryRow(ctx, `
+		UPDATE templates SET
+			name = COALESCE($2, name),
+			description = COALESCE($3, description),
+			icon_url = COALESCE($4, icon_url),
+			default_vcpus = COALESCE($5, default_vcpus),
+			default_ram_mb = COALESCE($6, default_ram_mb),
+			default_disk_gb = COALESCE($7, default_disk_gb),
+			is_active = COALESCE($8, is_active)
+		WHERE id = $1
+		RETURNING id, name, vcenter_template, os_type, default_vcpus, default_ram_mb,
+		          default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''), is_active, created_at
+	`, id, req.Name, req.Description, req.IconURL, req.DefaultVCPUs, req.DefaultRAMMB, req.DefaultDiskGB, req.IsActive,
+	).Scan(
+		&t.ID, &t.Name, &t.VCenterTemplate, &t.OSType, &t.DefaultVCPUs, &t.DefaultRAMMB,
+		&t.DefaultDiskGB, &t.MinVCPUs, &t.MinRAMMB, &t.Description, &t.IconURL, &t.IsActive, &t.CreatedAt,
+	)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	return &t, err
+}
+
+// DeleteTemplate removes a template by ID.
+func (q *Queries) DeleteTemplate(ctx context.Context, id uuid.UUID) error {
+	_, err := q.pool.Exec(ctx, "DELETE FROM templates WHERE id = $1", id)
+	return err
+}
+
+// ListAllJobs returns all jobs ordered by creation time (admin).
+func (q *Queries) ListAllJobs(ctx context.Context) ([]models.Job, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT id, type, payload, status, claimed_by, claimed_at, started_at,
+		       completed_at, result, retry_count, max_retries, rollback_steps, created_at
+		FROM jobs ORDER BY created_at DESC LIMIT 100
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []models.Job
+	for rows.Next() {
+		var j models.Job
+		if err := rows.Scan(
+			&j.ID, &j.Type, &j.Payload, &j.Status, &j.ClaimedBy, &j.ClaimedAt, &j.StartedAt,
+			&j.CompletedAt, &j.Result, &j.RetryCount, &j.MaxRetries, &j.RollbackSteps, &j.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, j)
+	}
+	return jobs, nil
+}
+
+// ListAuditLog returns recent audit log entries (admin).
+func (q *Queries) ListAuditLog(ctx context.Context) ([]models.AuditLog, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT id, user_id, action, resource_type, resource_id, details, ip_address, created_at
+		FROM audit_log ORDER BY created_at DESC LIMIT 200
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var entries []models.AuditLog
+	for rows.Next() {
+		var e models.AuditLog
+		if err := rows.Scan(
+			&e.ID, &e.UserID, &e.Action, &e.ResourceType, &e.ResourceID, &e.Details, &e.IPAddress, &e.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		entries = append(entries, e)
+	}
+	return entries, nil
+}
+
 // --- Pods ---
 
 // GetResourceUsage returns a user's current resource consumption.
@@ -331,7 +413,7 @@ func (q *Queries) ListPodsByOwner(ctx context.Context, ownerID uuid.UUID) ([]mod
 	rows, err := q.pool.Query(ctx, `
 		SELECT p.id, p.owner_id, p.name, p.salt, p.pod_index, p.vlan_id, p.subnet, p.status,
 		       p.error_message, p.expires_at, p.created_at, p.updated_at,
-		       u.id, u.username, u.email, u.display_name, u.role
+		       u.id, u.username, u.email, COALESCE(u.display_name, ''), u.role
 		FROM pods p
 		JOIN users u ON u.id = p.owner_id
 		WHERE p.owner_id = $1 AND p.status != 'destroyed'
@@ -374,7 +456,7 @@ func (q *Queries) ListAllPods(ctx context.Context) ([]models.Pod, error) {
 	rows, err := q.pool.Query(ctx, `
 		SELECT p.id, p.owner_id, p.name, p.salt, p.pod_index, p.vlan_id, p.subnet, p.status,
 		       p.error_message, p.expires_at, p.created_at, p.updated_at,
-		       u.id, u.username, u.email, u.display_name, u.role
+		       u.id, u.username, u.email, COALESCE(u.display_name, ''), u.role
 		FROM pods p
 		JOIN users u ON u.id = p.owner_id
 		WHERE p.status != 'destroyed'

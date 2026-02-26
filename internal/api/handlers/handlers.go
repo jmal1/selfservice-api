@@ -619,6 +619,79 @@ func (h *Handler) AdminSetTemplateAccess(w http.ResponseWriter, r *http.Request)
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// AdminUpdateTemplate partially updates a template.
+func (h *Handler) AdminUpdateTemplate(w http.ResponseWriter, r *http.Request) {
+	templateID, err := uuid.Parse(chi.URLParam(r, "templateID"))
+	if err != nil {
+		http.Error(w, "invalid template id", http.StatusBadRequest)
+		return
+	}
+
+	var req models.UpdateTemplateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	tmpl, err := h.db.UpdateTemplate(r.Context(), templateID, req)
+	if err != nil {
+		h.logger.Error("update template failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if tmpl == nil {
+		http.Error(w, "template not found", http.StatusNotFound)
+		return
+	}
+
+	respondJSON(w, http.StatusOK, tmpl)
+}
+
+// AdminDeleteTemplate deletes a template.
+func (h *Handler) AdminDeleteTemplate(w http.ResponseWriter, r *http.Request) {
+	templateID, err := uuid.Parse(chi.URLParam(r, "templateID"))
+	if err != nil {
+		http.Error(w, "invalid template id", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.db.DeleteTemplate(r.Context(), templateID); err != nil {
+		h.logger.Error("delete template failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// AdminListJobs returns all jobs.
+func (h *Handler) AdminListJobs(w http.ResponseWriter, r *http.Request) {
+	jobs, err := h.db.ListAllJobs(r.Context())
+	if err != nil {
+		h.logger.Error("admin list jobs failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if jobs == nil {
+		jobs = []models.Job{}
+	}
+	respondJSON(w, http.StatusOK, jobs)
+}
+
+// AdminListAuditLog returns audit log entries.
+func (h *Handler) AdminListAuditLog(w http.ResponseWriter, r *http.Request) {
+	entries, err := h.db.ListAuditLog(r.Context())
+	if err != nil {
+		h.logger.Error("admin list audit log failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if entries == nil {
+		entries = []models.AuditLog{}
+	}
+	respondJSON(w, http.StatusOK, entries)
+}
+
 // Health returns service health status.
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
