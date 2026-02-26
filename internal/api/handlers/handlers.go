@@ -184,7 +184,7 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Generate a short random salt for VM naming
-	saltBytes := make([]byte, 4)
+	saltBytes := make([]byte, 3)
 	if _, err := rand.Read(saltBytes); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
