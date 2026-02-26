@@ -33,9 +33,8 @@ func (p *Provisioner) DestroyPod(ctx context.Context, job *models.Job) error {
 	}
 
 	vlanTag := pod.VLANID
-	podIndex := pod.PodIndex
-	pgName := fmt.Sprintf("Pod-%03d-VLAN%d", podIndex, vlanTag)
-	subnet := fmt.Sprintf("10.100.%d.0/24", podIndex)
+	pgName := fmt.Sprintf("Pod-VLAN%d", vlanTag)
+	subnet := pod.Subnet
 	var errors []error
 
 	// Mark pod as destroying
@@ -119,15 +118,17 @@ func (p *Provisioner) DestroyPod(ctx context.Context, job *models.Job) error {
 		}
 	}
 
-	// --- Step 7: Mark pod as destroyed ---
+	// --- Step 7: Mark pod as destroyed and release VLAN ---
 	if len(errors) > 0 {
 		errMsg := fmt.Sprintf("%d cleanup errors occurred", len(errors))
 		_ = p.db.UpdatePodStatus(ctx, pod.ID, "destroyed", errMsg)
+		_ = p.db.ReleaseVLAN(ctx, pod.ID)
 		p.logger.Warn("pod destroyed with errors", "pod_id", pod.ID, "error_count", len(errors))
 		return fmt.Errorf("pod destroyed with %d errors: %v", len(errors), errors)
 	}
 
 	_ = p.db.UpdatePodStatus(ctx, pod.ID, "destroyed", "")
+	_ = p.db.ReleaseVLAN(ctx, pod.ID)
 	p.publishProgress(job.ID, "destroyed", "Pod destroyed successfully")
 	p.logger.Info("pod destroyed successfully", "pod_id", pod.ID, "vlan", vlanTag)
 	return nil

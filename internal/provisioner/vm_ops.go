@@ -123,7 +123,7 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) error {
 		return fmt.Errorf("get pod VM: %w", err)
 	}
 
-	pgName := fmt.Sprintf("Pod-%03d-VLAN%d", pod.PodIndex, pod.VLANID)
+	pgName := fmt.Sprintf("Pod-VLAN%d", pod.VLANID)
 
 	// Step 1: Clone VM
 	p.publishProgress(job.ID, "vm_clone", fmt.Sprintf("Cloning %s from %s", payload.VMName, payload.TemplateName))

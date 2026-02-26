@@ -147,10 +147,10 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 
 	rb := p.newRollbackEngine(job.ID)
 	vlanTag := pod.VLANID
-	podIndex := pod.PodIndex
-	subnet := fmt.Sprintf("10.100.%d.0/24", podIndex)
-	gateway := fmt.Sprintf("10.100.%d.1/24", podIndex)
-	pgName := fmt.Sprintf("Pod-%03d-VLAN%d", podIndex, vlanTag)
+	octet := vlanTag - 100
+	subnet := pod.Subnet
+	gateway := fmt.Sprintf("10.100.%d.1/24", octet)
+	pgName := fmt.Sprintf("Pod-VLAN%d", vlanTag)
 
 	// --- Step 1: Update pod status to provisioning ---
 	p.publishProgress(job.ID, "pod_update", "Setting pod status to provisioning")
@@ -170,7 +170,7 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		vlanPreexisting = true
 		p.logger.Info("VLAN already exists", "tag", vlanTag, "uuid", vlanUUID)
 	} else {
-		vlanUUID, err = p.opn.CreateVLAN(ctx, "vmx1", vlanTag, fmt.Sprintf("Pod-%03d", podIndex))
+		vlanUUID, err = p.opn.CreateVLAN(ctx, "vmx1", vlanTag, fmt.Sprintf("Pod-VLAN%d", vlanTag))
 		if err != nil {
 			return fmt.Errorf("create VLAN: %w", err)
 		}
@@ -253,7 +253,7 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		dhcpPreexisting = true
 		p.logger.Info("DHCP subnet already exists", "subnet", subnet, "uuid", dhcpUUID)
 	} else {
-		poolRange := fmt.Sprintf("10.100.%d.10-10.100.%d.250", podIndex, podIndex)
+		poolRange := fmt.Sprintf("10.100.%d.10-10.100.%d.250", octet, octet)
 		dhcpUUID, err = p.opn.CreateDHCPSubnet(ctx, subnet, poolRange, gateway)
 		if err != nil {
 			rbErrs := rb.Rollback(ctx)

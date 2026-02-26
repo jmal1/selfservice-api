@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
@@ -193,7 +194,7 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	// Begin transaction: allocate pod_index, create pod, create pod_vms
+	// Begin transaction: checkout VLAN, create pod, create pod_vms
 	tx, err := h.db.Pool().Begin(ctx)
 	if err != nil {
 		h.logger.Error("begin tx failed", "error", err)
@@ -202,24 +203,29 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(ctx)
 
-	podIndex, err := h.db.AllocatePodIndex(ctx, tx)
+	// Reserve a pod ID for the VLAN checkout
+	var podID uuid.UUID
+	if err := tx.QueryRow(ctx, "SELECT gen_random_uuid()").Scan(&podID); err != nil {
+		h.logger.Error("generate pod id failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	vlanTag, subnet, err := h.db.CheckoutVLAN(ctx, tx, podID, "all")
 	if err != nil {
-		h.logger.Error("allocate pod index failed", "error", err)
-		http.Error(w, "no available pod slots", http.StatusConflict)
+		h.logger.Error("checkout VLAN failed", "error", err)
+		http.Error(w, "no available VLAN slots", http.StatusConflict)
 		return
 	}
 
 	// Insert pod record
-	var podID uuid.UUID
-	var vlanID int
-	var subnet string
 	var podCreatedAt, podUpdatedAt time.Time
 	err = tx.QueryRow(ctx, `
-		INSERT INTO pods (owner_id, name, salt, pod_index, status, expires_at)
-		VALUES ($1, $2, $3, $4, 'pending', $5)
-		RETURNING id, vlan_id, subnet, created_at, updated_at
-	`, userID, req.Name, salt, podIndex, expiresAt).Scan(
-		&podID, &vlanID, &subnet, &podCreatedAt, &podUpdatedAt,
+		INSERT INTO pods (id, owner_id, name, salt, vlan_id, subnet, status, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)
+		RETURNING created_at, updated_at
+	`, podID, userID, req.Name, salt, vlanTag, subnet, expiresAt).Scan(
+		&podCreatedAt, &podUpdatedAt,
 	)
 	if err != nil {
 		h.logger.Error("create pod failed", "error", err)
@@ -808,6 +814,91 @@ func (h *Handler) AdminListAuditLog(w http.ResponseWriter, r *http.Request) {
 		entries = []models.AuditLog{}
 	}
 	respondJSON(w, http.StatusOK, entries)
+}
+
+// --- VLAN Pool Admin Handlers ---
+
+// AdminListVLANPool returns all VLAN pool entries.
+func (h *Handler) AdminListVLANPool(w http.ResponseWriter, r *http.Request) {
+	entries, err := h.db.ListVLANPool(r.Context())
+	if err != nil {
+		h.logger.Error("admin list vlan pool failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if entries == nil {
+		entries = []models.VLANPoolEntry{}
+	}
+	respondJSON(w, http.StatusOK, entries)
+}
+
+// AdminAddVLAN adds a new VLAN to the pool.
+func (h *Handler) AdminAddVLAN(w http.ResponseWriter, r *http.Request) {
+	var req models.AddVLANRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.VLANTag < 1 || req.VLANTag > 4094 || req.Subnet == "" || req.HostScope == "" {
+		http.Error(w, "vlan_tag (1-4094), subnet, and host_scope are required", http.StatusBadRequest)
+		return
+	}
+
+	entry, err := h.db.AddVLAN(r.Context(), req)
+	if err != nil {
+		h.logger.Error("add VLAN failed", "error", err)
+		http.Error(w, "failed to add VLAN (may already exist)", http.StatusConflict)
+		return
+	}
+
+	respondJSON(w, http.StatusCreated, entry)
+}
+
+// AdminUpdateVLAN updates a VLAN pool entry's scope.
+func (h *Handler) AdminUpdateVLAN(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "vlanID")
+	var id int
+	if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
+		http.Error(w, "invalid vlan id", http.StatusBadRequest)
+		return
+	}
+
+	var req models.UpdateVLANRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	entry, err := h.db.UpdateVLAN(r.Context(), id, req)
+	if err != nil {
+		h.logger.Error("update VLAN failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if entry == nil {
+		http.Error(w, "VLAN not found", http.StatusNotFound)
+		return
+	}
+
+	respondJSON(w, http.StatusOK, entry)
+}
+
+// AdminRemoveVLAN removes a VLAN from the pool (only if unallocated).
+func (h *Handler) AdminRemoveVLAN(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "vlanID")
+	var id int
+	if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
+		http.Error(w, "invalid vlan id", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.db.RemoveVLAN(r.Context(), id); err != nil {
+		h.logger.Error("remove VLAN failed", "error", err)
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // Health returns service health status.

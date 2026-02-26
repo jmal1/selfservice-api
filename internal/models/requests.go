@@ -69,6 +69,18 @@ type AccessRule struct {
 	Role   *string    `json:"role,omitempty" validate:"omitempty,oneof=student instructor admin"`
 }
 
+// AddVLANRequest is the admin API request to add VLANs to the pool.
+type AddVLANRequest struct {
+	VLANTag   int    `json:"vlan_tag" validate:"required,min=1,max=4094"`
+	Subnet    string `json:"subnet" validate:"required"`
+	HostScope string `json:"host_scope" validate:"required,oneof=all switch1"`
+}
+
+// UpdateVLANRequest is the admin API request to update a VLAN pool entry.
+type UpdateVLANRequest struct {
+	HostScope *string `json:"host_scope,omitempty" validate:"omitempty,oneof=all switch1"`
+}
+
 // PodResponse extends Pod with computed fields for API responses.
 type PodResponse struct {
 	Pod

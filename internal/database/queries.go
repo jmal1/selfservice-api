@@ -340,39 +340,70 @@ func (q *Queries) GetResourceUsage(ctx context.Context, userID uuid.UUID) (*mode
 	return &usage, err
 }
 
-// AllocatePodIndex finds the next available pod index (0–255).
-func (q *Queries) AllocatePodIndex(ctx context.Context, tx pgx.Tx) (int, error) {
-	var idx int
-	err := tx.QueryRow(ctx, `
-		SELECT i FROM generate_series(0, 255) AS i
-		WHERE i NOT IN (SELECT pod_index FROM pods WHERE status NOT IN ('destroyed'))
-		ORDER BY i LIMIT 1
-	`).Scan(&idx)
-	if err == pgx.ErrNoRows {
-		return -1, fmt.Errorf("no available pod indices (all 256 in use)")
+// CheckoutVLAN atomically reserves a random available VLAN from the pool.
+// hostScope filters VLANs by host compatibility: "all" for any host, "switch1" for esxi1/esxi2 only.
+// Pass empty string to accept any VLAN regardless of scope.
+func (q *Queries) CheckoutVLAN(ctx context.Context, tx pgx.Tx, podID uuid.UUID, hostScope string) (int, string, error) {
+	var vlanTag int
+	var subnet string
+
+	query := `
+		UPDATE vlan_pool SET pod_id = $1, allocated_at = now()
+		WHERE id = (
+			SELECT id FROM vlan_pool
+			WHERE pod_id IS NULL
+	`
+	args := []any{podID}
+
+	// Prefer 'all' scope VLANs first (work on every host), fall back to any available
+	if hostScope == "all" {
+		query += ` AND host_scope = 'all'`
+	} else if hostScope != "" {
+		query += fmt.Sprintf(` AND host_scope = '%s'`, hostScope)
 	}
-	return idx, err
+
+	query += `
+			ORDER BY RANDOM()
+			LIMIT 1
+			FOR UPDATE SKIP LOCKED
+		)
+		RETURNING vlan_tag, subnet
+	`
+
+	err := tx.QueryRow(ctx, query, args...).Scan(&vlanTag, &subnet)
+	if err == pgx.ErrNoRows {
+		return 0, "", fmt.Errorf("no available VLANs in pool")
+	}
+	return vlanTag, subnet, err
 }
 
-// CreatePod inserts a pod record with an allocated index.
-func (q *Queries) CreatePod(ctx context.Context, pod *models.Pod) error {
-	return q.pool.QueryRow(ctx, `
-		INSERT INTO pods (owner_id, name, salt, pod_index, status, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		RETURNING id, vlan_id, subnet, created_at, updated_at
-	`, pod.OwnerID, pod.Name, pod.Salt, pod.PodIndex, pod.Status, pod.ExpiresAt,
-	).Scan(&pod.ID, &pod.VLANID, &pod.Subnet, &pod.CreatedAt, &pod.UpdatedAt)
+// ReleaseVLAN returns a pod's VLAN back to the available pool.
+func (q *Queries) ReleaseVLAN(ctx context.Context, podID uuid.UUID) error {
+	_, err := q.pool.Exec(ctx, `
+		UPDATE vlan_pool SET pod_id = NULL, allocated_at = NULL WHERE pod_id = $1
+	`, podID)
+	return err
+}
+
+// CreatePod inserts a pod record with a checked-out VLAN.
+func (q *Queries) CreatePod(ctx context.Context, tx pgx.Tx, pod *models.Pod) error {
+	return tx.QueryRow(ctx, `
+		INSERT INTO pods (owner_id, name, salt, vlan_id, subnet, status, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		RETURNING id, created_at, updated_at
+	`, pod.OwnerID, pod.Name, pod.Salt, pod.VLANID, pod.Subnet, pod.Status, pod.ExpiresAt,
+	).Scan(&pod.ID, &pod.CreatedAt, &pod.UpdatedAt)
 }
 
 // GetPodByID retrieves a pod with its VMs and owner.
 func (q *Queries) GetPodByID(ctx context.Context, id uuid.UUID) (*models.Pod, error) {
 	var p models.Pod
 	err := q.pool.QueryRow(ctx, `
-		SELECT id, owner_id, name, salt, pod_index, vlan_id, subnet, status,
+		SELECT id, owner_id, name, salt, vlan_id, subnet, status,
 		       error_message, expires_at, created_at, updated_at
 		FROM pods WHERE id = $1
 	`, id).Scan(
-		&p.ID, &p.OwnerID, &p.Name, &p.Salt, &p.PodIndex, &p.VLANID, &p.Subnet, &p.Status,
+		&p.ID, &p.OwnerID, &p.Name, &p.Salt, &p.VLANID, &p.Subnet, &p.Status,
 		&p.ErrorMessage, &p.ExpiresAt, &p.CreatedAt, &p.UpdatedAt,
 	)
 	if err == pgx.ErrNoRows {
@@ -416,7 +447,7 @@ func (q *Queries) GetPodByID(ctx context.Context, id uuid.UUID) (*models.Pod, er
 // ListPodsByOwner returns all non-destroyed pods for a user (with VMs and owner).
 func (q *Queries) ListPodsByOwner(ctx context.Context, ownerID uuid.UUID) ([]models.Pod, error) {
 	rows, err := q.pool.Query(ctx, `
-		SELECT p.id, p.owner_id, p.name, p.salt, p.pod_index, p.vlan_id, p.subnet, p.status,
+		SELECT p.id, p.owner_id, p.name, p.salt, p.vlan_id, p.subnet, p.status,
 		       p.error_message, p.expires_at, p.created_at, p.updated_at,
 		       u.id, u.username, u.email, COALESCE(u.display_name, ''), u.role
 		FROM pods p
@@ -434,7 +465,7 @@ func (q *Queries) ListPodsByOwner(ctx context.Context, ownerID uuid.UUID) ([]mod
 		var p models.Pod
 		var owner models.User
 		if err := rows.Scan(
-			&p.ID, &p.OwnerID, &p.Name, &p.Salt, &p.PodIndex, &p.VLANID, &p.Subnet, &p.Status,
+			&p.ID, &p.OwnerID, &p.Name, &p.Salt, &p.VLANID, &p.Subnet, &p.Status,
 			&p.ErrorMessage, &p.ExpiresAt, &p.CreatedAt, &p.UpdatedAt,
 			&owner.ID, &owner.Username, &owner.Email, &owner.DisplayName, &owner.Role,
 		); err != nil {
@@ -459,7 +490,7 @@ func (q *Queries) ListPodsByOwner(ctx context.Context, ownerID uuid.UUID) ([]mod
 // ListAllPods returns all non-destroyed pods (admin, with owner info).
 func (q *Queries) ListAllPods(ctx context.Context) ([]models.Pod, error) {
 	rows, err := q.pool.Query(ctx, `
-		SELECT p.id, p.owner_id, p.name, p.salt, p.pod_index, p.vlan_id, p.subnet, p.status,
+		SELECT p.id, p.owner_id, p.name, p.salt, p.vlan_id, p.subnet, p.status,
 		       p.error_message, p.expires_at, p.created_at, p.updated_at,
 		       u.id, u.username, u.email, COALESCE(u.display_name, ''), u.role
 		FROM pods p
@@ -477,7 +508,7 @@ func (q *Queries) ListAllPods(ctx context.Context) ([]models.Pod, error) {
 		var p models.Pod
 		var owner models.User
 		if err := rows.Scan(
-			&p.ID, &p.OwnerID, &p.Name, &p.Salt, &p.PodIndex, &p.VLANID, &p.Subnet, &p.Status,
+			&p.ID, &p.OwnerID, &p.Name, &p.Salt, &p.VLANID, &p.Subnet, &p.Status,
 			&p.ErrorMessage, &p.ExpiresAt, &p.CreatedAt, &p.UpdatedAt,
 			&owner.ID, &owner.Username, &owner.Email, &owner.DisplayName, &owner.Role,
 		); err != nil {
@@ -633,6 +664,73 @@ func (q *Queries) InsertAuditLog(ctx context.Context, entry models.AuditLog) err
 		VALUES ($1, $2, $3, $4, $5, $6)
 	`, entry.UserID, entry.Action, entry.ResourceType, entry.ResourceID, entry.Details, entry.IPAddress)
 	return err
+}
+
+// --- VLAN Pool ---
+
+// ListVLANPool returns all VLAN pool entries.
+func (q *Queries) ListVLANPool(ctx context.Context) ([]models.VLANPoolEntry, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT id, vlan_tag, subnet, host_scope, pod_id, allocated_at
+		FROM vlan_pool ORDER BY vlan_tag
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var entries []models.VLANPoolEntry
+	for rows.Next() {
+		var e models.VLANPoolEntry
+		if err := rows.Scan(&e.ID, &e.VLANTag, &e.Subnet, &e.HostScope, &e.PodID, &e.AllocatedAt); err != nil {
+			return nil, err
+		}
+		entries = append(entries, e)
+	}
+	return entries, nil
+}
+
+// AddVLAN inserts a new VLAN into the pool.
+func (q *Queries) AddVLAN(ctx context.Context, req models.AddVLANRequest) (*models.VLANPoolEntry, error) {
+	var e models.VLANPoolEntry
+	err := q.pool.QueryRow(ctx, `
+		INSERT INTO vlan_pool (vlan_tag, subnet, host_scope)
+		VALUES ($1, $2, $3)
+		RETURNING id, vlan_tag, subnet, host_scope, pod_id, allocated_at
+	`, req.VLANTag, req.Subnet, req.HostScope).Scan(
+		&e.ID, &e.VLANTag, &e.Subnet, &e.HostScope, &e.PodID, &e.AllocatedAt,
+	)
+	return &e, err
+}
+
+// UpdateVLAN updates a VLAN pool entry's scope.
+func (q *Queries) UpdateVLAN(ctx context.Context, id int, req models.UpdateVLANRequest) (*models.VLANPoolEntry, error) {
+	var e models.VLANPoolEntry
+	err := q.pool.QueryRow(ctx, `
+		UPDATE vlan_pool SET host_scope = COALESCE($2, host_scope)
+		WHERE id = $1
+		RETURNING id, vlan_tag, subnet, host_scope, pod_id, allocated_at
+	`, id, req.HostScope).Scan(
+		&e.ID, &e.VLANTag, &e.Subnet, &e.HostScope, &e.PodID, &e.AllocatedAt,
+	)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	return &e, err
+}
+
+// RemoveVLAN deletes a VLAN from the pool (only if not allocated).
+func (q *Queries) RemoveVLAN(ctx context.Context, id int) error {
+	result, err := q.pool.Exec(ctx, `
+		DELETE FROM vlan_pool WHERE id = $1 AND pod_id IS NULL
+	`, id)
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() == 0 {
+		return fmt.Errorf("VLAN not found or currently allocated to a pod")
+	}
+	return nil
 }
 
 // --- Pod Status ---

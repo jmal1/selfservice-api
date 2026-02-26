@@ -84,6 +84,11 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider) *chi.Mux {
 
 			r.Get("/jobs", h.AdminListJobs)
 			r.Get("/audit", h.AdminListAuditLog)
+
+			r.Get("/vlans", h.AdminListVLANPool)
+			r.Post("/vlans", h.AdminAddVLAN)
+			r.Patch("/vlans/{vlanID}", h.AdminUpdateVLAN)
+			r.Delete("/vlans/{vlanID}", h.AdminRemoveVLAN)
 		})
 	})
 

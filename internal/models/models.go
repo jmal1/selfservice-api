@@ -53,7 +53,6 @@ type Pod struct {
 	OwnerID      uuid.UUID  `json:"owner_id" db:"owner_id"`
 	Name         string     `json:"name" db:"name"`
 	Salt         string     `json:"salt" db:"salt"`
-	PodIndex     int        `json:"pod_index" db:"pod_index"`
 	VLANID       int        `json:"vlan_id" db:"vlan_id"`
 	Subnet       string     `json:"subnet" db:"subnet"`
 	Status       string     `json:"status" db:"status"`
@@ -108,6 +107,16 @@ type AuditLog struct {
 	Details      []byte     `json:"details,omitempty" db:"details"`
 	IPAddress    *string    `json:"ip_address,omitempty" db:"ip_address"`
 	CreatedAt    time.Time  `json:"created_at" db:"created_at"`
+}
+
+// VLANPoolEntry represents a VLAN in the allocation pool.
+type VLANPoolEntry struct {
+	ID          int        `json:"id" db:"id"`
+	VLANTag     int        `json:"vlan_tag" db:"vlan_tag"`
+	Subnet      string     `json:"subnet" db:"subnet"`
+	HostScope   string     `json:"host_scope" db:"host_scope"`
+	PodID       *uuid.UUID `json:"pod_id,omitempty" db:"pod_id"`
+	AllocatedAt *time.Time `json:"allocated_at,omitempty" db:"allocated_at"`
 }
 
 // Pod status constants.
