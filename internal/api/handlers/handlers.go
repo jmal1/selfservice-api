@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -79,7 +81,7 @@ func (h *Handler) GetPod(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, pod)
 }
 
-// CreatePod queues a pod creation job.
+// CreatePod creates the pod + VMs in the DB, then queues a provisioning job.
 func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 	var req models.CreatePodRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -111,13 +113,23 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Resolve templates and calculate requested resources
+	type resolvedVM struct {
+		req      models.VMRequest
+		template models.Template
+		vcpus    int
+		ramMB    int
+		diskGB   int
+	}
+	var resolved []resolvedVM
 	var totalVCPUs, totalRAM int
+
+	templates, err := h.db.ListTemplatesForUser(r.Context(), userID, role)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
 	for _, vm := range req.VMs {
-		templates, err := h.db.ListTemplatesForUser(r.Context(), userID, role)
-		if err != nil {
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
-		}
 		var found *models.Template
 		for _, t := range templates {
 			if t.ID == vm.TemplateID {
@@ -134,12 +146,17 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 		if vm.VCPUs != nil {
 			vcpus = *vm.VCPUs
 		}
-		ram := found.DefaultRAMMB
+		ramMB := found.DefaultRAMMB
 		if vm.RAMMB != nil {
-			ram = *vm.RAMMB
+			ramMB = *vm.RAMMB
+		}
+		diskGB := found.DefaultDiskGB
+		if vm.DiskGB != nil {
+			diskGB = *vm.DiskGB
 		}
 		totalVCPUs += vcpus
-		totalRAM += ram
+		totalRAM += ramMB
+		resolved = append(resolved, resolvedVM{req: vm, template: *found, vcpus: vcpus, ramMB: ramMB, diskGB: diskGB})
 	}
 
 	if usage.ActivePods+1 > user.MaxPods {
@@ -166,22 +183,106 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 		expiresAt = &t
 	}
 
-	// Create job payload
-	type createPayload struct {
-		UserID    string                 `json:"user_id"`
-		PodName   string                 `json:"pod_name"`
-		VMs       []models.VMRequest     `json:"vms"`
-		ExpiresAt *time.Time             `json:"expires_at,omitempty"`
+	// Generate a short random salt for VM naming
+	saltBytes := make([]byte, 4)
+	if _, err := rand.Read(saltBytes); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
 	}
-	payload, _ := json.Marshal(createPayload{
-		UserID:    userID.String(),
-		PodName:   req.Name,
-		VMs:       req.VMs,
-		ExpiresAt: expiresAt,
+	salt := hex.EncodeToString(saltBytes)
+
+	ctx := r.Context()
+
+	// Begin transaction: allocate pod_index, create pod, create pod_vms
+	tx, err := h.db.Pool().Begin(ctx)
+	if err != nil {
+		h.logger.Error("begin tx failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	podIndex, err := h.db.AllocatePodIndex(ctx, tx)
+	if err != nil {
+		h.logger.Error("allocate pod index failed", "error", err)
+		http.Error(w, "no available pod slots", http.StatusConflict)
+		return
+	}
+
+	// Insert pod record
+	var podID uuid.UUID
+	var vlanID int
+	var subnet string
+	var podCreatedAt, podUpdatedAt time.Time
+	err = tx.QueryRow(ctx, `
+		INSERT INTO pods (owner_id, name, salt, pod_index, status, expires_at)
+		VALUES ($1, $2, $3, $4, 'pending', $5)
+		RETURNING id, vlan_id, subnet, created_at, updated_at
+	`, userID, req.Name, salt, podIndex, expiresAt).Scan(
+		&podID, &vlanID, &subnet, &podCreatedAt, &podUpdatedAt,
+	)
+	if err != nil {
+		h.logger.Error("create pod failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	// Insert pod_vm records and build worker VM specs
+	type workerVMSpec struct {
+		PodVMID      uuid.UUID `json:"pod_vm_id"`
+		TemplateName string    `json:"template_name"`
+		VMName       string    `json:"vm_name"`
+		VCPUs        int32     `json:"vcpus"`
+		RAMMB        int64     `json:"ram_mb"`
+		DiskGB       int       `json:"disk_gb"`
+	}
+	var vmSpecs []workerVMSpec
+
+	for _, rv := range resolved {
+		var vmID uuid.UUID
+		var vmCreatedAt time.Time
+		err = tx.QueryRow(ctx, `
+			INSERT INTO pod_vms (pod_id, template_id, display_name, vcpus, ram_mb, disk_gb, status)
+			VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+			RETURNING id, created_at
+		`, podID, rv.template.ID, rv.req.DisplayName, rv.vcpus, rv.ramMB, rv.diskGB).Scan(&vmID, &vmCreatedAt)
+		if err != nil {
+			h.logger.Error("create pod_vm failed", "error", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+
+		vmName := salt + "-" + sanitizeName(rv.req.DisplayName)
+		vmSpecs = append(vmSpecs, workerVMSpec{
+			PodVMID:      vmID,
+			TemplateName: rv.template.VCenterTemplate,
+			VMName:       vmName,
+			VCPUs:        int32(rv.vcpus),
+			RAMMB:        int64(rv.ramMB),
+			DiskGB:       rv.diskGB,
+		})
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		h.logger.Error("commit tx failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	// Create job payload matching worker's CreatePodPayload struct
+	type jobPayload struct {
+		PodID  uuid.UUID      `json:"pod_id"`
+		VMs    []workerVMSpec `json:"vms"`
+		UserID string         `json:"user_id"`
+	}
+	payload, _ := json.Marshal(jobPayload{
+		PodID:  podID,
+		VMs:    vmSpecs,
+		UserID: userID.String(),
 	})
 
 	// Insert job
-	job, err := h.db.CreateJob(r.Context(), models.JobTypePodCreate, payload)
+	job, err := h.db.CreateJob(ctx, models.JobTypePodCreate, payload)
 	if err != nil {
 		h.logger.Error("create job failed", "error", err)
 		http.Error(w, "failed to queue provisioning job", http.StatusInternalServerError)
@@ -194,7 +295,7 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Audit
-	h.db.InsertAuditLog(r.Context(), models.AuditLog{
+	h.db.InsertAuditLog(ctx, models.AuditLog{
 		UserID:       &userID,
 		Action:       "pod.create.requested",
 		ResourceType: strPtr("job"),
@@ -205,6 +306,7 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 
 	respondJSON(w, http.StatusAccepted, map[string]any{
 		"job_id": job.ID,
+		"pod_id": podID,
 		"status": "pending",
 	})
 }

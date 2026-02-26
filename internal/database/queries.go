@@ -21,6 +21,11 @@ func NewQueries(pool *pgxpool.Pool) *Queries {
 	return &Queries{pool: pool}
 }
 
+// Pool exposes the underlying connection pool (e.g. for transactions in handlers).
+func (q *Queries) Pool() *pgxpool.Pool {
+	return q.pool
+}
+
 // --- Users ---
 
 // UpsertUser creates or updates a user from OIDC claims.

@@ -141,6 +141,9 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 	if err != nil {
 		return fmt.Errorf("get pod: %w", err)
 	}
+	if pod == nil {
+		return fmt.Errorf("pod %s not found in database", payload.PodID)
+	}
 
 	rb := p.newRollbackEngine(job.ID)
 	vlanTag := pod.VLANID
