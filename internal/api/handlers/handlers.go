@@ -29,10 +29,18 @@ func NewHandler(db *database.Queries, events *events.Client, logger *slog.Logger
 
 // --- Pod Handlers ---
 
-// ListPods returns the user's pods (admin: all pods).
+// ListPods returns the user's pods (admin: all pods with owners).
 func (h *Handler) ListPods(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.UserIDFromContext(r.Context())
-	pods, err := h.db.ListPodsByOwner(r.Context(), userID)
+	role := middleware.RoleFromContext(r.Context())
+
+	var pods []models.Pod
+	var err error
+	if role == models.RoleAdmin {
+		pods, err = h.db.ListAllPods(r.Context())
+	} else {
+		pods, err = h.db.ListPodsByOwner(r.Context(), userID)
+	}
 	if err != nil {
 		h.logger.Error("list pods failed", "error", err, "user_id", userID)
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -245,7 +253,211 @@ func (h *Handler) DeletePod(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// --- Template Handlers ---
+// DeleteVM queues a single VM destruction job.
+func (h *Handler) DeleteVM(w http.ResponseWriter, r *http.Request) {
+	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
+	if err != nil {
+		http.Error(w, "invalid pod id", http.StatusBadRequest)
+		return
+	}
+	vmID, err := uuid.Parse(chi.URLParam(r, "vmID"))
+	if err != nil {
+		http.Error(w, "invalid vm id", http.StatusBadRequest)
+		return
+	}
+
+	pod, err := h.db.GetPodByID(r.Context(), podID)
+	if err != nil || pod == nil {
+		http.Error(w, "pod not found", http.StatusNotFound)
+		return
+	}
+
+	userID := middleware.UserIDFromContext(r.Context())
+	role := middleware.RoleFromContext(r.Context())
+	if pod.OwnerID != userID && role != models.RoleAdmin {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	// Verify VM belongs to this pod
+	vm, err := h.db.GetPodVM(r.Context(), vmID)
+	if err != nil || vm.PodID != podID {
+		http.Error(w, "vm not found in this pod", http.StatusNotFound)
+		return
+	}
+	if vm.Status == models.VMStatusDeleted {
+		http.Error(w, "vm is already deleted", http.StatusConflict)
+		return
+	}
+
+	payload, _ := json.Marshal(map[string]string{
+		"pod_id":    podID.String(),
+		"pod_vm_id": vmID.String(),
+	})
+	job, err := h.db.CreateJob(r.Context(), models.JobTypeVMDestroy, payload)
+	if err != nil {
+		h.logger.Error("create vm destroy job failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	if err := h.events.PublishJobCreated(job.ID, job.Type); err != nil {
+		h.logger.Warn("failed to publish job created event", "error", err)
+	}
+
+	h.db.InsertAuditLog(r.Context(), models.AuditLog{
+		UserID:       &userID,
+		Action:       "vm.delete.requested",
+		ResourceType: strPtr("vm"),
+		ResourceID:   &vmID,
+		Details:      payload,
+		IPAddress:    strPtr(r.RemoteAddr),
+	})
+
+	respondJSON(w, http.StatusAccepted, map[string]any{
+		"job_id": job.ID,
+		"status": "pending",
+	})
+}
+
+// AddVM queues a job to add a VM to an existing pod.
+func (h *Handler) AddVM(w http.ResponseWriter, r *http.Request) {
+	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
+	if err != nil {
+		http.Error(w, "invalid pod id", http.StatusBadRequest)
+		return
+	}
+
+	var req models.AddVMRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.DisplayName == "" {
+		http.Error(w, "display_name is required", http.StatusBadRequest)
+		return
+	}
+
+	pod, err := h.db.GetPodByID(r.Context(), podID)
+	if err != nil || pod == nil {
+		http.Error(w, "pod not found", http.StatusNotFound)
+		return
+	}
+
+	userID := middleware.UserIDFromContext(r.Context())
+	role := middleware.RoleFromContext(r.Context())
+	if pod.OwnerID != userID && role != models.RoleAdmin {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	if pod.Status != models.PodStatusActive {
+		http.Error(w, "pod must be active to add VMs", http.StatusConflict)
+		return
+	}
+
+	// Resolve template
+	templates, err := h.db.ListTemplatesForUser(r.Context(), userID, role)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	var found *models.Template
+	for _, t := range templates {
+		if t.ID == req.TemplateID {
+			found = &t
+			break
+		}
+	}
+	if found == nil {
+		http.Error(w, "template not found or not accessible", http.StatusBadRequest)
+		return
+	}
+
+	// Check quotas
+	user, err := h.db.GetUserByID(r.Context(), userID)
+	if err != nil || user == nil {
+		http.Error(w, "user not found", http.StatusInternalServerError)
+		return
+	}
+	usage, err := h.db.GetResourceUsage(r.Context(), userID)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	vcpus := found.DefaultVCPUs
+	if req.VCPUs != nil {
+		vcpus = *req.VCPUs
+	}
+	ram := found.DefaultRAMMB
+	if req.RAMMB != nil {
+		ram = *req.RAMMB
+	}
+	diskGB := found.DefaultDiskGB
+	if req.DiskGB != nil {
+		diskGB = *req.DiskGB
+	}
+
+	if usage.UsedVCPUs+vcpus > user.MaxVCPUs {
+		http.Error(w, "vCPU quota exceeded", http.StatusConflict)
+		return
+	}
+	if usage.UsedRAMMB+ram > user.MaxRAMMB {
+		http.Error(w, "RAM quota exceeded", http.StatusConflict)
+		return
+	}
+
+	// Create pod_vm record
+	vm := &models.PodVM{
+		PodID:       podID,
+		TemplateID:  req.TemplateID,
+		DisplayName: req.DisplayName,
+		VCPUs:       vcpus,
+		RAMMB:       ram,
+		DiskGB:      diskGB,
+		Status:      models.VMStatusPending,
+	}
+	if err := h.db.CreatePodVM(r.Context(), vm); err != nil {
+		h.logger.Error("create pod vm failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	// Queue vm_add job
+	payload, _ := json.Marshal(map[string]string{
+		"pod_id":        podID.String(),
+		"pod_vm_id":     vm.ID.String(),
+		"template_name": found.VCenterTemplate,
+		"vm_name":       pod.Salt + "-" + sanitizeName(req.DisplayName),
+		"display_name":  req.DisplayName,
+	})
+	job, err := h.db.CreateJob(r.Context(), models.JobTypeVMAdd, payload)
+	if err != nil {
+		h.logger.Error("create vm add job failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	if err := h.events.PublishJobCreated(job.ID, job.Type); err != nil {
+		h.logger.Warn("failed to publish job created event", "error", err)
+	}
+
+	h.db.InsertAuditLog(r.Context(), models.AuditLog{
+		UserID:       &userID,
+		Action:       "vm.add.requested",
+		ResourceType: strPtr("vm"),
+		ResourceID:   &vm.ID,
+		Details:      payload,
+		IPAddress:    strPtr(r.RemoteAddr),
+	})
+
+	respondJSON(w, http.StatusAccepted, map[string]any{
+		"job_id": job.ID,
+		"vm_id":  vm.ID,
+		"status": "pending",
+	})
+}
 
 // ListTemplates returns templates accessible to the current user.
 func (h *Handler) ListTemplates(w http.ResponseWriter, r *http.Request) {
@@ -422,4 +634,25 @@ func respondJSON(w http.ResponseWriter, status int, data any) {
 
 func strPtr(s string) *string {
 	return &s
+}
+
+// sanitizeName converts a display name to a DNS-safe slug.
+func sanitizeName(name string) string {
+	result := make([]byte, 0, len(name))
+	for _, c := range []byte(name) {
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
+			result = append(result, c)
+		} else if c >= 'A' && c <= 'Z' {
+			result = append(result, c+32)
+		} else if c == ' ' || c == '_' || c == '.' {
+			if len(result) > 0 && result[len(result)-1] != '-' {
+				result = append(result, '-')
+			}
+		}
+	}
+	// Trim trailing dash
+	for len(result) > 0 && result[len(result)-1] == '-' {
+		result = result[:len(result)-1]
+	}
+	return string(result)
 }

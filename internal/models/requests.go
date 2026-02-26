@@ -10,10 +10,20 @@ type CreatePodRequest struct {
 
 // VMRequest describes a VM to create within a pod.
 type VMRequest struct {
-	TemplateID uuid.UUID `json:"template_id" validate:"required"`
-	VCPUs      *int      `json:"vcpus,omitempty" validate:"omitempty,min=1,max=16"`
-	RAMMB      *int      `json:"ram_mb,omitempty" validate:"omitempty,min=512,max=65536"`
-	DiskGB     *int      `json:"disk_gb,omitempty" validate:"omitempty,min=10,max=500"`
+	TemplateID  uuid.UUID `json:"template_id" validate:"required"`
+	DisplayName string    `json:"display_name" validate:"required,min=1,max=64"`
+	VCPUs       *int      `json:"vcpus,omitempty" validate:"omitempty,min=1,max=16"`
+	RAMMB       *int      `json:"ram_mb,omitempty" validate:"omitempty,min=512,max=65536"`
+	DiskGB      *int      `json:"disk_gb,omitempty" validate:"omitempty,min=10,max=500"`
+}
+
+// AddVMRequest is the API request to add a VM to an existing pod.
+type AddVMRequest struct {
+	TemplateID  uuid.UUID `json:"template_id" validate:"required"`
+	DisplayName string    `json:"display_name" validate:"required,min=1,max=64"`
+	VCPUs       *int      `json:"vcpus,omitempty" validate:"omitempty,min=1,max=16"`
+	RAMMB       *int      `json:"ram_mb,omitempty" validate:"omitempty,min=512,max=65536"`
+	DiskGB      *int      `json:"disk_gb,omitempty" validate:"omitempty,min=10,max=500"`
 }
 
 // CreateTemplateRequest is the admin API request to create a template.

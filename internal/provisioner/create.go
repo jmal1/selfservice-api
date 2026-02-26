@@ -67,6 +67,10 @@ func (p *Provisioner) ProcessJob(ctx context.Context, job *models.Job) error {
 		err = p.PowerVM(ctx, job, "stop")
 	case models.JobTypeVMRestart:
 		err = p.PowerVM(ctx, job, "restart")
+	case models.JobTypeVMDestroy:
+		err = p.DestroyVM(ctx, job)
+	case models.JobTypeVMAdd:
+		err = p.AddVM(ctx, job)
 	default:
 		err = fmt.Errorf("unknown job type: %s", job.Type)
 	}

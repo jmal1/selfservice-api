@@ -270,22 +270,22 @@ func (q *Queries) AllocatePodIndex(ctx context.Context, tx pgx.Tx) (int, error) 
 // CreatePod inserts a pod record with an allocated index.
 func (q *Queries) CreatePod(ctx context.Context, pod *models.Pod) error {
 	return q.pool.QueryRow(ctx, `
-		INSERT INTO pods (owner_id, name, pod_index, status, expires_at)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO pods (owner_id, name, salt, pod_index, status, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		RETURNING id, vlan_id, subnet, created_at, updated_at
-	`, pod.OwnerID, pod.Name, pod.PodIndex, pod.Status, pod.ExpiresAt,
+	`, pod.OwnerID, pod.Name, pod.Salt, pod.PodIndex, pod.Status, pod.ExpiresAt,
 	).Scan(&pod.ID, &pod.VLANID, &pod.Subnet, &pod.CreatedAt, &pod.UpdatedAt)
 }
 
-// GetPodByID retrieves a pod with its VMs.
+// GetPodByID retrieves a pod with its VMs and owner.
 func (q *Queries) GetPodByID(ctx context.Context, id uuid.UUID) (*models.Pod, error) {
 	var p models.Pod
 	err := q.pool.QueryRow(ctx, `
-		SELECT id, owner_id, name, pod_index, vlan_id, subnet, status,
+		SELECT id, owner_id, name, salt, pod_index, vlan_id, subnet, status,
 		       error_message, expires_at, created_at, updated_at
 		FROM pods WHERE id = $1
 	`, id).Scan(
-		&p.ID, &p.OwnerID, &p.Name, &p.PodIndex, &p.VLANID, &p.Subnet, &p.Status,
+		&p.ID, &p.OwnerID, &p.Name, &p.Salt, &p.PodIndex, &p.VLANID, &p.Subnet, &p.Status,
 		&p.ErrorMessage, &p.ExpiresAt, &p.CreatedAt, &p.UpdatedAt,
 	)
 	if err == pgx.ErrNoRows {
@@ -295,11 +295,17 @@ func (q *Queries) GetPodByID(ctx context.Context, id uuid.UUID) (*models.Pod, er
 		return nil, err
 	}
 
+	// Load owner
+	owner, err := q.GetUserByID(ctx, p.OwnerID)
+	if err == nil && owner != nil {
+		p.Owner = owner
+	}
+
 	// Load VMs
 	rows, err := q.pool.Query(ctx, `
-		SELECT id, pod_id, template_id, vcenter_vm_name, vcenter_vm_id,
+		SELECT id, pod_id, template_id, display_name, vcenter_vm_name, vcenter_vm_id,
 		       vcpus, ram_mb, disk_gb, ip_address, status, created_at
-		FROM pod_vms WHERE pod_id = $1 ORDER BY created_at
+		FROM pod_vms WHERE pod_id = $1 AND status != 'deleted' ORDER BY created_at
 	`, id)
 	if err != nil {
 		return nil, err
@@ -309,7 +315,7 @@ func (q *Queries) GetPodByID(ctx context.Context, id uuid.UUID) (*models.Pod, er
 	for rows.Next() {
 		var vm models.PodVM
 		if err := rows.Scan(
-			&vm.ID, &vm.PodID, &vm.TemplateID, &vm.VCenterVMName, &vm.VCenterVMID,
+			&vm.ID, &vm.PodID, &vm.TemplateID, &vm.DisplayName, &vm.VCenterVMName, &vm.VCenterVMID,
 			&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.IPAddress, &vm.Status, &vm.CreatedAt,
 		); err != nil {
 			return nil, err
@@ -320,13 +326,16 @@ func (q *Queries) GetPodByID(ctx context.Context, id uuid.UUID) (*models.Pod, er
 	return &p, nil
 }
 
-// ListPodsByOwner returns all non-destroyed pods for a user.
+// ListPodsByOwner returns all non-destroyed pods for a user (with VMs and owner).
 func (q *Queries) ListPodsByOwner(ctx context.Context, ownerID uuid.UUID) ([]models.Pod, error) {
 	rows, err := q.pool.Query(ctx, `
-		SELECT id, owner_id, name, pod_index, vlan_id, subnet, status,
-		       error_message, expires_at, created_at, updated_at
-		FROM pods WHERE owner_id = $1 AND status != 'destroyed'
-		ORDER BY created_at DESC
+		SELECT p.id, p.owner_id, p.name, p.salt, p.pod_index, p.vlan_id, p.subnet, p.status,
+		       p.error_message, p.expires_at, p.created_at, p.updated_at,
+		       u.id, u.username, u.email, u.display_name, u.role
+		FROM pods p
+		JOIN users u ON u.id = p.owner_id
+		WHERE p.owner_id = $1 AND p.status != 'destroyed'
+		ORDER BY p.created_at DESC
 	`, ownerID)
 	if err != nil {
 		return nil, err
@@ -336,15 +345,96 @@ func (q *Queries) ListPodsByOwner(ctx context.Context, ownerID uuid.UUID) ([]mod
 	var pods []models.Pod
 	for rows.Next() {
 		var p models.Pod
+		var owner models.User
 		if err := rows.Scan(
-			&p.ID, &p.OwnerID, &p.Name, &p.PodIndex, &p.VLANID, &p.Subnet, &p.Status,
+			&p.ID, &p.OwnerID, &p.Name, &p.Salt, &p.PodIndex, &p.VLANID, &p.Subnet, &p.Status,
 			&p.ErrorMessage, &p.ExpiresAt, &p.CreatedAt, &p.UpdatedAt,
+			&owner.ID, &owner.Username, &owner.Email, &owner.DisplayName, &owner.Role,
 		); err != nil {
 			return nil, err
 		}
+		p.Owner = &owner
 		pods = append(pods, p)
 	}
+
+	// Load VMs for each pod
+	for i := range pods {
+		vms, err := q.listPodVMsActive(ctx, pods[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		pods[i].VMs = vms
+	}
+
 	return pods, nil
+}
+
+// ListAllPods returns all non-destroyed pods (admin, with owner info).
+func (q *Queries) ListAllPods(ctx context.Context) ([]models.Pod, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT p.id, p.owner_id, p.name, p.salt, p.pod_index, p.vlan_id, p.subnet, p.status,
+		       p.error_message, p.expires_at, p.created_at, p.updated_at,
+		       u.id, u.username, u.email, u.display_name, u.role
+		FROM pods p
+		JOIN users u ON u.id = p.owner_id
+		WHERE p.status != 'destroyed'
+		ORDER BY p.created_at DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var pods []models.Pod
+	for rows.Next() {
+		var p models.Pod
+		var owner models.User
+		if err := rows.Scan(
+			&p.ID, &p.OwnerID, &p.Name, &p.Salt, &p.PodIndex, &p.VLANID, &p.Subnet, &p.Status,
+			&p.ErrorMessage, &p.ExpiresAt, &p.CreatedAt, &p.UpdatedAt,
+			&owner.ID, &owner.Username, &owner.Email, &owner.DisplayName, &owner.Role,
+		); err != nil {
+			return nil, err
+		}
+		p.Owner = &owner
+		pods = append(pods, p)
+	}
+
+	for i := range pods {
+		vms, err := q.listPodVMsActive(ctx, pods[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		pods[i].VMs = vms
+	}
+
+	return pods, nil
+}
+
+// listPodVMsActive returns non-deleted VMs for a pod.
+func (q *Queries) listPodVMsActive(ctx context.Context, podID uuid.UUID) ([]models.PodVM, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT id, pod_id, template_id, display_name, vcenter_vm_name, vcenter_vm_id,
+		       vcpus, ram_mb, disk_gb, ip_address, status, created_at
+		FROM pod_vms WHERE pod_id = $1 AND status != 'deleted' ORDER BY created_at
+	`, podID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var vms []models.PodVM
+	for rows.Next() {
+		var vm models.PodVM
+		if err := rows.Scan(
+			&vm.ID, &vm.PodID, &vm.TemplateID, &vm.DisplayName, &vm.VCenterVMName, &vm.VCenterVMID,
+			&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.IPAddress, &vm.Status, &vm.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		vms = append(vms, vm)
+	}
+	return vms, nil
 }
 
 // --- Jobs ---
@@ -448,7 +538,7 @@ func (q *Queries) UpdatePodStatus(ctx context.Context, id uuid.UUID, status, err
 // ListPodVMs returns all VMs belonging to a pod.
 func (q *Queries) ListPodVMs(ctx context.Context, podID uuid.UUID) ([]models.PodVM, error) {
 	rows, err := q.pool.Query(ctx, `
-		SELECT id, pod_id, template_id, vcenter_vm_name, vcenter_vm_id, vcpus, ram_mb, disk_gb, ip_address, status, created_at
+		SELECT id, pod_id, template_id, display_name, vcenter_vm_name, vcenter_vm_id, vcpus, ram_mb, disk_gb, ip_address, status, created_at
 		FROM pod_vms WHERE pod_id = $1
 	`, podID)
 	if err != nil {
@@ -459,7 +549,7 @@ func (q *Queries) ListPodVMs(ctx context.Context, podID uuid.UUID) ([]models.Pod
 	var vms []models.PodVM
 	for rows.Next() {
 		var vm models.PodVM
-		err := rows.Scan(&vm.ID, &vm.PodID, &vm.TemplateID, &vm.VCenterVMName, &vm.VCenterVMID,
+		err := rows.Scan(&vm.ID, &vm.PodID, &vm.TemplateID, &vm.DisplayName, &vm.VCenterVMName, &vm.VCenterVMID,
 			&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.IPAddress, &vm.Status, &vm.CreatedAt)
 		if err != nil {
 			return nil, err
@@ -473,9 +563,9 @@ func (q *Queries) ListPodVMs(ctx context.Context, podID uuid.UUID) ([]models.Pod
 func (q *Queries) GetPodVM(ctx context.Context, id uuid.UUID) (*models.PodVM, error) {
 	var vm models.PodVM
 	err := q.pool.QueryRow(ctx, `
-		SELECT id, pod_id, template_id, vcenter_vm_name, vcenter_vm_id, vcpus, ram_mb, disk_gb, ip_address, status, created_at
+		SELECT id, pod_id, template_id, display_name, vcenter_vm_name, vcenter_vm_id, vcpus, ram_mb, disk_gb, ip_address, status, created_at
 		FROM pod_vms WHERE id = $1
-	`, id).Scan(&vm.ID, &vm.PodID, &vm.TemplateID, &vm.VCenterVMName, &vm.VCenterVMID,
+	`, id).Scan(&vm.ID, &vm.PodID, &vm.TemplateID, &vm.DisplayName, &vm.VCenterVMName, &vm.VCenterVMID,
 		&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.IPAddress, &vm.Status, &vm.CreatedAt)
 	if err != nil {
 		return nil, err
@@ -501,4 +591,23 @@ func (q *Queries) UpdatePodVMStatus(ctx context.Context, id uuid.UUID, status st
 func (q *Queries) UpdatePodVMIP(ctx context.Context, id uuid.UUID, ip string) error {
 	_, err := q.pool.Exec(ctx, `UPDATE pod_vms SET ip_address = $1 WHERE id = $2`, ip, id)
 	return err
+}
+
+// CreatePodVM inserts a new VM record into an existing pod.
+func (q *Queries) CreatePodVM(ctx context.Context, vm *models.PodVM) error {
+	return q.pool.QueryRow(ctx, `
+		INSERT INTO pod_vms (pod_id, template_id, display_name, vcpus, ram_mb, disk_gb, status)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		RETURNING id, created_at
+	`, vm.PodID, vm.TemplateID, vm.DisplayName, vm.VCPUs, vm.RAMMB, vm.DiskGB, vm.Status,
+	).Scan(&vm.ID, &vm.CreatedAt)
+}
+
+// CountActiveVMsInPod returns the number of non-deleted VMs in a pod.
+func (q *Queries) CountActiveVMsInPod(ctx context.Context, podID uuid.UUID) (int, error) {
+	var count int
+	err := q.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM pod_vms WHERE pod_id = $1 AND status != 'deleted'
+	`, podID).Scan(&count)
+	return count, err
 }

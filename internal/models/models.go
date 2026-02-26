@@ -52,6 +52,7 @@ type Pod struct {
 	ID           uuid.UUID  `json:"id" db:"id"`
 	OwnerID      uuid.UUID  `json:"owner_id" db:"owner_id"`
 	Name         string     `json:"name" db:"name"`
+	Salt         string     `json:"salt" db:"salt"`
 	PodIndex     int        `json:"pod_index" db:"pod_index"`
 	VLANID       int        `json:"vlan_id" db:"vlan_id"`
 	Subnet       string     `json:"subnet" db:"subnet"`
@@ -61,6 +62,7 @@ type Pod struct {
 	CreatedAt    time.Time  `json:"created_at" db:"created_at"`
 	UpdatedAt    time.Time  `json:"updated_at" db:"updated_at"`
 	VMs          []PodVM    `json:"vms,omitempty"`
+	Owner        *User      `json:"owner,omitempty"`
 }
 
 // PodVM represents a virtual machine within a pod.
@@ -68,6 +70,7 @@ type PodVM struct {
 	ID            uuid.UUID `json:"id" db:"id"`
 	PodID         uuid.UUID `json:"pod_id" db:"pod_id"`
 	TemplateID    uuid.UUID `json:"template_id" db:"template_id"`
+	DisplayName   string    `json:"display_name" db:"display_name"`
 	VCenterVMName *string   `json:"vcenter_vm_name,omitempty" db:"vcenter_vm_name"`
 	VCenterVMID   *string   `json:"vcenter_vm_id,omitempty" db:"vcenter_vm_id"`
 	VCPUs         int       `json:"vcpus" db:"vcpus"`
@@ -135,6 +138,8 @@ const (
 	JobTypeVMStart    = "vm_start"
 	JobTypeVMStop     = "vm_stop"
 	JobTypeVMRestart  = "vm_restart"
+	JobTypeVMDestroy  = "vm_destroy"
+	JobTypeVMAdd      = "vm_add"
 )
 
 // Job status constants.

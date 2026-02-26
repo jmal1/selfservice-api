@@ -56,6 +56,10 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider) *chi.Mux {
 			r.Post("/", h.CreatePod)
 			r.Get("/{podID}", h.GetPod)
 			r.Delete("/{podID}", h.DeletePod)
+
+			// VM sub-routes
+			r.Post("/{podID}/vms", h.AddVM)
+			r.Delete("/{podID}/vms/{vmID}", h.DeleteVM)
 		})
 
 		// Templates
