@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -402,6 +403,7 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 	}
 
 	// --- Step 6: Clone VMs ---
+	var clonedVMs []int // indices of successfully cloned VMs
 	for i, vmSpec := range payload.VMs {
 		stepName := fmt.Sprintf("vm_clone_%d", i)
 		p.publishProgress(job.ID, stepName, fmt.Sprintf("Cloning VM %s from %s", vmSpec.VMName, vmSpec.TemplateName))
@@ -433,8 +435,9 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 			Password:     password,
 		})
 		if err != nil {
-			rbErrs := rb.Rollback(ctx)
-			return fmt.Errorf("clone VM %s (rollback errors: %v): %w", vmSpec.VMName, rbErrs, err)
+			p.logger.Error("failed to clone VM", "vm", vmSpec.VMName, "error", err)
+			_ = p.db.UpdatePodVMStatus(ctx, vmSpec.PodVMID, "failed")
+			continue // Skip this VM, try the rest
 		}
 
 		// Update pod_vms record with vCenter details
@@ -456,42 +459,65 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		if err := rb.Record(ctx, stepName, map[string]string{"moref": moref}); err != nil {
 			return err
 		}
+		clonedVMs = append(clonedVMs, i)
 	}
 
-	// --- Step 7: Power on VMs and wait for IPs ---
-	for i, vmSpec := range payload.VMs {
-		stepName := fmt.Sprintf("vm_poweron_%d", i)
-		p.publishProgress(job.ID, stepName, fmt.Sprintf("Powering on %s", vmSpec.VMName))
+	// If no VMs were cloned at all, rollback infrastructure
+	if len(clonedVMs) == 0 {
+		rbErrs := rb.Rollback(ctx)
+		return fmt.Errorf("all VM clones failed (rollback errors: %v)", rbErrs)
+	}
 
-		// Get moref from DB
+	// --- Step 7: Power on VMs in parallel and wait for IPs concurrently ---
+	p.publishProgress(job.ID, "vm_poweron", "Powering on VMs")
+
+	// Power on all cloned VMs
+	type vmPowerInfo struct {
+		index   int
+		vmSpec  VMSpec
+		moref   string
+	}
+	var toPowerOn []vmPowerInfo
+	for _, i := range clonedVMs {
+		vmSpec := payload.VMs[i]
 		podVM, err := p.db.GetPodVM(ctx, vmSpec.PodVMID)
 		if err != nil {
-			rbErrs := rb.Rollback(ctx)
-			return fmt.Errorf("get pod VM %s (rollback errors: %v): %w", vmSpec.PodVMID, rbErrs, err)
+			p.logger.Error("failed to get pod VM for power-on", "vm", vmSpec.VMName, "error", err)
+			_ = p.db.UpdatePodVMStatus(ctx, vmSpec.PodVMID, "failed")
+			continue
 		}
-
 		if podVM.VCenterVMID == nil || *podVM.VCenterVMID == "" {
-			rbErrs := rb.Rollback(ctx)
-			return fmt.Errorf("pod VM %s has no moref (rollback errors: %v)", vmSpec.PodVMID, rbErrs)
-		}
-		vmMoref := *podVM.VCenterVMID
-
-		if err := p.vc.PowerOnVM(ctx, vmMoref); err != nil {
-			rbErrs := rb.Rollback(ctx)
-			return fmt.Errorf("power on %s (rollback errors: %v): %w", vmSpec.VMName, rbErrs, err)
+			p.logger.Error("pod VM has no moref", "vm", vmSpec.VMName)
+			_ = p.db.UpdatePodVMStatus(ctx, vmSpec.PodVMID, "failed")
+			continue
 		}
 
-		// Wait for IP (5 minute timeout per VM)
-		ip, err := p.vc.WaitForIP(ctx, vmMoref, 5*time.Minute)
-		if err != nil {
-			p.logger.Warn("timeout waiting for VM IP", "vm", vmSpec.VMName, "error", err)
-			// Don't rollback for IP timeout — VM is still usable
-		} else {
-			_ = p.db.UpdatePodVMIP(ctx, vmSpec.PodVMID, ip)
+		if err := p.vc.PowerOnVM(ctx, *podVM.VCenterVMID); err != nil {
+			p.logger.Error("failed to power on VM", "vm", vmSpec.VMName, "error", err)
+			_ = p.db.UpdatePodVMStatus(ctx, vmSpec.PodVMID, "failed")
+			continue
 		}
 
 		_ = p.db.UpdatePodVMStatus(ctx, vmSpec.PodVMID, "running")
+		toPowerOn = append(toPowerOn, vmPowerInfo{index: i, vmSpec: vmSpec, moref: *podVM.VCenterVMID})
 	}
+
+	// Wait for IPs concurrently (don't block provisioning completion)
+	var wg sync.WaitGroup
+	for _, info := range toPowerOn {
+		wg.Add(1)
+		go func(vmInfo vmPowerInfo) {
+			defer wg.Done()
+			ip, err := p.vc.WaitForIP(ctx, vmInfo.moref, 5*time.Minute)
+			if err != nil {
+				p.logger.Warn("timeout waiting for VM IP", "vm", vmInfo.vmSpec.VMName, "error", err)
+				return
+			}
+			_ = p.db.UpdatePodVMIP(ctx, vmInfo.vmSpec.PodVMID, ip)
+			p.logger.Info("VM got IP", "vm", vmInfo.vmSpec.VMName, "ip", ip)
+		}(info)
+	}
+	wg.Wait()
 
 	// --- Step 8: Mark pod active ---
 	p.publishProgress(job.ID, "pod_active", "Pod is active")
