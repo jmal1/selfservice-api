@@ -300,8 +300,12 @@ func (q *Queries) ListAllJobs(ctx context.Context) ([]models.Job, error) {
 // ListAuditLog returns recent audit log entries (admin).
 func (q *Queries) ListAuditLog(ctx context.Context) ([]models.AuditLog, error) {
 	rows, err := q.pool.Query(ctx, `
-		SELECT id, user_id, action, resource_type, resource_id, details, CAST(ip_address AS TEXT), created_at
-		FROM audit_log ORDER BY created_at DESC LIMIT 200
+		SELECT a.id, a.user_id, u.display_name as user_display_name, u.email as user_email,
+		       a.action, a.resource_type, a.resource_id, a.details,
+		       CAST(a.ip_address AS TEXT), a.created_at
+		FROM audit_log a
+		LEFT JOIN users u ON a.user_id = u.id
+		ORDER BY a.created_at DESC LIMIT 200
 	`)
 	if err != nil {
 		return nil, err
@@ -312,7 +316,8 @@ func (q *Queries) ListAuditLog(ctx context.Context) ([]models.AuditLog, error) {
 	for rows.Next() {
 		var e models.AuditLog
 		if err := rows.Scan(
-			&e.ID, &e.UserID, &e.Action, &e.ResourceType, &e.ResourceID, &e.Details, &e.IPAddress, &e.CreatedAt,
+			&e.ID, &e.UserID, &e.UserDisplayName, &e.UserEmail,
+			&e.Action, &e.ResourceType, &e.ResourceID, &e.Details, &e.IPAddress, &e.CreatedAt,
 		); err != nil {
 			return nil, err
 		}

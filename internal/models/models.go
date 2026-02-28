@@ -99,14 +99,16 @@ type Job struct {
 
 // AuditLog records user actions for compliance and debugging.
 type AuditLog struct {
-	ID           int64      `json:"id" db:"id"`
-	UserID       *uuid.UUID `json:"user_id,omitempty" db:"user_id"`
-	Action       string     `json:"action" db:"action"`
-	ResourceType *string    `json:"resource_type,omitempty" db:"resource_type"`
-	ResourceID   *uuid.UUID `json:"resource_id,omitempty" db:"resource_id"`
-	Details      []byte     `json:"details,omitempty" db:"details"`
-	IPAddress    *string    `json:"ip_address,omitempty" db:"ip_address"`
-	CreatedAt    time.Time  `json:"created_at" db:"created_at"`
+	ID              int64      `json:"id" db:"id"`
+	UserID          *uuid.UUID `json:"user_id,omitempty" db:"user_id"`
+	UserDisplayName *string    `json:"user_display_name,omitempty" db:"user_display_name"`
+	UserEmail       *string    `json:"user_email,omitempty" db:"user_email"`
+	Action          string     `json:"action" db:"action"`
+	ResourceType    *string    `json:"resource_type,omitempty" db:"resource_type"`
+	ResourceID      *uuid.UUID `json:"resource_id,omitempty" db:"resource_id"`
+	Details         []byte     `json:"details,omitempty" db:"details"`
+	IPAddress       *string    `json:"ip_address,omitempty" db:"ip_address"`
+	CreatedAt       time.Time  `json:"created_at" db:"created_at"`
 }
 
 // VLANPoolEntry represents a VLAN in the allocation pool.
