@@ -84,6 +84,8 @@ type PodVM struct {
 	GeneratedUsername string    `json:"generated_username" db:"generated_username"`
 	GeneratedPassword string    `json:"generated_password" db:"generated_password"`
 	CreatedAt         time.Time `json:"created_at" db:"created_at"`
+	TemplateName      string    `json:"template_name,omitempty"`
+	OSType            string    `json:"os_type,omitempty"`
 }
 
 // Job represents a durable task in the job queue.

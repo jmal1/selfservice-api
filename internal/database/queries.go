@@ -443,7 +443,8 @@ func (q *Queries) GetPodByID(ctx context.Context, id uuid.UUID) (*models.Pod, er
 		SELECT pv.id, pv.pod_id, pv.template_id, pv.display_name, pv.vcenter_vm_name, pv.vcenter_vm_id,
 		       pv.vcpus, pv.ram_mb, pv.disk_gb, pv.ip_address, pv.status,
 		       COALESCE(t.default_username, ''), COALESCE(t.default_password, ''),
-		       pv.generated_username, pv.generated_password, pv.created_at
+		       pv.generated_username, pv.generated_password, pv.created_at,
+		       COALESCE(t.name, ''), COALESCE(t.os_type, '')
 		FROM pod_vms pv
 		LEFT JOIN templates t ON pv.template_id = t.id
 		WHERE pv.pod_id = $1 AND pv.status != 'deleted' ORDER BY pv.created_at
@@ -460,6 +461,7 @@ func (q *Queries) GetPodByID(ctx context.Context, id uuid.UUID) (*models.Pod, er
 			&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.IPAddress, &vm.Status,
 			&vm.DefaultUsername, &vm.DefaultPassword,
 			&vm.GeneratedUsername, &vm.GeneratedPassword, &vm.CreatedAt,
+			&vm.TemplateName, &vm.OSType,
 		); err != nil {
 			return nil, err
 		}
@@ -560,7 +562,8 @@ func (q *Queries) listPodVMsActive(ctx context.Context, podID uuid.UUID) ([]mode
 		SELECT pv.id, pv.pod_id, pv.template_id, pv.display_name, pv.vcenter_vm_name, pv.vcenter_vm_id,
 		       pv.vcpus, pv.ram_mb, pv.disk_gb, pv.ip_address, pv.status,
 		       COALESCE(t.default_username, ''), COALESCE(t.default_password, ''),
-		       pv.generated_username, pv.generated_password, pv.created_at
+		       pv.generated_username, pv.generated_password, pv.created_at,
+		       COALESCE(t.name, ''), COALESCE(t.os_type, '')
 		FROM pod_vms pv
 		LEFT JOIN templates t ON pv.template_id = t.id
 		WHERE pv.pod_id = $1 AND pv.status != 'deleted' ORDER BY pv.created_at
@@ -578,6 +581,7 @@ func (q *Queries) listPodVMsActive(ctx context.Context, podID uuid.UUID) ([]mode
 			&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.IPAddress, &vm.Status,
 			&vm.DefaultUsername, &vm.DefaultPassword,
 			&vm.GeneratedUsername, &vm.GeneratedPassword, &vm.CreatedAt,
+			&vm.TemplateName, &vm.OSType,
 		); err != nil {
 			return nil, err
 		}
@@ -794,7 +798,8 @@ func (q *Queries) ListPodVMs(ctx context.Context, podID uuid.UUID) ([]models.Pod
 		SELECT pv.id, pv.pod_id, pv.template_id, pv.display_name, pv.vcenter_vm_name, pv.vcenter_vm_id,
 		       pv.vcpus, pv.ram_mb, pv.disk_gb, pv.ip_address, pv.status,
 		       COALESCE(t.default_username, ''), COALESCE(t.default_password, ''),
-		       pv.generated_username, pv.generated_password, pv.created_at
+		       pv.generated_username, pv.generated_password, pv.created_at,
+		       COALESCE(t.name, ''), COALESCE(t.os_type, '')
 		FROM pod_vms pv
 		LEFT JOIN templates t ON pv.template_id = t.id
 		WHERE pv.pod_id = $1
@@ -810,7 +815,8 @@ func (q *Queries) ListPodVMs(ctx context.Context, podID uuid.UUID) ([]models.Pod
 		err := rows.Scan(&vm.ID, &vm.PodID, &vm.TemplateID, &vm.DisplayName, &vm.VCenterVMName, &vm.VCenterVMID,
 			&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.IPAddress, &vm.Status,
 			&vm.DefaultUsername, &vm.DefaultPassword,
-			&vm.GeneratedUsername, &vm.GeneratedPassword, &vm.CreatedAt)
+			&vm.GeneratedUsername, &vm.GeneratedPassword, &vm.CreatedAt,
+			&vm.TemplateName, &vm.OSType)
 		if err != nil {
 			return nil, err
 		}
@@ -826,14 +832,16 @@ func (q *Queries) GetPodVM(ctx context.Context, id uuid.UUID) (*models.PodVM, er
 		SELECT pv.id, pv.pod_id, pv.template_id, pv.display_name, pv.vcenter_vm_name, pv.vcenter_vm_id,
 		       pv.vcpus, pv.ram_mb, pv.disk_gb, pv.ip_address, pv.status,
 		       COALESCE(t.default_username, ''), COALESCE(t.default_password, ''),
-		       pv.generated_username, pv.generated_password, pv.created_at
+		       pv.generated_username, pv.generated_password, pv.created_at,
+		       COALESCE(t.name, ''), COALESCE(t.os_type, '')
 		FROM pod_vms pv
 		LEFT JOIN templates t ON pv.template_id = t.id
 		WHERE pv.id = $1
 	`, id).Scan(&vm.ID, &vm.PodID, &vm.TemplateID, &vm.DisplayName, &vm.VCenterVMName, &vm.VCenterVMID,
 		&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.IPAddress, &vm.Status,
 		&vm.DefaultUsername, &vm.DefaultPassword,
-		&vm.GeneratedUsername, &vm.GeneratedPassword, &vm.CreatedAt)
+		&vm.GeneratedUsername, &vm.GeneratedPassword, &vm.CreatedAt,
+		&vm.TemplateName, &vm.OSType)
 	if err != nil {
 		return nil, err
 	}
