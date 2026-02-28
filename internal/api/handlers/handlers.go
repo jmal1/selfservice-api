@@ -793,6 +793,35 @@ func (h *Handler) AdminDeleteTemplate(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// AdminListTemplateDependents returns VMs that depend on a template's base disk.
+func (h *Handler) AdminListTemplateDependents(w http.ResponseWriter, r *http.Request) {
+	templateID, err := uuid.Parse(chi.URLParam(r, "templateID"))
+	if err != nil {
+		http.Error(w, "invalid template id", http.StatusBadRequest)
+		return
+	}
+
+	templateName, vms, err := h.db.ListTemplateDependents(r.Context(), templateID)
+	if err != nil {
+		h.logger.Error("list template dependents failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if vms == nil {
+		vms = []models.TemplateDependentVM{}
+	}
+
+	resp := models.TemplateDependentsResponse{
+		TemplateID:   templateID.String(),
+		TemplateName: templateName,
+		ActiveVMs:    len(vms),
+		VMs:          vms,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
 // AdminListJobs returns all jobs.
 func (h *Handler) AdminListJobs(w http.ResponseWriter, r *http.Request) {
 	jobs, err := h.db.ListAllJobs(r.Context())

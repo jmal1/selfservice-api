@@ -81,6 +81,7 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider) *chi.Mux {
 			r.Patch("/templates/{templateID}", h.AdminUpdateTemplate)
 			r.Delete("/templates/{templateID}", h.AdminDeleteTemplate)
 			r.Post("/templates/{templateID}/access", h.AdminSetTemplateAccess)
+			r.Get("/templates/{templateID}/dependents", h.AdminListTemplateDependents)
 
 			r.Get("/jobs", h.AdminListJobs)
 			r.Get("/audit", h.AdminListAuditLog)

@@ -112,3 +112,21 @@ type MeResponse struct {
 	User          User          `json:"user"`
 	ResourceUsage ResourceUsage `json:"resource_usage"`
 }
+
+// TemplateDependentVM represents a VM that depends on a template's base disk (linked clone).
+type TemplateDependentVM struct {
+	VMID      string `json:"vm_id"`
+	VMName    string `json:"vm_name"`
+	PodName   string `json:"pod_name"`
+	PodID     string `json:"pod_id"`
+	OwnerName string `json:"owner_name"`
+	Status    string `json:"status"`
+}
+
+// TemplateDependentsResponse is returned by GET /admin/templates/{id}/dependents.
+type TemplateDependentsResponse struct {
+	TemplateID   string                `json:"template_id"`
+	TemplateName string                `json:"template_name"`
+	ActiveVMs    int                   `json:"active_vms"`
+	VMs          []TemplateDependentVM `json:"vms"`
+}

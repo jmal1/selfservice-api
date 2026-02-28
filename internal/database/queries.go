@@ -822,3 +822,44 @@ func (q *Queries) CountActiveVMsInPod(ctx context.Context, podID uuid.UUID) (int
 	`, podID).Scan(&count)
 	return count, err
 }
+
+// ListTemplateDependents returns all active VMs cloned from a given template.
+func (q *Queries) ListTemplateDependents(ctx context.Context, templateID uuid.UUID) (string, []models.TemplateDependentVM, error) {
+	// Get template name
+	var templateName string
+	err := q.pool.QueryRow(ctx, `SELECT name FROM templates WHERE id = $1`, templateID).Scan(&templateName)
+	if err != nil {
+		return "", nil, fmt.Errorf("template not found: %w", err)
+	}
+
+	rows, err := q.pool.Query(ctx, `
+		SELECT pv.vcenter_vm_id, pv.vcenter_vm_name, p.name, p.id, u.display_name, pv.status
+		FROM pod_vms pv
+		JOIN pods p ON pv.pod_id = p.id
+		JOIN users u ON p.owner_id = u.id
+		WHERE pv.template_id = $1
+		  AND pv.status NOT IN ('deleted', 'error')
+		ORDER BY pv.created_at DESC
+	`, templateID)
+	if err != nil {
+		return templateName, nil, err
+	}
+	defer rows.Close()
+
+	var vms []models.TemplateDependentVM
+	for rows.Next() {
+		var vm models.TemplateDependentVM
+		var vmID, vmName *string
+		if err := rows.Scan(&vmID, &vmName, &vm.PodName, &vm.PodID, &vm.OwnerName, &vm.Status); err != nil {
+			return templateName, nil, err
+		}
+		if vmID != nil {
+			vm.VMID = *vmID
+		}
+		if vmName != nil {
+			vm.VMName = *vmName
+		}
+		vms = append(vms, vm)
+	}
+	return templateName, vms, rows.Err()
+}
