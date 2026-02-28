@@ -353,7 +353,7 @@ func (h *Handler) DeletePod(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	payload, _ := json.Marshal(map[string]string{"pod_id": podID.String(), "pod_name": pod.Name})
+	payload, _ := json.Marshal(map[string]string{"pod_id": podID.String(), "pod_name": pod.Name, "user_id": userID.String()})
 	job, err := h.db.CreateJob(r.Context(), models.JobTypePodDestroy, payload)
 	if err != nil {
 		h.logger.Error("create destroy job failed", "error", err)
@@ -417,6 +417,7 @@ func (h *Handler) DeleteVM(w http.ResponseWriter, r *http.Request) {
 		"pod_vm_id": vmID.String(),
 		"pod_name":  pod.Name,
 		"vm_name":   vmName,
+		"user_id":   userID.String(),
 	})
 	job, err := h.db.CreateJob(r.Context(), models.JobTypeVMDestroy, payload)
 	if err != nil {
@@ -555,6 +556,7 @@ func (h *Handler) AddVM(w http.ResponseWriter, r *http.Request) {
 		"template_name": found.VCenterTemplate,
 		"vm_name":       pod.Salt + "-" + sanitizeName(req.DisplayName),
 		"display_name":  req.DisplayName,
+		"user_id":       userID.String(),
 	})
 	job, err := h.db.CreateJob(r.Context(), models.JobTypeVMAdd, payload)
 	if err != nil {

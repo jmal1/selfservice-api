@@ -136,33 +136,41 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) error {
 		password = generatePassword(12)
 	}
 
-	// Step 1: Clone VM
-	p.publishProgress(job.ID, "vm_clone", fmt.Sprintf("Cloning %s from %s", payload.VMName, payload.TemplateName))
-	_ = p.db.UpdatePodVMStatus(ctx, podVMID, models.VMStatusCloning)
+	// Resume support: skip clone if VM was already cloned (e.g., job retry after worker restart)
+	moref := ""
+	if podVM.VCenterVMID != nil && *podVM.VCenterVMID != "" {
+		moref = *podVM.VCenterVMID
+		p.logger.Info("resuming VM add — already cloned", "vm", payload.VMName, "moref", moref)
+	} else {
+		// Step 1: Clone VM
+		p.publishProgress(job.ID, "vm_clone", fmt.Sprintf("Cloning %s from %s", payload.VMName, payload.TemplateName))
+		_ = p.db.UpdatePodVMStatus(ctx, podVMID, models.VMStatusCloning)
 
-	moref, err := p.vc.CloneVM(ctx, vcenter.CloneVMParams{
-		TemplateName: payload.TemplateName,
-		VMName:       payload.VMName,
-		VCPUs:        int32(podVM.VCPUs),
-		RAMmb:        int64(podVM.RAMMB),
-		Network:      pgName,
-		OSType:       osType,
-		Password:     password,
-	})
-	if err != nil {
-		_ = p.db.UpdatePodVMStatus(ctx, podVMID, models.VMStatusError)
-		return fmt.Errorf("clone VM: %w", err)
+		var err error
+		moref, err = p.vc.CloneVM(ctx, vcenter.CloneVMParams{
+			TemplateName: payload.TemplateName,
+			VMName:       payload.VMName,
+			VCPUs:        int32(podVM.VCPUs),
+			RAMmb:        int64(podVM.RAMMB),
+			Network:      pgName,
+			OSType:       osType,
+			Password:     password,
+		})
+		if err != nil {
+			_ = p.db.UpdatePodVMStatus(ctx, podVMID, models.VMStatusError)
+			return fmt.Errorf("clone VM: %w", err)
+		}
+
+		_ = p.db.UpdatePodVM(ctx, podVMID, moref, payload.VMName, models.VMStatusConfiguring)
+
+		// Store generated credentials
+		genUser := "student"
+		if osType == "windows" {
+			genUser = "Student"
+			password = ""
+		}
+		_ = p.db.UpdatePodVMCredentials(ctx, podVMID, genUser, password)
 	}
-
-	_ = p.db.UpdatePodVM(ctx, podVMID, moref, payload.VMName, models.VMStatusConfiguring)
-
-	// Store generated credentials
-	genUser := "student"
-	if osType == "windows" {
-		genUser = "Student"
-		password = ""
-	}
-	_ = p.db.UpdatePodVMCredentials(ctx, podVMID, genUser, password)
 
 	// Step 2: Power on
 	p.publishProgress(job.ID, "vm_poweron", fmt.Sprintf("Powering on %s", payload.VMName))
