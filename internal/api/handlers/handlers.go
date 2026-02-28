@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"path"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -282,14 +283,16 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 
 	// Create job payload matching worker's CreatePodPayload struct
 	type jobPayload struct {
-		PodID  uuid.UUID      `json:"pod_id"`
-		VMs    []workerVMSpec `json:"vms"`
-		UserID string         `json:"user_id"`
+		PodID   uuid.UUID      `json:"pod_id"`
+		PodName string         `json:"pod_name"`
+		VMs     []workerVMSpec `json:"vms"`
+		UserID  string         `json:"user_id"`
 	}
 	payload, _ := json.Marshal(jobPayload{
-		PodID:  podID,
-		VMs:    vmSpecs,
-		UserID: userID.String(),
+		PodID:   podID,
+		PodName: req.Name,
+		VMs:     vmSpecs,
+		UserID:  userID.String(),
 	})
 
 	// Insert job
@@ -348,7 +351,7 @@ func (h *Handler) DeletePod(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	payload, _ := json.Marshal(map[string]string{"pod_id": podID.String()})
+	payload, _ := json.Marshal(map[string]string{"pod_id": podID.String(), "pod_name": pod.Name})
 	job, err := h.db.CreateJob(r.Context(), models.JobTypePodDestroy, payload)
 	if err != nil {
 		h.logger.Error("create destroy job failed", "error", err)
@@ -568,6 +571,88 @@ func (h *Handler) AddVM(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusAccepted, map[string]any{
 		"job_id": job.ID,
 		"vm_id":  vm.ID,
+		"status": "pending",
+	})
+}
+
+// VMPowerAction handles start/stop/restart for a VM within a pod.
+func (h *Handler) VMPowerAction(w http.ResponseWriter, r *http.Request) {
+	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
+	if err != nil {
+		http.Error(w, "invalid pod id", http.StatusBadRequest)
+		return
+	}
+	vmID, err := uuid.Parse(chi.URLParam(r, "vmID"))
+	if err != nil {
+		http.Error(w, "invalid vm id", http.StatusBadRequest)
+		return
+	}
+
+	// Determine action from the last path segment
+	action := path.Base(r.URL.Path)
+	var jobType string
+	switch action {
+	case "start":
+		jobType = models.JobTypeVMStart
+	case "stop":
+		jobType = models.JobTypeVMStop
+	case "restart":
+		jobType = models.JobTypeVMRestart
+	default:
+		http.Error(w, "unknown power action", http.StatusBadRequest)
+		return
+	}
+
+	pod, err := h.db.GetPodByID(r.Context(), podID)
+	if err != nil || pod == nil {
+		http.Error(w, "pod not found", http.StatusNotFound)
+		return
+	}
+
+	userID := middleware.UserIDFromContext(r.Context())
+	role := middleware.RoleFromContext(r.Context())
+	if pod.OwnerID != userID && role != models.RoleAdmin {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	// Verify VM belongs to this pod
+	vm, err := h.db.GetPodVM(r.Context(), vmID)
+	if err != nil || vm.PodID != podID {
+		http.Error(w, "vm not found in this pod", http.StatusNotFound)
+		return
+	}
+	if vm.Status == models.VMStatusDeleted {
+		http.Error(w, "vm is deleted", http.StatusConflict)
+		return
+	}
+
+	payload, _ := json.Marshal(map[string]string{
+		"pod_id":    podID.String(),
+		"pod_vm_id": vmID.String(),
+	})
+	job, err := h.db.CreateJob(r.Context(), jobType, payload)
+	if err != nil {
+		h.logger.Error("create vm power job failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	if err := h.events.PublishJobCreated(job.ID, job.Type); err != nil {
+		h.logger.Warn("failed to publish job created event", "error", err)
+	}
+
+	h.db.InsertAuditLog(r.Context(), models.AuditLog{
+		UserID:       &userID,
+		Action:       "vm." + action + ".requested",
+		ResourceType: strPtr("vm"),
+		ResourceID:   &vmID,
+		Details:      payload,
+		IPAddress:    strPtr(r.RemoteAddr),
+	})
+
+	respondJSON(w, http.StatusAccepted, map[string]any{
+		"job_id": job.ID,
 		"status": "pending",
 	})
 }
