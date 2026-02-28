@@ -406,9 +406,15 @@ func (h *Handler) DeleteVM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	vmName := vm.DisplayName
+	if vm.VCenterVMName != nil {
+		vmName = *vm.VCenterVMName
+	}
 	payload, _ := json.Marshal(map[string]string{
 		"pod_id":    podID.String(),
 		"pod_vm_id": vmID.String(),
+		"pod_name":  pod.Name,
+		"vm_name":   vmName,
 	})
 	job, err := h.db.CreateJob(r.Context(), models.JobTypeVMDestroy, payload)
 	if err != nil {
