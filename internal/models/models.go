@@ -35,6 +35,8 @@ type Template struct {
 	MinRAMMB        int       `json:"min_ram_mb" db:"min_ram_mb"`
 	Description     string    `json:"description" db:"description"`
 	IconURL         string    `json:"icon_url" db:"icon_url"`
+	DefaultUsername string    `json:"default_username" db:"default_username"`
+	DefaultPassword string    `json:"default_password" db:"default_password"`
 	IsActive        bool      `json:"is_active" db:"is_active"`
 	CreatedAt       time.Time `json:"created_at" db:"created_at"`
 }
@@ -66,18 +68,20 @@ type Pod struct {
 
 // PodVM represents a virtual machine within a pod.
 type PodVM struct {
-	ID            uuid.UUID `json:"id" db:"id"`
-	PodID         uuid.UUID `json:"pod_id" db:"pod_id"`
-	TemplateID    uuid.UUID `json:"template_id" db:"template_id"`
-	DisplayName   string    `json:"display_name" db:"display_name"`
-	VCenterVMName *string   `json:"vcenter_vm_name,omitempty" db:"vcenter_vm_name"`
-	VCenterVMID   *string   `json:"vcenter_vm_id,omitempty" db:"vcenter_vm_id"`
-	VCPUs         int       `json:"vcpus" db:"vcpus"`
-	RAMMB         int       `json:"ram_mb" db:"ram_mb"`
-	DiskGB        int       `json:"disk_gb" db:"disk_gb"`
-	IPAddress     *string   `json:"ip_address,omitempty" db:"ip_address"`
-	Status        string    `json:"status" db:"status"`
-	CreatedAt     time.Time `json:"created_at" db:"created_at"`
+	ID              uuid.UUID `json:"id" db:"id"`
+	PodID           uuid.UUID `json:"pod_id" db:"pod_id"`
+	TemplateID      uuid.UUID `json:"template_id" db:"template_id"`
+	DisplayName     string    `json:"display_name" db:"display_name"`
+	VCenterVMName   *string   `json:"vcenter_vm_name,omitempty" db:"vcenter_vm_name"`
+	VCenterVMID     *string   `json:"vcenter_vm_id,omitempty" db:"vcenter_vm_id"`
+	VCPUs           int       `json:"vcpus" db:"vcpus"`
+	RAMMB           int       `json:"ram_mb" db:"ram_mb"`
+	DiskGB          int       `json:"disk_gb" db:"disk_gb"`
+	IPAddress       *string   `json:"ip_address,omitempty" db:"ip_address"`
+	Status          string    `json:"status" db:"status"`
+	DefaultUsername string    `json:"default_username" db:"default_username"`
+	DefaultPassword string    `json:"default_password" db:"default_password"`
+	CreatedAt       time.Time `json:"created_at" db:"created_at"`
 }
 
 // Job represents a durable task in the job queue.

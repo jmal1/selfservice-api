@@ -38,17 +38,21 @@ type CreateTemplateRequest struct {
 	MinRAMMB        int    `json:"min_ram_mb" validate:"required,min=512"`
 	Description     string `json:"description,omitempty"`
 	IconURL         string `json:"icon_url,omitempty"`
+	DefaultUsername string `json:"default_username,omitempty"`
+	DefaultPassword string `json:"default_password,omitempty"`
 }
 
 // UpdateTemplateRequest is the admin API request to update a template.
 type UpdateTemplateRequest struct {
-	Name         *string `json:"name,omitempty" validate:"omitempty,min=1,max=128"`
-	Description  *string `json:"description,omitempty"`
-	IconURL      *string `json:"icon_url,omitempty"`
-	DefaultVCPUs *int    `json:"default_vcpus,omitempty" validate:"omitempty,min=1,max=16"`
-	DefaultRAMMB *int    `json:"default_ram_mb,omitempty" validate:"omitempty,min=512,max=65536"`
-	DefaultDiskGB *int   `json:"default_disk_gb,omitempty" validate:"omitempty,min=10,max=500"`
-	IsActive     *bool   `json:"is_active,omitempty"`
+	Name            *string `json:"name,omitempty" validate:"omitempty,min=1,max=128"`
+	Description     *string `json:"description,omitempty"`
+	IconURL         *string `json:"icon_url,omitempty"`
+	DefaultVCPUs    *int    `json:"default_vcpus,omitempty" validate:"omitempty,min=1,max=16"`
+	DefaultRAMMB    *int    `json:"default_ram_mb,omitempty" validate:"omitempty,min=512,max=65536"`
+	DefaultDiskGB   *int    `json:"default_disk_gb,omitempty" validate:"omitempty,min=10,max=500"`
+	IsActive        *bool   `json:"is_active,omitempty"`
+	DefaultUsername *string `json:"default_username,omitempty"`
+	DefaultPassword *string `json:"default_password,omitempty"`
 }
 
 // UpdateQuotaRequest is the admin API request to update user quotas.

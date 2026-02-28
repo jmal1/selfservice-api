@@ -140,15 +140,19 @@ func (q *Queries) CreateTemplate(ctx context.Context, req models.CreateTemplateR
 	var t models.Template
 	err := q.pool.QueryRow(ctx, `
 		INSERT INTO templates (name, vcenter_template, os_type, default_vcpus, default_ram_mb,
-		                       default_disk_gb, min_vcpus, min_ram_mb, description, icon_url)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		                       default_disk_gb, min_vcpus, min_ram_mb, description, icon_url,
+		                       default_username, default_password)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		RETURNING id, name, vcenter_template, os_type, default_vcpus, default_ram_mb,
-		          default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''), is_active, created_at
+		          default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''),
+		          default_username, default_password, is_active, created_at
 	`, req.Name, req.VCenterTemplate, req.OSType, req.DefaultVCPUs, req.DefaultRAMMB,
 		req.DefaultDiskGB, req.MinVCPUs, req.MinRAMMB, req.Description, req.IconURL,
+		req.DefaultUsername, req.DefaultPassword,
 	).Scan(
 		&t.ID, &t.Name, &t.VCenterTemplate, &t.OSType, &t.DefaultVCPUs, &t.DefaultRAMMB,
-		&t.DefaultDiskGB, &t.MinVCPUs, &t.MinRAMMB, &t.Description, &t.IconURL, &t.IsActive, &t.CreatedAt,
+		&t.DefaultDiskGB, &t.MinVCPUs, &t.MinRAMMB, &t.Description, &t.IconURL,
+		&t.DefaultUsername, &t.DefaultPassword, &t.IsActive, &t.CreatedAt,
 	)
 	return &t, err
 }
@@ -158,7 +162,8 @@ func (q *Queries) ListTemplatesForUser(ctx context.Context, userID uuid.UUID, ro
 	rows, err := q.pool.Query(ctx, `
 		SELECT DISTINCT t.id, t.name, t.vcenter_template, t.os_type, t.default_vcpus,
 		       t.default_ram_mb, t.default_disk_gb, t.min_vcpus, t.min_ram_mb,
-		       COALESCE(t.description, ''), COALESCE(t.icon_url, ''), t.is_active, t.created_at
+		       COALESCE(t.description, ''), COALESCE(t.icon_url, ''),
+		       t.default_username, t.default_password, t.is_active, t.created_at
 		FROM templates t
 		LEFT JOIN template_access ta ON t.id = ta.template_id
 		WHERE t.is_active = true
@@ -177,7 +182,8 @@ func (q *Queries) ListTemplatesForUser(ctx context.Context, userID uuid.UUID, ro
 		if err := rows.Scan(
 			&t.ID, &t.Name, &t.VCenterTemplate, &t.OSType, &t.DefaultVCPUs,
 			&t.DefaultRAMMB, &t.DefaultDiskGB, &t.MinVCPUs, &t.MinRAMMB,
-			&t.Description, &t.IconURL, &t.IsActive, &t.CreatedAt,
+			&t.Description, &t.IconURL, &t.DefaultUsername, &t.DefaultPassword,
+			&t.IsActive, &t.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -190,7 +196,8 @@ func (q *Queries) ListTemplatesForUser(ctx context.Context, userID uuid.UUID, ro
 func (q *Queries) ListAllTemplates(ctx context.Context) ([]models.Template, error) {
 	rows, err := q.pool.Query(ctx, `
 		SELECT id, name, vcenter_template, os_type, default_vcpus, default_ram_mb,
-		       default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''), is_active, created_at
+		       default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''),
+		       default_username, default_password, is_active, created_at
 		FROM templates ORDER BY name
 	`)
 	if err != nil {
@@ -204,7 +211,8 @@ func (q *Queries) ListAllTemplates(ctx context.Context) ([]models.Template, erro
 		if err := rows.Scan(
 			&t.ID, &t.Name, &t.VCenterTemplate, &t.OSType, &t.DefaultVCPUs,
 			&t.DefaultRAMMB, &t.DefaultDiskGB, &t.MinVCPUs, &t.MinRAMMB,
-			&t.Description, &t.IconURL, &t.IsActive, &t.CreatedAt,
+			&t.Description, &t.IconURL, &t.DefaultUsername, &t.DefaultPassword,
+			&t.IsActive, &t.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -250,14 +258,19 @@ func (q *Queries) UpdateTemplate(ctx context.Context, id uuid.UUID, req models.U
 			default_vcpus = COALESCE($5, default_vcpus),
 			default_ram_mb = COALESCE($6, default_ram_mb),
 			default_disk_gb = COALESCE($7, default_disk_gb),
-			is_active = COALESCE($8, is_active)
+			is_active = COALESCE($8, is_active),
+			default_username = COALESCE($9, default_username),
+			default_password = COALESCE($10, default_password)
 		WHERE id = $1
 		RETURNING id, name, vcenter_template, os_type, default_vcpus, default_ram_mb,
-		          default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''), is_active, created_at
+		          default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''),
+		          default_username, default_password, is_active, created_at
 	`, id, req.Name, req.Description, req.IconURL, req.DefaultVCPUs, req.DefaultRAMMB, req.DefaultDiskGB, req.IsActive,
+		req.DefaultUsername, req.DefaultPassword,
 	).Scan(
 		&t.ID, &t.Name, &t.VCenterTemplate, &t.OSType, &t.DefaultVCPUs, &t.DefaultRAMMB,
-		&t.DefaultDiskGB, &t.MinVCPUs, &t.MinRAMMB, &t.Description, &t.IconURL, &t.IsActive, &t.CreatedAt,
+		&t.DefaultDiskGB, &t.MinVCPUs, &t.MinRAMMB, &t.Description, &t.IconURL,
+		&t.DefaultUsername, &t.DefaultPassword, &t.IsActive, &t.CreatedAt,
 	)
 	if err == pgx.ErrNoRows {
 		return nil, nil
@@ -427,9 +440,12 @@ func (q *Queries) GetPodByID(ctx context.Context, id uuid.UUID) (*models.Pod, er
 
 	// Load VMs
 	rows, err := q.pool.Query(ctx, `
-		SELECT id, pod_id, template_id, display_name, vcenter_vm_name, vcenter_vm_id,
-		       vcpus, ram_mb, disk_gb, ip_address, status, created_at
-		FROM pod_vms WHERE pod_id = $1 AND status != 'deleted' ORDER BY created_at
+		SELECT pv.id, pv.pod_id, pv.template_id, pv.display_name, pv.vcenter_vm_name, pv.vcenter_vm_id,
+		       pv.vcpus, pv.ram_mb, pv.disk_gb, pv.ip_address, pv.status,
+		       COALESCE(t.default_username, ''), COALESCE(t.default_password, ''), pv.created_at
+		FROM pod_vms pv
+		LEFT JOIN templates t ON pv.template_id = t.id
+		WHERE pv.pod_id = $1 AND pv.status != 'deleted' ORDER BY pv.created_at
 	`, id)
 	if err != nil {
 		return nil, err
@@ -440,7 +456,8 @@ func (q *Queries) GetPodByID(ctx context.Context, id uuid.UUID) (*models.Pod, er
 		var vm models.PodVM
 		if err := rows.Scan(
 			&vm.ID, &vm.PodID, &vm.TemplateID, &vm.DisplayName, &vm.VCenterVMName, &vm.VCenterVMID,
-			&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.IPAddress, &vm.Status, &vm.CreatedAt,
+			&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.IPAddress, &vm.Status,
+			&vm.DefaultUsername, &vm.DefaultPassword, &vm.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -538,9 +555,12 @@ func (q *Queries) ListAllPods(ctx context.Context) ([]models.Pod, error) {
 // listPodVMsActive returns non-deleted VMs for a pod.
 func (q *Queries) listPodVMsActive(ctx context.Context, podID uuid.UUID) ([]models.PodVM, error) {
 	rows, err := q.pool.Query(ctx, `
-		SELECT id, pod_id, template_id, display_name, vcenter_vm_name, vcenter_vm_id,
-		       vcpus, ram_mb, disk_gb, ip_address, status, created_at
-		FROM pod_vms WHERE pod_id = $1 AND status != 'deleted' ORDER BY created_at
+		SELECT pv.id, pv.pod_id, pv.template_id, pv.display_name, pv.vcenter_vm_name, pv.vcenter_vm_id,
+		       pv.vcpus, pv.ram_mb, pv.disk_gb, pv.ip_address, pv.status,
+		       COALESCE(t.default_username, ''), COALESCE(t.default_password, ''), pv.created_at
+		FROM pod_vms pv
+		LEFT JOIN templates t ON pv.template_id = t.id
+		WHERE pv.pod_id = $1 AND pv.status != 'deleted' ORDER BY pv.created_at
 	`, podID)
 	if err != nil {
 		return nil, err
@@ -552,7 +572,8 @@ func (q *Queries) listPodVMsActive(ctx context.Context, podID uuid.UUID) ([]mode
 		var vm models.PodVM
 		if err := rows.Scan(
 			&vm.ID, &vm.PodID, &vm.TemplateID, &vm.DisplayName, &vm.VCenterVMName, &vm.VCenterVMID,
-			&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.IPAddress, &vm.Status, &vm.CreatedAt,
+			&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.IPAddress, &vm.Status,
+			&vm.DefaultUsername, &vm.DefaultPassword, &vm.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -754,8 +775,12 @@ func (q *Queries) UpdatePodStatus(ctx context.Context, id uuid.UUID, status, err
 // ListPodVMs returns all VMs belonging to a pod.
 func (q *Queries) ListPodVMs(ctx context.Context, podID uuid.UUID) ([]models.PodVM, error) {
 	rows, err := q.pool.Query(ctx, `
-		SELECT id, pod_id, template_id, display_name, vcenter_vm_name, vcenter_vm_id, vcpus, ram_mb, disk_gb, ip_address, status, created_at
-		FROM pod_vms WHERE pod_id = $1
+		SELECT pv.id, pv.pod_id, pv.template_id, pv.display_name, pv.vcenter_vm_name, pv.vcenter_vm_id,
+		       pv.vcpus, pv.ram_mb, pv.disk_gb, pv.ip_address, pv.status,
+		       COALESCE(t.default_username, ''), COALESCE(t.default_password, ''), pv.created_at
+		FROM pod_vms pv
+		LEFT JOIN templates t ON pv.template_id = t.id
+		WHERE pv.pod_id = $1
 	`, podID)
 	if err != nil {
 		return nil, err
@@ -766,7 +791,8 @@ func (q *Queries) ListPodVMs(ctx context.Context, podID uuid.UUID) ([]models.Pod
 	for rows.Next() {
 		var vm models.PodVM
 		err := rows.Scan(&vm.ID, &vm.PodID, &vm.TemplateID, &vm.DisplayName, &vm.VCenterVMName, &vm.VCenterVMID,
-			&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.IPAddress, &vm.Status, &vm.CreatedAt)
+			&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.IPAddress, &vm.Status,
+			&vm.DefaultUsername, &vm.DefaultPassword, &vm.CreatedAt)
 		if err != nil {
 			return nil, err
 		}
@@ -779,10 +805,15 @@ func (q *Queries) ListPodVMs(ctx context.Context, podID uuid.UUID) ([]models.Pod
 func (q *Queries) GetPodVM(ctx context.Context, id uuid.UUID) (*models.PodVM, error) {
 	var vm models.PodVM
 	err := q.pool.QueryRow(ctx, `
-		SELECT id, pod_id, template_id, display_name, vcenter_vm_name, vcenter_vm_id, vcpus, ram_mb, disk_gb, ip_address, status, created_at
-		FROM pod_vms WHERE id = $1
+		SELECT pv.id, pv.pod_id, pv.template_id, pv.display_name, pv.vcenter_vm_name, pv.vcenter_vm_id,
+		       pv.vcpus, pv.ram_mb, pv.disk_gb, pv.ip_address, pv.status,
+		       COALESCE(t.default_username, ''), COALESCE(t.default_password, ''), pv.created_at
+		FROM pod_vms pv
+		LEFT JOIN templates t ON pv.template_id = t.id
+		WHERE pv.id = $1
 	`, id).Scan(&vm.ID, &vm.PodID, &vm.TemplateID, &vm.DisplayName, &vm.VCenterVMName, &vm.VCenterVMID,
-		&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.IPAddress, &vm.Status, &vm.CreatedAt)
+		&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.IPAddress, &vm.Status,
+		&vm.DefaultUsername, &vm.DefaultPassword, &vm.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
