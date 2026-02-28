@@ -194,15 +194,16 @@ func (c *Client) GetVLANByTag(ctx context.Context, tag int) (*VLAN, error) {
 
 // ---------- DHCP Operations ----------
 
-// CreateDHCPSubnet creates a Kea DHCPv4 subnet.
+// CreateDHCPSubnet creates a Kea DHCPv4 subnet with DNS configured.
+// Uses autocollect to set the router from the interface, then patches
+// DNS via setSubnet (addSubnet ignores nested option_data fields).
 func (c *Client) CreateDHCPSubnet(ctx context.Context, subnet, poolRange, gateway string) (string, error) {
+	// Step 1: Create subnet with autocollect (reliably sets router option)
 	payload := map[string]any{
 		"subnet4": map[string]any{
-			"subnet":                            subnet,
-			"pools":                             poolRange,
-			"option_data_autocollect":           "0",
-			"option_data.routers":               gateway,
-			"option_data.domain_name_servers":   gateway,
+			"subnet":                  subnet,
+			"pools":                   poolRange,
+			"option_data_autocollect": "1",
 		},
 	}
 
@@ -216,6 +217,20 @@ func (c *Client) CreateDHCPSubnet(ctx context.Context, subnet, poolRange, gatewa
 	}
 	if err := json.Unmarshal(resp, &result); err != nil {
 		return "", fmt.Errorf("parse DHCP response: %w", err)
+	}
+
+	// Step 2: Patch subnet to add DNS server (setSubnet accepts nested option_data)
+	if result.UUID != "" {
+		dnsPayload := map[string]any{
+			"subnet4": map[string]any{
+				"option_data": map[string]any{
+					"domain_name_servers": gateway,
+				},
+			},
+		}
+		if _, err := c.doRequest(ctx, "POST", "/kea/dhcpv4/setSubnet/"+result.UUID, dnsPayload); err != nil {
+			c.logger.Warn("failed to set DNS on DHCP subnet", "uuid", result.UUID, "error", err)
+		}
 	}
 
 	c.logger.Info("created DHCP subnet", "subnet", subnet, "uuid", result.UUID)
