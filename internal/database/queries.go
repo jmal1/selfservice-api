@@ -644,6 +644,18 @@ func (q *Queries) UpdateJobRollbackSteps(ctx context.Context, id uuid.UUID, step
 	return err
 }
 
+// RecoverStaleJobs resets in_progress/claimed jobs that were abandoned (e.g., worker restart).
+func (q *Queries) RecoverStaleJobs(ctx context.Context) (int64, error) {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE jobs SET status = 'pending', claimed_by = NULL, claimed_at = NULL, started_at = NULL
+		WHERE status IN ('in_progress', 'claimed') AND completed_at IS NULL
+	`)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
 // GetJob retrieves a job by ID.
 func (q *Queries) GetJob(ctx context.Context, id uuid.UUID) (*models.Job, error) {
 	var j models.Job

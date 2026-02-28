@@ -92,6 +92,14 @@ func main() {
 		"opnsense", cfg.OPNsense.BaseURL,
 	)
 
+	// Recover any jobs that were abandoned by a previous worker instance
+	recovered, err := queries.RecoverStaleJobs(ctx)
+	if err != nil {
+		logger.Error("failed to recover stale jobs", "error", err)
+	} else if recovered > 0 {
+		logger.Info("recovered stale jobs", "count", recovered)
+	}
+
 	// Subscribe to job notifications from NATS
 	_, err = natsClient.SubscribeJobCreated(func(jobID string, jobType string) {
 		logger.Info("received job notification", "job_id", jobID, "type", jobType)
@@ -105,6 +113,9 @@ func main() {
 	// Polling fallback: check for jobs every 30 seconds
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
+
+	// Immediately process any pending/recovered jobs
+	go processJobs(ctx, queries, prov, workerID, logger)
 
 	go func() {
 		for {
