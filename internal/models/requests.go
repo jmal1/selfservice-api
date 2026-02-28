@@ -98,12 +98,13 @@ type JobStatusResponse struct {
 
 // ResourceUsage shows a user's current resource consumption.
 type ResourceUsage struct {
-	UsedVCPUs  int `json:"used_vcpus"`
-	UsedRAMMB  int `json:"used_ram_mb"`
-	ActivePods int `json:"active_pods"`
-	MaxVCPUs   int `json:"max_vcpus"`
-	MaxRAMMB   int `json:"max_ram_mb"`
-	MaxPods    int `json:"max_pods"`
+	UsedVCPUs    int `json:"used_vcpus"`
+	UsedRAMMB    int `json:"used_ram_mb"`
+	UsedStorageGB int `json:"used_storage_gb"`
+	ActivePods   int `json:"active_pods"`
+	MaxVCPUs     int `json:"max_vcpus"`
+	MaxRAMMB     int `json:"max_ram_mb"`
+	MaxPods      int `json:"max_pods"`
 }
 
 // MeResponse is returned by GET /auth/me.

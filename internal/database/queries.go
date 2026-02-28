@@ -300,7 +300,7 @@ func (q *Queries) ListAllJobs(ctx context.Context) ([]models.Job, error) {
 // ListAuditLog returns recent audit log entries (admin).
 func (q *Queries) ListAuditLog(ctx context.Context) ([]models.AuditLog, error) {
 	rows, err := q.pool.Query(ctx, `
-		SELECT id, user_id, action, resource_type, resource_id, details, ip_address, created_at
+		SELECT id, user_id, action, resource_type, resource_id, details, CAST(ip_address AS TEXT), created_at
 		FROM audit_log ORDER BY created_at DESC LIMIT 200
 	`)
 	if err != nil {
@@ -331,11 +331,12 @@ func (q *Queries) GetResourceUsage(ctx context.Context, userID uuid.UUID) (*mode
 		SELECT
 			COALESCE(SUM(pv.vcpus), 0),
 			COALESCE(SUM(pv.ram_mb), 0),
+			COALESCE(SUM(pv.disk_gb), 0),
 			COUNT(DISTINCT p.id)
 		FROM pods p
 		LEFT JOIN pod_vms pv ON p.id = pv.pod_id AND pv.status NOT IN ('deleted', 'error')
 		WHERE p.owner_id = $1 AND p.status NOT IN ('destroyed', 'error')
-	`, userID).Scan(&usage.UsedVCPUs, &usage.UsedRAMMB, &usage.ActivePods)
+	`, userID).Scan(&usage.UsedVCPUs, &usage.UsedRAMMB, &usage.UsedStorageGB, &usage.ActivePods)
 
 	return &usage, err
 }
