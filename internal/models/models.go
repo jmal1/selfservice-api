@@ -68,20 +68,22 @@ type Pod struct {
 
 // PodVM represents a virtual machine within a pod.
 type PodVM struct {
-	ID              uuid.UUID `json:"id" db:"id"`
-	PodID           uuid.UUID `json:"pod_id" db:"pod_id"`
-	TemplateID      uuid.UUID `json:"template_id" db:"template_id"`
-	DisplayName     string    `json:"display_name" db:"display_name"`
-	VCenterVMName   *string   `json:"vcenter_vm_name,omitempty" db:"vcenter_vm_name"`
-	VCenterVMID     *string   `json:"vcenter_vm_id,omitempty" db:"vcenter_vm_id"`
-	VCPUs           int       `json:"vcpus" db:"vcpus"`
-	RAMMB           int       `json:"ram_mb" db:"ram_mb"`
-	DiskGB          int       `json:"disk_gb" db:"disk_gb"`
-	IPAddress       *string   `json:"ip_address,omitempty" db:"ip_address"`
-	Status          string    `json:"status" db:"status"`
-	DefaultUsername string    `json:"default_username" db:"default_username"`
-	DefaultPassword string    `json:"default_password" db:"default_password"`
-	CreatedAt       time.Time `json:"created_at" db:"created_at"`
+	ID                uuid.UUID `json:"id" db:"id"`
+	PodID             uuid.UUID `json:"pod_id" db:"pod_id"`
+	TemplateID        uuid.UUID `json:"template_id" db:"template_id"`
+	DisplayName       string    `json:"display_name" db:"display_name"`
+	VCenterVMName     *string   `json:"vcenter_vm_name,omitempty" db:"vcenter_vm_name"`
+	VCenterVMID       *string   `json:"vcenter_vm_id,omitempty" db:"vcenter_vm_id"`
+	VCPUs             int       `json:"vcpus" db:"vcpus"`
+	RAMMB             int       `json:"ram_mb" db:"ram_mb"`
+	DiskGB            int       `json:"disk_gb" db:"disk_gb"`
+	IPAddress         *string   `json:"ip_address,omitempty" db:"ip_address"`
+	Status            string    `json:"status" db:"status"`
+	DefaultUsername   string    `json:"default_username" db:"default_username"`
+	DefaultPassword   string    `json:"default_password" db:"default_password"`
+	GeneratedUsername string    `json:"generated_username" db:"generated_username"`
+	GeneratedPassword string    `json:"generated_password" db:"generated_password"`
+	CreatedAt         time.Time `json:"created_at" db:"created_at"`
 }
 
 // Job represents a durable task in the job queue.

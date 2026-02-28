@@ -442,7 +442,8 @@ func (q *Queries) GetPodByID(ctx context.Context, id uuid.UUID) (*models.Pod, er
 	rows, err := q.pool.Query(ctx, `
 		SELECT pv.id, pv.pod_id, pv.template_id, pv.display_name, pv.vcenter_vm_name, pv.vcenter_vm_id,
 		       pv.vcpus, pv.ram_mb, pv.disk_gb, pv.ip_address, pv.status,
-		       COALESCE(t.default_username, ''), COALESCE(t.default_password, ''), pv.created_at
+		       COALESCE(t.default_username, ''), COALESCE(t.default_password, ''),
+		       pv.generated_username, pv.generated_password, pv.created_at
 		FROM pod_vms pv
 		LEFT JOIN templates t ON pv.template_id = t.id
 		WHERE pv.pod_id = $1 AND pv.status != 'deleted' ORDER BY pv.created_at
@@ -457,7 +458,8 @@ func (q *Queries) GetPodByID(ctx context.Context, id uuid.UUID) (*models.Pod, er
 		if err := rows.Scan(
 			&vm.ID, &vm.PodID, &vm.TemplateID, &vm.DisplayName, &vm.VCenterVMName, &vm.VCenterVMID,
 			&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.IPAddress, &vm.Status,
-			&vm.DefaultUsername, &vm.DefaultPassword, &vm.CreatedAt,
+			&vm.DefaultUsername, &vm.DefaultPassword,
+			&vm.GeneratedUsername, &vm.GeneratedPassword, &vm.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -557,7 +559,8 @@ func (q *Queries) listPodVMsActive(ctx context.Context, podID uuid.UUID) ([]mode
 	rows, err := q.pool.Query(ctx, `
 		SELECT pv.id, pv.pod_id, pv.template_id, pv.display_name, pv.vcenter_vm_name, pv.vcenter_vm_id,
 		       pv.vcpus, pv.ram_mb, pv.disk_gb, pv.ip_address, pv.status,
-		       COALESCE(t.default_username, ''), COALESCE(t.default_password, ''), pv.created_at
+		       COALESCE(t.default_username, ''), COALESCE(t.default_password, ''),
+		       pv.generated_username, pv.generated_password, pv.created_at
 		FROM pod_vms pv
 		LEFT JOIN templates t ON pv.template_id = t.id
 		WHERE pv.pod_id = $1 AND pv.status != 'deleted' ORDER BY pv.created_at
@@ -573,7 +576,8 @@ func (q *Queries) listPodVMsActive(ctx context.Context, podID uuid.UUID) ([]mode
 		if err := rows.Scan(
 			&vm.ID, &vm.PodID, &vm.TemplateID, &vm.DisplayName, &vm.VCenterVMName, &vm.VCenterVMID,
 			&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.IPAddress, &vm.Status,
-			&vm.DefaultUsername, &vm.DefaultPassword, &vm.CreatedAt,
+			&vm.DefaultUsername, &vm.DefaultPassword,
+			&vm.GeneratedUsername, &vm.GeneratedPassword, &vm.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -777,7 +781,8 @@ func (q *Queries) ListPodVMs(ctx context.Context, podID uuid.UUID) ([]models.Pod
 	rows, err := q.pool.Query(ctx, `
 		SELECT pv.id, pv.pod_id, pv.template_id, pv.display_name, pv.vcenter_vm_name, pv.vcenter_vm_id,
 		       pv.vcpus, pv.ram_mb, pv.disk_gb, pv.ip_address, pv.status,
-		       COALESCE(t.default_username, ''), COALESCE(t.default_password, ''), pv.created_at
+		       COALESCE(t.default_username, ''), COALESCE(t.default_password, ''),
+		       pv.generated_username, pv.generated_password, pv.created_at
 		FROM pod_vms pv
 		LEFT JOIN templates t ON pv.template_id = t.id
 		WHERE pv.pod_id = $1
@@ -792,7 +797,8 @@ func (q *Queries) ListPodVMs(ctx context.Context, podID uuid.UUID) ([]models.Pod
 		var vm models.PodVM
 		err := rows.Scan(&vm.ID, &vm.PodID, &vm.TemplateID, &vm.DisplayName, &vm.VCenterVMName, &vm.VCenterVMID,
 			&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.IPAddress, &vm.Status,
-			&vm.DefaultUsername, &vm.DefaultPassword, &vm.CreatedAt)
+			&vm.DefaultUsername, &vm.DefaultPassword,
+			&vm.GeneratedUsername, &vm.GeneratedPassword, &vm.CreatedAt)
 		if err != nil {
 			return nil, err
 		}
@@ -807,13 +813,15 @@ func (q *Queries) GetPodVM(ctx context.Context, id uuid.UUID) (*models.PodVM, er
 	err := q.pool.QueryRow(ctx, `
 		SELECT pv.id, pv.pod_id, pv.template_id, pv.display_name, pv.vcenter_vm_name, pv.vcenter_vm_id,
 		       pv.vcpus, pv.ram_mb, pv.disk_gb, pv.ip_address, pv.status,
-		       COALESCE(t.default_username, ''), COALESCE(t.default_password, ''), pv.created_at
+		       COALESCE(t.default_username, ''), COALESCE(t.default_password, ''),
+		       pv.generated_username, pv.generated_password, pv.created_at
 		FROM pod_vms pv
 		LEFT JOIN templates t ON pv.template_id = t.id
 		WHERE pv.id = $1
 	`, id).Scan(&vm.ID, &vm.PodID, &vm.TemplateID, &vm.DisplayName, &vm.VCenterVMName, &vm.VCenterVMID,
 		&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.IPAddress, &vm.Status,
-		&vm.DefaultUsername, &vm.DefaultPassword, &vm.CreatedAt)
+		&vm.DefaultUsername, &vm.DefaultPassword,
+		&vm.GeneratedUsername, &vm.GeneratedPassword, &vm.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -838,6 +846,33 @@ func (q *Queries) UpdatePodVMStatus(ctx context.Context, id uuid.UUID, status st
 func (q *Queries) UpdatePodVMIP(ctx context.Context, id uuid.UUID, ip string) error {
 	_, err := q.pool.Exec(ctx, `UPDATE pod_vms SET ip_address = $1 WHERE id = $2`, ip, id)
 	return err
+}
+
+// UpdatePodVMCredentials stores the generated credentials for a pod VM.
+func (q *Queries) UpdatePodVMCredentials(ctx context.Context, id uuid.UUID, username, password string) error {
+	_, err := q.pool.Exec(ctx,
+		`UPDATE pod_vms SET generated_username = $2, generated_password = $3 WHERE id = $1`,
+		id, username, password)
+	return err
+}
+
+// GetTemplateByID returns a template by its ID.
+func (q *Queries) GetTemplateByID(ctx context.Context, id uuid.UUID) (*models.Template, error) {
+	var t models.Template
+	err := q.pool.QueryRow(ctx, `
+		SELECT id, name, vcenter_template, os_type, default_vcpus, default_ram_mb,
+		       default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''),
+		       default_username, default_password, is_active, created_at
+		FROM templates WHERE id = $1
+	`, id).Scan(
+		&t.ID, &t.Name, &t.VCenterTemplate, &t.OSType, &t.DefaultVCPUs, &t.DefaultRAMMB,
+		&t.DefaultDiskGB, &t.MinVCPUs, &t.MinRAMMB, &t.Description, &t.IconURL,
+		&t.DefaultUsername, &t.DefaultPassword, &t.IsActive, &t.CreatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
 }
 
 // CreatePodVM inserts a new VM record into an existing pod.

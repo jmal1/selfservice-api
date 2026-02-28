@@ -2,9 +2,11 @@ package provisioner
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"time"
 
 	"github.com/google/uuid"
@@ -127,6 +129,41 @@ type VMSpec struct {
 	VCPUs        int32     `json:"vcpus"`
 	RAMMB        int64     `json:"ram_mb"`
 	DiskGB       int       `json:"disk_gb"`
+	OSType       string    `json:"os_type"`       // "linux" or "windows"
+}
+
+// generatePassword creates a random password with uppercase, lowercase, digits, and a special char.
+func generatePassword(length int) string {
+	const (
+		upper   = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+		lower   = "abcdefghjkmnpqrstuvwxyz"
+		digits  = "23456789"
+		special = "!@#$%&*"
+	)
+
+	// Guarantee at least one of each class
+	pick := func(charset string) byte {
+		n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
+		return charset[n.Int64()]
+	}
+
+	buf := make([]byte, length)
+	buf[0] = pick(upper)
+	buf[1] = pick(lower)
+	buf[2] = pick(digits)
+	buf[3] = pick(special)
+
+	all := upper + lower + digits
+	for i := 4; i < length; i++ {
+		buf[i] = pick(all)
+	}
+
+	// Shuffle (Fisher-Yates)
+	for i := length - 1; i > 0; i-- {
+		j, _ := rand.Int(rand.Reader, big.NewInt(int64(i+1)))
+		buf[i], buf[j.Int64()] = buf[j.Int64()], buf[i]
+	}
+	return string(buf)
 }
 
 // CreatePod executes the full pod creation workflow with rollback.
@@ -333,12 +370,31 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		stepName := fmt.Sprintf("vm_clone_%d", i)
 		p.publishProgress(job.ID, stepName, fmt.Sprintf("Cloning VM %s from %s", vmSpec.VMName, vmSpec.TemplateName))
 
+		// Generate credentials for cloud-init injection
+		password := ""
+		osType := vmSpec.OSType
+		if osType == "" {
+			// Look up OS type from template if not in payload
+			podVM, lookupErr := p.db.GetPodVM(ctx, vmSpec.PodVMID)
+			if lookupErr == nil {
+				tmpl, tmplErr := p.db.GetTemplateByID(ctx, podVM.TemplateID)
+				if tmplErr == nil {
+					osType = tmpl.OSType
+				}
+			}
+		}
+		if osType == "linux" {
+			password = generatePassword(12)
+		}
+
 		moref, err := p.vc.CloneVM(ctx, vcenter.CloneVMParams{
 			TemplateName: vmSpec.TemplateName,
 			VMName:       vmSpec.VMName,
 			VCPUs:        vmSpec.VCPUs,
 			RAMmb:        vmSpec.RAMMB,
 			Network:      pgName,
+			OSType:       osType,
+			Password:     password,
 		})
 		if err != nil {
 			rbErrs := rb.Rollback(ctx)
@@ -347,6 +403,14 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 
 		// Update pod_vms record with vCenter details
 		_ = p.db.UpdatePodVM(ctx, vmSpec.PodVMID, moref, vmSpec.VMName, "cloned")
+
+		// Store generated credentials
+		username := "student"
+		if osType == "windows" {
+			username = "Student"
+			password = "" // Windows OOBE requires manual password setup
+		}
+		_ = p.db.UpdatePodVMCredentials(ctx, vmSpec.PodVMID, username, password)
 
 		rb.RegisterUndo(stepName, func(ctx context.Context, data json.RawMessage) error {
 			var d struct{ Moref string }

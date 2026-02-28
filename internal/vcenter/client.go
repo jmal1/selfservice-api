@@ -2,6 +2,7 @@ package vcenter
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -137,6 +138,8 @@ type CloneVMParams struct {
 	VCPUs        int32
 	RAMmb        int64
 	Network      string // port group name
+	OSType       string // "linux" or "windows"
+	Password     string // generated password for cloud-init
 }
 
 // CloneVM clones a template into the Student-VMs folder.
@@ -249,6 +252,26 @@ func (c *Client) CloneVM(ctx context.Context, params CloneVMParams) (string, err
 			})
 			break
 		}
+	}
+
+	// Inject cloud-init guestinfo for Linux VMs
+	if params.OSType == "linux" && params.Password != "" {
+		userdata := fmt.Sprintf(`#cloud-config
+password: %s
+chpasswd:
+  expire: false
+ssh_pwauth: true
+hostname: %s
+`, params.Password, params.VMName)
+
+		metadata := fmt.Sprintf(`{"instance-id": "%s", "local-hostname": "%s"}`, params.VMName, params.VMName)
+
+		configSpec.ExtraConfig = append(configSpec.ExtraConfig,
+			&types.OptionValue{Key: "guestinfo.userdata", Value: base64.StdEncoding.EncodeToString([]byte(userdata))},
+			&types.OptionValue{Key: "guestinfo.userdata.encoding", Value: "base64"},
+			&types.OptionValue{Key: "guestinfo.metadata", Value: base64.StdEncoding.EncodeToString([]byte(metadata))},
+			&types.OptionValue{Key: "guestinfo.metadata.encoding", Value: "base64"},
+		)
 	}
 
 	reconfigTask, err := clonedVM.Reconfigure(ctx, configSpec)

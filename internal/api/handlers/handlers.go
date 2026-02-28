@@ -247,6 +247,7 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 		VCPUs        int32     `json:"vcpus"`
 		RAMMB        int64     `json:"ram_mb"`
 		DiskGB       int       `json:"disk_gb"`
+		OSType       string    `json:"os_type"`
 	}
 	var vmSpecs []workerVMSpec
 
@@ -272,6 +273,7 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 			VCPUs:        int32(rv.vcpus),
 			RAMMB:        int64(rv.ramMB),
 			DiskGB:       rv.diskGB,
+			OSType:       rv.template.OSType,
 		})
 	}
 

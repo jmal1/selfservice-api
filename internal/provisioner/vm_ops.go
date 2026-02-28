@@ -125,6 +125,17 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) error {
 
 	pgName := fmt.Sprintf("Pod-VLAN%d", pod.VLANID)
 
+	// Determine OS type and generate credentials
+	password := ""
+	osType := ""
+	tmpl, tmplErr := p.db.GetTemplateByID(ctx, podVM.TemplateID)
+	if tmplErr == nil {
+		osType = tmpl.OSType
+	}
+	if osType == "linux" {
+		password = generatePassword(12)
+	}
+
 	// Step 1: Clone VM
 	p.publishProgress(job.ID, "vm_clone", fmt.Sprintf("Cloning %s from %s", payload.VMName, payload.TemplateName))
 	_ = p.db.UpdatePodVMStatus(ctx, podVMID, models.VMStatusCloning)
@@ -135,6 +146,8 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) error {
 		VCPUs:        int32(podVM.VCPUs),
 		RAMmb:        int64(podVM.RAMMB),
 		Network:      pgName,
+		OSType:       osType,
+		Password:     password,
 	})
 	if err != nil {
 		_ = p.db.UpdatePodVMStatus(ctx, podVMID, models.VMStatusError)
@@ -142,6 +155,14 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) error {
 	}
 
 	_ = p.db.UpdatePodVM(ctx, podVMID, moref, payload.VMName, models.VMStatusConfiguring)
+
+	// Store generated credentials
+	genUser := "student"
+	if osType == "windows" {
+		genUser = "Student"
+		password = ""
+	}
+	_ = p.db.UpdatePodVMCredentials(ctx, podVMID, genUser, password)
 
 	// Step 2: Power on
 	p.publishProgress(job.ID, "vm_poweron", fmt.Sprintf("Powering on %s", payload.VMName))
