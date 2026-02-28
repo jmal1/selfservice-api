@@ -317,6 +317,7 @@ func (c *Client) ensureTemplateSnapshot(ctx context.Context, template *object.Vi
 }
 
 // DestroyVM powers off (if running) and destroys a VM by MoRef.
+// Idempotent: returns nil if the VM was already deleted.
 func (c *Client) DestroyVM(ctx context.Context, moref string) error {
 	if err := c.ensureConnected(ctx); err != nil {
 		return err
@@ -325,18 +326,26 @@ func (c *Client) DestroyVM(ctx context.Context, moref string) error {
 	vm := object.NewVirtualMachine(c.client.Client,
 		types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
 
-	// Try to power off first (ignore errors if already off)
+	// Try to power off first (ignore errors if already off or deleted)
 	powerOffTask, err := vm.PowerOff(ctx)
 	if err == nil {
 		_ = powerOffTask.Wait(ctx)
 	}
 
-	// Destroy
+	// Destroy — treat "already deleted" as success
 	destroyTask, err := vm.Destroy(ctx)
 	if err != nil {
+		if isAlreadyDeletedErr(err) {
+			c.logger.Info("VM already deleted", "moref", moref)
+			return nil
+		}
 		return fmt.Errorf("destroy VM %s: %w", moref, err)
 	}
 	if err := destroyTask.Wait(ctx); err != nil {
+		if isAlreadyDeletedErr(err) {
+			c.logger.Info("VM already deleted", "moref", moref)
+			return nil
+		}
 		return fmt.Errorf("destroy VM task %s: %w", moref, err)
 	}
 
@@ -361,6 +370,7 @@ func (c *Client) PowerOnVM(ctx context.Context, moref string) error {
 }
 
 // PowerOffVM powers off a VM.
+// Idempotent: returns nil if the VM was already deleted.
 func (c *Client) PowerOffVM(ctx context.Context, moref string) error {
 	if err := c.ensureConnected(ctx); err != nil {
 		return err
@@ -371,9 +381,18 @@ func (c *Client) PowerOffVM(ctx context.Context, moref string) error {
 
 	task, err := vm.PowerOff(ctx)
 	if err != nil {
+		if isAlreadyDeletedErr(err) {
+			return nil
+		}
 		return fmt.Errorf("power off %s: %w", moref, err)
 	}
-	return task.Wait(ctx)
+	if err := task.Wait(ctx); err != nil {
+		if isAlreadyDeletedErr(err) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // RestartVM guest-restarts a VM (graceful reboot via VMware Tools).
@@ -571,7 +590,15 @@ func (c *Client) deletePortGroup(ctx context.Context, hostName, pgName string) e
 		return fmt.Errorf("get network system: %w", err)
 	}
 
-	return ns.RemovePortGroup(ctx, pgName)
+	if err := ns.RemovePortGroup(ctx, pgName); err != nil {
+		// Idempotent: port group already removed
+		if isResourceNotFoundErr(err) {
+			c.logger.Info("port group already removed", "host", hostName, "name", pgName)
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // FindTemplate looks up a VM template by name in the datacenter.
@@ -591,4 +618,18 @@ func (c *Client) Ping(ctx context.Context) error {
 	}
 	_, err := c.finder.Datacenter(ctx, c.config.Datacenter)
 	return err
+}
+
+// isAlreadyDeletedErr checks if a vSphere error indicates the object was already deleted.
+func isAlreadyDeletedErr(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "has already been deleted") ||
+		strings.Contains(msg, "not been completely created")
+}
+
+// isResourceNotFoundErr checks if a vSphere error indicates the resource was not found.
+func isResourceNotFoundErr(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "could not be found") ||
+		strings.Contains(msg, "NotFound")
 }
