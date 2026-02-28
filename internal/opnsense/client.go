@@ -198,9 +198,13 @@ func (c *Client) GetVLANByTag(ctx context.Context, tag int) (*VLAN, error) {
 func (c *Client) CreateDHCPSubnet(ctx context.Context, subnet, poolRange, gateway string) (string, error) {
 	payload := map[string]any{
 		"subnet4": map[string]any{
-			"subnet": subnet,
-			"pools":  poolRange,
-			"option_data_autocollect": "1",
+			"subnet":                  subnet,
+			"pools":                   poolRange,
+			"option_data_autocollect": "0",
+			"option_data": map[string]any{
+				"routers":              gateway,
+				"domain_name_servers":  gateway,
+			},
 		},
 	}
 
