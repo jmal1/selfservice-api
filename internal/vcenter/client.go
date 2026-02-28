@@ -180,8 +180,9 @@ func (c *Client) CloneVM(ctx context.Context, params CloneVMParams) (string, err
 		},
 	}
 
-	// Build clone spec — clone first without config changes to avoid
-	// vCenter disk format errors with non-admin service accounts.
+	// Build clone spec — use linked clones for fast provisioning.
+	// Linked clones create a thin delta disk referencing the template's snapshot,
+	// reducing clone time from minutes (full copy) to seconds.
 	poolRef := pool.Reference()
 	cloneSpec := types.VirtualMachineCloneSpec{
 		Location: types.VirtualMachineRelocateSpec{
@@ -190,6 +191,17 @@ func (c *Client) CloneVM(ctx context.Context, params CloneVMParams) (string, err
 		},
 		PowerOn:  false,
 		Template: false,
+	}
+
+	// Get or create a snapshot on the template for linked cloning
+	snapRef, err := c.ensureTemplateSnapshot(ctx, template, params.TemplateName)
+	if err != nil {
+		c.logger.Warn("linked clone unavailable, falling back to full clone",
+			"template", params.TemplateName, "error", err)
+	} else {
+		cloneSpec.Snapshot = snapRef
+		cloneSpec.Location.DiskMoveType = string(types.VirtualMachineRelocateDiskMoveOptionsCreateNewChildDiskBacking)
+		c.logger.Info("using linked clone", "template", params.TemplateName)
 	}
 
 	c.logger.Info("cloning VM",
@@ -249,6 +261,36 @@ func (c *Client) CloneVM(ctx context.Context, params CloneVMParams) (string, err
 
 	c.logger.Info("VM reconfigured", "name", params.VMName, "vcpus", params.VCPUs, "ram_mb", params.RAMmb)
 	return vmRef.Value, nil
+}
+
+// ensureTemplateSnapshot checks if the template has a snapshot for linked cloning.
+// If no snapshot exists, it creates one. Returns the snapshot MoRef.
+func (c *Client) ensureTemplateSnapshot(ctx context.Context, template *object.VirtualMachine, name string) (*types.ManagedObjectReference, error) {
+	var vmMo mo.VirtualMachine
+	if err := template.Properties(ctx, template.Reference(), []string{"snapshot"}, &vmMo); err != nil {
+		return nil, fmt.Errorf("get snapshot info: %w", err)
+	}
+
+	// Use existing snapshot if available
+	if vmMo.Snapshot != nil && vmMo.Snapshot.CurrentSnapshot != nil {
+		c.logger.Info("template has existing snapshot", "template", name)
+		return vmMo.Snapshot.CurrentSnapshot, nil
+	}
+
+	// Create a snapshot for linked cloning (no memory, no quiesce — template is powered off)
+	c.logger.Info("creating linked-clone base snapshot", "template", name)
+	task, err := template.CreateSnapshot(ctx, "linked-clone-base", "Auto-created for linked clone provisioning", false, false)
+	if err != nil {
+		return nil, fmt.Errorf("create snapshot: %w", err)
+	}
+
+	info, err := task.WaitForResult(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot task: %w", err)
+	}
+
+	snapRef := info.Result.(types.ManagedObjectReference)
+	return &snapRef, nil
 }
 
 // DestroyVM powers off (if running) and destroys a VM by MoRef.
