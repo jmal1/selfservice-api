@@ -269,19 +269,20 @@ hostname: %s
 `, params.Password, params.VMName)
 			metadata = fmt.Sprintf(`{"instance-id": "%s", "local-hostname": "%s"}`, params.VMName, params.VMName)
 		} else if params.OSType == "windows" {
-			// cloudbase-init format: PowerShell script to set Student password and hostname
-			userdata = fmt.Sprintf(`#ps1
-$password = ConvertTo-SecureString '%s' -AsPlainText -Force
-Get-LocalUser -Name 'Student' | Set-LocalUser -Password $password
-Rename-Computer -NewName '%s' -Force
-`, params.Password, params.VMName)
-			metadata = fmt.Sprintf(`{"instance-id": "%s", "local-hostname": "%s"}`, params.VMName, params.VMName)
+			// cloudbase-init: SetUserPasswordPlugin reads admin_pass from metadata,
+			// SetHostNamePlugin reads local-hostname. No userdata script needed.
+			metadata = fmt.Sprintf(`{"instance-id": "%s", "local-hostname": "%s", "admin_pass": "%s"}`,
+				params.VMName, params.VMName, params.Password)
 		}
 
 		if userdata != "" {
 			configSpec.ExtraConfig = append(configSpec.ExtraConfig,
 				&types.OptionValue{Key: "guestinfo.userdata", Value: base64.StdEncoding.EncodeToString([]byte(userdata))},
 				&types.OptionValue{Key: "guestinfo.userdata.encoding", Value: "base64"},
+			)
+		}
+		if metadata != "" {
+			configSpec.ExtraConfig = append(configSpec.ExtraConfig,
 				&types.OptionValue{Key: "guestinfo.metadata", Value: base64.StdEncoding.EncodeToString([]byte(metadata))},
 				&types.OptionValue{Key: "guestinfo.metadata.encoding", Value: "base64"},
 			)
