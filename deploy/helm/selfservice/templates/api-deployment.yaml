@@ -85,12 +85,12 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.secrets.vcenter }}
-                  key: username
+                  key: vcenter-user
             - name: VCENTER_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.secrets.vcenter }}
-                  key: password
+                  key: vcenter-password
             - name: VCENTER_DATACENTER
               value: {{ .Values.vcenter.datacenter | quote }}
             - name: VCENTER_INSECURE
