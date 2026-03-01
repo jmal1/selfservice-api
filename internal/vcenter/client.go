@@ -384,6 +384,7 @@ func (c *Client) DestroyVM(ctx context.Context, moref string) error {
 }
 
 // PowerOnVM powers on a VM.
+// Idempotent: returns nil if the VM is already powered on.
 func (c *Client) PowerOnVM(ctx context.Context, moref string) error {
 	if err := c.ensureConnected(ctx); err != nil {
 		return err
@@ -394,9 +395,18 @@ func (c *Client) PowerOnVM(ctx context.Context, moref string) error {
 
 	task, err := vm.PowerOn(ctx)
 	if err != nil {
+		if isAlreadyPoweredOnErr(err) {
+			return nil
+		}
 		return fmt.Errorf("power on %s: %w", moref, err)
 	}
-	return task.Wait(ctx)
+	if err := task.Wait(ctx); err != nil {
+		if isAlreadyPoweredOnErr(err) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // PowerOffVM powers off a VM.
@@ -685,6 +695,13 @@ func isAlreadyDeletedErr(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "has already been deleted") ||
 		strings.Contains(msg, "not been completely created")
+}
+
+// isAlreadyPoweredOnErr checks if a vSphere error indicates the VM is already powered on.
+func isAlreadyPoweredOnErr(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "current state (Powered on)") ||
+		strings.Contains(msg, "InvalidPowerState")
 }
 
 // isResourceNotFoundErr checks if a vSphere error indicates the resource was not found.
