@@ -123,7 +123,12 @@ func (h *Handler) VMConsoleWS(w http.ResponseWriter, r *http.Request) {
 	defer esxiConn.Close()
 
 	// Upgrade client connection to WebSocket
-	clientConn, err := wsUpgrader.Upgrade(w, r, nil)
+	// Pass through the negotiated subprotocol from ESXi
+	responseHeader := http.Header{}
+	if sp := esxiConn.Subprotocol(); sp != "" {
+		responseHeader.Set("Sec-WebSocket-Protocol", sp)
+	}
+	clientConn, err := wsUpgrader.Upgrade(w, r, responseHeader)
 	if err != nil {
 		h.logger.Error("console: client upgrade failed", "error", err)
 		return // Upgrade already sent error response
@@ -132,6 +137,13 @@ func (h *Handler) VMConsoleWS(w http.ResponseWriter, r *http.Request) {
 
 	h.logger.Info("console: session started", "user", userID, "vm", vm.DisplayName, "pod", pod.Name)
 
+	h.logger.Info("console: proxy starting",
+		"user", userID,
+		"vm", vm.DisplayName,
+		"esxi_subprotocol", esxiConn.Subprotocol(),
+		"client_subprotocol", clientConn.Subprotocol(),
+	)
+
 	// Bidirectional proxy
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -139,7 +151,8 @@ func (h *Handler) VMConsoleWS(w http.ResponseWriter, r *http.Request) {
 	// Client → ESXi
 	go func() {
 		defer wg.Done()
-		proxyWS(clientConn, esxiConn)
+		err := proxyWS(clientConn, esxiConn)
+		h.logger.Info("console: client→esxi closed", "error", err, "vm", vm.DisplayName)
 		esxiConn.WriteMessage(websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 	}()
@@ -147,7 +160,8 @@ func (h *Handler) VMConsoleWS(w http.ResponseWriter, r *http.Request) {
 	// ESXi → Client
 	go func() {
 		defer wg.Done()
-		proxyWS(esxiConn, clientConn)
+		err := proxyWS(esxiConn, clientConn)
+		h.logger.Info("console: esxi→client closed", "error", err, "vm", vm.DisplayName)
 		clientConn.WriteMessage(websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 	}()
@@ -166,21 +180,21 @@ func (h *Handler) VMConsoleWS(w http.ResponseWriter, r *http.Request) {
 }
 
 // proxyWS copies messages from src to dst until an error occurs.
-func proxyWS(src, dst *websocket.Conn) {
+func proxyWS(src, dst *websocket.Conn) error {
 	for {
 		msgType, reader, err := src.NextReader()
 		if err != nil {
-			return
+			return fmt.Errorf("NextReader: %w", err)
 		}
 		writer, err := dst.NextWriter(msgType)
 		if err != nil {
-			return
+			return fmt.Errorf("NextWriter: %w", err)
 		}
 		if _, err := io.Copy(writer, reader); err != nil {
-			return
+			return fmt.Errorf("Copy: %w", err)
 		}
 		if err := writer.Close(); err != nil {
-			return
+			return fmt.Errorf("WriterClose: %w", err)
 		}
 	}
 }
