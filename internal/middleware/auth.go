@@ -30,6 +30,9 @@ func Auth(provider *auth.Provider) func(http.Handler) http.Handler {
 				return
 			}
 
+			// Sliding window: refresh token if past halfway
+			provider.RefreshSessionCookie(w, claims)
+
 			uid, err := uuid.Parse(claims.UserID)
 			if err != nil {
 				http.Error(w, "invalid session", http.StatusUnauthorized)

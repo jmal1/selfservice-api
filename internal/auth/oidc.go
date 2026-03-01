@@ -31,6 +31,8 @@ type OIDCClaims struct {
 	Groups        []string `json:"groups"`
 }
 
+const sessionTTL = 8 * time.Hour
+
 // SessionClaims are stored in the JWT session token.
 type SessionClaims struct {
 	jwt.RegisteredClaims
@@ -189,7 +191,7 @@ func (p *Provider) CallbackHandler(w http.ResponseWriter, r *http.Request) {
 		Name:     "session",
 		Value:    sessionToken,
 		Path:     "/",
-		MaxAge:   int((15 * time.Minute).Seconds()),
+		MaxAge:   int(sessionTTL.Seconds()),
 		HttpOnly: true,
 		Secure:   true,
 		SameSite: http.SameSiteLaxMode,
@@ -265,13 +267,45 @@ func (p *Provider) ValidateSession(r *http.Request) (*SessionClaims, error) {
 	return claims, nil
 }
 
+// RefreshSessionCookie re-issues the session JWT if it's past the halfway point of its TTL.
+// This creates a sliding window so active users don't get logged out.
+func (p *Provider) RefreshSessionCookie(w http.ResponseWriter, claims *SessionClaims) {
+	if claims.ExpiresAt == nil || claims.IssuedAt == nil {
+		return
+	}
+	total := claims.ExpiresAt.Time.Sub(claims.IssuedAt.Time)
+	elapsed := time.Since(claims.IssuedAt.Time)
+	if elapsed < total/2 {
+		return
+	}
+
+	// Re-issue token with fresh TTL
+	now := time.Now()
+	claims.IssuedAt = jwt.NewNumericDate(now)
+	claims.ExpiresAt = jwt.NewNumericDate(now.Add(sessionTTL))
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := token.SignedString(p.jwtSecret)
+	if err != nil {
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     "session",
+		Value:    signed,
+		Path:     "/",
+		MaxAge:   int(sessionTTL.Seconds()),
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
 func (p *Provider) issueSessionToken(user *models.User, sessionID string) (string, error) {
 	now := time.Now()
 	claims := SessionClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   user.ID.String(),
 			IssuedAt:  jwt.NewNumericDate(now),
-			ExpiresAt: jwt.NewNumericDate(now.Add(15 * time.Minute)),
+			ExpiresAt: jwt.NewNumericDate(now.Add(sessionTTL)),
 			Issuer:    "selfservice-api",
 		},
 		UserID:    user.ID.String(),
