@@ -19,9 +19,7 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 	// Global middleware
 	r.Use(chimiddleware.RequestID)
 	r.Use(chimiddleware.RealIP)
-	r.Use(chimiddleware.Logger)
 	r.Use(chimiddleware.Recoverer)
-	r.Use(chimiddleware.Compress(5))
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{"https://selfservice.lab.jmal.io"},
 		AllowedMethods:   []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"},
@@ -33,6 +31,17 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 	// Health check (unauthenticated)
 	r.Get("/healthz", h.Health)
 	r.Get("/readyz", h.Health)
+
+	// WebSocket routes — mounted before Logger/Compress which break http.Hijacker
+	r.Route("/api/v1/pods/{podID}/vms/{vmID}/console", func(r chi.Router) {
+		r.Use(middleware.Auth(authProvider))
+		r.Get("/ws", h.VMConsoleWS)
+	})
+
+	// Non-WebSocket routes get Logger + Compress
+	r.Group(func(r chi.Router) {
+		r.Use(chimiddleware.Logger)
+		r.Use(chimiddleware.Compress(5))
 
 	// Auth routes (unauthenticated)
 	r.Route("/auth", func(r chi.Router) {
@@ -67,9 +76,6 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 			r.Post("/{podID}/vms/{vmID}/start", h.VMPowerAction)
 			r.Post("/{podID}/vms/{vmID}/stop", h.VMPowerAction)
 			r.Post("/{podID}/vms/{vmID}/restart", h.VMPowerAction)
-
-			// VM console WebSocket proxy
-			r.Get("/{podID}/vms/{vmID}/console/ws", h.VMConsoleWS)
 		})
 
 		// Templates
@@ -105,6 +111,7 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 			r.Delete("/vlans/{vlanID}", h.AdminRemoveVLAN)
 		})
 	})
+	}) // close r.Group for Logger/Compress
 
 	return r
 }
