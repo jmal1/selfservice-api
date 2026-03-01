@@ -269,8 +269,14 @@ hostname: %s
 `, params.Password, params.VMName)
 			metadata = fmt.Sprintf(`{"instance-id": "%s", "local-hostname": "%s"}`, params.VMName, params.VMName)
 		} else if params.OSType == "windows" {
-			// cloudbase-init: SetUserPasswordPlugin reads admin_pass from metadata,
-			// SetHostNamePlugin reads local-hostname. No userdata script needed.
+			// cloudbase-init: UserDataPlugin runs #ps1 script to set password.
+			// SetHostNamePlugin reads local-hostname from metadata.
+			// Plugin order in cloudbase-init.conf must have UserData before SetHostName
+			// (SetHostName triggers a reboot).
+			userdata = fmt.Sprintf(`#ps1_sysnative
+$password = ConvertTo-SecureString '%s' -AsPlainText -Force
+Get-LocalUser -Name 'Student' | Set-LocalUser -Password $password
+`, params.Password)
 			metadata = fmt.Sprintf(`{"instance-id": "%s", "local-hostname": "%s", "admin_pass": "%s"}`,
 				params.VMName, params.VMName, params.Password)
 		}
