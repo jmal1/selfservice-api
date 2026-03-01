@@ -3,7 +3,6 @@ package handlers
 import (
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
+	"github.com/jmal1/selfservice-api/internal/audit"
 	"github.com/jmal1/selfservice-api/internal/middleware"
 	"github.com/jmal1/selfservice-api/internal/models"
 )
@@ -92,18 +92,12 @@ func (h *Handler) VMConsoleWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Audit: console opened
-	details, _ := json.Marshal(map[string]string{
-		"vm_name": vm.DisplayName,
-		"moref":   *vm.VCenterVMID,
-	})
-	h.db.InsertAuditLog(ctx, models.AuditLog{
-		UserID:       &userID,
-		Action:       "console.open",
-		ResourceType: strPtr("vm"),
-		ResourceID:   &vmID,
-		Details:      details,
-		IPAddress:    strPtr(r.RemoteAddr),
-	})
+	audit.Log(ctx, h.db, "console.open",
+		audit.Resource("vm", vmID),
+		audit.IP(r.RemoteAddr),
+		audit.Detail("vm_name", vm.DisplayName),
+		audit.Detail("moref", *vm.VCenterVMID),
+	)
 
 	// Connect to ESXi WebMKS endpoint
 	esxiURL := fmt.Sprintf("wss://%s:%d/ticket/%s", ticket.Host, ticket.Port, ticket.Ticket)
@@ -161,14 +155,12 @@ func (h *Handler) VMConsoleWS(w http.ResponseWriter, r *http.Request) {
 	wg.Wait()
 
 	// Audit: console closed
-	h.db.InsertAuditLog(context.Background(), models.AuditLog{
-		UserID:       &userID,
-		Action:       "console.close",
-		ResourceType: strPtr("vm"),
-		ResourceID:   &vmID,
-		Details:      details,
-		IPAddress:    strPtr(r.RemoteAddr),
-	})
+	audit.Log(context.Background(), h.db, "console.close",
+		audit.Resource("vm", vmID),
+		audit.IP(r.RemoteAddr),
+		audit.Detail("vm_name", vm.DisplayName),
+		audit.Detail("moref", *vm.VCenterVMID),
+	)
 
 	h.logger.Info("console: session ended", "user", userID, "vm", vm.DisplayName)
 }

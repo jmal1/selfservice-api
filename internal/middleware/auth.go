@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/jmal1/selfservice-api/internal/audit"
 	"github.com/jmal1/selfservice-api/internal/auth"
 	"github.com/jmal1/selfservice-api/internal/models"
 )
@@ -13,9 +14,10 @@ import (
 type contextKey string
 
 const (
-	userIDKey   contextKey = "user_id"
-	usernameKey contextKey = "username"
-	roleKey     contextKey = "role"
+	userIDKey    contextKey = "user_id"
+	usernameKey  contextKey = "username"
+	roleKey      contextKey = "role"
+	sessionIDKey contextKey = "session_id"
 )
 
 // Auth returns middleware that validates the session JWT.
@@ -37,6 +39,13 @@ func Auth(provider *auth.Provider) func(http.Handler) http.Handler {
 			ctx := context.WithValue(r.Context(), userIDKey, uid)
 			ctx = context.WithValue(ctx, usernameKey, claims.Username)
 			ctx = context.WithValue(ctx, roleKey, claims.Role)
+			ctx = audit.WithUserID(ctx, uid)
+			ctx = audit.WithClientIP(ctx, r.RemoteAddr)
+			if claims.SessionID != "" {
+				if sid, err := uuid.Parse(claims.SessionID); err == nil {
+					ctx = context.WithValue(ctx, sessionIDKey, sid)
+				}
+			}
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
@@ -78,6 +87,14 @@ func RoleFromContext(ctx context.Context) string {
 		return v
 	}
 	return ""
+}
+
+// SessionIDFromContext extracts the session ID from the request context.
+func SessionIDFromContext(ctx context.Context) uuid.UUID {
+	if v, ok := ctx.Value(sessionIDKey).(uuid.UUID); ok {
+		return v
+	}
+	return uuid.Nil
 }
 
 // hasMinRole checks if the actual role meets or exceeds the minimum required role.

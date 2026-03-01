@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -953,4 +954,200 @@ func (q *Queries) ListTemplateDependents(ctx context.Context, templateID uuid.UU
 		vms = append(vms, vm)
 	}
 	return templateName, vms, rows.Err()
+}
+
+// --- User Sessions ---
+
+// CreateSession inserts a new active session row.
+func (q *Queries) CreateSession(ctx context.Context, id uuid.UUID, userID uuid.UUID, ip, userAgent string) error {
+	_, err := q.pool.Exec(ctx, `
+		INSERT INTO user_sessions (id, user_id, ip_address, user_agent)
+		VALUES ($1, $2, $3, $4)
+	`, id, userID, ip, userAgent)
+	return err
+}
+
+// DeactivateSession marks a session as inactive.
+func (q *Queries) DeactivateSession(ctx context.Context, sessionID uuid.UUID) error {
+	_, err := q.pool.Exec(ctx, `
+		UPDATE user_sessions SET is_active = false WHERE id = $1
+	`, sessionID)
+	return err
+}
+
+// TouchSession updates last_activity for a session.
+func (q *Queries) TouchSession(ctx context.Context, sessionID uuid.UUID) error {
+	_, err := q.pool.Exec(ctx, `
+		UPDATE user_sessions SET last_activity = now() WHERE id = $1 AND is_active = true
+	`, sessionID)
+	return err
+}
+
+// DeactivateStaleSessions marks sessions with no activity for the given duration as inactive.
+func (q *Queries) DeactivateStaleSessions(ctx context.Context, staleMinutes int) (int64, error) {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE user_sessions SET is_active = false
+		WHERE is_active = true AND last_activity < now() - make_interval(mins := $1)
+	`, staleMinutes)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// ActiveSession represents a session joined with user info for admin display.
+type ActiveSession struct {
+	ID           uuid.UUID  `json:"id"`
+	UserID       uuid.UUID  `json:"user_id"`
+	Username     string     `json:"username"`
+	DisplayName  *string    `json:"display_name,omitempty"`
+	Email        *string    `json:"email,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+	LastActivity time.Time  `json:"last_activity"`
+	IPAddress    *string    `json:"ip_address,omitempty"`
+	UserAgent    *string    `json:"user_agent,omitempty"`
+}
+
+// ListActiveSessions returns all active sessions with user info.
+func (q *Queries) ListActiveSessions(ctx context.Context) ([]ActiveSession, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT s.id, s.user_id, u.username, u.display_name, u.email,
+		       s.created_at, s.last_activity, CAST(s.ip_address AS TEXT), s.user_agent
+		FROM user_sessions s
+		JOIN users u ON s.user_id = u.id
+		WHERE s.is_active = true
+		ORDER BY s.last_activity DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var sessions []ActiveSession
+	for rows.Next() {
+		var s ActiveSession
+		if err := rows.Scan(&s.ID, &s.UserID, &s.Username, &s.DisplayName, &s.Email,
+			&s.CreatedAt, &s.LastActivity, &s.IPAddress, &s.UserAgent); err != nil {
+			return nil, err
+		}
+		sessions = append(sessions, s)
+	}
+	return sessions, rows.Err()
+}
+
+// --- Paginated Audit Log ---
+
+// AuditLogFilter holds optional query filters for listing audit entries.
+type AuditLogFilter struct {
+	Page         int
+	PerPage      int
+	Action       string     // prefix match (e.g. "pod" matches "pod.create", "pod.delete")
+	UserID       *uuid.UUID
+	ResourceType string
+	ResourceID   *uuid.UUID
+	Since        *time.Time
+	Until        *time.Time
+}
+
+// AuditLogPage holds a page of audit entries plus total count.
+type AuditLogPage struct {
+	Entries []models.AuditLog `json:"entries"`
+	Total   int64             `json:"total"`
+	Page    int               `json:"page"`
+	PerPage int               `json:"per_page"`
+}
+
+// ListAuditLogPaginated returns a filtered, paginated audit log.
+func (q *Queries) ListAuditLogPaginated(ctx context.Context, f AuditLogFilter) (*AuditLogPage, error) {
+	if f.Page < 1 {
+		f.Page = 1
+	}
+	if f.PerPage < 1 || f.PerPage > 100 {
+		f.PerPage = 50
+	}
+
+	// Build WHERE clauses dynamically
+	where := "WHERE 1=1"
+	args := []any{}
+	argIdx := 1
+
+	if f.Action != "" {
+		where += fmt.Sprintf(" AND a.action LIKE $%d", argIdx)
+		args = append(args, f.Action+"%")
+		argIdx++
+	}
+	if f.UserID != nil {
+		where += fmt.Sprintf(" AND a.user_id = $%d", argIdx)
+		args = append(args, *f.UserID)
+		argIdx++
+	}
+	if f.ResourceType != "" {
+		where += fmt.Sprintf(" AND a.resource_type = $%d", argIdx)
+		args = append(args, f.ResourceType)
+		argIdx++
+	}
+	if f.ResourceID != nil {
+		where += fmt.Sprintf(" AND a.resource_id = $%d", argIdx)
+		args = append(args, *f.ResourceID)
+		argIdx++
+	}
+	if f.Since != nil {
+		where += fmt.Sprintf(" AND a.created_at >= $%d", argIdx)
+		args = append(args, *f.Since)
+		argIdx++
+	}
+	if f.Until != nil {
+		where += fmt.Sprintf(" AND a.created_at <= $%d", argIdx)
+		args = append(args, *f.Until)
+		argIdx++
+	}
+
+	// Count total
+	var total int64
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM audit_log a %s", where)
+	if err := q.pool.QueryRow(ctx, countQuery, args...).Scan(&total); err != nil {
+		return nil, err
+	}
+
+	// Fetch page
+	offset := (f.Page - 1) * f.PerPage
+	dataQuery := fmt.Sprintf(`
+		SELECT a.id, a.user_id, u.display_name, u.email,
+		       a.action, a.resource_type, a.resource_id, a.details,
+		       CAST(a.ip_address AS TEXT), a.created_at
+		FROM audit_log a
+		LEFT JOIN users u ON a.user_id = u.id
+		%s
+		ORDER BY a.created_at DESC
+		LIMIT $%d OFFSET $%d
+	`, where, argIdx, argIdx+1)
+	args = append(args, f.PerPage, offset)
+
+	rows, err := q.pool.Query(ctx, dataQuery, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var entries []models.AuditLog
+	for rows.Next() {
+		var e models.AuditLog
+		if err := rows.Scan(
+			&e.ID, &e.UserID, &e.UserDisplayName, &e.UserEmail,
+			&e.Action, &e.ResourceType, &e.ResourceID, &e.Details, &e.IPAddress, &e.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		entries = append(entries, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return &AuditLogPage{
+		Entries: entries,
+		Total:   total,
+		Page:    f.Page,
+		PerPage: f.PerPage,
+	}, nil
 }

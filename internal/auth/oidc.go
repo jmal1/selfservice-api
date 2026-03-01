@@ -13,8 +13,10 @@ import (
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 	"golang.org/x/oauth2"
 
+	"github.com/jmal1/selfservice-api/internal/audit"
 	"github.com/jmal1/selfservice-api/internal/config"
 	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/models"
@@ -32,9 +34,10 @@ type OIDCClaims struct {
 // SessionClaims are stored in the JWT session token.
 type SessionClaims struct {
 	jwt.RegisteredClaims
-	UserID   string `json:"user_id"`
-	Username string `json:"username"`
-	Role     string `json:"role"`
+	UserID    string `json:"user_id"`
+	Username  string `json:"username"`
+	Role      string `json:"role"`
+	SessionID string `json:"session_id,omitempty"`
 }
 
 // Provider handles OIDC authentication with Authentik.
@@ -166,8 +169,15 @@ func (p *Provider) CallbackHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Create server-side session
+	sessionID := uuid.New()
+	if err := p.queries.CreateSession(r.Context(), sessionID, dbUser.ID, r.RemoteAddr, r.UserAgent()); err != nil {
+		p.logger.Error("failed to create session", "error", err)
+		// Non-fatal: continue without server-side session tracking
+	}
+
 	// Issue JWT session token
-	sessionToken, err := p.issueSessionToken(dbUser)
+	sessionToken, err := p.issueSessionToken(dbUser, sessionID.String())
 	if err != nil {
 		p.logger.Error("failed to issue session token", "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -194,11 +204,32 @@ func (p *Provider) CallbackHandler(w http.ResponseWriter, r *http.Request) {
 	})
 
 	// Redirect to frontend
+	audit.Log(r.Context(), p.queries, "auth.login",
+		audit.User(dbUser.ID),
+		audit.IP(r.RemoteAddr),
+		audit.Detail("username", dbUser.Username),
+		audit.Detail("role", role),
+		audit.Detail("session_id", sessionID.String()),
+	)
 	http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
 }
 
 // LogoutHandler clears the session.
 func (p *Provider) LogoutHandler(w http.ResponseWriter, r *http.Request) {
+	// Deactivate server-side session if present
+	if claims, err := p.ValidateSession(r); err == nil {
+		if sid, err := uuid.Parse(claims.SessionID); err == nil {
+			_ = p.queries.DeactivateSession(r.Context(), sid)
+		}
+		if uid, err := uuid.Parse(claims.UserID); err == nil {
+			audit.Log(r.Context(), p.queries, "auth.logout",
+				audit.User(uid),
+				audit.IP(r.RemoteAddr),
+				audit.Detail("username", claims.Username),
+			)
+		}
+	}
+
 	http.SetCookie(w, &http.Cookie{
 		Name:   "session",
 		Value:  "",
@@ -234,7 +265,7 @@ func (p *Provider) ValidateSession(r *http.Request) (*SessionClaims, error) {
 	return claims, nil
 }
 
-func (p *Provider) issueSessionToken(user *models.User) (string, error) {
+func (p *Provider) issueSessionToken(user *models.User, sessionID string) (string, error) {
 	now := time.Now()
 	claims := SessionClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
@@ -243,9 +274,10 @@ func (p *Provider) issueSessionToken(user *models.User) (string, error) {
 			ExpiresAt: jwt.NewNumericDate(now.Add(15 * time.Minute)),
 			Issuer:    "selfservice-api",
 		},
-		UserID:   user.ID.String(),
-		Username: user.Username,
-		Role:     user.Role,
+		UserID:    user.ID.String(),
+		Username:  user.Username,
+		Role:      user.Role,
+		SessionID: sessionID,
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)

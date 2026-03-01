@@ -7,12 +7,13 @@ import (
 
 	"github.com/jmal1/selfservice-api/internal/api/handlers"
 	"github.com/jmal1/selfservice-api/internal/auth"
+	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/middleware"
 	"github.com/jmal1/selfservice-api/internal/models"
 )
 
 // Setup creates the chi router with all routes.
-func Setup(h *handlers.Handler, authProvider *auth.Provider) *chi.Mux {
+func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Queries) *chi.Mux {
 	r := chi.NewRouter()
 
 	// Global middleware
@@ -49,6 +50,7 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider) *chi.Mux {
 	// API v1 (authenticated)
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Use(middleware.Auth(authProvider))
+		r.Use(middleware.AuditRequests(db))
 
 		// Pods
 		r.Route("/pods", func(r chi.Router) {
@@ -93,6 +95,9 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider) *chi.Mux {
 
 			r.Get("/jobs", h.AdminListJobs)
 			r.Get("/audit", h.AdminListAuditLog)
+			r.Get("/audit/search", h.AdminSearchAuditLog)
+
+			r.Get("/sessions", h.AdminListSessions)
 
 			r.Get("/vlans", h.AdminListVLANPool)
 			r.Post("/vlans", h.AdminAddVLAN)

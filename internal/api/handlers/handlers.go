@@ -14,6 +14,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/jmal1/selfservice-api/internal/audit"
 	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/middleware"
 	"github.com/jmal1/selfservice-api/internal/models"
@@ -319,14 +320,11 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Audit
-	h.db.InsertAuditLog(ctx, models.AuditLog{
-		UserID:       &userID,
-		Action:       "pod.create.requested",
-		ResourceType: strPtr("job"),
-		ResourceID:   &job.ID,
-		Details:      payload,
-		IPAddress:    strPtr(r.RemoteAddr),
-	})
+	audit.Log(r.Context(), h.db, "pod.create",
+		audit.Resource("job", job.ID),
+		audit.IP(r.RemoteAddr),
+		audit.Detail("pod_id", podID.String()),
+	)
 
 	respondJSON(w, http.StatusAccepted, map[string]any{
 		"job_id": job.ID,
@@ -372,6 +370,13 @@ func (h *Handler) DeletePod(w http.ResponseWriter, r *http.Request) {
 	if err := h.events.PublishJobCreated(job.ID, job.Type); err != nil {
 		h.logger.Warn("failed to publish job created event", "error", err)
 	}
+
+	audit.Log(r.Context(), h.db, "pod.delete",
+		audit.Resource("pod", podID),
+		audit.IP(r.RemoteAddr),
+		audit.Detail("pod_name", pod.Name),
+		audit.Detail("job_id", job.ID.String()),
+	)
 
 	respondJSON(w, http.StatusAccepted, map[string]any{
 		"job_id": job.ID,
@@ -438,14 +443,11 @@ func (h *Handler) DeleteVM(w http.ResponseWriter, r *http.Request) {
 		h.logger.Warn("failed to publish job created event", "error", err)
 	}
 
-	h.db.InsertAuditLog(r.Context(), models.AuditLog{
-		UserID:       &userID,
-		Action:       "vm.delete.requested",
-		ResourceType: strPtr("vm"),
-		ResourceID:   &vmID,
-		Details:      payload,
-		IPAddress:    strPtr(r.RemoteAddr),
-	})
+	audit.Log(r.Context(), h.db, "vm.delete",
+		audit.Resource("vm", vmID),
+		audit.IP(r.RemoteAddr),
+		audit.Detail("job_id", job.ID.String()),
+	)
 
 	respondJSON(w, http.StatusAccepted, map[string]any{
 		"job_id": job.ID,
@@ -577,14 +579,11 @@ func (h *Handler) AddVM(w http.ResponseWriter, r *http.Request) {
 		h.logger.Warn("failed to publish job created event", "error", err)
 	}
 
-	h.db.InsertAuditLog(r.Context(), models.AuditLog{
-		UserID:       &userID,
-		Action:       "vm.add.requested",
-		ResourceType: strPtr("vm"),
-		ResourceID:   &vm.ID,
-		Details:      payload,
-		IPAddress:    strPtr(r.RemoteAddr),
-	})
+	audit.Log(r.Context(), h.db, "vm.add",
+		audit.Resource("vm", vm.ID),
+		audit.IP(r.RemoteAddr),
+		audit.Detail("job_id", job.ID.String()),
+	)
 
 	respondJSON(w, http.StatusAccepted, map[string]any{
 		"job_id": job.ID,
@@ -660,14 +659,11 @@ func (h *Handler) VMPowerAction(w http.ResponseWriter, r *http.Request) {
 		h.logger.Warn("failed to publish job created event", "error", err)
 	}
 
-	h.db.InsertAuditLog(r.Context(), models.AuditLog{
-		UserID:       &userID,
-		Action:       "vm." + action + ".requested",
-		ResourceType: strPtr("vm"),
-		ResourceID:   &vmID,
-		Details:      payload,
-		IPAddress:    strPtr(r.RemoteAddr),
-	})
+	audit.Log(r.Context(), h.db, "vm."+action,
+		audit.Resource("vm", vmID),
+		audit.IP(r.RemoteAddr),
+		audit.Detail("job_id", job.ID.String()),
+	)
 
 	respondJSON(w, http.StatusAccepted, map[string]any{
 		"job_id": job.ID,
@@ -1051,10 +1047,6 @@ func respondJSON(w http.ResponseWriter, status int, data any) {
 	json.NewEncoder(w).Encode(data)
 }
 
-func strPtr(s string) *string {
-	return &s
-}
-
 // sanitizeName converts a display name to a DNS-safe slug.
 func sanitizeName(name string) string {
 	result := make([]byte, 0, len(name))
@@ -1074,4 +1066,70 @@ func sanitizeName(name string) string {
 		result = result[:len(result)-1]
 	}
 	return string(result)
+}
+
+// --- Paginated Audit Log ---
+
+// AdminSearchAuditLog returns filtered, paginated audit log entries.
+func (h *Handler) AdminSearchAuditLog(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+
+	filter := database.AuditLogFilter{
+		Action:       q.Get("action"),
+		ResourceType: q.Get("resource_type"),
+	}
+
+	if p := q.Get("page"); p != "" {
+		fmt.Sscanf(p, "%d", &filter.Page)
+	}
+	if pp := q.Get("per_page"); pp != "" {
+		fmt.Sscanf(pp, "%d", &filter.PerPage)
+	}
+	if uid := q.Get("user_id"); uid != "" {
+		if id, err := uuid.Parse(uid); err == nil {
+			filter.UserID = &id
+		}
+	}
+	if rid := q.Get("resource_id"); rid != "" {
+		if id, err := uuid.Parse(rid); err == nil {
+			filter.ResourceID = &id
+		}
+	}
+	if s := q.Get("since"); s != "" {
+		if t, err := time.Parse(time.RFC3339, s); err == nil {
+			filter.Since = &t
+		}
+	}
+	if u := q.Get("until"); u != "" {
+		if t, err := time.Parse(time.RFC3339, u); err == nil {
+			filter.Until = &t
+		}
+	}
+
+	page, err := h.db.ListAuditLogPaginated(r.Context(), filter)
+	if err != nil {
+		h.logger.Error("admin search audit log failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if page.Entries == nil {
+		page.Entries = []models.AuditLog{}
+	}
+	respondJSON(w, http.StatusOK, page)
+}
+
+// --- Session Admin ---
+
+// AdminListSessions returns all active user sessions.
+func (h *Handler) AdminListSessions(w http.ResponseWriter, r *http.Request) {
+	sessions, err := h.db.ListActiveSessions(r.Context())
+	if err != nil {
+		h.logger.Error("admin list sessions failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if sessions == nil {
+		sessions = []database.ActiveSession{}
+	}
+	respondJSON(w, http.StatusOK, sessions)
 }
