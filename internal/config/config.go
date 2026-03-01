@@ -118,7 +118,7 @@ func Load() (*Config, error) {
 			Datacenter:    getEnv("VCENTER_DATACENTER", "JMAL-Datacenter"),
 			Datastore:     getEnv("VCENTER_DATASTORE", "NAS-vmstore"),
 			VMFolder:      getEnv("VCENTER_VM_FOLDER", "Student-VMs"),
-			ResourcePools: splitEnv("VCENTER_RESOURCE_POOLS", "*/Resources/Student-VMs"),
+			ResourcePools: splitEnv("VCENTER_RESOURCE_POOLS", "/JMAL-Datacenter/host/Intel-Cluster/Resources/Student-VMs,/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs"),
 			Hosts:         splitEnv("VCENTER_HOSTS", "esxi1.lab.jmal.io,esxi2.lab.jmal.io,nuc1.lab.jmal.io,nuc2.lab.jmal.io,nuc3.lab.jmal.io"),
 			Insecure:      getEnvBool("VCENTER_INSECURE", true),
 		},
