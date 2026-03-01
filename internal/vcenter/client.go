@@ -254,24 +254,38 @@ func (c *Client) CloneVM(ctx context.Context, params CloneVMParams) (string, err
 		}
 	}
 
-	// Inject cloud-init guestinfo for Linux VMs
-	if params.OSType == "linux" && params.Password != "" {
-		userdata := fmt.Sprintf(`#cloud-config
+	// Inject guestinfo for guest OS customization
+	if params.Password != "" {
+		var userdata, metadata string
+
+		if params.OSType == "linux" {
+			// cloud-init format
+			userdata = fmt.Sprintf(`#cloud-config
 password: %s
 chpasswd:
   expire: false
 ssh_pwauth: true
 hostname: %s
 `, params.Password, params.VMName)
+			metadata = fmt.Sprintf(`{"instance-id": "%s", "local-hostname": "%s"}`, params.VMName, params.VMName)
+		} else if params.OSType == "windows" {
+			// cloudbase-init format: PowerShell script to set Student password and hostname
+			userdata = fmt.Sprintf(`#ps1
+$password = ConvertTo-SecureString '%s' -AsPlainText -Force
+Get-LocalUser -Name 'Student' | Set-LocalUser -Password $password
+Rename-Computer -NewName '%s' -Force
+`, params.Password, params.VMName)
+			metadata = fmt.Sprintf(`{"instance-id": "%s", "local-hostname": "%s"}`, params.VMName, params.VMName)
+		}
 
-		metadata := fmt.Sprintf(`{"instance-id": "%s", "local-hostname": "%s"}`, params.VMName, params.VMName)
-
-		configSpec.ExtraConfig = append(configSpec.ExtraConfig,
-			&types.OptionValue{Key: "guestinfo.userdata", Value: base64.StdEncoding.EncodeToString([]byte(userdata))},
-			&types.OptionValue{Key: "guestinfo.userdata.encoding", Value: "base64"},
-			&types.OptionValue{Key: "guestinfo.metadata", Value: base64.StdEncoding.EncodeToString([]byte(metadata))},
-			&types.OptionValue{Key: "guestinfo.metadata.encoding", Value: "base64"},
-		)
+		if userdata != "" {
+			configSpec.ExtraConfig = append(configSpec.ExtraConfig,
+				&types.OptionValue{Key: "guestinfo.userdata", Value: base64.StdEncoding.EncodeToString([]byte(userdata))},
+				&types.OptionValue{Key: "guestinfo.userdata.encoding", Value: "base64"},
+				&types.OptionValue{Key: "guestinfo.metadata", Value: base64.StdEncoding.EncodeToString([]byte(metadata))},
+				&types.OptionValue{Key: "guestinfo.metadata.encoding", Value: "base64"},
+			)
+		}
 	}
 
 	reconfigTask, err := clonedVM.Reconfigure(ctx, configSpec)
@@ -443,6 +457,36 @@ func (c *Client) GetVM(ctx context.Context, moref string) (*mo.VirtualMachine, e
 		return nil, err
 	}
 	return &props, nil
+}
+
+// WebMKSTicket holds the result of a WebMKS ticket acquisition.
+type WebMKSTicket struct {
+	Host   string
+	Port   int32
+	Ticket string
+}
+
+// AcquireWebMKSTicket gets a WebMKS console ticket for a VM.
+// The ticket can be used to open a WebSocket connection to the ESXi host.
+func (c *Client) AcquireWebMKSTicket(ctx context.Context, moref string) (*WebMKSTicket, error) {
+	if err := c.ensureConnected(ctx); err != nil {
+		return nil, err
+	}
+
+	vm := object.NewVirtualMachine(c.client.Client,
+		types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
+
+	ticket, err := vm.AcquireTicket(ctx, string(types.VirtualMachineTicketTypeWebmks))
+	if err != nil {
+		return nil, fmt.Errorf("acquire webmks ticket for %s: %w", moref, err)
+	}
+
+	c.logger.Info("acquired WebMKS ticket", "moref", moref, "host", ticket.Host, "port", ticket.Port)
+	return &WebMKSTicket{
+		Host:   ticket.Host,
+		Port:   ticket.Port,
+		Ticket: ticket.Ticket,
+	}, nil
 }
 
 // ---------- Resource Pool Selection ----------

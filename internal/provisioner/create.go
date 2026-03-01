@@ -408,7 +408,7 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		stepName := fmt.Sprintf("vm_clone_%d", i)
 		p.publishProgress(job.ID, stepName, fmt.Sprintf("Cloning VM %s from %s", vmSpec.VMName, vmSpec.TemplateName))
 
-		// Generate credentials for cloud-init injection
+		// Generate credentials for cloud-init/cloudbase-init injection
 		password := ""
 		osType := vmSpec.OSType
 		if osType == "" {
@@ -421,7 +421,7 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 				}
 			}
 		}
-		if osType == "linux" {
+		if osType == "linux" || osType == "windows" {
 			password = generatePassword(12)
 		}
 
@@ -447,7 +447,6 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		username := "student"
 		if osType == "windows" {
 			username = "Student"
-			password = "" // Windows OOBE requires manual password setup
 		}
 		_ = p.db.UpdatePodVMCredentials(ctx, vmSpec.PodVMID, username, password)
 

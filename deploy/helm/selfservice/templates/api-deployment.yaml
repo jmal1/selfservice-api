@@ -78,6 +78,23 @@ spec:
                   key: client-secret
             - name: NATS_URL
               value: {{ .Values.natsURL | quote }}
+            # vCenter credentials for console access
+            - name: VCENTER_URL
+              value: "https://vcenter.lab.jmal.io/sdk"
+            - name: VCENTER_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.vcenter }}
+                  key: username
+            - name: VCENTER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.vcenter }}
+                  key: password
+            - name: VCENTER_DATACENTER
+              value: {{ .Values.vcenter.datacenter | quote }}
+            - name: VCENTER_INSECURE
+              value: {{ .Values.vcenter.insecure | quote }}
           livenessProbe:
             httpGet:
               path: /healthz

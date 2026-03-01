@@ -132,7 +132,7 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) error {
 	if tmplErr == nil {
 		osType = tmpl.OSType
 	}
-	if osType == "linux" {
+	if osType == "linux" || osType == "windows" {
 		password = generatePassword(12)
 	}
 
@@ -167,7 +167,6 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) error {
 		genUser := "student"
 		if osType == "windows" {
 			genUser = "Student"
-			password = ""
 		}
 		_ = p.db.UpdatePodVMCredentials(ctx, podVMID, genUser, password)
 	}

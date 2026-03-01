@@ -1,0 +1,194 @@
+package handlers
+
+import (
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"sync"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
+
+	"github.com/jmal1/selfservice-api/internal/middleware"
+	"github.com/jmal1/selfservice-api/internal/models"
+)
+
+var wsUpgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		origin := r.Header.Get("Origin")
+		return origin == "" || origin == "https://selfservice.lab.jmal.io"
+	},
+	ReadBufferSize:  4096,
+	WriteBufferSize: 4096,
+}
+
+// VMConsoleWS upgrades to WebSocket and proxies traffic to the ESXi WebMKS endpoint.
+// Authentication is via the session cookie (same as all other API endpoints).
+func (h *Handler) VMConsoleWS(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	userID := middleware.UserIDFromContext(ctx)
+	role := middleware.RoleFromContext(ctx)
+
+	// Parse and validate IDs
+	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
+	if err != nil {
+		http.Error(w, "invalid pod id", http.StatusBadRequest)
+		return
+	}
+	vmID, err := uuid.Parse(chi.URLParam(r, "vmID"))
+	if err != nil {
+		http.Error(w, "invalid vm id", http.StatusBadRequest)
+		return
+	}
+
+	// Verify pod ownership
+	pod, err := h.db.GetPodByID(ctx, podID)
+	if err != nil {
+		h.logger.Error("console: get pod failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if pod == nil {
+		http.Error(w, "pod not found", http.StatusNotFound)
+		return
+	}
+	if pod.OwnerID != userID && role != models.RoleAdmin {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	// Get VM and verify it belongs to this pod
+	vm, err := h.db.GetPodVM(ctx, vmID)
+	if err != nil {
+		h.logger.Error("console: get vm failed", "error", err)
+		http.Error(w, "vm not found", http.StatusNotFound)
+		return
+	}
+	if vm.PodID != podID {
+		http.Error(w, "vm does not belong to this pod", http.StatusForbidden)
+		return
+	}
+	if vm.VCenterVMID == nil || *vm.VCenterVMID == "" {
+		http.Error(w, "vm has no vCenter reference", http.StatusBadRequest)
+		return
+	}
+
+	// Check vCenter client is available
+	if h.vc == nil {
+		http.Error(w, "console not available (vCenter not configured)", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Acquire WebMKS ticket from vCenter
+	ticket, err := h.vc.AcquireWebMKSTicket(ctx, *vm.VCenterVMID)
+	if err != nil {
+		h.logger.Error("console: acquire ticket failed", "error", err, "moref", *vm.VCenterVMID)
+		http.Error(w, "failed to acquire console ticket", http.StatusInternalServerError)
+		return
+	}
+
+	// Audit: console opened
+	details, _ := json.Marshal(map[string]string{
+		"vm_name": vm.DisplayName,
+		"moref":   *vm.VCenterVMID,
+	})
+	h.db.InsertAuditLog(ctx, models.AuditLog{
+		UserID:       &userID,
+		Action:       "console.open",
+		ResourceType: strPtr("vm"),
+		ResourceID:   &vmID,
+		Details:      details,
+		IPAddress:    strPtr(r.RemoteAddr),
+	})
+
+	// Connect to ESXi WebMKS endpoint
+	esxiURL := fmt.Sprintf("wss://%s:%d/ticket/%s", ticket.Host, ticket.Port, ticket.Ticket)
+	h.logger.Info("console: connecting to ESXi", "url", esxiURL, "user", userID, "vm", vm.DisplayName)
+
+	esxiDialer := websocket.Dialer{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		Subprotocols:    []string{"binary"},
+	}
+
+	// Pass through subprotocols from the client request
+	clientProtocols := websocket.Subprotocols(r)
+	if len(clientProtocols) > 0 {
+		esxiDialer.Subprotocols = clientProtocols
+	}
+
+	esxiConn, _, err := esxiDialer.DialContext(ctx, esxiURL, nil)
+	if err != nil {
+		h.logger.Error("console: ESXi dial failed", "error", err, "url", esxiURL)
+		http.Error(w, "failed to connect to VM console", http.StatusBadGateway)
+		return
+	}
+	defer esxiConn.Close()
+
+	// Upgrade client connection to WebSocket
+	clientConn, err := wsUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		h.logger.Error("console: client upgrade failed", "error", err)
+		return // Upgrade already sent error response
+	}
+	defer clientConn.Close()
+
+	h.logger.Info("console: session started", "user", userID, "vm", vm.DisplayName, "pod", pod.Name)
+
+	// Bidirectional proxy
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Client → ESXi
+	go func() {
+		defer wg.Done()
+		proxyWS(clientConn, esxiConn)
+		esxiConn.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+	}()
+
+	// ESXi → Client
+	go func() {
+		defer wg.Done()
+		proxyWS(esxiConn, clientConn)
+		clientConn.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+	}()
+
+	wg.Wait()
+
+	// Audit: console closed
+	h.db.InsertAuditLog(context.Background(), models.AuditLog{
+		UserID:       &userID,
+		Action:       "console.close",
+		ResourceType: strPtr("vm"),
+		ResourceID:   &vmID,
+		Details:      details,
+		IPAddress:    strPtr(r.RemoteAddr),
+	})
+
+	h.logger.Info("console: session ended", "user", userID, "vm", vm.DisplayName)
+}
+
+// proxyWS copies messages from src to dst until an error occurs.
+func proxyWS(src, dst *websocket.Conn) {
+	for {
+		msgType, reader, err := src.NextReader()
+		if err != nil {
+			return
+		}
+		writer, err := dst.NextWriter(msgType)
+		if err != nil {
+			return
+		}
+		if _, err := io.Copy(writer, reader); err != nil {
+			return
+		}
+		if err := writer.Close(); err != nil {
+			return
+		}
+	}
+}

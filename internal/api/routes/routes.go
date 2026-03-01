@@ -65,6 +65,9 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider) *chi.Mux {
 			r.Post("/{podID}/vms/{vmID}/start", h.VMPowerAction)
 			r.Post("/{podID}/vms/{vmID}/stop", h.VMPowerAction)
 			r.Post("/{podID}/vms/{vmID}/restart", h.VMPowerAction)
+
+			// VM console WebSocket proxy
+			r.Get("/{podID}/vms/{vmID}/console/ws", h.VMConsoleWS)
 		})
 
 		// Templates

@@ -16,6 +16,7 @@ import (
 	"github.com/jmal1/selfservice-api/internal/config"
 	"github.com/jmal1/selfservice-api/internal/database"
 	events "github.com/jmal1/selfservice-api/internal/nats"
+	"github.com/jmal1/selfservice-api/internal/vcenter"
 )
 
 func main() {
@@ -71,8 +72,26 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Initialize vCenter client for console access (optional — console won't work without it)
+	var vcClient handlers.VCenterConsole
+	if cfg.VCenter.URL != "" && cfg.VCenter.User != "" {
+		vc := vcenter.New(vcenter.Config{
+			URL:        cfg.VCenter.URL,
+			User:       cfg.VCenter.User,
+			Password:   cfg.VCenter.Password,
+			Datacenter: cfg.VCenter.Datacenter,
+			Insecure:   cfg.VCenter.Insecure,
+		}, logger)
+		if err := vc.Connect(ctx); err != nil {
+			logger.Warn("vCenter connection failed — console access disabled", "error", err)
+		} else {
+			vcClient = vc
+			logger.Info("vCenter connected for console access")
+		}
+	}
+
 	// Create handlers and router
-	handler := handlers.NewHandler(queries, natsClient, logger)
+	handler := handlers.NewHandler(queries, natsClient, vcClient, logger)
 	router := routes.Setup(handler, authProvider)
 
 	// Start HTTP server

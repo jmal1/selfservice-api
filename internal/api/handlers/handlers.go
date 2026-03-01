@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -17,18 +18,25 @@ import (
 	"github.com/jmal1/selfservice-api/internal/middleware"
 	"github.com/jmal1/selfservice-api/internal/models"
 	events "github.com/jmal1/selfservice-api/internal/nats"
+	"github.com/jmal1/selfservice-api/internal/vcenter"
 )
 
 // Handler holds shared dependencies for all API handlers.
 type Handler struct {
 	db     *database.Queries
 	events *events.Client
+	vc     VCenterConsole
 	logger *slog.Logger
 }
 
+// VCenterConsole is the interface for vCenter console operations needed by the API.
+type VCenterConsole interface {
+	AcquireWebMKSTicket(ctx context.Context, moref string) (*vcenter.WebMKSTicket, error)
+}
+
 // NewHandler creates a new Handler.
-func NewHandler(db *database.Queries, events *events.Client, logger *slog.Logger) *Handler {
-	return &Handler{db: db, events: events, logger: logger}
+func NewHandler(db *database.Queries, events *events.Client, vc VCenterConsole, logger *slog.Logger) *Handler {
+	return &Handler{db: db, events: events, vc: vc, logger: logger}
 }
 
 // --- Pod Handlers ---
