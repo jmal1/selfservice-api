@@ -54,7 +54,11 @@ func New(cfg Config, logger *slog.Logger) *Client {
 func (c *Client) Connect(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.connectLocked(ctx)
+}
 
+// connectLocked does the actual connection work. Caller must hold c.mu.
+func (c *Client) connectLocked(ctx context.Context) error {
 	u, err := soap.ParseURL(c.config.URL)
 	if err != nil {
 		return fmt.Errorf("parse vCenter URL: %w", err)
@@ -66,8 +70,19 @@ func (c *Client) Connect(ctx context.Context) error {
 		return fmt.Errorf("connect to vCenter: %w", err)
 	}
 
-	// Enable keepalive to auto-reconnect
-	client.RoundTripper = session.KeepAlive(client.RoundTripper, 5*time.Minute)
+	// KeepAliveHandler with re-login: fires after 5 min idle, re-authenticates
+	// if the session has expired instead of just pinging.
+	client.RoundTripper = session.KeepAliveHandler(client.RoundTripper, 5*time.Minute,
+		func(rt soap.RoundTripper) error {
+			mgr := session.NewManager(client.Client)
+			active, _ := mgr.SessionIsActive(context.Background())
+			if active {
+				return nil
+			}
+			c.logger.Info("vCenter session expired, re-authenticating via keepalive")
+			return mgr.Login(context.Background(), u.User)
+		},
+	)
 
 	c.client = client
 	c.finder = find.NewFinder(client.Client, true)
@@ -100,10 +115,7 @@ func (c *Client) ensureConnected(ctx context.Context) error {
 	defer c.mu.Unlock()
 
 	if c.client == nil {
-		c.mu.Unlock()
-		err := c.Connect(ctx)
-		c.mu.Lock()
-		return err
+		return c.connectLocked(ctx)
 	}
 
 	// Check if session is still valid
@@ -111,10 +123,7 @@ func (c *Client) ensureConnected(ctx context.Context) error {
 	_, err := mgr.UserSession(ctx)
 	if err != nil {
 		c.logger.Warn("vCenter session expired, reconnecting", "error", err)
-		c.mu.Unlock()
-		err = c.Connect(ctx)
-		c.mu.Lock()
-		return err
+		return c.connectLocked(ctx)
 	}
 	return nil
 }
