@@ -70,17 +70,25 @@ func (c *Client) connectLocked(ctx context.Context) error {
 		return fmt.Errorf("connect to vCenter: %w", err)
 	}
 
-	// KeepAliveHandler with re-login: fires after 5 min idle, re-authenticates
-	// if the session has expired instead of just pinging.
-	client.RoundTripper = session.KeepAliveHandler(client.RoundTripper, 5*time.Minute,
+	// KeepAliveHandler with re-login: fires after 10 min idle, re-authenticates
+	// if the session has expired. NEVER return a non-nil error from the handler —
+	// that kills the keepalive goroutine permanently. If re-login fails here,
+	// withRetry() on the next real operation will do a full reconnect.
+	client.RoundTripper = session.KeepAliveHandler(client.RoundTripper, 10*time.Minute,
 		func(rt soap.RoundTripper) error {
+			ctx := context.Background()
 			mgr := session.NewManager(client.Client)
-			active, _ := mgr.SessionIsActive(context.Background())
-			if active {
+			active, err := mgr.SessionIsActive(ctx)
+			if err == nil && active {
 				return nil
 			}
 			c.logger.Info("vCenter session expired, re-authenticating via keepalive")
-			return mgr.Login(context.Background(), u.User)
+			if loginErr := mgr.Login(ctx, u.User); loginErr != nil {
+				c.logger.Error("keepalive re-login failed, will reconnect on next operation", "error", loginErr)
+				return nil // keep goroutine alive; withRetry handles full reconnect
+			}
+			c.logger.Info("vCenter session re-authenticated via keepalive")
+			return nil
 		},
 	)
 
@@ -158,6 +166,17 @@ func (c *Client) CloneVM(ctx context.Context, params CloneVMParams) (string, err
 		return "", err
 	}
 
+	var moref string
+	err := c.withRetry(ctx, "clone VM", func() error {
+		var cloneErr error
+		moref, cloneErr = c.cloneVMInner(ctx, params)
+		return cloneErr
+	})
+	return moref, err
+}
+
+// cloneVMInner contains the actual clone logic (called by CloneVM via withRetry).
+func (c *Client) cloneVMInner(ctx context.Context, params CloneVMParams) (string, error) {
 	// Find template
 	template, err := c.finder.VirtualMachine(ctx, params.TemplateName)
 	if err != nil {
@@ -593,14 +612,15 @@ func (c *Client) CreatePortGroupOnAllHosts(ctx context.Context, pgName string, v
 		return err
 	}
 
-	for _, hostName := range c.config.Hosts {
-		if err := c.createPortGroup(ctx, hostName, pgName, vlanID); err != nil {
-			return fmt.Errorf("create port group on %s: %w", hostName, err)
+	return c.withRetry(ctx, "create port groups", func() error {
+		for _, hostName := range c.config.Hosts {
+			if err := c.createPortGroup(ctx, hostName, pgName, vlanID); err != nil {
+				return fmt.Errorf("create port group on %s: %w", hostName, err)
+			}
 		}
-	}
-
-	c.logger.Info("port group created on all hosts", "name", pgName, "vlan_id", vlanID, "hosts", len(c.config.Hosts))
-	return nil
+		c.logger.Info("port group created on all hosts", "name", pgName, "vlan_id", vlanID, "hosts", len(c.config.Hosts))
+		return nil
+	})
 }
 
 // DeletePortGroupOnAllHosts removes a port group from every configured ESXi host.
@@ -609,15 +629,16 @@ func (c *Client) DeletePortGroupOnAllHosts(ctx context.Context, pgName string) e
 		return err
 	}
 
-	var lastErr error
-	for _, hostName := range c.config.Hosts {
-		if err := c.deletePortGroup(ctx, hostName, pgName); err != nil {
-			c.logger.Warn("failed to delete port group", "host", hostName, "pg", pgName, "error", err)
-			lastErr = err
-			// Continue trying other hosts
+	return c.withRetry(ctx, "delete port groups", func() error {
+		var lastErr error
+		for _, hostName := range c.config.Hosts {
+			if err := c.deletePortGroup(ctx, hostName, pgName); err != nil {
+				c.logger.Warn("failed to delete port group", "host", hostName, "pg", pgName, "error", err)
+				lastErr = err
+			}
 		}
-	}
-	return lastErr
+		return lastErr
+	})
 }
 
 func (c *Client) createPortGroup(ctx context.Context, hostName, pgName string, vlanID int) error {
@@ -688,6 +709,25 @@ func (c *Client) Ping(ctx context.Context) error {
 	}
 	_, err := c.finder.Datacenter(ctx, c.config.Datacenter)
 	return err
+}
+
+// withRetry executes fn; if it returns NotAuthenticated, does a full reconnect and retries once.
+func (c *Client) withRetry(ctx context.Context, op string, fn func() error) error {
+	err := fn()
+	if err == nil || !isNotAuthenticatedErr(err) {
+		return err
+	}
+	c.logger.Warn("NotAuthenticated during operation, reconnecting",
+		"op", op, "error", err)
+	if reconErr := c.Connect(ctx); reconErr != nil {
+		return fmt.Errorf("reconnect after NotAuthenticated: %w", reconErr)
+	}
+	return fn()
+}
+
+// isNotAuthenticatedErr checks if an error chain contains a vSphere NotAuthenticated fault.
+func isNotAuthenticatedErr(err error) bool {
+	return strings.Contains(err.Error(), "NotAuthenticated")
 }
 
 // isAlreadyDeletedErr checks if a vSphere error indicates the object was already deleted.
