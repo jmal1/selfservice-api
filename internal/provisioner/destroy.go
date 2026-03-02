@@ -16,6 +16,8 @@ type DestroyPodPayload struct {
 // DestroyPod executes the pod destruction workflow.
 // Destruction is best-effort — we continue even if individual steps fail
 // because we want to clean up as much as possible.
+// If vCenter operations fail, the pod is marked "destroy_failed" so the
+// retry sweep can attempt cleanup again later.
 func (p *Provisioner) DestroyPod(ctx context.Context, job *models.Job) error {
 	var payload DestroyPodPayload
 	if err := json.Unmarshal(job.Payload, &payload); err != nil {
@@ -121,10 +123,10 @@ func (p *Provisioner) DestroyPod(ctx context.Context, job *models.Job) error {
 	// --- Step 7: Mark pod as destroyed and release VLAN ---
 	if len(errors) > 0 {
 		errMsg := fmt.Sprintf("%d cleanup errors occurred", len(errors))
-		_ = p.db.UpdatePodStatus(ctx, pod.ID, "destroyed", errMsg)
-		_ = p.db.ReleaseVLAN(ctx, pod.ID)
-		p.logger.Warn("pod destroyed with errors", "pod_id", pod.ID, "error_count", len(errors))
-		return fmt.Errorf("pod destroyed with %d errors: %v", len(errors), errors)
+		_ = p.db.UpdatePodStatus(ctx, pod.ID, models.PodStatusDestroyFailed, errMsg)
+		p.logger.Warn("pod destruction incomplete, marked destroy_failed",
+			"pod_id", pod.ID, "error_count", len(errors))
+		return fmt.Errorf("pod destroy incomplete with %d errors: %v", len(errors), errors)
 	}
 
 	_ = p.db.UpdatePodStatus(ctx, pod.ID, "destroyed", "")
@@ -132,4 +134,36 @@ func (p *Provisioner) DestroyPod(ctx context.Context, job *models.Job) error {
 	p.publishProgress(job.ID, "destroyed", "Pod destroyed successfully")
 	p.logger.Info("pod destroyed successfully", "pod_id", pod.ID, "vlan", vlanTag)
 	return nil
+}
+
+// RetryFailedDestroys finds pods stuck in "destroy_failed" and re-runs
+// the destroy workflow for each. Since every step is idempotent, re-running
+// the full sequence is safe — already-completed steps are no-ops.
+func (p *Provisioner) RetryFailedDestroys(ctx context.Context) {
+	pods, err := p.db.ListDestroyFailedPods(ctx)
+	if err != nil {
+		p.logger.Error("failed to list destroy_failed pods", "error", err)
+		return
+	}
+	if len(pods) == 0 {
+		return
+	}
+
+	p.logger.Info("retrying failed destroys", "count", len(pods))
+	for _, pod := range pods {
+		// Create a synthetic job so DestroyPod can reuse the same code path
+		payload, _ := json.Marshal(DestroyPodPayload{PodID: pod.ID.String()})
+		syntheticJob := &models.Job{
+			ID:      pod.ID, // reuse pod ID as job ID for logging
+			Type:    models.JobTypePodDestroy,
+			Payload: payload,
+		}
+
+		p.logger.Info("retrying destroy for pod", "pod_id", pod.ID, "vlan", pod.VLANID)
+		if err := p.DestroyPod(ctx, syntheticJob); err != nil {
+			p.logger.Warn("retry destroy still failing", "pod_id", pod.ID, "error", err)
+		} else {
+			p.logger.Info("retry destroy succeeded", "pod_id", pod.ID)
+		}
+	}
 }

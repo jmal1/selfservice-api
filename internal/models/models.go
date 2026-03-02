@@ -131,12 +131,13 @@ type VLANPoolEntry struct {
 
 // Pod status constants.
 const (
-	PodStatusPending      = "pending"
-	PodStatusProvisioning = "provisioning"
-	PodStatusActive       = "active"
-	PodStatusDestroying   = "destroying"
-	PodStatusDestroyed    = "destroyed"
-	PodStatusError        = "error"
+	PodStatusPending        = "pending"
+	PodStatusProvisioning   = "provisioning"
+	PodStatusActive         = "active"
+	PodStatusDestroying     = "destroying"
+	PodStatusDestroyFailed  = "destroy_failed"
+	PodStatusDestroyed      = "destroyed"
+	PodStatusError          = "error"
 )
 
 // VM status constants.

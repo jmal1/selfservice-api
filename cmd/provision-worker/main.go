@@ -100,6 +100,9 @@ func main() {
 		logger.Info("recovered stale jobs", "count", recovered)
 	}
 
+	// Retry any pods stuck in destroy_failed from previous runs
+	prov.RetryFailedDestroys(ctx)
+
 	// Subscribe to job notifications from NATS
 	_, err = natsClient.SubscribeJobCreated(func(jobID string, jobType string) {
 		logger.Info("received job notification", "job_id", jobID, "type", jobType)
@@ -114,6 +117,10 @@ func main() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
+	// Retry failed destroys every 5 minutes
+	retryTicker := time.NewTicker(5 * time.Minute)
+	defer retryTicker.Stop()
+
 	// Immediately process any pending/recovered jobs
 	go processJobs(ctx, queries, prov, workerID, logger)
 
@@ -124,6 +131,8 @@ func main() {
 				return
 			case <-ticker.C:
 				processJobs(ctx, queries, prov, workerID, logger)
+			case <-retryTicker.C:
+				prov.RetryFailedDestroys(ctx)
 			}
 		}
 	}()

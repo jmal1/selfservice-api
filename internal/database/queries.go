@@ -791,6 +791,30 @@ func (q *Queries) UpdatePodStatus(ctx context.Context, id uuid.UUID, status, err
 	return err
 }
 
+// ListDestroyFailedPods returns pods stuck in "destroy_failed" status.
+func (q *Queries) ListDestroyFailedPods(ctx context.Context) ([]models.Pod, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT id, owner_id, name, status, error_message, expires_at, created_at, updated_at, salt, vlan_id, subnet
+		FROM pods WHERE status = 'destroy_failed'
+		ORDER BY updated_at ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var pods []models.Pod
+	for rows.Next() {
+		var p models.Pod
+		if err := rows.Scan(&p.ID, &p.OwnerID, &p.Name, &p.Status, &p.ErrorMessage,
+			&p.ExpiresAt, &p.CreatedAt, &p.UpdatedAt, &p.Salt, &p.VLANID, &p.Subnet); err != nil {
+			return nil, err
+		}
+		pods = append(pods, p)
+	}
+	return pods, rows.Err()
+}
+
 // --- Pod VMs ---
 
 // ListPodVMs returns all VMs belonging to a pod.
