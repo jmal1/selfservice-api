@@ -372,34 +372,36 @@ func (c *Client) DestroyVM(ctx context.Context, moref string) error {
 		return err
 	}
 
-	vm := object.NewVirtualMachine(c.client.Client,
-		types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
+	return c.withRetry(ctx, "destroy VM", func() error {
+		vm := object.NewVirtualMachine(c.client.Client,
+			types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
 
-	// Try to power off first (ignore errors if already off or deleted)
-	powerOffTask, err := vm.PowerOff(ctx)
-	if err == nil {
-		_ = powerOffTask.Wait(ctx)
-	}
-
-	// Destroy — treat "already deleted" as success
-	destroyTask, err := vm.Destroy(ctx)
-	if err != nil {
-		if isAlreadyDeletedErr(err) {
-			c.logger.Info("VM already deleted", "moref", moref)
-			return nil
+		// Try to power off first (ignore errors if already off or deleted)
+		powerOffTask, err := vm.PowerOff(ctx)
+		if err == nil {
+			_ = powerOffTask.Wait(ctx)
 		}
-		return fmt.Errorf("destroy VM %s: %w", moref, err)
-	}
-	if err := destroyTask.Wait(ctx); err != nil {
-		if isAlreadyDeletedErr(err) {
-			c.logger.Info("VM already deleted", "moref", moref)
-			return nil
-		}
-		return fmt.Errorf("destroy VM task %s: %w", moref, err)
-	}
 
-	c.logger.Info("VM destroyed", "moref", moref)
-	return nil
+		// Destroy — treat "already deleted" as success
+		destroyTask, err := vm.Destroy(ctx)
+		if err != nil {
+			if isAlreadyDeletedErr(err) {
+				c.logger.Info("VM already deleted", "moref", moref)
+				return nil
+			}
+			return fmt.Errorf("destroy VM %s: %w", moref, err)
+		}
+		if err := destroyTask.Wait(ctx); err != nil {
+			if isAlreadyDeletedErr(err) {
+				c.logger.Info("VM already deleted", "moref", moref)
+				return nil
+			}
+			return fmt.Errorf("destroy VM task %s: %w", moref, err)
+		}
+
+		c.logger.Info("VM destroyed", "moref", moref)
+		return nil
+	})
 }
 
 // PowerOnVM powers on a VM.
@@ -409,23 +411,25 @@ func (c *Client) PowerOnVM(ctx context.Context, moref string) error {
 		return err
 	}
 
-	vm := object.NewVirtualMachine(c.client.Client,
-		types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
+	return c.withRetry(ctx, "power on VM", func() error {
+		vm := object.NewVirtualMachine(c.client.Client,
+			types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
 
-	task, err := vm.PowerOn(ctx)
-	if err != nil {
-		if isAlreadyPoweredOnErr(err) {
-			return nil
+		task, err := vm.PowerOn(ctx)
+		if err != nil {
+			if isAlreadyPoweredOnErr(err) {
+				return nil
+			}
+			return fmt.Errorf("power on %s: %w", moref, err)
 		}
-		return fmt.Errorf("power on %s: %w", moref, err)
-	}
-	if err := task.Wait(ctx); err != nil {
-		if isAlreadyPoweredOnErr(err) {
-			return nil
+		if err := task.Wait(ctx); err != nil {
+			if isAlreadyPoweredOnErr(err) {
+				return nil
+			}
+			return err
 		}
-		return err
-	}
-	return nil
+		return nil
+	})
 }
 
 // PowerOffVM powers off a VM.
@@ -435,23 +439,25 @@ func (c *Client) PowerOffVM(ctx context.Context, moref string) error {
 		return err
 	}
 
-	vm := object.NewVirtualMachine(c.client.Client,
-		types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
+	return c.withRetry(ctx, "power off VM", func() error {
+		vm := object.NewVirtualMachine(c.client.Client,
+			types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
 
-	task, err := vm.PowerOff(ctx)
-	if err != nil {
-		if isAlreadyDeletedErr(err) {
-			return nil
+		task, err := vm.PowerOff(ctx)
+		if err != nil {
+			if isAlreadyDeletedErr(err) {
+				return nil
+			}
+			return fmt.Errorf("power off %s: %w", moref, err)
 		}
-		return fmt.Errorf("power off %s: %w", moref, err)
-	}
-	if err := task.Wait(ctx); err != nil {
-		if isAlreadyDeletedErr(err) {
-			return nil
+		if err := task.Wait(ctx); err != nil {
+			if isAlreadyDeletedErr(err) {
+				return nil
+			}
+			return err
 		}
-		return err
-	}
-	return nil
+		return nil
+	})
 }
 
 // RestartVM guest-restarts a VM (graceful reboot via VMware Tools).
@@ -460,10 +466,11 @@ func (c *Client) RestartVM(ctx context.Context, moref string) error {
 		return err
 	}
 
-	vm := object.NewVirtualMachine(c.client.Client,
-		types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
-
-	return vm.RebootGuest(ctx)
+	return c.withRetry(ctx, "restart VM", func() error {
+		vm := object.NewVirtualMachine(c.client.Client,
+			types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
+		return vm.RebootGuest(ctx)
+	})
 }
 
 // WaitForIP waits for VMware Tools to report an IP address.
@@ -472,19 +479,24 @@ func (c *Client) WaitForIP(ctx context.Context, moref string, timeout time.Durat
 		return "", err
 	}
 
-	vm := object.NewVirtualMachine(c.client.Client,
-		types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
+	var ip string
+	err := c.withRetry(ctx, "wait for IP", func() error {
+		vm := object.NewVirtualMachine(c.client.Client,
+			types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
 
-	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+		timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
 
-	ip, err := vm.WaitForIP(timeoutCtx, true)
-	if err != nil {
-		return "", fmt.Errorf("wait for IP on %s: %w", moref, err)
-	}
+		var waitErr error
+		ip, waitErr = vm.WaitForIP(timeoutCtx, true)
+		if waitErr != nil {
+			return fmt.Errorf("wait for IP on %s: %w", moref, waitErr)
+		}
 
-	c.logger.Info("VM got IP", "moref", moref, "ip", ip)
-	return ip, nil
+		c.logger.Info("VM got IP", "moref", moref, "ip", ip)
+		return nil
+	})
+	return ip, err
 }
 
 // GetVM retrieves a VM's properties by MoRef (for idempotency checks).
@@ -493,11 +505,12 @@ func (c *Client) GetVM(ctx context.Context, moref string) (*mo.VirtualMachine, e
 		return nil, err
 	}
 
-	vm := object.NewVirtualMachine(c.client.Client,
-		types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
-
 	var props mo.VirtualMachine
-	err := vm.Properties(ctx, vm.Reference(), []string{"name", "runtime", "guest", "config"}, &props)
+	err := c.withRetry(ctx, "get VM", func() error {
+		vm := object.NewVirtualMachine(c.client.Client,
+			types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
+		return vm.Properties(ctx, vm.Reference(), []string{"name", "runtime", "guest", "config"}, &props)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -518,20 +531,25 @@ func (c *Client) AcquireWebMKSTicket(ctx context.Context, moref string) (*WebMKS
 		return nil, err
 	}
 
-	vm := object.NewVirtualMachine(c.client.Client,
-		types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
+	var result *WebMKSTicket
+	err := c.withRetry(ctx, "acquire webmks ticket", func() error {
+		vm := object.NewVirtualMachine(c.client.Client,
+			types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
 
-	ticket, err := vm.AcquireTicket(ctx, string(types.VirtualMachineTicketTypeWebmks))
-	if err != nil {
-		return nil, fmt.Errorf("acquire webmks ticket for %s: %w", moref, err)
-	}
+		ticket, err := vm.AcquireTicket(ctx, string(types.VirtualMachineTicketTypeWebmks))
+		if err != nil {
+			return fmt.Errorf("acquire webmks ticket for %s: %w", moref, err)
+		}
 
-	c.logger.Info("acquired WebMKS ticket", "moref", moref, "host", ticket.Host, "port", ticket.Port)
-	return &WebMKSTicket{
-		Host:   ticket.Host,
-		Port:   ticket.Port,
-		Ticket: ticket.Ticket,
-	}, nil
+		c.logger.Info("acquired WebMKS ticket", "moref", moref, "host", ticket.Host, "port", ticket.Port)
+		result = &WebMKSTicket{
+			Host:   ticket.Host,
+			Port:   ticket.Port,
+			Ticket: ticket.Ticket,
+		}
+		return nil
+	})
+	return result, err
 }
 
 // ---------- Resource Pool Selection ----------
@@ -697,7 +715,13 @@ func (c *Client) FindTemplate(ctx context.Context, name string) (*object.Virtual
 	if err := c.ensureConnected(ctx); err != nil {
 		return nil, err
 	}
-	return c.finder.VirtualMachine(ctx, name)
+	var result *object.VirtualMachine
+	err := c.withRetry(ctx, "find template", func() error {
+		var findErr error
+		result, findErr = c.finder.VirtualMachine(ctx, name)
+		return findErr
+	})
+	return result, err
 }
 
 
@@ -707,8 +731,10 @@ func (c *Client) Ping(ctx context.Context) error {
 	if err := c.ensureConnected(ctx); err != nil {
 		return err
 	}
-	_, err := c.finder.Datacenter(ctx, c.config.Datacenter)
-	return err
+	return c.withRetry(ctx, "ping", func() error {
+		_, err := c.finder.Datacenter(ctx, c.config.Datacenter)
+		return err
+	})
 }
 
 // withRetry executes fn; if it returns NotAuthenticated, does a full reconnect and retries once.
