@@ -18,10 +18,6 @@ import (
 )
 
 var wsUpgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		origin := r.Header.Get("Origin")
-		return origin == "" || origin == "https://crucible.lab.jmal.io"
-	},
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
 }
@@ -32,6 +28,21 @@ func (h *Handler) VMConsoleWS(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	userID := middleware.UserIDFromContext(ctx)
 	role := middleware.RoleFromContext(ctx)
+
+	// Configure origin check using allowed origins from config
+	upgrader := wsUpgrader
+	upgrader.CheckOrigin = func(r *http.Request) bool {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true
+		}
+		for _, allowed := range h.allowedOrigins {
+			if origin == allowed {
+				return true
+			}
+		}
+		return false
+	}
 
 	// Parse and validate IDs
 	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
@@ -128,7 +139,7 @@ func (h *Handler) VMConsoleWS(w http.ResponseWriter, r *http.Request) {
 	if sp := esxiConn.Subprotocol(); sp != "" {
 		responseHeader.Set("Sec-WebSocket-Protocol", sp)
 	}
-	clientConn, err := wsUpgrader.Upgrade(w, r, responseHeader)
+	clientConn, err := upgrader.Upgrade(w, r, responseHeader)
 	if err != nil {
 		h.logger.Error("console: client upgrade failed", "error", err)
 		return // Upgrade already sent error response

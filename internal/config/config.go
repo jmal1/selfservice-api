@@ -19,8 +19,9 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Host string
-	Port int
+	Host           string
+	Port           int
+	AllowedOrigins []string
 }
 
 type DatabaseConfig struct {
@@ -85,8 +86,9 @@ type OPNsenseConfig struct {
 func Load() (*Config, error) {
 	cfg := &Config{
 		Server: ServerConfig{
-			Host: getEnv("SERVER_HOST", "0.0.0.0"),
-			Port: getEnvInt("SERVER_PORT", 8080),
+			Host:           getEnv("SERVER_HOST", "0.0.0.0"),
+			Port:           getEnvInt("SERVER_PORT", 8080),
+			AllowedOrigins: splitEnv("ALLOWED_ORIGINS", "https://crucible.jmal.io"),
 		},
 		Database: DatabaseConfig{
 			Host:     getEnv("DB_HOST", "localhost"),

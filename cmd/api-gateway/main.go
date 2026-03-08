@@ -91,8 +91,8 @@ func main() {
 	}
 
 	// Create handlers and router
-	handler := handlers.NewHandler(queries, natsClient, vcClient, logger)
-	router := routes.Setup(handler, authProvider, queries)
+	handler := handlers.NewHandler(queries, natsClient, vcClient, logger, cfg.Server.AllowedOrigins)
+	router := routes.Setup(handler, authProvider, queries, cfg.Server.AllowedOrigins)
 
 	// Start HTTP server
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)

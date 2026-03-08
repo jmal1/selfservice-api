@@ -13,7 +13,7 @@ import (
 )
 
 // Setup creates the chi router with all routes.
-func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Queries) *chi.Mux {
+func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Queries, allowedOrigins []string) *chi.Mux {
 	r := chi.NewRouter()
 
 	// Global middleware
@@ -21,7 +21,7 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 	r.Use(chimiddleware.RealIP)
 	r.Use(chimiddleware.Recoverer)
 	r.Use(cors.Handler(cors.Options{
-		AllowedOrigins:   []string{"https://crucible.lab.jmal.io"},
+		AllowedOrigins:   allowedOrigins,
 		AllowedMethods:   []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Content-Type", "Authorization"},
 		AllowCredentials: true,

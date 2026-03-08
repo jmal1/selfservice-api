@@ -24,10 +24,11 @@ import (
 
 // Handler holds shared dependencies for all API handlers.
 type Handler struct {
-	db     *database.Queries
-	events *events.Client
-	vc     VCenterConsole
-	logger *slog.Logger
+	db             *database.Queries
+	events         *events.Client
+	vc             VCenterConsole
+	logger         *slog.Logger
+	allowedOrigins []string
 }
 
 // VCenterConsole is the interface for vCenter console operations needed by the API.
@@ -36,8 +37,8 @@ type VCenterConsole interface {
 }
 
 // NewHandler creates a new Handler.
-func NewHandler(db *database.Queries, events *events.Client, vc VCenterConsole, logger *slog.Logger) *Handler {
-	return &Handler{db: db, events: events, vc: vc, logger: logger}
+func NewHandler(db *database.Queries, events *events.Client, vc VCenterConsole, logger *slog.Logger, allowedOrigins []string) *Handler {
+	return &Handler{db: db, events: events, vc: vc, logger: logger, allowedOrigins: allowedOrigins}
 }
 
 // --- Pod Handlers ---
