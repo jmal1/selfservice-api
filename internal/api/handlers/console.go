@@ -20,7 +20,7 @@ import (
 var wsUpgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		origin := r.Header.Get("Origin")
-		return origin == "" || origin == "https://selfservice.lab.jmal.io"
+		return origin == "" || origin == "https://crucible.lab.jmal.io"
 	},
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
