@@ -16,6 +16,7 @@ imagePullSecrets:
 
 api:
   port: 8080
+  allowedOrigins: "https://crucible.jmal.io"
   resources:
     requests:
       cpu: 100m
@@ -36,7 +37,7 @@ worker:
 # OIDC Configuration (non-secret values)
 oidc:
   issuerURL: "https://authentik.jmal.io/application/o/selfservice/"
-  redirectURL: "https://selfservice.lab.jmal.io/auth/callback"
+  redirectURL: "https://crucible.jmal.io/auth/callback"
 
 # K8s secret names
 secrets:
@@ -83,7 +84,7 @@ vault:
 # Traefik IngressRoute
 ingress:
   enabled: true
-  hostname: selfservice.lab.jmal.io
+  hostname: crucible.jmal.io
 
 # PostgreSQL subchart values
 postgresql:

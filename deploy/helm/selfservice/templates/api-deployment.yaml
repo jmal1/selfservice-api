@@ -95,6 +95,10 @@ spec:
               value: {{ .Values.vcenter.datacenter | quote }}
             - name: VCENTER_INSECURE
               value: {{ .Values.vcenter.insecure | quote }}
+            {{- if .Values.api.allowedOrigins }}
+            - name: ALLOWED_ORIGINS
+              value: {{ .Values.api.allowedOrigins | quote }}
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /healthz
