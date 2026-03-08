@@ -21,7 +21,7 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 	r.Use(chimiddleware.RealIP)
 	r.Use(chimiddleware.Recoverer)
 	r.Use(cors.Handler(cors.Options{
-		AllowedOrigins:   []string{"https://selfservice.lab.jmal.io"},
+		AllowedOrigins:   []string{"https://crucible.lab.jmal.io"},
 		AllowedMethods:   []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Content-Type", "Authorization"},
 		AllowCredentials: true,
