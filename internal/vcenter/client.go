@@ -753,7 +753,10 @@ func (c *Client) withRetry(ctx context.Context, op string, fn func() error) erro
 
 // isNotAuthenticatedErr checks if an error chain contains a vSphere NotAuthenticated fault.
 func isNotAuthenticatedErr(err error) bool {
-	return strings.Contains(err.Error(), "NotAuthenticated")
+	msg := err.Error()
+	return strings.Contains(msg, "NotAuthenticated") ||
+		strings.Contains(strings.ToLower(msg), "not authenticated") ||
+		strings.Contains(strings.ToLower(msg), "session is not authenticated")
 }
 
 // isAlreadyDeletedErr checks if a vSphere error indicates the object was already deleted.
