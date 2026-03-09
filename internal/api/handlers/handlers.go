@@ -650,6 +650,9 @@ func (h *Handler) VMPowerAction(w http.ResponseWriter, r *http.Request) {
 	payload, _ := json.Marshal(map[string]string{
 		"pod_id":    podID.String(),
 		"pod_vm_id": vmID.String(),
+		"user_id":   userID.String(),
+		"vm_name":   vm.DisplayName,
+		"pod_name":  pod.Name,
 	})
 	job, err := h.db.CreateJob(r.Context(), jobType, payload)
 	if err != nil {

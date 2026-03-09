@@ -29,17 +29,19 @@ func (p *Provisioner) SnapshotVM(ctx context.Context, job *models.Job) error {
 
 	podVM, err := p.db.GetPodVM(ctx, podVMID)
 	if err != nil {
-		return fmt.Errorf("get pod VM: %w", err)
+		p.logger.Error("snapshot failed: get pod VM", "job_id", job.ID, "pod_vm_id", podVMID, "error", err)
+		return fmt.Errorf("get pod VM %s: %w", podVMID, err)
 	}
 	if podVM.VCenterVMID == nil {
-		return fmt.Errorf("pod VM %s has no vCenter moref", podVMID)
+		return fmt.Errorf("VM %q has no vCenter reference", podVM.DisplayName)
 	}
 
-	p.publishProgress(job.ID, "snapshot_create", fmt.Sprintf("Creating snapshot %q for VM %s", payload.Name, podVMID))
+	p.publishProgress(job.ID, "snapshot_create", fmt.Sprintf("Creating snapshot %q for %s", payload.Name, podVM.DisplayName))
 
 	snapMoref, err := p.vc.CreateVMSnapshot(ctx, *podVM.VCenterVMID, payload.Name, payload.Description)
 	if err != nil {
-		return fmt.Errorf("create vCenter snapshot: %w", err)
+		p.logger.Error("snapshot failed: vCenter create", "job_id", job.ID, "vm_name", podVM.DisplayName, "snapshot_name", payload.Name, "error", err)
+		return fmt.Errorf("failed to create snapshot %q on %s: %w", payload.Name, podVM.DisplayName, err)
 	}
 
 	if err := p.db.CreateVMSnapshot(ctx, &models.VMSnapshot{
@@ -49,10 +51,11 @@ func (p *Provisioner) SnapshotVM(ctx context.Context, job *models.Job) error {
 		VCenterSnapshotID: snapMoref,
 		IsInitial:         false,
 	}); err != nil {
-		return fmt.Errorf("save snapshot record: %w", err)
+		p.logger.Error("snapshot failed: save record", "job_id", job.ID, "vm_name", podVM.DisplayName, "snapshot_name", payload.Name, "error", err)
+		return fmt.Errorf("save snapshot record for %s: %w", podVM.DisplayName, err)
 	}
 
-	p.logger.Info("snapshot created", "pod_vm_id", podVMID, "snapshot", payload.Name, "moref", snapMoref)
+	p.logger.Info("snapshot created", "job_id", job.ID, "pod_vm_id", podVMID, "vm_name", podVM.DisplayName, "snapshot", payload.Name, "moref", snapMoref)
 	return nil
 }
 
@@ -81,31 +84,34 @@ func (p *Provisioner) RevertVM(ctx context.Context, job *models.Job) error {
 
 	podVM, err := p.db.GetPodVM(ctx, podVMID)
 	if err != nil {
-		return fmt.Errorf("get pod VM: %w", err)
+		p.logger.Error("revert failed: get pod VM", "job_id", job.ID, "pod_vm_id", podVMID, "error", err)
+		return fmt.Errorf("get pod VM %s: %w", podVMID, err)
 	}
 	if podVM.VCenterVMID == nil {
-		return fmt.Errorf("pod VM %s has no vCenter moref", podVMID)
+		return fmt.Errorf("VM %q has no vCenter reference", podVM.DisplayName)
 	}
 
 	snap, err := p.db.GetVMSnapshot(ctx, snapID)
 	if err != nil {
-		return fmt.Errorf("get snapshot: %w", err)
+		p.logger.Error("revert failed: get snapshot", "job_id", job.ID, "snapshot_id", snapID, "error", err)
+		return fmt.Errorf("get snapshot %s: %w", snapID, err)
 	}
 	if snap == nil {
 		return fmt.Errorf("snapshot %s not found", snapID)
 	}
 
-	p.publishProgress(job.ID, "snapshot_revert", fmt.Sprintf("Reverting VM %s to snapshot %q", podVMID, snap.Name))
+	p.publishProgress(job.ID, "snapshot_revert", fmt.Sprintf("Reverting %s to snapshot %q", podVM.DisplayName, snap.Name))
 
 	if err := p.vc.RevertToSnapshot(ctx, *podVM.VCenterVMID, snap.VCenterSnapshotID); err != nil {
-		return fmt.Errorf("revert to snapshot: %w", err)
+		p.logger.Error("revert failed: vCenter revert", "job_id", job.ID, "vm_name", podVM.DisplayName, "snapshot_name", snap.Name, "error", err)
+		return fmt.Errorf("failed to revert %s to snapshot %q: %w", podVM.DisplayName, snap.Name, err)
 	}
 
 	if err := p.db.UpdatePodVMIP(ctx, podVMID, ""); err != nil {
-		return fmt.Errorf("clear VM IP after revert: %w", err)
+		p.logger.Warn("revert: failed to clear VM IP", "job_id", job.ID, "pod_vm_id", podVMID, "error", err)
 	}
 
-	p.logger.Info("VM reverted to snapshot", "pod_vm_id", podVMID, "snapshot_id", snapID, "snapshot", snap.Name)
+	p.logger.Info("VM reverted to snapshot", "job_id", job.ID, "pod_vm_id", podVMID, "vm_name", podVM.DisplayName, "snapshot_id", snapID, "snapshot", snap.Name)
 	return nil
 }
 
@@ -128,7 +134,8 @@ func (p *Provisioner) DeleteSnapshot(ctx context.Context, job *models.Job) error
 
 	snap, err := p.db.GetVMSnapshot(ctx, snapID)
 	if err != nil {
-		return fmt.Errorf("get snapshot: %w", err)
+		p.logger.Error("delete snapshot failed: get snapshot", "job_id", job.ID, "snapshot_id", snapID, "error", err)
+		return fmt.Errorf("get snapshot %s: %w", snapID, err)
 	}
 	if snap == nil {
 		return fmt.Errorf("snapshot %s not found", snapID)
@@ -136,22 +143,25 @@ func (p *Provisioner) DeleteSnapshot(ctx context.Context, job *models.Job) error
 
 	podVM, err := p.db.GetPodVM(ctx, snap.PodVMID)
 	if err != nil {
-		return fmt.Errorf("get pod VM: %w", err)
+		p.logger.Error("delete snapshot failed: get pod VM", "job_id", job.ID, "pod_vm_id", snap.PodVMID, "error", err)
+		return fmt.Errorf("get pod VM for snapshot: %w", err)
 	}
 	if podVM.VCenterVMID == nil {
-		return fmt.Errorf("pod VM %s has no vCenter moref", snap.PodVMID)
+		return fmt.Errorf("VM %q has no vCenter reference", podVM.DisplayName)
 	}
 
-	p.publishProgress(job.ID, "snapshot_delete", fmt.Sprintf("Deleting snapshot %q from VM %s", snap.Name, snap.PodVMID))
+	p.publishProgress(job.ID, "snapshot_delete", fmt.Sprintf("Deleting snapshot %q from %s", snap.Name, podVM.DisplayName))
 
 	if err := p.vc.RemoveVMSnapshot(ctx, *podVM.VCenterVMID, snap.VCenterSnapshotID); err != nil {
-		return fmt.Errorf("remove vCenter snapshot: %w", err)
+		p.logger.Error("delete snapshot failed: vCenter remove", "job_id", job.ID, "vm_name", podVM.DisplayName, "snapshot_name", snap.Name, "error", err)
+		return fmt.Errorf("failed to remove snapshot %q from %s: %w", snap.Name, podVM.DisplayName, err)
 	}
 
 	if err := p.db.DeleteVMSnapshot(ctx, snapID); err != nil {
+		p.logger.Error("delete snapshot failed: remove record", "job_id", job.ID, "snapshot_id", snapID, "error", err)
 		return fmt.Errorf("delete snapshot record: %w", err)
 	}
 
-	p.logger.Info("snapshot deleted", "snapshot_id", snapID, "snapshot", snap.Name, "pod_vm_id", snap.PodVMID)
+	p.logger.Info("snapshot deleted", "job_id", job.ID, "snapshot_id", snapID, "vm_name", podVM.DisplayName, "snapshot", snap.Name, "pod_vm_id", snap.PodVMID)
 	return nil
 }

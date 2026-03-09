@@ -112,6 +112,9 @@ func (h *Handler) CreateVMSnapshot(w http.ResponseWriter, r *http.Request) {
 		"pod_vm_id":   vmID.String(),
 		"name":        body.Name,
 		"description": body.Description,
+		"user_id":     userID.String(),
+		"vm_name":     vm.DisplayName,
+		"pod_name":    pod.Name,
 	})
 	job, err := h.db.CreateJob(r.Context(), models.JobTypeVMSnapshot, payload)
 	if err != nil {
@@ -191,8 +194,12 @@ func (h *Handler) RevertToInitial(w http.ResponseWriter, r *http.Request) {
 	}
 
 	payload, _ := json.Marshal(map[string]string{
-		"pod_vm_id":   vmID.String(),
-		"snapshot_id": initialSnap.ID.String(),
+		"pod_vm_id":     vmID.String(),
+		"snapshot_id":   initialSnap.ID.String(),
+		"user_id":       userID.String(),
+		"vm_name":       vm.DisplayName,
+		"pod_name":      pod.Name,
+		"snapshot_name": initialSnap.Name,
 	})
 	job, err := h.db.CreateJob(r.Context(), models.JobTypeVMRevert, payload)
 	if err != nil {
@@ -268,8 +275,12 @@ func (h *Handler) RevertToSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	payload, _ := json.Marshal(map[string]string{
-		"pod_vm_id":   vmID.String(),
-		"snapshot_id": snapID.String(),
+		"pod_vm_id":     vmID.String(),
+		"snapshot_id":   snapID.String(),
+		"user_id":       userID.String(),
+		"vm_name":       vm.DisplayName,
+		"pod_name":      pod.Name,
+		"snapshot_name": snap.Name,
 	})
 	job, err := h.db.CreateJob(r.Context(), models.JobTypeVMRevert, payload)
 	if err != nil {
@@ -344,7 +355,11 @@ func (h *Handler) DeleteVMSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	payload, _ := json.Marshal(map[string]string{
-		"snapshot_id": snapID.String(),
+		"snapshot_id":   snapID.String(),
+		"user_id":       userID.String(),
+		"vm_name":       vm.DisplayName,
+		"pod_name":      pod.Name,
+		"snapshot_name": snap.Name,
 	})
 	job, err := h.db.CreateJob(r.Context(), models.JobTypeVMSnapshotDelete, payload)
 	if err != nil {

@@ -93,7 +93,8 @@ func (p *Provisioner) ProcessJob(ctx context.Context, job *models.Job) error {
 		return err
 	}
 
-	_ = p.db.UpdateJobStatus(ctx, job.ID, models.JobStatusCompleted, nil)
+	result, _ := json.Marshal(map[string]string{"message": "completed successfully"})
+	_ = p.db.UpdateJobStatus(ctx, job.ID, models.JobStatusCompleted, result)
 	p.publishProgress(job.ID, "completed", "Job completed successfully")
 	return nil
 }

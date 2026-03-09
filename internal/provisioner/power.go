@@ -29,38 +29,43 @@ func (p *Provisioner) PowerVM(ctx context.Context, job *models.Job, action strin
 
 	podVM, err := p.db.GetPodVM(ctx, podVMID)
 	if err != nil {
-		return fmt.Errorf("get pod VM: %w", err)
+		p.logger.Error("power op failed: get pod VM", "job_id", job.ID, "action", action, "pod_vm_id", podVMID, "error", err)
+		return fmt.Errorf("get VM %s: %w", podVMID, err)
 	}
 
 	if podVM.VCenterVMID == nil || *podVM.VCenterVMID == "" {
-		return fmt.Errorf("VM %s has no vCenter reference", podVMID)
+		return fmt.Errorf("VM %q has no vCenter reference", podVM.DisplayName)
 	}
 	moref := *podVM.VCenterVMID
 
-	p.publishProgress(job.ID, action, fmt.Sprintf("Performing %s on VM", action))
+	p.publishProgress(job.ID, action, fmt.Sprintf("Performing %s on %s", action, podVM.DisplayName))
 
 	switch action {
 	case "start":
 		if err := p.vc.PowerOnVM(ctx, moref); err != nil {
-			return fmt.Errorf("power on: %w", err)
+			p.logger.Error("power on failed", "job_id", job.ID, "vm_name", podVM.DisplayName, "error", err)
+			return fmt.Errorf("failed to start %s: %w", podVM.DisplayName, err)
 		}
 		_ = p.db.UpdatePodVMStatus(ctx, podVMID, "running")
 
 	case "stop":
 		if err := p.vc.PowerOffVM(ctx, moref); err != nil {
-			return fmt.Errorf("power off: %w", err)
+			p.logger.Error("power off failed", "job_id", job.ID, "vm_name", podVM.DisplayName, "error", err)
+			return fmt.Errorf("failed to stop %s: %w", podVM.DisplayName, err)
 		}
 		_ = p.db.UpdatePodVMStatus(ctx, podVMID, "stopped")
 
 	case "restart":
 		if err := p.vc.RestartVM(ctx, moref); err != nil {
-			return fmt.Errorf("restart: %w", err)
+			p.logger.Error("restart failed", "job_id", job.ID, "vm_name", podVM.DisplayName, "error", err)
+			return fmt.Errorf("failed to restart %s: %w", podVM.DisplayName, err)
 		}
 		_ = p.db.UpdatePodVMStatus(ctx, podVMID, "running")
 
 	case "reset":
 		if err := p.vc.ResetVM(ctx, moref); err != nil {
-			return fmt.Errorf("reset: %w", err)
+			p.logger.Error("reset failed", "job_id", job.ID, "vm_name", podVM.DisplayName, "error", err)
+			return fmt.Errorf("failed to reset %s: %w", podVM.DisplayName, err)
 		}
 		_ = p.db.UpdatePodVMStatus(ctx, podVMID, "running")
 
@@ -68,7 +73,7 @@ func (p *Provisioner) PowerVM(ctx context.Context, job *models.Job, action strin
 		return fmt.Errorf("unknown power action: %s", action)
 	}
 
-	p.logger.Info("VM power operation completed", "vm_id", podVMID, "action", action, "moref", moref)
+	p.logger.Info("VM power operation completed", "job_id", job.ID, "vm_name", podVM.DisplayName, "vm_id", podVMID, "action", action, "moref", moref)
 	return nil
 }
 
