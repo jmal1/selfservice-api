@@ -385,6 +385,129 @@ func (h *Handler) DeletePod(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ExtendPod allows a user to extend their pod's expiration (attestation).
+func (h *Handler) ExtendPod(w http.ResponseWriter, r *http.Request) {
+	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
+	if err != nil {
+		http.Error(w, "invalid pod id", http.StatusBadRequest)
+		return
+	}
+
+	pod, err := h.db.GetPodByID(r.Context(), podID)
+	if err != nil || pod == nil {
+		http.Error(w, "pod not found", http.StatusNotFound)
+		return
+	}
+
+	userID := middleware.UserIDFromContext(r.Context())
+	role := middleware.RoleFromContext(r.Context())
+	if pod.OwnerID != userID && role != models.RoleAdmin {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	if pod.Status != models.PodStatusActive {
+		http.Error(w, "pod must be active to extend", http.StatusConflict)
+		return
+	}
+
+	// Calculate new expiry based on role (+7d student, +30d instructor/admin)
+	var extension time.Duration
+	switch role {
+	case models.RoleInstructor, models.RoleAdmin:
+		extension = 30 * 24 * time.Hour
+	default:
+		extension = 7 * 24 * time.Hour
+	}
+	newExpiry := time.Now().Add(extension)
+
+	// Record attestation
+	attestation := &models.PodAttestation{
+		PodID:             podID,
+		UserID:            userID,
+		PreviousExpiresAt: pod.ExpiresAt,
+		NewExpiresAt:      newExpiry,
+	}
+	if err := h.db.CreatePodAttestation(r.Context(), attestation); err != nil {
+		h.logger.Error("create attestation failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	// Update pod expiry
+	if err := h.db.UpdatePodExpiry(r.Context(), podID, newExpiry); err != nil {
+		h.logger.Error("update pod expiry failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	audit.Log(r.Context(), h.db, "pod.extend",
+		audit.Resource("pod", podID),
+		audit.IP(r.RemoteAddr),
+		audit.Detail("previous_expires_at", fmt.Sprintf("%v", pod.ExpiresAt)),
+		audit.Detail("new_expires_at", newExpiry.Format(time.RFC3339)),
+	)
+
+	respondJSON(w, http.StatusOK, map[string]any{
+		"pod_id":           podID,
+		"expires_at":       newExpiry.Format(time.RFC3339),
+		"extended_by_days": int(extension.Hours() / 24),
+	})
+}
+
+// AdminExtendPod allows an admin to extend any pod's expiration.
+func (h *Handler) AdminExtendPod(w http.ResponseWriter, r *http.Request) {
+	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
+	if err != nil {
+		http.Error(w, "invalid pod id", http.StatusBadRequest)
+		return
+	}
+
+	pod, err := h.db.GetPodByID(r.Context(), podID)
+	if err != nil || pod == nil {
+		http.Error(w, "pod not found", http.StatusNotFound)
+		return
+	}
+
+	if pod.Status != models.PodStatusActive {
+		http.Error(w, "pod must be active to extend", http.StatusConflict)
+		return
+	}
+
+	userID := middleware.UserIDFromContext(r.Context())
+	newExpiry := time.Now().Add(30 * 24 * time.Hour)
+
+	attestation := &models.PodAttestation{
+		PodID:             podID,
+		UserID:            userID,
+		PreviousExpiresAt: pod.ExpiresAt,
+		NewExpiresAt:      newExpiry,
+	}
+	if err := h.db.CreatePodAttestation(r.Context(), attestation); err != nil {
+		h.logger.Error("create attestation failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	if err := h.db.UpdatePodExpiry(r.Context(), podID, newExpiry); err != nil {
+		h.logger.Error("update pod expiry failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	audit.Log(r.Context(), h.db, "pod.admin_extend",
+		audit.Resource("pod", podID),
+		audit.IP(r.RemoteAddr),
+		audit.Detail("new_expires_at", newExpiry.Format(time.RFC3339)),
+	)
+
+	respondJSON(w, http.StatusOK, map[string]any{
+		"pod_id":           podID,
+		"expires_at":       newExpiry.Format(time.RFC3339),
+		"extended_by_days": 30,
+	})
+}
+
 // DeleteVM queues a single VM destruction job.
 func (h *Handler) DeleteVM(w http.ResponseWriter, r *http.Request) {
 	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
@@ -489,6 +612,11 @@ func (h *Handler) AddVM(w http.ResponseWriter, r *http.Request) {
 
 	if pod.Status != models.PodStatusActive {
 		http.Error(w, "pod must be active to add VMs", http.StatusConflict)
+		return
+	}
+
+	if !pod.AllowVMAdditions && role != models.RoleAdmin {
+		http.Error(w, "this environment does not allow adding VMs", http.StatusForbidden)
 		return
 	}
 

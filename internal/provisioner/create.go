@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"sort"
 	"sync"
 	"time"
 
@@ -140,6 +141,7 @@ type VMSpec struct {
 	RAMMB        int64     `json:"ram_mb"`
 	DiskGB       int       `json:"disk_gb"`
 	OSType       string    `json:"os_type"`       // "linux" or "windows"
+	BootOrder    int       `json:"boot_order"`
 }
 
 // generatePassword creates a random password with uppercase, lowercase, digits, and a special char.
@@ -476,56 +478,74 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		return fmt.Errorf("all VM clones failed (rollback errors: %v)", rbErrs)
 	}
 
-	// --- Step 7: Power on VMs in parallel and wait for IPs concurrently ---
+	// --- Step 7: Power on VMs by boot order and wait for IPs per group ---
 	p.publishProgress(job.ID, "vm_poweron", "Powering on VMs")
 
-	// Power on all cloned VMs
 	type vmPowerInfo struct {
 		index   int
 		vmSpec  VMSpec
 		moref   string
 	}
-	var toPowerOn []vmPowerInfo
+
+	// Group cloned VMs by boot order
+	bootGroups := make(map[int][]int) // boot_order -> clonedVM indices
 	for _, i := range clonedVMs {
-		vmSpec := payload.VMs[i]
-		podVM, err := p.db.GetPodVM(ctx, vmSpec.PodVMID)
-		if err != nil {
-			p.logger.Error("failed to get pod VM for power-on", "vm", vmSpec.VMName, "error", err)
-			_ = p.db.UpdatePodVMStatus(ctx, vmSpec.PodVMID, "failed")
-			continue
-		}
-		if podVM.VCenterVMID == nil || *podVM.VCenterVMID == "" {
-			p.logger.Error("pod VM has no moref", "vm", vmSpec.VMName)
-			_ = p.db.UpdatePodVMStatus(ctx, vmSpec.PodVMID, "failed")
-			continue
-		}
-
-		if err := p.vc.PowerOnVM(ctx, *podVM.VCenterVMID); err != nil {
-			p.logger.Error("failed to power on VM", "vm", vmSpec.VMName, "error", err)
-			_ = p.db.UpdatePodVMStatus(ctx, vmSpec.PodVMID, "failed")
-			continue
-		}
-
-		_ = p.db.UpdatePodVMStatus(ctx, vmSpec.PodVMID, "running")
-		toPowerOn = append(toPowerOn, vmPowerInfo{index: i, vmSpec: vmSpec, moref: *podVM.VCenterVMID})
+		bo := payload.VMs[i].BootOrder
+		bootGroups[bo] = append(bootGroups[bo], i)
 	}
+	var bootOrders []int
+	for bo := range bootGroups {
+		bootOrders = append(bootOrders, bo)
+	}
+	sort.Ints(bootOrders)
 
-	// Wait for IPs concurrently (don't block provisioning completion)
-	var wg sync.WaitGroup
-	for _, info := range toPowerOn {
-		wg.Add(1)
-		go func(vmInfo vmPowerInfo) {
-			defer wg.Done()
-			ip, err := p.vc.WaitForIP(ctx, vmInfo.moref, 5*time.Minute)
+	// Power on each boot-order group sequentially; VMs within a group start in parallel
+	var toPowerOn []vmPowerInfo
+	for _, bo := range bootOrders {
+		var groupPoweredOn []vmPowerInfo
+		for _, i := range bootGroups[bo] {
+			vmSpec := payload.VMs[i]
+			podVM, err := p.db.GetPodVM(ctx, vmSpec.PodVMID)
 			if err != nil {
-				p.logger.Warn("timeout waiting for VM IP", "vm", vmInfo.vmSpec.VMName, "error", err)
-				return
+				p.logger.Error("failed to get pod VM for power-on", "vm", vmSpec.VMName, "error", err)
+				_ = p.db.UpdatePodVMStatus(ctx, vmSpec.PodVMID, "failed")
+				continue
 			}
-			_ = p.db.UpdatePodVMIP(ctx, vmInfo.vmSpec.PodVMID, ip)
-			p.logger.Info("VM got IP", "vm", vmInfo.vmSpec.VMName, "ip", ip)
-		}(info)
+			if podVM.VCenterVMID == nil || *podVM.VCenterVMID == "" {
+				p.logger.Error("pod VM has no moref", "vm", vmSpec.VMName)
+				_ = p.db.UpdatePodVMStatus(ctx, vmSpec.PodVMID, "failed")
+				continue
+			}
+
+			if err := p.vc.PowerOnVM(ctx, *podVM.VCenterVMID); err != nil {
+				p.logger.Error("failed to power on VM", "vm", vmSpec.VMName, "error", err)
+				_ = p.db.UpdatePodVMStatus(ctx, vmSpec.PodVMID, "failed")
+				continue
+			}
+
+			_ = p.db.UpdatePodVMStatus(ctx, vmSpec.PodVMID, "running")
+			groupPoweredOn = append(groupPoweredOn, vmPowerInfo{index: i, vmSpec: vmSpec, moref: *podVM.VCenterVMID})
+		}
+
+		// Wait for IPs in this boot-order group before starting the next group
+		var wg sync.WaitGroup
+		for _, info := range groupPoweredOn {
+			wg.Add(1)
+			go func(vmInfo vmPowerInfo) {
+				defer wg.Done()
+				ip, err := p.vc.WaitForIP(ctx, vmInfo.moref, 5*time.Minute)
+				if err != nil {
+					p.logger.Warn("timeout waiting for VM IP", "vm", vmInfo.vmSpec.VMName, "error", err)
+					return
+				}
+				_ = p.db.UpdatePodVMIP(ctx, vmInfo.vmSpec.PodVMID, ip)
+				p.logger.Info("VM got IP", "vm", vmInfo.vmSpec.VMName, "ip", ip)
+			}(info)
+		}
+		wg.Wait()
+
+		toPowerOn = append(toPowerOn, groupPoweredOn...)
 	}
-	wg.Wait()
 
 	// --- Step 7b: Take initial snapshots for restore-to-original (non-fatal) ---
 	for _, info := range toPowerOn {

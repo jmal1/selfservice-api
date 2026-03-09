@@ -59,8 +59,10 @@ type Pod struct {
 	Subnet       string     `json:"subnet" db:"subnet"`
 	Status       string     `json:"status" db:"status"`
 	ErrorMessage *string    `json:"error_message,omitempty" db:"error_message"`
-	ExpiresAt    *time.Time `json:"expires_at,omitempty" db:"expires_at"`
-	CreatedAt    time.Time  `json:"created_at" db:"created_at"`
+	ExpiresAt        *time.Time `json:"expires_at,omitempty" db:"expires_at"`
+	BlueprintID      *uuid.UUID `json:"blueprint_id,omitempty" db:"blueprint_id"`
+	AllowVMAdditions bool       `json:"allow_vm_additions" db:"allow_vm_additions"`
+	CreatedAt        time.Time  `json:"created_at" db:"created_at"`
 	UpdatedAt    time.Time  `json:"updated_at" db:"updated_at"`
 	VMs          []PodVM    `json:"vms,omitempty"`
 	Owner        *User      `json:"owner,omitempty"`
@@ -83,6 +85,7 @@ type PodVM struct {
 	DefaultPassword   string    `json:"default_password" db:"default_password"`
 	GeneratedUsername string    `json:"generated_username" db:"generated_username"`
 	GeneratedPassword string    `json:"generated_password" db:"generated_password"`
+	BootOrder         int       `json:"boot_order" db:"boot_order"`
 	CreatedAt         time.Time `json:"created_at" db:"created_at"`
 	TemplateName      string    `json:"template_name,omitempty"`
 	OSType            string    `json:"os_type,omitempty"`
@@ -99,8 +102,55 @@ type VMSnapshot struct {
 	CreatedAt         time.Time `json:"created_at"`
 }
 
+// PodAttestation records each pod lifetime extension for audit trail.
+type PodAttestation struct {
+	ID                uuid.UUID  `json:"id" db:"id"`
+	PodID             uuid.UUID  `json:"pod_id" db:"pod_id"`
+	UserID            uuid.UUID  `json:"user_id" db:"user_id"`
+	PreviousExpiresAt *time.Time `json:"previous_expires_at,omitempty" db:"previous_expires_at"`
+	NewExpiresAt      time.Time  `json:"new_expires_at" db:"new_expires_at"`
+	CreatedAt         time.Time  `json:"created_at" db:"created_at"`
+}
+
 // MaxUserSnapshots is the maximum number of user-created snapshots per VM.
 const MaxUserSnapshots = 2
+
+// Blueprint is a reusable pod template created by instructors/admins.
+type Blueprint struct {
+	ID               uuid.UUID     `json:"id" db:"id"`
+	Name             string        `json:"name" db:"name"`
+	Description      string        `json:"description" db:"description"`
+	CreatedBy        uuid.UUID     `json:"created_by" db:"created_by"`
+	AllowVMAdditions bool          `json:"allow_vm_additions" db:"allow_vm_additions"`
+	IsActive         bool          `json:"is_active" db:"is_active"`
+	CreatedAt        time.Time     `json:"created_at" db:"created_at"`
+	UpdatedAt        time.Time     `json:"updated_at" db:"updated_at"`
+	VMs              []BlueprintVM `json:"vms,omitempty"`
+	Creator          *User         `json:"creator,omitempty"`
+}
+
+// BlueprintVM defines a VM within a blueprint.
+type BlueprintVM struct {
+	ID           uuid.UUID `json:"id" db:"id"`
+	BlueprintID  uuid.UUID `json:"blueprint_id" db:"blueprint_id"`
+	TemplateID   uuid.UUID `json:"template_id" db:"template_id"`
+	DisplayName  string    `json:"display_name" db:"display_name"`
+	VCPUs        *int      `json:"vcpus,omitempty" db:"vcpus"`
+	RAMMB        *int      `json:"ram_mb,omitempty" db:"ram_mb"`
+	DiskGB       *int      `json:"disk_gb,omitempty" db:"disk_gb"`
+	BootOrder    int       `json:"boot_order" db:"boot_order"`
+	Quantity     int       `json:"quantity" db:"quantity"`
+	CreatedAt    time.Time `json:"created_at" db:"created_at"`
+	TemplateName string    `json:"template_name,omitempty"`
+}
+
+// BlueprintAccess controls which users/roles can deploy a blueprint.
+type BlueprintAccess struct {
+	ID          uuid.UUID  `json:"id" db:"id"`
+	BlueprintID uuid.UUID  `json:"blueprint_id" db:"blueprint_id"`
+	UserID      *uuid.UUID `json:"user_id,omitempty" db:"user_id"`
+	Role        *string    `json:"role,omitempty" db:"role"`
+}
 
 // Job represents a durable task in the job queue.
 type Job struct {

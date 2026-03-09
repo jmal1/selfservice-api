@@ -1,0 +1,1 @@
+ALTER TABLE pod_vms ADD COLUMN boot_order INT NOT NULL DEFAULT 0;

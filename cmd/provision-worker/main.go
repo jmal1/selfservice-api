@@ -121,6 +121,9 @@ func main() {
 	retryTicker := time.NewTicker(5 * time.Minute)
 	defer retryTicker.Stop()
 
+	// Start expiration cron (checks for expired pods every 5 minutes)
+	go prov.StartExpirationCron(ctx)
+
 	// Immediately process any pending/recovered jobs
 	go processJobs(ctx, queries, prov, workerID, logger)
 

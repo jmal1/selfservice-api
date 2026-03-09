@@ -421,11 +421,11 @@ func (q *Queries) GetPodByID(ctx context.Context, id uuid.UUID) (*models.Pod, er
 	var p models.Pod
 	err := q.pool.QueryRow(ctx, `
 		SELECT id, owner_id, name, salt, vlan_id, subnet, status,
-		       error_message, expires_at, created_at, updated_at
+		       error_message, expires_at, blueprint_id, allow_vm_additions, created_at, updated_at
 		FROM pods WHERE id = $1
 	`, id).Scan(
 		&p.ID, &p.OwnerID, &p.Name, &p.Salt, &p.VLANID, &p.Subnet, &p.Status,
-		&p.ErrorMessage, &p.ExpiresAt, &p.CreatedAt, &p.UpdatedAt,
+		&p.ErrorMessage, &p.ExpiresAt, &p.BlueprintID, &p.AllowVMAdditions, &p.CreatedAt, &p.UpdatedAt,
 	)
 	if err == pgx.ErrNoRows {
 		return nil, nil
@@ -445,11 +445,11 @@ func (q *Queries) GetPodByID(ctx context.Context, id uuid.UUID) (*models.Pod, er
 		SELECT pv.id, pv.pod_id, pv.template_id, pv.display_name, pv.vcenter_vm_name, pv.vcenter_vm_id,
 		       pv.vcpus, pv.ram_mb, pv.disk_gb, pv.ip_address, pv.status,
 		       COALESCE(t.default_username, ''), COALESCE(t.default_password, ''),
-		       pv.generated_username, pv.generated_password, pv.created_at,
+		       pv.generated_username, pv.generated_password, pv.boot_order, pv.created_at,
 		       COALESCE(t.name, ''), COALESCE(t.os_type, '')
 		FROM pod_vms pv
 		LEFT JOIN templates t ON pv.template_id = t.id
-		WHERE pv.pod_id = $1 AND pv.status != 'deleted' ORDER BY pv.created_at
+		WHERE pv.pod_id = $1 AND pv.status != 'deleted' ORDER BY pv.boot_order, pv.created_at
 	`, id)
 	if err != nil {
 		return nil, err
@@ -462,7 +462,7 @@ func (q *Queries) GetPodByID(ctx context.Context, id uuid.UUID) (*models.Pod, er
 			&vm.ID, &vm.PodID, &vm.TemplateID, &vm.DisplayName, &vm.VCenterVMName, &vm.VCenterVMID,
 			&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.IPAddress, &vm.Status,
 			&vm.DefaultUsername, &vm.DefaultPassword,
-			&vm.GeneratedUsername, &vm.GeneratedPassword, &vm.CreatedAt,
+			&vm.GeneratedUsername, &vm.GeneratedPassword, &vm.BootOrder, &vm.CreatedAt,
 			&vm.TemplateName, &vm.OSType,
 		); err != nil {
 			return nil, err
@@ -477,7 +477,7 @@ func (q *Queries) GetPodByID(ctx context.Context, id uuid.UUID) (*models.Pod, er
 func (q *Queries) ListPodsByOwner(ctx context.Context, ownerID uuid.UUID) ([]models.Pod, error) {
 	rows, err := q.pool.Query(ctx, `
 		SELECT p.id, p.owner_id, p.name, p.salt, p.vlan_id, p.subnet, p.status,
-		       p.error_message, p.expires_at, p.created_at, p.updated_at,
+		       p.error_message, p.expires_at, p.blueprint_id, p.allow_vm_additions, p.created_at, p.updated_at,
 		       u.id, u.username, u.email, COALESCE(u.display_name, ''), u.role
 		FROM pods p
 		JOIN users u ON u.id = p.owner_id
@@ -495,7 +495,7 @@ func (q *Queries) ListPodsByOwner(ctx context.Context, ownerID uuid.UUID) ([]mod
 		var owner models.User
 		if err := rows.Scan(
 			&p.ID, &p.OwnerID, &p.Name, &p.Salt, &p.VLANID, &p.Subnet, &p.Status,
-			&p.ErrorMessage, &p.ExpiresAt, &p.CreatedAt, &p.UpdatedAt,
+			&p.ErrorMessage, &p.ExpiresAt, &p.BlueprintID, &p.AllowVMAdditions, &p.CreatedAt, &p.UpdatedAt,
 			&owner.ID, &owner.Username, &owner.Email, &owner.DisplayName, &owner.Role,
 		); err != nil {
 			return nil, err
@@ -520,7 +520,7 @@ func (q *Queries) ListPodsByOwner(ctx context.Context, ownerID uuid.UUID) ([]mod
 func (q *Queries) ListAllPods(ctx context.Context) ([]models.Pod, error) {
 	rows, err := q.pool.Query(ctx, `
 		SELECT p.id, p.owner_id, p.name, p.salt, p.vlan_id, p.subnet, p.status,
-		       p.error_message, p.expires_at, p.created_at, p.updated_at,
+		       p.error_message, p.expires_at, p.blueprint_id, p.allow_vm_additions, p.created_at, p.updated_at,
 		       u.id, u.username, u.email, COALESCE(u.display_name, ''), u.role
 		FROM pods p
 		JOIN users u ON u.id = p.owner_id
@@ -538,7 +538,7 @@ func (q *Queries) ListAllPods(ctx context.Context) ([]models.Pod, error) {
 		var owner models.User
 		if err := rows.Scan(
 			&p.ID, &p.OwnerID, &p.Name, &p.Salt, &p.VLANID, &p.Subnet, &p.Status,
-			&p.ErrorMessage, &p.ExpiresAt, &p.CreatedAt, &p.UpdatedAt,
+			&p.ErrorMessage, &p.ExpiresAt, &p.BlueprintID, &p.AllowVMAdditions, &p.CreatedAt, &p.UpdatedAt,
 			&owner.ID, &owner.Username, &owner.Email, &owner.DisplayName, &owner.Role,
 		); err != nil {
 			return nil, err
@@ -564,11 +564,11 @@ func (q *Queries) listPodVMsActive(ctx context.Context, podID uuid.UUID) ([]mode
 		SELECT pv.id, pv.pod_id, pv.template_id, pv.display_name, pv.vcenter_vm_name, pv.vcenter_vm_id,
 		       pv.vcpus, pv.ram_mb, pv.disk_gb, pv.ip_address, pv.status,
 		       COALESCE(t.default_username, ''), COALESCE(t.default_password, ''),
-		       pv.generated_username, pv.generated_password, pv.created_at,
+		       pv.generated_username, pv.generated_password, pv.boot_order, pv.created_at,
 		       COALESCE(t.name, ''), COALESCE(t.os_type, '')
 		FROM pod_vms pv
 		LEFT JOIN templates t ON pv.template_id = t.id
-		WHERE pv.pod_id = $1 AND pv.status != 'deleted' ORDER BY pv.created_at
+		WHERE pv.pod_id = $1 AND pv.status != 'deleted' ORDER BY pv.boot_order, pv.created_at
 	`, podID)
 	if err != nil {
 		return nil, err
@@ -582,7 +582,7 @@ func (q *Queries) listPodVMsActive(ctx context.Context, podID uuid.UUID) ([]mode
 			&vm.ID, &vm.PodID, &vm.TemplateID, &vm.DisplayName, &vm.VCenterVMName, &vm.VCenterVMID,
 			&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.IPAddress, &vm.Status,
 			&vm.DefaultUsername, &vm.DefaultPassword,
-			&vm.GeneratedUsername, &vm.GeneratedPassword, &vm.CreatedAt,
+			&vm.GeneratedUsername, &vm.GeneratedPassword, &vm.BootOrder, &vm.CreatedAt,
 			&vm.TemplateName, &vm.OSType,
 		); err != nil {
 			return nil, err
@@ -1249,4 +1249,295 @@ func (q *Queries) CountUserSnapshots(ctx context.Context, podVMID uuid.UUID) (in
 		return 0, fmt.Errorf("count user snapshots: %w", err)
 	}
 	return count, nil
+}
+
+// --- Pod Expiration ---
+
+// UpdatePodExpiry updates the expires_at timestamp for a pod.
+func (q *Queries) UpdatePodExpiry(ctx context.Context, podID uuid.UUID, expiresAt time.Time) error {
+	_, err := q.pool.Exec(ctx, `UPDATE pods SET expires_at = $1, updated_at = now() WHERE id = $2`, expiresAt, podID)
+	return err
+}
+
+// CreatePodAttestation records a pod extension event.
+func (q *Queries) CreatePodAttestation(ctx context.Context, a *models.PodAttestation) error {
+	return q.pool.QueryRow(ctx, `
+		INSERT INTO pod_attestations (pod_id, user_id, previous_expires_at, new_expires_at)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id, created_at
+	`, a.PodID, a.UserID, a.PreviousExpiresAt, a.NewExpiresAt).Scan(&a.ID, &a.CreatedAt)
+}
+
+// ListExpiredPods returns active pods that have passed their expiration time.
+func (q *Queries) ListExpiredPods(ctx context.Context) ([]uuid.UUID, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT id FROM pods
+		WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at < now()
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+// --- Blueprints ---
+
+// ListBlueprintsForUser returns blueprints accessible to a user based on their role.
+func (q *Queries) ListBlueprintsForUser(ctx context.Context, userID uuid.UUID, role string) ([]models.Blueprint, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT DISTINCT b.id, b.name, b.description, b.created_by, b.allow_vm_additions,
+		       b.is_active, b.created_at, b.updated_at
+		FROM blueprints b
+		LEFT JOIN blueprint_access ba ON b.id = ba.blueprint_id
+		WHERE b.is_active = true
+		  AND (ba.role = $1 OR ba.user_id = $2 OR $1 = 'admin'
+		       OR NOT EXISTS (SELECT 1 FROM blueprint_access WHERE blueprint_id = b.id))
+		ORDER BY b.name
+	`, role, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var blueprints []models.Blueprint
+	for rows.Next() {
+		var bp models.Blueprint
+		if err := rows.Scan(
+			&bp.ID, &bp.Name, &bp.Description, &bp.CreatedBy, &bp.AllowVMAdditions,
+			&bp.IsActive, &bp.CreatedAt, &bp.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		blueprints = append(blueprints, bp)
+	}
+
+	// Load VMs for each blueprint
+	for i := range blueprints {
+		vms, err := q.listBlueprintVMs(ctx, blueprints[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		blueprints[i].VMs = vms
+	}
+
+	return blueprints, nil
+}
+
+// ListAllBlueprints returns all blueprints (admin).
+func (q *Queries) ListAllBlueprints(ctx context.Context) ([]models.Blueprint, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT b.id, b.name, b.description, b.created_by, b.allow_vm_additions,
+		       b.is_active, b.created_at, b.updated_at,
+		       u.id, u.username, u.email, COALESCE(u.display_name, ''), u.role
+		FROM blueprints b
+		JOIN users u ON u.id = b.created_by
+		ORDER BY b.name
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var blueprints []models.Blueprint
+	for rows.Next() {
+		var bp models.Blueprint
+		var creator models.User
+		if err := rows.Scan(
+			&bp.ID, &bp.Name, &bp.Description, &bp.CreatedBy, &bp.AllowVMAdditions,
+			&bp.IsActive, &bp.CreatedAt, &bp.UpdatedAt,
+			&creator.ID, &creator.Username, &creator.Email, &creator.DisplayName, &creator.Role,
+		); err != nil {
+			return nil, err
+		}
+		bp.Creator = &creator
+		blueprints = append(blueprints, bp)
+	}
+
+	for i := range blueprints {
+		vms, err := q.listBlueprintVMs(ctx, blueprints[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		blueprints[i].VMs = vms
+	}
+
+	return blueprints, nil
+}
+
+// GetBlueprintByID retrieves a blueprint with its VMs.
+func (q *Queries) GetBlueprintByID(ctx context.Context, id uuid.UUID) (*models.Blueprint, error) {
+	var bp models.Blueprint
+	err := q.pool.QueryRow(ctx, `
+		SELECT id, name, description, created_by, allow_vm_additions,
+		       is_active, created_at, updated_at
+		FROM blueprints WHERE id = $1
+	`, id).Scan(
+		&bp.ID, &bp.Name, &bp.Description, &bp.CreatedBy, &bp.AllowVMAdditions,
+		&bp.IsActive, &bp.CreatedAt, &bp.UpdatedAt,
+	)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	vms, err := q.listBlueprintVMs(ctx, bp.ID)
+	if err != nil {
+		return nil, err
+	}
+	bp.VMs = vms
+
+	creator, err := q.GetUserByID(ctx, bp.CreatedBy)
+	if err == nil && creator != nil {
+		bp.Creator = creator
+	}
+
+	return &bp, nil
+}
+
+func (q *Queries) listBlueprintVMs(ctx context.Context, blueprintID uuid.UUID) ([]models.BlueprintVM, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT bv.id, bv.blueprint_id, bv.template_id, bv.display_name,
+		       bv.vcpus, bv.ram_mb, bv.disk_gb, bv.boot_order, bv.quantity,
+		       bv.created_at, COALESCE(t.name, '')
+		FROM blueprint_vms bv
+		LEFT JOIN templates t ON bv.template_id = t.id
+		WHERE bv.blueprint_id = $1
+		ORDER BY bv.boot_order, bv.created_at
+	`, blueprintID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var vms []models.BlueprintVM
+	for rows.Next() {
+		var vm models.BlueprintVM
+		if err := rows.Scan(
+			&vm.ID, &vm.BlueprintID, &vm.TemplateID, &vm.DisplayName,
+			&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.BootOrder, &vm.Quantity,
+			&vm.CreatedAt, &vm.TemplateName,
+		); err != nil {
+			return nil, err
+		}
+		vms = append(vms, vm)
+	}
+	return vms, nil
+}
+
+// CreateBlueprint creates a new blueprint with its VMs.
+func (q *Queries) CreateBlueprint(ctx context.Context, bp *models.Blueprint) error {
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	err = tx.QueryRow(ctx, `
+		INSERT INTO blueprints (name, description, created_by, allow_vm_additions)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id, is_active, created_at, updated_at
+	`, bp.Name, bp.Description, bp.CreatedBy, bp.AllowVMAdditions).Scan(
+		&bp.ID, &bp.IsActive, &bp.CreatedAt, &bp.UpdatedAt,
+	)
+	if err != nil {
+		return err
+	}
+
+	for i := range bp.VMs {
+		vm := &bp.VMs[i]
+		err = tx.QueryRow(ctx, `
+			INSERT INTO blueprint_vms (blueprint_id, template_id, display_name, vcpus, ram_mb, disk_gb, boot_order, quantity)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			RETURNING id, created_at
+		`, bp.ID, vm.TemplateID, vm.DisplayName, vm.VCPUs, vm.RAMMB, vm.DiskGB, vm.BootOrder, vm.Quantity).Scan(
+			&vm.ID, &vm.CreatedAt,
+		)
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit(ctx)
+}
+
+// UpdateBlueprint updates a blueprint and replaces its VMs.
+func (q *Queries) UpdateBlueprint(ctx context.Context, bp *models.Blueprint) error {
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	_, err = tx.Exec(ctx, `
+		UPDATE blueprints SET name = $1, description = $2, allow_vm_additions = $3, updated_at = now()
+		WHERE id = $4
+	`, bp.Name, bp.Description, bp.AllowVMAdditions, bp.ID)
+	if err != nil {
+		return err
+	}
+
+	// Replace all VMs
+	_, err = tx.Exec(ctx, `DELETE FROM blueprint_vms WHERE blueprint_id = $1`, bp.ID)
+	if err != nil {
+		return err
+	}
+
+	for i := range bp.VMs {
+		vm := &bp.VMs[i]
+		err = tx.QueryRow(ctx, `
+			INSERT INTO blueprint_vms (blueprint_id, template_id, display_name, vcpus, ram_mb, disk_gb, boot_order, quantity)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			RETURNING id, created_at
+		`, bp.ID, vm.TemplateID, vm.DisplayName, vm.VCPUs, vm.RAMMB, vm.DiskGB, vm.BootOrder, vm.Quantity).Scan(
+			&vm.ID, &vm.CreatedAt,
+		)
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit(ctx)
+}
+
+// DeleteBlueprint soft-deletes a blueprint by setting is_active = false.
+func (q *Queries) DeleteBlueprint(ctx context.Context, id uuid.UUID) error {
+	_, err := q.pool.Exec(ctx, `UPDATE blueprints SET is_active = false, updated_at = now() WHERE id = $1`, id)
+	return err
+}
+
+// SetBlueprintAccess replaces all access rules for a blueprint.
+func (q *Queries) SetBlueprintAccess(ctx context.Context, blueprintID uuid.UUID, rules []models.BlueprintAccess) error {
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	_, err = tx.Exec(ctx, `DELETE FROM blueprint_access WHERE blueprint_id = $1`, blueprintID)
+	if err != nil {
+		return err
+	}
+
+	for _, rule := range rules {
+		_, err = tx.Exec(ctx, `
+			INSERT INTO blueprint_access (blueprint_id, user_id, role) VALUES ($1, $2, $3)
+		`, blueprintID, rule.UserID, rule.Role)
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit(ctx)
 }

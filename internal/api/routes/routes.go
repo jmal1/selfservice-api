@@ -22,7 +22,7 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 	r.Use(chimiddleware.Recoverer)
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   allowedOrigins,
-		AllowedMethods:   []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Content-Type", "Authorization"},
 		AllowCredentials: true,
 		MaxAge:           300,
@@ -84,10 +84,20 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 			r.Post("/{podID}/vms/{vmID}/snapshots/revert-initial", h.RevertToInitial)
 			r.Post("/{podID}/vms/{vmID}/snapshots/{snapID}/revert", h.RevertToSnapshot)
 			r.Delete("/{podID}/vms/{vmID}/snapshots/{snapID}", h.DeleteVMSnapshot)
+
+			// Pod expiration
+			r.Post("/{podID}/extend", h.ExtendPod)
 		})
 
 		// Templates
 		r.Get("/templates", h.ListTemplates)
+
+		// Blueprints
+		r.Route("/blueprints", func(r chi.Router) {
+			r.Get("/", h.ListBlueprints)
+			r.Get("/{blueprintID}", h.GetBlueprint)
+			r.Post("/{blueprintID}/deploy", h.DeployBlueprint)
+		})
 
 		// Jobs
 		r.Get("/jobs", h.ListMyJobs)
@@ -117,6 +127,16 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 			r.Post("/vlans", h.AdminAddVLAN)
 			r.Patch("/vlans/{vlanID}", h.AdminUpdateVLAN)
 			r.Delete("/vlans/{vlanID}", h.AdminRemoveVLAN)
+
+			// Blueprints
+			r.Get("/blueprints", h.AdminListBlueprints)
+			r.Post("/blueprints", h.AdminCreateBlueprint)
+			r.Put("/blueprints/{blueprintID}", h.AdminUpdateBlueprint)
+			r.Delete("/blueprints/{blueprintID}", h.AdminDeleteBlueprint)
+			r.Post("/blueprints/{blueprintID}/access", h.AdminSetBlueprintAccess)
+
+			// Admin pod management
+			r.Post("/pods/{podID}/extend", h.AdminExtendPod)
 		})
 	})
 	}) // close r.Group for Logger/Compress
