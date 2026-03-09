@@ -552,6 +552,141 @@ func (c *Client) AcquireWebMKSTicket(ctx context.Context, moref string) (*WebMKS
 	return result, err
 }
 
+// ---------- Snapshot Operations ----------
+
+// CreateVMSnapshot creates a snapshot of a VM and returns the snapshot's ManagedObjectReference value.
+func (c *Client) CreateVMSnapshot(ctx context.Context, moref, name, description string) (string, error) {
+	if err := c.ensureConnected(ctx); err != nil {
+		return "", err
+	}
+
+	var snapMoref string
+	err := c.withRetry(ctx, "create snapshot", func() error {
+		vm := object.NewVirtualMachine(c.client.Client,
+			types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
+
+		task, taskErr := vm.CreateSnapshot(ctx, name, description, false, false)
+		if taskErr != nil {
+			return fmt.Errorf("create snapshot for %s: %w", moref, taskErr)
+		}
+
+		info, taskErr := task.WaitForResult(ctx)
+		if taskErr != nil {
+			return fmt.Errorf("snapshot task for %s: %w", moref, taskErr)
+		}
+
+		ref, ok := info.Result.(types.ManagedObjectReference)
+		if !ok {
+			return fmt.Errorf("unexpected snapshot result type for %s", moref)
+		}
+		snapMoref = ref.Value
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+
+	c.logger.Info("created VM snapshot", "moref", moref, "snapshot", snapMoref, "name", name)
+	return snapMoref, nil
+}
+
+// RevertToSnapshot reverts a VM to the specified snapshot.
+func (c *Client) RevertToSnapshot(ctx context.Context, vmMoref, snapshotMoref string) error {
+	if err := c.ensureConnected(ctx); err != nil {
+		return err
+	}
+
+	return c.withRetry(ctx, "revert snapshot", func() error {
+		vm := object.NewVirtualMachine(c.client.Client,
+			types.ManagedObjectReference{Type: "VirtualMachine", Value: vmMoref})
+
+		task, err := vm.RevertToSnapshot(ctx, snapshotMoref, true)
+		if err != nil {
+			return fmt.Errorf("revert snapshot %s on %s: %w", snapshotMoref, vmMoref, err)
+		}
+
+		if err := task.Wait(ctx); err != nil {
+			return fmt.Errorf("revert snapshot task %s on %s: %w", snapshotMoref, vmMoref, err)
+		}
+
+		c.logger.Info("reverted VM to snapshot", "vm", vmMoref, "snapshot", snapshotMoref)
+		return nil
+	})
+}
+
+// SnapshotInfo holds snapshot metadata returned by ListVMSnapshots.
+type SnapshotInfo struct {
+	Name        string
+	Description string
+	Moref       string
+	CreateTime  time.Time
+}
+
+// ListVMSnapshots returns all snapshots for a VM.
+func (c *Client) ListVMSnapshots(ctx context.Context, moref string) ([]SnapshotInfo, error) {
+	if err := c.ensureConnected(ctx); err != nil {
+		return nil, err
+	}
+
+	var result []SnapshotInfo
+	err := c.withRetry(ctx, "list snapshots", func() error {
+		vm := object.NewVirtualMachine(c.client.Client,
+			types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
+
+		var props mo.VirtualMachine
+		if err := vm.Properties(ctx, vm.Reference(), []string{"snapshot"}, &props); err != nil {
+			return fmt.Errorf("get snapshot properties for %s: %w", moref, err)
+		}
+
+		result = nil
+		if props.Snapshot == nil {
+			return nil
+		}
+
+		// Flatten the snapshot tree
+		var flatten func([]types.VirtualMachineSnapshotTree)
+		flatten = func(nodes []types.VirtualMachineSnapshotTree) {
+			for _, node := range nodes {
+				result = append(result, SnapshotInfo{
+					Name:        node.Name,
+					Description: node.Description,
+					Moref:       node.Snapshot.Value,
+					CreateTime:  node.CreateTime,
+				})
+				flatten(node.ChildSnapshotList)
+			}
+		}
+		flatten(props.Snapshot.RootSnapshotList)
+		return nil
+	})
+	return result, err
+}
+
+// RemoveVMSnapshot removes a single snapshot from a VM (does not remove children).
+func (c *Client) RemoveVMSnapshot(ctx context.Context, vmMoref, snapshotMoref string) error {
+	if err := c.ensureConnected(ctx); err != nil {
+		return err
+	}
+
+	return c.withRetry(ctx, "remove snapshot", func() error {
+		vm := object.NewVirtualMachine(c.client.Client,
+			types.ManagedObjectReference{Type: "VirtualMachine", Value: vmMoref})
+
+		consolidate := true
+		task, err := vm.RemoveSnapshot(ctx, snapshotMoref, false, &consolidate)
+		if err != nil {
+			return fmt.Errorf("remove snapshot %s from %s: %w", snapshotMoref, vmMoref, err)
+		}
+
+		if err := task.Wait(ctx); err != nil {
+			return fmt.Errorf("remove snapshot task %s from %s: %w", snapshotMoref, vmMoref, err)
+		}
+
+		c.logger.Info("removed VM snapshot", "vm", vmMoref, "snapshot", snapshotMoref)
+		return nil
+	})
+}
+
 // ---------- Resource Pool Selection ----------
 
 // selectBestPool queries all configured resource pools and returns the one

@@ -188,6 +188,24 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) error {
 
 	_ = p.db.UpdatePodVMStatus(ctx, podVMID, models.VMStatusRunning)
 
+	// Take initial snapshot for restore-to-original (non-fatal if fails)
+	p.publishProgress(job.ID, "initial_snapshot", "Creating initial snapshot for restore-to-original")
+	snapMoref, snapErr := p.vc.CreateVMSnapshot(ctx, moref, "initial", "Auto-created at provisioning")
+	if snapErr != nil {
+		p.logger.Warn("failed to create initial snapshot (non-fatal)", "vm", payload.VMName, "error", snapErr)
+	} else {
+		snap := &models.VMSnapshot{
+			PodVMID:           podVMID,
+			Name:              "initial",
+			Description:       "Original state at provisioning",
+			VCenterSnapshotID: snapMoref,
+			IsInitial:         true,
+		}
+		if dbErr := p.db.CreateVMSnapshot(ctx, snap); dbErr != nil {
+			p.logger.Warn("failed to record initial snapshot in DB (non-fatal)", "vm", payload.VMName, "error", dbErr)
+		}
+	}
+
 	p.logger.Info("VM added successfully", "vm_id", podVMID, "pod_id", podID, "moref", moref)
 	return nil
 }

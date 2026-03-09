@@ -76,6 +76,13 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 			r.Post("/{podID}/vms/{vmID}/start", h.VMPowerAction)
 			r.Post("/{podID}/vms/{vmID}/stop", h.VMPowerAction)
 			r.Post("/{podID}/vms/{vmID}/restart", h.VMPowerAction)
+
+			// VM snapshot operations
+			r.Get("/{podID}/vms/{vmID}/snapshots", h.ListVMSnapshots)
+			r.Post("/{podID}/vms/{vmID}/snapshots", h.CreateVMSnapshot)
+			r.Post("/{podID}/vms/{vmID}/snapshots/revert-initial", h.RevertToInitial)
+			r.Post("/{podID}/vms/{vmID}/snapshots/{snapID}/revert", h.RevertToSnapshot)
+			r.Delete("/{podID}/vms/{vmID}/snapshots/{snapID}", h.DeleteVMSnapshot)
 		})
 
 		// Templates

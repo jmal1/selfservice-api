@@ -88,6 +88,20 @@ type PodVM struct {
 	OSType            string    `json:"os_type,omitempty"`
 }
 
+// VMSnapshot represents a point-in-time snapshot of a VM.
+type VMSnapshot struct {
+	ID                uuid.UUID `json:"id"`
+	PodVMID           uuid.UUID `json:"pod_vm_id"`
+	Name              string    `json:"name"`
+	Description       string    `json:"description"`
+	VCenterSnapshotID string    `json:"vcenter_snapshot_id"`
+	IsInitial         bool      `json:"is_initial"`
+	CreatedAt         time.Time `json:"created_at"`
+}
+
+// MaxUserSnapshots is the maximum number of user-created snapshots per VM.
+const MaxUserSnapshots = 2
+
 // Job represents a durable task in the job queue.
 type Job struct {
 	ID            uuid.UUID  `json:"id" db:"id"`
@@ -158,8 +172,11 @@ const (
 	JobTypeVMStart    = "vm_start"
 	JobTypeVMStop     = "vm_stop"
 	JobTypeVMRestart  = "vm_restart"
-	JobTypeVMDestroy  = "vm_destroy"
-	JobTypeVMAdd      = "vm_add"
+	JobTypeVMDestroy        = "vm_destroy"
+	JobTypeVMAdd            = "vm_add"
+	JobTypeVMSnapshot       = "vm_snapshot"
+	JobTypeVMRevert         = "vm_revert"
+	JobTypeVMSnapshotDelete = "vm_snapshot_delete"
 )
 
 // Job status constants.

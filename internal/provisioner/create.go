@@ -74,6 +74,12 @@ func (p *Provisioner) ProcessJob(ctx context.Context, job *models.Job) error {
 		err = p.DestroyVM(ctx, job)
 	case models.JobTypeVMAdd:
 		err = p.AddVM(ctx, job)
+	case models.JobTypeVMSnapshot:
+		err = p.SnapshotVM(ctx, job)
+	case models.JobTypeVMRevert:
+		err = p.RevertVM(ctx, job)
+	case models.JobTypeVMSnapshotDelete:
+		err = p.DeleteSnapshot(ctx, job)
 	default:
 		err = fmt.Errorf("unknown job type: %s", job.Type)
 	}
@@ -517,6 +523,25 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		}(info)
 	}
 	wg.Wait()
+
+	// --- Step 7b: Take initial snapshots for restore-to-original (non-fatal) ---
+	for _, info := range toPowerOn {
+		snapMoref, snapErr := p.vc.CreateVMSnapshot(ctx, info.moref, "initial", "Auto-created at provisioning")
+		if snapErr != nil {
+			p.logger.Warn("failed to create initial snapshot (non-fatal)", "vm", info.vmSpec.VMName, "error", snapErr)
+			continue
+		}
+		snap := &models.VMSnapshot{
+			PodVMID:           info.vmSpec.PodVMID,
+			Name:              "initial",
+			Description:       "Original state at provisioning",
+			VCenterSnapshotID: snapMoref,
+			IsInitial:         true,
+		}
+		if dbErr := p.db.CreateVMSnapshot(ctx, snap); dbErr != nil {
+			p.logger.Warn("failed to record initial snapshot in DB", "vm", info.vmSpec.VMName, "error", dbErr)
+		}
+	}
 
 	// --- Step 8: Mark pod active ---
 	p.publishProgress(job.ID, "pod_active", "Pod is active")

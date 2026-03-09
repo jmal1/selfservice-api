@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -1174,4 +1175,78 @@ func (q *Queries) ListAuditLogPaginated(ctx context.Context, f AuditLogFilter) (
 		Page:    f.Page,
 		PerPage: f.PerPage,
 	}, nil
+}
+
+// --- VM Snapshots ---
+
+// ListVMSnapshots returns all snapshots for a VM, ordered by creation time.
+func (q *Queries) ListVMSnapshots(ctx context.Context, podVMID uuid.UUID) ([]models.VMSnapshot, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT id, pod_vm_id, name, description, vcenter_snapshot_id, is_initial, created_at
+		FROM vm_snapshots
+		WHERE pod_vm_id = $1
+		ORDER BY created_at ASC`, podVMID)
+	if err != nil {
+		return nil, fmt.Errorf("list vm snapshots: %w", err)
+	}
+	defer rows.Close()
+
+	var snapshots []models.VMSnapshot
+	for rows.Next() {
+		var s models.VMSnapshot
+		if err := rows.Scan(&s.ID, &s.PodVMID, &s.Name, &s.Description,
+			&s.VCenterSnapshotID, &s.IsInitial, &s.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan vm snapshot: %w", err)
+		}
+		snapshots = append(snapshots, s)
+	}
+	return snapshots, rows.Err()
+}
+
+// GetVMSnapshot returns a single snapshot by ID, or nil if not found.
+func (q *Queries) GetVMSnapshot(ctx context.Context, id uuid.UUID) (*models.VMSnapshot, error) {
+	var s models.VMSnapshot
+	err := q.pool.QueryRow(ctx, `
+		SELECT id, pod_vm_id, name, description, vcenter_snapshot_id, is_initial, created_at
+		FROM vm_snapshots
+		WHERE id = $1`, id).Scan(&s.ID, &s.PodVMID, &s.Name, &s.Description,
+		&s.VCenterSnapshotID, &s.IsInitial, &s.CreatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get vm snapshot: %w", err)
+	}
+	return &s, nil
+}
+
+// CreateVMSnapshot inserts a snapshot and populates its ID and CreatedAt.
+func (q *Queries) CreateVMSnapshot(ctx context.Context, snap *models.VMSnapshot) error {
+	return q.pool.QueryRow(ctx, `
+		INSERT INTO vm_snapshots (pod_vm_id, name, description, vcenter_snapshot_id, is_initial)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING id, created_at`,
+		snap.PodVMID, snap.Name, snap.Description, snap.VCenterSnapshotID, snap.IsInitial,
+	).Scan(&snap.ID, &snap.CreatedAt)
+}
+
+// DeleteVMSnapshot removes a snapshot by ID.
+func (q *Queries) DeleteVMSnapshot(ctx context.Context, id uuid.UUID) error {
+	_, err := q.pool.Exec(ctx, `DELETE FROM vm_snapshots WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("delete vm snapshot: %w", err)
+	}
+	return nil
+}
+
+// CountUserSnapshots returns the number of non-initial snapshots for a VM.
+func (q *Queries) CountUserSnapshots(ctx context.Context, podVMID uuid.UUID) (int, error) {
+	var count int
+	err := q.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM vm_snapshots
+		WHERE pod_vm_id = $1 AND is_initial = false`, podVMID).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count user snapshots: %w", err)
+	}
+	return count, nil
 }
