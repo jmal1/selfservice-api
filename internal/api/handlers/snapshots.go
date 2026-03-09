@@ -84,11 +84,6 @@ func (h *Handler) CreateVMSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if vm.Status != models.VMStatusStopped {
-		http.Error(w, "vm must be powered off", http.StatusConflict)
-		return
-	}
-
 	var body struct {
 		Name        string `json:"name"`
 		Description string `json:"description"`
