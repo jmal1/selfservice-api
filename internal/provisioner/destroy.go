@@ -67,10 +67,10 @@ func (p *Provisioner) DestroyPod(ctx context.Context, job *models.Job) error {
 				if err := p.vc.DestroyVM(ctx, *vm.VCenterVMID); err != nil {
 					p.logger.Warn("failed to destroy VM", "moref", *vm.VCenterVMID, "error", err)
 					errors = append(errors, fmt.Errorf("destroy VM %s: %w", *vm.VCenterVMID, err))
-				} else {
-					_ = p.db.UpdatePodVMStatus(ctx, vm.ID, "deleted")
 				}
 			}
+			// Always mark VM as deleted — vCenter VM is gone (or never existed)
+			_ = p.db.UpdatePodVMStatus(ctx, vm.ID, "deleted")
 		}
 	}
 
