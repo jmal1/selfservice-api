@@ -58,6 +58,12 @@ func (p *Provisioner) PowerVM(ctx context.Context, job *models.Job, action strin
 		}
 		_ = p.db.UpdatePodVMStatus(ctx, podVMID, "running")
 
+	case "reset":
+		if err := p.vc.ResetVM(ctx, moref); err != nil {
+			return fmt.Errorf("reset: %w", err)
+		}
+		_ = p.db.UpdatePodVMStatus(ctx, podVMID, "running")
+
 	default:
 		return fmt.Errorf("unknown power action: %s", action)
 	}

@@ -70,6 +70,8 @@ func (p *Provisioner) ProcessJob(ctx context.Context, job *models.Job) error {
 		err = p.PowerVM(ctx, job, "stop")
 	case models.JobTypeVMRestart:
 		err = p.PowerVM(ctx, job, "restart")
+	case models.JobTypeVMReset:
+		err = p.PowerVM(ctx, job, "reset")
 	case models.JobTypeVMDestroy:
 		err = p.DestroyVM(ctx, job)
 	case models.JobTypeVMAdd:

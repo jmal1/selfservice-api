@@ -174,6 +174,7 @@ const (
 	JobTypeVMRestart  = "vm_restart"
 	JobTypeVMDestroy        = "vm_destroy"
 	JobTypeVMAdd            = "vm_add"
+	JobTypeVMReset          = "vm_reset"
 	JobTypeVMSnapshot       = "vm_snapshot"
 	JobTypeVMRevert         = "vm_revert"
 	JobTypeVMSnapshotDelete = "vm_snapshot_delete"

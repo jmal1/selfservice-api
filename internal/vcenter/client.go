@@ -473,6 +473,23 @@ func (c *Client) RestartVM(ctx context.Context, moref string) error {
 	})
 }
 
+// ResetVM performs a hard reset (power cycle) on a VM.
+func (c *Client) ResetVM(ctx context.Context, moref string) error {
+	if err := c.ensureConnected(ctx); err != nil {
+		return err
+	}
+
+	return c.withRetry(ctx, "reset VM", func() error {
+		vm := object.NewVirtualMachine(c.client.Client,
+			types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
+		task, err := vm.Reset(ctx)
+		if err != nil {
+			return fmt.Errorf("reset %s: %w", moref, err)
+		}
+		return task.Wait(ctx)
+	})
+}
+
 // WaitForIP waits for VMware Tools to report an IP address.
 func (c *Client) WaitForIP(ctx context.Context, moref string, timeout time.Duration) (string, error) {
 	if err := c.ensureConnected(ctx); err != nil {

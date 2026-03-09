@@ -616,6 +616,8 @@ func (h *Handler) VMPowerAction(w http.ResponseWriter, r *http.Request) {
 		jobType = models.JobTypeVMStop
 	case "restart":
 		jobType = models.JobTypeVMRestart
+	case "reset":
+		jobType = models.JobTypeVMReset
 	default:
 		http.Error(w, "unknown power action", http.StatusBadRequest)
 		return
