@@ -1,0 +1,235 @@
+package engine
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/jmal1/selfservice-api/internal/models"
+)
+
+// Queries provides database operations for the workflow engine.
+type Queries struct {
+	pool *pgxpool.Pool
+}
+
+// NewQueries creates a new Queries instance.
+func NewQueries(pool *pgxpool.Pool) *Queries {
+	return &Queries{pool: pool}
+}
+
+// ClaimPendingRun atomically claims the oldest pending run for processing.
+// Returns nil if no pending runs are available.
+func (q *Queries) ClaimPendingRun(ctx context.Context, engineID string) (*models.Run, error) {
+	var run models.Run
+	err := q.pool.QueryRow(ctx, `
+		UPDATE runs
+		SET status = $1, started_at = NOW(), updated_at = NOW()
+		WHERE id = (
+			SELECT id FROM runs
+			WHERE status = $2
+			ORDER BY created_at ASC
+			FOR UPDATE SKIP LOCKED
+			LIMIT 1
+		)
+		RETURNING id, pod_id, playlist_id, triggered_by, callback_token, status,
+		          total_workflows, passed_workflows, failed_workflows,
+		          error_message, started_at, completed_at, created_at, updated_at
+	`, models.RunStatusProvisioning, models.RunStatusPending).Scan(
+		&run.ID, &run.PodID, &run.PlaylistID, &run.TriggeredBy,
+		&run.CallbackToken, &run.Status,
+		&run.TotalWorkflows, &run.PassedWorkflows, &run.FailedWorkflows,
+		&run.ErrorMessage, &run.StartedAt, &run.CompletedAt,
+		&run.CreatedAt, &run.UpdatedAt,
+	)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("claim pending run: %w", err)
+	}
+	return &run, nil
+}
+
+// UpdateRunStatus updates the status of a run.
+func (q *Queries) UpdateRunStatus(ctx context.Context, runID uuid.UUID, status string, errorMsg *string) error {
+	var completedAt *time.Time
+	if status == models.RunStatusCompleted || status == models.RunStatusFailed ||
+		status == models.RunStatusTimeout || status == models.RunStatusCancelled {
+		now := time.Now()
+		completedAt = &now
+	}
+
+	_, err := q.pool.Exec(ctx, `
+		UPDATE runs
+		SET status = $2, error_message = $3, completed_at = $4, updated_at = NOW()
+		WHERE id = $1
+	`, runID, status, errorMsg, completedAt)
+	return err
+}
+
+// UpdateRunCounts updates the pass/fail counts on a run.
+func (q *Queries) UpdateRunCounts(ctx context.Context, runID uuid.UUID) error {
+	_, err := q.pool.Exec(ctx, `
+		UPDATE runs SET
+			total_workflows = (SELECT COUNT(*) FROM workflow_results WHERE run_id = $1),
+			passed_workflows = (SELECT COUNT(*) FROM workflow_results WHERE run_id = $1 AND status = 'pass'),
+			failed_workflows = (SELECT COUNT(*) FROM workflow_results WHERE run_id = $1 AND status IN ('fail', 'error', 'timeout')),
+			updated_at = NOW()
+		WHERE id = $1
+	`, runID)
+	return err
+}
+
+// FindStaleRuns returns runs stuck in provisioning or running for longer than maxAge.
+func (q *Queries) FindStaleRuns(ctx context.Context, maxAge time.Duration) ([]models.Run, error) {
+	cutoff := time.Now().Add(-maxAge)
+	rows, err := q.pool.Query(ctx, `
+		SELECT id, pod_id, playlist_id, triggered_by, runner_vm_id, runner_vm_name,
+		       callback_token, status, total_workflows, passed_workflows, failed_workflows,
+		       error_message, started_at, completed_at, created_at, updated_at
+		FROM runs
+		WHERE status IN ($1, $2)
+		  AND started_at < $3
+	`, models.RunStatusProvisioning, models.RunStatusRunning, cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("find stale runs: %w", err)
+	}
+	defer rows.Close()
+
+	var runs []models.Run
+	for rows.Next() {
+		var r models.Run
+		if err := rows.Scan(
+			&r.ID, &r.PodID, &r.PlaylistID, &r.TriggeredBy,
+			&r.RunnerVMID, &r.RunnerVMName, &r.CallbackToken, &r.Status,
+			&r.TotalWorkflows, &r.PassedWorkflows, &r.FailedWorkflows,
+			&r.ErrorMessage, &r.StartedAt, &r.CompletedAt,
+			&r.CreatedAt, &r.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan stale run: %w", err)
+		}
+		runs = append(runs, r)
+	}
+	return runs, nil
+}
+
+// GetWorkflowsForPlaylist returns all active workflows in a playlist, ordered.
+func (q *Queries) GetWorkflowsForPlaylist(ctx context.Context, playlistID uuid.UUID) ([]models.Workflow, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT w.id, w.name, w.slug, w.description, w.category, w.execution_mode,
+		       w.script, w.setup_script, w.timeout_seconds, w.target_os, w.target_vm,
+		       w.guest_interpreter, w.status, w.creation_mode, w.created_by, w.is_active,
+		       w.created_at, w.updated_at
+		FROM workflows w
+		JOIN playlist_workflows pw ON w.id = pw.workflow_id
+		WHERE pw.playlist_id = $1
+		  AND w.is_active = true
+		ORDER BY pw.execution_order ASC
+	`, playlistID)
+	if err != nil {
+		return nil, fmt.Errorf("get workflows for playlist: %w", err)
+	}
+	defer rows.Close()
+
+	var workflows []models.Workflow
+	for rows.Next() {
+		var w models.Workflow
+		if err := rows.Scan(
+			&w.ID, &w.Name, &w.Slug, &w.Description, &w.Category, &w.ExecutionMode,
+			&w.Script, &w.SetupScript, &w.TimeoutSeconds, &w.TargetOS, &w.TargetVM,
+			&w.GuestInterpreter, &w.Status, &w.CreationMode, &w.CreatedBy, &w.IsActive,
+			&w.CreatedAt, &w.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan workflow: %w", err)
+		}
+		workflows = append(workflows, w)
+	}
+	return workflows, nil
+}
+
+// GetActionsForWorkflow returns all actions for a workflow, ordered.
+func (q *Queries) GetActionsForWorkflow(ctx context.Context, workflowID uuid.UUID) ([]models.Action, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT id, workflow_id, name, description, action_type, params,
+		       execution_order, timeout_seconds, student_fail_hint, points, penalty, created_at
+		FROM actions
+		WHERE workflow_id = $1
+		ORDER BY execution_order ASC
+	`, workflowID)
+	if err != nil {
+		return nil, fmt.Errorf("get actions for workflow: %w", err)
+	}
+	defer rows.Close()
+
+	var actions []models.Action
+	for rows.Next() {
+		var a models.Action
+		if err := rows.Scan(
+			&a.ID, &a.WorkflowID, &a.Name, &a.Description, &a.ActionType, &a.Params,
+			&a.ExecutionOrder, &a.TimeoutSeconds, &a.StudentFailHint,
+			&a.Points, &a.Penalty, &a.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan action: %w", err)
+		}
+		actions = append(actions, a)
+	}
+	return actions, nil
+}
+
+// CreateWorkflowVersion creates an immutable version snapshot.
+func (q *Queries) CreateWorkflowVersion(ctx context.Context, wv *models.WorkflowVersion) error {
+	return q.pool.QueryRow(ctx, `
+		INSERT INTO workflow_versions (workflow_id, version, script, actions, created_by)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING id, created_at
+	`, wv.WorkflowID, wv.Version, wv.Script, wv.Actions, wv.CreatedBy).Scan(&wv.ID, &wv.CreatedAt)
+}
+
+// GetLatestWorkflowVersion returns the latest version number for a workflow.
+func (q *Queries) GetLatestWorkflowVersion(ctx context.Context, workflowID uuid.UUID) (int, error) {
+	var version int
+	err := q.pool.QueryRow(ctx, `
+		SELECT COALESCE(MAX(version), 0) FROM workflow_versions WHERE workflow_id = $1
+	`, workflowID).Scan(&version)
+	return version, err
+}
+
+// InsertWorkflowResult inserts a pending workflow result for a run.
+func (q *Queries) InsertWorkflowResult(ctx context.Context, wr *models.WorkflowResult) error {
+	return q.pool.QueryRow(ctx, `
+		INSERT INTO workflow_results (run_id, workflow_id, workflow_version_id, execution_order, execution_mode, status)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id, created_at
+	`, wr.RunID, wr.WorkflowID, wr.WorkflowVersionID, wr.ExecutionOrder, wr.ExecutionMode, wr.Status,
+	).Scan(&wr.ID, &wr.CreatedAt)
+}
+
+// UpdateWorkflowResult updates a workflow result with execution outcome.
+func (q *Queries) UpdateWorkflowResult(ctx context.Context, resultID uuid.UUID, status string,
+	studentMsg *string, instructorOutput, actionResults []byte, durationMs *int) error {
+
+	now := time.Now()
+	_, err := q.pool.Exec(ctx, `
+		UPDATE workflow_results
+		SET status = $2, student_message = $3, instructor_output = $4,
+		    action_results = $5, duration_ms = $6, completed_at = $7
+		WHERE id = $1
+	`, resultID, status, studentMsg, instructorOutput, actionResults, durationMs, now)
+	return err
+}
+
+// GenerateCallbackToken creates a cryptographically random callback token.
+func GenerateCallbackToken() (string, error) {
+	bytes := make([]byte, 32)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", fmt.Errorf("generate callback token: %w", err)
+	}
+	return hex.EncodeToString(bytes), nil
+}

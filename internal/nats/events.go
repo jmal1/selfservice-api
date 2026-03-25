@@ -116,3 +116,21 @@ func (c *Client) publish(subject string, evt Event) error {
 	}
 	return nil
 }
+
+// PublishRaw publishes an Event to an arbitrary subject.
+// Used by crucible-engine for testing.runs.* subjects.
+func (c *Client) PublishRaw(subject string, evt Event) error {
+	return c.publish(subject, evt)
+}
+
+// SubscribeRaw subscribes to an arbitrary subject and calls handler with decoded events.
+func (c *Client) SubscribeRaw(subject string, handler func(evt Event)) (*nats.Subscription, error) {
+	return c.conn.Subscribe(subject, func(msg *nats.Msg) {
+		var evt Event
+		if err := json.Unmarshal(msg.Data, &evt); err != nil {
+			c.logger.Error("failed to unmarshal event", "subject", subject, "error", err)
+			return
+		}
+		handler(evt)
+	})
+}
