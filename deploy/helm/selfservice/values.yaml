@@ -4,10 +4,12 @@
 replicaCount:
   api: 1
   worker: 1
+  engine: 1
 
 image:
   api: ghcr.io/jmal1/selfservice-api-gateway
   worker: ghcr.io/jmal1/selfservice-provision-worker
+  engine: ghcr.io/jmal1/selfservice-crucible-engine
   tag: "latest"
   pullPolicy: Always
 
@@ -71,6 +73,20 @@ database:
 
 # NATS connection
 natsURL: "nats://selfservice-nats:4222"
+
+# Crucible Engine (assessment runner provisioner)
+engine:
+  port: 8081
+  runnerImage: "ghcr.io/jmal1/selfservice-crucible-runner:latest"
+  runnerNode: "k3sv03"
+  trunkNIC: "ens34"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
 
 # Vault sidecar annotations (disabled for now)
 vault:

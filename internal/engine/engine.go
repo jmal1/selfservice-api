@@ -8,24 +8,29 @@ import (
 
 	"github.com/jmal1/selfservice-api/internal/models"
 	events "github.com/jmal1/selfservice-api/internal/nats"
+	"github.com/jmal1/selfservice-api/internal/runner"
 )
 
 // Engine is the workflow run orchestrator. It watches for pending runs,
 // provisions K8s Job runners, and manages the run lifecycle.
 type Engine struct {
-	queries  *Queries
-	nats     *events.Client
-	engineID string
-	logger   *slog.Logger
+	queries   *Queries
+	nats      *events.Client
+	k8s       *K8sClient
+	engineID  string
+	engineURL string
+	logger    *slog.Logger
 }
 
 // New creates a new Engine instance.
-func New(queries *Queries, natsClient *events.Client, engineID string, logger *slog.Logger) *Engine {
+func New(queries *Queries, natsClient *events.Client, k8sClient *K8sClient, engineID, engineURL string, logger *slog.Logger) *Engine {
 	return &Engine{
-		queries:  queries,
-		nats:     natsClient,
-		engineID: engineID,
-		logger:   logger,
+		queries:   queries,
+		nats:      natsClient,
+		k8s:       k8sClient,
+		engineID:  engineID,
+		engineURL: engineURL,
+		logger:    logger,
 	}
 }
 
@@ -46,6 +51,9 @@ func (e *Engine) RecoverStaleRuns(ctx context.Context) error {
 		)
 
 		// TODO: Clean up K8s resources (Job, Secret, NAD) if they exist
+		if e.k8s != nil && run.RunnerVMName != nil {
+			_ = e.k8s.CleanupRunner(ctx, *run.RunnerVMName, *run.RunnerVMName+"-config")
+		}
 
 		errMsg := "Engine restarted — run was orphaned and has been marked as failed"
 		if err := e.queries.UpdateRunStatus(ctx, run.ID, models.RunStatusFailed, &errMsg); err != nil {
@@ -147,19 +155,70 @@ func (e *Engine) executeRun(ctx context.Context, run *models.Run) error {
 	e.publishRunEvent(run.PodID.String(), run.ID.String(), "running",
 		fmt.Sprintf("Executing %d workflows", len(workflows)))
 
-	// TODO: Provision K8s Job runner on k3sv03
-	// For now, log what would happen
-	e.logger.Info("would provision K8s Job runner",
-		"run_id", run.ID,
-		"pod_id", run.PodID,
-		"workflow_count", len(workflows),
-		"callback_token", run.CallbackToken[:8]+"...",
-	)
+	// Provision K8s Job runner on k3sv03
+	if e.k8s != nil {
+		// Resolve VLAN tag for this pod (stored in pod record)
+		vlanTag, err := e.queries.GetPodVLANTag(ctx, run.PodID)
+		if err != nil {
+			return fmt.Errorf("get pod VLAN tag: %w", err)
+		}
+
+		// Build WorkflowDefs from loaded workflows
+		wfDefs := make([]runner.WorkflowDef, len(workflows))
+		for i, wf := range workflows {
+			var setup string
+			if wf.SetupScript != nil {
+				setup = *wf.SetupScript
+			}
+			wfDefs[i] = runner.WorkflowDef{
+				Slug:           wf.Slug,
+				Name:           wf.Name,
+				Script:         wf.Script,
+				Setup:          setup,
+				TimeoutSeconds: wf.TimeoutSeconds,
+			}
+		}
+
+		// Resolve target info
+		target, pod, err := e.queries.GetRunTargetInfo(ctx, run.PodID)
+		if err != nil {
+			return fmt.Errorf("get target info: %w", err)
+		}
+
+		result, err := e.k8s.ProvisionRunner(ctx,
+			run.ID.String(),
+			run.CallbackToken,
+			vlanTag,
+			wfDefs,
+			target,
+			pod,
+			e.engineURL,
+		)
+		if err != nil {
+			return fmt.Errorf("provision runner: %w", err)
+		}
+
+		// Store the job name for later cleanup
+		if err := e.queries.SetRunnerPodName(ctx, run.ID, result.JobName); err != nil {
+			e.logger.Warn("failed to store runner pod name", "run_id", run.ID, "error", err)
+		}
+
+		e.logger.Info("provisioned K8s runner",
+			"run_id", run.ID,
+			"job", result.JobName,
+			"secret", result.SecretName,
+			"nad", result.NADName,
+		)
+	} else {
+		e.logger.Warn("k8s client not available, skipping provisioning",
+			"run_id", run.ID,
+		)
+	}
 
 	// The actual execution happens asynchronously:
-	// 1. Engine creates K8s Job + Secret + NAD
+	// 1. Engine created K8s Job + Secret + NAD above
 	// 2. Runner pod starts, executes workflows, POSTs results to callback
-	// 3. Callback handler (in Phase 4) writes results to DB
+	// 3. Callback handler (Phase 4) writes results to DB
 	// 4. Timeout watchdog catches stuck runs
 
 	return nil
@@ -222,7 +281,10 @@ func (e *Engine) checkForTimeouts(ctx context.Context) {
 			"status", run.Status,
 		)
 
-		// TODO: Clean up K8s resources (delete Job, Secret)
+		// Clean up K8s resources (delete Job, Secret)
+		if e.k8s != nil && run.RunnerVMName != nil {
+			_ = e.k8s.CleanupRunner(ctx, *run.RunnerVMName, *run.RunnerVMName+"-config")
+		}
 
 		errMsg := "Run timed out after 10 minutes"
 		if err := e.queries.UpdateRunStatus(ctx, run.ID, models.RunStatusTimeout, &errMsg); err != nil {
@@ -245,5 +307,30 @@ func (e *Engine) publishRunEvent(podID, runID, status, message string) {
 	subject := fmt.Sprintf("testing.runs.%s.progress", podID)
 	if err := e.nats.PublishRaw(subject, evt); err != nil {
 		e.logger.Warn("failed to publish run event", "subject", subject, "error", err)
+	}
+}
+
+// StartOrphanCleanup starts a goroutine that periodically cleans up
+// completed runner Jobs that weren't cleaned up by callbacks.
+func (e *Engine) StartOrphanCleanup(ctx context.Context) {
+	if e.k8s == nil {
+		return
+	}
+
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cleaned, err := e.k8s.CleanupOrphanedRunners(ctx)
+			if err != nil {
+				e.logger.Error("orphan cleanup failed", "error", err)
+			} else if cleaned > 0 {
+				e.logger.Info("orphan cleanup completed", "cleaned", cleaned)
+			}
+		}
 	}
 }

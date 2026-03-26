@@ -56,9 +56,24 @@ func main() {
 		engineID = "engine-unknown"
 	}
 
+	// Create K8s client (nil if running outside cluster — e.g., local dev)
+	k8sCfg := engine.K8sConfig{
+		Namespace:   getEnv("ENGINE_NAMESPACE", "selfservice"),
+		RunnerImage: getEnv("RUNNER_IMAGE", "ghcr.io/jmal1/selfservice-crucible-runner:latest"),
+		RunnerNode:  getEnv("RUNNER_NODE", "k3sv03"),
+		TrunkNIC:    getEnv("RUNNER_TRUNK_NIC", "ens34"),
+		EngineURL:   getEnv("ENGINE_CALLBACK_URL", "http://crucible-engine.selfservice.svc.cluster.local:8081"),
+	}
+
+	var k8sClient *engine.K8sClient
+	k8sClient, err = engine.NewK8sClient(k8sCfg, logger)
+	if err != nil {
+		logger.Warn("k8s client not available — running without K8s provisioning", "error", err)
+	}
+
 	// Create engine
 	queries := engine.NewQueries(pool)
-	eng := engine.New(queries, natsClient, engineID, logger)
+	eng := engine.New(queries, natsClient, k8sClient, engineID, k8sCfg.EngineURL, logger)
 
 	logger.Info("starting crucible-engine",
 		"engine_id", engineID,
@@ -83,6 +98,9 @@ func main() {
 
 	// Start timeout watchdog
 	go eng.StartTimeoutWatchdog(ctx)
+
+	// Start orphan cleanup (every 5 min)
+	go eng.StartOrphanCleanup(ctx)
 
 	// Polling fallback: check for runs every 30 seconds
 	ticker := time.NewTicker(30 * time.Second)
@@ -109,4 +127,11 @@ func main() {
 
 	logger.Info("shutting down crucible-engine")
 	cancel()
+}
+
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }

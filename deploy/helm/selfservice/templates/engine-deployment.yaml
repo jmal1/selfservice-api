@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-engine
+  labels:
+    app.kubernetes.io/name: selfservice-api
+    app.kubernetes.io/component: crucible-engine
+spec:
+  replicas: {{ .Values.replicaCount.engine | default 1 }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: selfservice-api
+      app.kubernetes.io/component: crucible-engine
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: selfservice-api
+        app.kubernetes.io/component: crucible-engine
+    spec:
+      serviceAccountName: {{ .Release.Name }}-engine
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: engine
+          image: "{{ .Values.image.engine | default "ghcr.io/jmal1/selfservice-crucible-engine" }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            # Database
+            - name: DB_HOST
+              value: {{ .Values.database.host | quote }}
+            - name: DB_PORT
+              value: {{ .Values.database.port | quote }}
+            - name: DB_NAME
+              value: {{ .Values.database.name | quote }}
+            - name: DB_USER
+              value: {{ .Values.database.user | quote }}
+            - name: DB_SSLMODE
+              value: {{ .Values.database.sslmode | quote }}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.db }}
+                  key: password
+            # NATS
+            - name: NATS_URL
+              value: {{ .Values.natsURL | quote }}
+            # Runner provisioner
+            - name: ENGINE_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: RUNNER_IMAGE
+              value: {{ .Values.engine.runnerImage | default "ghcr.io/jmal1/selfservice-crucible-runner:latest" | quote }}
+            - name: RUNNER_NODE
+              value: {{ .Values.engine.runnerNode | default "k3sv03" | quote }}
+            - name: RUNNER_TRUNK_NIC
+              value: {{ .Values.engine.trunkNIC | default "ens34" | quote }}
+            - name: ENGINE_CALLBACK_URL
+              value: "http://{{ .Release.Name }}-engine.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.engine.port | default 8081 }}"
+          ports:
+            - name: callback
+              containerPort: {{ .Values.engine.port | default 8081 }}
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.engine.resources | nindent 12 }}

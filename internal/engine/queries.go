@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/jmal1/selfservice-api/internal/models"
+	"github.com/jmal1/selfservice-api/internal/runner"
 )
 
 // Queries provides database operations for the workflow engine.
@@ -232,4 +233,62 @@ func GenerateCallbackToken() (string, error) {
 		return "", fmt.Errorf("generate callback token: %w", err)
 	}
 	return hex.EncodeToString(bytes), nil
+}
+
+// GetPodVLANTag returns the VLAN tag assigned to a pod.
+func (q *Queries) GetPodVLANTag(ctx context.Context, podID uuid.UUID) (int, error) {
+	var vlanTag int
+	err := q.pool.QueryRow(ctx, `
+		SELECT v.vlan_tag FROM pods p
+		JOIN vlans v ON p.vlan_id = v.id
+		WHERE p.id = $1
+	`, podID).Scan(&vlanTag)
+	if err != nil {
+		return 0, fmt.Errorf("get pod VLAN tag: %w", err)
+	}
+	return vlanTag, nil
+}
+
+// GetRunTargetInfo retrieves the primary target VM info and pod network config
+// for building the runner config. Returns the target (first VM with credentials)
+// and pod network metadata.
+func (q *Queries) GetRunTargetInfo(ctx context.Context, podID uuid.UUID) (runner.TargetConfig, runner.PodConfig, error) {
+	var target runner.TargetConfig
+	var pod runner.PodConfig
+
+	// Get the first VM in this pod with generated credentials
+	err := q.pool.QueryRow(ctx, `
+		SELECT COALESCE(pv.ip_address, ''), COALESCE(t.os_type, 'linux'),
+		       COALESCE(pv.generated_username, ''), COALESCE(pv.generated_password, '')
+		FROM pod_vms pv
+		JOIN vm_templates t ON pv.template_id = t.id
+		WHERE pv.pod_id = $1
+		ORDER BY pv.created_at ASC
+		LIMIT 1
+	`, podID).Scan(&target.IP, &target.OS, &target.Username, &target.Password)
+	if err != nil {
+		return target, pod, fmt.Errorf("get target VM: %w", err)
+	}
+
+	// Get pod network info
+	err = q.pool.QueryRow(ctx, `
+		SELECT v.subnet, COALESCE(p.pod_index, 0)
+		FROM pods p
+		JOIN vlans v ON p.vlan_id = v.id
+		WHERE p.id = $1
+	`, podID).Scan(&pod.Subnet, &pod.Index)
+	if err != nil {
+		return target, pod, fmt.Errorf("get pod network: %w", err)
+	}
+
+	return target, pod, nil
+}
+
+// SetRunnerPodName stores the K8s Job name on the run for later cleanup.
+func (q *Queries) SetRunnerPodName(ctx context.Context, runID uuid.UUID, jobName string) error {
+	_, err := q.pool.Exec(ctx, `
+		UPDATE runs SET runner_vm_name = $2, updated_at = NOW()
+		WHERE id = $1
+	`, runID, jobName)
+	return err
 }
