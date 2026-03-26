@@ -262,19 +262,20 @@ func (h *Handler) AdminGetAction(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) AdminCreateAction(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name            string          `json:"name"`
-		Slug            string          `json:"slug"`
-		Description     string          `json:"description"`
-		ActionType      string          `json:"action_type"`
-		ActionCategory  string          `json:"action_category"`
-		Params          json.RawMessage `json:"params"`
-		Script          string          `json:"script"`
-		InputContext    json.RawMessage `json:"input_context"`
-		OutputContext   json.RawMessage `json:"output_context"`
-		TimeoutSeconds  int             `json:"timeout_seconds"`
-		StudentFailHint *string         `json:"student_fail_hint"`
-		Points          *int            `json:"points"`
-		Penalty         *int            `json:"penalty"`
+		Name               string          `json:"name"`
+		Slug               string          `json:"slug"`
+		Description        string          `json:"description"`
+		ActionType         string          `json:"action_type"`
+		ActionCategory     string          `json:"action_category"`
+		Params             json.RawMessage `json:"params"`
+		Script             string          `json:"script"`
+		InputContext       json.RawMessage `json:"input_context"`
+		OutputContext      json.RawMessage `json:"output_context"`
+		TimeoutSeconds     int             `json:"timeout_seconds"`
+		StudentFailHint    *string         `json:"student_fail_hint"`
+		Points             *int            `json:"points"`
+		Penalty            *int            `json:"penalty"`
+		SupportedPlatforms json.RawMessage `json:"supported_platforms"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -302,22 +303,26 @@ func (h *Handler) AdminCreateAction(w http.ResponseWriter, r *http.Request) {
 	if req.OutputContext == nil {
 		req.OutputContext = json.RawMessage("[]")
 	}
+	if req.SupportedPlatforms == nil {
+		req.SupportedPlatforms = json.RawMessage(`["any"]`)
+	}
 
 	action := &models.Action{
-		Name:            req.Name,
-		Slug:            &req.Slug,
-		Description:     req.Description,
-		ActionType:      req.ActionType,
-		ActionCategory:  req.ActionCategory,
-		Params:          req.Params,
-		Script:          req.Script,
-		InputContext:    req.InputContext,
-		OutputContext:   req.OutputContext,
-		TimeoutSeconds:  req.TimeoutSeconds,
-		StudentFailHint: req.StudentFailHint,
-		Points:          req.Points,
-		Penalty:         req.Penalty,
-		IsLibrary:       true,
+		Name:               req.Name,
+		Slug:               &req.Slug,
+		Description:        req.Description,
+		ActionType:         req.ActionType,
+		ActionCategory:     req.ActionCategory,
+		Params:             req.Params,
+		Script:             req.Script,
+		InputContext:       req.InputContext,
+		OutputContext:      req.OutputContext,
+		TimeoutSeconds:     req.TimeoutSeconds,
+		StudentFailHint:    req.StudentFailHint,
+		Points:             req.Points,
+		Penalty:            req.Penalty,
+		IsLibrary:          true,
+		SupportedPlatforms: req.SupportedPlatforms,
 	}
 
 	if err := h.db.CreateLibraryAction(r.Context(), action); err != nil {
@@ -336,19 +341,20 @@ func (h *Handler) AdminUpdateAction(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Name            *string          `json:"name"`
-		Slug            *string          `json:"slug"`
-		Description     *string          `json:"description"`
-		ActionType      *string          `json:"action_type"`
-		ActionCategory  *string          `json:"action_category"`
-		Params          *json.RawMessage `json:"params"`
-		Script          *string          `json:"script"`
-		InputContext    *json.RawMessage `json:"input_context"`
-		OutputContext   *json.RawMessage `json:"output_context"`
-		TimeoutSeconds  *int             `json:"timeout_seconds"`
-		StudentFailHint *string          `json:"student_fail_hint"`
-		Points          *int             `json:"points"`
-		Penalty         *int             `json:"penalty"`
+		Name               *string          `json:"name"`
+		Slug               *string          `json:"slug"`
+		Description        *string          `json:"description"`
+		ActionType         *string          `json:"action_type"`
+		ActionCategory     *string          `json:"action_category"`
+		Params             *json.RawMessage `json:"params"`
+		Script             *string          `json:"script"`
+		InputContext       *json.RawMessage `json:"input_context"`
+		OutputContext      *json.RawMessage `json:"output_context"`
+		TimeoutSeconds     *int             `json:"timeout_seconds"`
+		StudentFailHint    *string          `json:"student_fail_hint"`
+		Points             *int             `json:"points"`
+		Penalty            *int             `json:"penalty"`
+		SupportedPlatforms *json.RawMessage `json:"supported_platforms"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -365,7 +371,7 @@ func (h *Handler) AdminUpdateAction(w http.ResponseWriter, r *http.Request) {
 	if err := h.db.UpdateLibraryAction(r.Context(), id, req.Name, req.Slug, req.Description,
 		req.ActionType, req.ActionCategory, paramsStr, req.Script,
 		req.InputContext, req.OutputContext, req.TimeoutSeconds, req.StudentFailHint,
-		req.Points, req.Penalty); err != nil {
+		req.Points, req.Penalty, req.SupportedPlatforms); err != nil {
 		h.logger.Error("failed to update action", "error", err)
 		http.Error(w, "failed to update action", http.StatusInternalServerError)
 		return

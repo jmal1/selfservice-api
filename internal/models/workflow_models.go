@@ -102,8 +102,9 @@ type Action struct {
 	StudentFailHint *string         `json:"student_fail_hint" db:"student_fail_hint"`
 	Points          *int            `json:"points" db:"points"`
 	Penalty         *int            `json:"penalty" db:"penalty"`
-	IsLibrary       bool            `json:"is_library" db:"is_library"`
-	CreatedAt       time.Time       `json:"created_at" db:"created_at"`
+	IsLibrary          bool            `json:"is_library" db:"is_library"`
+	SupportedPlatforms json.RawMessage `json:"supported_platforms" db:"supported_platforms"`
+	CreatedAt          time.Time       `json:"created_at" db:"created_at"`
 	UpdatedAt       time.Time       `json:"updated_at" db:"updated_at"`
 }
 

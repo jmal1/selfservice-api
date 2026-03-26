@@ -296,7 +296,8 @@ func (q *Queries) GetWorkflowWithActions(ctx context.Context, id uuid.UUID) (*mo
 
 	rows, err := q.pool.Query(ctx, `
 		SELECT id, workflow_id, name, description, action_type, params,
-		       execution_order, timeout_seconds, student_fail_hint, points, penalty, created_at
+		       execution_order, timeout_seconds, student_fail_hint, points, penalty,
+		       supported_platforms, created_at
 		FROM actions WHERE workflow_id = $1 ORDER BY execution_order
 	`, id)
 	if err != nil {
@@ -308,7 +309,7 @@ func (q *Queries) GetWorkflowWithActions(ctx context.Context, id uuid.UUID) (*mo
 		var a models.Action
 		if err := rows.Scan(&a.ID, &a.WorkflowID, &a.Name, &a.Description, &a.ActionType,
 			&a.Params, &a.ExecutionOrder, &a.TimeoutSeconds, &a.StudentFailHint,
-			&a.Points, &a.Penalty, &a.CreatedAt); err != nil {
+			&a.Points, &a.Penalty, &a.SupportedPlatforms, &a.CreatedAt); err != nil {
 			return nil, err
 		}
 		wf.Actions = append(wf.Actions, a)
@@ -423,7 +424,7 @@ func (q *Queries) ListLibraryActions(ctx context.Context) ([]models.Action, erro
 		SELECT id, workflow_id, name, slug, description, action_type, action_category,
 		       params, script, input_context, output_context, execution_order,
 		       timeout_seconds, student_fail_hint, points, penalty, is_library,
-		       created_at, updated_at
+		       supported_platforms, created_at, updated_at
 		FROM actions WHERE is_library = true
 		ORDER BY action_category, name
 	`)
@@ -439,7 +440,7 @@ func (q *Queries) ListLibraryActions(ctx context.Context) ([]models.Action, erro
 			&a.ActionType, &a.ActionCategory, &a.Params, &a.Script,
 			&a.InputContext, &a.OutputContext, &a.ExecutionOrder,
 			&a.TimeoutSeconds, &a.StudentFailHint, &a.Points, &a.Penalty,
-			&a.IsLibrary, &a.CreatedAt, &a.UpdatedAt); err != nil {
+			&a.IsLibrary, &a.SupportedPlatforms, &a.CreatedAt, &a.UpdatedAt); err != nil {
 			return nil, err
 		}
 		actions = append(actions, a)
@@ -449,15 +450,19 @@ func (q *Queries) ListLibraryActions(ctx context.Context) ([]models.Action, erro
 
 // CreateLibraryAction inserts a new standalone action.
 func (q *Queries) CreateLibraryAction(ctx context.Context, a *models.Action) error {
+	platforms := a.SupportedPlatforms
+	if platforms == nil {
+		platforms = json.RawMessage(`["any"]`)
+	}
 	return q.pool.QueryRow(ctx, `
 		INSERT INTO actions (name, slug, description, action_type, action_category,
 		       params, script, input_context, output_context, timeout_seconds,
-		       student_fail_hint, points, penalty, is_library)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, true)
+		       student_fail_hint, points, penalty, is_library, supported_platforms)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, true, $14)
 		RETURNING id, created_at, updated_at
 	`, a.Name, a.Slug, a.Description, a.ActionType, a.ActionCategory,
 		a.Params, a.Script, a.InputContext, a.OutputContext, a.TimeoutSeconds,
-		a.StudentFailHint, a.Points, a.Penalty,
+		a.StudentFailHint, a.Points, a.Penalty, platforms,
 	).Scan(&a.ID, &a.CreatedAt, &a.UpdatedAt)
 }
 
@@ -468,13 +473,13 @@ func (q *Queries) GetLibraryAction(ctx context.Context, id uuid.UUID) (*models.A
 		SELECT id, workflow_id, name, slug, description, action_type, action_category,
 		       params, script, input_context, output_context, execution_order,
 		       timeout_seconds, student_fail_hint, points, penalty, is_library,
-		       created_at, updated_at
+		       supported_platforms, created_at, updated_at
 		FROM actions WHERE id = $1 AND is_library = true
 	`, id).Scan(&a.ID, &a.WorkflowID, &a.Name, &a.Slug, &a.Description,
 		&a.ActionType, &a.ActionCategory, &a.Params, &a.Script,
 		&a.InputContext, &a.OutputContext, &a.ExecutionOrder,
 		&a.TimeoutSeconds, &a.StudentFailHint, &a.Points, &a.Penalty,
-		&a.IsLibrary, &a.CreatedAt, &a.UpdatedAt)
+		&a.IsLibrary, &a.SupportedPlatforms, &a.CreatedAt, &a.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -485,7 +490,8 @@ func (q *Queries) GetLibraryAction(ctx context.Context, id uuid.UUID) (*models.A
 func (q *Queries) UpdateLibraryAction(ctx context.Context, id uuid.UUID, name, slug, description,
 	actionType, actionCategory *string, params, script *string,
 	inputContext, outputContext *json.RawMessage,
-	timeoutSeconds *int, studentFailHint *string, points, penalty *int) error {
+	timeoutSeconds *int, studentFailHint *string, points, penalty *int,
+	supportedPlatforms *json.RawMessage) error {
 	_, err := q.pool.Exec(ctx, `
 		UPDATE actions SET
 			name = COALESCE($2, name),
@@ -501,11 +507,12 @@ func (q *Queries) UpdateLibraryAction(ctx context.Context, id uuid.UUID, name, s
 			student_fail_hint = COALESCE($12, student_fail_hint),
 			points = COALESCE($13, points),
 			penalty = COALESCE($14, penalty),
+			supported_platforms = COALESCE($15, supported_platforms),
 			updated_at = NOW()
 		WHERE id = $1 AND is_library = true
 	`, id, name, slug, description, actionType, actionCategory,
 		params, script, inputContext, outputContext,
-		timeoutSeconds, studentFailHint, points, penalty)
+		timeoutSeconds, studentFailHint, points, penalty, supportedPlatforms)
 	return err
 }
 
