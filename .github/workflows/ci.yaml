@@ -19,10 +19,19 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        component:
-          - api-gateway
-          - provision-worker
-          - crucible-engine
+        include:
+          - component: api-gateway
+            dockerfile: Dockerfile
+            target: api-gateway
+          - component: provision-worker
+            dockerfile: Dockerfile
+            target: provision-worker
+          - component: crucible-engine
+            dockerfile: Dockerfile
+            target: crucible-engine
+          - component: crucible-runner
+            dockerfile: deploy/runner/Dockerfile
+            target: ""
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -52,7 +61,8 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          target: ${{ matrix.component }}
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target || '' }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
