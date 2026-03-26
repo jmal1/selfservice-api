@@ -84,20 +84,27 @@ type Workflow struct {
 	Actions []Action `json:"actions,omitempty" db:"-"`
 }
 
-// Action represents an ordered step within a workflow.
+// Action represents an ordered step within a workflow or a standalone library action.
 type Action struct {
 	ID              uuid.UUID       `json:"id" db:"id"`
-	WorkflowID      uuid.UUID       `json:"workflow_id" db:"workflow_id"`
+	WorkflowID      *uuid.UUID      `json:"workflow_id,omitempty" db:"workflow_id"`
 	Name            string          `json:"name" db:"name"`
+	Slug            *string         `json:"slug,omitempty" db:"slug"`
 	Description     string          `json:"description" db:"description"`
 	ActionType      string          `json:"action_type" db:"action_type"`
+	ActionCategory  string          `json:"action_category" db:"action_category"`
 	Params          json.RawMessage `json:"params" db:"params"`
+	Script          string          `json:"script" db:"script"`
+	InputContext    json.RawMessage `json:"input_context" db:"input_context"`
+	OutputContext   json.RawMessage `json:"output_context" db:"output_context"`
 	ExecutionOrder  int             `json:"execution_order" db:"execution_order"`
 	TimeoutSeconds  int             `json:"timeout_seconds" db:"timeout_seconds"`
 	StudentFailHint *string         `json:"student_fail_hint" db:"student_fail_hint"`
 	Points          *int            `json:"points" db:"points"`
 	Penalty         *int            `json:"penalty" db:"penalty"`
+	IsLibrary       bool            `json:"is_library" db:"is_library"`
 	CreatedAt       time.Time       `json:"created_at" db:"created_at"`
+	UpdatedAt       time.Time       `json:"updated_at" db:"updated_at"`
 }
 
 // WorkflowVersion is an immutable snapshot of a workflow for run pinning.

@@ -415,6 +415,112 @@ func (q *Queries) ListWorkflowsWithActions(ctx context.Context) ([]models.Workfl
 	return workflows, nil
 }
 
+// --- Action Library CRUD Queries ---
+
+// ListLibraryActions returns all standalone library actions.
+func (q *Queries) ListLibraryActions(ctx context.Context) ([]models.Action, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT id, workflow_id, name, slug, description, action_type, action_category,
+		       params, script, input_context, output_context, execution_order,
+		       timeout_seconds, student_fail_hint, points, penalty, is_library,
+		       created_at, updated_at
+		FROM actions WHERE is_library = true
+		ORDER BY action_category, name
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var actions []models.Action
+	for rows.Next() {
+		var a models.Action
+		if err := rows.Scan(&a.ID, &a.WorkflowID, &a.Name, &a.Slug, &a.Description,
+			&a.ActionType, &a.ActionCategory, &a.Params, &a.Script,
+			&a.InputContext, &a.OutputContext, &a.ExecutionOrder,
+			&a.TimeoutSeconds, &a.StudentFailHint, &a.Points, &a.Penalty,
+			&a.IsLibrary, &a.CreatedAt, &a.UpdatedAt); err != nil {
+			return nil, err
+		}
+		actions = append(actions, a)
+	}
+	return actions, nil
+}
+
+// CreateLibraryAction inserts a new standalone action.
+func (q *Queries) CreateLibraryAction(ctx context.Context, a *models.Action) error {
+	return q.pool.QueryRow(ctx, `
+		INSERT INTO actions (name, slug, description, action_type, action_category,
+		       params, script, input_context, output_context, timeout_seconds,
+		       student_fail_hint, points, penalty, is_library)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, true)
+		RETURNING id, created_at, updated_at
+	`, a.Name, a.Slug, a.Description, a.ActionType, a.ActionCategory,
+		a.Params, a.Script, a.InputContext, a.OutputContext, a.TimeoutSeconds,
+		a.StudentFailHint, a.Points, a.Penalty,
+	).Scan(&a.ID, &a.CreatedAt, &a.UpdatedAt)
+}
+
+// GetLibraryAction returns a single library action by ID.
+func (q *Queries) GetLibraryAction(ctx context.Context, id uuid.UUID) (*models.Action, error) {
+	var a models.Action
+	err := q.pool.QueryRow(ctx, `
+		SELECT id, workflow_id, name, slug, description, action_type, action_category,
+		       params, script, input_context, output_context, execution_order,
+		       timeout_seconds, student_fail_hint, points, penalty, is_library,
+		       created_at, updated_at
+		FROM actions WHERE id = $1 AND is_library = true
+	`, id).Scan(&a.ID, &a.WorkflowID, &a.Name, &a.Slug, &a.Description,
+		&a.ActionType, &a.ActionCategory, &a.Params, &a.Script,
+		&a.InputContext, &a.OutputContext, &a.ExecutionOrder,
+		&a.TimeoutSeconds, &a.StudentFailHint, &a.Points, &a.Penalty,
+		&a.IsLibrary, &a.CreatedAt, &a.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &a, nil
+}
+
+// UpdateLibraryAction updates a library action using COALESCE for partial updates.
+func (q *Queries) UpdateLibraryAction(ctx context.Context, id uuid.UUID, name, slug, description,
+	actionType, actionCategory *string, params, script *string,
+	inputContext, outputContext *json.RawMessage,
+	timeoutSeconds *int, studentFailHint *string, points, penalty *int) error {
+	_, err := q.pool.Exec(ctx, `
+		UPDATE actions SET
+			name = COALESCE($2, name),
+			slug = COALESCE($3, slug),
+			description = COALESCE($4, description),
+			action_type = COALESCE($5, action_type),
+			action_category = COALESCE($6, action_category),
+			params = COALESCE($7, params),
+			script = COALESCE($8, script),
+			input_context = COALESCE($9, input_context),
+			output_context = COALESCE($10, output_context),
+			timeout_seconds = COALESCE($11, timeout_seconds),
+			student_fail_hint = COALESCE($12, student_fail_hint),
+			points = COALESCE($13, points),
+			penalty = COALESCE($14, penalty),
+			updated_at = NOW()
+		WHERE id = $1 AND is_library = true
+	`, id, name, slug, description, actionType, actionCategory,
+		params, script, inputContext, outputContext,
+		timeoutSeconds, studentFailHint, points, penalty)
+	return err
+}
+
+// DeleteLibraryAction deletes a standalone action (not workflow-bound).
+func (q *Queries) DeleteLibraryAction(ctx context.Context, id uuid.UUID) error {
+	result, err := q.pool.Exec(ctx, `DELETE FROM actions WHERE id = $1 AND is_library = true`, id)
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() == 0 {
+		return fmt.Errorf("action not found or not a library action")
+	}
+	return nil
+}
+
 // --- Playlist CRUD Queries ---
 
 // ListPlaylists returns all playlists.

@@ -160,6 +160,15 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 				r.Post("/{workflowID}/activate", h.AdminActivateWorkflow)
 			})
 
+			// Actions (reusable action library)
+			r.Route("/actions", func(r chi.Router) {
+				r.Get("/", h.AdminListActions)
+				r.Post("/", h.AdminCreateAction)
+				r.Get("/{actionID}", h.AdminGetAction)
+				r.Put("/{actionID}", h.AdminUpdateAction)
+				r.Delete("/{actionID}", h.AdminDeleteAction)
+			})
+
 			// Playlists
 			r.Route("/playlists", func(r chi.Router) {
 				r.Get("/", h.AdminListPlaylists)

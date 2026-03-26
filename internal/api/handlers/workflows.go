@@ -234,3 +234,154 @@ func (h *Handler) AdminExportWorkflows(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", "attachment; filename=workflows.json")
 	json.NewEncoder(w).Encode(workflows)
 }
+
+// --- Admin Action Library Routes ---
+
+func (h *Handler) AdminListActions(w http.ResponseWriter, r *http.Request) {
+	actions, err := h.db.ListLibraryActions(r.Context())
+	if err != nil {
+		http.Error(w, "failed to list actions", http.StatusInternalServerError)
+		return
+	}
+	respondJSON(w, http.StatusOK, actions)
+}
+
+func (h *Handler) AdminGetAction(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "actionID"))
+	if err != nil {
+		http.Error(w, "invalid action ID", http.StatusBadRequest)
+		return
+	}
+	action, err := h.db.GetLibraryAction(r.Context(), id)
+	if err != nil {
+		http.Error(w, "action not found", http.StatusNotFound)
+		return
+	}
+	respondJSON(w, http.StatusOK, action)
+}
+
+func (h *Handler) AdminCreateAction(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name            string          `json:"name"`
+		Slug            string          `json:"slug"`
+		Description     string          `json:"description"`
+		ActionType      string          `json:"action_type"`
+		ActionCategory  string          `json:"action_category"`
+		Params          json.RawMessage `json:"params"`
+		Script          string          `json:"script"`
+		InputContext    json.RawMessage `json:"input_context"`
+		OutputContext   json.RawMessage `json:"output_context"`
+		TimeoutSeconds  int             `json:"timeout_seconds"`
+		StudentFailHint *string         `json:"student_fail_hint"`
+		Points          *int            `json:"points"`
+		Penalty         *int            `json:"penalty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Name == "" || req.Slug == "" {
+		http.Error(w, "name and slug are required", http.StatusBadRequest)
+		return
+	}
+	if req.ActionType == "" {
+		req.ActionType = "command"
+	}
+	if req.ActionCategory == "" {
+		req.ActionCategory = "general"
+	}
+	if req.TimeoutSeconds <= 0 {
+		req.TimeoutSeconds = 60
+	}
+	if req.Params == nil {
+		req.Params = json.RawMessage("{}")
+	}
+	if req.InputContext == nil {
+		req.InputContext = json.RawMessage("[]")
+	}
+	if req.OutputContext == nil {
+		req.OutputContext = json.RawMessage("[]")
+	}
+
+	action := &models.Action{
+		Name:            req.Name,
+		Slug:            &req.Slug,
+		Description:     req.Description,
+		ActionType:      req.ActionType,
+		ActionCategory:  req.ActionCategory,
+		Params:          req.Params,
+		Script:          req.Script,
+		InputContext:    req.InputContext,
+		OutputContext:   req.OutputContext,
+		TimeoutSeconds:  req.TimeoutSeconds,
+		StudentFailHint: req.StudentFailHint,
+		Points:          req.Points,
+		Penalty:         req.Penalty,
+		IsLibrary:       true,
+	}
+
+	if err := h.db.CreateLibraryAction(r.Context(), action); err != nil {
+		h.logger.Error("failed to create action", "error", err)
+		http.Error(w, "failed to create action", http.StatusInternalServerError)
+		return
+	}
+	respondJSON(w, http.StatusCreated, action)
+}
+
+func (h *Handler) AdminUpdateAction(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "actionID"))
+	if err != nil {
+		http.Error(w, "invalid action ID", http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		Name            *string          `json:"name"`
+		Slug            *string          `json:"slug"`
+		Description     *string          `json:"description"`
+		ActionType      *string          `json:"action_type"`
+		ActionCategory  *string          `json:"action_category"`
+		Params          *json.RawMessage `json:"params"`
+		Script          *string          `json:"script"`
+		InputContext    *json.RawMessage `json:"input_context"`
+		OutputContext   *json.RawMessage `json:"output_context"`
+		TimeoutSeconds  *int             `json:"timeout_seconds"`
+		StudentFailHint *string          `json:"student_fail_hint"`
+		Points          *int             `json:"points"`
+		Penalty         *int             `json:"penalty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Convert json.RawMessage pointer to string pointer for the COALESCE query
+	var paramsStr *string
+	if req.Params != nil {
+		s := string(*req.Params)
+		paramsStr = &s
+	}
+
+	if err := h.db.UpdateLibraryAction(r.Context(), id, req.Name, req.Slug, req.Description,
+		req.ActionType, req.ActionCategory, paramsStr, req.Script,
+		req.InputContext, req.OutputContext, req.TimeoutSeconds, req.StudentFailHint,
+		req.Points, req.Penalty); err != nil {
+		h.logger.Error("failed to update action", "error", err)
+		http.Error(w, "failed to update action", http.StatusInternalServerError)
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]string{"status": "updated"})
+}
+
+func (h *Handler) AdminDeleteAction(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "actionID"))
+	if err != nil {
+		http.Error(w, "invalid action ID", http.StatusBadRequest)
+		return
+	}
+	if err := h.db.DeleteLibraryAction(r.Context(), id); err != nil {
+		http.Error(w, "action not found or not a library action", http.StatusNotFound)
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
