@@ -79,7 +79,7 @@ engine:
   port: 8081
   runnerImage: "ghcr.io/jmal1/selfservice-crucible-runner:latest"
   runnerNode: "k3sv03"
-  trunkNIC: "ens34"
+  trunkNIC: "ens224"
   resources:
     requests:
       cpu: 100m

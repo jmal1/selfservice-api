@@ -61,7 +61,7 @@ func main() {
 		Namespace:   getEnv("ENGINE_NAMESPACE", "selfservice"),
 		RunnerImage: getEnv("RUNNER_IMAGE", "ghcr.io/jmal1/selfservice-crucible-runner:latest"),
 		RunnerNode:  getEnv("RUNNER_NODE", "k3sv03"),
-		TrunkNIC:    getEnv("RUNNER_TRUNK_NIC", "ens34"),
+		TrunkNIC:    getEnv("RUNNER_TRUNK_NIC", "ens224"),
 		EngineURL:   getEnv("ENGINE_CALLBACK_URL", "http://crucible-engine.selfservice.svc.cluster.local:8081"),
 	}
 
