@@ -133,20 +133,23 @@ type PlaylistWorkflow struct {
 	ExecutionOrder int       `json:"execution_order" db:"execution_order"`
 }
 
-// PlaylistAccess controls which roles/users can run a playlist.
-type PlaylistAccess struct {
-	ID         uuid.UUID  `json:"id" db:"id"`
-	PlaylistID uuid.UUID  `json:"playlist_id" db:"playlist_id"`
-	Role       *string    `json:"role" db:"role"`
-	UserID     *uuid.UUID `json:"user_id" db:"user_id"`
-	CreatedAt  time.Time  `json:"created_at" db:"created_at"`
+// TemplatePlaylist links default playlists to a VM template.
+// All VMs cloned from this template inherit these playlists unless
+// overridden at the blueprint level.
+type TemplatePlaylist struct {
+	TemplateID     uuid.UUID `json:"template_id" db:"template_id"`
+	PlaylistID     uuid.UUID `json:"playlist_id" db:"playlist_id"`
+	ExecutionOrder int       `json:"execution_order" db:"execution_order"`
 }
 
-// BlueprintPlaylist links a default playlist to a blueprint.
-type BlueprintPlaylist struct {
-	BlueprintID uuid.UUID `json:"blueprint_id" db:"blueprint_id"`
-	PlaylistID  uuid.UUID `json:"playlist_id" db:"playlist_id"`
-	IsDefault   bool      `json:"is_default" db:"is_default"`
+// BlueprintVMPlaylist links playlist overrides to a specific VM slot in a blueprint.
+// When present for a given (blueprint_id, vm_slot), these completely replace
+// the template-level playlists for that VM.
+type BlueprintVMPlaylist struct {
+	BlueprintID    uuid.UUID `json:"blueprint_id" db:"blueprint_id"`
+	VMSlot         int       `json:"vm_slot" db:"vm_slot"`
+	PlaylistID     uuid.UUID `json:"playlist_id" db:"playlist_id"`
+	ExecutionOrder int       `json:"execution_order" db:"execution_order"`
 }
 
 // Run represents one execution of a playlist against a pod.
