@@ -1,0 +1,579 @@
+package database
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/jmal1/selfservice-api/internal/models"
+)
+
+// --- Testing / Run Queries ---
+
+// GetPlaylistsForPod resolves playlists for a pod using the two-level model:
+// 1. Check blueprint_vm_playlists for overrides
+// 2. Fall back to template_playlists defaults
+func (q *Queries) GetPlaylistsForPod(ctx context.Context, podID uuid.UUID) ([]models.Playlist, error) {
+	// First try blueprint-level overrides
+	rows, err := q.pool.Query(ctx, `
+		SELECT p.id, p.name, p.slug, p.description, p.scoring_mode, p.created_by,
+		       p.is_active, p.created_at, p.updated_at
+		FROM playlists p
+		JOIN blueprint_vm_playlists bvp ON p.id = bvp.playlist_id
+		JOIN pods pod ON pod.id = $1
+		JOIN blueprint_vms bv ON bv.blueprint_id = pod.blueprint_id AND bv.slot = bvp.vm_slot
+		JOIN pod_vms pv ON pv.pod_id = pod.id AND pv.template_id = bv.template_id
+		WHERE bvp.blueprint_id = pod.blueprint_id
+		  AND p.is_active = true
+		ORDER BY bvp.execution_order
+	`, podID)
+	if err != nil {
+		return nil, fmt.Errorf("get blueprint playlists: %w", err)
+	}
+	defer rows.Close()
+
+	var playlists []models.Playlist
+	for rows.Next() {
+		var p models.Playlist
+		if err := rows.Scan(&p.ID, &p.Name, &p.Slug, &p.Description, &p.ScoringMode,
+			&p.CreatedBy, &p.IsActive, &p.CreatedAt, &p.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan playlist: %w", err)
+		}
+		playlists = append(playlists, p)
+	}
+
+	if len(playlists) > 0 {
+		return playlists, nil // Blueprint overrides found
+	}
+
+	// Fall back to template-level defaults
+	rows2, err := q.pool.Query(ctx, `
+		SELECT DISTINCT p.id, p.name, p.slug, p.description, p.scoring_mode, p.created_by,
+		       p.is_active, p.created_at, p.updated_at
+		FROM playlists p
+		JOIN template_playlists tp ON p.id = tp.playlist_id
+		JOIN pod_vms pv ON pv.template_id = tp.template_id
+		WHERE pv.pod_id = $1
+		  AND p.is_active = true
+		ORDER BY p.name
+	`, podID)
+	if err != nil {
+		return nil, fmt.Errorf("get template playlists: %w", err)
+	}
+	defer rows2.Close()
+
+	for rows2.Next() {
+		var p models.Playlist
+		if err := rows2.Scan(&p.ID, &p.Name, &p.Slug, &p.Description, &p.ScoringMode,
+			&p.CreatedBy, &p.IsActive, &p.CreatedAt, &p.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan template playlist: %w", err)
+		}
+		playlists = append(playlists, p)
+	}
+
+	return playlists, nil
+}
+
+// HasActiveRun checks if a pod has a run in pending/provisioning/running status.
+func (q *Queries) HasActiveRun(ctx context.Context, podID uuid.UUID) (bool, error) {
+	var count int
+	err := q.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM runs
+		WHERE pod_id = $1 AND status IN ('pending', 'provisioning', 'running')
+	`, podID).Scan(&count)
+	return count > 0, err
+}
+
+// CountRecentRuns counts runs triggered by a user on a pod within a time window.
+func (q *Queries) CountRecentRuns(ctx context.Context, podID, userID uuid.UUID, window time.Duration) (int, error) {
+	var count int
+	cutoff := time.Now().Add(-window)
+	err := q.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM runs
+		WHERE pod_id = $1 AND triggered_by = $2 AND created_at > $3
+	`, podID, userID, cutoff).Scan(&count)
+	return count, err
+}
+
+// CreateRun inserts a new run record.
+func (q *Queries) CreateRun(ctx context.Context, run *models.Run) error {
+	return q.pool.QueryRow(ctx, `
+		INSERT INTO runs (pod_id, playlist_id, triggered_by, callback_token, status)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING id, created_at, updated_at
+	`, run.PodID, run.PlaylistID, run.TriggeredBy, run.CallbackToken, run.Status,
+	).Scan(&run.ID, &run.CreatedAt, &run.UpdatedAt)
+}
+
+// GetRecentRunsForPod returns the N most recent runs for a pod.
+func (q *Queries) GetRecentRunsForPod(ctx context.Context, podID uuid.UUID, limit int) ([]models.Run, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT id, pod_id, playlist_id, triggered_by, status,
+		       total_workflows, passed_workflows, failed_workflows,
+		       error_message, started_at, completed_at, created_at, updated_at
+		FROM runs WHERE pod_id = $1
+		ORDER BY created_at DESC LIMIT $2
+	`, podID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var runs []models.Run
+	for rows.Next() {
+		var r models.Run
+		if err := rows.Scan(&r.ID, &r.PodID, &r.PlaylistID, &r.TriggeredBy, &r.Status,
+			&r.TotalWorkflows, &r.PassedWorkflows, &r.FailedWorkflows,
+			&r.ErrorMessage, &r.StartedAt, &r.CompletedAt,
+			&r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		runs = append(runs, r)
+	}
+	return runs, nil
+}
+
+// GetRunsForPod returns all runs for a pod.
+func (q *Queries) GetRunsForPod(ctx context.Context, podID uuid.UUID) ([]models.Run, error) {
+	return q.GetRecentRunsForPod(ctx, podID, 100)
+}
+
+// GetRun returns a single run by ID.
+func (q *Queries) GetRun(ctx context.Context, runID uuid.UUID) (*models.Run, error) {
+	var r models.Run
+	err := q.pool.QueryRow(ctx, `
+		SELECT id, pod_id, playlist_id, triggered_by, runner_vm_id, runner_vm_name,
+		       callback_token, status, total_workflows, passed_workflows, failed_workflows,
+		       error_message, started_at, completed_at, created_at, updated_at
+		FROM runs WHERE id = $1
+	`, runID).Scan(&r.ID, &r.PodID, &r.PlaylistID, &r.TriggeredBy,
+		&r.RunnerVMID, &r.RunnerVMName, &r.CallbackToken, &r.Status,
+		&r.TotalWorkflows, &r.PassedWorkflows, &r.FailedWorkflows,
+		&r.ErrorMessage, &r.StartedAt, &r.CompletedAt,
+		&r.CreatedAt, &r.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
+// GetRunWithResults returns a run with all workflow results.
+func (q *Queries) GetRunWithResults(ctx context.Context, runID uuid.UUID) (*models.Run, error) {
+	run, err := q.GetRun(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := q.pool.Query(ctx, `
+		SELECT wr.id, wr.run_id, wr.workflow_id, wr.workflow_version_id,
+		       wr.execution_order, wr.execution_mode, wr.status,
+		       wr.student_message, wr.instructor_output, wr.action_results,
+		       wr.points_awarded, wr.duration_ms, wr.started_at, wr.completed_at,
+		       wr.created_at, w.name
+		FROM workflow_results wr
+		JOIN workflows w ON wr.workflow_id = w.id
+		WHERE wr.run_id = $1
+		ORDER BY wr.execution_order
+	`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var wr models.WorkflowResult
+		if err := rows.Scan(&wr.ID, &wr.RunID, &wr.WorkflowID, &wr.WorkflowVersionID,
+			&wr.ExecutionOrder, &wr.ExecutionMode, &wr.Status,
+			&wr.StudentMessage, &wr.InstructorOutput, &wr.ActionResults,
+			&wr.PointsAwarded, &wr.DurationMs, &wr.StartedAt, &wr.CompletedAt,
+			&wr.CreatedAt, &wr.WorkflowName); err != nil {
+			return nil, err
+		}
+		run.Results = append(run.Results, wr)
+	}
+
+	return run, nil
+}
+
+// UpdateRunStatus updates the status of a run (used by API cancel handler).
+func (q *Queries) UpdateRunStatus(ctx context.Context, runID uuid.UUID, status string, errorMsg *string) error {
+	var completedAt *time.Time
+	if status == models.RunStatusCompleted || status == models.RunStatusFailed ||
+		status == models.RunStatusTimeout || status == models.RunStatusCancelled {
+		now := time.Now()
+		completedAt = &now
+	}
+	_, err := q.pool.Exec(ctx, `
+		UPDATE runs SET status = $2, error_message = $3, completed_at = $4, updated_at = NOW()
+		WHERE id = $1
+	`, runID, status, errorMsg, completedAt)
+	return err
+}
+
+// ListAllRuns returns all runs (admin view).
+func (q *Queries) ListAllRuns(ctx context.Context) ([]models.Run, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT id, pod_id, playlist_id, triggered_by, status,
+		       total_workflows, passed_workflows, failed_workflows,
+		       error_message, started_at, completed_at, created_at, updated_at
+		FROM runs ORDER BY created_at DESC LIMIT 200
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var runs []models.Run
+	for rows.Next() {
+		var r models.Run
+		if err := rows.Scan(&r.ID, &r.PodID, &r.PlaylistID, &r.TriggeredBy, &r.Status,
+			&r.TotalWorkflows, &r.PassedWorkflows, &r.FailedWorkflows,
+			&r.ErrorMessage, &r.StartedAt, &r.CompletedAt,
+			&r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		runs = append(runs, r)
+	}
+	return runs, nil
+}
+
+// --- Workflow CRUD Queries ---
+
+// ListWorkflows returns all workflows.
+func (q *Queries) ListWorkflows(ctx context.Context) ([]models.Workflow, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT id, name, slug, description, category, execution_mode,
+		       timeout_seconds, status, creation_mode, visible_to_students,
+		       created_by, approved_by, is_active, created_at, updated_at
+		FROM workflows ORDER BY name
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var workflows []models.Workflow
+	for rows.Next() {
+		var w models.Workflow
+		if err := rows.Scan(&w.ID, &w.Name, &w.Slug, &w.Description, &w.Category,
+			&w.ExecutionMode, &w.TimeoutSeconds, &w.Status, &w.CreationMode,
+			&w.VisibleToStudents, &w.CreatedBy, &w.ApprovedBy, &w.IsActive,
+			&w.CreatedAt, &w.UpdatedAt); err != nil {
+			return nil, err
+		}
+		workflows = append(workflows, w)
+	}
+	return workflows, nil
+}
+
+// GetWorkflow returns a single workflow by ID.
+func (q *Queries) GetWorkflow(ctx context.Context, id uuid.UUID) (*models.Workflow, error) {
+	var w models.Workflow
+	err := q.pool.QueryRow(ctx, `
+		SELECT id, name, slug, description, category, execution_mode, script,
+		       setup_script, timeout_seconds, status, creation_mode, visible_to_students,
+		       created_by, approved_by, is_active, created_at, updated_at
+		FROM workflows WHERE id = $1
+	`, id).Scan(&w.ID, &w.Name, &w.Slug, &w.Description, &w.Category,
+		&w.ExecutionMode, &w.Script, &w.SetupScript, &w.TimeoutSeconds,
+		&w.Status, &w.CreationMode, &w.VisibleToStudents, &w.CreatedBy,
+		&w.ApprovedBy, &w.IsActive, &w.CreatedAt, &w.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &w, nil
+}
+
+// GetWorkflowWithActions returns a workflow with its actions.
+func (q *Queries) GetWorkflowWithActions(ctx context.Context, id uuid.UUID) (*models.Workflow, error) {
+	wf, err := q.GetWorkflow(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := q.pool.Query(ctx, `
+		SELECT id, workflow_id, name, description, action_type, params,
+		       execution_order, timeout_seconds, student_fail_hint, points, penalty, created_at
+		FROM actions WHERE workflow_id = $1 ORDER BY execution_order
+	`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var a models.Action
+		if err := rows.Scan(&a.ID, &a.WorkflowID, &a.Name, &a.Description, &a.ActionType,
+			&a.Params, &a.ExecutionOrder, &a.TimeoutSeconds, &a.StudentFailHint,
+			&a.Points, &a.Penalty, &a.CreatedAt); err != nil {
+			return nil, err
+		}
+		wf.Actions = append(wf.Actions, a)
+	}
+	return wf, nil
+}
+
+// CreateWorkflow inserts a new workflow and its actions.
+func (q *Queries) CreateWorkflow(ctx context.Context, wf *models.Workflow) error {
+	err := q.pool.QueryRow(ctx, `
+		INSERT INTO workflows (name, slug, description, category, execution_mode, script,
+		       setup_script, timeout_seconds, creation_mode, visible_to_students, status, created_by, is_active)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		RETURNING id, created_at, updated_at
+	`, wf.Name, wf.Slug, wf.Description, wf.Category, wf.ExecutionMode, wf.Script,
+		wf.SetupScript, wf.TimeoutSeconds, wf.CreationMode, wf.VisibleToStudents,
+		wf.Status, wf.CreatedBy, wf.IsActive,
+	).Scan(&wf.ID, &wf.CreatedAt, &wf.UpdatedAt)
+	if err != nil {
+		return err
+	}
+
+	// Insert actions
+	for i, a := range wf.Actions {
+		paramsJSON := a.Params
+		if paramsJSON == nil {
+			paramsJSON = json.RawMessage("{}")
+		}
+		_, err := q.pool.Exec(ctx, `
+			INSERT INTO actions (workflow_id, name, description, action_type, params,
+			       execution_order, timeout_seconds, student_fail_hint, points, penalty)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		`, wf.ID, a.Name, a.Description, a.ActionType, paramsJSON,
+			i, a.TimeoutSeconds, a.StudentFailHint, a.Points, a.Penalty)
+		if err != nil {
+			return fmt.Errorf("insert action %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// UpdateWorkflow updates a workflow's metadata.
+func (q *Queries) UpdateWorkflow(ctx context.Context, id uuid.UUID, name, description, category,
+	script, setupScript *string, timeoutSeconds *int, creationMode *string, actions []models.Action) error {
+
+	_, err := q.pool.Exec(ctx, `
+		UPDATE workflows SET
+			name = COALESCE($2, name),
+			description = COALESCE($3, description),
+			category = COALESCE($4, category),
+			script = COALESCE($5, script),
+			setup_script = COALESCE($6, setup_script),
+			timeout_seconds = COALESCE($7, timeout_seconds),
+			creation_mode = COALESCE($8, creation_mode),
+			updated_at = NOW()
+		WHERE id = $1
+	`, id, name, description, category, script, setupScript, timeoutSeconds, creationMode)
+	return err
+}
+
+// TransitionWorkflowStatus atomically transitions a workflow between states.
+func (q *Queries) TransitionWorkflowStatus(ctx context.Context, id uuid.UUID, from, to string) error {
+	result, err := q.pool.Exec(ctx, `
+		UPDATE workflows SET status = $3, updated_at = NOW()
+		WHERE id = $1 AND status = $2
+	`, id, from, to)
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() == 0 {
+		return fmt.Errorf("workflow not in %s status", from)
+	}
+	return nil
+}
+
+// ApproveWorkflow approves a workflow and records the approver.
+func (q *Queries) ApproveWorkflow(ctx context.Context, id, approverID uuid.UUID) error {
+	result, err := q.pool.Exec(ctx, `
+		UPDATE workflows SET status = 'approved', approved_by = $2, updated_at = NOW()
+		WHERE id = $1 AND status = 'pending_review'
+	`, id, approverID)
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() == 0 {
+		return fmt.Errorf("workflow not in pending_review status")
+	}
+	return nil
+}
+
+// ListWorkflowsWithActions returns all workflows with their actions (for export).
+func (q *Queries) ListWorkflowsWithActions(ctx context.Context) ([]models.Workflow, error) {
+	workflows, err := q.ListWorkflows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for i := range workflows {
+		wf, err := q.GetWorkflowWithActions(ctx, workflows[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		workflows[i].Actions = wf.Actions
+	}
+	return workflows, nil
+}
+
+// --- Playlist CRUD Queries ---
+
+// ListPlaylists returns all playlists.
+func (q *Queries) ListPlaylists(ctx context.Context) ([]models.Playlist, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT id, name, slug, description, scoring_mode, created_by, is_active, created_at, updated_at
+		FROM playlists ORDER BY name
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var playlists []models.Playlist
+	for rows.Next() {
+		var p models.Playlist
+		if err := rows.Scan(&p.ID, &p.Name, &p.Slug, &p.Description, &p.ScoringMode,
+			&p.CreatedBy, &p.IsActive, &p.CreatedAt, &p.UpdatedAt); err != nil {
+			return nil, err
+		}
+		playlists = append(playlists, p)
+	}
+	return playlists, nil
+}
+
+// GetPlaylistWithWorkflows returns a playlist with its workflows.
+func (q *Queries) GetPlaylistWithWorkflows(ctx context.Context, id uuid.UUID) (*models.Playlist, error) {
+	var p models.Playlist
+	err := q.pool.QueryRow(ctx, `
+		SELECT id, name, slug, description, scoring_mode, created_by, is_active, created_at, updated_at
+		FROM playlists WHERE id = $1
+	`, id).Scan(&p.ID, &p.Name, &p.Slug, &p.Description, &p.ScoringMode,
+		&p.CreatedBy, &p.IsActive, &p.CreatedAt, &p.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := q.pool.Query(ctx, `
+		SELECT w.id, w.name, w.slug, w.description, w.category, w.execution_mode,
+		       w.timeout_seconds, w.status, w.visible_to_students, w.is_active
+		FROM workflows w
+		JOIN playlist_workflows pw ON w.id = pw.workflow_id
+		WHERE pw.playlist_id = $1
+		ORDER BY pw.execution_order
+	`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var w models.Workflow
+		if err := rows.Scan(&w.ID, &w.Name, &w.Slug, &w.Description, &w.Category,
+			&w.ExecutionMode, &w.TimeoutSeconds, &w.Status, &w.VisibleToStudents,
+			&w.IsActive); err != nil {
+			return nil, err
+		}
+		p.Workflows = append(p.Workflows, w)
+	}
+	return &p, nil
+}
+
+// CreatePlaylist creates a playlist and sets its workflow membership.
+func (q *Queries) CreatePlaylist(ctx context.Context, pl *models.Playlist, workflowIDs []uuid.UUID) error {
+	err := q.pool.QueryRow(ctx, `
+		INSERT INTO playlists (name, slug, description, scoring_mode, created_by, is_active)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id, created_at, updated_at
+	`, pl.Name, pl.Slug, pl.Description, pl.ScoringMode, pl.CreatedBy, pl.IsActive,
+	).Scan(&pl.ID, &pl.CreatedAt, &pl.UpdatedAt)
+	if err != nil {
+		return err
+	}
+
+	for i, wfID := range workflowIDs {
+		_, err := q.pool.Exec(ctx, `
+			INSERT INTO playlist_workflows (playlist_id, workflow_id, execution_order)
+			VALUES ($1, $2, $3)
+		`, pl.ID, wfID, i)
+		if err != nil {
+			return fmt.Errorf("insert playlist_workflow: %w", err)
+		}
+	}
+	return nil
+}
+
+// UpdatePlaylist updates a playlist's metadata and optionally its workflow membership.
+func (q *Queries) UpdatePlaylist(ctx context.Context, id uuid.UUID, name, description *string,
+	isActive *bool, workflowIDs []uuid.UUID) error {
+
+	_, err := q.pool.Exec(ctx, `
+		UPDATE playlists SET
+			name = COALESCE($2, name),
+			description = COALESCE($3, description),
+			is_active = COALESCE($4, is_active),
+			updated_at = NOW()
+		WHERE id = $1
+	`, id, name, description, isActive)
+	if err != nil {
+		return err
+	}
+
+	// Replace workflow membership if provided
+	if workflowIDs != nil {
+		_, err = q.pool.Exec(ctx, `DELETE FROM playlist_workflows WHERE playlist_id = $1`, id)
+		if err != nil {
+			return err
+		}
+		for i, wfID := range workflowIDs {
+			_, err = q.pool.Exec(ctx, `
+				INSERT INTO playlist_workflows (playlist_id, workflow_id, execution_order)
+				VALUES ($1, $2, $3)
+			`, id, wfID, i)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// DeactivatePlaylist soft-deletes a playlist.
+func (q *Queries) DeactivatePlaylist(ctx context.Context, id uuid.UUID) error {
+	_, err := q.pool.Exec(ctx, `UPDATE playlists SET is_active = false, updated_at = NOW() WHERE id = $1`, id)
+	return err
+}
+
+// SetTemplatePlaylists replaces the playlists assigned to a template.
+func (q *Queries) SetTemplatePlaylists(ctx context.Context, templateID uuid.UUID, playlistIDs []uuid.UUID) error {
+	_, err := q.pool.Exec(ctx, `DELETE FROM template_playlists WHERE template_id = $1`, templateID)
+	if err != nil {
+		return err
+	}
+	for i, plID := range playlistIDs {
+		_, err = q.pool.Exec(ctx, `
+			INSERT INTO template_playlists (template_id, playlist_id, execution_order)
+			VALUES ($1, $2, $3)
+		`, templateID, plID, i)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SetBlueprintVMPlaylists replaces the playlist overrides for a blueprint VM slot.
+func (q *Queries) SetBlueprintVMPlaylists(ctx context.Context, blueprintID uuid.UUID, vmSlot int, playlistIDs []uuid.UUID) error {
+	_, err := q.pool.Exec(ctx, `DELETE FROM blueprint_vm_playlists WHERE blueprint_id = $1 AND vm_slot = $2`, blueprintID, vmSlot)
+	if err != nil {
+		return err
+	}
+	for i, plID := range playlistIDs {
+		_, err = q.pool.Exec(ctx, `
+			INSERT INTO blueprint_vm_playlists (blueprint_id, vm_slot, playlist_id, execution_order)
+			VALUES ($1, $2, $3, $4)
+		`, blueprintID, vmSlot, plID, i)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}

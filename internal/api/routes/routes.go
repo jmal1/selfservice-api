@@ -87,6 +87,15 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 
 			// Pod expiration
 			r.Post("/{podID}/extend", h.ExtendPod)
+
+			// Testing (assessments)
+			r.Route("/{podID}/testing", func(r chi.Router) {
+				r.Get("/", h.GetTestingDashboard)
+				r.Post("/run", h.CreateTestingRun)
+				r.Get("/runs", h.ListTestingRuns)
+				r.Get("/runs/{runID}", h.GetTestingRun)
+				r.Post("/runs/{runID}/cancel", h.CancelTestingRun)
+			})
 		})
 
 		// Templates
@@ -137,6 +146,37 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 
 			// Admin pod management
 			r.Post("/pods/{podID}/extend", h.AdminExtendPod)
+
+			// Workflows (assessment scripts)
+			r.Route("/workflows", func(r chi.Router) {
+				r.Get("/", h.AdminListWorkflows)
+				r.Post("/", h.AdminCreateWorkflow)
+				r.Post("/import", h.AdminImportWorkflows)
+				r.Get("/export", h.AdminExportWorkflows)
+				r.Get("/{workflowID}", h.AdminGetWorkflow)
+				r.Put("/{workflowID}", h.AdminUpdateWorkflow)
+				r.Post("/{workflowID}/submit", h.AdminSubmitWorkflow)
+				r.Post("/{workflowID}/approve", h.AdminApproveWorkflow)
+				r.Post("/{workflowID}/activate", h.AdminActivateWorkflow)
+			})
+
+			// Playlists
+			r.Route("/playlists", func(r chi.Router) {
+				r.Get("/", h.AdminListPlaylists)
+				r.Post("/", h.AdminCreatePlaylist)
+				r.Get("/{playlistID}", h.AdminGetPlaylist)
+				r.Put("/{playlistID}", h.AdminUpdatePlaylist)
+				r.Delete("/{playlistID}", h.AdminDeletePlaylist)
+			})
+
+			// Template playlist assignment
+			r.Post("/templates/{templateID}/playlists", h.AdminSetTemplatePlaylists)
+
+			// Blueprint VM playlist overrides
+			r.Post("/blueprints/{blueprintID}/vm-playlists", h.AdminSetBlueprintVMPlaylists)
+
+			// Testing runs (admin view)
+			r.Get("/runs", h.AdminListRuns)
 		})
 	})
 	}) // close r.Group for Logger/Compress
