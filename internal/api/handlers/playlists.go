@@ -145,6 +145,27 @@ func (h *Handler) AdminSetTemplatePlaylists(w http.ResponseWriter, r *http.Reque
 	respondJSON(w, http.StatusOK, map[string]string{"status": "updated"})
 }
 
+// AdminGetTemplatePlaylists returns playlist IDs assigned to a template.
+func (h *Handler) AdminGetTemplatePlaylists(w http.ResponseWriter, r *http.Request) {
+	templateID, err := uuid.Parse(chi.URLParam(r, "templateID"))
+	if err != nil {
+		http.Error(w, "invalid template ID", http.StatusBadRequest)
+		return
+	}
+
+	ids, err := h.db.GetTemplatePlaylists(r.Context(), templateID)
+	if err != nil {
+		h.logger.Error("failed to get template playlists", "error", err)
+		http.Error(w, "failed to get playlists", http.StatusInternalServerError)
+		return
+	}
+	if ids == nil {
+		ids = []uuid.UUID{}
+	}
+
+	respondJSON(w, http.StatusOK, map[string]any{"playlist_ids": ids})
+}
+
 // AdminSetBlueprintVMPlaylists assigns playlist overrides to a blueprint VM slot.
 func (h *Handler) AdminSetBlueprintVMPlaylists(w http.ResponseWriter, r *http.Request) {
 	blueprintID, err := uuid.Parse(chi.URLParam(r, "blueprintID"))

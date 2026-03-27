@@ -132,6 +132,23 @@ func (h *Handler) AdminUpdateWorkflow(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, map[string]string{"status": "updated"})
 }
 
+// AdminDeleteWorkflow deletes a workflow and its actions.
+func (h *Handler) AdminDeleteWorkflow(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "workflowID"))
+	if err != nil {
+		http.Error(w, "invalid workflow ID", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.db.DeleteWorkflow(r.Context(), id); err != nil {
+		h.logger.Error("failed to delete workflow", "error", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
 // AdminSubmitWorkflow moves a workflow from draft to pending_review.
 func (h *Handler) AdminSubmitWorkflow(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "workflowID"))

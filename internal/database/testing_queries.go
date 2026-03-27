@@ -400,6 +400,29 @@ func (q *Queries) ApproveWorkflow(ctx context.Context, id, approverID uuid.UUID)
 	return nil
 }
 
+// DeleteWorkflow deletes a workflow and its associated actions.
+// Only drafts can be deleted; active/approved workflows must be deactivated first.
+func (q *Queries) DeleteWorkflow(ctx context.Context, id uuid.UUID) error {
+	// Delete actions first (foreign key)
+	_, err := q.pool.Exec(ctx, `DELETE FROM actions WHERE workflow_id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("failed to delete workflow actions: %w", err)
+	}
+	// Remove from any playlist associations
+	_, err = q.pool.Exec(ctx, `DELETE FROM playlist_workflows WHERE workflow_id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("failed to remove playlist associations: %w", err)
+	}
+	result, err := q.pool.Exec(ctx, `DELETE FROM workflows WHERE id = $1`, id)
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() == 0 {
+		return fmt.Errorf("workflow not found")
+	}
+	return nil
+}
+
 // ListWorkflowsWithActions returns all workflows with their actions (for export).
 func (q *Queries) ListWorkflowsWithActions(ctx context.Context) ([]models.Workflow, error) {
 	workflows, err := q.ListWorkflows(ctx)
@@ -671,6 +694,27 @@ func (q *Queries) SetTemplatePlaylists(ctx context.Context, templateID uuid.UUID
 		}
 	}
 	return nil
+}
+
+// GetTemplatePlaylists returns playlist IDs assigned to a template.
+func (q *Queries) GetTemplatePlaylists(ctx context.Context, templateID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT playlist_id FROM template_playlists
+		WHERE template_id = $1 ORDER BY execution_order
+	`, templateID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
 }
 
 // SetBlueprintVMPlaylists replaces the playlist overrides for a blueprint VM slot.

@@ -155,6 +155,7 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 				r.Get("/export", h.AdminExportWorkflows)
 				r.Get("/{workflowID}", h.AdminGetWorkflow)
 				r.Put("/{workflowID}", h.AdminUpdateWorkflow)
+				r.Delete("/{workflowID}", h.AdminDeleteWorkflow)
 				r.Post("/{workflowID}/submit", h.AdminSubmitWorkflow)
 				r.Post("/{workflowID}/approve", h.AdminApproveWorkflow)
 				r.Post("/{workflowID}/activate", h.AdminActivateWorkflow)
@@ -179,6 +180,7 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 			})
 
 			// Template playlist assignment
+			r.Get("/templates/{templateID}/playlists", h.AdminGetTemplatePlaylists)
 			r.Post("/templates/{templateID}/playlists", h.AdminSetTemplatePlaylists)
 
 			// Blueprint VM playlist overrides
