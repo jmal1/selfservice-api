@@ -10,6 +10,7 @@ image:
   api: ghcr.io/jmal1/selfservice-api-gateway
   worker: ghcr.io/jmal1/selfservice-provision-worker
   engine: ghcr.io/jmal1/selfservice-crucible-engine
+  ui: ghcr.io/jmal1/selfservice-ui
   tag: "latest"
   pullPolicy: Always
 
