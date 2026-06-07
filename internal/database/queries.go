@@ -35,6 +35,30 @@ func (q *Queries) Pool() *pgxpool.Pool {
 // prompt the operator to re-load and reconcile.
 var ErrTemplateStale = errors.New("template was modified by another user")
 
+// templateSelectCols is the canonical list of columns returned by every
+// Template SELECT / INSERT RETURNING / UPDATE RETURNING. Keep in lockstep
+// with scanTemplate so the order matches the Scan() argument list.
+// Migration 000018 added template_state, created_by, vcenter_vm_id,
+// source_type, source_ref, staging_network.
+const templateSelectCols = `id, name, vcenter_template, os_type, default_vcpus, default_ram_mb,
+		default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''),
+		default_username, default_password, kind, assign_ip, is_active,
+		template_state, created_by, vcenter_vm_id, source_type, source_ref, staging_network,
+		created_at, updated_at`
+
+// scanTemplate populates t from a row whose columns are in templateSelectCols
+// order. Centralizes the column ordering so adding a column in the future
+// only requires updating this function + templateSelectCols above.
+func scanTemplate(row pgx.Row, t *models.Template) error {
+	return row.Scan(
+		&t.ID, &t.Name, &t.VCenterTemplate, &t.OSType, &t.DefaultVCPUs, &t.DefaultRAMMB,
+		&t.DefaultDiskGB, &t.MinVCPUs, &t.MinRAMMB, &t.Description, &t.IconURL,
+		&t.DefaultUsername, &t.DefaultPassword, &t.Kind, &t.AssignIP, &t.IsActive,
+		&t.TemplateState, &t.CreatedBy, &t.VCenterVMID, &t.SourceType, &t.SourceRef, &t.StagingNetwork,
+		&t.CreatedAt, &t.UpdatedAt,
+	)
+}
+
 // --- Users ---
 
 // UpsertUser creates or updates a user from OIDC claims.
@@ -155,32 +179,23 @@ func (q *Queries) CreateTemplate(ctx context.Context, req models.CreateTemplateR
 		assignIP = *req.AssignIP
 	}
 	var t models.Template
-	err := q.pool.QueryRow(ctx, `
+	err := scanTemplate(q.pool.QueryRow(ctx, `
 		INSERT INTO templates (name, vcenter_template, os_type, default_vcpus, default_ram_mb,
 		                       default_disk_gb, min_vcpus, min_ram_mb, description, icon_url,
 		                       default_username, default_password, kind, assign_ip)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-		RETURNING id, name, vcenter_template, os_type, default_vcpus, default_ram_mb,
-		          default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''),
-		          default_username, default_password, kind, assign_ip, is_active, created_at, updated_at
+		RETURNING `+templateSelectCols+`
 	`, req.Name, req.VCenterTemplate, req.OSType, req.DefaultVCPUs, req.DefaultRAMMB,
 		req.DefaultDiskGB, req.MinVCPUs, req.MinRAMMB, req.Description, req.IconURL,
 		req.DefaultUsername, req.DefaultPassword, kind, assignIP,
-	).Scan(
-		&t.ID, &t.Name, &t.VCenterTemplate, &t.OSType, &t.DefaultVCPUs, &t.DefaultRAMMB,
-		&t.DefaultDiskGB, &t.MinVCPUs, &t.MinRAMMB, &t.Description, &t.IconURL,
-		&t.DefaultUsername, &t.DefaultPassword, &t.Kind, &t.AssignIP, &t.IsActive, &t.CreatedAt, &t.UpdatedAt,
-	)
+	), &t)
 	return &t, err
 }
 
 // ListTemplatesForUser returns templates accessible to a user based on their role.
 func (q *Queries) ListTemplatesForUser(ctx context.Context, userID uuid.UUID, role string) ([]models.Template, error) {
 	rows, err := q.pool.Query(ctx, `
-		SELECT DISTINCT t.id, t.name, t.vcenter_template, t.os_type, t.default_vcpus,
-		       t.default_ram_mb, t.default_disk_gb, t.min_vcpus, t.min_ram_mb,
-		       COALESCE(t.description, ''), COALESCE(t.icon_url, ''),
-		       t.default_username, t.default_password, t.kind, t.assign_ip, t.is_active, t.created_at, t.updated_at
+		SELECT DISTINCT `+templateSelectCols+`
 		FROM templates t
 		LEFT JOIN template_access ta ON t.id = ta.template_id
 		WHERE t.is_active = true
@@ -196,12 +211,7 @@ func (q *Queries) ListTemplatesForUser(ctx context.Context, userID uuid.UUID, ro
 	var templates []models.Template
 	for rows.Next() {
 		var t models.Template
-		if err := rows.Scan(
-			&t.ID, &t.Name, &t.VCenterTemplate, &t.OSType, &t.DefaultVCPUs,
-			&t.DefaultRAMMB, &t.DefaultDiskGB, &t.MinVCPUs, &t.MinRAMMB,
-			&t.Description, &t.IconURL, &t.DefaultUsername, &t.DefaultPassword,
-			&t.Kind, &t.AssignIP, &t.IsActive, &t.CreatedAt, &t.UpdatedAt,
-		); err != nil {
+		if err := scanTemplate(rows, &t); err != nil {
 			return nil, err
 		}
 		templates = append(templates, t)
@@ -212,9 +222,7 @@ func (q *Queries) ListTemplatesForUser(ctx context.Context, userID uuid.UUID, ro
 // ListAllTemplates returns all templates (admin).
 func (q *Queries) ListAllTemplates(ctx context.Context) ([]models.Template, error) {
 	rows, err := q.pool.Query(ctx, `
-		SELECT id, name, vcenter_template, os_type, default_vcpus, default_ram_mb,
-		       default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''),
-		       default_username, default_password, kind, assign_ip, is_active, created_at, updated_at
+		SELECT `+templateSelectCols+`
 		FROM templates ORDER BY name
 	`)
 	if err != nil {
@@ -225,12 +233,7 @@ func (q *Queries) ListAllTemplates(ctx context.Context) ([]models.Template, erro
 	var templates []models.Template
 	for rows.Next() {
 		var t models.Template
-		if err := rows.Scan(
-			&t.ID, &t.Name, &t.VCenterTemplate, &t.OSType, &t.DefaultVCPUs,
-			&t.DefaultRAMMB, &t.DefaultDiskGB, &t.MinVCPUs, &t.MinRAMMB,
-			&t.Description, &t.IconURL, &t.DefaultUsername, &t.DefaultPassword,
-			&t.Kind, &t.AssignIP, &t.IsActive, &t.CreatedAt, &t.UpdatedAt,
-		); err != nil {
+		if err := scanTemplate(rows, &t); err != nil {
 			return nil, err
 		}
 		templates = append(templates, t)
@@ -272,7 +275,7 @@ func (q *Queries) UpdateTemplate(ctx context.Context, id uuid.UUID, req models.U
 	// from "row does not exist" by a follow-up existence probe so the
 	// handler can return 409 (stale) vs 404 (gone).
 	var t models.Template
-	err := q.pool.QueryRow(ctx, `
+	err := scanTemplate(q.pool.QueryRow(ctx, `
 		UPDATE templates SET
 			name = COALESCE($2, name),
 			description = COALESCE($3, description),
@@ -287,16 +290,10 @@ func (q *Queries) UpdateTemplate(ctx context.Context, id uuid.UUID, req models.U
 			assign_ip = COALESCE($12, assign_ip)
 		WHERE id = $1
 		  AND ($13::timestamptz IS NULL OR updated_at = $13)
-		RETURNING id, name, vcenter_template, os_type, default_vcpus, default_ram_mb,
-		          default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''),
-		          default_username, default_password, kind, assign_ip, is_active, created_at, updated_at
+		RETURNING `+templateSelectCols+`
 	`, id, req.Name, req.Description, req.IconURL, req.DefaultVCPUs, req.DefaultRAMMB, req.DefaultDiskGB, req.IsActive,
 		req.DefaultUsername, req.DefaultPassword, req.Kind, req.AssignIP, req.ExpectedUpdatedAt,
-	).Scan(
-		&t.ID, &t.Name, &t.VCenterTemplate, &t.OSType, &t.DefaultVCPUs, &t.DefaultRAMMB,
-		&t.DefaultDiskGB, &t.MinVCPUs, &t.MinRAMMB, &t.Description, &t.IconURL,
-		&t.DefaultUsername, &t.DefaultPassword, &t.Kind, &t.AssignIP, &t.IsActive, &t.CreatedAt, &t.UpdatedAt,
-	)
+	), &t)
 	if err == pgx.ErrNoRows {
 		// Distinguish missing-row from version-mismatch. If the caller
 		// did not supply ExpectedUpdatedAt at all the only reason
@@ -943,16 +940,10 @@ func (q *Queries) UpdatePodVMCredentials(ctx context.Context, id uuid.UUID, user
 // GetTemplateByID returns a template by its ID.
 func (q *Queries) GetTemplateByID(ctx context.Context, id uuid.UUID) (*models.Template, error) {
 	var t models.Template
-	err := q.pool.QueryRow(ctx, `
-		SELECT id, name, vcenter_template, os_type, default_vcpus, default_ram_mb,
-		       default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''),
-		       default_username, default_password, kind, assign_ip, is_active, created_at, updated_at
+	err := scanTemplate(q.pool.QueryRow(ctx, `
+		SELECT `+templateSelectCols+`
 		FROM templates WHERE id = $1
-	`, id).Scan(
-		&t.ID, &t.Name, &t.VCenterTemplate, &t.OSType, &t.DefaultVCPUs, &t.DefaultRAMMB,
-		&t.DefaultDiskGB, &t.MinVCPUs, &t.MinRAMMB, &t.Description, &t.IconURL,
-		&t.DefaultUsername, &t.DefaultPassword, &t.Kind, &t.AssignIP, &t.IsActive, &t.CreatedAt, &t.UpdatedAt,
-	)
+	`, id), &t)
 	if err != nil {
 		return nil, err
 	}

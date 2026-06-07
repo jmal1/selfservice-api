@@ -24,24 +24,33 @@ type User struct {
 
 // Template represents a VM template available for provisioning.
 type Template struct {
-	ID              uuid.UUID `json:"id" db:"id"`
-	Name            string    `json:"name" db:"name"`
-	VCenterTemplate string    `json:"vcenter_template" db:"vcenter_template"`
-	OSType          string    `json:"os_type" db:"os_type"`
-	DefaultVCPUs    int       `json:"default_vcpus" db:"default_vcpus"`
-	DefaultRAMMB    int       `json:"default_ram_mb" db:"default_ram_mb"`
-	DefaultDiskGB   int       `json:"default_disk_gb" db:"default_disk_gb"`
-	MinVCPUs        int       `json:"min_vcpus" db:"min_vcpus"`
-	MinRAMMB        int       `json:"min_ram_mb" db:"min_ram_mb"`
-	Description     string    `json:"description" db:"description"`
-	IconURL         string    `json:"icon_url" db:"icon_url"`
-	DefaultUsername string    `json:"default_username" db:"default_username"`
-	DefaultPassword string    `json:"default_password" db:"default_password"`
-	Kind            string    `json:"kind" db:"kind"`
-	AssignIP        bool      `json:"assign_ip" db:"assign_ip"`
-	IsActive        bool      `json:"is_active" db:"is_active"`
-	CreatedAt       time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at" db:"updated_at"`
+	ID              uuid.UUID  `json:"id" db:"id"`
+	Name            string     `json:"name" db:"name"`
+	VCenterTemplate string     `json:"vcenter_template" db:"vcenter_template"`
+	OSType          string     `json:"os_type" db:"os_type"`
+	DefaultVCPUs    int        `json:"default_vcpus" db:"default_vcpus"`
+	DefaultRAMMB    int        `json:"default_ram_mb" db:"default_ram_mb"`
+	DefaultDiskGB   int        `json:"default_disk_gb" db:"default_disk_gb"`
+	MinVCPUs        int        `json:"min_vcpus" db:"min_vcpus"`
+	MinRAMMB        int        `json:"min_ram_mb" db:"min_ram_mb"`
+	Description     string     `json:"description" db:"description"`
+	IconURL         string     `json:"icon_url" db:"icon_url"`
+	DefaultUsername string     `json:"default_username" db:"default_username"`
+	DefaultPassword string     `json:"default_password" db:"default_password"`
+	Kind            string     `json:"kind" db:"kind"`
+	AssignIP        bool       `json:"assign_ip" db:"assign_ip"`
+	IsActive        bool       `json:"is_active" db:"is_active"`
+	// TemplateState drives the wizard lifecycle (migration 000018).
+	// See models.TemplateState* constants and internal/templates/lifecycle.go
+	// for allowed transitions. Defaults to 'active' for legacy rows.
+	TemplateState  string     `json:"template_state" db:"template_state"`
+	CreatedBy      *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
+	VCenterVMID    string     `json:"vcenter_vm_id" db:"vcenter_vm_id"`
+	SourceType     string     `json:"source_type" db:"source_type"`
+	SourceRef      string     `json:"source_ref" db:"source_ref"`
+	StagingNetwork string     `json:"staging_network" db:"staging_network"`
+	CreatedAt      time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at" db:"updated_at"`
 }
 
 // Template kind constants — keep in sync with the CHECK constraint in
@@ -62,6 +71,59 @@ const (
 	// canonical template; per-pod copies are always linked clones. Static
 	// credentials live in default_username/default_password.
 	TemplateKindRegisteredExistingVM = "registered_existing_vm"
+)
+
+// Template lifecycle state constants — keep in sync with the CHECK
+// constraint in migration 000018_template_lifecycle.up.sql and the state
+// machine in internal/templates/lifecycle.go.
+//
+// New templates start at `draft` (metadata only, no VM exists) and walk
+// forward through provisioning/configuring/generalizing to `ready`, then
+// publish to `active` to make them available to students. `error` is the
+// terminal failure state; the operator can recover via cancel→draft.
+const (
+	TemplateStateDraft        = "draft"
+	TemplateStateProvisioning = "provisioning"
+	TemplateStateConfiguring  = "configuring"
+	TemplateStateGeneralizing = "generalizing"
+	TemplateStateReady        = "ready"
+	TemplateStateActive       = "active"
+	TemplateStateError        = "error"
+)
+
+// AllTemplateStates is the canonical list of valid template lifecycle
+// states. Keep in lockstep with the TemplateState* constants above.
+var AllTemplateStates = []string{
+	TemplateStateDraft,
+	TemplateStateProvisioning,
+	TemplateStateConfiguring,
+	TemplateStateGeneralizing,
+	TemplateStateReady,
+	TemplateStateActive,
+	TemplateStateError,
+}
+
+// Template source type constants — keep in sync with the CHECK constraint
+// in migration 000018_template_lifecycle.up.sql.
+const (
+	// TemplateSourceManual is the legacy path: the VM was created in
+	// vCenter directly (or by another tool) and an admin filled in the
+	// template form. No machine-readable source reference.
+	TemplateSourceManual = "manual"
+
+	// TemplateSourceCloneTemplate clones an existing published template
+	// (a row in this table whose template_state='active'). source_ref
+	// holds the source template's UUID.
+	TemplateSourceCloneTemplate = "clone_template"
+
+	// TemplateSourceCloneVCenter clones an arbitrary vCenter VM by MoRef.
+	// source_ref holds the MoRef. Use when the source isn't already a
+	// Crucible template (e.g. an instructor's hand-built reference VM).
+	TemplateSourceCloneVCenter = "clone_vcenter"
+
+	// TemplateSourceISO mounts an ISO and starts a clean install.
+	// source_ref holds the ISO's datastore path.
+	TemplateSourceISO = "iso"
 )
 
 // TemplateAccess controls which users/roles can use a template.
