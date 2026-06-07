@@ -44,9 +44,11 @@ type GuestExecutor interface {
 
 // DispatcherQueries is the subset of *Queries that the dispatcher writes to.
 // Promoted to an interface so unit tests can record calls instead of needing
-// a real Postgres pool.
+// a real Postgres pool. Method signatures mirror the real Queries methods
+// exactly (including []byte for JSON payloads — json.RawMessage and []byte
+// are not interchangeable for Go interface satisfaction).
 type DispatcherQueries interface {
-	UpdateWorkflowResultBySlug(ctx context.Context, runID uuid.UUID, slug string, status, message string, instructorOutput, actionResults json.RawMessage, durationMs *int) error
+	UpdateWorkflowResultBySlug(ctx context.Context, runID uuid.UUID, workflowSlug, status, message string, instructorOutput, actionResults []byte, durationMs *int) error
 	UpdateRunCounts(ctx context.Context, runID uuid.UUID) error
 }
 

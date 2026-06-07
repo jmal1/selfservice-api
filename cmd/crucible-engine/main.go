@@ -13,6 +13,7 @@ import (
 	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/engine"
 	events "github.com/jmal1/selfservice-api/internal/nats"
+	"github.com/jmal1/selfservice-api/internal/vcenter"
 )
 
 func main() {
@@ -75,6 +76,35 @@ func main() {
 	// Create engine
 	queries := engine.NewQueries(pool)
 	eng := engine.New(queries, natsClient, k8sClient, engineID, k8sCfg.EngineURL, logger)
+
+	// Wire vCenter client + GuestOperations dispatcher so workflows with
+	// execution_mode=vmware_tools can run in-process. If vCenter config is
+	// missing or connection fails we keep going — kali_runner workflows
+	// still work, vmware_tools ones will surface a clean per-workflow error.
+	if cfg.VCenter.URL != "" {
+		vcClient := vcenter.New(vcenter.Config{
+			URL:           cfg.VCenter.URL,
+			User:          cfg.VCenter.User,
+			Password:      cfg.VCenter.Password,
+			Datacenter:    cfg.VCenter.Datacenter,
+			Datastore:     cfg.VCenter.Datastore,
+			VMFolder:      cfg.VCenter.VMFolder,
+			ResourcePools: cfg.VCenter.ResourcePools,
+			Hosts:         cfg.VCenter.Hosts,
+			Insecure:      cfg.VCenter.Insecure,
+		}, logger)
+		if err := vcClient.Connect(ctx); err != nil {
+			logger.Warn("vCenter connection failed; vmware_tools workflows will be rejected",
+				"error", err)
+		} else {
+			defer vcClient.Disconnect(ctx)
+			dispatcher := engine.NewVMwareToolsDispatcher(vcClient, queries, eng, logger)
+			eng.WithVMwareToolsDispatcher(dispatcher)
+			logger.Info("vmware_tools dispatcher configured", "vcenter_url", cfg.VCenter.URL)
+		}
+	} else {
+		logger.Info("vCenter config not provided; vmware_tools workflows will be rejected")
+	}
 
 	logger.Info("starting crucible-engine",
 		"engine_id", engineID,

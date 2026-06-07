@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"time"
@@ -14,12 +15,13 @@ import (
 // Engine is the workflow run orchestrator. It watches for pending runs,
 // provisions K8s Job runners, and manages the run lifecycle.
 type Engine struct {
-	queries   *Queries
-	nats      *events.Client
-	k8s       *K8sClient
-	engineID  string
-	engineURL string
-	logger    *slog.Logger
+	queries    *Queries
+	nats       *events.Client
+	k8s        *K8sClient
+	dispatcher *VMwareToolsDispatcher
+	engineID   string
+	engineURL  string
+	logger     *slog.Logger
 }
 
 // New creates a new Engine instance.
@@ -32,6 +34,16 @@ func New(queries *Queries, natsClient *events.Client, k8sClient *K8sClient, engi
 		engineURL: engineURL,
 		logger:    logger,
 	}
+}
+
+// WithVMwareToolsDispatcher attaches a GuestOperations-backed dispatcher so
+// workflows with execution_mode=vmware_tools can be executed in-process.
+// Optional: if not set, vmware_tools workflows fail fast with a clear error
+// rather than silently routing to the Kali runner (which would also fail,
+// just less helpfully).
+func (e *Engine) WithVMwareToolsDispatcher(d *VMwareToolsDispatcher) *Engine {
+	e.dispatcher = d
+	return e
 }
 
 // RecoverStaleRuns finds runs that were abandoned by a previous engine instance
@@ -155,7 +167,39 @@ func (e *Engine) executeRun(ctx context.Context, run *models.Run) error {
 	e.publishRunEvent(run.PodID.String(), run.ID.String(), "running",
 		fmt.Sprintf("Executing %d workflows", len(workflows)))
 
-	// Provision K8s Job runner on k3sv03
+	// Split workflows by execution mode so each mode can be dispatched along
+	// its own path. Mixed-mode playlists are allowed: kali workflows go to
+	// the K8s Job runner as before; vmware_tools workflows are executed
+	// in-process via the GuestOperations dispatcher.
+	kaliWorkflows := make([]models.Workflow, 0, len(workflows))
+	vmwareToolsWorkflows := make([]models.Workflow, 0, len(workflows))
+	for _, wf := range workflows {
+		if wf.ExecutionMode == models.ExecModeVMwareTools {
+			vmwareToolsWorkflows = append(vmwareToolsWorkflows, wf)
+		} else {
+			kaliWorkflows = append(kaliWorkflows, wf)
+		}
+	}
+
+	// Dispatch vmware_tools workflows first (in-process, fast) so any guest
+	// preflight errors surface before we provision the kali pod. Runs even
+	// when there are no kali workflows.
+	if len(vmwareToolsWorkflows) > 0 {
+		if err := e.dispatchVMwareTools(ctx, run, vmwareToolsWorkflows); err != nil {
+			// The dispatcher already wrote per-workflow error rows, so we
+			// just log here and continue — the kali path can still run any
+			// of its workflows even if guest-side ones failed.
+			e.logger.Error("vmware_tools dispatch returned error", "run_id", run.ID, "error", err)
+		}
+	}
+
+	// Provision K8s Job runner on k3sv03 for kali_runner workflows.
+	if len(kaliWorkflows) == 0 {
+		// All workflows were vmware_tools; the dispatcher fully owns this run.
+		// Mark it completed (or failed if everything failed) based on counts.
+		return e.finalizeRunFromCounts(ctx, run)
+	}
+
 	if e.k8s != nil {
 		// Resolve VLAN tag for this pod (stored in pod record)
 		vlanTag, err := e.queries.GetPodVLANTag(ctx, run.PodID)
@@ -163,9 +207,10 @@ func (e *Engine) executeRun(ctx context.Context, run *models.Run) error {
 			return fmt.Errorf("get pod VLAN tag: %w", err)
 		}
 
-		// Build WorkflowDefs from loaded workflows
-		wfDefs := make([]runner.WorkflowDef, len(workflows))
-		for i, wf := range workflows {
+		// Build WorkflowDefs only for kali-mode workflows; vmware_tools were
+		// already dispatched above.
+		wfDefs := make([]runner.WorkflowDef, len(kaliWorkflows))
+		for i, wf := range kaliWorkflows {
 			var setup string
 			if wf.SetupScript != nil {
 				setup = *wf.SetupScript
@@ -224,7 +269,62 @@ func (e *Engine) executeRun(ctx context.Context, run *models.Run) error {
 	return nil
 }
 
-// createVersionSnapshot creates an immutable snapshot of a workflow.
+// dispatchVMwareTools resolves the target moref+credentials once and hands
+// the workflows to the in-process dispatcher. If the dispatcher hasn't been
+// configured (no vCenter creds at engine startup), every workflow is marked
+// as error so the run can still complete.
+func (e *Engine) dispatchVMwareTools(ctx context.Context, run *models.Run, workflows []models.Workflow) error {
+	if e.dispatcher == nil {
+		e.logger.Warn("vmware_tools dispatcher not configured; failing affected workflows",
+			"run_id", run.ID, "workflow_count", len(workflows))
+		for _, wf := range workflows {
+			actionResults, _ := json.Marshal([]runner.ActionOutput{{
+				Action:  wf.Slug,
+				Status:  models.ResultStatusError,
+				Message: "vmware_tools execution mode not configured on this engine",
+			}})
+			instructorOutput, _ := json.Marshal(map[string]any{
+				"execution_mode": models.ExecModeVMwareTools,
+				"error":          "dispatcher not configured",
+			})
+			durationMs := 0
+			_ = e.queries.UpdateWorkflowResultBySlug(ctx, run.ID, wf.Slug,
+				models.ResultStatusError, "vmware_tools execution mode not configured", instructorOutput, actionResults, &durationMs)
+		}
+		return fmt.Errorf("vmware_tools dispatcher not configured")
+	}
+
+	moref, osType, username, password, err := e.queries.GetVMwareToolsTarget(ctx, run.PodID)
+	if err != nil {
+		return fmt.Errorf("resolve vmware_tools target: %w", err)
+	}
+	target := VMwareToolsTarget{
+		VMMoref:  moref,
+		OS:       osType,
+		Username: username,
+		Password: password,
+	}
+	return e.dispatcher.Dispatch(ctx, run, workflows, target)
+}
+
+// finalizeRunFromCounts inspects the run's current pass/fail counts and
+// transitions the run to completed (any pass) or failed (all fail/error).
+// Used when no kali runner is involved and the engine needs to close out the
+// run itself — normally the kali callback handles this.
+func (e *Engine) finalizeRunFromCounts(ctx context.Context, run *models.Run) error {
+	if err := e.queries.UpdateRunCounts(ctx, run.ID); err != nil {
+		e.logger.Warn("failed to update run counts at finalize", "run_id", run.ID, "error", err)
+	}
+	// The simplest closeout: mark completed. UpdateRunCounts already populated
+	// pass_count/fail_count which the UI uses for overall status display, so
+	// we don't need to decide pass-vs-fail at the run level.
+	if err := e.queries.UpdateRunStatus(ctx, run.ID, models.RunStatusCompleted, nil); err != nil {
+		return fmt.Errorf("finalize run: %w", err)
+	}
+	e.publishRunEvent(run.PodID.String(), run.ID.String(), "completed",
+		"All workflows executed via vmware_tools")
+	return nil
+}
 func (e *Engine) createVersionSnapshot(ctx context.Context, wf *models.Workflow) (*models.WorkflowVersion, error) {
 	latestVersion, err := e.queries.GetLatestWorkflowVersion(ctx, wf.ID)
 	if err != nil {

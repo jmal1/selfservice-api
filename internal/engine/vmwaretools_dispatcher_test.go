@@ -50,7 +50,7 @@ type workflowUpdate struct {
 	DurationMs       *int
 }
 
-func (q *fakeQueries) UpdateWorkflowResultBySlug(ctx context.Context, runID uuid.UUID, slug, status, message string, instructorOutput, actionResults json.RawMessage, durationMs *int) error {
+func (q *fakeQueries) UpdateWorkflowResultBySlug(ctx context.Context, runID uuid.UUID, slug, status, message string, instructorOutput, actionResults []byte, durationMs *int) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.updates = append(q.updates, workflowUpdate{

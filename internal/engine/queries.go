@@ -261,7 +261,7 @@ func (q *Queries) GetRunTargetInfo(ctx context.Context, podID uuid.UUID) (runner
 		SELECT COALESCE(pv.ip_address, ''), COALESCE(t.os_type, 'linux'),
 		       COALESCE(pv.generated_username, ''), COALESCE(pv.generated_password, '')
 		FROM pod_vms pv
-		JOIN vm_templates t ON pv.template_id = t.id
+		JOIN templates t ON pv.template_id = t.id
 		WHERE pv.pod_id = $1
 		ORDER BY pv.created_at ASC
 		LIMIT 1
@@ -282,6 +282,40 @@ func (q *Queries) GetRunTargetInfo(ctx context.Context, podID uuid.UUID) (runner
 	}
 
 	return target, pod, nil
+}
+
+// GetVMwareToolsTarget loads the moref + guest credentials needed to dispatch
+// a vmware_tools workflow against a pod's primary VM.
+//
+// Resolution rules:
+//   - moref comes from pod_vms.vcenter_vm_id (required; if missing the VM
+//     wasn't provisioned through us and we can't talk to it via govmomi)
+//   - generated credentials win over the template's defaults (this matches
+//     the kali_runner path so behavior is consistent across modes)
+//   - falls back to templates.default_username/default_password for VMs that
+//     don't get per-pod credential generation (e.g. registered_existing_vm
+//     kind from Track T3, where the static creds are the source of truth)
+//
+// Returns ErrNoVMwareToolsTarget if no eligible VM is found, so the caller
+// can produce a clean per-workflow error rather than a generic 500.
+func (q *Queries) GetVMwareToolsTarget(ctx context.Context, podID uuid.UUID) (string, string, string, string, error) {
+	var moref, osType, username, password string
+	err := q.pool.QueryRow(ctx, `
+		SELECT
+			COALESCE(pv.vcenter_vm_id, ''),
+			COALESCE(t.os_type, 'linux'),
+			COALESCE(NULLIF(pv.generated_username, ''), t.default_username, ''),
+			COALESCE(NULLIF(pv.generated_password, ''), t.default_password, '')
+		FROM pod_vms pv
+		JOIN templates t ON pv.template_id = t.id
+		WHERE pv.pod_id = $1
+		ORDER BY pv.created_at ASC
+		LIMIT 1
+	`, podID).Scan(&moref, &osType, &username, &password)
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("get vmware_tools target: %w", err)
+	}
+	return moref, osType, username, password, nil
 }
 
 // SetRunnerPodName stores the K8s Job name on the run for later cleanup.
