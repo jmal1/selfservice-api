@@ -88,6 +88,34 @@ engine:
       cpu: 500m
       memory: 256Mi
 
+# Synthetic API Monitor (customer-emulating runner; see internal/synthetic)
+# Deploys a K8s CronJob that exercises live API routes as a real user and
+# pushes results to Pushgateway → Prometheus → Grafana alerts.
+synthetic:
+  enabled: true
+  image: ghcr.io/jmal1/selfservice-synthetic-api-monitor
+  imageTag: ""  # defaults to .Values.image.tag
+  schedule: "*/10 * * * *"
+  baseURL: "https://crucible.jmal.io"
+  pushgatewayURL: "http://pushgateway.observability:9091"
+  job: "crucible_synthetic_api"
+  layer: "api"
+  username: "synthetic"
+  role: "student"
+  checkTimeout: "30s"
+  # Name of the K8s Secret holding the synthetic user's DB user-id. The
+  # secret MUST contain key `user-id` whose value is the UUID of the
+  # synthetic user row in the users table. Bootstrap via the SQL in
+  # deploy/sql/synthetic-user.sql.
+  secretName: selfservice-synthetic-user
+  resources:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
 # Vault sidecar annotations (disabled for now)
 vault:
   enabled: false

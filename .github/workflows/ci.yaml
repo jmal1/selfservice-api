@@ -29,6 +29,9 @@ jobs:
           - component: crucible-engine
             dockerfile: Dockerfile
             target: crucible-engine
+          - component: synthetic-api-monitor
+            dockerfile: Dockerfile
+            target: synthetic-api-monitor
           - component: crucible-runner
             dockerfile: deploy/runner/Dockerfile
             target: ""

@@ -32,6 +32,11 @@ func (h *Handler) GetTestingDashboard(w http.ResponseWriter, r *http.Request) {
 	// Verify pod ownership (or admin)
 	pod, err := h.db.GetPodByID(r.Context(), podID)
 	if err != nil {
+		h.logger.Error("get pod failed", "pod_id", podID, "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if pod == nil {
 		http.Error(w, "pod not found", http.StatusNotFound)
 		return
 	}
@@ -75,6 +80,11 @@ func (h *Handler) CreateTestingRun(w http.ResponseWriter, r *http.Request) {
 	// Verify pod ownership
 	pod, err := h.db.GetPodByID(r.Context(), podID)
 	if err != nil {
+		h.logger.Error("get pod failed", "pod_id", podID, "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if pod == nil {
 		http.Error(w, "pod not found", http.StatusNotFound)
 		return
 	}
@@ -167,6 +177,11 @@ func (h *Handler) ListTestingRuns(w http.ResponseWriter, r *http.Request) {
 
 	pod, err := h.db.GetPodByID(r.Context(), podID)
 	if err != nil {
+		h.logger.Error("get pod failed", "pod_id", podID, "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if pod == nil {
 		http.Error(w, "pod not found", http.StatusNotFound)
 		return
 	}
@@ -202,6 +217,11 @@ func (h *Handler) GetTestingRun(w http.ResponseWriter, r *http.Request) {
 
 	pod, err := h.db.GetPodByID(r.Context(), podID)
 	if err != nil {
+		h.logger.Error("get pod failed", "pod_id", podID, "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if pod == nil {
 		http.Error(w, "pod not found", http.StatusNotFound)
 		return
 	}
@@ -249,6 +269,11 @@ func (h *Handler) CancelTestingRun(w http.ResponseWriter, r *http.Request) {
 
 	pod, err := h.db.GetPodByID(r.Context(), podID)
 	if err != nil {
+		h.logger.Error("get pod failed", "pod_id", podID, "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if pod == nil {
 		http.Error(w, "pod not found", http.StatusNotFound)
 		return
 	}

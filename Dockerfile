@@ -18,6 +18,9 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o /bin/provision-worker ./cmd/provision-w
 # Build crucible engine
 RUN CGO_ENABLED=0 GOOS=linux go build -o /bin/crucible-engine ./cmd/crucible-engine/
 
+# Build synthetic API monitor
+RUN CGO_ENABLED=0 GOOS=linux go build -o /bin/synthetic-api-monitor ./cmd/synthetic-api-monitor/
+
 # --- API Gateway image ---
 FROM alpine:3.19 AS api-gateway
 RUN apk add --no-cache ca-certificates tzdata
@@ -38,3 +41,10 @@ RUN apk add --no-cache ca-certificates tzdata
 COPY --from=builder /bin/crucible-engine /usr/local/bin/crucible-engine
 USER 65534:65534
 ENTRYPOINT ["crucible-engine"]
+
+# --- Synthetic API Monitor image ---
+FROM alpine:3.19 AS synthetic-api-monitor
+RUN apk add --no-cache ca-certificates tzdata
+COPY --from=builder /bin/synthetic-api-monitor /usr/local/bin/synthetic-api-monitor
+USER 65534:65534
+ENTRYPOINT ["synthetic-api-monitor"]
