@@ -170,6 +170,10 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 				r.Delete("/{actionID}", h.AdminDeleteAction)
 			})
 
+			// Script validator (shellcheck-backed) — used by the workflow
+			// + action editor to surface lint findings as Monaco markers.
+			r.Post("/scripts/validate", h.AdminValidateScript)
+
 			// Playlists
 			r.Route("/playlists", func(r chi.Router) {
 				r.Get("/", h.AdminListPlaylists)

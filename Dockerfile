@@ -23,7 +23,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o /bin/synthetic-api-monitor ./cmd/synthe
 
 # --- API Gateway image ---
 FROM alpine:3.19 AS api-gateway
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates tzdata shellcheck
 COPY --from=builder /bin/api-gateway /usr/local/bin/api-gateway
 USER 65534:65534
 ENTRYPOINT ["api-gateway"]
