@@ -37,9 +37,31 @@ type Template struct {
 	IconURL         string    `json:"icon_url" db:"icon_url"`
 	DefaultUsername string    `json:"default_username" db:"default_username"`
 	DefaultPassword string    `json:"default_password" db:"default_password"`
+	Kind            string    `json:"kind" db:"kind"`
+	AssignIP        bool      `json:"assign_ip" db:"assign_ip"`
 	IsActive        bool      `json:"is_active" db:"is_active"`
 	CreatedAt       time.Time `json:"created_at" db:"created_at"`
 }
+
+// Template kind constants — keep in sync with the CHECK constraint in
+// migration 000016_template_kind.up.sql.
+const (
+	// TemplateKindCloneWithCustomize is the default; provisioner clones the
+	// vCenter template, runs guest customization (sysprep / cloud-init), and
+	// assigns an IP from the pod VLAN.
+	TemplateKindCloneWithCustomize = "clone_with_customize"
+
+	// TemplateKindCloneNoCustomize clones the template and attaches the NIC,
+	// but does NOT run guest customization. Guest is responsible for its own
+	// hostname/network config. Use when the source VM is already prepared with
+	// the correct settings.
+	TemplateKindCloneNoCustomize = "clone_no_customize"
+
+	// TemplateKindRegisteredExistingVM treats the named vCenter VM as the
+	// canonical template; per-pod copies are always linked clones. Static
+	// credentials live in default_username/default_password.
+	TemplateKindRegisteredExistingVM = "registered_existing_vm"
+)
 
 // TemplateAccess controls which users/roles can use a template.
 type TemplateAccess struct {

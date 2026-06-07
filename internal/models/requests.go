@@ -40,6 +40,14 @@ type CreateTemplateRequest struct {
 	IconURL         string `json:"icon_url,omitempty"`
 	DefaultUsername string `json:"default_username,omitempty"`
 	DefaultPassword string `json:"default_password,omitempty"`
+	// Kind controls the provisioner intake mode. Defaults to
+	// "clone_with_customize" if omitted, matching today's behavior.
+	Kind string `json:"kind,omitempty" validate:"omitempty,oneof=clone_with_customize clone_no_customize registered_existing_vm"`
+	// AssignIP, when explicitly false, tells the provisioner NOT to assign an
+	// IP from the pod VLAN DHCP scope. Defaults to true if omitted. Use false
+	// for registered_existing_vm or for clone_no_customize templates whose
+	// guests manage their own networking.
+	AssignIP *bool `json:"assign_ip,omitempty"`
 }
 
 // UpdateTemplateRequest is the admin API request to update a template.
@@ -53,6 +61,8 @@ type UpdateTemplateRequest struct {
 	IsActive        *bool   `json:"is_active,omitempty"`
 	DefaultUsername *string `json:"default_username,omitempty"`
 	DefaultPassword *string `json:"default_password,omitempty"`
+	Kind            *string `json:"kind,omitempty" validate:"omitempty,oneof=clone_with_customize clone_no_customize registered_existing_vm"`
+	AssignIP        *bool   `json:"assign_ip,omitempty"`
 }
 
 // UpdateQuotaRequest is the admin API request to update user quotas.

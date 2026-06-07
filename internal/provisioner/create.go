@@ -140,8 +140,15 @@ type VMSpec struct {
 	VCPUs        int32     `json:"vcpus"`
 	RAMMB        int64     `json:"ram_mb"`
 	DiskGB       int       `json:"disk_gb"`
-	OSType       string    `json:"os_type"`       // "linux" or "windows"
+	OSType       string    `json:"os_type"` // "linux" or "windows"
 	BootOrder    int       `json:"boot_order"`
+	// Kind mirrors templates.kind. Empty string is treated as
+	// "clone_with_customize" for backward compatibility with pre-T3 payloads.
+	Kind string `json:"kind,omitempty"`
+	// AssignIP defaults to true. When the API layer explicitly sends false
+	// (template was registered with assign_ip=false), the provisioner attaches
+	// the NIC but skips WaitForIP, leaving pod_vms.ip_address NULL.
+	AssignIP bool `json:"assign_ip"`
 }
 
 // generatePassword creates a random password with uppercase, lowercase, digits, and a special char.
@@ -527,9 +534,16 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 			groupPoweredOn = append(groupPoweredOn, vmPowerInfo{index: i, vmSpec: vmSpec, moref: *podVM.VCenterVMID})
 		}
 
-		// Wait for IPs in this boot-order group before starting the next group
+		// Wait for IPs in this boot-order group before starting the next group.
+		// Skip the wait for any VM whose template was registered with
+		// assign_ip=false — its network is owner-managed (DHCP/static inside
+		// the guest), so the provisioner has no IP to record.
 		var wg sync.WaitGroup
 		for _, info := range groupPoweredOn {
+			if !info.vmSpec.AssignIP {
+				p.logger.Info("skipping WaitForIP (template assign_ip=false)", "vm", info.vmSpec.VMName)
+				continue
+			}
 			wg.Add(1)
 			go func(vmInfo vmPowerInfo) {
 				defer wg.Done()

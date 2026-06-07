@@ -139,22 +139,30 @@ func (q *Queries) UpdateUserQuotas(ctx context.Context, id uuid.UUID, req models
 
 // CreateTemplate inserts a new template.
 func (q *Queries) CreateTemplate(ctx context.Context, req models.CreateTemplateRequest) (*models.Template, error) {
+	kind := req.Kind
+	if kind == "" {
+		kind = models.TemplateKindCloneWithCustomize
+	}
+	assignIP := true
+	if req.AssignIP != nil {
+		assignIP = *req.AssignIP
+	}
 	var t models.Template
 	err := q.pool.QueryRow(ctx, `
 		INSERT INTO templates (name, vcenter_template, os_type, default_vcpus, default_ram_mb,
 		                       default_disk_gb, min_vcpus, min_ram_mb, description, icon_url,
-		                       default_username, default_password)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		                       default_username, default_password, kind, assign_ip)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		RETURNING id, name, vcenter_template, os_type, default_vcpus, default_ram_mb,
 		          default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''),
-		          default_username, default_password, is_active, created_at
+		          default_username, default_password, kind, assign_ip, is_active, created_at
 	`, req.Name, req.VCenterTemplate, req.OSType, req.DefaultVCPUs, req.DefaultRAMMB,
 		req.DefaultDiskGB, req.MinVCPUs, req.MinRAMMB, req.Description, req.IconURL,
-		req.DefaultUsername, req.DefaultPassword,
+		req.DefaultUsername, req.DefaultPassword, kind, assignIP,
 	).Scan(
 		&t.ID, &t.Name, &t.VCenterTemplate, &t.OSType, &t.DefaultVCPUs, &t.DefaultRAMMB,
 		&t.DefaultDiskGB, &t.MinVCPUs, &t.MinRAMMB, &t.Description, &t.IconURL,
-		&t.DefaultUsername, &t.DefaultPassword, &t.IsActive, &t.CreatedAt,
+		&t.DefaultUsername, &t.DefaultPassword, &t.Kind, &t.AssignIP, &t.IsActive, &t.CreatedAt,
 	)
 	return &t, err
 }
@@ -165,7 +173,7 @@ func (q *Queries) ListTemplatesForUser(ctx context.Context, userID uuid.UUID, ro
 		SELECT DISTINCT t.id, t.name, t.vcenter_template, t.os_type, t.default_vcpus,
 		       t.default_ram_mb, t.default_disk_gb, t.min_vcpus, t.min_ram_mb,
 		       COALESCE(t.description, ''), COALESCE(t.icon_url, ''),
-		       t.default_username, t.default_password, t.is_active, t.created_at
+		       t.default_username, t.default_password, t.kind, t.assign_ip, t.is_active, t.created_at
 		FROM templates t
 		LEFT JOIN template_access ta ON t.id = ta.template_id
 		WHERE t.is_active = true
@@ -185,7 +193,7 @@ func (q *Queries) ListTemplatesForUser(ctx context.Context, userID uuid.UUID, ro
 			&t.ID, &t.Name, &t.VCenterTemplate, &t.OSType, &t.DefaultVCPUs,
 			&t.DefaultRAMMB, &t.DefaultDiskGB, &t.MinVCPUs, &t.MinRAMMB,
 			&t.Description, &t.IconURL, &t.DefaultUsername, &t.DefaultPassword,
-			&t.IsActive, &t.CreatedAt,
+			&t.Kind, &t.AssignIP, &t.IsActive, &t.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -199,7 +207,7 @@ func (q *Queries) ListAllTemplates(ctx context.Context) ([]models.Template, erro
 	rows, err := q.pool.Query(ctx, `
 		SELECT id, name, vcenter_template, os_type, default_vcpus, default_ram_mb,
 		       default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''),
-		       default_username, default_password, is_active, created_at
+		       default_username, default_password, kind, assign_ip, is_active, created_at
 		FROM templates ORDER BY name
 	`)
 	if err != nil {
@@ -214,7 +222,7 @@ func (q *Queries) ListAllTemplates(ctx context.Context) ([]models.Template, erro
 			&t.ID, &t.Name, &t.VCenterTemplate, &t.OSType, &t.DefaultVCPUs,
 			&t.DefaultRAMMB, &t.DefaultDiskGB, &t.MinVCPUs, &t.MinRAMMB,
 			&t.Description, &t.IconURL, &t.DefaultUsername, &t.DefaultPassword,
-			&t.IsActive, &t.CreatedAt,
+			&t.Kind, &t.AssignIP, &t.IsActive, &t.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -262,17 +270,19 @@ func (q *Queries) UpdateTemplate(ctx context.Context, id uuid.UUID, req models.U
 			default_disk_gb = COALESCE($7, default_disk_gb),
 			is_active = COALESCE($8, is_active),
 			default_username = COALESCE($9, default_username),
-			default_password = COALESCE($10, default_password)
+			default_password = COALESCE($10, default_password),
+			kind = COALESCE($11, kind),
+			assign_ip = COALESCE($12, assign_ip)
 		WHERE id = $1
 		RETURNING id, name, vcenter_template, os_type, default_vcpus, default_ram_mb,
 		          default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''),
-		          default_username, default_password, is_active, created_at
+		          default_username, default_password, kind, assign_ip, is_active, created_at
 	`, id, req.Name, req.Description, req.IconURL, req.DefaultVCPUs, req.DefaultRAMMB, req.DefaultDiskGB, req.IsActive,
-		req.DefaultUsername, req.DefaultPassword,
+		req.DefaultUsername, req.DefaultPassword, req.Kind, req.AssignIP,
 	).Scan(
 		&t.ID, &t.Name, &t.VCenterTemplate, &t.OSType, &t.DefaultVCPUs, &t.DefaultRAMMB,
 		&t.DefaultDiskGB, &t.MinVCPUs, &t.MinRAMMB, &t.Description, &t.IconURL,
-		&t.DefaultUsername, &t.DefaultPassword, &t.IsActive, &t.CreatedAt,
+		&t.DefaultUsername, &t.DefaultPassword, &t.Kind, &t.AssignIP, &t.IsActive, &t.CreatedAt,
 	)
 	if err == pgx.ErrNoRows {
 		return nil, nil
@@ -908,12 +918,12 @@ func (q *Queries) GetTemplateByID(ctx context.Context, id uuid.UUID) (*models.Te
 	err := q.pool.QueryRow(ctx, `
 		SELECT id, name, vcenter_template, os_type, default_vcpus, default_ram_mb,
 		       default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''),
-		       default_username, default_password, is_active, created_at
+		       default_username, default_password, kind, assign_ip, is_active, created_at
 		FROM templates WHERE id = $1
 	`, id).Scan(
 		&t.ID, &t.Name, &t.VCenterTemplate, &t.OSType, &t.DefaultVCPUs, &t.DefaultRAMMB,
 		&t.DefaultDiskGB, &t.MinVCPUs, &t.MinRAMMB, &t.Description, &t.IconURL,
-		&t.DefaultUsername, &t.DefaultPassword, &t.IsActive, &t.CreatedAt,
+		&t.DefaultUsername, &t.DefaultPassword, &t.Kind, &t.AssignIP, &t.IsActive, &t.CreatedAt,
 	)
 	if err != nil {
 		return nil, err

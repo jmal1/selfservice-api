@@ -303,6 +303,14 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 		RAMMB        int64     `json:"ram_mb"`
 		DiskGB       int       `json:"disk_gb"`
 		OSType       string    `json:"os_type"`
+		// Kind mirrors templates.kind so the provisioner can branch between
+		// clone_with_customize / clone_no_customize / registered_existing_vm
+		// without re-reading the template row.
+		Kind string `json:"kind"`
+		// AssignIP mirrors templates.assign_ip. When false, the provisioner
+		// attaches the NIC but skips WaitForIP and leaves pod_vms.ip_address
+		// NULL — the guest is expected to manage its own networking.
+		AssignIP bool `json:"assign_ip"`
 	}
 	var vmSpecs []workerVMSpec
 
@@ -321,6 +329,10 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 		}
 
 		vmName := salt + "-" + sanitizeName(rv.req.DisplayName)
+		kind := rv.template.Kind
+		if kind == "" {
+			kind = models.TemplateKindCloneWithCustomize
+		}
 		vmSpecs = append(vmSpecs, workerVMSpec{
 			PodVMID:      vmID,
 			TemplateName: rv.template.VCenterTemplate,
@@ -329,6 +341,8 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 			RAMMB:        int64(rv.ramMB),
 			DiskGB:       rv.diskGB,
 			OSType:       rv.template.OSType,
+			Kind:         kind,
+			AssignIP:     rv.template.AssignIP,
 		})
 	}
 

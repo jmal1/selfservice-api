@@ -255,6 +255,8 @@ func (h *Handler) DeployBlueprint(w http.ResponseWriter, r *http.Request) {
 		DiskGB       int    `json:"disk_gb"`
 		OSType       string `json:"os_type"`
 		BootOrder    int    `json:"boot_order"`
+		Kind         string `json:"kind"`
+		AssignIP     bool   `json:"assign_ip"`
 	}
 	var vmPayloads []vmPayload
 
@@ -271,6 +273,10 @@ func (h *Handler) DeployBlueprint(w http.ResponseWriter, r *http.Request) {
 		}
 
 		vmName := salt + "-" + sanitizeName(rv.DisplayName)
+		kind := rv.Template.Kind
+		if kind == "" {
+			kind = models.TemplateKindCloneWithCustomize
+		}
 		vmPayloads = append(vmPayloads, vmPayload{
 			PodVMID:      vmID.String(),
 			TemplateName: rv.Template.VCenterTemplate,
@@ -281,6 +287,8 @@ func (h *Handler) DeployBlueprint(w http.ResponseWriter, r *http.Request) {
 			DiskGB:       rv.DiskGB,
 			OSType:       rv.Template.OSType,
 			BootOrder:    rv.BootOrder,
+			Kind:         kind,
+			AssignIP:     rv.Template.AssignIP,
 		})
 	}
 
