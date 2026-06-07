@@ -313,6 +313,13 @@ const (
 	JobTypeVMSnapshot       = "vm_snapshot"
 	JobTypeVMRevert         = "vm_revert"
 	JobTypeVMSnapshotDelete = "vm_snapshot_delete"
+
+	// Template wizard (T4) jobs. template_provision creates the staging VM
+	// from a source (existing template, vCenter VM, or ISO) and powers it on.
+	// template_generalize runs sysprep / cloud-init clean inside the running
+	// VM via GuestOperations, then snapshots the powered-off VM as base-image.
+	JobTypeTemplateProvision  = "template_provision"
+	JobTypeTemplateGeneralize = "template_generalize"
 )
 
 // Job status constants.

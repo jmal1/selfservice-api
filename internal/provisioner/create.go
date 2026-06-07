@@ -83,6 +83,10 @@ func (p *Provisioner) ProcessJob(ctx context.Context, job *models.Job) error {
 		err = p.RevertVM(ctx, job)
 	case models.JobTypeVMSnapshotDelete:
 		err = p.DeleteSnapshot(ctx, job)
+	case models.JobTypeTemplateProvision:
+		err = p.ProvisionTemplate(ctx, job)
+	case models.JobTypeTemplateGeneralize:
+		err = p.GeneralizeTemplate(ctx, job)
 	default:
 		err = fmt.Errorf("unknown job type: %s", job.Type)
 	}

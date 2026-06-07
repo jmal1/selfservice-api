@@ -321,6 +321,55 @@ func (q *Queries) DeleteTemplate(ctx context.Context, id uuid.UUID) error {
 	return err
 }
 
+// UpdateTemplateLifecycleState transitions a template's template_state column.
+// Used exclusively by the T4 wizard worker jobs and the lifecycle-aware
+// API handlers. The caller MUST have validated the transition against
+// internal/templates.CanTransition first — this query simply persists
+// the new value, gated on `from` matching the current row so concurrent
+// workers don't overwrite each other.
+//
+// Returns ErrTemplateStale when the row exists but its current
+// template_state is no longer `from` (a different worker advanced it).
+// Returns pgx.ErrNoRows when the template was deleted underneath us.
+func (q *Queries) UpdateTemplateLifecycleState(ctx context.Context, id uuid.UUID, from, to string) error {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE templates
+		SET template_state = $3, updated_at = NOW()
+		WHERE id = $1 AND template_state = $2
+	`, id, from, to)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		// Distinguish "row gone" from "state moved underneath us".
+		var exists bool
+		if e := q.pool.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM templates WHERE id = $1)`, id,
+		).Scan(&exists); e != nil {
+			return e
+		}
+		if !exists {
+			return pgx.ErrNoRows
+		}
+		return ErrTemplateStale
+	}
+	return nil
+}
+
+// SetTemplateVCenterVM stores the freshly-cloned VM's moref against the
+// template row. Called by template_provision after a successful clone so
+// subsequent jobs (generalize, snapshot) know which VM to act on. Safe
+// to call multiple times — overwrites whatever was previously set.
+func (q *Queries) SetTemplateVCenterVM(ctx context.Context, id uuid.UUID, vcenterVMID string) error {
+	_, err := q.pool.Exec(ctx, `
+		UPDATE templates
+		SET vcenter_vm_id = $2, updated_at = NOW()
+		WHERE id = $1
+	`, id, vcenterVMID)
+	return err
+}
+
+
 // ListAllJobs returns all jobs ordered by creation time (admin).
 func (q *Queries) ListAllJobs(ctx context.Context) ([]models.Job, error) {
 	rows, err := q.pool.Query(ctx, `
