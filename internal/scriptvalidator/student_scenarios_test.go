@@ -59,20 +59,23 @@ return 0
 		}
 	})
 
-	t.Run("undeclared_ctx_var_is_surfaced", func(t *testing.T) {
-		// Instructor referenced CTX_TYPO but only declared CTX_PATH; the
-		// wrapper does NOT pre-declare CTX_TYPO so SC2154 should fire.
-		script := `if [[ -f "$CTX_TYPO" ]]; then
-    echo "exists"
-fi
+	t.Run("undeclared_lowercase_var_is_surfaced", func(t *testing.T) {
+		// shellcheck's SC2154 heuristic doesn't fire on ALL_CAPS variables
+		// (they're assumed to be from the environment), so it can't catch
+		// a typo'd $CTX_FOO. We document that limitation in the script-
+		// editor doc + AGENTS.md. SC2154 DOES still catch typos in
+		// lowercase local-style names though, which is useful inside
+		// helper closures.
+		script := `local file="${CTX_FILE:-}"
+echo "$nope"
 `
 		res, err := v.Validate(context.Background(), "bash", script,
-			Options{InputContextNames: []string{"path"}})
+			Options{InputContextNames: []string{"file"}})
 		if err != nil {
 			t.Fatalf("validate: %v", err)
 		}
 		if !hasCode(res.Findings, "SC2154") {
-			t.Errorf("expected SC2154 (referenced but not assigned) for CTX_TYPO; got: %s",
+			t.Errorf("expected SC2154 for undeclared lowercase $nope; got: %s",
 				dumpFindings(res.Findings))
 		}
 	})
