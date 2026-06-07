@@ -120,11 +120,15 @@ func (v *Validator) Validate(ctx context.Context, language, script string) (*Res
 //	                which the validator cannot resolve from stdin.
 //	SC1017          Carriage-return noise (we already strip CRs in Validate,
 //	                but exclude defensively in case any survive).
+//	SC2034          Variables like LAST_ERROR / LAST_STUDENT_MSG are
+//	                assigned by the action body and consumed by the wrapper
+//	                runner via env / source, so shellcheck can't see the
+//	                read site.
 //	SC2168          Action bodies are commonly executed as the body of a
 //	                wrapper function (via `run_action`) or sourced into a
 //	                larger script, so top-level `local x=$(ctx_get …)` is
 //	                idiomatic and not a real bug.
-var excludedShellcheckCodes = []string{"SC1017", "SC1090", "SC1091", "SC2168"}
+var excludedShellcheckCodes = []string{"SC1017", "SC1090", "SC1091", "SC2034", "SC2168"}
 
 // runShellcheck invokes shellcheck with JSON output, parses it, and normalizes
 // the findings into our Result schema.
