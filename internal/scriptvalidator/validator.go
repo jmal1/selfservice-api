@@ -210,6 +210,13 @@ func (v *Validator) runShellcheck(ctx context.Context, script string, opts Optio
 	}
 	findings = remapFindings(findings, wrapped)
 
+	// CRU0001 — undeclared $CTX_<NAME> references. shellcheck's SC2154
+	// deliberately ignores ALL_CAPS variables, so typos in CTX_ refs slip
+	// past the linter entirely. We compensate with a focused static pass
+	// that runs against the ORIGINAL user script (not the wrapped version)
+	// so the line/column numbers map directly to what the user sees.
+	findings = append(findings, undeclaredCTXFindings(script, opts)...)
+
 	res := &Result{
 		Language:     "bash",
 		Findings:     findings,

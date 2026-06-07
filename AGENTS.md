@@ -446,8 +446,8 @@ The Admin UI's script editor sends your action body to `POST /api/v1/admin/scrip
 |---|---|---|
 | Top-level `local foo=bar` | **No SC2168.** Allowed. | The wrapper places your body inside a function shell (`_crucible_action_body() { … }`). |
 | `LAST_ERROR="msg"` / `LAST_STUDENT_MSG="…"` set but seemingly unused | **No SC2034.** Allowed. | The wrapper consumes these after your body returns. |
-| `$CTX_FOO` where `foo` was declared in **Input Context** on the action form | **No SC2154.** Allowed. | The wrapper emits `: "${CTX_FOO:=}"` for every declared input. |
-| `$CTX_TYPO` where `typo` was **not** declared | **Not surfaced by shellcheck** (silent passthrough). | shellcheck's SC2154 heuristic intentionally ignores ALL_CAPS variables (they're assumed to be from the environment). **You are responsible for typo-checking your `$CTX_*` references.** A future validator pass will catch these statically. |
+| `$CTX_FOO` where `foo` was declared in **Input Context** on the action form | **No SC2154 / no CRU0001.** Allowed. | The wrapper emits `: "${CTX_FOO:=}"` for every declared input. |
+| `$CTX_TYPO` where `typo` was **not** declared | **CRU0001 fires** (warning). | shellcheck's SC2154 deliberately ignores ALL_CAPS variables, so a Crucible-specific static pass (`internal/scriptvalidator/ctxcheck.go`) catches undeclared `$CTX_*` refs. Emitted as a warning so legitimate runtime-injected names aren't blocked. |
 | `$x` in `[ -f $x ]` (unquoted) | **SC2086 fires.** Real bug. | Word-splitting + globbing risk. |
 | Genuinely unused `local thisIsUnused=…` | **SC2034 fires.** Real bug. | We don't over-suppress. |
 | `if [ -f /x ]` *without* `then` | **Parse error.** Real bug. | Will also be caught by the client-side `sh-syntax` layer instantly. |

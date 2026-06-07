@@ -80,6 +80,26 @@ echo "$nope"
 		}
 	})
 
+	t.Run("undeclared_CTX_var_is_caught_by_CRU0001", func(t *testing.T) {
+		// CRU0001 is our custom static pass that fills shellcheck's SC2154
+		// blind spot for ALL_CAPS env-style vars. Typos in $CTX_<NAME>
+		// refs should be surfaced as warnings (not errors — there are
+		// legitimate dynamic injection patterns) so the editor highlights
+		// them but Save isn't blocked.
+		script := `local path="${CTX_FILE:-}"
+echo "$CTX_FIEL"
+`
+		res, err := v.Validate(context.Background(), "bash", script,
+			Options{InputContextNames: []string{"file"}})
+		if err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+		if !hasCode(res.Findings, "CRU0001") {
+			t.Errorf("expected CRU0001 for typo'd $CTX_FIEL; got: %s",
+				dumpFindings(res.Findings))
+		}
+	})
+
 	t.Run("unquoted_variable_is_warned", func(t *testing.T) {
 		// Real bug — splits on whitespace, globs on *.
 		script := `local file="${CTX_FILE:-}"
