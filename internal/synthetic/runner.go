@@ -64,8 +64,10 @@ func (r *Runner) RunOnce(ctx context.Context) []Result {
 // panic so a buggy check cannot take down the whole run.
 func (r *Runner) runOne(ctx context.Context, check Check) (res Result) {
 	res = Result{
-		Name:     check.Name(),
-		Severity: check.Severity(),
+		Name:        check.Name(),
+		Title:       check.Title(),
+		Description: check.Description(),
+		Severity:    check.Severity(),
 	}
 	checkCtx, cancel := context.WithTimeout(ctx, r.CheckTimeout)
 	defer cancel()

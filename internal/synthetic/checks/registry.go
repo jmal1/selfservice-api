@@ -22,8 +22,10 @@ import (
 // expected body. This is the canary check: if it fails, every other check is
 // likely to fail too, and the alert wording should make that obvious.
 var Healthz = synthetic.CheckFunc{
-	NameVal:     "healthz",
-	SeverityVal: synthetic.SeverityCritical,
+	NameVal:        "healthz",
+	TitleVal:       "API Liveness",
+	DescriptionVal: "Hits the unauthenticated /healthz endpoint and verifies the {\"status\":\"ok\"} payload. First to fail if ingress, Caddy, or the API pod is down.",
+	SeverityVal:    synthetic.SeverityCritical,
 	RunFn: func(ctx context.Context, c *synthetic.Client) (int, error) {
 		resp, err := c.Do(ctx, http.MethodGet, "/healthz", nil)
 		if err != nil {
@@ -50,8 +52,10 @@ var Healthz = synthetic.CheckFunc{
 // synthetic session cookie is valid AND the API can talk to its database
 // (the handler looks up the user row).
 var AuthMe = synthetic.CheckFunc{
-	NameVal:     "auth_me",
-	SeverityVal: synthetic.SeverityCritical,
+	NameVal:        "auth_me",
+	TitleVal:       "Session Auth + DB",
+	DescriptionVal: "Logs in as the synthetic user and calls /auth/me. Proves the JWT secret, the middleware, and the users-table lookup all work end-to-end.",
+	SeverityVal:    synthetic.SeverityCritical,
 	RunFn: func(ctx context.Context, c *synthetic.Client) (int, error) {
 		resp, err := c.Do(ctx, http.MethodGet, "/auth/me", nil)
 		if err != nil {
@@ -84,8 +88,10 @@ var AuthMe = synthetic.CheckFunc{
 // may legitimately have no pods. If the API ever changes the response shape
 // (e.g. to {pods: [...]}) this check fails and the breakage is obvious.
 var PodsList = synthetic.CheckFunc{
-	NameVal:     "pods_list",
-	SeverityVal: synthetic.SeverityCritical,
+	NameVal:        "pods_list",
+	TitleVal:       "List My Pods",
+	DescriptionVal: "Calls /api/v1/pods as the synthetic user and verifies a JSON array (or null) comes back. Smoke-tests the most-used customer route + role filter.",
+	SeverityVal:    synthetic.SeverityCritical,
 	RunFn: func(ctx context.Context, c *synthetic.Client) (int, error) {
 		resp, err := c.Do(ctx, http.MethodGet, "/api/v1/pods", nil)
 		if err != nil {
@@ -109,8 +115,10 @@ var PodsList = synthetic.CheckFunc{
 // the admin route with 403. This is critical: a permission regression that
 // silently grants admin access would not surface in any other check.
 var AdminListUsers403 = synthetic.CheckFunc{
-	NameVal:     "admin_list_users_403",
-	SeverityVal: synthetic.SeverityCritical,
+	NameVal:        "admin_list_users_403",
+	TitleVal:       "RBAC: Student Cannot Admin",
+	DescriptionVal: "Calls /api/v1/admin/users as a student-role user and requires a 403. Catches any RBAC regression that would silently elevate students to admin.",
+	SeverityVal:    synthetic.SeverityCritical,
 	RunFn: func(ctx context.Context, c *synthetic.Client) (int, error) {
 		resp, err := c.Do(ctx, http.MethodGet, "/api/v1/admin/users", nil)
 		if err != nil {
@@ -131,8 +139,10 @@ var AdminListUsers403 = synthetic.CheckFunc{
 // expects 404, NOT 500. If a future config-load failure begins returning 500
 // for missing pods (the way the original bug did), this check fires.
 var PodTestingDashboard404 = synthetic.CheckFunc{
-	NameVal:     "pod_testing_dashboard_404",
-	SeverityVal: synthetic.SeverityCritical,
+	NameVal:        "pod_testing_dashboard_404",
+	TitleVal:       "Missing Pod Returns 404 (not 500)",
+	DescriptionVal: "Probes /pods/{phantom-uuid}/testing and requires 404. Watches for the historical nil-deref bug in GetTestingDashboard that produced 500s for missing pods.",
+	SeverityVal:    synthetic.SeverityCritical,
 	RunFn: func(ctx context.Context, c *synthetic.Client) (int, error) {
 		// Deterministic non-existent UUID; if a pod with this ID ever exists,
 		// we have bigger problems.

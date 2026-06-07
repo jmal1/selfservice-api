@@ -187,3 +187,20 @@ func TestAll_StableNames(t *testing.T) {
 		t.Errorf("expected check %q not registered", missing)
 	}
 }
+
+// TestAll_HasFriendlyMetadata guarantees every check is dashboard-ready:
+// non-empty Title (for status pills + alert summaries) and Description (for
+// status table). A check that ships without either is invisible to humans.
+func TestAll_HasFriendlyMetadata(t *testing.T) {
+	for _, c := range All() {
+		if strings.TrimSpace(c.Title()) == "" {
+			t.Errorf("check %q has empty Title()", c.Name())
+		}
+		if strings.TrimSpace(c.Description()) == "" {
+			t.Errorf("check %q has empty Description()", c.Name())
+		}
+		if len(c.Title()) > 60 {
+			t.Errorf("check %q Title() = %q is too long (>60 chars; keep it pill-sized)", c.Name(), c.Title())
+		}
+	}
+}

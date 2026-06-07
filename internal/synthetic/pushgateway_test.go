@@ -16,24 +16,46 @@ import (
 // monitoring breaking change.
 func TestSerializeResults_ContainsRequiredFamilies(t *testing.T) {
 	body := string(serializeResults([]Result{
-		{Name: "healthz", Severity: SeverityCritical, Success: true, Duration: 123 * time.Millisecond, HTTPStatus: 200},
-		{Name: "auth_me", Severity: SeverityWarning, Success: false, Duration: 2 * time.Second, HTTPStatus: 500},
+		{Name: "healthz", Title: "API Liveness", Description: "hits /healthz", Severity: SeverityCritical, Success: true, Duration: 123 * time.Millisecond, HTTPStatus: 200},
+		{Name: "auth_me", Title: "Session Auth + DB", Description: "calls /auth/me", Severity: SeverityWarning, Success: false, Duration: 2 * time.Second, HTTPStatus: 500},
 	}))
 
 	required := []string{
 		"# TYPE crucible_synthetic_check_success gauge",
 		"# TYPE crucible_synthetic_check_duration_seconds gauge",
 		"# TYPE crucible_synthetic_check_http_status gauge",
+		"# TYPE crucible_synthetic_check_info gauge",
 		"# TYPE crucible_synthetic_run_timestamp_seconds gauge",
-		`crucible_synthetic_check_success{check="healthz",severity="critical"} 1`,
-		`crucible_synthetic_check_success{check="auth_me",severity="warning"} 0`,
-		`crucible_synthetic_check_http_status{check="healthz",severity="critical"} 200`,
-		`crucible_synthetic_check_http_status{check="auth_me",severity="warning"} 500`,
+		`crucible_synthetic_check_success{check="healthz",title="API Liveness",severity="critical"} 1`,
+		`crucible_synthetic_check_success{check="auth_me",title="Session Auth + DB",severity="warning"} 0`,
+		`crucible_synthetic_check_http_status{check="healthz",title="API Liveness",severity="critical"} 200`,
+		`crucible_synthetic_check_http_status{check="auth_me",title="Session Auth + DB",severity="warning"} 500`,
+		`crucible_synthetic_check_info{check="healthz",title="API Liveness",description="hits /healthz",severity="critical"} 1`,
+		`crucible_synthetic_check_info{check="auth_me",title="Session Auth + DB",description="calls /auth/me",severity="warning"} 1`,
 	}
 	for _, want := range required {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %q.\nbody:\n%s", want, body)
 		}
+	}
+}
+
+// TestSerializeResults_SanitizesLabelValues ensures titles/descriptions that
+// would break the exposition format are flattened rather than corrupting the
+// push. Multi-line descriptions in particular would otherwise produce invalid
+// metrics that Pushgateway rejects.
+func TestSerializeResults_SanitizesLabelValues(t *testing.T) {
+	body := string(serializeResults([]Result{
+		{Name: "x", Title: "line1\nline2", Description: "tab\there", Severity: SeverityCritical},
+	}))
+	if strings.Contains(body, "line1\nline2") {
+		t.Errorf("title newline not sanitized:\n%s", body)
+	}
+	if strings.Contains(body, "tab\there") {
+		t.Errorf("description tab not sanitized:\n%s", body)
+	}
+	if !strings.Contains(body, `title="line1 line2"`) {
+		t.Errorf("expected flattened title in body:\n%s", body)
 	}
 }
 

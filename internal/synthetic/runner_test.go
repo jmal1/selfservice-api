@@ -14,13 +14,17 @@ import (
 // fakeCheck lets each test parameterize behaviour without defining new types.
 type fakeCheck struct {
 	name     string
+	title    string
+	desc     string
 	severity Severity
 	run      func(ctx context.Context, c *Client) (int, error)
 }
 
-func (f fakeCheck) Name() string                                          { return f.name }
-func (f fakeCheck) Severity() Severity                                    { return f.severity }
-func (f fakeCheck) Run(ctx context.Context, c *Client) (int, error)       { return f.run(ctx, c) }
+func (f fakeCheck) Name() string                                    { return f.name }
+func (f fakeCheck) Title() string                                   { return f.title }
+func (f fakeCheck) Description() string                             { return f.desc }
+func (f fakeCheck) Severity() Severity                              { return f.severity }
+func (f fakeCheck) Run(ctx context.Context, c *Client) (int, error) { return f.run(ctx, c) }
 
 // noopLogger discards all log output so tests stay quiet.
 func noopLogger() *slog.Logger {

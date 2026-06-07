@@ -105,29 +105,43 @@ func (p *Pushgateway) PushResults(ctx context.Context, results []Result) error {
 // serializeResults builds the Prometheus text-format body for a result batch.
 // It is exported only via the package-internal tests to make assertions
 // possible without spinning up an HTTP server.
+//
+// Title is emitted as a label on every per-check metric so dashboards and
+// alert templates can render the friendly name without joining on a separate
+// info metric. Description is verbose; it lives only on the dedicated
+// `crucible_synthetic_check_info` metric so per-cycle time-series stay slim.
 func serializeResults(results []Result) []byte {
 	var b bytes.Buffer
 	// Metric: crucible_synthetic_check_success — gauge 0 or 1.
 	b.WriteString("# HELP crucible_synthetic_check_success 1 if the check passed, 0 otherwise.\n")
 	b.WriteString("# TYPE crucible_synthetic_check_success gauge\n")
 	for _, r := range results {
-		fmt.Fprintf(&b, `crucible_synthetic_check_success{check=%q,severity=%q} %d`+"\n",
-			r.Name, string(r.Severity), boolToInt(r.Success))
+		fmt.Fprintf(&b, `crucible_synthetic_check_success{check=%q,title=%q,severity=%q} %d`+"\n",
+			r.Name, sanitizeLabel(r.Title), string(r.Severity), boolToInt(r.Success))
 	}
 	// Metric: crucible_synthetic_check_duration_seconds — gauge of last run.
 	b.WriteString("# HELP crucible_synthetic_check_duration_seconds Wall-clock duration of the last run.\n")
 	b.WriteString("# TYPE crucible_synthetic_check_duration_seconds gauge\n")
 	for _, r := range results {
-		fmt.Fprintf(&b, `crucible_synthetic_check_duration_seconds{check=%q,severity=%q} %f`+"\n",
-			r.Name, string(r.Severity), r.Duration.Seconds())
+		fmt.Fprintf(&b, `crucible_synthetic_check_duration_seconds{check=%q,title=%q,severity=%q} %f`+"\n",
+			r.Name, sanitizeLabel(r.Title), string(r.Severity), r.Duration.Seconds())
 	}
 	// Metric: crucible_synthetic_check_http_status — gauge of last HTTP code,
 	// 0 if no HTTP call completed (e.g. DNS failure before send).
 	b.WriteString("# HELP crucible_synthetic_check_http_status HTTP status of the last response, 0 if no response.\n")
 	b.WriteString("# TYPE crucible_synthetic_check_http_status gauge\n")
 	for _, r := range results {
-		fmt.Fprintf(&b, `crucible_synthetic_check_http_status{check=%q,severity=%q} %d`+"\n",
-			r.Name, string(r.Severity), r.HTTPStatus)
+		fmt.Fprintf(&b, `crucible_synthetic_check_http_status{check=%q,title=%q,severity=%q} %d`+"\n",
+			r.Name, sanitizeLabel(r.Title), string(r.Severity), r.HTTPStatus)
+	}
+	// Metric: crucible_synthetic_check_info — constant 1 carrying friendly
+	// metadata as labels. Standard `_info`-metric pattern: dashboards join
+	// against this on the `check` label to surface title/description.
+	b.WriteString("# HELP crucible_synthetic_check_info Static metadata about each synthetic check.\n")
+	b.WriteString("# TYPE crucible_synthetic_check_info gauge\n")
+	for _, r := range results {
+		fmt.Fprintf(&b, `crucible_synthetic_check_info{check=%q,title=%q,description=%q,severity=%q} 1`+"\n",
+			r.Name, sanitizeLabel(r.Title), sanitizeLabel(r.Description), string(r.Severity))
 	}
 	// Metric: crucible_synthetic_run_timestamp_seconds — unix time of this push.
 	// Used by alerts that want to fire if results are stale (no recent push).
@@ -135,6 +149,24 @@ func serializeResults(results []Result) []byte {
 	b.WriteString("# TYPE crucible_synthetic_run_timestamp_seconds gauge\n")
 	fmt.Fprintf(&b, "crucible_synthetic_run_timestamp_seconds %d\n", time.Now().Unix())
 	return b.Bytes()
+}
+
+// sanitizeLabel strips characters that would break Prometheus exposition
+// when emitted via %q. Newlines and tabs are mapped to spaces; %q itself
+// handles escaping quotes and backslashes, so we only need to flatten
+// whitespace. Result is also trimmed to 200 chars to bound label size.
+func sanitizeLabel(s string) string {
+	s = strings.Map(func(r rune) rune {
+		switch r {
+		case '\n', '\r', '\t':
+			return ' '
+		}
+		return r
+	}, s)
+	if len(s) > 200 {
+		s = s[:200]
+	}
+	return s
 }
 
 func boolToInt(b bool) int {
