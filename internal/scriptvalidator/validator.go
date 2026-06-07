@@ -64,7 +64,10 @@ func NewValidator() *Validator {
 	return &Validator{
 		run:         execRun,
 		maxScriptKB: 64,
-		timeout:     8 * time.Second,
+		// 3s is comfortably above worst-case shellcheck runtime for the 64KB
+		// script cap on the API pod (observed ~150ms p99). Tight enough to
+		// neutralize any pathological-input DoS attempt.
+		timeout: 3 * time.Second,
 	}
 }
 
@@ -77,6 +80,12 @@ func (v *Validator) WithRunner(r commandRunner) *Validator {
 // WithMaxScriptKB overrides the script size limit (for tests).
 func (v *Validator) WithMaxScriptKB(kb int) *Validator {
 	v.maxScriptKB = kb
+	return v
+}
+
+// WithTimeout overrides the per-invocation wall-clock timeout (for tests).
+func (v *Validator) WithTimeout(d time.Duration) *Validator {
+	v.timeout = d
 	return v
 }
 
@@ -93,7 +102,19 @@ var ErrScriptTooLarge = errors.New("script too large")
 //
 // Carriage returns are stripped before linting so scripts that were authored
 // or stored with CRLF line endings don't produce SC1017 noise on every line.
-func (v *Validator) Validate(ctx context.Context, language, script string) (*Result, error) {
+//
+// The script is wrapped in a synthetic preamble + function shell that
+// expresses the runtime context Crucible action / workflow scripts execute in
+// (sourced actions.sh, called as the body of a function, standard runner env
+// vars, conventional LAST_* outputs). This lets shellcheck flag real bugs
+// without polluting the editor with false positives for idiomatic patterns
+// like `local x=$(ctx_get path)` at top level.
+//
+// Pass Options.InputContextNames so CTX_* vars the instructor declared on
+// this action are pre-declared in the preamble. SC2154 still fires for CTX_
+// names the instructor forgot to declare — that's a real bug, surfaced
+// deliberately.
+func (v *Validator) Validate(ctx context.Context, language, script string, opts ...Options) (*Result, error) {
 	if maxBytes := v.maxScriptKB * 1024; len(script) > maxBytes {
 		return nil, fmt.Errorf("%w: script is %d bytes, max %d", ErrScriptTooLarge, len(script), maxBytes)
 	}
@@ -105,36 +126,62 @@ func (v *Validator) Validate(ctx context.Context, language, script string) (*Res
 	script = strings.ReplaceAll(script, "\r\n", "\n")
 	script = strings.ReplaceAll(script, "\r", "\n")
 
+	var o Options
+	if len(opts) > 0 {
+		o = opts[0]
+	}
+
 	switch strings.ToLower(language) {
 	case "bash", "sh", "shell":
-		return v.runShellcheck(ctx, script)
+		// If the script body looks like PowerShell, return an empty result
+		// rather than feed it to bash shellcheck. This happens for actions
+		// whose action_type is "command" but body is PowerShell — the bash
+		// linter has nothing useful to say about that code and would just
+		// flood the editor with noise.
+		if detectShellLanguage(script) == "powershell" {
+			return &Result{
+				Language: "powershell",
+				Findings: []Finding{},
+			}, nil
+		}
+		return v.runShellcheck(ctx, script, o)
+	case "powershell", "pwsh":
+		// No PowerShell linter integrated yet — accept silently rather than
+		// breaking the editor. Returning a clean result keeps the Save
+		// button enabled and the marker bar empty.
+		return &Result{
+			Language: "powershell",
+			Findings: []Finding{},
+		}, nil
 	default:
-		return nil, fmt.Errorf("%w: %q (supported: bash)", ErrUnsupportedLanguage, language)
+		return nil, fmt.Errorf("%w: %q (supported: bash, powershell)", ErrUnsupportedLanguage, language)
 	}
 }
 
-// excludedShellcheckCodes are rules that produce false positives for Crucible
-// action / workflow scripts and so are filtered out at lint time.
+// excludedShellcheckCodes are the only rules we suppress globally. Both
+// concern the linter's inability to resolve files it cannot see from stdin,
+// not the actual quality of the user's code.
 //
-//	SC1090, SC1091  Scripts always begin with `source /opt/crucible/lib/actions.sh`
-//	                which the validator cannot resolve from stdin.
-//	SC1017          Carriage-return noise (we already strip CRs in Validate,
-//	                but exclude defensively in case any survive).
-//	SC2034          Variables like LAST_ERROR / LAST_STUDENT_MSG are
-//	                assigned by the action body and consumed by the wrapper
-//	                runner via env / source, so shellcheck can't see the
-//	                read site.
-//	SC2168          Action bodies are commonly executed as the body of a
-//	                wrapper function (via `run_action`) or sourced into a
-//	                larger script, so top-level `local x=$(ctx_get …)` is
-//	                idiomatic and not a real bug.
-var excludedShellcheckCodes = []string{"SC1017", "SC1090", "SC1091", "SC2034", "SC2168"}
+//	SC1090  "Can't follow non-constant source."
+//	SC1091  "Not following: file not specified as input."
+//
+// Every other false positive Crucible scripts used to hit (SC1017, SC2034
+// for LAST_*, SC2168 for top-level `local`, SC2154 for CTX_* / CRUCIBLE_*)
+// is now handled by wrapForValidation building a preamble + function shell
+// that expresses the real runtime context. That keeps the linter honest:
+// SC2034 still flags a typo'd output variable, SC2168 still flags `local`
+// in a script that genuinely has no enclosing function, SC2154 still flags
+// a CTX_ name the instructor forgot to declare.
+var excludedShellcheckCodes = []string{"SC1090", "SC1091"}
 
-// runShellcheck invokes shellcheck with JSON output, parses it, and normalizes
-// the findings into our Result schema.
-func (v *Validator) runShellcheck(ctx context.Context, script string) (*Result, error) {
+// runShellcheck wraps the script for context, invokes shellcheck with JSON
+// output, parses the result, and maps findings back to the user's coordinate
+// space before returning.
+func (v *Validator) runShellcheck(ctx context.Context, script string, opts Options) (*Result, error) {
 	cctx, cancel := context.WithTimeout(ctx, v.timeout)
 	defer cancel()
+
+	wrapped := wrapForValidation(script, opts)
 
 	start := time.Now()
 	stdout, stderr, exitCode, err := v.run(cctx, "shellcheck", []string{
@@ -143,7 +190,7 @@ func (v *Validator) runShellcheck(ctx context.Context, script string) (*Result, 
 		"--severity=style", // surface everything; the UI filters
 		"--exclude=" + strings.Join(excludedShellcheckCodes, ","),
 		"-", // read script from stdin
-	}, script)
+	}, wrapped.text)
 	duration := time.Since(start)
 
 	// shellcheck exits 1 when there are findings — that's not an error for us.
@@ -161,6 +208,7 @@ func (v *Validator) runShellcheck(ctx context.Context, script string) (*Result, 
 	if err != nil {
 		return nil, fmt.Errorf("parse shellcheck output: %w", err)
 	}
+	findings = remapFindings(findings, wrapped)
 
 	res := &Result{
 		Language:     "bash",

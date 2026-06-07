@@ -43,7 +43,7 @@ func swapValidator(fn scriptValidateFunc) func() {
 
 func TestAdminValidateScript_Success(t *testing.T) {
 	resetRateLimiterForTest()
-	defer swapValidator(func(ctx context.Context, lang, script string) (*scriptvalidator.Result, error) {
+	defer swapValidator(func(ctx context.Context, lang, script string, opts ...scriptvalidator.Options) (*scriptvalidator.Result, error) {
 		return &scriptvalidator.Result{
 			Language: "bash",
 			Findings: []scriptvalidator.Finding{
@@ -80,7 +80,7 @@ func TestAdminValidateScript_Success(t *testing.T) {
 func TestAdminValidateScript_EmptyScriptShortCircuits(t *testing.T) {
 	resetRateLimiterForTest()
 	called := atomic.Bool{}
-	defer swapValidator(func(ctx context.Context, lang, script string) (*scriptvalidator.Result, error) {
+	defer swapValidator(func(ctx context.Context, lang, script string, opts ...scriptvalidator.Options) (*scriptvalidator.Result, error) {
 		called.Store(true)
 		return nil, errors.New("should not be called")
 	})()
@@ -101,7 +101,7 @@ func TestAdminValidateScript_EmptyScriptShortCircuits(t *testing.T) {
 
 func TestAdminValidateScript_UnsupportedLanguageIs400(t *testing.T) {
 	resetRateLimiterForTest()
-	defer swapValidator(func(ctx context.Context, lang, script string) (*scriptvalidator.Result, error) {
+	defer swapValidator(func(ctx context.Context, lang, script string, opts ...scriptvalidator.Options) (*scriptvalidator.Result, error) {
 		return nil, scriptvalidator.ErrUnsupportedLanguage
 	})()
 
@@ -118,7 +118,7 @@ func TestAdminValidateScript_UnsupportedLanguageIs400(t *testing.T) {
 
 func TestAdminValidateScript_ScriptTooLargeIs413(t *testing.T) {
 	resetRateLimiterForTest()
-	defer swapValidator(func(ctx context.Context, lang, script string) (*scriptvalidator.Result, error) {
+	defer swapValidator(func(ctx context.Context, lang, script string, opts ...scriptvalidator.Options) (*scriptvalidator.Result, error) {
 		return nil, scriptvalidator.ErrScriptTooLarge
 	})()
 
@@ -135,7 +135,7 @@ func TestAdminValidateScript_ScriptTooLargeIs413(t *testing.T) {
 
 func TestAdminValidateScript_InternalErrorIs500(t *testing.T) {
 	resetRateLimiterForTest()
-	defer swapValidator(func(ctx context.Context, lang, script string) (*scriptvalidator.Result, error) {
+	defer swapValidator(func(ctx context.Context, lang, script string, opts ...scriptvalidator.Options) (*scriptvalidator.Result, error) {
 		return nil, errors.New("shellcheck not found")
 	})()
 
@@ -152,7 +152,7 @@ func TestAdminValidateScript_InternalErrorIs500(t *testing.T) {
 
 func TestAdminValidateScript_RateLimit429(t *testing.T) {
 	resetRateLimiterForTest()
-	defer swapValidator(func(ctx context.Context, lang, script string) (*scriptvalidator.Result, error) {
+	defer swapValidator(func(ctx context.Context, lang, script string, opts ...scriptvalidator.Options) (*scriptvalidator.Result, error) {
 		return &scriptvalidator.Result{Language: "bash", Findings: []scriptvalidator.Finding{}}, nil
 	})()
 
@@ -204,7 +204,7 @@ func TestAdminValidateScript_UnknownFieldsRejected(t *testing.T) {
 func TestAdminValidateScript_DefaultLanguageIsBash(t *testing.T) {
 	resetRateLimiterForTest()
 	var receivedLang string
-	defer swapValidator(func(ctx context.Context, lang, script string) (*scriptvalidator.Result, error) {
+	defer swapValidator(func(ctx context.Context, lang, script string, opts ...scriptvalidator.Options) (*scriptvalidator.Result, error) {
 		receivedLang = lang
 		return &scriptvalidator.Result{Language: lang}, nil
 	})()
@@ -226,7 +226,7 @@ func TestAdminValidateScript_DefaultLanguageIsBash(t *testing.T) {
 // validator (we should pass the real request context through).
 func TestAdminValidateScript_ContextPassedThrough(t *testing.T) {
 	resetRateLimiterForTest()
-	defer swapValidator(func(ctx context.Context, lang, script string) (*scriptvalidator.Result, error) {
+	defer swapValidator(func(ctx context.Context, lang, script string, opts ...scriptvalidator.Options) (*scriptvalidator.Result, error) {
 		if _, ok := ctx.Deadline(); ok {
 			t.Error("did not expect a deadline on the validator ctx (handler doesn't set one)")
 		}

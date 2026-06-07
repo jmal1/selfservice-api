@@ -22,7 +22,7 @@ var scriptValidateFn = scriptvalidator.NewValidator().Validate
 // scriptValidateFunc is the signature of scriptValidateFn — kept as a type
 // so tests can construct fakes without depending on the validator package's
 // internals.
-type scriptValidateFunc func(ctx context.Context, language, script string) (*scriptvalidator.Result, error)
+type scriptValidateFunc func(ctx context.Context, language, script string, opts ...scriptvalidator.Options) (*scriptvalidator.Result, error)
 
 // validateRateLimiter is a per-user token bucket. 30 requests/minute,
 // burst of 10 — matches the "save-as-you-type" debounce pattern.
@@ -74,8 +74,10 @@ func (h *Handler) AdminValidateScript(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Language string `json:"language"`
-		Script   string `json:"script"`
+		Language           string   `json:"language"`
+		Script             string   `json:"script"`
+		InputContextNames  []string `json:"input_context_names,omitempty"`
+		OutputContextNames []string `json:"output_context_names,omitempty"`
 	}
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128*1024))
 	dec.DisallowUnknownFields()
@@ -95,7 +97,10 @@ func (h *Handler) AdminValidateScript(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := scriptValidateFn(r.Context(), req.Language, req.Script)
+	res, err := scriptValidateFn(r.Context(), req.Language, req.Script, scriptvalidator.Options{
+		InputContextNames:  req.InputContextNames,
+		OutputContextNames: req.OutputContextNames,
+	})
 	if err != nil {
 		switch {
 		case errors.Is(err, scriptvalidator.ErrUnsupportedLanguage):
