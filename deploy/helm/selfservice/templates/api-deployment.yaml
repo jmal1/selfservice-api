@@ -95,6 +95,12 @@ spec:
               value: {{ .Values.vcenter.datacenter | quote }}
             - name: VCENTER_INSECURE
               value: {{ .Values.vcenter.insecure | quote }}
+            {{- if .Values.vcenter.healthPushgatewayURL }}
+            - name: VCENTER_HEALTH_PUSHGATEWAY_URL
+              value: {{ .Values.vcenter.healthPushgatewayURL | quote }}
+            - name: VCENTER_HEALTH_INTERVAL
+              value: {{ .Values.vcenter.healthInterval | default "5m" | quote }}
+            {{- end }}
             {{- if .Values.api.allowedOrigins }}
             - name: ALLOWED_ORIGINS
               value: {{ .Values.api.allowedOrigins | quote }}

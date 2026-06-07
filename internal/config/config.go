@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config holds all application configuration.
@@ -74,6 +75,14 @@ type VCenterConfig struct {
 	ResourcePools   []string
 	Hosts         []string
 	Insecure      bool
+
+	// HealthPushgatewayURL enables the in-process vCenter credentials
+	// health probe (see internal/vsphere/health). When set, the api-gateway
+	// performs a fresh login every HealthCheckInterval and pushes
+	// vsphere_login_success to this Pushgateway. Empty disables the probe.
+	HealthPushgatewayURL string
+	// HealthCheckInterval is how often the probe runs. Defaults to 5m.
+	HealthCheckInterval time.Duration
 }
 
 // OPNsenseConfig holds OPNsense connection settings.
@@ -129,6 +138,8 @@ func Load() (*Config, error) {
 			ResourcePools:   splitEnv("VCENTER_RESOURCE_POOLS", "/JMAL-Datacenter/host/Intel-Cluster/Resources/Student-VMs,/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs"),
 			Hosts:         splitEnv("VCENTER_HOSTS", "esxi1.lab.jmal.io,esxi2.lab.jmal.io,nuc1.lab.jmal.io,nuc2.lab.jmal.io,nuc3.lab.jmal.io"),
 			Insecure:      getEnvBool("VCENTER_INSECURE", true),
+			HealthPushgatewayURL: getEnv("VCENTER_HEALTH_PUSHGATEWAY_URL", ""),
+			HealthCheckInterval:  getEnvDuration("VCENTER_HEALTH_INTERVAL", 5*time.Minute),
 		},
 		OPNsense: OPNsenseConfig{
 			BaseURL:     getEnv("OPNSENSE_URL", "https://10.10.10.60/api"),
@@ -164,6 +175,16 @@ func getEnvBool(key string, fallback bool) bool {
 		b, err := strconv.ParseBool(v)
 		if err == nil {
 			return b
+		}
+	}
+	return fallback
+}
+
+func getEnvDuration(key string, fallback time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		d, err := time.ParseDuration(v)
+		if err == nil {
+			return d
 		}
 	}
 	return fallback

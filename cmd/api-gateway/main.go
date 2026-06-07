@@ -17,6 +17,7 @@ import (
 	"github.com/jmal1/selfservice-api/internal/database"
 	events "github.com/jmal1/selfservice-api/internal/nats"
 	"github.com/jmal1/selfservice-api/internal/vcenter"
+	vsphereHealth "github.com/jmal1/selfservice-api/internal/vsphere/health"
 )
 
 func main() {
@@ -96,6 +97,35 @@ func main() {
 		handler.WithVCenterFolders(vc, cfg.VCenter.TemplatesFolder)
 		logger.Info("vCenter folder enumeration enabled", "folder", cfg.VCenter.TemplatesFolder)
 	}
+
+	// Start the vCenter credentials health probe (OP-1). Runs in-process so
+	// it shares the api-gateway pod lifecycle. The probe creates a fresh
+	// govmomi client every cycle so cached sessions cannot mask a rotated
+	// SSO password — the exact failure mode we hit on 2026-06-07.
+	if cfg.VCenter.URL != "" && cfg.VCenter.User != "" && cfg.VCenter.Password != "" {
+		probe, err := vsphereHealth.New(vsphereHealth.Config{
+			VCenterURL:           cfg.VCenter.URL,
+			User:                 cfg.VCenter.User,
+			Password:             cfg.VCenter.Password,
+			Insecure:             cfg.VCenter.Insecure,
+			PushgatewayURL:       cfg.VCenter.HealthPushgatewayURL,
+			Job:                  "crucible_vsphere_health",
+			GroupingLabels:       map[string]string{"layer": "vsphere"},
+		}, logger)
+		if err != nil {
+			logger.Warn("vsphere health probe disabled", "error", err)
+		} else {
+			interval := cfg.VCenter.HealthCheckInterval
+			if interval == 0 {
+				interval = 5 * time.Minute
+			}
+			go probe.RunPeriodic(ctx, interval)
+			logger.Info("vsphere health probe started",
+				"interval", interval,
+				"pushgateway_configured", cfg.VCenter.HealthPushgatewayURL != "")
+		}
+	}
+
 	router := routes.Setup(handler, authProvider, queries, cfg.Server.AllowedOrigins)
 
 	// Start HTTP server

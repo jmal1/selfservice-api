@@ -57,6 +57,13 @@ vcenter:
   resourcePools: "AMD-Cluster/Resources/Student-VMs,Intel-Cluster/Resources/Student-VMs"
   hosts: "esxi1.lab.jmal.io,esxi2.lab.jmal.io,nuc1.lab.jmal.io,nuc2.lab.jmal.io,nuc3.lab.jmal.io"
   insecure: "true"
+  # vCenter credentials health probe (OP-1). Set healthPushgatewayURL to the
+  # Pushgateway endpoint and the api-gateway will perform a fresh login
+  # every healthInterval, pushing vsphere_login_success{user=...}. Catches
+  # rotated SSO passwords that would otherwise be masked by cached sessions
+  # for weeks (the failure mode that triggered this probe on 2026-06-07).
+  healthPushgatewayURL: "http://pushgateway.observability:9091"
+  healthInterval: "5m"
 
 # OPNsense configuration (non-secret values; credentials from K8s secret)
 opnsense:
