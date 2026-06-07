@@ -119,6 +119,22 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 		r.Get("/jobs", h.ListMyJobs)
 		r.Get("/jobs/{jobID}/status", h.GetJobStatus)
 
+		// Template wizard (T4) — instructor-accessible subset of /admin.
+		// These endpoints live outside the /admin RoleAdmin guard so the
+		// `lab-instructors` Authentik group (mapped to RoleInstructor) can
+		// use them. RoleAdmin satisfies RoleInstructor via hasMinRole.
+		r.Route("/admin/templates", func(r chi.Router) {
+			r.Use(middleware.RequireRole(models.RoleInstructor))
+			r.Post("/draft", h.AdminCreateTemplateDraft)
+			r.Get("/{templateID}/wizard-state", h.AdminGetWizardState)
+			r.Post("/{templateID}/provision", h.AdminProvisionTemplate)
+			r.Post("/{templateID}/generalize", h.AdminGeneralizeTemplate)
+			r.Post("/{templateID}/publish", h.AdminPublishTemplate)
+			r.Post("/{templateID}/unpublish", h.AdminUnpublishTemplate)
+			r.Post("/{templateID}/cancel", h.AdminCancelTemplate)
+			r.Post("/{templateID}/retry", h.AdminRetryTemplate)
+		})
+
 		// Admin routes
 		r.Route("/admin", func(r chi.Router) {
 			r.Use(middleware.RequireRole(models.RoleAdmin))
