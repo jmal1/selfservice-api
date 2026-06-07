@@ -133,6 +133,9 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 			r.Post("/templates/{templateID}/access", h.AdminSetTemplateAccess)
 			r.Get("/templates/{templateID}/dependents", h.AdminListTemplateDependents)
 
+			// vCenter folder browser for template registration UI (cached 5 min).
+			r.Get("/vcenter/templates-folder", h.AdminListVCenterTemplatesFolder)
+
 			r.Get("/jobs", h.AdminListJobs)
 			r.Get("/audit", h.AdminListAuditLog)
 			r.Get("/audit/search", h.AdminSearchAuditLog)

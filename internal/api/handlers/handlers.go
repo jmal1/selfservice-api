@@ -24,11 +24,13 @@ import (
 
 // Handler holds shared dependencies for all API handlers.
 type Handler struct {
-	db             *database.Queries
-	events         *events.Client
-	vc             VCenterConsole
-	logger         *slog.Logger
-	allowedOrigins []string
+	db              *database.Queries
+	events          *events.Client
+	vc              VCenterConsole
+	vcFolders       VCenterFolderEnumerator
+	logger          *slog.Logger
+	allowedOrigins  []string
+	templatesFolder *TemplatesFolderHandler
 }
 
 // VCenterConsole is the interface for vCenter console operations needed by the API.
@@ -39,6 +41,49 @@ type VCenterConsole interface {
 // NewHandler creates a new Handler.
 func NewHandler(db *database.Queries, events *events.Client, vc VCenterConsole, logger *slog.Logger, allowedOrigins []string) *Handler {
 	return &Handler{db: db, events: events, vc: vc, logger: logger, allowedOrigins: allowedOrigins}
+}
+
+// WithVCenterFolders enables the admin folder-enumeration endpoint by wiring
+// a VCenterFolderEnumerator (typically *vcenter.Client) and the configured
+// inventory path of the Templates folder.
+func (h *Handler) WithVCenterFolders(vcf VCenterFolderEnumerator, templatesFolderPath string) *Handler {
+	h.vcFolders = vcf
+	h.templatesFolder = NewTemplatesFolderHandler(vcf, templatesFolderPath, func(ctx context.Context) ([]vcenterTemplateRow, error) {
+		ts, err := h.db.ListAllTemplates(ctx)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]vcenterTemplateRow, 0, len(ts))
+		for _, t := range ts {
+			out = append(out, vcenterTemplateRow{
+				ID:              t.ID.String(),
+				Name:            t.Name,
+				VCenterTemplate: t.VCenterTemplate,
+			})
+		}
+		return out, nil
+	})
+	return h
+}
+
+// AdminListVCenterTemplatesFolder returns enumerated VMs in the configured
+// templates folder plus per-VM Crucible registration status. Cache TTL is 5
+// minutes; pass ?refresh=true to bypass. Returns 503 if vCenter is not wired.
+func (h *Handler) AdminListVCenterTemplatesFolder(w http.ResponseWriter, r *http.Request) {
+	if h.templatesFolder == nil {
+		http.Error(w, "vCenter folder enumeration not configured", http.StatusServiceUnavailable)
+		return
+	}
+	h.templatesFolder.ServeHTTP(w, r)
+}
+
+// invalidateTemplatesFolderCache should be called by template
+// create/update/delete handlers so a newly-registered template appears in the
+// admin browser immediately on the next request.
+func (h *Handler) invalidateTemplatesFolderCache() {
+	if h.templatesFolder != nil {
+		h.templatesFolder.cache.Invalidate()
+	}
 }
 
 // --- Pod Handlers ---
@@ -955,6 +1000,7 @@ func (h *Handler) AdminCreateTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.invalidateTemplatesFolderCache()
 	respondJSON(w, http.StatusCreated, tmpl)
 }
 
@@ -1006,6 +1052,7 @@ func (h *Handler) AdminUpdateTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.invalidateTemplatesFolderCache()
 	respondJSON(w, http.StatusOK, tmpl)
 }
 
@@ -1023,6 +1070,7 @@ func (h *Handler) AdminDeleteTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.invalidateTemplatesFolderCache()
 	w.WriteHeader(http.StatusNoContent)
 }
 

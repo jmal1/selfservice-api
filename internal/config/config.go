@@ -66,7 +66,12 @@ type VCenterConfig struct {
 	Datacenter    string
 	Datastore     string
 	VMFolder      string
-	ResourcePools []string
+	// TemplatesFolder is the full inventory path to the vCenter folder housing
+	// golden-image VMs that admins can register as Crucible templates (e.g.,
+	// "/JMAL-Datacenter/vm/Templates"). Used by the admin folder-enumeration
+	// endpoint; not used by provisioning.
+	TemplatesFolder string
+	ResourcePools   []string
 	Hosts         []string
 	Insecure      bool
 }
@@ -119,8 +124,9 @@ func Load() (*Config, error) {
 			Password:      getEnv("VCENTER_PASSWORD", ""),
 			Datacenter:    getEnv("VCENTER_DATACENTER", "JMAL-Datacenter"),
 			Datastore:     getEnv("VCENTER_DATASTORE", "NAS-vmstore"),
-			VMFolder:      getEnv("VCENTER_VM_FOLDER", "Student-VMs"),
-			ResourcePools: splitEnv("VCENTER_RESOURCE_POOLS", "/JMAL-Datacenter/host/Intel-Cluster/Resources/Student-VMs,/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs"),
+			VMFolder:        getEnv("VCENTER_VM_FOLDER", "Student-VMs"),
+			TemplatesFolder: getEnv("VCENTER_TEMPLATES_FOLDER", "/JMAL-Datacenter/vm/Templates"),
+			ResourcePools:   splitEnv("VCENTER_RESOURCE_POOLS", "/JMAL-Datacenter/host/Intel-Cluster/Resources/Student-VMs,/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs"),
 			Hosts:         splitEnv("VCENTER_HOSTS", "esxi1.lab.jmal.io,esxi2.lab.jmal.io,nuc1.lab.jmal.io,nuc2.lab.jmal.io,nuc3.lab.jmal.io"),
 			Insecure:      getEnvBool("VCENTER_INSECURE", true),
 		},

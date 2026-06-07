@@ -92,6 +92,10 @@ func main() {
 
 	// Create handlers and router
 	handler := handlers.NewHandler(queries, natsClient, vcClient, logger, cfg.Server.AllowedOrigins)
+	if vc, ok := vcClient.(*vcenter.Client); ok && vc != nil && cfg.VCenter.TemplatesFolder != "" {
+		handler.WithVCenterFolders(vc, cfg.VCenter.TemplatesFolder)
+		logger.Info("vCenter folder enumeration enabled", "folder", cfg.VCenter.TemplatesFolder)
+	}
 	router := routes.Setup(handler, authProvider, queries, cfg.Server.AllowedOrigins)
 
 	// Start HTTP server
