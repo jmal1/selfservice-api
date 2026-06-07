@@ -55,7 +55,7 @@ vcenter:
   datacenter: JMAL-Datacenter
   datastore: NAS-vmstore
   vmFolder: Student-VMs
-  resourcePools: "AMD-Cluster/Resources/Student-VMs,Intel-Cluster/Resources/Student-VMs"
+  resourcePools: "/JMAL-Datacenter/host/Intel-Cluster/Resources/Student-VMs,/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs"
   hosts: "esxi1.lab.jmal.io,esxi2.lab.jmal.io,nuc1.lab.jmal.io,nuc2.lab.jmal.io,nuc3.lab.jmal.io"
   insecure: "true"
   # vCenter credentials health probe (OP-1). Set healthPushgatewayURL to the
