@@ -426,21 +426,38 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		stepName := fmt.Sprintf("vm_clone_%d", i)
 		p.publishProgress(job.ID, stepName, fmt.Sprintf("Cloning VM %s from %s", vmSpec.VMName, vmSpec.TemplateName))
 
-		// Generate credentials for cloud-init/cloudbase-init injection
-		password := ""
-		osType := vmSpec.OSType
-		if osType == "" {
-			// Look up OS type from template if not in payload
-			podVM, lookupErr := p.db.GetPodVM(ctx, vmSpec.PodVMID)
-			if lookupErr == nil {
-				tmpl, tmplErr := p.db.GetTemplateByID(ctx, podVM.TemplateID)
-				if tmplErr == nil {
-					osType = tmpl.OSType
-				}
+		// Load the template once so we can branch on kind + reuse default
+		// credentials for the no-customize / registered-existing paths.
+		var tmpl *models.Template
+		if podVM, lookupErr := p.db.GetPodVM(ctx, vmSpec.PodVMID); lookupErr == nil {
+			if t, tmplErr := p.db.GetTemplateByID(ctx, podVM.TemplateID); tmplErr == nil {
+				tmpl = t
 			}
 		}
-		if osType == "linux" || osType == "windows" {
-			password = generatePassword(12)
+
+		osType := vmSpec.OSType
+		if osType == "" && tmpl != nil {
+			osType = tmpl.OSType
+		}
+
+		kind := resolveTemplateKind(vmSpec.Kind)
+		if kind != vmSpec.Kind && vmSpec.Kind != "" {
+			p.logger.Warn("unknown template kind, defaulting to clone_with_customize",
+				"vm", vmSpec.VMName, "kind", vmSpec.Kind)
+		}
+
+		// Branch on kind:
+		//   * clone_with_customize  — generate a fresh password and inject
+		//     it via guestinfo. The clone path runs sysprep / cloud-init.
+		//   * clone_no_customize    — clone the source (linked, like today)
+		//     but skip credential injection. Use the template's static
+		//     default_username / default_password if present.
+		//   * registered_existing_vm — same code path as clone_no_customize;
+		//     the source VM is treated as the canonical golden image, and
+		//     CloneVM already does a linked clone off its current snapshot.
+		var generatedPassword string
+		if shouldGenerateGuestPassword(kind, osType) {
+			generatedPassword = generatePassword(12)
 		}
 
 		moref, err := p.vc.CloneVM(ctx, vcenter.CloneVMParams{
@@ -450,7 +467,7 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 			RAMmb:        vmSpec.RAMMB,
 			Network:      pgName,
 			OSType:       osType,
-			Password:     password,
+			Password:     generatedPassword,
 		})
 		if err != nil {
 			p.logger.Error("failed to clone VM", "vm", vmSpec.VMName, "error", err)
@@ -461,12 +478,10 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		// Update pod_vms record with vCenter details
 		_ = p.db.UpdatePodVM(ctx, vmSpec.PodVMID, moref, vmSpec.VMName, "cloned")
 
-		// Store generated credentials
-		username := "student"
-		if osType == "windows" {
-			username = "Student"
-		}
-		_ = p.db.UpdatePodVMCredentials(ctx, vmSpec.PodVMID, username, password)
+		// Resolve credentials to record on the pod_vms row. Pure helper —
+		// see kind_helpers.go for the policy + unit tests.
+		storedUsername, storedPassword := resolvePodVMCredentials(kind, osType, generatedPassword, tmpl)
+		_ = p.db.UpdatePodVMCredentials(ctx, vmSpec.PodVMID, storedUsername, storedPassword)
 
 		rb.RegisterUndo(stepName, func(ctx context.Context, data json.RawMessage) error {
 			var d struct{ Moref string }
