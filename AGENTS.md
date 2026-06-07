@@ -438,6 +438,29 @@ Whenever you generate a workflow or action, the instructor will likely paste it 
 6. **Timeouts are sane** — `timeout_seconds` should be 2-3× the slowest realistic action; default 60s for actions, 300s for workflows is usually right.
 7. **No leaked secrets** — never echo `$CRUCIBLE_TARGET_PASSWORD` or write it to a file outside `$CRUCIBLE_WORKDIR`.
 
+### 12.1 Admin script validator wrapper model (read before authoring action bodies)
+
+The Admin UI's script editor sends your action body to `POST /api/v1/admin/scripts/validate`, which **wraps your script** in a synthetic preamble before running `shellcheck`. This is why some patterns that would look like errors in a standalone script don't get flagged, and vice versa:
+
+| Pattern in your action body | Validator behaviour | Why |
+|---|---|---|
+| Top-level `local foo=bar` | **No SC2168.** Allowed. | The wrapper places your body inside a function shell (`_crucible_action_body() { … }`). |
+| `LAST_ERROR="msg"` / `LAST_STUDENT_MSG="…"` set but seemingly unused | **No SC2034.** Allowed. | The wrapper consumes these after your body returns. |
+| `$CTX_FOO` where `foo` was declared in **Input Context** on the action form | **No SC2154.** Allowed. | The wrapper emits `: "${CTX_FOO:=}"` for every declared input. |
+| `$CTX_TYPO` where `typo` was **not** declared | **SC2154 fires.** Real bug. | Surfaces forgotten/misspelled context refs. |
+| `$x` in `[ -f $x ]` (unquoted) | **SC2086 fires.** Real bug. | Word-splitting + globbing risk. |
+| Genuinely unused `local thisIsUnused=…` | **SC2034 fires.** Real bug. | We don't over-suppress. |
+| `if [ -f /x ]` *without* `then` | **Parse error.** Real bug. | Will also be caught by the client-side `sh-syntax` layer instantly. |
+| Body that looks like PowerShell (`$Var = …`, `Get-Service`, `param(…)`) | **Skipped, returns empty findings.** | Detected by shebang or heuristic; bash shellcheck would just produce noise. |
+
+**Practical takeaway for authoring:** declare every context input you read on the action form (Input Context tab), use the `LAST_*` exit vars for error reporting, and don't bother adding `# shellcheck disable=…` comments — the wrapper has already handled the false positives that are specific to Crucible's runtime, and anything that does fire is almost certainly a real bug worth fixing.
+
+The validator runs in two layers:
+- **Client-side (300 ms debounce):** `sh-syntax` WASM in the browser catches syntax-level errors instantly with zero server load.
+- **Server-side (2000 ms debounce + on Save):** real `shellcheck` runs in the API pod for the full SC**** rule library. Admin-only, 64 KB cap, 30 req/min rate limit, 3 s timeout.
+
+Source: [`internal/scriptvalidator/wrap.go`](internal/scriptvalidator/wrap.go), [`internal/scriptvalidator/detect.go`](internal/scriptvalidator/detect.go), [`internal/scriptvalidator/validator.go`](internal/scriptvalidator/validator.go).
+
 ---
 
 ## 13. When you should hand back to the human
