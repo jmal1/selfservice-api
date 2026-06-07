@@ -17,8 +17,11 @@ package vcenter
 //     transfer URL pipeline, so the upload step itself fails — we treat
 //     that as a fixture limitation and assert on the error string only).
 //
-// Marked t.Parallel() so they run alongside other vcenter tests without
-// serializing the whole package. Each test gets its own simulator instance.
+// NOT marked t.Parallel(): vcsim's simulator.LicenseManager.init()
+// touches a package-global slice without a mutex, and `go test -race`
+// (used in CI) flags two simultaneous Model.Create() calls as a data
+// race even when each test owns its own Model+Server. Running these
+// tests serially is cheap (~1s each) and avoids the race.
 
 import (
 	"context"
@@ -123,7 +126,6 @@ func firstVM(t *testing.T, ctx context.Context, vimc *vim25.Client) (*object.Vir
 }
 
 func TestRunScriptInGuest_VCsim_UnknownMoref(t *testing.T) {
-	t.Parallel()
 	withSimulator(t, func(ctx context.Context, c *Client, _ *vim25.Client) {
 		_, err := c.RunScriptInGuest(ctx, GuestExecRequest{
 			VMMoref:       "vm-does-not-exist-9999",
@@ -149,7 +151,6 @@ func TestRunScriptInGuest_VCsim_UnknownMoref(t *testing.T) {
 }
 
 func TestRunScriptInGuest_VCsim_PoweredOff(t *testing.T) {
-	t.Parallel()
 	withSimulator(t, func(ctx context.Context, c *Client, vimc *vim25.Client) {
 		vm, moref := firstVM(t, ctx, vimc)
 		// vcsim VMs start powered off; explicitly leave them that way.
@@ -188,7 +189,6 @@ func TestRunScriptInGuest_VCsim_PoweredOff(t *testing.T) {
 }
 
 func TestRunScriptInGuest_VCsim_PoweredOnNoTools(t *testing.T) {
-	t.Parallel()
 	withSimulator(t, func(ctx context.Context, c *Client, vimc *vim25.Client) {
 		vm, moref := firstVM(t, ctx, vimc)
 		if err := ensurePoweredOn(ctx, vm); err != nil {
