@@ -134,3 +134,18 @@ func (c *Client) SubscribeRaw(subject string, handler func(evt Event)) (*nats.Su
 		handler(evt)
 	})
 }
+
+// SubscribeRawWithMsg is a variant of SubscribeRaw that also surfaces the
+// raw *nats.Msg to the handler — useful when the consumer needs subject,
+// reply, or headers in addition to the decoded Event (e.g. the run-progress
+// WS handler routes by subject suffix).
+func (c *Client) SubscribeRawWithMsg(subject string, handler func(evt Event, msg *nats.Msg)) (*nats.Subscription, error) {
+	return c.conn.Subscribe(subject, func(msg *nats.Msg) {
+		var evt Event
+		if err := json.Unmarshal(msg.Data, &evt); err != nil {
+			c.logger.Error("failed to unmarshal event", "subject", subject, "error", err)
+			return
+		}
+		handler(evt, msg)
+	})
+}

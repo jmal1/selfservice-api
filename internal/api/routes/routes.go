@@ -38,6 +38,13 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 		r.Get("/ws", h.VMConsoleWS)
 	})
 
+	// Run progress WebSocket — streams live workflow_start/action_complete/
+	// workflow_complete events for a given run. Replaces 2s polling.
+	r.Route("/api/v1/runs/{runID}", func(r chi.Router) {
+		r.Use(middleware.Auth(authProvider))
+		r.Get("/progress/ws", h.RunProgressWS)
+	})
+
 	// Non-WebSocket routes get Logger + Compress
 	r.Group(func(r chi.Router) {
 		r.Use(chimiddleware.Logger)
