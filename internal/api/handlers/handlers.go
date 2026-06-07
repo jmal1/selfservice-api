@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -1057,6 +1058,10 @@ func (h *Handler) AdminUpdateTemplate(w http.ResponseWriter, r *http.Request) {
 
 	tmpl, err := h.db.UpdateTemplate(r.Context(), templateID, req)
 	if err != nil {
+		if errors.Is(err, database.ErrTemplateStale) {
+			http.Error(w, "template was modified by another user; refresh and try again", http.StatusConflict)
+			return
+		}
 		h.logger.Error("update template failed", "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return

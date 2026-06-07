@@ -41,6 +41,7 @@ type Template struct {
 	AssignIP        bool      `json:"assign_ip" db:"assign_ip"`
 	IsActive        bool      `json:"is_active" db:"is_active"`
 	CreatedAt       time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at" db:"updated_at"`
 }
 
 // Template kind constants — keep in sync with the CHECK constraint in

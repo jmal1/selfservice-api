@@ -28,6 +28,13 @@ func (q *Queries) Pool() *pgxpool.Pool {
 	return q.pool
 }
 
+// ErrTemplateStale is returned by UpdateTemplate when the caller passed
+// an ExpectedUpdatedAt that no longer matches the current row, meaning
+// another admin has saved an edit since the caller's last read. The
+// handler should translate this into HTTP 409 Conflict so the UI can
+// prompt the operator to re-load and reconcile.
+var ErrTemplateStale = errors.New("template was modified by another user")
+
 // --- Users ---
 
 // UpsertUser creates or updates a user from OIDC claims.
@@ -155,14 +162,14 @@ func (q *Queries) CreateTemplate(ctx context.Context, req models.CreateTemplateR
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		RETURNING id, name, vcenter_template, os_type, default_vcpus, default_ram_mb,
 		          default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''),
-		          default_username, default_password, kind, assign_ip, is_active, created_at
+		          default_username, default_password, kind, assign_ip, is_active, created_at, updated_at
 	`, req.Name, req.VCenterTemplate, req.OSType, req.DefaultVCPUs, req.DefaultRAMMB,
 		req.DefaultDiskGB, req.MinVCPUs, req.MinRAMMB, req.Description, req.IconURL,
 		req.DefaultUsername, req.DefaultPassword, kind, assignIP,
 	).Scan(
 		&t.ID, &t.Name, &t.VCenterTemplate, &t.OSType, &t.DefaultVCPUs, &t.DefaultRAMMB,
 		&t.DefaultDiskGB, &t.MinVCPUs, &t.MinRAMMB, &t.Description, &t.IconURL,
-		&t.DefaultUsername, &t.DefaultPassword, &t.Kind, &t.AssignIP, &t.IsActive, &t.CreatedAt,
+		&t.DefaultUsername, &t.DefaultPassword, &t.Kind, &t.AssignIP, &t.IsActive, &t.CreatedAt, &t.UpdatedAt,
 	)
 	return &t, err
 }
@@ -173,7 +180,7 @@ func (q *Queries) ListTemplatesForUser(ctx context.Context, userID uuid.UUID, ro
 		SELECT DISTINCT t.id, t.name, t.vcenter_template, t.os_type, t.default_vcpus,
 		       t.default_ram_mb, t.default_disk_gb, t.min_vcpus, t.min_ram_mb,
 		       COALESCE(t.description, ''), COALESCE(t.icon_url, ''),
-		       t.default_username, t.default_password, t.kind, t.assign_ip, t.is_active, t.created_at
+		       t.default_username, t.default_password, t.kind, t.assign_ip, t.is_active, t.created_at, t.updated_at
 		FROM templates t
 		LEFT JOIN template_access ta ON t.id = ta.template_id
 		WHERE t.is_active = true
@@ -193,7 +200,7 @@ func (q *Queries) ListTemplatesForUser(ctx context.Context, userID uuid.UUID, ro
 			&t.ID, &t.Name, &t.VCenterTemplate, &t.OSType, &t.DefaultVCPUs,
 			&t.DefaultRAMMB, &t.DefaultDiskGB, &t.MinVCPUs, &t.MinRAMMB,
 			&t.Description, &t.IconURL, &t.DefaultUsername, &t.DefaultPassword,
-			&t.Kind, &t.AssignIP, &t.IsActive, &t.CreatedAt,
+			&t.Kind, &t.AssignIP, &t.IsActive, &t.CreatedAt, &t.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -207,7 +214,7 @@ func (q *Queries) ListAllTemplates(ctx context.Context) ([]models.Template, erro
 	rows, err := q.pool.Query(ctx, `
 		SELECT id, name, vcenter_template, os_type, default_vcpus, default_ram_mb,
 		       default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''),
-		       default_username, default_password, kind, assign_ip, is_active, created_at
+		       default_username, default_password, kind, assign_ip, is_active, created_at, updated_at
 		FROM templates ORDER BY name
 	`)
 	if err != nil {
@@ -222,7 +229,7 @@ func (q *Queries) ListAllTemplates(ctx context.Context) ([]models.Template, erro
 			&t.ID, &t.Name, &t.VCenterTemplate, &t.OSType, &t.DefaultVCPUs,
 			&t.DefaultRAMMB, &t.DefaultDiskGB, &t.MinVCPUs, &t.MinRAMMB,
 			&t.Description, &t.IconURL, &t.DefaultUsername, &t.DefaultPassword,
-			&t.Kind, &t.AssignIP, &t.IsActive, &t.CreatedAt,
+			&t.Kind, &t.AssignIP, &t.IsActive, &t.CreatedAt, &t.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -259,6 +266,11 @@ func (q *Queries) SetTemplateAccess(ctx context.Context, templateID uuid.UUID, r
 
 // UpdateTemplate partially updates a template by ID.
 func (q *Queries) UpdateTemplate(ctx context.Context, id uuid.UUID, req models.UpdateTemplateRequest) (*models.Template, error) {
+	// Optimistic concurrency: if the caller provided ExpectedUpdatedAt,
+	// gate the UPDATE on the row still being at that version. A
+	// mismatch returns 0 rows from the UPDATE, which we differentiate
+	// from "row does not exist" by a follow-up existence probe so the
+	// handler can return 409 (stale) vs 404 (gone).
 	var t models.Template
 	err := q.pool.QueryRow(ctx, `
 		UPDATE templates SET
@@ -274,18 +286,34 @@ func (q *Queries) UpdateTemplate(ctx context.Context, id uuid.UUID, req models.U
 			kind = COALESCE($11, kind),
 			assign_ip = COALESCE($12, assign_ip)
 		WHERE id = $1
+		  AND ($13::timestamptz IS NULL OR updated_at = $13)
 		RETURNING id, name, vcenter_template, os_type, default_vcpus, default_ram_mb,
 		          default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''),
-		          default_username, default_password, kind, assign_ip, is_active, created_at
+		          default_username, default_password, kind, assign_ip, is_active, created_at, updated_at
 	`, id, req.Name, req.Description, req.IconURL, req.DefaultVCPUs, req.DefaultRAMMB, req.DefaultDiskGB, req.IsActive,
-		req.DefaultUsername, req.DefaultPassword, req.Kind, req.AssignIP,
+		req.DefaultUsername, req.DefaultPassword, req.Kind, req.AssignIP, req.ExpectedUpdatedAt,
 	).Scan(
 		&t.ID, &t.Name, &t.VCenterTemplate, &t.OSType, &t.DefaultVCPUs, &t.DefaultRAMMB,
 		&t.DefaultDiskGB, &t.MinVCPUs, &t.MinRAMMB, &t.Description, &t.IconURL,
-		&t.DefaultUsername, &t.DefaultPassword, &t.Kind, &t.AssignIP, &t.IsActive, &t.CreatedAt,
+		&t.DefaultUsername, &t.DefaultPassword, &t.Kind, &t.AssignIP, &t.IsActive, &t.CreatedAt, &t.UpdatedAt,
 	)
 	if err == pgx.ErrNoRows {
-		return nil, nil
+		// Distinguish missing-row from version-mismatch. If the caller
+		// did not supply ExpectedUpdatedAt at all the only reason
+		// UPDATE returned 0 rows is that the row truly doesn't exist.
+		if req.ExpectedUpdatedAt == nil {
+			return nil, nil
+		}
+		var exists bool
+		if err2 := q.pool.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM templates WHERE id = $1)`, id,
+		).Scan(&exists); err2 != nil {
+			return nil, err2
+		}
+		if !exists {
+			return nil, nil
+		}
+		return nil, ErrTemplateStale
 	}
 	return &t, err
 }
@@ -918,12 +946,12 @@ func (q *Queries) GetTemplateByID(ctx context.Context, id uuid.UUID) (*models.Te
 	err := q.pool.QueryRow(ctx, `
 		SELECT id, name, vcenter_template, os_type, default_vcpus, default_ram_mb,
 		       default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''),
-		       default_username, default_password, kind, assign_ip, is_active, created_at
+		       default_username, default_password, kind, assign_ip, is_active, created_at, updated_at
 		FROM templates WHERE id = $1
 	`, id).Scan(
 		&t.ID, &t.Name, &t.VCenterTemplate, &t.OSType, &t.DefaultVCPUs, &t.DefaultRAMMB,
 		&t.DefaultDiskGB, &t.MinVCPUs, &t.MinRAMMB, &t.Description, &t.IconURL,
-		&t.DefaultUsername, &t.DefaultPassword, &t.Kind, &t.AssignIP, &t.IsActive, &t.CreatedAt,
+		&t.DefaultUsername, &t.DefaultPassword, &t.Kind, &t.AssignIP, &t.IsActive, &t.CreatedAt, &t.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err

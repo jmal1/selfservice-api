@@ -1,6 +1,10 @@
 package models
 
-import "github.com/google/uuid"
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
 
 // CreatePodRequest is the API request to create a new pod.
 type CreatePodRequest struct {
@@ -63,6 +67,14 @@ type UpdateTemplateRequest struct {
 	DefaultPassword *string `json:"default_password,omitempty"`
 	Kind            *string `json:"kind,omitempty" validate:"omitempty,oneof=clone_with_customize clone_no_customize registered_existing_vm"`
 	AssignIP        *bool   `json:"assign_ip,omitempty"`
+	// ExpectedUpdatedAt enables optimistic concurrency control. When set
+	// the database UPDATE will only succeed if the row's current
+	// updated_at matches; otherwise UpdateTemplate returns
+	// ErrTemplateStale so the handler can return HTTP 409. Clients
+	// should populate this from the value they received on the most
+	// recent GET so concurrent admin edits cannot silently overwrite
+	// each other.
+	ExpectedUpdatedAt *time.Time `json:"expected_updated_at,omitempty"`
 }
 
 // UpdateQuotaRequest is the admin API request to update user quotas.
