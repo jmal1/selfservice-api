@@ -90,10 +90,20 @@ var ErrScriptTooLarge = errors.New("script too large")
 
 // Validate runs the linter for the given language against script and returns
 // a normalized Result. Currently supports "bash" only.
+//
+// Carriage returns are stripped before linting so scripts that were authored
+// or stored with CRLF line endings don't produce SC1017 noise on every line.
 func (v *Validator) Validate(ctx context.Context, language, script string) (*Result, error) {
 	if maxBytes := v.maxScriptKB * 1024; len(script) > maxBytes {
 		return nil, fmt.Errorf("%w: script is %d bytes, max %d", ErrScriptTooLarge, len(script), maxBytes)
 	}
+
+	// Normalize CRLF/CR → LF. shellcheck flags every \r as SC1017 ("Literal
+	// carriage return"), which floods the editor with noise even when the
+	// script is otherwise clean. Scripts run on linux runners anyway, so
+	// stripping CRs matches actual runtime behaviour.
+	script = strings.ReplaceAll(script, "\r\n", "\n")
+	script = strings.ReplaceAll(script, "\r", "\n")
 
 	switch strings.ToLower(language) {
 	case "bash", "sh", "shell":
@@ -102,6 +112,19 @@ func (v *Validator) Validate(ctx context.Context, language, script string) (*Res
 		return nil, fmt.Errorf("%w: %q (supported: bash)", ErrUnsupportedLanguage, language)
 	}
 }
+
+// excludedShellcheckCodes are rules that produce false positives for Crucible
+// action / workflow scripts and so are filtered out at lint time.
+//
+//	SC1090, SC1091  Scripts always begin with `source /opt/crucible/lib/actions.sh`
+//	                which the validator cannot resolve from stdin.
+//	SC1017          Carriage-return noise (we already strip CRs in Validate,
+//	                but exclude defensively in case any survive).
+//	SC2168          Action bodies are commonly executed as the body of a
+//	                wrapper function (via `run_action`) or sourced into a
+//	                larger script, so top-level `local x=$(ctx_get …)` is
+//	                idiomatic and not a real bug.
+var excludedShellcheckCodes = []string{"SC1017", "SC1090", "SC1091", "SC2168"}
 
 // runShellcheck invokes shellcheck with JSON output, parses it, and normalizes
 // the findings into our Result schema.
@@ -114,7 +137,8 @@ func (v *Validator) runShellcheck(ctx context.Context, script string) (*Result, 
 		"--shell=bash",
 		"--format=json1",
 		"--severity=style", // surface everything; the UI filters
-		"-",                // read script from stdin
+		"--exclude=" + strings.Join(excludedShellcheckCodes, ","),
+		"-", // read script from stdin
 	}, script)
 	duration := time.Since(start)
 

@@ -194,3 +194,76 @@ func TestParseShellcheckJSON_UnknownSeverityFallsBackToInfo(t *testing.T) {
 		t.Errorf("expected info fallback, got %+v", got)
 	}
 }
+
+// captureStdinRunner records the stdin shellcheck receives so we can assert
+// the validator stripped CRs before invoking the linter.
+func captureStdinRunner(captured *string) commandRunner {
+	return func(ctx context.Context, name string, args []string, stdin string) ([]byte, []byte, int, error) {
+		*captured = stdin
+		return []byte(`{"comments":[]}`), nil, 0, nil
+	}
+}
+
+func TestValidate_StripsCarriageReturns(t *testing.T) {
+	var stdin string
+	v := NewValidator().WithRunner(captureStdinRunner(&stdin))
+
+	in := "echo hi\r\nls -la\r\n"
+	if _, err := v.Validate(context.Background(), "bash", in); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.ContainsRune(stdin, '\r') {
+		t.Errorf("validator forwarded \\r to shellcheck: %q", stdin)
+	}
+	if stdin != "echo hi\nls -la\n" {
+		t.Errorf("unexpected stdin: %q", stdin)
+	}
+}
+
+func TestValidate_StripsBareCarriageReturns(t *testing.T) {
+	var stdin string
+	v := NewValidator().WithRunner(captureStdinRunner(&stdin))
+
+	if _, err := v.Validate(context.Background(), "bash", "a\rb\rc"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if stdin != "a\nb\nc" {
+		t.Errorf("bare \\r not normalized: %q", stdin)
+	}
+}
+
+// captureArgsRunner records the argv shellcheck was invoked with so we can
+// assert the exclusion list is wired through.
+func captureArgsRunner(captured *[]string) commandRunner {
+	return func(ctx context.Context, name string, args []string, stdin string) ([]byte, []byte, int, error) {
+		*captured = args
+		return []byte(`{"comments":[]}`), nil, 0, nil
+	}
+}
+
+func TestValidate_PassesExclusionList(t *testing.T) {
+	var args []string
+	v := NewValidator().WithRunner(captureArgsRunner(&args))
+
+	if _, err := v.Validate(context.Background(), "bash", "echo hi"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var excludeArg string
+	for _, a := range args {
+		if strings.HasPrefix(a, "--exclude=") {
+			excludeArg = a
+			break
+		}
+	}
+	if excludeArg == "" {
+		t.Fatalf("validator did not pass --exclude flag; args=%v", args)
+	}
+	// Each rule from the package-level list must be present so the docstring
+	// stays in sync with the actual lint config.
+	for _, code := range excludedShellcheckCodes {
+		if !strings.Contains(excludeArg, code) {
+			t.Errorf("exclude flag %q missing code %s", excludeArg, code)
+		}
+	}
+}

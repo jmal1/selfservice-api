@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -10,6 +11,41 @@ import (
 	"github.com/jmal1/selfservice-api/internal/middleware"
 	"github.com/jmal1/selfservice-api/internal/models"
 )
+
+// normalizeScriptLineEndings converts CRLF and bare CR to LF so scripts
+// authored on Windows don't ship to the linux runner with literal carriage
+// returns (which break shebangs, conditionals, and trigger shellcheck SC1017
+// on every line).
+func normalizeScriptLineEndings(s string) string {
+	if s == "" {
+		return s
+	}
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	return s
+}
+
+// normalizeScriptPtr applies normalizeScriptLineEndings through a *string,
+// leaving nil pointers untouched. Used for PATCH-style request bodies where
+// "field absent" and "field empty" mean different things.
+func normalizeScriptPtr(p *string) *string {
+	if p == nil {
+		return nil
+	}
+	v := normalizeScriptLineEndings(*p)
+	return &v
+}
+
+// normalizeActionScripts applies normalizeScriptLineEndings to every Script
+// field in a slice of actions in place, so workflow create/update payloads
+// can't introduce CRLF endings through their nested action list. Returns the
+// same slice for chaining at the call site.
+func normalizeActionScripts(actions []models.Action) []models.Action {
+	for i := range actions {
+		actions[i].Script = normalizeScriptLineEndings(actions[i].Script)
+	}
+	return actions
+}
 
 // --- Admin Workflow Routes ---
 
@@ -80,14 +116,14 @@ func (h *Handler) AdminCreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		Description:    req.Description,
 		Category:       req.Category,
 		ExecutionMode:  req.ExecutionMode,
-		Script:         req.Script,
-		SetupScript:    req.SetupScript,
+		Script:         normalizeScriptLineEndings(req.Script),
+		SetupScript:    normalizeScriptPtr(req.SetupScript),
 		TimeoutSeconds: req.TimeoutSeconds,
 		CreationMode:   req.CreationMode,
 		Status:         models.WorkflowStatusDraft,
 		CreatedBy:      userID,
 		IsActive:       true,
-		Actions:        req.Actions,
+		Actions:        normalizeActionScripts(req.Actions),
 	}
 
 	if err := h.db.CreateWorkflow(r.Context(), wf); err != nil {
@@ -123,7 +159,8 @@ func (h *Handler) AdminUpdateWorkflow(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.db.UpdateWorkflow(r.Context(), id, req.Name, req.Description, req.Category,
-		req.Script, req.SetupScript, req.TimeoutSeconds, req.CreationMode, req.Actions); err != nil {
+		normalizeScriptPtr(req.Script), normalizeScriptPtr(req.SetupScript),
+		req.TimeoutSeconds, req.CreationMode, normalizeActionScripts(req.Actions)); err != nil {
 		h.logger.Error("failed to update workflow", "error", err)
 		http.Error(w, "failed to update workflow", http.StatusInternalServerError)
 		return
@@ -229,6 +266,9 @@ func (h *Handler) AdminImportWorkflows(w http.ResponseWriter, r *http.Request) {
 		workflows[i].CreatedBy = userID
 		workflows[i].Status = models.WorkflowStatusDraft
 		workflows[i].IsActive = true
+		workflows[i].Script = normalizeScriptLineEndings(workflows[i].Script)
+		workflows[i].SetupScript = normalizeScriptPtr(workflows[i].SetupScript)
+		workflows[i].Actions = normalizeActionScripts(workflows[i].Actions)
 		if err := h.db.CreateWorkflow(r.Context(), &workflows[i]); err != nil {
 			skipped++
 			continue
@@ -331,7 +371,7 @@ func (h *Handler) AdminCreateAction(w http.ResponseWriter, r *http.Request) {
 		ActionType:         req.ActionType,
 		ActionCategory:     req.ActionCategory,
 		Params:             req.Params,
-		Script:             req.Script,
+		Script:             normalizeScriptLineEndings(req.Script),
 		InputContext:       req.InputContext,
 		OutputContext:      req.OutputContext,
 		TimeoutSeconds:     req.TimeoutSeconds,
@@ -386,7 +426,7 @@ func (h *Handler) AdminUpdateAction(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.db.UpdateLibraryAction(r.Context(), id, req.Name, req.Slug, req.Description,
-		req.ActionType, req.ActionCategory, paramsStr, req.Script,
+		req.ActionType, req.ActionCategory, paramsStr, normalizeScriptPtr(req.Script),
 		req.InputContext, req.OutputContext, req.TimeoutSeconds, req.StudentFailHint,
 		req.Points, req.Penalty, req.SupportedPlatforms); err != nil {
 		h.logger.Error("failed to update action", "error", err)
