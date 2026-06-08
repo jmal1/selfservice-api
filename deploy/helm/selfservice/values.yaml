@@ -123,6 +123,17 @@ synthetic:
     limits:
       cpu: 200m
       memory: 128Mi
+  # Optional pod_lifecycle check (creates+destroys a real pod every cycle).
+  # Disabled by default; enable only after the named template exists.
+  lifecycle:
+    enabled: false
+    template: "synthetic-noop"
+    readyTimeout: "8m"
+    destroyTimeout: "90s"
+    # activeDeadlineSeconds for the CronJob pod when lifecycle is enabled.
+    # Must exceed readyTimeout + destroyTimeout + per-check overhead. 900s
+    # (15 min) gives ~3 min headroom on top of the default 11m envelope.
+    activeDeadlineSeconds: 900
 
 # Vault sidecar annotations (disabled for now)
 vault:

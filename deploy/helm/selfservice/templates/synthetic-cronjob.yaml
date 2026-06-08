@@ -16,7 +16,7 @@ spec:
   jobTemplate:
     spec:
       backoffLimit: 0
-      activeDeadlineSeconds: 300
+      activeDeadlineSeconds: {{ if .Values.synthetic.lifecycle.enabled }}{{ .Values.synthetic.lifecycle.activeDeadlineSeconds | default 900 }}{{ else }}300{{ end }}
       ttlSecondsAfterFinished: 1800
       template:
         metadata:
@@ -58,6 +58,16 @@ spec:
                     secretKeyRef:
                       name: {{ .Values.secrets.jwt }}
                       key: jwt-secret
+                {{- if .Values.synthetic.lifecycle.enabled }}
+                - name: SYNTHETIC_LIFECYCLE_ENABLED
+                  value: "true"
+                - name: SYNTHETIC_LIFECYCLE_TEMPLATE
+                  value: {{ .Values.synthetic.lifecycle.template | quote }}
+                - name: SYNTHETIC_LIFECYCLE_READY_TIMEOUT
+                  value: {{ .Values.synthetic.lifecycle.readyTimeout | quote }}
+                - name: SYNTHETIC_LIFECYCLE_DESTROY_TIMEOUT
+                  value: {{ .Values.synthetic.lifecycle.destroyTimeout | quote }}
+                {{- end }}
               resources:
                 {{- toYaml .Values.synthetic.resources | nindent 16 }}
               securityContext:

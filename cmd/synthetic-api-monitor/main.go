@@ -21,9 +21,11 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -45,6 +47,21 @@ const (
 	envLayer         = "SYNTHETIC_LAYER"           // grouping label `layer`, default api
 	envLoopInterval  = "SYNTHETIC_LOOP_INTERVAL"   // optional duration; if set, runs forever
 	envCheckTimeout  = "SYNTHETIC_CHECK_TIMEOUT"   // optional duration, default 30s
+
+	// envLifecycleEnabled enables the (expensive) pod_lifecycle check that
+	// creates + destroys a real pod. OFF by default so the binary is safe to
+	// roll out before SYNTHETIC_LIFECYCLE_TEMPLATE points at a valid row.
+	envLifecycleEnabled = "SYNTHETIC_LIFECYCLE_ENABLED"
+	// envLifecycleTemplate is the templates.name to clone (NOT the
+	// vcenter_template). The synthetic-noop template (see plan §Phase 2) is
+	// the intended value in production.
+	envLifecycleTemplate = "SYNTHETIC_LIFECYCLE_TEMPLATE"
+	// envLifecycleReadyTimeout overrides the default 8m timeout for waiting
+	// on PodStatusActive. Increase if vCenter is slow; decrease for tests.
+	envLifecycleReadyTimeout = "SYNTHETIC_LIFECYCLE_READY_TIMEOUT"
+	// envLifecycleDestroyTimeout overrides the default 90s timeout for
+	// waiting on PodStatusDestroyed.
+	envLifecycleDestroyTimeout = "SYNTHETIC_LIFECYCLE_DESTROY_TIMEOUT"
 )
 
 func main() {
@@ -92,8 +109,50 @@ func run(logger *slog.Logger) error {
 	pg := synthetic.NewPushgateway(pushgatewayURL, job, map[string]string{
 		"layer": layer,
 	})
-	runner := synthetic.NewRunner(client, pg, checks.All(), logger)
-	runner.CheckTimeout = checkTimeout
+
+	// Build the active check list. The expensive pod_lifecycle check is
+	// gated by SYNTHETIC_LIFECYCLE_ENABLED so the binary can be rolled out
+	// before the synthetic-noop template exists.
+	activeChecks := checks.All()
+	if envBool(envLifecycleEnabled) {
+		tmpl := os.Getenv(envLifecycleTemplate)
+		if tmpl == "" {
+			return fmt.Errorf("%s=true but %s is empty", envLifecycleEnabled, envLifecycleTemplate)
+		}
+		cfg := checks.DefaultPodLifecycleConfig(tmpl)
+		if v := os.Getenv(envLifecycleReadyTimeout); v != "" {
+			d, err := time.ParseDuration(v)
+			if err != nil {
+				return fmt.Errorf("invalid %s=%q: %w", envLifecycleReadyTimeout, v, err)
+			}
+			cfg.ReadyTimeout = d
+		}
+		if v := os.Getenv(envLifecycleDestroyTimeout); v != "" {
+			d, err := time.ParseDuration(v)
+			if err != nil {
+				return fmt.Errorf("invalid %s=%q: %w", envLifecycleDestroyTimeout, v, err)
+			}
+			cfg.DestroyTimeout = d
+		}
+		logger.Info("registering pod_lifecycle check",
+			"template", tmpl,
+			"ready_timeout", cfg.ReadyTimeout,
+			"destroy_timeout", cfg.DestroyTimeout,
+		)
+		activeChecks = append(activeChecks, checks.PodLifecycle(cfg))
+	}
+
+	runner := synthetic.NewRunner(client, pg, activeChecks, logger)
+	// pod_lifecycle needs its own timeout budget — it polls for minutes.
+	// Use the larger of (configured CheckTimeout) or (ready + destroy + 60s).
+	runner.CheckTimeout = lifecycleSafeTimeout(checkTimeout, activeChecks)
+
+	// Phase 4: probe /auth/me once at startup so a stale synthetic UUID
+	// (i.e. the secret's user-id no longer matches a row in users) surfaces
+	// as a single clear warning instead of cascading 404s. Other checks
+	// continue regardless so a temporary DB blip on this one probe does not
+	// suppress the rest of the run.
+	probeSyntheticUser(client, logger)
 
 	// Handle SIGTERM cleanly so a CronJob delete doesn't drop in-flight pushes.
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -151,6 +210,64 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// envBool returns true for "1", "true", "yes" (case-insensitive).
+func envBool(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// lifecycleSafeTimeout returns a CheckTimeout that fits the most expensive
+// registered check. pod_lifecycle can legitimately run for ~10 minutes; the
+// per-check timeout MUST exceed its sum of ready + destroy budgets or the
+// check will always fail mid-run.
+func lifecycleSafeTimeout(base time.Duration, all []synthetic.Check) time.Duration {
+	const lifecycleName = "pod_lifecycle"
+	// 11 minutes is the worst-case envelope for the default config
+	// (8m ready + 90s destroy + ~90s of pre-clean + HTTP overhead).
+	const lifecycleEnvelope = 11 * time.Minute
+	for _, c := range all {
+		if c.Name() == lifecycleName && base < lifecycleEnvelope {
+			return lifecycleEnvelope
+		}
+	}
+	return base
+}
+
+// probeSyntheticUser hits /auth/me once at startup. A 404 means the
+// SYNTHETIC_USER_ID secret no longer matches a row in users (most commonly
+// because someone re-created the synthetic user via the UI or OIDC). Logging
+// it as a structured warning with a runbook URL is the simplest defensive
+// fix; the AuthMe check will still record its own failure metric.
+func probeSyntheticUser(client *synthetic.Client, logger *slog.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := client.Do(ctx, http.MethodGet, "/auth/me", nil)
+	if err != nil {
+		logger.Warn("startup auth probe failed",
+			"error", err,
+			"note", "monitor will continue; AuthMe check will report cleanly",
+		)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		logger.Warn("synthetic user secret out of sync",
+			"status", 404,
+			"hint", "SYNTHETIC_USER_ID no longer matches a row in users; rotate the secret to current UUID",
+			"runbook", "https://github.com/jmal1/Homelab/blob/master/future/Synthetic-Monitoring.md#synthetic-user-secret-out-of-sync",
+		)
+		return
+	}
+	if resp.StatusCode != http.StatusOK {
+		logger.Warn("startup auth probe unexpected status",
+			"status", resp.StatusCode,
+		)
+	}
 }
 
 // (Used by tests of binary-level helpers.)
