@@ -1,4 +1,4 @@
-.PHONY: build test test-race lint fmt vet tidy clean dev-up dev-down dev-logs help
+.PHONY: build test test-race lint fmt vet tidy clean dev-up dev-down dev-logs help wiki-bundle verify-wiki
 
 GO            ?= go
 GOFLAGS       ?=
@@ -6,6 +6,15 @@ BUILD_FLAGS   ?= -trimpath
 BIN_DIR       ?= bin
 CMDS          := api-gateway provision-worker crucible-engine crucible-runner synthetic-api-monitor
 COMPOSE       ?= docker compose -f docker-compose.dev.yaml
+
+# Seed list for cmd/wiki-bundler. Adding a new top-level instructor doc
+# is a two-step change: drop the .md in the repo, add it here, run
+# `make wiki-bundle`. The bundler will then walk its links recursively.
+WIKI_SEEDS    := \
+	AGENTS.md \
+	docs/ai-prompts/build-workflow.md \
+	docs/ai/build-workflow-prompt.md
+WIKI_OUT      := internal/docs/_bundle
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*##"; printf "Usage:\n  make \033[36m<target>\033[0m\n\nTargets:\n"} /^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
@@ -50,4 +59,20 @@ dev-logs: ## Tail logs from the local stack
 
 clean: ## Remove build artifacts
 	rm -rf $(BIN_DIR)
+
+wiki-bundle: ## Build the instructor wiki bundle (run after editing seeds)
+	@$(GO) run ./cmd/wiki-bundler \
+		-repo-root . \
+		-out $(WIKI_OUT) \
+		$(addprefix -seed ,$(WIKI_SEEDS))
+
+verify-wiki: ## Fail if wiki bundle is out of date (CI guard)
+	@tmp=$$(mktemp -d) && \
+		$(GO) run ./cmd/wiki-bundler -repo-root . -out $$tmp $(addprefix -seed ,$(WIKI_SEEDS)) && \
+		diff -r $$tmp $(WIKI_OUT) > /dev/null 2>&1 || { \
+			echo "FAIL: $(WIKI_OUT) is stale. Run 'make wiki-bundle' and commit."; \
+			rm -rf $$tmp; exit 1; \
+		}; \
+		rm -rf $$tmp; \
+		echo "OK: wiki bundle is up to date"
 

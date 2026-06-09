@@ -148,47 +148,42 @@ func (c *Client) cloneTemplateSourceVMInner(ctx context.Context, params Template
 	folderRef := folder.Reference()
 	hasSnapshot := sourceProps.Snapshot != nil && sourceProps.Snapshot.CurrentSnapshot != nil
 	isVCenterTemplate := sourceProps.Config != nil && sourceProps.Config.Template
-	c.logger.Info("template source clone disk strategy",
+	c.logger.Info("template source clone strategy",
 		"source", params.SourceMoref,
 		"has_snapshot", hasSnapshot,
 		"is_template", isVCenterTemplate)
+	// CloneSpec intentionally minimal: leave both `Snapshot` and
+	// `DiskMoveType` unset. This matches what `govc vm.clone` does by
+	// default and what the vCenter UI does when you right-click
+	// "Clone to Virtual Machine" — vCenter copies the full disk chain
+	// (including any snapshot deltas) into an independent VM at the
+	// target datastore, with no source-side consolidation required and
+	// no dependency on the source snapshot's child-clone count.
+	//
+	// History (this code has been wrong three times — keep the comment):
+	//   * Round 2 set DiskMoveType=MoveAllDiskBackingsAndConsolidate to
+	//     "fix" a misdiagnosed "virtual disk is either corrupted or not
+	//     a supported format" error. It actually masked a different
+	//     bug and introduced its own failures.
+	//   * Round 6 made the DiskMoveType conditional on hasSnapshot, on
+	//     the (also wrong) theory that consolidation was required for
+	//     snapshot-bearing sources.
+	//   * Round 8 dropped DiskMoveType but set Snapshot=CurrentSnapshot,
+	//     which silently turns the clone into a linked-clone-style
+	//     "moveChildMostDiskBacking" operation that can't produce an
+	//     independent full copy and fails in ~300ms.
+	//
+	// `govc vm.clone` against student-windows-11 (a regular VM with a
+	// 3-deep snapshot chain and active linked-clone children) succeeds
+	// with neither flag set, so the minimal spec is the right call.
 	cloneSpec := types.VirtualMachineCloneSpec{
 		Location: types.VirtualMachineRelocateSpec{
 			Datastore: &dsRef,
 			Folder:    &folderRef,
 			Pool:      &poolRef,
-			// DiskMoveType left empty (= vCenter default "moveAllDiskBackings"
-			// when Snapshot is set, or full deep copy otherwise). See the
-			// long comment in cloneSpec.Snapshot setter below for why this
-			// is the safe choice for snapshot-bearing sources.
 		},
 		PowerOn:  false, // we power on after hardware + NIC are configured
 		Template: false, // keep as regular VM so it can be edited
-	}
-	// If the source carries a snapshot (Crucible templates auto-get a
-	// `linked-clone-base` snapshot the first time they're used to spawn a
-	// student pod), pin the clone to that snapshot point. Without this
-	// vCenter rejects the clone for two different reasons depending on
-	// the snapshot tree's exact state:
-	//   * "MoveAllDiskBackingsAndConsolidate" works only when no other
-	//     linked clones reference the snapshot; otherwise vCenter returns
-	//     "virtual disk is either corrupted or not a supported format"
-	//     (observed intermittently for student-windows-11 — succeeded once
-	//     when no pods were running off it, failed twice when synthetic
-	//     pods were active).
-	//   * Empty DiskMoveType without an explicit Snapshot triggers the
-	//     same misleading error for snapshot-bearing sources.
-	// Cloning from the current snapshot with empty DiskMoveType produces
-	// a clean, independent full copy of the disk as of that snapshot —
-	// exactly what the wizard wants and what the vCenter UI does by
-	// default when you right-click "Clone to Virtual Machine" on a VM
-	// with snapshots. vCenter-marked Templates (Config.Template=true)
-	// can't have snapshots, so this branch is skipped for them.
-	if hasSnapshot && !isVCenterTemplate {
-		cloneSpec.Snapshot = sourceProps.Snapshot.CurrentSnapshot
-		c.logger.Info("cloning from current snapshot for clean full copy",
-			"source", params.SourceMoref,
-			"snapshot", sourceProps.Snapshot.CurrentSnapshot.Value)
 	}
 
 	// If the caller wants different hardware, set ConfigSpec. We do this
