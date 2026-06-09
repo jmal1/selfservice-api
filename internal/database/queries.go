@@ -39,11 +39,13 @@ var ErrTemplateStale = errors.New("template was modified by another user")
 // Template SELECT / INSERT RETURNING / UPDATE RETURNING. Keep in lockstep
 // with scanTemplate so the order matches the Scan() argument list.
 // Migration 000018 added template_state, created_by, vcenter_vm_id,
-// source_type, source_ref, staging_network.
+// source_type, source_ref, staging_network. Migration 000019 added
+// is_internal.
 const templateSelectCols = `id, name, vcenter_template, os_type, default_vcpus, default_ram_mb,
 		default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''),
 		default_username, default_password, kind, assign_ip, is_active,
 		template_state, created_by, vcenter_vm_id, source_type, source_ref, staging_network,
+		is_internal,
 		created_at, updated_at`
 
 // scanTemplate populates t from a row whose columns are in templateSelectCols
@@ -55,6 +57,7 @@ func scanTemplate(row pgx.Row, t *models.Template) error {
 		&t.DefaultDiskGB, &t.MinVCPUs, &t.MinRAMMB, &t.Description, &t.IconURL,
 		&t.DefaultUsername, &t.DefaultPassword, &t.Kind, &t.AssignIP, &t.IsActive,
 		&t.TemplateState, &t.CreatedBy, &t.VCenterVMID, &t.SourceType, &t.SourceRef, &t.StagingNetwork,
+		&t.IsInternal,
 		&t.CreatedAt, &t.UpdatedAt,
 	)
 }

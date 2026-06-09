@@ -866,6 +866,12 @@ func (h *Handler) VMPowerAction(w http.ResponseWriter, r *http.Request) {
 }
 
 // ListTemplates returns templates accessible to the current user.
+// Internal templates (is_internal=true, e.g. synthetic-noop) are
+// filtered out here so they don't appear in the user-facing picker
+// at /pods/new. Admins who need to see them should use /admin/templates
+// (ListAllTemplates). The unfiltered list is still used by the
+// server-side pod-create / vm-add handlers so the synthetic user can
+// resolve internal templates by ID through the API.
 func (h *Handler) ListTemplates(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.UserIDFromContext(r.Context())
 	role := middleware.RoleFromContext(r.Context())
@@ -876,7 +882,14 @@ func (h *Handler) ListTemplates(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	respondJSON(w, http.StatusOK, templates)
+	visible := templates[:0]
+	for _, t := range templates {
+		if t.IsInternal {
+			continue
+		}
+		visible = append(visible, t)
+	}
+	respondJSON(w, http.StatusOK, visible)
 }
 
 // --- Job Handlers ---

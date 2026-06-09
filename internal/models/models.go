@@ -40,6 +40,13 @@ type Template struct {
 	Kind            string     `json:"kind" db:"kind"`
 	AssignIP        bool       `json:"assign_ip" db:"assign_ip"`
 	IsActive        bool       `json:"is_active" db:"is_active"`
+	// IsInternal flags fixture / synthetic templates (e.g. synthetic-noop
+	// used by the lifecycle monitor) so they're hidden from the public
+	// /api/templates listing while still being resolvable by ID from
+	// pod-create / vm-add when granted via template_access rules.
+	// Admin-only /admin/templates still shows internal rows.
+	// Migration 000019.
+	IsInternal bool `json:"is_internal" db:"is_internal"`
 	// TemplateState drives the wizard lifecycle (migration 000018).
 	// See models.TemplateState* constants and internal/templates/lifecycle.go
 	// for allowed transitions. Defaults to 'active' for legacy rows.
