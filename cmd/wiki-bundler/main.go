@@ -39,6 +39,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/jmal1/selfservice-api/internal/wikitypes"
 )
 
 // Safety caps prevent a runaway closure from blowing up the binary. If
@@ -115,37 +117,17 @@ func deriveTitle(path string, data []byte, ext string) string {
 	return base
 }
 
-// ManifestEntry describes one file in the bundle. Path is repo-relative
-// (the same path used in the source tree and in the embed.FS); size and
-// sha let the API report cache-friendly ETags and let CI catch
-// inadvertent drift.
-type ManifestEntry struct {
-	Path string `json:"path"`
-	// Title is the human-friendly display name for the UI sidebar.
-	// For markdown files it's the first `# H1` heading (whitespace-
-	// trimmed). For source files it's a humanised version of the
-	// basename (filename + parenthesised language hint). Always
-	// non-empty so the UI can render it unconditionally.
-	Title      string `json:"title"`
-	Size       int64  `json:"size"`
-	SHA256     string `json:"sha256"`
-	IsMarkdown bool   `json:"is_markdown"`
-	// LinksOut is the list of in-closure files this file references. nil
-	// for non-markdown files. Useful for the UI's "referenced by" panel.
-	LinksOut []string `json:"links_out,omitempty"`
-	// FromSeed indicates this file was passed in as a seed (top-level
-	// instructor doc). Used by the UI to surface the "Start here" set.
-	FromSeed bool `json:"from_seed"`
-}
-
-// Manifest is the top-level bundle index. It's both written to disk
-// (bundle/manifest.json) and consumed by the API at runtime.
-type Manifest struct {
-	GeneratedAt string          `json:"generated_at,omitempty"` // optional; left blank for reproducible builds
-	Seeds       []string        `json:"seeds"`
-	Files       []ManifestEntry `json:"files"`
-	TotalBytes  int64           `json:"total_bytes"`
-}
+// ManifestEntry and Manifest now live in internal/wikitypes so the
+// bundler and the runtime consumer (internal/docs) share a single
+// source of truth. Adding a field there is automatically picked up
+// here.
+//
+// Aliases (not re-declarations) so we can use the short names locally
+// without re-exporting from this main package.
+type (
+	ManifestEntry = wikitypes.ManifestEntry
+	Manifest      = wikitypes.Manifest
+)
 
 type stringSliceFlag []string
 
