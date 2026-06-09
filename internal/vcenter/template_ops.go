@@ -183,6 +183,34 @@ func (c *Client) cloneTemplateSourceVMInner(ctx context.Context, params Template
 	return newRef.Value, nil
 }
 
+// ResolveVMByName returns the moref ("vm-NNN") of a VM looked up by its
+// inventory name via the finder. Used by the template wizard's
+// clone_template branch: the API stores the *Crucible* template UUID in
+// templates.source_ref, but vCenter clones need a real MoRef. We resolve
+// the source template row's vcenter_template (a name) to a MoRef here.
+//
+// Returns a descriptive error if the VM is not found or the lookup
+// fails. The returned moref is suitable for passing as
+// TemplateCloneParams.SourceMoref.
+func (c *Client) ResolveVMByName(ctx context.Context, name string) (string, error) {
+	if name == "" {
+		return "", fmt.Errorf("vm name required")
+	}
+	if err := c.ensureConnected(ctx); err != nil {
+		return "", err
+	}
+	var moref string
+	err := c.withRetry(ctx, "resolve VM by name", func() error {
+		vm, inner := c.finder.VirtualMachine(ctx, name)
+		if inner != nil {
+			return fmt.Errorf("find VM %q: %w", name, inner)
+		}
+		moref = vm.Reference().Value
+		return nil
+	})
+	return moref, err
+}
+
 // findVMInFolder returns the moref of a VM matching `name` within
 // `folder`, or "" if none is found. Used for the clone idempotency
 // check above. Errors only on unexpected vCenter failures, not on

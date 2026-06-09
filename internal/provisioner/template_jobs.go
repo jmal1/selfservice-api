@@ -116,9 +116,51 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 	}
 
 	// Source dispatch.
+	//
+	// IMPORTANT: source_ref semantics depend on source_type. Historically
+	// this branch treated both as a raw moref, which silently broke the
+	// clone_template flow because the UI submits the *Crucible templates.id
+	// UUID* — not a vCenter moref. We now resolve clone_template's UUID
+	// to a real moref by looking up the source template row and using
+	// its vCenter VM ID (preferred, set by a prior wizard run) or its
+	// vcenter_template name (fallback for legacy/static templates).
 	var sourceMoref string
 	switch payload.SourceType {
-	case models.TemplateSourceCloneTemplate, models.TemplateSourceCloneVCenter:
+	case models.TemplateSourceCloneTemplate:
+		if payload.SourceRef == "" {
+			return p.markTemplateError(ctx, payload.TemplateID, fmt.Errorf("source_ref required for source_type=%s", payload.SourceType))
+		}
+		sourceTemplateID, parseErr := uuid.Parse(payload.SourceRef)
+		if parseErr != nil {
+			return p.markTemplateError(ctx, payload.TemplateID,
+				fmt.Errorf("source_ref %q is not a valid Crucible template UUID for source_type=clone_template: %w", payload.SourceRef, parseErr))
+		}
+		srcTmpl, srcErr := p.db.GetTemplateByID(ctx, sourceTemplateID)
+		if srcErr != nil {
+			return p.markTemplateError(ctx, payload.TemplateID, fmt.Errorf("load source template %s: %w", sourceTemplateID, srcErr))
+		}
+		if srcTmpl == nil {
+			return p.markTemplateError(ctx, payload.TemplateID, fmt.Errorf("source template %s not found", sourceTemplateID))
+		}
+		switch {
+		case srcTmpl.VCenterVMID != "":
+			sourceMoref = srcTmpl.VCenterVMID
+			p.logger.Info("resolved clone_template source via VCenterVMID",
+				"source_template_id", sourceTemplateID, "moref", sourceMoref)
+		case srcTmpl.VCenterTemplate != "":
+			resolved, rerr := p.vc.ResolveVMByName(ctx, srcTmpl.VCenterTemplate)
+			if rerr != nil {
+				return p.markTemplateError(ctx, payload.TemplateID,
+					fmt.Errorf("resolve source template %q to vCenter moref: %w", srcTmpl.VCenterTemplate, rerr))
+			}
+			sourceMoref = resolved
+			p.logger.Info("resolved clone_template source via vCenterTemplate name",
+				"source_template_id", sourceTemplateID, "vcenter_template", srcTmpl.VCenterTemplate, "moref", sourceMoref)
+		default:
+			return p.markTemplateError(ctx, payload.TemplateID,
+				fmt.Errorf("source template %s has neither vcenter_vm_id nor vcenter_template set; cannot resolve to a vCenter VM", sourceTemplateID))
+		}
+	case models.TemplateSourceCloneVCenter:
 		if payload.SourceRef == "" {
 			return p.markTemplateError(ctx, payload.TemplateID, fmt.Errorf("source_ref required for source_type=%s", payload.SourceType))
 		}
