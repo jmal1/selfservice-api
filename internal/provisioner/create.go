@@ -436,9 +436,13 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		p.publishProgress(job.ID, stepName, fmt.Sprintf("Cloning VM %s from %s", vmSpec.VMName, vmSpec.TemplateName))
 
 		// Load the template once so we can branch on kind + reuse default
-		// credentials for the no-customize / registered-existing paths.
+		// credentials for the no-customize / registered-existing paths. We
+		// also reuse the loaded podVM row for the resume-clone idempotency
+		// check below.
 		var tmpl *models.Template
+		var podVMRow *models.PodVM
 		if podVM, lookupErr := p.db.GetPodVM(ctx, vmSpec.PodVMID); lookupErr == nil {
+			podVMRow = podVM
 			if t, tmplErr := p.db.GetTemplateByID(ctx, podVM.TemplateID); tmplErr == nil {
 				tmpl = t
 			}
@@ -469,23 +473,37 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 			generatedPassword = generatePassword(12)
 		}
 
-		moref, err := p.vc.CloneVM(ctx, vcenter.CloneVMParams{
-			TemplateName: vmSpec.TemplateName,
-			VMName:       vmSpec.VMName,
-			VCPUs:        vmSpec.VCPUs,
-			RAMmb:        vmSpec.RAMMB,
-			Network:      pgName,
-			OSType:       osType,
-			Password:     generatedPassword,
-		})
-		if err != nil {
-			p.logger.Error("failed to clone VM", "vm", vmSpec.VMName, "error", err)
-			_ = p.db.UpdatePodVMStatus(ctx, vmSpec.PodVMID, "failed")
-			continue // Skip this VM, try the rest
-		}
+		// Resume support: if a prior worker already cloned this VM (job was
+		// recovered after a worker restart via RecoverStaleJobs), the
+		// pod_vms row will have vcenter_vm_id set. Re-cloning with the
+		// same name fails with "already exists", leaks the cloned VM, and
+		// marks the pod failed. Reuse the existing clone instead. Mirrors
+		// AddVM's resume path in vm_ops.go.
+		var moref string
+		if podVMRow != nil && podVMRow.VCenterVMID != nil && *podVMRow.VCenterVMID != "" {
+			moref = *podVMRow.VCenterVMID
+			p.logger.Info("resuming pod create — VM already cloned",
+				"vm", vmSpec.VMName, "moref", moref, "pod_vm_id", vmSpec.PodVMID)
+		} else {
+			var cloneErr error
+			moref, cloneErr = p.vc.CloneVM(ctx, vcenter.CloneVMParams{
+				TemplateName: vmSpec.TemplateName,
+				VMName:       vmSpec.VMName,
+				VCPUs:        vmSpec.VCPUs,
+				RAMmb:        vmSpec.RAMMB,
+				Network:      pgName,
+				OSType:       osType,
+				Password:     generatedPassword,
+			})
+			if cloneErr != nil {
+				p.logger.Error("failed to clone VM", "vm", vmSpec.VMName, "error", cloneErr)
+				_ = p.db.UpdatePodVMStatus(ctx, vmSpec.PodVMID, "failed")
+				continue // Skip this VM, try the rest
+			}
 
-		// Update pod_vms record with vCenter details
-		_ = p.db.UpdatePodVM(ctx, vmSpec.PodVMID, moref, vmSpec.VMName, "cloned")
+			// Update pod_vms record with vCenter details
+			_ = p.db.UpdatePodVM(ctx, vmSpec.PodVMID, moref, vmSpec.VMName, "cloned")
+		}
 
 		// Resolve credentials to record on the pod_vms row. Pure helper —
 		// see kind_helpers.go for the policy + unit tests.

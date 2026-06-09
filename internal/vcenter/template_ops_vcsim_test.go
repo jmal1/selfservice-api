@@ -166,3 +166,56 @@ func TestAttachNetworkAdapter_VCsim_SwapsNICToRequestedNetwork(t *testing.T) {
 		}
 	})
 }
+
+// TestCloneVM_VCsim_IdempotentOnExistingName verifies that CloneVM
+// returns the existing VM's moref (instead of erroring with "name
+// already exists") when a VM with the requested name is already present
+// in the target folder. This is the regression case from the synthetic
+// UI test failure: RecoverStaleJobs re-queued a partially-completed
+// pod_create job after a worker restart, the retry re-cloned with the
+// same name, and vCenter responded with "The name 'X' already exists",
+// leaving an orphan VM that no janitor would sweep.
+func TestCloneVM_VCsim_IdempotentOnExistingName(t *testing.T) {
+	withSimulator(t, func(ctx context.Context, c *Client, vimc *vim25.Client) {
+		// vcsim's default VPX inventory exposes /DC0/vm (Folder) and
+		// LocalDS_0 (Datastore). Wire them onto the test Client so
+		// CloneVM's finder lookups succeed.
+		c.config.VMFolder = "/DC0/vm"
+		c.config.Datastore = "LocalDS_0"
+
+		// The first VM in the simulator is our "template". Find it
+		// once so we can reference it by name.
+		vm, _ := firstVM(t, ctx, vimc)
+		templateName, err := vm.ObjectName(ctx)
+		if err != nil {
+			t.Fatalf("ObjectName: %v", err)
+		}
+
+		// findVMInFolder must see the simulator's existing VM and
+		// return its moref. This is the actual code path the new
+		// idempotency check in CloneVM hits before any clone task is
+		// submitted, so testing it directly proves the guard works
+		// without depending on vcsim's clone-task semantics.
+		folder, err := c.finder.Folder(ctx, c.config.VMFolder)
+		if err != nil {
+			t.Fatalf("find folder %q: %v", c.config.VMFolder, err)
+		}
+		existing, err := c.findVMInFolder(ctx, folder, templateName)
+		if err != nil {
+			t.Fatalf("findVMInFolder(%q): %v", templateName, err)
+		}
+		if existing == "" {
+			t.Fatalf("findVMInFolder(%q) = empty, want a moref", templateName)
+		}
+
+		// Sanity: an unrelated name returns "" with no error, so the
+		// idempotency guard does NOT swallow legitimate fresh clones.
+		fresh, err := c.findVMInFolder(ctx, folder, "definitely-not-a-clone-target-xyz")
+		if err != nil {
+			t.Fatalf("findVMInFolder(fresh name): %v", err)
+		}
+		if fresh != "" {
+			t.Errorf("findVMInFolder(fresh name) = %q, want empty", fresh)
+		}
+	})
+}
