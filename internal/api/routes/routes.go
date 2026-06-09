@@ -38,6 +38,19 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 		r.Get("/ws", h.VMConsoleWS)
 	})
 
+	// Template build-VM console WebSocket — instructors building a
+	// template need browser console access to the staging VM while it
+	// is in provisioning/configuring/generalizing. Auth + state gating
+	// happen inside the handler (see templates_console.go).
+	// RequireRole(RoleInstructor) here keeps unauth/non-instructor
+	// users out at the route layer; per-template ownership check is in
+	// the handler.
+	r.Route("/api/v1/admin/templates/{templateID}/console", func(r chi.Router) {
+		r.Use(middleware.Auth(authProvider))
+		r.Use(middleware.RequireRole(models.RoleInstructor))
+		r.Get("/ws", h.TemplateBuildConsoleWS)
+	})
+
 	// Run progress WebSocket — streams live workflow_start/action_complete/
 	// workflow_complete events for a given run. Replaces 2s polling.
 	r.Route("/api/v1/runs/{runID}", func(r chi.Router) {
@@ -149,6 +162,11 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 			r.Post("/{templateID}/unpublish", h.AdminUnpublishTemplate)
 			r.Post("/{templateID}/cancel", h.AdminCancelTemplate)
 			r.Post("/{templateID}/retry", h.AdminRetryTemplate)
+
+			// Build-VM console ticket (G4 / Phase G). The WS endpoint
+			// itself is registered above in the pre-Logger WebSocket
+			// section; this just hands the UI the URL + metadata.
+			r.Get("/{templateID}/console/ticket", h.TemplateBuildConsoleTicket)
 
 			// Template CRUD + access + playlists — admin only.
 			r.Group(func(r chi.Router) {
