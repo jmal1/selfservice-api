@@ -1,6 +1,7 @@
 {
   "seeds": [
     "AGENTS.md",
+    "docs/instructor/overview.md",
     "docs/ai-prompts/build-workflow.md",
     "docs/ai/build-workflow-prompt.md"
   ],
@@ -51,9 +52,117 @@
       "from_seed": true
     },
     {
+      "path": "docs/instructor/actions.md",
+      "size": 7090,
+      "sha256": "8e0bcfd5f82788d16a7aac3898c66f8d08c023dbfead9c1cbd7e2c616ce2bc48",
+      "is_markdown": true,
+      "links_out": [
+        "AGENTS.md",
+        "AGENTS.md",
+        "docs/instructor/runner-environment.md",
+        "docs/instructor/runner-environment.md",
+        "docs/instructor/troubleshooting.md",
+        "docs/instructor/workflows.md",
+        "docs/instructor/workflows.md",
+        "internal/database/migrations/000015_action_platforms.up.sql",
+        "internal/engine/engine.go"
+      ],
+      "from_seed": false
+    },
+    {
+      "path": "docs/instructor/glossary.md",
+      "size": 4928,
+      "sha256": "75fcac64a6c3a6ed3628525da91b7bc2828e887a229a2dfb9ceda7e835ab9b7e",
+      "is_markdown": true,
+      "links_out": [
+        "docs/instructor/actions.md",
+        "docs/instructor/playlists.md",
+        "docs/instructor/runner-environment.md"
+      ],
+      "from_seed": false
+    },
+    {
+      "path": "docs/instructor/overview.md",
+      "size": 7506,
+      "sha256": "7c0dd724167c3f7cf486af20afcd64eeb946d9176b1db01b5225cd31d11f694e",
+      "is_markdown": true,
+      "links_out": [
+        "AGENTS.md",
+        "AGENTS.md",
+        "AGENTS.md",
+        "docs/instructor/actions.md",
+        "docs/instructor/glossary.md",
+        "docs/instructor/playlists.md",
+        "docs/instructor/runner-environment.md",
+        "docs/instructor/runner-environment.md",
+        "docs/instructor/troubleshooting.md",
+        "docs/instructor/workflows.md",
+        "docs/instructor/workflows.md"
+      ],
+      "from_seed": true
+    },
+    {
+      "path": "docs/instructor/playlists.md",
+      "size": 5886,
+      "sha256": "15ccdae95e1d3aacb3c4fcb4e723618160c31122a2585e8082d2245e940dc0a8",
+      "is_markdown": true,
+      "links_out": [
+        "docs/instructor/overview.md",
+        "docs/instructor/troubleshooting.md",
+        "docs/instructor/workflows.md",
+        "docs/instructor/workflows.md"
+      ],
+      "from_seed": false
+    },
+    {
+      "path": "docs/instructor/runner-environment.md",
+      "size": 6013,
+      "sha256": "04eb7bec05fc1efc9de5ee90ba83c0cb36f52249ab37e00e09dfc09874625fc6",
+      "is_markdown": true,
+      "links_out": [
+        "deploy/runner/actions.sh",
+        "docs/instructor/overview.md",
+        "docs/instructor/troubleshooting.md",
+        "docs/instructor/workflows.md"
+      ],
+      "from_seed": false
+    },
+    {
+      "path": "docs/instructor/troubleshooting.md",
+      "size": 6223,
+      "sha256": "e473c91489c86c2a9f44b48ec223becc38c6cb6a970733e76d7ff2b091101369",
+      "is_markdown": true,
+      "links_out": [
+        "docs/instructor/actions.md",
+        "docs/instructor/glossary.md",
+        "docs/instructor/runner-environment.md",
+        "docs/instructor/runner-environment.md",
+        "docs/instructor/workflows.md"
+      ],
+      "from_seed": false
+    },
+    {
+      "path": "docs/instructor/workflows.md",
+      "size": 7981,
+      "sha256": "c6344a5a9146db39682eed32f4ad97e33671c8383f429ffb652a46469106adef",
+      "is_markdown": true,
+      "links_out": [
+        "AGENTS.md",
+        "docs/instructor/actions.md",
+        "docs/instructor/overview.md",
+        "docs/instructor/overview.md",
+        "docs/instructor/playlists.md",
+        "docs/instructor/runner-environment.md",
+        "docs/instructor/troubleshooting.md",
+        "internal/database/migrations/000012_assessment_engine.up.sql",
+        "internal/models/workflow_models.go"
+      ],
+      "from_seed": false
+    },
+    {
       "path": "internal/api/routes/routes.go",
-      "size": 9001,
-      "sha256": "83f8474764a0df027f507222afa8be5e2be97dfa965828fd375c17a58b359ecf",
+      "size": 9530,
+      "sha256": "a022b141c5f9b06ff9fe3ab7c8f91ac09d4334128c226b1a7146d2f5e2e6bff0",
       "is_markdown": false,
       "from_seed": false
     },
@@ -121,5 +230,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 114773
+  "total_bytes": 160929
 }
