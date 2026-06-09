@@ -1,0 +1,5 @@
+# Keep generated wiki bundle byte-identical across platforms so the
+# `make verify-wiki` CI check (which diffs against a fresh local
+# regeneration) doesn't fail on Windows checkouts that would otherwise
+# rewrite LF to CRLF.
+internal/docs/_bundle/** -text eol=lf
