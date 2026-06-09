@@ -57,4 +57,13 @@ markdown changes. CI runs `make verify-wiki` to ensure the checked-in
 bundle matches what the seeds produce, so an out-of-sync bundle will
 fail the build.
 
+**Wiki architecture / schema changes:** If you are adding or removing
+fields on the wiki manifest (`wikitypes.Manifest` /
+`wikitypes.ManifestEntry`), read `docs/architecture/wiki.md` first.
+The schema is single-sourced in `internal/wikitypes` and a golden
+test in `internal/docs/embed_test.go` will fail on any unannounced
+change — fix is to update the UI's `WikiManifestEntry` interface in
+`selfservice-ui/src/lib/api/client.ts` and run
+`go test ./internal/docs -update` to regenerate the fixture.
+
 For everything else, follow repository conventions visible in the existing code.

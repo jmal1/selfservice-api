@@ -3,3 +3,7 @@
 # regeneration) doesn't fail on Windows checkouts that would otherwise
 # rewrite LF to CRLF.
 internal/docs/_bundle/** -text eol=lf
+
+# Golden-test fixtures must stay LF-only so the schema diff is
+# deterministic across Windows and Linux contributors.
+internal/docs/testdata/*.json text eol=lf

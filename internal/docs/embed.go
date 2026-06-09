@@ -16,6 +16,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/jmal1/selfservice-api/internal/wikitypes"
 )
 
 // bundleFS embeds the entire wiki bundle directory tree. The directory
@@ -30,28 +32,15 @@ import (
 //go:embed all:_bundle
 var bundleFS embed.FS
 
-// ManifestEntry mirrors cmd/wiki-bundler.ManifestEntry. Duplicated
-// rather than imported because the bundler is a main package and
-// importing it would pull in unused flag/os deps. If you add a field
-// here, mirror it in the bundler struct (and vice versa) — otherwise
-// the field round-trips through JSON as undefined on the consumer side.
-type ManifestEntry struct {
-	Path       string   `json:"path"`
-	Title      string   `json:"title"`
-	Size       int64    `json:"size"`
-	SHA256     string   `json:"sha256"`
-	IsMarkdown bool     `json:"is_markdown"`
-	LinksOut   []string `json:"links_out,omitempty"`
-	FromSeed   bool     `json:"from_seed"`
-}
-
-// Manifest mirrors the bundler manifest shape; see cmd/wiki-bundler.
-type Manifest struct {
-	GeneratedAt string          `json:"generated_at,omitempty"`
-	Seeds       []string        `json:"seeds"`
-	Files       []ManifestEntry `json:"files"`
-	TotalBytes  int64           `json:"total_bytes"`
-}
+// ManifestEntry and Manifest are re-exported as type aliases from
+// internal/wikitypes so existing API handler code (e.g. wiki.go's
+// `docs.ManifestEntry` field) continues to compile unchanged after the
+// schema-source-of-truth migration. New code should import wikitypes
+// directly; these aliases exist purely for back-compat.
+type (
+	ManifestEntry = wikitypes.ManifestEntry
+	Manifest      = wikitypes.Manifest
+)
 
 // Bundle is the in-memory representation of the wiki bundle. Construct
 // via Load; the result is safe for concurrent use.
