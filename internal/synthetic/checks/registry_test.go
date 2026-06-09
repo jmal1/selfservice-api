@@ -166,6 +166,30 @@ func TestPodTestingDashboard404_FailsLoudlyOn500(t *testing.T) {
 	}
 }
 
+func TestWikiIndexRBAC_PassesOn403(t *testing.T) {
+	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
+		"/api/v1/wiki/index": func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(403) },
+	})
+	status, err := WikiIndexRBAC.Run(context.Background(), synthetic.NewClient(srv.URL, ""))
+	if err != nil || status != 403 {
+		t.Fatalf("403 should pass: status=%d err=%v", status, err)
+	}
+}
+
+func TestWikiIndexRBAC_FailsOn200(t *testing.T) {
+	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
+		"/api/v1/wiki/index": func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			w.Write([]byte(`{"seeds":[],"files":[],"total_bytes":0}`))
+		},
+	})
+	_, err := WikiIndexRBAC.Run(context.Background(), synthetic.NewClient(srv.URL, ""))
+	if err == nil {
+		t.Fatal("a 200 from /wiki/index as a student MUST fail — that is the entire point of this check")
+	}
+}
+
 func TestAll_StableNames(t *testing.T) {
 	// Alert rules reference check names; renames are monitoring breaking
 	// changes. If you intentionally rename a check, update the alert YAML in
@@ -176,6 +200,7 @@ func TestAll_StableNames(t *testing.T) {
 		"pods_list":                 true,
 		"admin_list_users_403":      true,
 		"pod_testing_dashboard_404": true,
+		"wiki_index_rbac":           true,
 	}
 	for _, c := range All() {
 		if !wantNames[c.Name()] {

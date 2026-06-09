@@ -163,6 +163,33 @@ var PodTestingDashboard404 = synthetic.CheckFunc{
 	},
 }
 
+// WikiIndexRBAC asserts that a non-instructor synthetic user is rejected from
+// the wiki index with 403. The wiki contains internal authoring docs scoped
+// to instructors and admins; a permission regression would surface here.
+//
+// We intentionally do NOT positive-path-test /wiki/index against an instructor
+// JWT here — the synthetic runs with one role per cycle and the prod
+// synthetic is a student. The endpoint itself is exercised by integration
+// tests in selfservice-api; this check guards the gate.
+var WikiIndexRBAC = synthetic.CheckFunc{
+	NameVal:        "wiki_index_rbac",
+	TitleVal:       "RBAC: Student Cannot Read Wiki",
+	DescriptionVal: "Calls /api/v1/wiki/index as a student-role user and requires a 403. Catches any RBAC regression that would expose the instructor wiki to students.",
+	SeverityVal:    synthetic.SeverityCritical,
+	RunFn: func(ctx context.Context, c *synthetic.Client) (int, error) {
+		resp, err := c.Do(ctx, http.MethodGet, "/api/v1/wiki/index", nil)
+		if err != nil {
+			return 0, err
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		if resp.StatusCode != http.StatusForbidden {
+			return resp.StatusCode, fmt.Errorf("wiki/index returned %d, want 403", resp.StatusCode)
+		}
+		return resp.StatusCode, nil
+	},
+}
+
 // All returns the canonical list of synthetic checks the monitor runs each
 // cycle. Ordering does not matter — checks run sequentially and results are
 // pushed atomically. Add new checks here.
@@ -173,6 +200,7 @@ func All() []synthetic.Check {
 		PodsList,
 		AdminListUsers403,
 		PodTestingDashboard404,
+		WikiIndexRBAC,
 	}
 }
 
