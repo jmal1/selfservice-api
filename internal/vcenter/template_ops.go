@@ -149,6 +149,16 @@ func (c *Client) cloneTemplateSourceVMInner(ctx context.Context, params Template
 			Datastore: &dsRef,
 			Folder:    &folderRef,
 			Pool:      &poolRef,
+			// MoveAllDiskBackingsAndConsolidate flattens the source VM's
+			// snapshot chain (Crucible templates carry a linked-clone-base
+			// snapshot used for student-pod cloning) into a single flat
+			// disk on the destination. Without this, vCenter rejects the
+			// clone with "The virtual disk is either corrupted or not a
+			// supported format" when the source has snapshots — that was
+			// the failure mode the wizard hit on first ship for any
+			// clone_template source that had already been used as a
+			// student-pod template.
+			DiskMoveType: string(types.VirtualMachineRelocateDiskMoveOptionsMoveAllDiskBackingsAndConsolidate),
 		},
 		PowerOn:  false, // we power on after hardware + NIC are configured
 		Template: false, // keep as regular VM so it can be edited
