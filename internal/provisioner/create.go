@@ -28,6 +28,11 @@ type Provisioner struct {
 	opnSSH   *opnsense.SSHClient
 	nats     *events.Client
 	logger   *slog.Logger
+
+	// DestroyFailedPusher is optional. When set, RetryFailedDestroys pushes
+	// the current count to Pushgateway so the
+	// CruciblePodsStuckInDestroyFailed alert can fire within 15m. Nil disables.
+	DestroyFailedPusher *DestroyFailedPusher
 }
 
 // New creates a provisioner with all required clients.

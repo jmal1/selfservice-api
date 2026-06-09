@@ -80,6 +80,24 @@ func main() {
 	// Create provisioner
 	prov := provisioner.New(queries, vcClient, opnClient, opnSSH, natsClient, logger)
 
+	// Optional: enable destroy_failed Pushgateway metric. When the
+	// WORKER_PUSHGATEWAY_URL env is set, the worker publishes
+	// crucible_pods_destroy_failed_count every 5 minutes so the
+	// CruciblePodsStuckInDestroyFailed alert can fire even before the
+	// lifecycle synthetic detects user-visible breakage. Empty disables it.
+	if pgURL := os.Getenv("WORKER_PUSHGATEWAY_URL"); pgURL != "" {
+		job := os.Getenv("WORKER_PUSHGATEWAY_JOB")
+		if job == "" {
+			job = "crucible_provision_worker"
+		}
+		prov.DestroyFailedPusher = &provisioner.DestroyFailedPusher{
+			BaseURL:        pgURL,
+			Job:            job,
+			GroupingLabels: map[string]string{"layer": "api"},
+		}
+		logger.Info("destroy_failed pushgateway enabled", "url", pgURL, "job", job)
+	}
+
 	// Worker ID for job claiming
 	workerID, err := os.Hostname()
 	if err != nil {

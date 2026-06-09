@@ -139,6 +139,11 @@ func (p *Provisioner) DestroyPod(ctx context.Context, job *models.Job) error {
 // RetryFailedDestroys finds pods stuck in "destroy_failed" and re-runs
 // the destroy workflow for each. Since every step is idempotent, re-running
 // the full sequence is safe — already-completed steps are no-ops.
+//
+// After the sweep, the post-retry count is pushed to Pushgateway (if a
+// DestroyFailedPusher is configured) so the CruciblePodsStuckInDestroyFailed
+// alert reflects steady-state, not pre-retry state. A push failure is logged
+// but never blocks the retry itself.
 func (p *Provisioner) RetryFailedDestroys(ctx context.Context) {
 	pods, err := p.db.ListDestroyFailedPods(ctx)
 	if err != nil {
@@ -146,6 +151,7 @@ func (p *Provisioner) RetryFailedDestroys(ctx context.Context) {
 		return
 	}
 	if len(pods) == 0 {
+		p.publishDestroyFailedCount(ctx, 0)
 		return
 	}
 
@@ -166,4 +172,24 @@ func (p *Provisioner) RetryFailedDestroys(ctx context.Context) {
 			p.logger.Info("retry destroy succeeded", "pod_id", pod.ID)
 		}
 	}
+
+	// Re-read so the gauge reflects post-retry state, not what we started
+	// with. A retry that fully succeeded drops the count to 0 immediately;
+	// a retry that failed leaves the count at len(pods) for the alert.
+	if remaining, err := p.db.ListDestroyFailedPods(ctx); err == nil {
+		p.publishDestroyFailedCount(ctx, len(remaining))
+	}
+}
+
+// publishDestroyFailedCount pushes the count to Pushgateway when a pusher
+// is configured. Failures log at WARN — Pushgateway is best-effort.
+func (p *Provisioner) publishDestroyFailedCount(ctx context.Context, count int) {
+	if p.DestroyFailedPusher == nil {
+		return
+	}
+	if err := p.DestroyFailedPusher.Push(ctx, count); err != nil {
+		p.logger.Warn("destroy_failed metric push failed", "error", err, "count", count)
+		return
+	}
+	p.logger.Info("destroy_failed metric pushed", "count", count)
 }
