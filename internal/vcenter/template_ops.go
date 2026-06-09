@@ -120,8 +120,14 @@ func (c *Client) cloneTemplateSourceVMInner(ctx context.Context, params Template
 		return existing, nil
 	}
 
-	// Pick a resource pool. Reuse selectBestPool with the same CPU/RAM
-	// requirements we'll apply post-clone.
+	// Pick a resource pool. For template clones we MUST stay in the same
+	// cluster as the source VM — cross-cluster clone-from-snapshot is
+	// rejected by vCenter with the misleading "virtual disk is either
+	// corrupted or not a supported format" error (most likely CPU-vendor
+	// compatibility validation: Intel→AMD, or vice versa, on a guest
+	// with cpuid masks). Verified by `govc vm.clone -pool <source-cluster>`
+	// succeeding for the same source where `-pool <other-cluster>` fails
+	// in 300ms with the same error.
 	vcpus := params.VCPUs
 	if vcpus == 0 {
 		// Fall back to "any" by passing 1 (the smallest reasonable value).
@@ -131,7 +137,7 @@ func (c *Client) cloneTemplateSourceVMInner(ctx context.Context, params Template
 	if rammb == 0 {
 		rammb = 1024
 	}
-	pool, err := c.selectBestPool(ctx, vcpus, rammb)
+	pool, err := c.selectBestPoolInSourceCluster(ctx, sourceProps.Runtime.Host, vcpus, rammb)
 	if err != nil {
 		return "", fmt.Errorf("select resource pool: %w", err)
 	}
