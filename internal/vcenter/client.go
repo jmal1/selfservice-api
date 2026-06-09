@@ -774,6 +774,106 @@ func (c *Client) selectBestPool(ctx context.Context, vcpus int32, ramMB int64) (
 	return best.pool, nil
 }
 
+// selectBestPoolInSourceCluster is the same RAM-based selection as
+// selectBestPool but constrained to resource pools that live in the
+// same cluster as the source host. Used by template clones because
+// vCenter rejects cross-cluster clones with a misleading "virtual
+// disk is either corrupted or not a supported format" error when CPU
+// vendor differs (Intel ↔ AMD) or when guest cpuid masks were set on
+// the source.
+//
+// If sourceHost is nil (shouldn't happen for a real running source,
+// but possible for synthetic tests), falls back to the unconstrained
+// selectBestPool.
+func (c *Client) selectBestPoolInSourceCluster(ctx context.Context, sourceHost *types.ManagedObjectReference, vcpus int32, ramMB int64) (*object.ResourcePool, error) {
+	if sourceHost == nil {
+		c.logger.Warn("source host unknown, falling back to unconstrained pool selection")
+		return c.selectBestPool(ctx, vcpus, ramMB)
+	}
+
+	// Walk Host → ComputeResource (or ClusterComputeResource) parent.
+	// The parent's resource pool path is the prefix any same-cluster
+	// pool will share.
+	var hostProps mo.HostSystem
+	hostObj := object.NewHostSystem(c.client.Client, *sourceHost)
+	if err := hostObj.Properties(ctx, hostObj.Reference(), []string{"parent"}, &hostProps); err != nil {
+		return nil, fmt.Errorf("read source host parent: %w", err)
+	}
+	if hostProps.Parent == nil {
+		return nil, fmt.Errorf("source host %s has no parent compute resource", sourceHost.Value)
+	}
+
+	var cr mo.ComputeResource
+	crObj := object.NewComputeResource(c.client.Client, *hostProps.Parent)
+	if err := crObj.Properties(ctx, crObj.Reference(), []string{"name", "resourcePool"}, &cr); err != nil {
+		return nil, fmt.Errorf("read source cluster: %w", err)
+	}
+	clusterName := cr.Name
+	c.logger.Info("source cluster identified",
+		"host", sourceHost.Value,
+		"cluster", clusterName)
+
+	// Filter configured pools to those in the source cluster. Pool paths
+	// look like "/JMAL-Datacenter/host/Intel-Cluster/Resources/Student-VMs",
+	// so we match by the "/<clusterName>/" segment.
+	wanted := "/" + clusterName + "/"
+	var candidates []string
+	for _, poolPath := range c.config.ResourcePools {
+		if strings.Contains(poolPath, wanted) {
+			candidates = append(candidates, poolPath)
+		}
+	}
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("no configured resource pools in source cluster %q (configured pools: %v)", clusterName, c.config.ResourcePools)
+	}
+
+	if len(candidates) == 1 {
+		pool, err := c.finder.ResourcePool(ctx, candidates[0])
+		if err != nil {
+			return nil, fmt.Errorf("find resource pool %s: %w", candidates[0], err)
+		}
+		c.logger.Info("selected resource pool (single in source cluster)", "pool", candidates[0])
+		return pool, nil
+	}
+
+	// Multiple candidates: pick the one with most free memory, same as
+	// selectBestPool's policy.
+	type candidate struct {
+		pool      *object.ResourcePool
+		name      string
+		freeMemMB int64
+	}
+	var best *candidate
+	for _, poolPath := range candidates {
+		pool, err := c.finder.ResourcePool(ctx, poolPath)
+		if err != nil {
+			c.logger.Warn("resource pool not found, skipping", "pool", poolPath, "error", err)
+			continue
+		}
+		var props mo.ResourcePool
+		if err := pool.Properties(ctx, pool.Reference(), []string{"runtime.memory"}, &props); err != nil {
+			c.logger.Warn("failed to get pool stats, skipping", "pool", poolPath, "error", err)
+			continue
+		}
+		freeMem := (props.Runtime.Memory.MaxUsage - props.Runtime.Memory.OverallUsage) / (1024 * 1024)
+		c.logger.Info("resource pool stats (source-cluster constrained)",
+			"pool", poolPath,
+			"free_mb", freeMem)
+		if best == nil || freeMem > best.freeMemMB {
+			best = &candidate{pool: pool, name: poolPath, freeMemMB: freeMem}
+		}
+	}
+	if best == nil {
+		return nil, fmt.Errorf("no available resource pools in source cluster %q", clusterName)
+	}
+	if best.freeMemMB < ramMB {
+		c.logger.Warn("best same-cluster pool has less free memory than requested",
+			"pool", best.name, "free_mb", best.freeMemMB, "requested_mb", ramMB)
+	}
+	c.logger.Info("selected resource pool", "pool", best.name, "free_mb", best.freeMemMB, "constrained_to_cluster", clusterName)
+	return best.pool, nil
+}
+
 // ---------- Port Group Operations ----------
 
 // CreatePortGroupOnAllHosts creates a standard vSwitch port group on every configured ESXi host.
