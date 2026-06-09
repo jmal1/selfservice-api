@@ -1,0 +1,48 @@
+name: Helm Lint
+
+on:
+  pull_request:
+    paths:
+      - 'deploy/helm/**'
+      - '.github/workflows/helm-lint.yaml'
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/helm/**'
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.20.0'
+
+      - name: Add chart repos
+        run: |
+          helm repo add bitnami https://charts.bitnami.com/bitnami
+          helm repo add nats https://nats-io.github.io/k8s/helm/charts/
+
+      - name: helm dependency build
+        working-directory: deploy/helm/selfservice
+        run: helm dep build
+
+      # Lint catches schema-level chart errors.
+      - name: helm lint (defaults)
+        working-directory: deploy/helm/selfservice
+        run: helm lint . -f values.yaml
+
+      - name: helm lint (defaults + prod overrides)
+        working-directory: deploy/helm/selfservice
+        run: helm lint . -f values.yaml -f values.prod.yaml
+
+      # Template catches missing required values that lint won't (the bug from
+      # 2026-06-09 night when `synthetic.janitor.schedule` was added to
+      # values.yaml without `--reset-then-reuse-values` would have been caught
+      # here).
+      - name: helm template (defaults + prod overrides)
+        working-directory: deploy/helm/selfservice
+        run: helm template selfservice . -f values.yaml -f values.prod.yaml > /dev/null

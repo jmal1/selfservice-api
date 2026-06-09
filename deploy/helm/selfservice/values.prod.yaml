@@ -1,0 +1,30 @@
+# Production overrides for selfservice helm chart.
+# Apply with: helm upgrade selfservice . -n selfservice -f values.yaml -f values.prod.yaml
+#
+# Anything NOT listed here uses defaults from values.yaml. Keep this file as
+# small as possible — only true production overrides belong here.
+#
+# Secrets are NOT in this file. They are managed via External Secrets Operator
+# pulling from Vault. See:
+#   - SecretStore: kubectl get secretstore -n selfservice vault-backend
+#   - ExternalSecrets: kubectl get externalsecret -n selfservice
+#   - Vault path: secret/selfservice/<secret-name>
+
+# Synthetic monitoring: lifecycle + janitor are opt-in by chart default; both
+# are enabled in prod because the synthetic-noop template + grants exist here.
+synthetic:
+  lifecycle:
+    enabled: true
+    template: synthetic-noop
+    # Tightened from chart default 8m — the synthetic-noop template reliably
+    # reaches active in under 90s on this cluster. Alerts fire faster on regressions.
+    readyTimeout: 3m
+  janitor:
+    enabled: true
+
+# Bitnami postgresql subchart image overrides.
+# We pin tag explicitly to avoid surprise major upgrades on chart upgrade.
+postgresql:
+  image:
+    pullPolicy: IfNotPresent
+    tag: latest
