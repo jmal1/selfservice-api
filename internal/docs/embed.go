@@ -32,9 +32,12 @@ var bundleFS embed.FS
 
 // ManifestEntry mirrors cmd/wiki-bundler.ManifestEntry. Duplicated
 // rather than imported because the bundler is a main package and
-// importing it would pull in unused flag/os deps.
+// importing it would pull in unused flag/os deps. If you add a field
+// here, mirror it in the bundler struct (and vice versa) — otherwise
+// the field round-trips through JSON as undefined on the consumer side.
 type ManifestEntry struct {
 	Path       string   `json:"path"`
+	Title      string   `json:"title"`
 	Size       int64    `json:"size"`
 	SHA256     string   `json:"sha256"`
 	IsMarkdown bool     `json:"is_markdown"`
