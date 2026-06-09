@@ -831,6 +831,32 @@ func (q *Queries) ListJobsByUser(ctx context.Context, userID uuid.UUID) ([]model
 	return jobs, nil
 }
 
+// GetLatestJobForTemplate returns the most recent job whose payload's
+// template_id matches the given UUID, regardless of status. Used by the
+// wizard state endpoint to surface which step (template_provision vs
+// template_generalize) most recently ran, so the UI can mark the right
+// step as the failed one when state=error.
+//
+// Returns (nil, nil) when no job has ever targeted this template.
+func (q *Queries) GetLatestJobForTemplate(ctx context.Context, templateID uuid.UUID) (*models.Job, error) {
+	var j models.Job
+	err := q.pool.QueryRow(ctx, `
+		SELECT id, type, payload, status, claimed_by, claimed_at, started_at,
+		       completed_at, result, retry_count, max_retries, rollback_steps, created_at
+		FROM jobs
+		WHERE payload->>'template_id' = $1
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, templateID.String()).Scan(
+		&j.ID, &j.Type, &j.Payload, &j.Status, &j.ClaimedBy, &j.ClaimedAt, &j.StartedAt,
+		&j.CompletedAt, &j.Result, &j.RetryCount, &j.MaxRetries, &j.RollbackSteps, &j.CreatedAt,
+	)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	return &j, err
+}
+
 // InsertAuditLog records an action in the audit log.
 func (q *Queries) InsertAuditLog(ctx context.Context, entry models.AuditLog) error {
 	_, err := q.pool.Exec(ctx, `
