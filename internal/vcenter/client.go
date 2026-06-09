@@ -202,6 +202,20 @@ func (c *Client) cloneVMInner(ctx context.Context, params CloneVMParams) (string
 		return "", fmt.Errorf("find folder %s: %w", c.config.VMFolder, err)
 	}
 
+	// Idempotency: if a VM with this name already exists in the target
+	// folder, return it instead of cloning again. The pod_create job may
+	// be re-executed after a worker crash (RecoverStaleJobs re-queues any
+	// in_progress job at worker startup). The provisioner-layer guard in
+	// create.go covers the common case where the pod_vms row recorded
+	// vcenter_vm_id before the worker died; this lower-level guard covers
+	// the race where the clone task completed but the DB update did not.
+	// Mirrors CloneTemplate's idempotency in template_ops.go.
+	if existing, lookupErr := c.findVMInFolder(ctx, folder, params.VMName); lookupErr == nil && existing != "" {
+		c.logger.Info("clone target already exists, reusing",
+			"name", params.VMName, "moref", existing)
+		return existing, nil
+	}
+
 	// Select best resource pool based on available resources, but
 	// constrained to the template's cluster.
 	pool, err := c.selectBestPoolInSourceCluster(ctx, tmplProps.Runtime.Host, params.VCPUs, params.RAMmb)
