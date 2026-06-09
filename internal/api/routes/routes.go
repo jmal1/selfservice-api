@@ -119,12 +119,16 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 		r.Get("/jobs", h.ListMyJobs)
 		r.Get("/jobs/{jobID}/status", h.GetJobStatus)
 
-		// Template wizard (T4) — instructor-accessible subset of /admin.
-		// These endpoints live outside the /admin RoleAdmin guard so the
-		// `lab-instructors` Authentik group (mapped to RoleInstructor) can
-		// use them. RoleAdmin satisfies RoleInstructor via hasMinRole.
+		// All /admin/templates/* routes live here. The wizard subset is
+		// open to instructors (lab-instructors AuthN group); the CRUD
+		// subset is admin-only. We must declare them in one chi.Route
+		// because chi's Mount takes exclusive ownership of the prefix —
+		// registering /templates routes in the sibling /admin block
+		// would be silently shadowed and return 404.
 		r.Route("/admin/templates", func(r chi.Router) {
 			r.Use(middleware.RequireRole(models.RoleInstructor))
+
+			// Wizard (T4) — instructor-accessible.
 			r.Post("/draft", h.AdminCreateTemplateDraft)
 			r.Get("/{templateID}/wizard-state", h.AdminGetWizardState)
 			r.Post("/{templateID}/provision", h.AdminProvisionTemplate)
@@ -133,6 +137,19 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 			r.Post("/{templateID}/unpublish", h.AdminUnpublishTemplate)
 			r.Post("/{templateID}/cancel", h.AdminCancelTemplate)
 			r.Post("/{templateID}/retry", h.AdminRetryTemplate)
+
+			// Template CRUD + access + playlists — admin only.
+			r.Group(func(r chi.Router) {
+				r.Use(middleware.RequireRole(models.RoleAdmin))
+				r.Get("/", h.AdminListTemplates)
+				r.Post("/", h.AdminCreateTemplate)
+				r.Patch("/{templateID}", h.AdminUpdateTemplate)
+				r.Delete("/{templateID}", h.AdminDeleteTemplate)
+				r.Post("/{templateID}/access", h.AdminSetTemplateAccess)
+				r.Get("/{templateID}/dependents", h.AdminListTemplateDependents)
+				r.Get("/{templateID}/playlists", h.AdminGetTemplatePlaylists)
+				r.Post("/{templateID}/playlists", h.AdminSetTemplatePlaylists)
+			})
 		})
 
 		// Admin routes
@@ -142,12 +159,8 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 			r.Get("/users", h.AdminListUsers)
 			r.Patch("/users/{userID}/quotas", h.AdminUpdateQuotas)
 
-			r.Get("/templates", h.AdminListTemplates)
-			r.Post("/templates", h.AdminCreateTemplate)
-			r.Patch("/templates/{templateID}", h.AdminUpdateTemplate)
-			r.Delete("/templates/{templateID}", h.AdminDeleteTemplate)
-			r.Post("/templates/{templateID}/access", h.AdminSetTemplateAccess)
-			r.Get("/templates/{templateID}/dependents", h.AdminListTemplateDependents)
+			// NOTE: /admin/templates/* is registered in a dedicated
+			// chi.Route block above (chi Mount owns the entire prefix).
 
 			// vCenter folder browser for template registration UI (cached 5 min).
 			r.Get("/vcenter/templates-folder", h.AdminListVCenterTemplatesFolder)
@@ -209,9 +222,10 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 				r.Delete("/{playlistID}", h.AdminDeletePlaylist)
 			})
 
-			// Template playlist assignment
-			r.Get("/templates/{templateID}/playlists", h.AdminGetTemplatePlaylists)
-			r.Post("/templates/{templateID}/playlists", h.AdminSetTemplatePlaylists)
+			// Template playlist assignment is registered above in the
+			// dedicated /admin/templates chi.Route block (chi Mount owns
+			// the prefix, so sibling-block /templates/... routes would
+			// be silently shadowed).
 
 			// Blueprint VM playlist overrides
 			r.Post("/blueprints/{blueprintID}/vm-playlists", h.AdminSetBlueprintVMPlaylists)
