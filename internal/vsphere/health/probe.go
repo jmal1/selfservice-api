@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/vmware/govmomi"
@@ -91,6 +92,11 @@ type Result struct {
 type Probe struct {
 	cfg    Config
 	logger *slog.Logger
+	// last holds the most recent Result so callers (e.g. /admin/health)
+	// can read it without doing a fresh login. Pointer-typed so we can
+	// atomically swap a freshly populated Result in place; readers see a
+	// consistent snapshot. nil until the first Run completes.
+	last atomic.Pointer[Result]
 }
 
 // New validates the config and returns a Probe. ProbeTimeout < 1s is
@@ -126,6 +132,11 @@ func New(cfg Config, logger *slog.Logger) (*Probe, error) {
 // out of band without conflating "probe failed" with "push failed").
 func (p *Probe) Run(ctx context.Context) (Result, error) {
 	res := p.probe(ctx)
+	// Stash the result so consumers like /admin/health can read it without
+	// triggering another login round-trip. Done unconditionally — a failed
+	// probe is also useful diagnostic state.
+	stash := res
+	p.last.Store(&stash)
 	if p.cfg.PushgatewayURL == "" {
 		return res, nil
 	}
@@ -134,6 +145,17 @@ func (p *Probe) Run(ctx context.Context) (Result, error) {
 		return res, err
 	}
 	return res, nil
+}
+
+// LastResult returns the most recent probe Result and true. If no probe
+// cycle has completed yet, returns the zero Result and false. Reader-safe:
+// uses an atomic load on the internal pointer.
+func (p *Probe) LastResult() (Result, bool) {
+	r := p.last.Load()
+	if r == nil {
+		return Result{}, false
+	}
+	return *r, true
 }
 
 // RunPeriodic runs Probe.Run on a fixed interval until ctx is cancelled.
