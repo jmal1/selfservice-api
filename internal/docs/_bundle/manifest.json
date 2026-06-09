@@ -1,0 +1,125 @@
+{
+  "seeds": [
+    "AGENTS.md",
+    "docs/ai-prompts/build-workflow.md",
+    "docs/ai/build-workflow-prompt.md"
+  ],
+  "files": [
+    {
+      "path": "AGENTS.md",
+      "size": 28675,
+      "sha256": "1a1e7fb084e9ba46965e5cf4ddb6a025275fc179a522335185d39ab3e7ef7b57",
+      "is_markdown": true,
+      "links_out": [
+        "deploy/runner/actions.sh",
+        "docs/ai/build-workflow-prompt.md",
+        "internal/api/routes/routes.go",
+        "internal/database/migrations/000012_assessment_engine.up.sql",
+        "internal/database/migrations/000012_assessment_engine.up.sql",
+        "internal/database/migrations/000014_action_library.up.sql",
+        "internal/database/migrations/000015_action_platforms.up.sql",
+        "internal/engine/engine.go",
+        "internal/models/workflow_models.go",
+        "internal/models/workflow_models.go",
+        "internal/models/workflow_models.go",
+        "internal/runner/executor.go",
+        "internal/scriptvalidator/detect.go",
+        "internal/scriptvalidator/validator.go",
+        "internal/scriptvalidator/wrap.go"
+      ],
+      "from_seed": true
+    },
+    {
+      "path": "deploy/runner/actions.sh",
+      "size": 3589,
+      "sha256": "ee22d806bd23af22b4cb1d1b5a8f10171e9bb20efb04c7dfdddad778f74edbd7",
+      "is_markdown": false,
+      "from_seed": false
+    },
+    {
+      "path": "docs/ai-prompts/build-workflow.md",
+      "size": 5222,
+      "sha256": "8841c6b85bff2bd178097b4c5c110710882e8b6792b6ea2090f57d370e940f4e",
+      "is_markdown": true,
+      "from_seed": true
+    },
+    {
+      "path": "docs/ai/build-workflow-prompt.md",
+      "size": 3549,
+      "sha256": "f89ae79e48f086dd8153231ed6b8f3d12b35b20926161fce2c5f23456f7e3a09",
+      "is_markdown": true,
+      "from_seed": true
+    },
+    {
+      "path": "internal/api/routes/routes.go",
+      "size": 9001,
+      "sha256": "83f8474764a0df027f507222afa8be5e2be97dfa965828fd375c17a58b359ecf",
+      "is_markdown": false,
+      "from_seed": false
+    },
+    {
+      "path": "internal/database/migrations/000012_assessment_engine.up.sql",
+      "size": 8449,
+      "sha256": "fc10753a38a91dcc41abd61d3f79e77bc353c92e9dc71008305df7d21b467d3b",
+      "is_markdown": false,
+      "from_seed": false
+    },
+    {
+      "path": "internal/database/migrations/000014_action_library.up.sql",
+      "size": 882,
+      "sha256": "b335fef2f121315da13a9b2d44f31ff173a0b3f4256a6de17466870ff3b04387",
+      "is_markdown": false,
+      "from_seed": false
+    },
+    {
+      "path": "internal/database/migrations/000015_action_platforms.up.sql",
+      "size": 995,
+      "sha256": "cfa990e1fdeb358f281e5e4480c26c4c7375f878891382aa3d60c666de5bee60",
+      "is_markdown": false,
+      "from_seed": false
+    },
+    {
+      "path": "internal/engine/engine.go",
+      "size": 14662,
+      "sha256": "07733d469c1135138a0e37ddae92306c347686c7916e2cbd5fae467a32e76e9e",
+      "is_markdown": false,
+      "from_seed": false
+    },
+    {
+      "path": "internal/models/workflow_models.go",
+      "size": 9716,
+      "sha256": "24ff22cdca72df5692081f7c47764ffd5fb84259c7b7ab2efdbdc71ffb7bbe90",
+      "is_markdown": false,
+      "from_seed": false
+    },
+    {
+      "path": "internal/runner/executor.go",
+      "size": 7613,
+      "sha256": "5ca039ce653b9a9e592f5fe965ccebd2943b22b282eb0f2eacd9b71ff4896e67",
+      "is_markdown": false,
+      "from_seed": false
+    },
+    {
+      "path": "internal/scriptvalidator/detect.go",
+      "size": 3156,
+      "sha256": "8312d922c79423931aab825f283f98e0dcb2a7b81b60f6462e696cbf0155bc88",
+      "is_markdown": false,
+      "from_seed": false
+    },
+    {
+      "path": "internal/scriptvalidator/validator.go",
+      "size": 11496,
+      "sha256": "3575ef2f1c4ccea2783b47c646ec95eb57aea49cc2021a3460f7217cbc2577f2",
+      "is_markdown": false,
+      "from_seed": false
+    },
+    {
+      "path": "internal/scriptvalidator/wrap.go",
+      "size": 7768,
+      "sha256": "057b2ae97dd170b0abaa54111c0b7efb7d7809ecc3b62ecce6d72318535070f6",
+      "is_markdown": false,
+      "from_seed": false
+    }
+  ],
+  "total_bytes": 114773
+}
