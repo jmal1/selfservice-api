@@ -119,6 +119,18 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 		r.Get("/jobs", h.ListMyJobs)
 		r.Get("/jobs/{jobID}/status", h.GetJobStatus)
 
+		// Wiki — instructor + admin authoring reference. Embedded bundle
+		// is built by cmd/wiki-bundler (see make wiki-bundle). Gated to
+		// instructor+ since the docs include implementation details
+		// (action library bash, validator internals) that students
+		// shouldn't need and shouldn't be tempted to mine.
+		r.Route("/wiki", func(r chi.Router) {
+			r.Use(middleware.RequireRole(models.RoleInstructor))
+			r.Get("/index", h.WikiIndex)
+			r.Get("/bundle.zip", h.WikiZip)
+			r.Get("/page/*", h.WikiPage)
+		})
+
 		// All /admin/templates/* routes live here. The wizard subset is
 		// open to instructors (lab-instructors AuthN group); the CRUD
 		// subset is admin-only. We must declare them in one chi.Route
