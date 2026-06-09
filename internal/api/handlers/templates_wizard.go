@@ -64,14 +64,22 @@ type CreateTemplateDraftRequest struct {
 
 // WizardStateResponse is what GET /admin/templates/:id/wizard-state returns.
 // The UI uses AllowedNextStates to decide which action buttons to render.
+//
+// When TemplateState == "error", LastJobType and LastJobError tell the UI
+// which step failed (template_provision vs template_generalize) and what
+// the worker reported, so it can mark the right step as errored and show
+// the actual error instead of "check worker logs".
 type WizardStateResponse struct {
-	TemplateID         uuid.UUID `json:"template_id"`
-	TemplateState      string    `json:"template_state"`
-	AllowedNextStates  []string  `json:"allowed_next_states"`
-	VCenterVMID        string    `json:"vcenter_vm_id,omitempty"`
-	SourceType         string    `json:"source_type,omitempty"`
-	SourceRef          string    `json:"source_ref,omitempty"`
-	StagingNetwork     string    `json:"staging_network,omitempty"`
+	TemplateID        uuid.UUID `json:"template_id"`
+	TemplateState     string    `json:"template_state"`
+	AllowedNextStates []string  `json:"allowed_next_states"`
+	VCenterVMID       string    `json:"vcenter_vm_id,omitempty"`
+	SourceType        string    `json:"source_type,omitempty"`
+	SourceRef         string    `json:"source_ref,omitempty"`
+	StagingNetwork    string    `json:"staging_network,omitempty"`
+	LastJobType       string    `json:"last_job_type,omitempty"`
+	LastJobStatus     string    `json:"last_job_status,omitempty"`
+	LastJobError      string    `json:"last_job_error,omitempty"`
 }
 
 // vmNameSlugRe matches characters that aren't safe in a vCenter VM name.
@@ -346,7 +354,7 @@ func (h *Handler) AdminCancelTemplate(w http.ResponseWriter, r *http.Request) {
 	)
 
 	fresh, _ := h.db.GetTemplateByID(r.Context(), tmpl.ID)
-	resp := h.wizardState(fresh)
+	resp := h.wizardState(r.Context(), fresh)
 	resp.VCenterVMID = tmpl.VCenterVMID // surface so UI can prompt for manual cleanup if non-empty
 	respondJSON(w, http.StatusOK, map[string]any{
 		"state": resp,
@@ -369,7 +377,7 @@ func (h *Handler) AdminGetWizardState(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "template not found", http.StatusNotFound)
 		return
 	}
-	respondJSON(w, http.StatusOK, h.wizardState(tmpl))
+	respondJSON(w, http.StatusOK, h.wizardState(r.Context(), tmpl))
 }
 
 // --- shared helpers ---
@@ -449,7 +457,7 @@ func (h *Handler) advanceTemplateAndEnqueue(w http.ResponseWriter, r *http.Reque
 	fresh, _ := h.db.GetTemplateByID(r.Context(), tmpl.ID)
 	respondJSON(w, http.StatusAccepted, map[string]any{
 		"job_id": job.ID,
-		"state":  h.wizardState(fresh),
+		"state":  h.wizardState(r.Context(), fresh),
 	})
 	return true
 }
@@ -487,7 +495,7 @@ func (h *Handler) stateOnlyTransition(w http.ResponseWriter, r *http.Request, tm
 	)
 	h.invalidateTemplatesFolderCache()
 	fresh, _ := h.db.GetTemplateByID(r.Context(), tmpl.ID)
-	respondJSON(w, http.StatusOK, h.wizardState(fresh))
+	respondJSON(w, http.StatusOK, h.wizardState(r.Context(), fresh))
 	return true
 }
 
@@ -528,12 +536,12 @@ func (h *Handler) handleLifecycleUpdateErr(w http.ResponseWriter, tmpl *models.T
 	http.Error(w, "internal error", http.StatusInternalServerError)
 }
 
-func (h *Handler) wizardState(tmpl *models.Template) WizardStateResponse {
+func (h *Handler) wizardState(ctx stdcontext.Context, tmpl *models.Template) WizardStateResponse {
 	if tmpl == nil {
 		return WizardStateResponse{}
 	}
 	allowed, _ := templates.AllowedNextStates(tmpl.TemplateState)
-	return WizardStateResponse{
+	resp := WizardStateResponse{
 		TemplateID:        tmpl.ID,
 		TemplateState:     tmpl.TemplateState,
 		AllowedNextStates: allowed,
@@ -542,6 +550,36 @@ func (h *Handler) wizardState(tmpl *models.Template) WizardStateResponse {
 		SourceRef:         tmpl.SourceRef,
 		StagingNetwork:    tmpl.StagingNetwork,
 	}
+	// Surface the most recent worker job for this template so the UI can
+	// (a) mark the right wizard step as the errored one — without this it
+	// can only guess from template_state + vcenter_vm_id and gets it wrong
+	// when template_provision fails AFTER the clone succeeded — and (b)
+	// show the actual error string instead of "check worker logs".
+	if h.db == nil {
+		return resp
+	}
+	job, err := h.db.GetLatestJobForTemplate(ctx, tmpl.ID)
+	if err != nil {
+		h.logger.Warn("wizardState: GetLatestJobForTemplate failed", "template_id", tmpl.ID, "error", err)
+		return resp
+	}
+	if job == nil {
+		return resp
+	}
+	resp.LastJobType = job.Type
+	resp.LastJobStatus = job.Status
+	// job.Result is a JSON blob ({"error": "..."} on failure, or a success
+	// envelope). Pull out the error string if present so the wizard can
+	// render it inline.
+	if len(job.Result) > 0 {
+		var parsed struct {
+			Error string `json:"error"`
+		}
+		if jerr := json.Unmarshal(job.Result, &parsed); jerr == nil && parsed.Error != "" {
+			resp.LastJobError = parsed.Error
+		}
+	}
+	return resp
 }
 
 // buildTemplateVMName produces a vCenter-safe VM name from the template's

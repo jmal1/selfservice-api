@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"net/http/httptest"
 	"strings"
@@ -124,7 +125,7 @@ func TestWriteStateConflict(t *testing.T) {
 
 func TestWizardStateNil(t *testing.T) {
 	h := &Handler{}
-	got := h.wizardState(nil)
+	got := h.wizardState(context.Background(), nil)
 	if got.TemplateState != "" || got.TemplateID != uuid.Nil {
 		t.Errorf("wizardState(nil) = %+v; want zero value", got)
 	}
@@ -141,7 +142,7 @@ func TestWizardStateHappy(t *testing.T) {
 		SourceRef:      "src-tpl-uuid",
 		StagingNetwork: "LabVMs-VLAN30",
 	}
-	got := h.wizardState(tmpl)
+	got := h.wizardState(context.Background(), tmpl)
 	if got.TemplateID != id {
 		t.Errorf("TemplateID = %v; want %v", got.TemplateID, id)
 	}
