@@ -156,6 +156,11 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 		r.Route("/admin", func(r chi.Router) {
 			r.Use(middleware.RequireRole(models.RoleAdmin))
 
+			// Platform health dashboard — probes all backend dependencies
+			// (db, nats, vcenter, opnsense, engine) in parallel with a 5s
+			// per-probe timeout. See internal/api/handlers/admin_health.go.
+			r.Get("/health", h.AdminHealth)
+
 			r.Get("/users", h.AdminListUsers)
 			r.Patch("/users/{userID}/quotas", h.AdminUpdateQuotas)
 

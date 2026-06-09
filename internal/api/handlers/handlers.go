@@ -32,6 +32,10 @@ type Handler struct {
 	logger          *slog.Logger
 	allowedOrigins  []string
 	templatesFolder *TemplatesFolderHandler
+	// healthDeps is the dependency bag for GET /admin/health. Optional
+	// fields: nil pointers cause the corresponding probe to report
+	// "not_configured" instead of failing.
+	healthDeps HealthDeps
 }
 
 // VCenterConsole is the interface for vCenter console operations needed by the API.

@@ -106,6 +106,22 @@ func (c *Client) Close() {
 	c.conn.Drain()
 }
 
+// IsConnected reports whether the underlying nats.Conn is in CONNECTED state.
+// Used by /admin/health to report broker reachability without doing a round-trip.
+func (c *Client) IsConnected() bool {
+	return c.conn != nil && c.conn.IsConnected()
+}
+
+// ConnectedURL returns the NATS server URL the client is currently
+// connected to (e.g. nats://selfservice-nats:4222), or "" if disconnected.
+// Used in /admin/health diagnostic payloads.
+func (c *Client) ConnectedURL() string {
+	if c.conn == nil {
+		return ""
+	}
+	return c.conn.ConnectedUrl()
+}
+
 func (c *Client) publish(subject string, evt Event) error {
 	data, err := json.Marshal(evt)
 	if err != nil {

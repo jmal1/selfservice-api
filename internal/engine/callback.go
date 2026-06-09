@@ -35,6 +35,12 @@ func NewCallbackServer(engine *Engine, logger *slog.Logger) *CallbackServer {
 // Router returns the chi router for callback endpoints.
 func (s *CallbackServer) Router() http.Handler {
 	r := chi.NewRouter()
+	// Liveness probe used by the api-gateway /admin/health endpoint and by
+	// k8s readiness checks. Unauthenticated by design — it never reveals
+	// state, just returns 200 if the callback server's HTTP listener is
+	// up. If the engine is wedged enough to crash this listener, this
+	// will fail-closed and the dashboard will report the engine as down.
+	r.Get("/healthz", s.handleHealthz)
 	r.Route("/internal/callback/{token}", func(r chi.Router) {
 		r.Use(s.validateToken)
 		r.Post("/action", s.handleAction)
@@ -43,6 +49,19 @@ func (s *CallbackServer) Router() http.Handler {
 		r.Post("/heartbeat", s.handleHeartbeat)
 	})
 	return r
+}
+
+// handleHealthz is the liveness probe. Returns {"status":"ok"} with the
+// engine_id of the responding instance so /admin/health can show which
+// pod replied.
+func (s *CallbackServer) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	engineID := ""
+	if s.engine != nil {
+		engineID = s.engine.engineID
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(fmt.Sprintf(`{"status":"ok","engine_id":%q}`, engineID)))
 }
 
 // validateToken middleware checks the callback token against the runs table.

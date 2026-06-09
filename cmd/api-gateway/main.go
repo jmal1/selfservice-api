@@ -98,6 +98,13 @@ func main() {
 		logger.Info("vCenter folder enumeration enabled", "folder", cfg.VCenter.TemplatesFolder)
 	}
 
+	// Pre-declare so the in-process vSphere probe (started below) can be
+	// passed into the /admin/health dependency bag. The bag is wired
+	// *after* the probe is constructed; nil here means /admin/health
+	// reports vcenter as "not_configured" (consistent with the rest of
+	// the codebase: missing optional dep -> graceful degrade, not crash).
+	var vsphereProbeHandle *vsphereHealth.Probe
+
 	// Start the vCenter credentials health probe (OP-1). Runs in-process so
 	// it shares the api-gateway pod lifecycle. The probe creates a fresh
 	// govmomi client every cycle so cached sessions cannot mask a rotated
@@ -120,11 +127,30 @@ func main() {
 				interval = 5 * time.Minute
 			}
 			go probe.RunPeriodic(ctx, interval)
+			vsphereProbeHandle = probe
 			logger.Info("vsphere health probe started",
 				"interval", interval,
 				"pushgateway_configured", cfg.VCenter.HealthPushgatewayURL != "")
 		}
 	}
+
+	// Wire the /admin/health dependency bag. Each field is optional —
+	// missing values cause that probe to report "not_configured" rather
+	// than failing the whole endpoint. The engine URL falls back to the
+	// in-cluster service DNS used everywhere else in the codebase.
+	engineHealthURL := getenvOrDefault("ENGINE_HEALTH_URL",
+		"http://crucible-engine.selfservice.svc.cluster.local:8081/healthz")
+	handler.WithHealthDeps(handlers.HealthDeps{
+		Pool:            pool,
+		NATS:            natsClient,
+		VSphere:         vsphereProbeHandle,
+		OPNsenseBaseURL: cfg.OPNsense.BaseURL,
+		EngineHealthURL: engineHealthURL,
+	})
+	logger.Info("admin health endpoint wired",
+		"opnsense_configured", cfg.OPNsense.BaseURL != "",
+		"vsphere_probe_configured", vsphereProbeHandle != nil,
+		"engine_url", engineHealthURL)
 
 	router := routes.Setup(handler, authProvider, queries, cfg.Server.AllowedOrigins)
 
@@ -162,4 +188,15 @@ func main() {
 	}
 
 	logger.Info("server stopped")
+}
+
+// getenvOrDefault returns the value of the named environment variable, or
+// def if the variable is unset or empty. Used for optional wiring like
+// the engine /healthz URL where the in-cluster service DNS is the right
+// default but ops may want to override (e.g. point at a sidecar in dev).
+func getenvOrDefault(name, def string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return def
 }
