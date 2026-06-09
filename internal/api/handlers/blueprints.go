@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -178,16 +179,14 @@ func (h *Handler) DeployBlueprint(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	if usage.ActivePods+1 > user.MaxPods {
-		http.Error(w, "pod quota exceeded", http.StatusConflict)
-		return
-	}
-	if usage.UsedVCPUs+totalVCPUs > user.MaxVCPUs {
-		http.Error(w, "vCPU quota exceeded", http.StatusConflict)
-		return
-	}
-	if usage.UsedRAMMB+totalRAM > user.MaxRAMMB {
-		http.Error(w, "RAM quota exceeded", http.StatusConflict)
+	if err := ValidateQuotas(usage, user, 1, totalVCPUs, totalRAM); err != nil {
+		var qe *QuotaError
+		if errors.As(err, &qe) {
+			http.Error(w, qe.Error(), http.StatusConflict)
+		} else {
+			h.logger.Error("quota validation failed", "error", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+		}
 		return
 	}
 
