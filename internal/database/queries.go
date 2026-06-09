@@ -195,15 +195,27 @@ func (q *Queries) CreateTemplate(ctx context.Context, req models.CreateTemplateR
 	return &t, err
 }
 
-// ListTemplatesForUser returns templates accessible to a user based on their role.
+// ListTemplatesForUser returns templates accessible to a user based on their
+// role. A template is visible if any of the following hold:
+//
+//   - it has no template_access rules (open to all)
+//   - the user's role appears in template_access.role
+//   - the user's id appears in template_access.user_id
+//   - 'admin' appears in template_access.role (admins see everything)
+//
+// Uses EXISTS subqueries instead of a LEFT JOIN so the SELECT list (sharing
+// the unqualified `templateSelectCols` const) is unambiguous. The previous
+// LEFT JOIN form silently broke once a real template_access row existed
+// because `id` resolves to both templates.id and template_access.id.
 func (q *Queries) ListTemplatesForUser(ctx context.Context, userID uuid.UUID, role string) ([]models.Template, error) {
 	rows, err := q.pool.Query(ctx, `
-		SELECT DISTINCT `+templateSelectCols+`
+		SELECT `+templateSelectCols+`
 		FROM templates t
-		LEFT JOIN template_access ta ON t.id = ta.template_id
 		WHERE t.is_active = true
-		  AND (ta.role = $1 OR ta.user_id = $2 OR ta.role = 'admin'
-		       OR NOT EXISTS (SELECT 1 FROM template_access WHERE template_id = t.id))
+		  AND (NOT EXISTS (SELECT 1 FROM template_access ta WHERE ta.template_id = t.id)
+		       OR EXISTS (SELECT 1 FROM template_access ta
+		                  WHERE ta.template_id = t.id
+		                    AND (ta.role = $1 OR ta.user_id = $2 OR ta.role = 'admin')))
 		ORDER BY t.name
 	`, role, userID)
 	if err != nil {
