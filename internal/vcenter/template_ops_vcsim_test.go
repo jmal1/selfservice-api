@@ -88,6 +88,57 @@ func TestAttachNetworkAdapter_VCsim_RejectsVMWithNoNICs(t *testing.T) {
 	})
 }
 
+// TestResolveVMByName_VCsim_HappyPath verifies that ResolveVMByName
+// returns a vCenter MoRef (vm-NNN) when given the inventory name of a
+// real VM. This is the resolution step the template wizard does for
+// source_type=clone_template (where source_ref is a Crucible UUID, not
+// a vCenter MoRef). Without it, the worker hands the UUID straight to
+// vCenter and gets "object has been deleted or has not been completely
+// created" — the original T4 bug.
+func TestResolveVMByName_VCsim_HappyPath(t *testing.T) {
+	withSimulator(t, func(ctx context.Context, c *Client, vimc *vim25.Client) {
+		vm, expectedMoref := firstVM(t, ctx, vimc)
+		name, err := vm.ObjectName(ctx)
+		if err != nil {
+			t.Fatalf("ObjectName: %v", err)
+		}
+		if name == "" {
+			t.Fatal("simulator VM has empty name")
+		}
+		got, err := c.ResolveVMByName(ctx, name)
+		if err != nil {
+			t.Fatalf("ResolveVMByName(%q): %v", name, err)
+		}
+		if got != expectedMoref {
+			t.Errorf("ResolveVMByName(%q) = %q, want %q", name, got, expectedMoref)
+		}
+	})
+}
+
+func TestResolveVMByName_VCsim_UnknownVMReturnsError(t *testing.T) {
+	withSimulator(t, func(ctx context.Context, c *Client, _ *vim25.Client) {
+		_, err := c.ResolveVMByName(ctx, "definitely-not-a-real-vm-name-xyz")
+		if err == nil {
+			t.Fatal("expected error for unknown VM name, got nil")
+		}
+		if !strings.Contains(err.Error(), "find VM") {
+			t.Errorf("error %q should mention 'find VM'", err.Error())
+		}
+	})
+}
+
+func TestResolveVMByName_VCsim_EmptyNameRejected(t *testing.T) {
+	withSimulator(t, func(ctx context.Context, c *Client, _ *vim25.Client) {
+		_, err := c.ResolveVMByName(ctx, "")
+		if err == nil {
+			t.Fatal("expected error for empty name, got nil")
+		}
+		if !strings.Contains(err.Error(), "vm name required") {
+			t.Errorf("error %q should mention 'vm name required'", err.Error())
+		}
+	})
+}
+
 func TestAttachNetworkAdapter_VCsim_SwapsNICToRequestedNetwork(t *testing.T) {
 	withSimulator(t, func(ctx context.Context, c *Client, vimc *vim25.Client) {
 		vm, moref := firstVM(t, ctx, vimc)
