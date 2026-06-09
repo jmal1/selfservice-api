@@ -24,4 +24,37 @@ If a user request would require bypassing approval gates, reaching outside the p
 - DB migrations: numbered `internal/database/migrations/NNNNNN_name.up.sql` + matching `.down.sql`. Never edit a shipped migration in place.
 - API routes: register in `internal/api/routes/routes.go`. Admin-only routes go under the `r.Use(middleware.RequireRole(models.RoleAdmin))` group.
 
+## When changing user-facing Crucible behavior — update the wiki
+
+The instructor wiki (`/wiki` in the UI) is sourced from this repo via
+`make wiki-bundle`. The seed files in `Makefile`'s `WIKI_SEEDS` plus
+their transitively-linked closure are embedded into the binary and
+served by `/api/v1/wiki/*` to instructors and admins.
+
+**If your change touches any of the following, update the wiki in the
+same PR:**
+
+- `Workflow`, `Action`, `Playlist`, `Quota` JSON schemas (DB
+  migrations under `internal/database/migrations/`, struct tags in
+  `internal/models/`). Update `AGENTS.md` §3 and the relevant
+  `docs/instructor/*.md` page (workflows, actions, playlists).
+- Allowed enum values for `execution_mode`, `status`,
+  `creation_mode`, `scoring_mode`, `action_type`, `action_category`,
+  or `supported_platforms`. Update `AGENTS.md` §§3, 6.
+- Runner contract — `run_action`, `ctx_set`, `CTX_*` env vars,
+  `/opt/crucible/lib/actions.sh` helpers, validation hooks. Update
+  `AGENTS.md` §5 and `docs/instructor/runner-environment.md` /
+  `docs/instructor/actions.md`.
+- Quota limits, rate limits, or assessment-engine timeouts that an
+  instructor would hit during authoring. Update `AGENTS.md` §12 and
+  `docs/instructor/troubleshooting.md`.
+- New library actions in `internal/seeds/` — update `AGENTS.md` §7
+  and `docs/instructor/actions.md` (library catalog section).
+
+After editing markdown, run `make wiki-bundle` to regenerate
+`internal/docs/_bundle/`; commit the regenerated bundle alongside the
+markdown changes. CI runs `make verify-wiki` to ensure the checked-in
+bundle matches what the seeds produce, so an out-of-sync bundle will
+fail the build.
+
 For everything else, follow repository conventions visible in the existing code.
