@@ -105,6 +105,11 @@ spec:
             - name: ALLOWED_ORIGINS
               value: {{ .Values.api.allowedOrigins | quote }}
             {{- end }}
+            # Engine health probe target — release-scoped so the
+            # default (selfservice-engine) tracks the helm release name
+            # automatically. Used by GET /api/v1/admin/health.
+            - name: ENGINE_HEALTH_URL
+              value: "http://{{ .Release.Name }}-engine.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.engine.port | default 8081 }}/healthz"
           livenessProbe:
             httpGet:
               path: /healthz

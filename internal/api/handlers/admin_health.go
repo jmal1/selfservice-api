@@ -295,10 +295,14 @@ func probeOPNsense(ctx context.Context, baseURL string, client *http.Client) dep
 		}
 	}
 	// Probe the firmware status endpoint — it's authenticated-but-cheap
-	// and reachable on every OPNsense build we care about. If the URL
-	// doesn't include credentials we still get a useful signal: 401 ==
-	// reachable but auth wrong (degraded), connection error == down.
-	url := strings.TrimRight(baseURL, "/") + "/api/diagnostics/firmware/status"
+	// and reachable on every OPNsense build we care about. API key+secret
+	// aren't required for the probe — the goal is reachability + auth
+	// surface. We hit /diagnostics/firmware/status (a small JSON status
+	// endpoint). 200 == healthy, 401 == reachable but auth wrong
+	// (degraded), connection error == down. Path is relative to BaseURL
+	// which already includes /api (see internal/config and
+	// internal/opnsense/client.go).
+	url := strings.TrimRight(baseURL, "/") + "/diagnostics/firmware/status"
 	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 	start := time.Now()
