@@ -120,6 +120,7 @@ func run(logger *slog.Logger) error {
 			return fmt.Errorf("%s=true but %s is empty", envLifecycleEnabled, envLifecycleTemplate)
 		}
 		cfg := checks.DefaultPodLifecycleConfig(tmpl)
+		cfg.Logger = logger.With("component", "pod_lifecycle")
 		if v := os.Getenv(envLifecycleReadyTimeout); v != "" {
 			d, err := time.ParseDuration(v)
 			if err != nil {

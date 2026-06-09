@@ -85,12 +85,33 @@ func (r *Runner) runOne(ctx context.Context, check Check) (res Result) {
 				"panic", p,
 			)
 		}
-		r.Logger.Info("check completed",
-			"check", res.Name,
-			"success", res.Success,
-			"http_status", res.HTTPStatus,
-			"duration_ms", res.Duration.Milliseconds(),
-		)
+		// Always log a one-liner per check. On failure we ERROR-log with
+		// the full error message so an operator paging on this can see the
+		// reason without cross-referencing other services. A 30-day log
+		// retention means an alert that fires now must be diagnosable
+		// from logs alone — silent failures are the worst kind.
+		if res.Success {
+			r.Logger.Info("check completed",
+				"check", res.Name,
+				"success", true,
+				"severity", string(res.Severity),
+				"http_status", res.HTTPStatus,
+				"duration_ms", res.Duration.Milliseconds(),
+			)
+		} else {
+			errMsg := ""
+			if res.Err != nil {
+				errMsg = res.Err.Error()
+			}
+			r.Logger.Error("check failed",
+				"check", res.Name,
+				"success", false,
+				"severity", string(res.Severity),
+				"http_status", res.HTTPStatus,
+				"duration_ms", res.Duration.Milliseconds(),
+				"error", errMsg,
+			)
+		}
 	}()
 
 	status, err := check.Run(checkCtx, r.Client)

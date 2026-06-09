@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -38,6 +39,13 @@ type PodLifecycleConfig struct {
 	// 5 minutes is shorter than a normal lifecycle run so legitimate in-flight
 	// runs aren't trampled when overlap happens.
 	PreCleanMaxAge time.Duration
+
+	// Logger receives per-step audit lines. Every observable action
+	// (template resolve, orphan pre-clean, create, status poll, destroy)
+	// emits a structured line so an operator paging on this check can
+	// reconstruct what happened without re-running the test. Defaults to
+	// slog.Default() if nil.
+	Logger *slog.Logger
 }
 
 // DefaultPodLifecycleConfig returns the production-tuned defaults.
@@ -74,28 +82,45 @@ func PodLifecycle(cfg PodLifecycleConfig) synthetic.Check {
 
 // runPodLifecycle is the actual implementation, factored out for testability.
 // All HTTP status returns reflect the LAST status seen so failures surface
-// the offending response code in the metric.
+// the offending response code in the metric. Every step emits a structured
+// log line via cfg.Logger so an alert page contains a complete audit trail
+// without needing to re-run the check.
 func runPodLifecycle(ctx context.Context, c *synthetic.Client, cfg PodLifecycleConfig) (int, error) {
+	log := cfg.Logger
+	if log == nil {
+		log = slog.Default()
+	}
+	log = log.With("check", "pod_lifecycle", "template", cfg.TemplateName)
+
 	// 1. Resolve template name -> UUID via the live /templates endpoint.
+	log.Info("lifecycle: resolving template")
 	tmplID, status, err := resolveTemplateID(ctx, c, cfg.TemplateName)
 	if err != nil {
+		log.Error("lifecycle: resolve template failed", "http_status", status, "error", err.Error())
 		return status, fmt.Errorf("resolve template %q: %w", cfg.TemplateName, err)
 	}
+	log.Info("lifecycle: template resolved", "template_id", tmplID)
 
 	// 2. Pre-clean: destroy orphan synthetic pods so they don't accumulate
 	// when a previous run was killed mid-flight.
-	if status, err := preCleanOrphans(ctx, c, cfg.PreCleanMaxAge); err != nil {
+	log.Info("lifecycle: pre-cleaning orphans", "max_age", cfg.PreCleanMaxAge)
+	if status, err := preCleanOrphans(ctx, c, cfg.PreCleanMaxAge, log); err != nil {
 		// Pre-clean failure is logged via the returned error but does NOT
 		// fail the check on its own; the create+destroy below is the
 		// primary assertion. We do, however, propagate the status.
+		log.Error("lifecycle: pre-clean failed (continuing)", "http_status", status, "error", err.Error())
 		return status, fmt.Errorf("pre-clean (continuing): %w", err)
 	}
 
 	// 3. Create the pod.
+	log.Info("lifecycle: creating pod", "template_id", tmplID)
 	podID, status, err := createSyntheticPod(ctx, c, tmplID)
 	if err != nil {
+		log.Error("lifecycle: create pod failed", "http_status", status, "error", err.Error())
 		return status, fmt.Errorf("create pod: %w", err)
 	}
+	log.Info("lifecycle: pod created", "pod_id", podID, "http_status", status)
+	log = log.With("pod_id", podID)
 
 	// 4. Always attempt to destroy the pod, even on later failures, to keep
 	// the lab tidy. Deferred so a polling timeout still triggers cleanup.
@@ -104,23 +129,37 @@ func runPodLifecycle(ctx context.Context, c *synthetic.Client, cfg PodLifecycleC
 		// may already be at its deadline.
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), cfg.DestroyTimeout)
 		defer cancel()
-		_, _ = destroyPod(cleanupCtx, c, podID)
+		log.Info("lifecycle: deferred cleanup destroy")
+		s, err := destroyPod(cleanupCtx, c, podID)
+		if err != nil {
+			log.Warn("lifecycle: deferred destroy failed (best effort)", "http_status", s, "error", err.Error())
+		} else {
+			log.Info("lifecycle: deferred destroy issued", "http_status", s)
+		}
 	}()
 
 	// 5. Poll for active.
+	log.Info("lifecycle: polling for active", "timeout", cfg.ReadyTimeout)
 	if status, err := waitForPodStatus(ctx, c, podID, []string{"active"}, cfg.ReadyTimeout, 15*time.Second); err != nil {
+		log.Error("lifecycle: wait for active failed", "http_status", status, "error", err.Error())
 		return status, fmt.Errorf("wait for active: %w", err)
 	}
+	log.Info("lifecycle: pod reached active")
 
 	// 6. Delete.
+	log.Info("lifecycle: deleting pod")
 	if status, err := destroyPod(ctx, c, podID); err != nil {
+		log.Error("lifecycle: delete pod failed", "http_status", status, "error", err.Error())
 		return status, fmt.Errorf("delete pod: %w", err)
 	}
 
 	// 7. Poll for destroyed.
+	log.Info("lifecycle: polling for destroyed", "timeout", cfg.DestroyTimeout)
 	if status, err := waitForPodStatus(ctx, c, podID, []string{"destroyed"}, cfg.DestroyTimeout, 5*time.Second); err != nil {
+		log.Error("lifecycle: wait for destroyed failed", "http_status", status, "error", err.Error())
 		return status, fmt.Errorf("wait for destroyed: %w", err)
 	}
+	log.Info("lifecycle: pod destroyed; check passed")
 
 	return http.StatusOK, nil
 }
@@ -184,32 +223,53 @@ func listMyPods(ctx context.Context, c *synthetic.Client) ([]listPodEntry, int, 
 // preCleanOrphans destroys any pod owned by the synthetic user whose name
 // begins with SyntheticPodNamePrefix and whose CreatedAt is older than
 // maxAge. Errors during deletion are logged via the returned error but
-// each pod is attempted independently.
-func preCleanOrphans(ctx context.Context, c *synthetic.Client, maxAge time.Duration) (int, error) {
+// each pod is attempted independently. The log argument receives a per-pod
+// audit line for each orphan considered so we can see WHY a pre-clean did
+// or didn't act (e.g. "too recent, skipped", "destroy_failed, deleted").
+func preCleanOrphans(ctx context.Context, c *synthetic.Client, maxAge time.Duration, log *slog.Logger) (int, error) {
 	pods, status, err := listMyPods(ctx, c)
 	if err != nil {
 		return status, err
 	}
 	cutoff := time.Now().Add(-maxAge)
 	var firstErr error
+	considered, skippedTerminal, skippedRecent, attempted, failed := 0, 0, 0, 0, 0
 	for _, p := range pods {
 		if !strings.HasPrefix(p.Name, SyntheticPodNamePrefix) {
 			continue
 		}
+		considered++
 		if p.Status == "destroying" || p.Status == "destroyed" {
+			skippedTerminal++
 			continue
 		}
 		if !p.CreatedAt.IsZero() && p.CreatedAt.After(cutoff) {
 			// Pod is recent enough that another active run may own it.
+			skippedRecent++
+			log.Debug("pre-clean: skipping recent orphan",
+				"pod_id", p.ID, "name", p.Name, "status", p.Status, "created_at", p.CreatedAt)
 			continue
 		}
+		attempted++
+		log.Info("pre-clean: destroying orphan",
+			"pod_id", p.ID, "name", p.Name, "status", p.Status, "created_at", p.CreatedAt)
 		if delStatus, err := destroyPod(ctx, c, p.ID); err != nil {
+			failed++
+			log.Warn("pre-clean: destroy orphan failed",
+				"pod_id", p.ID, "http_status", delStatus, "error", err.Error())
 			if firstErr == nil {
 				firstErr = fmt.Errorf("destroy orphan %s: %w", p.ID, err)
 				status = delStatus
 			}
 		}
 	}
+	log.Info("pre-clean: summary",
+		"considered", considered,
+		"skipped_terminal", skippedTerminal,
+		"skipped_recent", skippedRecent,
+		"attempted", attempted,
+		"failed", failed,
+	)
 	return status, firstErr
 }
 
