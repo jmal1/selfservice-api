@@ -72,12 +72,61 @@ var allowedExts = map[string]bool{
 // is cheaper than two patterns.
 var linkRegexp = regexp.MustCompile(`\]\(([^)#\s]+)(?:#[^)]*)?\)`)
 
+// h1Regexp matches the first ATX-style level-1 heading in a markdown
+// file. We look for a line that begins (modulo leading whitespace) with
+// a single `#` followed by space and the heading text. The (?m) flag
+// makes `^` match line starts, not just file start, so a leading
+// front-matter block or HTML comment doesn't hide the H1.
+var h1Regexp = regexp.MustCompile(`(?m)^\s{0,3}#\s+(.+?)\s*$`)
+
+// languageHintByExt is the parenthesised label used in titles for
+// source files. Mirrors the language map in the UI but lives here so
+// the bundler doesn't need to import any frontend code.
+var languageHintByExt = map[string]string{
+	".go":   "Go",
+	".sql":  "SQL",
+	".sh":   "Bash",
+	".yaml": "YAML",
+	".yml":  "YAML",
+	".json": "JSON",
+	".txt":  "Text",
+}
+
+// deriveTitle produces the human-friendly display name for the manifest
+// entry. For markdown it pulls the first `# H1` line; for source files
+// it humanises the basename. Falls back to the basename if the markdown
+// has no H1 (rare — we'd want CI to flag that, but the wiki should
+// still render).
+func deriveTitle(path string, data []byte, ext string) string {
+	if ext == ".md" {
+		if m := h1Regexp.FindSubmatch(data); m != nil {
+			// Strip surrounding markdown emphasis (`**bold**`,
+			// `_italic_`) and inline code backticks so the sidebar
+			// shows plain text rather than literal punctuation.
+			t := string(m[1])
+			t = strings.Trim(t, "*_`")
+			return t
+		}
+	}
+	base := filepath.Base(path)
+	if hint, ok := languageHintByExt[ext]; ok {
+		return fmt.Sprintf("%s (%s)", base, hint)
+	}
+	return base
+}
+
 // ManifestEntry describes one file in the bundle. Path is repo-relative
 // (the same path used in the source tree and in the embed.FS); size and
 // sha let the API report cache-friendly ETags and let CI catch
 // inadvertent drift.
 type ManifestEntry struct {
-	Path       string `json:"path"`
+	Path string `json:"path"`
+	// Title is the human-friendly display name for the UI sidebar.
+	// For markdown files it's the first `# H1` heading (whitespace-
+	// trimmed). For source files it's a humanised version of the
+	// basename (filename + parenthesised language hint). Always
+	// non-empty so the UI can render it unconditionally.
+	Title      string `json:"title"`
 	Size       int64  `json:"size"`
 	SHA256     string `json:"sha256"`
 	IsMarkdown bool   `json:"is_markdown"`
@@ -214,6 +263,7 @@ func computeClosure(repoRoot string, seeds []string, verbose bool) (*Manifest, e
 		sum := sha256.Sum256(data)
 		entry := &ManifestEntry{
 			Path:       current,
+			Title:      deriveTitle(current, data, ext),
 			Size:       info.Size(),
 			SHA256:     hex.EncodeToString(sum[:]),
 			IsMarkdown: ext == ".md",
