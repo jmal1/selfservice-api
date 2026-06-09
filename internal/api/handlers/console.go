@@ -29,21 +29,6 @@ func (h *Handler) VMConsoleWS(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.UserIDFromContext(ctx)
 	role := middleware.RoleFromContext(ctx)
 
-	// Configure origin check using allowed origins from config
-	upgrader := wsUpgrader
-	upgrader.CheckOrigin = func(r *http.Request) bool {
-		origin := r.Header.Get("Origin")
-		if origin == "" {
-			return true
-		}
-		for _, allowed := range h.allowedOrigins {
-			if origin == allowed {
-				return true
-			}
-		}
-		return false
-	}
-
 	// Parse and validate IDs
 	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
 	if err != nil {
@@ -88,6 +73,62 @@ func (h *Handler) VMConsoleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.runWebMKSProxy(w, r, runWebMKSProxyArgs{
+		VCenterVMID:     *vm.VCenterVMID,
+		DisplayName:     vm.DisplayName,
+		AuditOpenEvent:  "console.open",
+		AuditCloseEvent: "console.close",
+		AuditOpts: []audit.Option{
+			audit.Resource("vm", vmID),
+			audit.IP(r.RemoteAddr),
+			audit.Detail("vm_name", vm.DisplayName),
+			audit.Detail("moref", *vm.VCenterVMID),
+		},
+		LogFields: []any{"user", userID, "vm", vm.DisplayName, "pod", pod.Name},
+	})
+}
+
+// runWebMKSProxyArgs bundles the per-request inputs that change between
+// pod-VM consoles and template-build-VM consoles.
+//
+// All authorization, resource lookup, and state validation MUST be done
+// by the caller before invoking runWebMKSProxy — this helper assumes the
+// request is authorized and the vCenter VM ID is valid.
+type runWebMKSProxyArgs struct {
+	VCenterVMID     string         // vCenter VM moref to acquire a ticket for
+	DisplayName     string         // human-friendly name for logs/audit detail
+	AuditOpenEvent  string         // e.g. "console.open" or "template.console.open"
+	AuditCloseEvent string         // e.g. "console.close" or "template.console.close"
+	AuditOpts       []audit.Option // resource/IP/details merged into both open+close events
+	LogFields       []any          // structured fields appended to every log line
+}
+
+// runWebMKSProxy acquires a WebMKS ticket for VCenterVMID, upgrades the
+// client to a WebSocket, dials ESXi, and proxies messages bidirectionally
+// until either side closes. This is the shared path between pod-VM
+// consoles (VMConsoleWS) and template-build-VM consoles
+// (TemplateBuildConsoleWS) — see internal/api/handlers/templates_console.go.
+//
+// All caller-side responsibilities (auth, lookup, state gating) are
+// expected to be complete before this is called.
+func (h *Handler) runWebMKSProxy(w http.ResponseWriter, r *http.Request, args runWebMKSProxyArgs) {
+	ctx := r.Context()
+
+	// Configure origin check using allowed origins from config
+	upgrader := wsUpgrader
+	upgrader.CheckOrigin = func(r *http.Request) bool {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true
+		}
+		for _, allowed := range h.allowedOrigins {
+			if origin == allowed {
+				return true
+			}
+		}
+		return false
+	}
+
 	// Check vCenter client is available
 	if h.vc == nil {
 		http.Error(w, "console not available (vCenter not configured)", http.StatusServiceUnavailable)
@@ -95,24 +136,19 @@ func (h *Handler) VMConsoleWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Acquire WebMKS ticket from vCenter
-	ticket, err := h.vc.AcquireWebMKSTicket(ctx, *vm.VCenterVMID)
+	ticket, err := h.vc.AcquireWebMKSTicket(ctx, args.VCenterVMID)
 	if err != nil {
-		h.logger.Error("console: acquire ticket failed", "error", err, "moref", *vm.VCenterVMID)
+		h.logger.Error("console: acquire ticket failed", "error", err, "moref", args.VCenterVMID)
 		http.Error(w, "failed to acquire console ticket", http.StatusInternalServerError)
 		return
 	}
 
 	// Audit: console opened
-	audit.Log(ctx, h.db, "console.open",
-		audit.Resource("vm", vmID),
-		audit.IP(r.RemoteAddr),
-		audit.Detail("vm_name", vm.DisplayName),
-		audit.Detail("moref", *vm.VCenterVMID),
-	)
+	audit.Log(ctx, h.db, args.AuditOpenEvent, args.AuditOpts...)
 
 	// Connect to ESXi WebMKS endpoint
 	esxiURL := fmt.Sprintf("wss://%s:%d/ticket/%s", ticket.Host, ticket.Port, ticket.Ticket)
-	h.logger.Info("console: connecting to ESXi", "url", esxiURL, "user", userID, "vm", vm.DisplayName)
+	h.logger.Info("console: connecting to ESXi", append([]any{"url", esxiURL}, args.LogFields...)...)
 
 	esxiDialer := websocket.Dialer{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
@@ -146,14 +182,11 @@ func (h *Handler) VMConsoleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer clientConn.Close()
 
-	h.logger.Info("console: session started", "user", userID, "vm", vm.DisplayName, "pod", pod.Name)
-
-	h.logger.Info("console: proxy starting",
-		"user", userID,
-		"vm", vm.DisplayName,
+	h.logger.Info("console: session started", args.LogFields...)
+	h.logger.Info("console: proxy starting", append([]any{
 		"esxi_subprotocol", esxiConn.Subprotocol(),
 		"client_subprotocol", clientConn.Subprotocol(),
-	)
+	}, args.LogFields...)...)
 
 	// Bidirectional proxy
 	var wg sync.WaitGroup
@@ -163,7 +196,7 @@ func (h *Handler) VMConsoleWS(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		defer wg.Done()
 		err := proxyWS(clientConn, esxiConn)
-		h.logger.Info("console: client→esxi closed", "error", err, "vm", vm.DisplayName)
+		h.logger.Info("console: client→esxi closed", append([]any{"error", err}, args.LogFields...)...)
 		esxiConn.WriteMessage(websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 	}()
@@ -172,22 +205,18 @@ func (h *Handler) VMConsoleWS(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		defer wg.Done()
 		err := proxyWS(esxiConn, clientConn)
-		h.logger.Info("console: esxi→client closed", "error", err, "vm", vm.DisplayName)
+		h.logger.Info("console: esxi→client closed", append([]any{"error", err}, args.LogFields...)...)
 		clientConn.WriteMessage(websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 	}()
 
 	wg.Wait()
 
-	// Audit: console closed
-	audit.Log(context.Background(), h.db, "console.close",
-		audit.Resource("vm", vmID),
-		audit.IP(r.RemoteAddr),
-		audit.Detail("vm_name", vm.DisplayName),
-		audit.Detail("moref", *vm.VCenterVMID),
-	)
+	// Audit: console closed (use background ctx because r.Context() may
+	// already be done when the WS closes)
+	audit.Log(context.Background(), h.db, args.AuditCloseEvent, args.AuditOpts...)
 
-	h.logger.Info("console: session ended", "user", userID, "vm", vm.DisplayName)
+	h.logger.Info("console: session ended", args.LogFields...)
 }
 
 // proxyWS copies messages from src to dst until an error occurs.

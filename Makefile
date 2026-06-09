@@ -12,6 +12,7 @@ COMPOSE       ?= docker compose -f docker-compose.dev.yaml
 # `make wiki-bundle`. The bundler will then walk its links recursively.
 WIKI_SEEDS    := \
 	docs/instructor/overview.md \
+	docs/instructor/templates.md \
 	AGENTS.md \
 	docs/ai-prompts/build-workflow.md \
 	docs/ai/build-workflow-prompt.md
