@@ -1,0 +1,90 @@
+{{- if and .Values.synthetic.enabled .Values.synthetic.janitor.enabled -}}
+# Standalone synthetic-pod janitor CronJob.
+#
+# Independent of the pod_lifecycle check's built-in pre-clean — runs from
+# its own (typically daily) schedule so orphan synthetic pods don't
+# accumulate even if the regular */10 monitor is paused, crash-looping,
+# or stuck. Reuses the same synthetic-api-monitor image, secrets, and
+# pushgateway plumbing as the regular monitor; SYNTHETIC_JANITOR_MODE=true
+# replaces the full check set with the single synthetic_janitor check.
+#
+# Failure of synthetic_janitor is warning-level (the steady state is "0
+# pods cleaned" — failures usually mean the API is down or the synthetic
+# token is invalid, which other checks already page on).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ .Release.Name }}-synthetic-janitor
+  labels:
+    app.kubernetes.io/name: selfservice-synthetic-janitor
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: synthetic-monitor
+spec:
+  schedule: {{ .Values.synthetic.janitor.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  startingDeadlineSeconds: 120
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: {{ .Values.synthetic.janitor.activeDeadlineSeconds | default 600 }}
+      ttlSecondsAfterFinished: 1800
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: selfservice-synthetic-janitor
+            app.kubernetes.io/component: synthetic-monitor
+        spec:
+          restartPolicy: Never
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: synthetic-janitor
+              image: "{{ .Values.synthetic.image }}:{{ .Values.synthetic.imageTag | default .Values.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              env:
+                - name: SYNTHETIC_BASE_URL
+                  value: {{ .Values.synthetic.baseURL | quote }}
+                - name: SYNTHETIC_PUSHGATEWAY_URL
+                  value: {{ .Values.synthetic.pushgatewayURL | quote }}
+                - name: SYNTHETIC_JOB
+                  value: {{ .Values.synthetic.job | quote }}
+                # Distinct layer label so janitor metrics don't blend
+                # with the */10 monitor's results in Pushgateway.
+                - name: SYNTHETIC_LAYER
+                  value: {{ .Values.synthetic.janitor.layer | default "janitor" | quote }}
+                - name: SYNTHETIC_USERNAME
+                  value: {{ .Values.synthetic.username | quote }}
+                - name: SYNTHETIC_ROLE
+                  value: {{ .Values.synthetic.role | quote }}
+                - name: SYNTHETIC_CHECK_TIMEOUT
+                  value: {{ .Values.synthetic.janitor.checkTimeout | default "120s" | quote }}
+                - name: SYNTHETIC_USER_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.synthetic.secretName }}
+                      key: user-id
+                - name: SYNTHETIC_JWT_SECRET
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.secrets.jwt }}
+                      key: jwt-secret
+                - name: SYNTHETIC_JANITOR_MODE
+                  value: "true"
+                - name: SYNTHETIC_JANITOR_MAX_AGE
+                  value: {{ .Values.synthetic.janitor.maxAge | default "1h" | quote }}
+              resources:
+                {{- toYaml .Values.synthetic.resources | nindent 16 }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                runAsNonRoot: true
+                runAsUser: 65534
+                runAsGroup: 65534
+                capabilities:
+                  drop:
+                    - ALL
+{{- end }}

@@ -139,6 +139,25 @@ synthetic:
     # Must exceed readyTimeout + destroyTimeout + per-check overhead. 900s
     # (15 min) gives ~3 min headroom on top of the default 11m envelope.
     activeDeadlineSeconds: 900
+  # Standalone orphan-pod janitor (defense-in-depth for synthetic monitoring).
+  # Runs independently of the */10 monitor so synthetic pods don't accumulate
+  # even if pod_lifecycle is broken or paused. The check name is
+  # `synthetic_janitor`; severity is warning. See checks/janitor.go.
+  janitor:
+    enabled: false
+    # Daily at 04:17 UTC — offset to avoid colliding with backup or monitor cron.
+    schedule: "17 4 * * *"
+    # Orphan-age cutoff. Pods named synthetic-noop-* and older than this are
+    # destroyed. 1h is conservative given lifecycle runs complete in <5min.
+    maxAge: "1h"
+    # 10 minutes is plenty for listing pods + a handful of DELETEs.
+    activeDeadlineSeconds: 600
+    # Per-check timeout — janitor only does one list + N deletes, but DELETE
+    # is async (returns 202) so we don't poll; 2 minutes is generous.
+    checkTimeout: "120s"
+    # Distinct Pushgateway layer label keeps janitor results separate from
+    # the regular */10 monitor in dashboards and alerts.
+    layer: "janitor"
 
 # Vault sidecar annotations (disabled for now)
 vault:

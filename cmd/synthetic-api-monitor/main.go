@@ -62,6 +62,19 @@ const (
 	// envLifecycleDestroyTimeout overrides the default 90s timeout for
 	// waiting on PodStatusDestroyed.
 	envLifecycleDestroyTimeout = "SYNTHETIC_LIFECYCLE_DESTROY_TIMEOUT"
+
+	// envJanitorMode, when truthy, replaces the entire check set with the
+	// single synthetic_janitor check. This is the standalone defense-in-depth
+	// sweep that runs from its own (daily) CronJob — its purpose is to
+	// destroy orphan synthetic pods regardless of whether the lifecycle
+	// check itself is healthy. All non-janitor env vars (base URL,
+	// pushgateway, JWT secret, etc.) still apply.
+	envJanitorMode = "SYNTHETIC_JANITOR_MODE"
+	// envJanitorMaxAge overrides the janitor's orphan-age cutoff. Defaults
+	// to 1h. Lower this when investigating accumulation; raise it during
+	// long-running manual debugging sessions where you want synthetic pods
+	// to stick around.
+	envJanitorMaxAge = "SYNTHETIC_JANITOR_MAX_AGE"
 )
 
 func main() {
@@ -113,8 +126,29 @@ func run(logger *slog.Logger) error {
 	// Build the active check list. The expensive pod_lifecycle check is
 	// gated by SYNTHETIC_LIFECYCLE_ENABLED so the binary can be rolled out
 	// before the synthetic-noop template exists.
+	//
+	// SYNTHETIC_JANITOR_MODE takes precedence: when set, the binary acts as
+	// a standalone orphan sweeper and registers ONLY the synthetic_janitor
+	// check. This lets a separate daily CronJob reuse the same image,
+	// secrets, and pushgateway plumbing as the regular monitor without
+	// running any of the cheap probes (which the */10 monitor already
+	// covers).
 	activeChecks := checks.All()
-	if envBool(envLifecycleEnabled) {
+	if envBool(envJanitorMode) {
+		cfg := checks.DefaultJanitorConfig()
+		cfg.Logger = logger.With("component", "synthetic_janitor")
+		if v := os.Getenv(envJanitorMaxAge); v != "" {
+			d, err := time.ParseDuration(v)
+			if err != nil {
+				return fmt.Errorf("invalid %s=%q: %w", envJanitorMaxAge, v, err)
+			}
+			cfg.MaxAge = d
+		}
+		logger.Info("janitor mode: registering synthetic_janitor only",
+			"max_age", cfg.MaxAge,
+		)
+		activeChecks = []synthetic.Check{checks.Janitor(cfg)}
+	} else if envBool(envLifecycleEnabled) {
 		tmpl := os.Getenv(envLifecycleTemplate)
 		if tmpl == "" {
 			return fmt.Errorf("%s=true but %s is empty", envLifecycleEnabled, envLifecycleTemplate)
