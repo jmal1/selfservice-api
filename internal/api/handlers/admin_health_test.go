@@ -140,8 +140,16 @@ func TestProbeOPNsense(t *testing.T) {
 
 	t.Run("ok_200", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !strings.HasSuffix(r.URL.Path, "/api/diagnostics/firmware/status") {
+			// Path is relative to BaseURL (which in prod ends in /api;
+			// the test injects a bare httptest URL so we just assert the
+			// tail). Probe MUST NOT double-prepend /api — see the
+			// production miscalibration where BaseURL=https://host/api
+			// produced /api/api/... and a 404.
+			if !strings.HasSuffix(r.URL.Path, "/diagnostics/firmware/status") {
 				t.Errorf("unexpected path: %s", r.URL.Path)
+			}
+			if strings.Contains(r.URL.Path, "/api/api/") {
+				t.Errorf("probe double-prepended /api: %s", r.URL.Path)
 			}
 			w.WriteHeader(http.StatusOK)
 		}))

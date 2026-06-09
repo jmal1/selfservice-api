@@ -139,7 +139,7 @@ func main() {
 	// than failing the whole endpoint. The engine URL falls back to the
 	// in-cluster service DNS used everywhere else in the codebase.
 	engineHealthURL := getenvOrDefault("ENGINE_HEALTH_URL",
-		"http://crucible-engine.selfservice.svc.cluster.local:8081/healthz")
+		"http://selfservice-engine.selfservice.svc.cluster.local:8081/healthz")
 	handler.WithHealthDeps(handlers.HealthDeps{
 		Pool:            pool,
 		NATS:            natsClient,
