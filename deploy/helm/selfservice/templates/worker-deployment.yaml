@@ -107,5 +107,13 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.secrets.opnsense }}
                   key: opnsense-ssh-password
+            # Pushgateway destination for the worker's DestroyFailedPusher,
+            # which surfaces pods stuck in destroy_failed via the
+            # CruciblePodsStuckInDestroyFailed Prometheus alert. Leaving
+            # pushgatewayURL empty disables the pusher cleanly.
+            - name: WORKER_PUSHGATEWAY_URL
+              value: {{ .Values.worker.pushgatewayURL | default "" | quote }}
+            - name: WORKER_PUSHGATEWAY_JOB
+              value: {{ .Values.worker.pushgatewayJob | default "crucible_provision_worker" | quote }}
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}

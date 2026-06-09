@@ -29,6 +29,11 @@ api:
       memory: 256Mi
 
 worker:
+  # Pushgateway endpoint for the DestroyFailedPusher (drives the
+  # CruciblePodsStuckInDestroyFailed Prometheus alert). Set to empty
+  # string to disable cleanly. Job label is the Pushgateway grouping key.
+  pushgatewayURL: "http://pushgateway.observability:9091"
+  pushgatewayJob: "crucible_provision_worker"
   resources:
     requests:
       cpu: 100m
