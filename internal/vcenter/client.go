@@ -183,14 +183,28 @@ func (c *Client) cloneVMInner(ctx context.Context, params CloneVMParams) (string
 		return "", fmt.Errorf("find template %s: %w", params.TemplateName, err)
 	}
 
+	// Pre-fetch the template's runtime host so we can constrain the
+	// resource-pool pick to the same cluster. Cross-cluster clones
+	// (Intel↔AMD) get rejected by vCenter with the misleading
+	// "virtual disk is either corrupted or not a supported format"
+	// error for Windows guests with cpuid masks (see Round 10 history
+	// in template_ops.go). Linked clones may sneak past clone-task
+	// validation but then fail at first power-on — same root cause,
+	// later surface. Pin to the source cluster up front.
+	var tmplProps mo.VirtualMachine
+	if err := template.Properties(ctx, template.Reference(), []string{"runtime"}, &tmplProps); err != nil {
+		return "", fmt.Errorf("read template runtime: %w", err)
+	}
+
 	// Find target folder
 	folder, err := c.finder.Folder(ctx, c.config.VMFolder)
 	if err != nil {
 		return "", fmt.Errorf("find folder %s: %w", c.config.VMFolder, err)
 	}
 
-	// Select best resource pool based on available resources
-	pool, err := c.selectBestPool(ctx, params.VCPUs, params.RAMmb)
+	// Select best resource pool based on available resources, but
+	// constrained to the template's cluster.
+	pool, err := c.selectBestPoolInSourceCluster(ctx, tmplProps.Runtime.Host, params.VCPUs, params.RAMmb)
 	if err != nil {
 		return "", fmt.Errorf("select resource pool: %w", err)
 	}
