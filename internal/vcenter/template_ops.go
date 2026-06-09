@@ -89,10 +89,12 @@ func (c *Client) cloneTemplateSourceVMInner(ctx context.Context, params Template
 		types.ManagedObjectReference{Type: "VirtualMachine", Value: params.SourceMoref})
 
 	// Pre-fetch source properties so we can default the folder/resource
-	// selection if the caller didn't specify.
+	// selection if the caller didn't specify, and so we can decide which
+	// DiskMoveType to request (depends on whether the source is a VM
+	// template marker and whether it has a snapshot chain).
 	var sourceProps mo.VirtualMachine
 	if err := source.Properties(ctx, source.Reference(),
-		[]string{"name", "parent", "resourcePool", "runtime"}, &sourceProps); err != nil {
+		[]string{"name", "parent", "resourcePool", "runtime", "snapshot", "config.template"}, &sourceProps); err != nil {
 		return "", fmt.Errorf("read source VM properties: %w", err)
 	}
 
@@ -144,21 +146,20 @@ func (c *Client) cloneTemplateSourceVMInner(ctx context.Context, params Template
 	dsRef := ds.Reference()
 
 	folderRef := folder.Reference()
+	hasSnapshot := sourceProps.Snapshot != nil && sourceProps.Snapshot.CurrentSnapshot != nil
+	isVCenterTemplate := sourceProps.Config != nil && sourceProps.Config.Template
+	diskMoveType := chooseTemplateCloneDiskMoveType(hasSnapshot, isVCenterTemplate)
+	c.logger.Info("template source clone disk strategy",
+		"source", params.SourceMoref,
+		"has_snapshot", hasSnapshot,
+		"is_template", isVCenterTemplate,
+		"disk_move_type", diskMoveType)
 	cloneSpec := types.VirtualMachineCloneSpec{
 		Location: types.VirtualMachineRelocateSpec{
-			Datastore: &dsRef,
-			Folder:    &folderRef,
-			Pool:      &poolRef,
-			// MoveAllDiskBackingsAndConsolidate flattens the source VM's
-			// snapshot chain (Crucible templates carry a linked-clone-base
-			// snapshot used for student-pod cloning) into a single flat
-			// disk on the destination. Without this, vCenter rejects the
-			// clone with "The virtual disk is either corrupted or not a
-			// supported format" when the source has snapshots — that was
-			// the failure mode the wizard hit on first ship for any
-			// clone_template source that had already been used as a
-			// student-pod template.
-			DiskMoveType: string(types.VirtualMachineRelocateDiskMoveOptionsMoveAllDiskBackingsAndConsolidate),
+			Datastore:    &dsRef,
+			Folder:       &folderRef,
+			Pool:         &poolRef,
+			DiskMoveType: diskMoveType,
 		},
 		PowerOn:  false, // we power on after hardware + NIC are configured
 		Template: false, // keep as regular VM so it can be edited
@@ -193,7 +194,35 @@ func (c *Client) cloneTemplateSourceVMInner(ctx context.Context, params Template
 	return newRef.Value, nil
 }
 
-// ResolveVMByName returns the moref ("vm-NNN") of a VM looked up by its
+// chooseTemplateCloneDiskMoveType picks the vCenter DiskMoveType for the
+// template-wizard clone call based on the source VM's shape.
+//
+// vCenter is picky about how disks are moved during a clone, and it
+// reports the same misleading error for two opposite mistakes:
+// "The virtual disk is either corrupted or not a supported format."
+//
+//   - Source is a vCenter-marked Template (Config.Template == true), or
+//     a regular VM with NO snapshot chain → leave DiskMoveType empty.
+//     vCenter defaults to a plain full copy of the base disk. Setting
+//     MoveAllDiskBackingsAndConsolidate against either of these returns
+//     the "corrupted" error.
+//   - Source is a regular VM WITH snapshots (Crucible templates auto-get
+//     a `linked-clone-base` snapshot the first time they're used to
+//     spawn a student pod) → request
+//     MoveAllDiskBackingsAndConsolidate. Without it, vCenter rejects the
+//     clone with the same "corrupted" error because the snapshot chain
+//     can't be copied as-is to an independent destination.
+//
+// Pulled out as a small pure helper so we can unit-test the matrix
+// without booting a vcsim VPX.
+func chooseTemplateCloneDiskMoveType(hasSnapshot, isVCenterTemplate bool) string {
+	if hasSnapshot && !isVCenterTemplate {
+		return string(types.VirtualMachineRelocateDiskMoveOptionsMoveAllDiskBackingsAndConsolidate)
+	}
+	return ""
+}
+
+
 // inventory name via the finder. Used by the template wizard's
 // clone_template branch: the API stores the *Crucible* template UUID in
 // templates.source_ref, but vCenter clones need a real MoRef. We resolve
