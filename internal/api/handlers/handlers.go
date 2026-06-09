@@ -868,10 +868,20 @@ func (h *Handler) VMPowerAction(w http.ResponseWriter, r *http.Request) {
 // ListTemplates returns templates accessible to the current user.
 // Internal templates (is_internal=true, e.g. synthetic-noop) are
 // filtered out here so they don't appear in the user-facing picker
-// at /pods/new. Admins who need to see them should use /admin/templates
-// (ListAllTemplates). The unfiltered list is still used by the
-// server-side pod-create / vm-add handlers so the synthetic user can
-// resolve internal templates by ID through the API.
+// at /pods/new. Two escape hatches keep system flows working:
+//
+//  1. Admins should use /admin/templates (ListAllTemplates) which
+//     shows everything regardless of is_internal.
+//  2. Users with an EXPLICIT per-user-id template_access grant still
+//     see the template even if is_internal=true. This is how the
+//     synthetic monitor user keeps access to synthetic-noop so the
+//     UI E2E lifecycle check (which walks /pods/new) continues to
+//     find the template card. Role-based grants alone do not bypass
+//     the filter — only an explicit user_id row in template_access.
+//
+// The server-side pod-create / vm-add / blueprint handlers continue
+// to use ListTemplatesForUser unfiltered so internal template IDs
+// resolve correctly.
 func (h *Handler) ListTemplates(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.UserIDFromContext(r.Context())
 	role := middleware.RoleFromContext(r.Context())
@@ -882,10 +892,18 @@ func (h *Handler) ListTemplates(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	explicit, err := h.db.ListExplicitTemplateAccessForUser(r.Context(), userID)
+	if err != nil {
+		h.logger.Error("list explicit template access failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 	visible := templates[:0]
 	for _, t := range templates {
 		if t.IsInternal {
-			continue
+			if _, ok := explicit[t.ID]; !ok {
+				continue
+			}
 		}
 		visible = append(visible, t)
 	}

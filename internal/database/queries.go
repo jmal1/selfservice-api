@@ -222,6 +222,32 @@ func (q *Queries) ListTemplatesForUser(ctx context.Context, userID uuid.UUID, ro
 	return templates, nil
 }
 
+// ListExplicitTemplateAccessForUser returns the set of template IDs for which
+// the user has an explicit per-user-id template_access grant (i.e. NOT a
+// role-based grant and NOT the "no rules = open" fallback). Callers use this
+// to selectively bypass is_internal filtering — internal templates remain
+// hidden from the public picker unless the user was specifically granted
+// access by user_id (e.g. the synthetic monitor user).
+func (q *Queries) ListExplicitTemplateAccessForUser(ctx context.Context, userID uuid.UUID) (map[uuid.UUID]struct{}, error) {
+	rows, err := q.pool.Query(ctx,
+		`SELECT DISTINCT template_id FROM template_access WHERE user_id = $1`,
+		userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[uuid.UUID]struct{})
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = struct{}{}
+	}
+	return out, nil
+}
+
 // ListAllTemplates returns all templates (admin).
 func (q *Queries) ListAllTemplates(ctx context.Context) ([]models.Template, error) {
 	rows, err := q.pool.Query(ctx, `
