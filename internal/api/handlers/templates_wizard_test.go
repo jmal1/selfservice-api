@@ -190,6 +190,11 @@ func (f *fakeVC) GetGuestInfo(_ context.Context, moref string) (*vcenter.GuestIn
 	return f.info, f.err
 }
 
+func (f *fakeVC) DestroyVM(_ context.Context, moref string) error {
+	f.gotCalls = append(f.gotCalls, "destroy:"+moref)
+	return nil
+}
+
 func TestWizardStatePopulatesBuildVMFields(t *testing.T) {
 	vc := &fakeVC{
 		info: &vcenter.GuestInfo{

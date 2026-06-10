@@ -38,7 +38,16 @@ type Handler struct {
 	healthDeps HealthDeps
 }
 
-// VCenterConsole is the interface for vCenter console operations needed by the API.
+// VCenterConsole is the interface for vCenter operations needed by the
+// HTTP API layer. Backed by *vcenter.Client in production. Tests
+// substitute a fake to drive specific behaviors (errors, slow calls).
+//
+// Methods are grouped by purpose:
+//   - AcquireWebMKSTicket: powers the browser console (T3 / template
+//     build console).
+//   - DestroyVM: powers cleanup paths that need to delete a staging or
+//     student VM as a side effect of an HTTP request (e.g. template
+//     delete cascading to the in-flight build VM — see AdminDeleteTemplate).
 type VCenterConsole interface {
 	AcquireWebMKSTicket(ctx context.Context, moref string) (*vcenter.WebMKSTicket, error)
 	// GetGuestInfo returns a non-blocking snapshot of a VM's guest state
@@ -47,6 +56,9 @@ type VCenterConsole interface {
 	// the instructor can SSH/RDP into the build VM without waiting.
 	// Errors are surfaced; an empty IPAddress is normal during boot.
 	GetGuestInfo(ctx context.Context, moref string) (*vcenter.GuestInfo, error)
+	// DestroyVM powers off the VM (if running) and destroys it.
+	// IDEMPOTENT: returns nil if the VM was already gone in vCenter.
+	DestroyVM(ctx context.Context, moref string) error
 }
 
 // NewHandler creates a new Handler.
@@ -1116,7 +1128,18 @@ func (h *Handler) AdminUpdateTemplate(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, tmpl)
 }
 
-// AdminDeleteTemplate deletes a template.
+// AdminDeleteTemplate deletes a template and (if it has a staging or
+// post-build VM in vCenter) destroys that VM first so we don't orphan
+// it. Refuses with 409 when a worker is actively building the VM
+// (states `provisioning` / `generalizing`) — the operator must wait
+// for that job to settle (or cancel it) before deleting, otherwise
+// the destroy here races the worker's clone/sysprep task.
+//
+// Order matters: destroy in vCenter FIRST, then DELETE the row. If
+// the vCenter call fails we keep the row so the operator can retry —
+// otherwise we'd leak the moref forever. If the row delete fails
+// after a successful destroy, the next retry sees `DestroyVM` return
+// nil (it's idempotent) and proceeds straight to the row delete.
 func (h *Handler) AdminDeleteTemplate(w http.ResponseWriter, r *http.Request) {
 	templateID, err := uuid.Parse(chi.URLParam(r, "templateID"))
 	if err != nil {
@@ -1124,14 +1147,87 @@ func (h *Handler) AdminDeleteTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	tmpl, err := h.db.GetTemplateByID(r.Context(), templateID)
+	if err != nil {
+		h.logger.Error("load template for delete failed", "error", err, "template_id", templateID)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if tmpl == nil {
+		// Treat as already-deleted — idempotent.
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	if refuse, reason := templateDeleteStateRefusal(tmpl.TemplateState); refuse {
+		h.writeStateConflict(w, tmpl, reason)
+		return
+	}
+
+	if tmpl.VCenterVMID != "" {
+		if h.vc == nil {
+			// Production always wires vc; this branch protects test/dev
+			// configs from silently orphaning VMs.
+			h.logger.Warn("template delete: vCenter client not configured, leaving VM in place",
+				"template_id", tmpl.ID, "moref", tmpl.VCenterVMID)
+		} else {
+			if err := h.vc.DestroyVM(r.Context(), tmpl.VCenterVMID); err != nil {
+				h.logger.Error("template delete: destroy staging VM failed",
+					"template_id", tmpl.ID, "moref", tmpl.VCenterVMID, "error", err)
+				audit.Log(r.Context(), h.db, "template.delete_failed",
+					audit.Resource("template", tmpl.ID),
+					audit.IP(r.RemoteAddr),
+					audit.Detail("moref", tmpl.VCenterVMID),
+					audit.Detail("error", err.Error()),
+				)
+				// 502: an upstream system (vCenter) failed. The DB row
+				// is preserved so the operator can retry.
+				http.Error(w, "failed to destroy staging VM in vCenter: "+err.Error(),
+					http.StatusBadGateway)
+				return
+			}
+			h.logger.Info("template delete: destroyed staging VM",
+				"template_id", tmpl.ID, "moref", tmpl.VCenterVMID)
+		}
+	}
+
 	if err := h.db.DeleteTemplate(r.Context(), templateID); err != nil {
-		h.logger.Error("delete template failed", "error", err)
+		h.logger.Error("delete template failed", "error", err, "template_id", templateID)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
+	audit.Log(r.Context(), h.db, "template.delete",
+		audit.Resource("template", tmpl.ID),
+		audit.IP(r.RemoteAddr),
+		audit.Detail("name", tmpl.Name),
+		audit.Detail("state", tmpl.TemplateState),
+		audit.Detail("moref", tmpl.VCenterVMID),
+	)
 	h.invalidateTemplatesFolderCache()
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// templateDeleteStateRefusal reports whether AdminDeleteTemplate should
+// refuse the request because a worker job is currently mid-flight on
+// the staging VM. Returning (false, "") means proceed.
+//
+// We refuse for `provisioning` (worker is cloning right now) and
+// `generalizing` (worker is running sysprep / cloud-init). For all
+// other states the VM is at rest — `configuring` means the operator
+// is interacting with it directly via the build console, but no
+// worker job is running, so it's safe to destroy. `ready` / `active`
+// have a converted-to-template VM. `error` has whatever state the
+// worker left behind, and the whole point of delete-with-cleanup is
+// to recover from those. `draft` has no VM.
+func templateDeleteStateRefusal(state string) (bool, string) {
+	switch state {
+	case models.TemplateStateProvisioning:
+		return true, "cannot delete while provisioning; wait for the job to settle or cancel first"
+	case models.TemplateStateGeneralizing:
+		return true, "cannot delete while generalizing; wait for the job to settle or cancel first"
+	}
+	return false, ""
 }
 
 // AdminListTemplateDependents returns VMs that depend on a template's base disk.
