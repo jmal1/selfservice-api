@@ -278,7 +278,7 @@ func (h *Handler) DeployBlueprint(w http.ResponseWriter, r *http.Request) {
 		}
 		vmPayloads = append(vmPayloads, vmPayload{
 			PodVMID:      vmID.String(),
-			TemplateName: rv.Template.VCenterTemplate,
+			TemplateName: rv.Template.VCenterRef(),
 			VMName:       vmName,
 			DisplayName:  rv.DisplayName,
 			VCPUs:        rv.VCPUs,
