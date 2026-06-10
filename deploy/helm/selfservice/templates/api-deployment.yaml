@@ -95,6 +95,10 @@ spec:
               value: {{ .Values.vcenter.datacenter | quote }}
             - name: VCENTER_INSECURE
               value: {{ .Values.vcenter.insecure | quote }}
+            {{- if .Values.vcenter.templatesFolder }}
+            - name: VCENTER_TEMPLATES_FOLDER
+              value: {{ .Values.vcenter.templatesFolder | quote }}
+            {{- end }}
             {{- if .Values.vcenter.healthPushgatewayURL }}
             - name: VCENTER_HEALTH_PUSHGATEWAY_URL
               value: {{ .Values.vcenter.healthPushgatewayURL | quote }}
