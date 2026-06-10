@@ -41,6 +41,12 @@ type Handler struct {
 // VCenterConsole is the interface for vCenter console operations needed by the API.
 type VCenterConsole interface {
 	AcquireWebMKSTicket(ctx context.Context, moref string) (*vcenter.WebMKSTicket, error)
+	// GetGuestInfo returns a non-blocking snapshot of a VM's guest state
+	// (name, IP, tools status, power state). The wizard polls this for
+	// the staging VM during provisioning / configuring / generalizing so
+	// the instructor can SSH/RDP into the build VM without waiting.
+	// Errors are surfaced; an empty IPAddress is normal during boot.
+	GetGuestInfo(ctx context.Context, moref string) (*vcenter.GuestInfo, error)
 }
 
 // NewHandler creates a new Handler.
