@@ -138,3 +138,89 @@ func TestBuildGuestInvocation_PowerShellUsesExecutionPolicyBypass(t *testing.T) 
 		t.Errorf("expected -NoProfile flag, got %q", args)
 	}
 }
+
+// TestGuestTempBase covers the OS-appropriate temp path resolution that
+// historically was hardcoded to /tmp/... and broke every Windows generalize
+// attempt with "Permission to perform this operation was denied" because
+// VMware Tools resolved /tmp on Windows to C:\tmp which (a) does not exist
+// and (b) the root of C: requires elevation that VMware Tools'' interactive
+// logon with a UAC-filtered admin token does not have.
+func TestGuestTempBase(t *testing.T) {
+	cases := []struct {
+		name      string
+		language  string
+		guestUser string
+		runID     string
+		slug      string
+		want      string
+		wantErr   bool
+	}{
+		{
+			name:      "linux bash uses /tmp regardless of user",
+			language:  "bash",
+			guestUser: "anyone",
+			runID:     "run-1",
+			slug:      "slug-a",
+			want:      "/tmp/crucible-run-1-slug-a",
+		},
+		{
+			name:      "linux unknown language defaults to /tmp",
+			language:  "",
+			guestUser: "anyone",
+			runID:     "run-1",
+			slug:      "slug-a",
+			want:      "/tmp/crucible-run-1-slug-a",
+		},
+		{
+			name:      "windows powershell uses user profile temp",
+			language:  "powershell",
+			guestUser: "Student",
+			runID:     "run-1",
+			slug:      "slug-a",
+			want:      `C:\Users\Student\AppData\Local\Temp\crucible-run-1-slug-a`,
+		},
+		{
+			name:      "windows pwsh alias is recognized",
+			language:  "pwsh",
+			guestUser: "Student",
+			runID:     "r",
+			slug:      "s",
+			want:      `C:\Users\Student\AppData\Local\Temp\crucible-r-s`,
+		},
+		{
+			name:      "windows requires guestUser to construct the path",
+			language:  "powershell",
+			guestUser: "",
+			wantErr:   true,
+		},
+		{
+			name:      "windows rejects path-traversal in guestUser",
+			language:  "powershell",
+			guestUser: `..\Administrator`,
+			wantErr:   true,
+		},
+		{
+			name:      "windows rejects domain-prefixed user (local accounts only)",
+			language:  "powershell",
+			guestUser: `LAB\Student`,
+			wantErr:   true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := guestTempBase(tc.language, tc.guestUser, tc.runID, tc.slug)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got %q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("guestTempBase() = %q; want %q", got, tc.want)
+			}
+		})
+	}
+}

@@ -19,7 +19,8 @@ import (
 //
 // We deliberately accept the script as a string (not a command path) so the
 // caller doesn't have to manage temp files inside the guest — RunScriptInGuest
-// uploads the script to /tmp/crucible-<runID>-<actionSlug>.sh, executes it,
+// uploads the script to an OS-appropriate temp dir (/tmp on Linux,
+// C:\Users\<GuestUser>\AppData\Local\Temp on Windows), executes it,
 // captures stdout/stderr to companion files, and pulls everything back.
 //
 // Limits we enforce (and why):
@@ -71,13 +72,23 @@ const (
 //
 // Process flow inside the guest:
 //
-//  1. UploadFileToGuest /tmp/crucible-<runid>-<slug>.sh         (the script)
-//  2. UploadFileToGuest /tmp/crucible-<runid>-<slug>.stdin      (empty)
-//  3. StartProgramInGuest /bin/bash <script> > .stdout 2> .stderr
+//  1. UploadFileToGuest <tmpBase>.sh|.ps1                       (the script)
+//  2. UploadFileToGuest <tmpBase>.stdin                         (empty)
+//  3. StartProgramInGuest /bin/sh|powershell.exe <script> > .stdout 2> .stderr
 //  4. ListProcessesInGuest in a loop until ExitCode != nil OR timeout
 //  5. If timeout: TerminateProcessInGuest, mark TimedOut=true
 //  6. InitiateFileTransferFromGuest .stdout and .stderr
-//  7. Delete /tmp/crucible-<runid>-<slug>.* files
+//  7. Delete <tmpBase>.* files
+//
+// `<tmpBase>` is OS-appropriate:
+//   - Linux  : /tmp/crucible-<runID>-<slug>
+//   - Windows: C:\Users\<GuestUser>\AppData\Local\Temp\crucible-<runID>-<slug>
+//     (a user-profile temp dir that is writable even when VMware Tools
+//     impersonates an Administrators-group user with a UAC-filtered token —
+//     C:\tmp does not exist by default and the root of C:\ requires
+//     elevation that filtered tokens lack, which historically broke every
+//     Windows generalize attempt with a "Permission to perform this
+//     operation was denied" ServerFaultCode on the first upload.)
 //
 // All of the above is wrapped in withRetry so a session expiry between any
 // two steps gets handled transparently.
@@ -139,7 +150,10 @@ func (c *Client) runScriptInGuestInner(ctx context.Context, req GuestExecRequest
 	}
 
 	// Resolve guest paths up front so cleanup can run even on error.
-	tmpBase := fmt.Sprintf("/tmp/crucible-%s-%s", req.RunID, req.ActionSlug)
+	tmpBase, err := guestTempBase(req.Language, req.GuestUser, req.RunID, req.ActionSlug)
+	if err != nil {
+		return nil, fmt.Errorf("resolve guest temp path: %w", err)
+	}
 	scriptPath := tmpBase + scriptSuffix(req.Language)
 	stdoutPath := tmpBase + ".stdout"
 	stderrPath := tmpBase + ".stderr"
@@ -323,6 +337,34 @@ func scriptSuffix(language string) string {
 		return ".ps1"
 	default:
 		return ".sh"
+	}
+}
+
+// guestTempBase returns the OS-appropriate temp file base path inside the
+// guest (no extension). On Windows we deliberately target the GuestUser's
+// own AppData\Local\Temp directory: it is guaranteed to exist for a logged-in
+// user, the user owns it (so VMware Tools can read/write/delete files there
+// even with a UAC-filtered token from interactive logon), and we don't have
+// to chase the surprisingly tight default ACLs on C:\Windows\Temp or
+// elevation requirements for C:\.
+//
+// guestUser is the local account name (no DOMAIN\ prefix supported — vCenter
+// guest-ops with local accounts is what Crucible uses for all template ops).
+// runID and actionSlug feed filename uniqueness so concurrent jobs don't
+// collide.
+func guestTempBase(language, guestUser, runID, actionSlug string) (string, error) {
+	switch strings.ToLower(language) {
+	case "powershell", "pwsh":
+		if guestUser == "" {
+			return "", fmt.Errorf("guestUser is required to resolve Windows temp path")
+		}
+		if strings.ContainsAny(guestUser, `\/:*?"<>|`) {
+			return "", fmt.Errorf("guestUser %q contains characters invalid in a Windows path", guestUser)
+		}
+		return fmt.Sprintf(`C:\Users\%s\AppData\Local\Temp\crucible-%s-%s`,
+			guestUser, runID, actionSlug), nil
+	default:
+		return fmt.Sprintf("/tmp/crucible-%s-%s", runID, actionSlug), nil
 	}
 }
 
