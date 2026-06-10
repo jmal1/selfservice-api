@@ -13,6 +13,7 @@ env:
 permissions:
   contents: read
   packages: write
+  pull-requests: read
 
 jobs:
   # `changes` runs dorny/paths-filter against the diff and produces two
