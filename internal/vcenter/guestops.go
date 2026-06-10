@@ -2,6 +2,7 @@ package vcenter
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net/http"
@@ -170,7 +171,11 @@ func (c *Client) runScriptInGuestInner(ctx context.Context, req GuestExecRequest
 
 	// Upload script body. Use a transfer URL that we POST to ourselves —
 	// VMware Tools accepts a single chunk PUT-like flow via this URL.
-	if err := uploadGuestFile(ctx, fileMgr, auth, scriptPath, []byte(req.Script)); err != nil {
+	// The URL points at an ESXi host (not vCenter) which serves a VMCA-signed
+	// cert that we have no reason to trust separately from the vCenter cert;
+	// honor the same Insecure flag the soap client uses.
+	httpClient := guestTransferClient(c.config.Insecure)
+	if err := uploadGuestFile(ctx, httpClient, fileMgr, auth, scriptPath, []byte(req.Script)); err != nil {
 		return nil, fmt.Errorf("upload script to guest: %w", err)
 	}
 
@@ -236,13 +241,14 @@ func (c *Client) runScriptInGuestInner(ctx context.Context, req GuestExecRequest
 	result.ExitCode = exitCode
 
 	// Download stdout and stderr (best-effort — script may have failed
-	// before writing them).
-	stdoutBytes, truncOut, err := downloadGuestFile(ctx, fileMgr, auth, stdoutPath, maxGuestOutputBytes)
+	// before writing them). Reuse httpClient with the same TLS posture
+	// as the upload so we don't choke on the ESXi host's VMCA cert.
+	stdoutBytes, truncOut, err := downloadGuestFile(ctx, httpClient, fileMgr, auth, stdoutPath, maxGuestOutputBytes)
 	if err == nil {
 		result.Stdout = string(stdoutBytes)
 		result.TruncatedOut = result.TruncatedOut || truncOut
 	}
-	stderrBytes, truncErr, err := downloadGuestFile(ctx, fileMgr, auth, stderrPath, maxGuestOutputBytes)
+	stderrBytes, truncErr, err := downloadGuestFile(ctx, httpClient, fileMgr, auth, stderrPath, maxGuestOutputBytes)
 	if err == nil {
 		result.Stderr = string(stderrBytes)
 		result.TruncatedOut = result.TruncatedOut || truncErr
@@ -264,7 +270,14 @@ func (c *Client) vmFromMoref(moref string) (*object.VirtualMachine, error) {
 // uploadGuestFile uploads a single file to the guest via the
 // InitiateFileTransferToGuest URL. The govmomi API returns a URL that the
 // caller must HTTP-PUT bytes to; we wrap that pattern here.
-func uploadGuestFile(ctx context.Context, fm *guest.FileManager, auth types.BaseGuestAuthentication, path string, data []byte) error {
+//
+// The URL points at the ESXi host the VM lives on (not vCenter). The host
+// serves a VMCA-signed cert that, in homelabs and dev clusters, often isn't
+// trusted by the worker's CA pool. Pass in an httpClient whose TLS posture
+// matches the soap client used to talk to vCenter so the two stay
+// consistent — there is no scenario where trusting vCenter and rejecting an
+// ESXi host that vCenter owns makes sense.
+func uploadGuestFile(ctx context.Context, httpClient *http.Client, fm *guest.FileManager, auth types.BaseGuestAuthentication, path string, data []byte) error {
 	attrs := &types.GuestFileAttributes{}
 	url, err := fm.InitiateFileTransferToGuest(ctx, auth, path, attrs, int64(len(data)), true)
 	if err != nil {
@@ -276,7 +289,6 @@ func uploadGuestFile(ctx context.Context, fm *guest.FileManager, auth types.Base
 		return fmt.Errorf("build upload request: %w", err)
 	}
 	req.ContentLength = int64(len(data))
-	httpClient := defaultHTTPClient()
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("upload file %s: %w", path, err)
@@ -290,8 +302,9 @@ func uploadGuestFile(ctx context.Context, fm *guest.FileManager, auth types.Base
 }
 
 // downloadGuestFile pulls a file from the guest, capped at maxBytes. The
-// second return value reports whether the file exceeded the cap.
-func downloadGuestFile(ctx context.Context, fm *guest.FileManager, auth types.BaseGuestAuthentication, path string, maxBytes int) ([]byte, bool, error) {
+// second return value reports whether the file exceeded the cap. See
+// uploadGuestFile for the rationale on the httpClient parameter.
+func downloadGuestFile(ctx context.Context, httpClient *http.Client, fm *guest.FileManager, auth types.BaseGuestAuthentication, path string, maxBytes int) ([]byte, bool, error) {
 	info, err := fm.InitiateFileTransferFromGuest(ctx, auth, path)
 	if err != nil {
 		return nil, false, fmt.Errorf("initiate download of %s: %w", path, err)
@@ -301,7 +314,7 @@ func downloadGuestFile(ctx context.Context, fm *guest.FileManager, auth types.Ba
 	if err != nil {
 		return nil, false, fmt.Errorf("build download request: %w", err)
 	}
-	resp, err := defaultHTTPClient().Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, false, fmt.Errorf("download %s: %w", path, err)
 	}
@@ -322,12 +335,25 @@ func downloadGuestFile(ctx context.Context, fm *guest.FileManager, auth types.Ba
 	return data, truncated, nil
 }
 
-// defaultHTTPClient returns the HTTP client used for guest file transfers.
-// Reuses the connection pool from the govmomi client (insecure settings
-// already applied if the caller chose them) to avoid double-handshaking.
-func defaultHTTPClient() *http.Client {
+// guestTransferClient returns the HTTP client used for VMware Tools guest
+// file transfers. The govmomi soap client is configured to honor a "Insecure"
+// flag at connect time (Config.Insecure → InsecureSkipVerify on its TLS
+// config). Guest file transfers happen out-of-band over a fresh HTTP client
+// pointed at an ESXi host; if the caller's vCenter session is insecure,
+// downstream PUTs to ESXi must also be insecure or every transfer will fail
+// with x509: certificate signed by unknown authority. Conversely if Insecure
+// is false, we DO verify — that matches a hardened deployment where VMCA has
+// been added to the worker's trust store.
+//
+// Timeout is generous (60s) because uploads can be megabytes over slow links.
+func guestTransferClient(insecure bool) *http.Client {
 	return &http.Client{
 		Timeout: 60 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: insecure, //nolint:gosec // honors the same flag as the vCenter soap client
+			},
+		},
 	}
 }
 
