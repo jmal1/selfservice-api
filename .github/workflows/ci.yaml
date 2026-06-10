@@ -3,8 +3,33 @@ name: Build and Push Images
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
+      - '.editorconfig'
+      - 'CONTRIBUTING*'
+      - 'CODE_OF_CONDUCT*'
+      - '.helmignore'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
+      - '.editorconfig'
+      - 'CONTRIBUTING*'
+      - 'CODE_OF_CONDUCT*'
+      - '.helmignore'
+
+# Cancel in-flight runs for the same PR ref when a new push arrives.
+# `cancel-in-progress` is gated to PRs only so main pushes (one per merge)
+# always run to completion and always produce an image.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   REGISTRY: ghcr.io
@@ -58,8 +83,14 @@ jobs:
           echo "run_tests=$GO_TESTS" >> "$GITHUB_OUTPUT"
 
   build:
-    needs: changes
-    if: needs.changes.outputs.components != '[]'
+    needs: [changes, test]
+    # `needs: test` gates image builds on tests passing — saves ~5-7 min on
+    # broken-test PRs. `if` keeps the build from skipping when `test` is
+    # skipped (i.e. for non-Go changes like deploy/runner-only).
+    if: |
+      always() &&
+      needs.changes.outputs.components != '[]' &&
+      (needs.test.result == 'success' || needs.test.result == 'skipped')
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
