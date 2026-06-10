@@ -297,12 +297,21 @@ func (p *Provisioner) GeneralizeTemplate(ctx context.Context, job *models.Job) e
 		ActionSlug:    "template-generalize",
 	})
 	// RunScriptInGuest may return an error because the VM shut itself
-	// down mid-script — that's the EXPECTED outcome for generalize. We
-	// rely on the wait-for-shutdown step below to determine real success.
-	// Only surface this error if it's a guest auth failure or tools issue.
-	if err != nil && !isExpectedShutdownErr(err) {
-		p.logger.Warn("generalize script returned (may be expected due to shutdown)",
-			"template_id", payload.TemplateID, "error", err)
+	// down mid-script — that's the EXPECTED outcome for generalize. Only
+	// swallow that flavor of error; everything else (auth failure, missing
+	// temp dir, tools crash, script syntax error) is a real failure and
+	// must surface immediately so the admin doesn't wait 10 minutes for
+	// waitForPowerOff to time out on a VM that was never going to shut
+	// down (see bug-generalize-error-swallow / bug-windows-guest-ops-temp-
+	// path discovered 2026-06-09 during the student-windows-11-v2 build).
+	if err != nil {
+		if isExpectedShutdownErr(err) {
+			p.logger.Info("generalize script connection lost mid-call (expected shutdown race)",
+				"template_id", payload.TemplateID, "error", err)
+		} else {
+			return p.markTemplateError(ctx, payload.TemplateID,
+				fmt.Errorf("generalize script failed before VM shutdown: %w", err))
+		}
 	}
 
 	// Step 3: wait for shutdown (10 min)
