@@ -13,31 +13,73 @@ env:
 permissions:
   contents: read
   packages: write
+  pull-requests: read
 
 jobs:
-  build:
+  # `changes` runs dorny/paths-filter against the diff and produces two
+  # outputs the rest of the workflow keys off:
+  #   - components: JSON array of matrix components that have to rebuild
+  #     (empty array = nothing to do).
+  #   - run_tests: 'true' if any Go source / module file changed.
+  # See .github/path-filters.yaml for the actual path lists.
+  changes:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - component: api-gateway
-            dockerfile: Dockerfile
-            target: api-gateway
-          - component: provision-worker
-            dockerfile: Dockerfile
-            target: provision-worker
-          - component: crucible-engine
-            dockerfile: Dockerfile
-            target: crucible-engine
-          - component: synthetic-api-monitor
-            dockerfile: Dockerfile
-            target: synthetic-api-monitor
-          - component: crucible-runner
-            dockerfile: deploy/runner/Dockerfile
-            target: ""
+    outputs:
+      components: ${{ steps.matrix.outputs.components }}
+      run_tests: ${{ steps.matrix.outputs.run_tests }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Filter changed paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: .github/path-filters.yaml
+
+      - name: Compute matrix
+        id: matrix
+        env:
+          CHANGES: ${{ steps.filter.outputs.changes }}
+          GO_TESTS: ${{ steps.filter.outputs.go-tests }}
+        run: |
+          set -euo pipefail
+          all='["api-gateway","provision-worker","crucible-engine","synthetic-api-monitor","crucible-runner"]'
+          if echo "$CHANGES" | jq -e 'index("shared")' > /dev/null; then
+            echo "shared paths changed; rebuilding ALL components" >&2
+            echo "components=$all" >> "$GITHUB_OUTPUT"
+          else
+            # Drop the 'shared' and 'go-tests' meta-channels; what remains
+            # is the set of components to rebuild.
+            components=$(echo "$CHANGES" | jq -c '[ .[] | select(. != "shared" and . != "go-tests") ]')
+            echo "components changed: $components" >&2
+            echo "components=$components" >> "$GITHUB_OUTPUT"
+          fi
+          echo "run_tests=$GO_TESTS" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: changes
+    if: needs.changes.outputs.components != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        component: ${{ fromJSON(needs.changes.outputs.components) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve Dockerfile + target
+        id: dockerfile
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.component }}" = "crucible-runner" ]; then
+            echo "file=deploy/runner/Dockerfile" >> "$GITHUB_OUTPUT"
+            echo "target=" >> "$GITHUB_OUTPUT"
+          else
+            echo "file=Dockerfile" >> "$GITHUB_OUTPUT"
+            echo "target=${{ matrix.component }}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -64,8 +106,8 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ${{ matrix.dockerfile }}
-          target: ${{ matrix.target || '' }}
+          file: ${{ steps.dockerfile.outputs.file }}
+          target: ${{ steps.dockerfile.outputs.target }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -73,6 +115,8 @@ jobs:
           cache-to: type=gha,mode=max
 
   test:
+    needs: changes
+    if: needs.changes.outputs.run_tests == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
