@@ -3,6 +3,9 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -10,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/jmal1/selfservice-api/internal/models"
+	"github.com/jmal1/selfservice-api/internal/vcenter"
 )
 
 // These tests cover the pure-function bits of templates_wizard.go that
@@ -164,4 +168,128 @@ func TestWizardStateHappy(t *testing.T) {
 		t.Errorf("AllowedNextStates %v does not contain %q",
 			got.AllowedNextStates, models.TemplateStateGeneralizing)
 	}
+}
+
+// fakeVC is a tiny in-memory VCenterConsole used by wizardState tests
+// that exercise the Phase H build-VM access fields. It records calls so
+// tests can assert wizardState() didn't query vCenter outside the
+// build-time states (cost: a wasted SOAP round-trip per poll otherwise).
+type fakeVC struct {
+	info     *vcenter.GuestInfo
+	err      error
+	gotCalls []string
+}
+
+func (f *fakeVC) AcquireWebMKSTicket(_ context.Context, moref string) (*vcenter.WebMKSTicket, error) {
+	f.gotCalls = append(f.gotCalls, "ticket:"+moref)
+	return nil, errors.New("not used in these tests")
+}
+
+func (f *fakeVC) GetGuestInfo(_ context.Context, moref string) (*vcenter.GuestInfo, error) {
+	f.gotCalls = append(f.gotCalls, "info:"+moref)
+	return f.info, f.err
+}
+
+func TestWizardStatePopulatesBuildVMFields(t *testing.T) {
+	vc := &fakeVC{
+		info: &vcenter.GuestInfo{
+			Name:         "tpl-windows11-ab12cd",
+			IPAddress:    "10.10.30.42",
+			ToolsRunning: true,
+			PoweredOn:    true,
+		},
+	}
+	h := &Handler{vc: vc, logger: noopLogger(t)}
+	tmpl := &models.Template{
+		ID:              uuid.New(),
+		TemplateState:   models.TemplateStateConfiguring,
+		VCenterVMID:     "vm-9001",
+		OSType:          "windows",
+		Kind:            models.TemplateKindCloneWithCustomize,
+		DefaultUsername: "Student",
+		DefaultPassword: "Changeme123!",
+	}
+	got := h.wizardState(context.Background(), tmpl)
+	if got.BuildVMName != "tpl-windows11-ab12cd" {
+		t.Errorf("BuildVMName = %q; want tpl-windows11-ab12cd", got.BuildVMName)
+	}
+	if got.BuildVMIP != "10.10.30.42" {
+		t.Errorf("BuildVMIP = %q; want 10.10.30.42", got.BuildVMIP)
+	}
+	if !got.BuildVMTools {
+		t.Errorf("BuildVMTools = false; want true")
+	}
+	if !got.BuildVMPowerOn {
+		t.Errorf("BuildVMPowerOn = false; want true")
+	}
+	if got.OSType != "windows" {
+		t.Errorf("OSType = %q; want windows", got.OSType)
+	}
+	if got.TemplateKind != models.TemplateKindCloneWithCustomize {
+		t.Errorf("TemplateKind = %q; want %q",
+			got.TemplateKind, models.TemplateKindCloneWithCustomize)
+	}
+	if got.DefaultUsername != "Student" {
+		t.Errorf("DefaultUsername = %q; want Student", got.DefaultUsername)
+	}
+	if got.DefaultPassword != "Changeme123!" {
+		t.Errorf("DefaultPassword = %q; want Changeme123!", got.DefaultPassword)
+	}
+	if len(vc.gotCalls) != 1 || vc.gotCalls[0] != "info:vm-9001" {
+		t.Errorf("expected one info:vm-9001 call; got %v", vc.gotCalls)
+	}
+}
+
+func TestWizardStateSkipsVCenterOutsideBuildStates(t *testing.T) {
+	// The point of isBuildState() is to avoid hammering vCenter on every
+	// 5-s wizard poll for templates that aren't actively being built. We
+	// assert here that draft + ready + active never trigger a GetGuestInfo.
+	for _, state := range []string{
+		models.TemplateStateDraft,
+		models.TemplateStateReady,
+		models.TemplateStateActive,
+	} {
+		t.Run(state, func(t *testing.T) {
+			vc := &fakeVC{}
+			h := &Handler{vc: vc, logger: noopLogger(t)}
+			tmpl := &models.Template{
+				ID:            uuid.New(),
+				TemplateState: state,
+				VCenterVMID:   "vm-should-not-be-queried",
+			}
+			_ = h.wizardState(context.Background(), tmpl)
+			if len(vc.gotCalls) != 0 {
+				t.Errorf("vCenter was called in state %q: %v (want zero calls)",
+					state, vc.gotCalls)
+			}
+		})
+	}
+}
+
+func TestWizardStateSurvivesVCenterError(t *testing.T) {
+	// Transient vCenter failures must not break the wizard response;
+	// the UI just won't see live IP/tools fields until the next poll.
+	vc := &fakeVC{err: errors.New("simulated vcenter outage")}
+	h := &Handler{vc: vc, logger: noopLogger(t)}
+	tmpl := &models.Template{
+		ID:              uuid.New(),
+		TemplateState:   models.TemplateStateConfiguring,
+		VCenterVMID:     "vm-broken",
+		DefaultUsername: "ubuntu",
+	}
+	got := h.wizardState(context.Background(), tmpl)
+	if got.BuildVMIP != "" || got.BuildVMName != "" {
+		t.Errorf("live VM fields should be empty on vCenter error; got name=%q ip=%q",
+			got.BuildVMName, got.BuildVMIP)
+	}
+	// The non-vCenter fields (from the template row) still come through.
+	if got.DefaultUsername != "ubuntu" {
+		t.Errorf("DefaultUsername should survive vCenter error; got %q",
+			got.DefaultUsername)
+	}
+}
+
+func noopLogger(t *testing.T) *slog.Logger {
+	t.Helper()
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }

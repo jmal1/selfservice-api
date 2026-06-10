@@ -80,6 +80,26 @@ type WizardStateResponse struct {
 	LastJobType       string    `json:"last_job_type,omitempty"`
 	LastJobStatus     string    `json:"last_job_status,omitempty"`
 	LastJobError      string    `json:"last_job_error,omitempty"`
+
+	// Build-VM access fields (Phase H). Populated for the wizard's
+	// `provisioning` / `configuring` / `generalizing` states so the
+	// instructor can SSH/RDP into the staging VM and see the bootstrap
+	// credentials if the OS locks them out. These are NOT secret data —
+	// they're the same defaults the template generalize step uses, and
+	// the wizard endpoint is already gated to template-owner + admin.
+	//
+	// BuildVMName + BuildVMIP come from a non-blocking vCenter
+	// property collector call; either may be empty while the guest
+	// boots or before VMware Tools reports an IP.
+	OSType          string `json:"os_type,omitempty"`
+	TemplateKind    string `json:"template_kind,omitempty"`
+	AssignIP        bool   `json:"assign_ip"`
+	BuildVMName     string `json:"build_vm_name,omitempty"`
+	BuildVMIP       string `json:"build_vm_ip,omitempty"`
+	BuildVMPowerOn  bool   `json:"build_vm_power_on,omitempty"`
+	BuildVMTools    bool   `json:"build_vm_tools_running,omitempty"`
+	DefaultUsername string `json:"default_username,omitempty"`
+	DefaultPassword string `json:"default_password,omitempty"`
 }
 
 // vmNameSlugRe matches characters that aren't safe in a vCenter VM name.
@@ -549,6 +569,32 @@ func (h *Handler) wizardState(ctx stdcontext.Context, tmpl *models.Template) Wiz
 		SourceType:        tmpl.SourceType,
 		SourceRef:         tmpl.SourceRef,
 		StagingNetwork:    tmpl.StagingNetwork,
+		// Build-VM access (Phase H): plumb the template's OS/kind/defaults
+		// always. The wizard UI only renders the access panel during
+		// transient build states, so a leak into non-build states would
+		// just be a no-op — but keeping these populated makes the field
+		// behavior predictable from the API's perspective.
+		OSType:          tmpl.OSType,
+		TemplateKind:    tmpl.Kind,
+		AssignIP:        tmpl.AssignIP,
+		DefaultUsername: tmpl.DefaultUsername,
+		DefaultPassword: tmpl.DefaultPassword,
+	}
+	// Live VM info from vCenter (Phase H): best-effort, never blocks the
+	// wizard response on a transient vCenter hiccup. Only queried during
+	// the build-time states where a staging VM actually exists.
+	if h.vc != nil && tmpl.VCenterVMID != "" && isBuildState(tmpl.TemplateState) {
+		info, err := h.vc.GetGuestInfo(ctx, tmpl.VCenterVMID)
+		switch {
+		case err != nil:
+			h.logger.Warn("wizardState: GetGuestInfo failed",
+				"template_id", tmpl.ID, "moref", tmpl.VCenterVMID, "error", err)
+		case info != nil:
+			resp.BuildVMName = info.Name
+			resp.BuildVMIP = info.IPAddress
+			resp.BuildVMPowerOn = info.PoweredOn
+			resp.BuildVMTools = info.ToolsRunning
+		}
 	}
 	// Surface the most recent worker job for this template so the UI can
 	// (a) mark the right wizard step as the errored one — without this it
@@ -580,6 +626,23 @@ func (h *Handler) wizardState(ctx stdcontext.Context, tmpl *models.Template) Wiz
 		}
 	}
 	return resp
+}
+
+// isBuildState reports whether the template is in a state where a real
+// staging VM exists in vCenter. The wizard only queries vCenter for live
+// VM info during these states — `draft` has no VM at all, `ready` /
+// `active` have a (converted-to-template) VM that's powered off and
+// useless for SSH/RDP, and `error` could be either pre- or post-clone
+// but we leave it alone to avoid spurious vCenter calls during an
+// already-failed build.
+func isBuildState(state string) bool {
+	switch state {
+	case models.TemplateStateProvisioning,
+		models.TemplateStateConfiguring,
+		models.TemplateStateGeneralizing:
+		return true
+	}
+	return false
 }
 
 // buildTemplateVMName produces a vCenter-safe VM name from the template's

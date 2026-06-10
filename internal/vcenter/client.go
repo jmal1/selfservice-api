@@ -562,6 +562,57 @@ func (c *Client) GetVM(ctx context.Context, moref string) (*mo.VirtualMachine, e
 	return &props, nil
 }
 
+// GuestInfo is a lightweight, JSON-friendly snapshot of a VM's
+// guest/runtime state suitable for surfacing to the wizard UI. Unlike
+// WaitForIP / WaitForTools, GetGuestInfo never blocks — it's a single
+// property collector call that returns whatever is currently known, so
+// the wizard's 5s polling loop drives the freshness.
+//
+// IPAddress may be empty if VMware Tools hasn't reported one yet (guest
+// still booting, tools not installed). ToolsRunning lets the UI explain
+// "waiting for VMware Tools…" vs "no IP assigned yet" instead of just
+// hiding the connection box silently.
+type GuestInfo struct {
+	Name         string // vCenter VM name (used for .rdp filename, audit, display)
+	IPAddress    string // primary guest IP if VMware Tools reports one, "" otherwise
+	ToolsRunning bool   // true when guest.toolsRunningStatus == guestToolsRunning
+	PoweredOn    bool   // true when runtime.powerState == poweredOn
+}
+
+// GetGuestInfo returns a non-blocking snapshot of the VM's guest/runtime
+// state. Used by the template wizard to surface IP + name to the
+// instructor without waiting for VMware Tools to come up.
+//
+// Returns an error only on transport/auth failures. A VM with no IP and
+// no tools is a normal "still booting" state and returns a populated
+// GuestInfo with empty IPAddress + ToolsRunning=false.
+func (c *Client) GetGuestInfo(ctx context.Context, moref string) (*GuestInfo, error) {
+	if err := c.ensureConnected(ctx); err != nil {
+		return nil, err
+	}
+
+	var props mo.VirtualMachine
+	err := c.withRetry(ctx, "get guest info", func() error {
+		vm := object.NewVirtualMachine(c.client.Client,
+			types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
+		return vm.Properties(ctx, vm.Reference(),
+			[]string{"name", "runtime.powerState", "guest.ipAddress", "guest.toolsRunningStatus"},
+			&props)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("get guest info for %s: %w", moref, err)
+	}
+
+	info := &GuestInfo{Name: props.Name}
+	if props.Guest != nil {
+		info.IPAddress = props.Guest.IpAddress
+		info.ToolsRunning = props.Guest.ToolsRunningStatus ==
+			string(types.VirtualMachineToolsRunningStatusGuestToolsRunning)
+	}
+	info.PoweredOn = props.Runtime.PowerState == types.VirtualMachinePowerStatePoweredOn
+	return info, nil
+}
+
 // WebMKSTicket holds the result of a WebMKS ticket acquisition.
 type WebMKSTicket struct {
 	Host   string
