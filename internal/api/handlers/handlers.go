@@ -356,7 +356,7 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 		}
 		vmSpecs = append(vmSpecs, workerVMSpec{
 			PodVMID:      vmID,
-			TemplateName: rv.template.VCenterTemplate,
+			TemplateName: rv.template.VCenterRef(),
 			VMName:       vmName,
 			VCPUs:        int32(rv.vcpus),
 			RAMMB:        int64(rv.ramMB),
@@ -774,7 +774,7 @@ func (h *Handler) AddVM(w http.ResponseWriter, r *http.Request) {
 	payload, _ := json.Marshal(map[string]string{
 		"pod_id":        podID.String(),
 		"pod_vm_id":     vm.ID.String(),
-		"template_name": found.VCenterTemplate,
+		"template_name": found.VCenterRef(),
 		"vm_name":       pod.Salt + "-" + sanitizeName(req.DisplayName),
 		"display_name":  req.DisplayName,
 		"user_id":       userID.String(),

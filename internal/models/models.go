@@ -60,6 +60,22 @@ type Template struct {
 	UpdatedAt      time.Time  `json:"updated_at" db:"updated_at"`
 }
 
+// VCenterRef returns the vCenter reference to clone FROM for this
+// template, preferring VCenterVMID (a managed-object moref like
+// "vm-8942", set by wizard-published templates) over VCenterTemplate
+// (a friendly inventory name, the legacy path used by manually-
+// registered templates). Returns "" if neither is set.
+//
+// Callers pass the result as CloneVMParams.TemplateName, which
+// cloneVMInner resolves to a *object.VirtualMachine — see
+// vcenter/client.go for moref-vs-name detection.
+func (t *Template) VCenterRef() string {
+	if t.VCenterVMID != "" {
+		return t.VCenterVMID
+	}
+	return t.VCenterTemplate
+}
+
 // Template kind constants — keep in sync with the CHECK constraint in
 // migration 000016_template_kind.up.sql.
 const (

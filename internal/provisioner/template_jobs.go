@@ -31,9 +31,30 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/jmal1/selfservice-api/internal/models"
+	"github.com/jmal1/selfservice-api/internal/provisioner/assets"
 	"github.com/jmal1/selfservice-api/internal/templates"
 	"github.com/jmal1/selfservice-api/internal/vcenter"
 )
+
+// windowsUnattendGuestPath is where the Windows generalize step writes a
+// freshly-rendered unattend.xml *before* invoking sysprep. We use the
+// canonical Panther location so the file is on the same volume as the OS
+// and survives sysprep's first-run pass (which renames it to
+// unattend.xml under Panther\Unattend\ regardless of source path).
+//
+// IMPORTANT: this file must be written *every* generalize run. Sysprep
+// ALWAYS scrubs plaintext <Password> elements in unattend.xml after a
+// /generalize, replacing them with "*SENSITIVE*DATA*DELETED*". Once that
+// happens the file is useless for subsequent clones (the LocalAccount
+// password becomes the literal scrub-marker string, no Student account
+// is ever created, and every L3 clone drops into manual OOBE). The fix
+// is two-part: (1) the file we ship uses base64-encoded UTF-16LE
+// passwords with <PlainText>false</PlainText>, which sysprep does NOT
+// scrub; (2) we still overwrite the file every generalize run so a
+// previously-scrubbed copy on a re-generalized L2 gets replaced. See
+// internal/provisioner/assets/windows-unattend.xml and the wiki entry
+// "Why Windows templates need a fresh unattend.xml on every generalize".
+const windowsUnattendGuestPath = `C:\Windows\Panther\unattend.xml`
 
 // TemplateProvisionPayload describes the work for a template_provision job.
 //
@@ -279,6 +300,22 @@ func (p *Provisioner) GeneralizeTemplate(ctx context.Context, job *models.Job) e
 			fmt.Errorf("VMware Tools not running: %w", err))
 	}
 
+	// Step 1b (Windows only): upload a fresh unattend.xml *before* sysprep.
+	// Sysprep scrubs plaintext passwords from any unattend.xml it processes,
+	// so a previously-generalized L2 has a poisoned copy on disk. We always
+	// overwrite it with the canonical encoded-password version from the
+	// embedded assets so every generalize starts from a known-good file.
+	// See windowsUnattendGuestPath docstring for the full bug story.
+	if osType == "windows" {
+		p.publishProgress(job.ID, "upload_unattend", "Uploading unattend.xml for sysprep")
+		if err := p.vc.UploadFileToGuest(ctx, payload.VMMoref,
+			payload.GuestUsername, payload.GuestPassword,
+			windowsUnattendGuestPath, assets.WindowsUnattendXML); err != nil {
+			return p.markTemplateError(ctx, payload.TemplateID,
+				fmt.Errorf("upload unattend.xml: %w", err))
+		}
+	}
+
 	// Step 2: run generalize script
 	p.publishProgress(job.ID, "run_generalize", fmt.Sprintf("Running %s generalization script", osType))
 	script := generalizeScript(osType)
@@ -297,12 +334,21 @@ func (p *Provisioner) GeneralizeTemplate(ctx context.Context, job *models.Job) e
 		ActionSlug:    "template-generalize",
 	})
 	// RunScriptInGuest may return an error because the VM shut itself
-	// down mid-script — that's the EXPECTED outcome for generalize. We
-	// rely on the wait-for-shutdown step below to determine real success.
-	// Only surface this error if it's a guest auth failure or tools issue.
-	if err != nil && !isExpectedShutdownErr(err) {
-		p.logger.Warn("generalize script returned (may be expected due to shutdown)",
-			"template_id", payload.TemplateID, "error", err)
+	// down mid-script — that's the EXPECTED outcome for generalize. Only
+	// swallow that flavor of error; everything else (auth failure, missing
+	// temp dir, tools crash, script syntax error) is a real failure and
+	// must surface immediately so the admin doesn't wait 10 minutes for
+	// waitForPowerOff to time out on a VM that was never going to shut
+	// down (see bug-generalize-error-swallow / bug-windows-guest-ops-temp-
+	// path discovered 2026-06-09 during the student-windows-11-v2 build).
+	if err != nil {
+		if isExpectedShutdownErr(err) {
+			p.logger.Info("generalize script connection lost mid-call (expected shutdown race)",
+				"template_id", payload.TemplateID, "error", err)
+		} else {
+			return p.markTemplateError(ctx, payload.TemplateID,
+				fmt.Errorf("generalize script failed before VM shutdown: %w", err))
+		}
 	}
 
 	// Step 3: wait for shutdown (10 min)
@@ -403,7 +449,14 @@ func generalizeScript(osType string) string {
 		// sysprep (sysprep will kill the parent session as part of
 		// shutdown). -Wait:$false means PS returns immediately and
 		// the worker's waitForPowerOff catches the resulting power-off.
-		return `Start-Process -FilePath "C:\Windows\System32\Sysprep\sysprep.exe" -ArgumentList "/generalize","/oobe","/shutdown","/quiet" -NoNewWindow`
+		//
+		// /unattend: points sysprep at the file we uploaded in Step 1b
+		// so the OOBE pass on the *next* boot of any clone follows
+		// our script (creates Student, runs FirstLogonCommands,
+		// hands off to cloudbase-init for per-pod password injection).
+		// Without it sysprep ignores our file and the clone drops into
+		// interactive OOBE.
+		return `Start-Process -FilePath "C:\Windows\System32\Sysprep\sysprep.exe" -ArgumentList "/generalize","/oobe","/shutdown","/quiet","/unattend:C:\Windows\Panther\unattend.xml" -NoNewWindow`
 	}
 	// Linux. Keep as POSIX-safe so it works under dash if /bin/sh is dash.
 	return strings.Join([]string{

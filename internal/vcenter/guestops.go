@@ -2,6 +2,7 @@ package vcenter
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,7 +20,8 @@ import (
 //
 // We deliberately accept the script as a string (not a command path) so the
 // caller doesn't have to manage temp files inside the guest — RunScriptInGuest
-// uploads the script to /tmp/crucible-<runID>-<actionSlug>.sh, executes it,
+// uploads the script to an OS-appropriate temp dir (/tmp on Linux,
+// C:\Users\<GuestUser>\AppData\Local\Temp on Windows), executes it,
 // captures stdout/stderr to companion files, and pulls everything back.
 //
 // Limits we enforce (and why):
@@ -71,13 +73,23 @@ const (
 //
 // Process flow inside the guest:
 //
-//  1. UploadFileToGuest /tmp/crucible-<runid>-<slug>.sh         (the script)
-//  2. UploadFileToGuest /tmp/crucible-<runid>-<slug>.stdin      (empty)
-//  3. StartProgramInGuest /bin/bash <script> > .stdout 2> .stderr
+//  1. UploadFileToGuest <tmpBase>.sh|.ps1                       (the script)
+//  2. UploadFileToGuest <tmpBase>.stdin                         (empty)
+//  3. StartProgramInGuest /bin/sh|powershell.exe <script> > .stdout 2> .stderr
 //  4. ListProcessesInGuest in a loop until ExitCode != nil OR timeout
 //  5. If timeout: TerminateProcessInGuest, mark TimedOut=true
 //  6. InitiateFileTransferFromGuest .stdout and .stderr
-//  7. Delete /tmp/crucible-<runid>-<slug>.* files
+//  7. Delete <tmpBase>.* files
+//
+// `<tmpBase>` is OS-appropriate:
+//   - Linux  : /tmp/crucible-<runID>-<slug>
+//   - Windows: C:\Users\<GuestUser>\AppData\Local\Temp\crucible-<runID>-<slug>
+//     (a user-profile temp dir that is writable even when VMware Tools
+//     impersonates an Administrators-group user with a UAC-filtered token —
+//     C:\tmp does not exist by default and the root of C:\ requires
+//     elevation that filtered tokens lack, which historically broke every
+//     Windows generalize attempt with a "Permission to perform this
+//     operation was denied" ServerFaultCode on the first upload.)
 //
 // All of the above is wrapped in withRetry so a session expiry between any
 // two steps gets handled transparently.
@@ -139,7 +151,10 @@ func (c *Client) runScriptInGuestInner(ctx context.Context, req GuestExecRequest
 	}
 
 	// Resolve guest paths up front so cleanup can run even on error.
-	tmpBase := fmt.Sprintf("/tmp/crucible-%s-%s", req.RunID, req.ActionSlug)
+	tmpBase, err := guestTempBase(req.Language, req.GuestUser, req.RunID, req.ActionSlug)
+	if err != nil {
+		return nil, fmt.Errorf("resolve guest temp path: %w", err)
+	}
 	scriptPath := tmpBase + scriptSuffix(req.Language)
 	stdoutPath := tmpBase + ".stdout"
 	stderrPath := tmpBase + ".stderr"
@@ -156,7 +171,11 @@ func (c *Client) runScriptInGuestInner(ctx context.Context, req GuestExecRequest
 
 	// Upload script body. Use a transfer URL that we POST to ourselves —
 	// VMware Tools accepts a single chunk PUT-like flow via this URL.
-	if err := uploadGuestFile(ctx, fileMgr, auth, scriptPath, []byte(req.Script)); err != nil {
+	// The URL points at an ESXi host (not vCenter) which serves a VMCA-signed
+	// cert that we have no reason to trust separately from the vCenter cert;
+	// honor the same Insecure flag the soap client uses.
+	httpClient := guestTransferClient(c.config.Insecure)
+	if err := uploadGuestFile(ctx, httpClient, fileMgr, auth, scriptPath, []byte(req.Script)); err != nil {
 		return nil, fmt.Errorf("upload script to guest: %w", err)
 	}
 
@@ -222,13 +241,14 @@ func (c *Client) runScriptInGuestInner(ctx context.Context, req GuestExecRequest
 	result.ExitCode = exitCode
 
 	// Download stdout and stderr (best-effort — script may have failed
-	// before writing them).
-	stdoutBytes, truncOut, err := downloadGuestFile(ctx, fileMgr, auth, stdoutPath, maxGuestOutputBytes)
+	// before writing them). Reuse httpClient with the same TLS posture
+	// as the upload so we don't choke on the ESXi host's VMCA cert.
+	stdoutBytes, truncOut, err := downloadGuestFile(ctx, httpClient, fileMgr, auth, stdoutPath, maxGuestOutputBytes)
 	if err == nil {
 		result.Stdout = string(stdoutBytes)
 		result.TruncatedOut = result.TruncatedOut || truncOut
 	}
-	stderrBytes, truncErr, err := downloadGuestFile(ctx, fileMgr, auth, stderrPath, maxGuestOutputBytes)
+	stderrBytes, truncErr, err := downloadGuestFile(ctx, httpClient, fileMgr, auth, stderrPath, maxGuestOutputBytes)
 	if err == nil {
 		result.Stderr = string(stderrBytes)
 		result.TruncatedOut = result.TruncatedOut || truncErr
@@ -247,10 +267,67 @@ func (c *Client) vmFromMoref(moref string) (*object.VirtualMachine, error) {
 	return object.NewVirtualMachine(c.client.Client, ref), nil
 }
 
+// UploadFileToGuest writes `data` to `guestPath` inside the target VM via
+// VMware Tools. Wraps the inner uploadGuestFile helper with connection
+// setup so callers outside this file (e.g. the provisioner's
+// GeneralizeTemplate step uploading a fresh unattend.xml before sysprep)
+// don't have to reach for govmomi primitives.
+//
+// Pre-conditions: VM must be powered on AND VMware Tools must be running.
+// Authentication is interactive-session NamePassword; the guest user must
+// have write permission to guestPath (use an administrator account for
+// system-protected paths like C:\Windows\Panther\unattend.xml).
+//
+// Idempotent overwrite: passes overwrite=true to InitiateFileTransferToGuest.
+//
+// Bounded payload: the data buffer is held entirely in memory, so callers
+// should keep files under a few MB. Suitable for unattend.xml, registry
+// dumps, small config files; NOT for ISOs.
+func (c *Client) UploadFileToGuest(ctx context.Context, moref, guestUser, guestPassword, guestPath string, data []byte) error {
+	if err := c.ensureConnected(ctx); err != nil {
+		return fmt.Errorf("ensure vCenter connection: %w", err)
+	}
+	return c.withRetry(ctx, "upload file to guest", func() error {
+		vm, err := c.vmFromMoref(moref)
+		if err != nil {
+			return err
+		}
+		var vmInfo mo.VirtualMachine
+		if err := vm.Properties(ctx, vm.Reference(), []string{"guest", "runtime"}, &vmInfo); err != nil {
+			return fmt.Errorf("refresh VM properties for %s: %w", moref, err)
+		}
+		if vmInfo.Runtime.PowerState != types.VirtualMachinePowerStatePoweredOn {
+			return fmt.Errorf("VM %s is not powered on (state=%s); cannot upload to guest",
+				moref, vmInfo.Runtime.PowerState)
+		}
+		if vmInfo.Guest == nil || vmInfo.Guest.ToolsRunningStatus != string(types.VirtualMachineToolsRunningStatusGuestToolsRunning) {
+			return fmt.Errorf("VMware Tools not running in guest on VM %s; install/start tools first", moref)
+		}
+		opsMgr := guest.NewOperationsManager(c.client.Client, vm.Reference())
+		fileMgr, err := opsMgr.FileManager(ctx)
+		if err != nil {
+			return fmt.Errorf("get guest file manager: %w", err)
+		}
+		auth := &types.NamePasswordAuthentication{
+			Username: guestUser,
+			Password: guestPassword,
+		}
+		httpClient := guestTransferClient(c.config.Insecure)
+		return uploadGuestFile(ctx, httpClient, fileMgr, auth, guestPath, data)
+	})
+}
+
 // uploadGuestFile uploads a single file to the guest via the
 // InitiateFileTransferToGuest URL. The govmomi API returns a URL that the
 // caller must HTTP-PUT bytes to; we wrap that pattern here.
-func uploadGuestFile(ctx context.Context, fm *guest.FileManager, auth types.BaseGuestAuthentication, path string, data []byte) error {
+//
+// The URL points at the ESXi host the VM lives on (not vCenter). The host
+// serves a VMCA-signed cert that, in homelabs and dev clusters, often isn't
+// trusted by the worker's CA pool. Pass in an httpClient whose TLS posture
+// matches the soap client used to talk to vCenter so the two stay
+// consistent — there is no scenario where trusting vCenter and rejecting an
+// ESXi host that vCenter owns makes sense.
+func uploadGuestFile(ctx context.Context, httpClient *http.Client, fm *guest.FileManager, auth types.BaseGuestAuthentication, path string, data []byte) error {
 	attrs := &types.GuestFileAttributes{}
 	url, err := fm.InitiateFileTransferToGuest(ctx, auth, path, attrs, int64(len(data)), true)
 	if err != nil {
@@ -262,7 +339,6 @@ func uploadGuestFile(ctx context.Context, fm *guest.FileManager, auth types.Base
 		return fmt.Errorf("build upload request: %w", err)
 	}
 	req.ContentLength = int64(len(data))
-	httpClient := defaultHTTPClient()
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("upload file %s: %w", path, err)
@@ -276,8 +352,9 @@ func uploadGuestFile(ctx context.Context, fm *guest.FileManager, auth types.Base
 }
 
 // downloadGuestFile pulls a file from the guest, capped at maxBytes. The
-// second return value reports whether the file exceeded the cap.
-func downloadGuestFile(ctx context.Context, fm *guest.FileManager, auth types.BaseGuestAuthentication, path string, maxBytes int) ([]byte, bool, error) {
+// second return value reports whether the file exceeded the cap. See
+// uploadGuestFile for the rationale on the httpClient parameter.
+func downloadGuestFile(ctx context.Context, httpClient *http.Client, fm *guest.FileManager, auth types.BaseGuestAuthentication, path string, maxBytes int) ([]byte, bool, error) {
 	info, err := fm.InitiateFileTransferFromGuest(ctx, auth, path)
 	if err != nil {
 		return nil, false, fmt.Errorf("initiate download of %s: %w", path, err)
@@ -287,7 +364,7 @@ func downloadGuestFile(ctx context.Context, fm *guest.FileManager, auth types.Ba
 	if err != nil {
 		return nil, false, fmt.Errorf("build download request: %w", err)
 	}
-	resp, err := defaultHTTPClient().Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, false, fmt.Errorf("download %s: %w", path, err)
 	}
@@ -308,12 +385,25 @@ func downloadGuestFile(ctx context.Context, fm *guest.FileManager, auth types.Ba
 	return data, truncated, nil
 }
 
-// defaultHTTPClient returns the HTTP client used for guest file transfers.
-// Reuses the connection pool from the govmomi client (insecure settings
-// already applied if the caller chose them) to avoid double-handshaking.
-func defaultHTTPClient() *http.Client {
+// guestTransferClient returns the HTTP client used for VMware Tools guest
+// file transfers. The govmomi soap client is configured to honor a "Insecure"
+// flag at connect time (Config.Insecure → InsecureSkipVerify on its TLS
+// config). Guest file transfers happen out-of-band over a fresh HTTP client
+// pointed at an ESXi host; if the caller's vCenter session is insecure,
+// downstream PUTs to ESXi must also be insecure or every transfer will fail
+// with x509: certificate signed by unknown authority. Conversely if Insecure
+// is false, we DO verify — that matches a hardened deployment where VMCA has
+// been added to the worker's trust store.
+//
+// Timeout is generous (60s) because uploads can be megabytes over slow links.
+func guestTransferClient(insecure bool) *http.Client {
 	return &http.Client{
 		Timeout: 60 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: insecure, //nolint:gosec // honors the same flag as the vCenter soap client
+			},
+		},
 	}
 }
 
@@ -323,6 +413,34 @@ func scriptSuffix(language string) string {
 		return ".ps1"
 	default:
 		return ".sh"
+	}
+}
+
+// guestTempBase returns the OS-appropriate temp file base path inside the
+// guest (no extension). On Windows we deliberately target the GuestUser's
+// own AppData\Local\Temp directory: it is guaranteed to exist for a logged-in
+// user, the user owns it (so VMware Tools can read/write/delete files there
+// even with a UAC-filtered token from interactive logon), and we don't have
+// to chase the surprisingly tight default ACLs on C:\Windows\Temp or
+// elevation requirements for C:\.
+//
+// guestUser is the local account name (no DOMAIN\ prefix supported — vCenter
+// guest-ops with local accounts is what Crucible uses for all template ops).
+// runID and actionSlug feed filename uniqueness so concurrent jobs don't
+// collide.
+func guestTempBase(language, guestUser, runID, actionSlug string) (string, error) {
+	switch strings.ToLower(language) {
+	case "powershell", "pwsh":
+		if guestUser == "" {
+			return "", fmt.Errorf("guestUser is required to resolve Windows temp path")
+		}
+		if strings.ContainsAny(guestUser, `\/:*?"<>|`) {
+			return "", fmt.Errorf("guestUser %q contains characters invalid in a Windows path", guestUser)
+		}
+		return fmt.Sprintf(`C:\Users\%s\AppData\Local\Temp\crucible-%s-%s`,
+			guestUser, runID, actionSlug), nil
+	default:
+		return fmt.Sprintf("/tmp/crucible-%s-%s", runID, actionSlug), nil
 	}
 }
 

@@ -39,7 +39,7 @@ func TestGeneralizeScript_LinuxContainsCriticalSteps(t *testing.T) {
 // times out waiting for power-off).
 func TestGeneralizeScript_WindowsRunsSysprep(t *testing.T) {
 	got := generalizeScript("windows")
-	for _, r := range []string{"sysprep.exe", "/generalize", "/oobe", "/shutdown"} {
+	for _, r := range []string{"sysprep.exe", "/generalize", "/oobe", "/shutdown", `/unattend:C:\Windows\Panther\unattend.xml`} {
 		if !strings.Contains(got, r) {
 			t.Errorf("Windows generalize script missing %q\nscript:\n%s", r, got)
 		}

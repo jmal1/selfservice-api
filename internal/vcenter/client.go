@@ -150,6 +150,12 @@ func (c *Client) Close(ctx context.Context) error {
 
 // CloneVMParams holds parameters for cloning a VM.
 type CloneVMParams struct {
+	// TemplateName accepts either a vCenter inventory name (e.g.
+	// "student-windows-11") or a managed-object reference like
+	// "vm-8942". Wizard-published templates only persist the moref
+	// (templates.vcenter_vm_id); legacy templates registered by name
+	// persist the inventory name (templates.vcenter_template).
+	// resolveSourceVM in cloneVMInner detects which form was passed.
 	TemplateName string
 	VMName       string
 	VCPUs        int32
@@ -175,10 +181,52 @@ func (c *Client) CloneVM(ctx context.Context, params CloneVMParams) (string, err
 	return moref, err
 }
 
+// resolveSourceVM looks up a VM by either inventory name or moref. A
+// "ref" beginning with "vm-" followed by digits is treated as a
+// VirtualMachine managed-object reference and wrapped directly; any
+// other value is resolved by name via the finder.
+//
+// Wizard-published templates persist only the moref
+// (templates.vcenter_vm_id, e.g. "vm-8942") because the staging VM
+// keeps its original name during publish — there is no friendly
+// "vcenter_template" entry to look up. Legacy templates registered
+// through the older UI persist the inventory name instead. Both
+// shapes need to clone, so we accept either.
+func (c *Client) resolveSourceVM(ctx context.Context, ref string) (*object.VirtualMachine, error) {
+	if ref == "" {
+		return nil, fmt.Errorf("template ref is empty")
+	}
+	if isVMMoref(ref) {
+		return object.NewVirtualMachine(c.client.Client,
+			types.ManagedObjectReference{Type: "VirtualMachine", Value: ref}), nil
+	}
+	return c.finder.VirtualMachine(ctx, ref)
+}
+
+// isVMMoref reports whether s looks like a VirtualMachine managed-object
+// reference (e.g. "vm-8942"). vCenter morefs use the prefix "vm-"
+// followed by one or more digits; no legitimate inventory name should
+// match this pattern.
+func isVMMoref(s string) bool {
+	if !strings.HasPrefix(s, "vm-") {
+		return false
+	}
+	rest := s[3:]
+	if rest == "" {
+		return false
+	}
+	for _, r := range rest {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // cloneVMInner contains the actual clone logic (called by CloneVM via withRetry).
 func (c *Client) cloneVMInner(ctx context.Context, params CloneVMParams) (string, error) {
-	// Find template
-	template, err := c.finder.VirtualMachine(ctx, params.TemplateName)
+	// Find template — accepts inventory name OR moref (e.g. "vm-8942").
+	template, err := c.resolveSourceVM(ctx, params.TemplateName)
 	if err != nil {
 		return "", fmt.Errorf("find template %s: %w", params.TemplateName, err)
 	}
