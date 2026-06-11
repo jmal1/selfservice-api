@@ -115,5 +115,16 @@ spec:
               value: {{ .Values.worker.pushgatewayURL | default "" | quote }}
             - name: WORKER_PUSHGATEWAY_JOB
               value: {{ .Values.worker.pushgatewayJob | default "crucible_provision_worker" | quote }}
+            # vCenter orphan reconciler: opt-in scan of the configured Student-VMs
+            # folder. Auto-destroys synthetic VMs whose pod is terminal; logs +
+            # counts everything else for operator review.
+            - name: WORKER_ORPHAN_RECONCILER_ENABLED
+              value: {{ .Values.worker.orphanReconciler.enabled | default false | quote }}
+            - name: WORKER_ORPHAN_RECONCILER_FOLDER
+              value: {{ .Values.worker.orphanReconciler.folder | default "" | quote }}
+            - name: WORKER_ORPHAN_RECONCILER_INTERVAL
+              value: {{ .Values.worker.orphanReconciler.interval | default "1h" | quote }}
+            - name: WORKER_ORPHAN_RECONCILER_MIN_AGE
+              value: {{ .Values.worker.orphanReconciler.minAge | default "1h" | quote }}
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}

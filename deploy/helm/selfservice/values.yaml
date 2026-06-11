@@ -34,6 +34,22 @@ worker:
   # string to disable cleanly. Job label is the Pushgateway grouping key.
   pushgatewayURL: "http://pushgateway.observability:9091"
   pushgatewayJob: "crucible_provision_worker"
+  # vCenter orphan reconciler (Phase 2.3 of the 2026-06-10 esxi2 NFS41 APD
+  # recovery). When enabled, the worker scans `orphanReconciler.folder` on
+  # `orphanReconciler.interval` and:
+  #   - auto-destroys any VM whose linked pod name starts with the synthetic
+  #     prefix AND whose pod is in a terminal state for >= minAge,
+  #   - logs + counts everything else (non-synthetic terminal pods, VMs with
+  #     no pod_vms row at all) via crucible_vcenter_orphans_* metrics so the
+  #     operator can review before any destructive action.
+  # Disabled by default; opt in with enabled: true after observing the
+  # dry-run metric counts for at least one tick.
+  orphanReconciler:
+    enabled: false
+    # Empty falls back to vcenter.vmFolder (the prod default Student-VMs).
+    folder: ""
+    interval: "1h"
+    minAge: "1h"
   resources:
     requests:
       cpu: 100m

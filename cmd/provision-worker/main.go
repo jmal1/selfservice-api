@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -98,6 +99,52 @@ func main() {
 		logger.Info("destroy_failed pushgateway enabled", "url", pgURL, "job", job)
 	}
 
+	// Optional: vCenter orphan reconciler. Scans the configured Student-VMs
+	// folder against pod_vms on an hourly tick. Auto-destroys synthetic-noop-*
+	// VMs whose parent pod is already terminal; logs + counts everything else
+	// for operator review via the crucible_vcenter_orphans_* metric family.
+	//
+	// Disabled by default. Set WORKER_ORPHAN_RECONCILER_ENABLED=true to opt in.
+	// WORKER_ORPHAN_RECONCILER_FOLDER overrides the scanned folder (defaults
+	// to cfg.VCenter.VMFolder). WORKER_ORPHAN_RECONCILER_INTERVAL accepts any
+	// Go duration ("1h", "30m"); empty falls back to 1 hour.
+	orphanEnabled := strings.EqualFold(os.Getenv("WORKER_ORPHAN_RECONCILER_ENABLED"), "true")
+	orphanInterval := time.Hour
+	if v := os.Getenv("WORKER_ORPHAN_RECONCILER_INTERVAL"); v != "" {
+		if parsed, err := time.ParseDuration(v); err == nil && parsed > 0 {
+			orphanInterval = parsed
+		} else {
+			logger.Warn("invalid WORKER_ORPHAN_RECONCILER_INTERVAL; using default 1h", "value", v, "error", err)
+		}
+	}
+	orphanFolder := os.Getenv("WORKER_ORPHAN_RECONCILER_FOLDER")
+	if orphanFolder == "" {
+		orphanFolder = cfg.VCenter.VMFolder
+	}
+	orphanMinAge := time.Hour
+	if v := os.Getenv("WORKER_ORPHAN_RECONCILER_MIN_AGE"); v != "" {
+		if parsed, err := time.ParseDuration(v); err == nil && parsed > 0 {
+			orphanMinAge = parsed
+		}
+	}
+	var orphanPusher *provisioner.OrphanCountPusher
+	if pgURL := os.Getenv("WORKER_PUSHGATEWAY_URL"); pgURL != "" {
+		job := os.Getenv("WORKER_PUSHGATEWAY_JOB")
+		if job == "" {
+			job = "crucible_provision_worker"
+		}
+		orphanPusher = &provisioner.OrphanCountPusher{
+			BaseURL:        pgURL,
+			Job:            job,
+			GroupingLabels: map[string]string{"layer": "api"},
+		}
+	}
+	orphanCfg := provisioner.OrphanReconcilerConfig{
+		Folder: orphanFolder,
+		MinAge: orphanMinAge,
+		Pusher: orphanPusher,
+	}
+
 	// Worker ID for job claiming
 	workerID, err := os.Hostname()
 	if err != nil {
@@ -139,6 +186,16 @@ func main() {
 	retryTicker := time.NewTicker(5 * time.Minute)
 	defer retryTicker.Stop()
 
+	// vCenter orphan reconciler ticker (opt-in; nil-safe).
+	var orphanTickerC <-chan time.Time
+	if orphanEnabled {
+		t := time.NewTicker(orphanInterval)
+		defer t.Stop()
+		orphanTickerC = t.C
+		logger.Info("vcenter orphan reconciler enabled",
+			"folder", orphanCfg.Folder, "interval", orphanInterval, "min_age", orphanMinAge)
+	}
+
 	// Start expiration cron (checks for expired pods every 5 minutes)
 	go prov.StartExpirationCron(ctx)
 
@@ -154,6 +211,10 @@ func main() {
 				processJobs(ctx, queries, prov, workerID, logger)
 			case <-retryTicker.C:
 				prov.RetryFailedDestroys(ctx)
+			case <-orphanTickerC:
+				if _, err := prov.ReconcileVCenterOrphans(ctx, orphanCfg); err != nil {
+					logger.Error("orphan reconcile failed", "error", err)
+				}
 			}
 		}
 	}()
