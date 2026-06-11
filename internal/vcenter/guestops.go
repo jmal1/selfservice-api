@@ -267,6 +267,56 @@ func (c *Client) vmFromMoref(moref string) (*object.VirtualMachine, error) {
 	return object.NewVirtualMachine(c.client.Client, ref), nil
 }
 
+// UploadFileToGuest writes `data` to `guestPath` inside the target VM via
+// VMware Tools. Wraps the inner uploadGuestFile helper with connection
+// setup so callers outside this file (e.g. the provisioner's
+// GeneralizeTemplate step uploading a fresh unattend.xml before sysprep)
+// don't have to reach for govmomi primitives.
+//
+// Pre-conditions: VM must be powered on AND VMware Tools must be running.
+// Authentication is interactive-session NamePassword; the guest user must
+// have write permission to guestPath (use an administrator account for
+// system-protected paths like C:\Windows\Panther\unattend.xml).
+//
+// Idempotent overwrite: passes overwrite=true to InitiateFileTransferToGuest.
+//
+// Bounded payload: the data buffer is held entirely in memory, so callers
+// should keep files under a few MB. Suitable for unattend.xml, registry
+// dumps, small config files; NOT for ISOs.
+func (c *Client) UploadFileToGuest(ctx context.Context, moref, guestUser, guestPassword, guestPath string, data []byte) error {
+	if err := c.ensureConnected(ctx); err != nil {
+		return fmt.Errorf("ensure vCenter connection: %w", err)
+	}
+	return c.withRetry(ctx, "upload file to guest", func() error {
+		vm, err := c.vmFromMoref(moref)
+		if err != nil {
+			return err
+		}
+		var vmInfo mo.VirtualMachine
+		if err := vm.Properties(ctx, vm.Reference(), []string{"guest", "runtime"}, &vmInfo); err != nil {
+			return fmt.Errorf("refresh VM properties for %s: %w", moref, err)
+		}
+		if vmInfo.Runtime.PowerState != types.VirtualMachinePowerStatePoweredOn {
+			return fmt.Errorf("VM %s is not powered on (state=%s); cannot upload to guest",
+				moref, vmInfo.Runtime.PowerState)
+		}
+		if vmInfo.Guest == nil || vmInfo.Guest.ToolsRunningStatus != string(types.VirtualMachineToolsRunningStatusGuestToolsRunning) {
+			return fmt.Errorf("VMware Tools not running in guest on VM %s; install/start tools first", moref)
+		}
+		opsMgr := guest.NewOperationsManager(c.client.Client, vm.Reference())
+		fileMgr, err := opsMgr.FileManager(ctx)
+		if err != nil {
+			return fmt.Errorf("get guest file manager: %w", err)
+		}
+		auth := &types.NamePasswordAuthentication{
+			Username: guestUser,
+			Password: guestPassword,
+		}
+		httpClient := guestTransferClient(c.config.Insecure)
+		return uploadGuestFile(ctx, httpClient, fileMgr, auth, guestPath, data)
+	})
+}
+
 // uploadGuestFile uploads a single file to the guest via the
 // InitiateFileTransferToGuest URL. The govmomi API returns a URL that the
 // caller must HTTP-PUT bytes to; we wrap that pattern here.
