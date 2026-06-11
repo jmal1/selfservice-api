@@ -56,27 +56,37 @@
         <SkipUserOOBE>true</SkipUserOOBE>
       </OOBE>
 
-      <!-- Create local Student account (cloudbase-init will set the password) -->
+      <!-- Create local Student account (cloudbase-init will set the password)
+           Password is base64-encoded UTF-16LE of "Changeme123!" + "Password"
+           with PlainText=false. Sysprep ONLY scrubs PlainText=true passwords;
+           the encoded form survives the L2 wizard generalize so L3 clones can
+           still create the Student account on first boot. Re-encode any
+           bootstrap password change with:
+             [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($pw + 'Password'))
+           See: https://learn.microsoft.com/en-us/windows-hardware/customize/desktop/unattend/microsoft-windows-shell-setup-useraccounts-localaccounts-localaccount-password
+      -->
       <UserAccounts>
         <LocalAccounts>
           <LocalAccount wcm:action="add">
             <Name>Student</Name>
             <Group>Administrators</Group>
             <Password>
-              <Value>Changeme123!</Value>
-              <PlainText>true</PlainText>
+              <Value>QwBoAGEAbgBnAGUAbQBlADEAMgAzACEAUABhAHMAcwB3AG8AcgBkAA==</Value>
+              <PlainText>false</PlainText>
             </Password>
           </LocalAccount>
         </LocalAccounts>
       </UserAccounts>
 
-      <!-- Auto-login as Student on first boot (cloudbase-init runs, then reboot) -->
+      <!-- Auto-login as Student on first boot (cloudbase-init runs, then reboot)
+           Same base64-UTF-16LE("Changeme123!Password") encoding as above so
+           sysprep doesn't strip it. -->
       <AutoLogon>
         <Enabled>true</Enabled>
         <Username>Student</Username>
         <Password>
-          <Value>Changeme123!</Value>
-          <PlainText>true</PlainText>
+          <Value>QwBoAGEAbgBnAGUAbQBlADEAMgAzACEAUABhAHMAcwB3AG8AcgBkAA==</Value>
+          <PlainText>false</PlainText>
         </Password>
         <LogonCount>1</LogonCount>
       </AutoLogon>

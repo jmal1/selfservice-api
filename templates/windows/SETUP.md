@@ -28,7 +28,7 @@ The platform uses a 3-level template hierarchy:
 
 - Access to vCenter Web Client and an account with VM-modify rights
 - Windows 11 Pro ISO mounted on the VM (currently in OOBE state)
-- This repo cloned (you'll need `templates/windows/unattend.xml`)
+- This repo cloned (you'll need `internal/provisioner/assets/windows-unattend.xml`)
 - A port group with internet egress for the build phase (the lab uses
   `Mgmt-VLAN10` or `LabVMs-VLAN30` — both have NAT to the internet via
   the home gateway)
@@ -149,7 +149,7 @@ stop_service_on_exit=false
 check_latest_version=false
 ```
 
-Copy `unattend.xml` from this directory to `C:\Windows\Panther\unattend.xml`
+Copy `internal/provisioner/assets/windows-unattend.xml` from this repo to `C:\Windows\Panther\unattend.xml`
 on the VM (the sysprep command in Step 9 reads it from there).
 
 Disable the cloudbase-init service pre-sysprep — the unattend.xml's
