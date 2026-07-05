@@ -296,14 +296,28 @@ func (h *Handler) AdminGeneralizeTemplate(w http.ResponseWriter, r *http.Request
 }
 
 // AdminPublishTemplate (POST /admin/templates/:id/publish) — wizard step 5.
-// ready → active, flips is_active so it shows in /api/v1/templates for students.
+//
+// Hard smoke gate: this no longer flips the template live directly. It
+// transitions ready → verifying and enqueues a template_verify job that
+// clones the base-image, boots it, and only promotes the template to
+// `active` (setting is_active) if that succeeds. On smoke failure the
+// template returns to `ready`. This guarantees no student ever clones a
+// template that was never proven to boot.
 func (h *Handler) AdminPublishTemplate(w http.ResponseWriter, r *http.Request) {
 	tmpl, ok := h.requireTemplateInState(w, r, models.TemplateStateReady)
 	if !ok {
 		return
 	}
-	if !h.stateOnlyTransition(w, r, tmpl, models.TemplateStateReady, models.TemplateStateActive, "template.publish",
-		true /* setIsActive */) {
+	if tmpl.VCenterVMID == "" {
+		http.Error(w, "template has no vCenter VM / base-image to verify (generalize never completed)", http.StatusConflict)
+		return
+	}
+	payload := map[string]any{
+		"template_id": tmpl.ID,
+		"vm_moref":    tmpl.VCenterVMID,
+	}
+	if !h.advanceTemplateAndEnqueue(w, r, tmpl, models.TemplateStateReady, models.TemplateStateVerifying,
+		models.JobTypeTemplateVerify, payload, "template.publish") {
 		return
 	}
 }

@@ -1226,6 +1226,8 @@ func templateDeleteStateRefusal(state string) (bool, string) {
 		return true, "cannot delete while provisioning; wait for the job to settle or cancel first"
 	case models.TemplateStateGeneralizing:
 		return true, "cannot delete while generalizing; wait for the job to settle or cancel first"
+	case models.TemplateStateVerifying:
+		return true, "cannot delete while verifying (smoke test running); wait for the job to settle first"
 	}
 	return false, ""
 }

@@ -45,11 +45,15 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 	// RequireRole(RoleInstructor) here keeps unauth/non-instructor
 	// users out at the route layer; per-template ownership check is in
 	// the handler.
-	r.Route("/api/v1/admin/templates/{templateID}/console", func(r chi.Router) {
-		r.Use(middleware.Auth(authProvider))
-		r.Use(middleware.RequireRole(models.RoleInstructor))
-		r.Get("/ws", h.TemplateBuildConsoleWS)
-	})
+	//
+	// IMPORTANT: register as a single Get(), NOT chi.Route(prefix), so
+	// chi doesn't take ownership of the /...templates/{id}/console/*
+	// subtree. The sibling /ticket endpoint lives in the Logger group
+	// below and would be shadowed otherwise.
+	r.With(
+		middleware.Auth(authProvider),
+		middleware.RequireRole(models.RoleInstructor),
+	).Get("/api/v1/admin/templates/{templateID}/console/ws", h.TemplateBuildConsoleWS)
 
 	// Run progress WebSocket — streams live workflow_start/action_complete/
 	// workflow_complete events for a given run. Replaces 2s polling.

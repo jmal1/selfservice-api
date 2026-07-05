@@ -14,9 +14,10 @@ a vCenter account to build a template.
 ## Lifecycle in one diagram
 
 ```
-   draft ──Provision──▶ provisioning ──auto──▶ configuring ──Generalize──▶ generalizing ──auto──▶ ready ──Publish──▶ active
-                                                  ▲                                                    │
-                                                  └────────────── Reconfigure ─────────── Unpublish ◀──┘
+   draft ──Provision──▶ provisioning ──auto──▶ configuring ──Generalize──▶ generalizing ──auto──▶ ready ──Publish──▶ verifying ──auto──▶ active
+                                                  ▲                                                    │                    │
+                                                  └────────────── Reconfigure ─────────── Unpublish ◀──┘                    │
+                                                                                                       ▲── smoke test fails ─┘
 ```
 
 Every state except `draft` has a **staging VM** living in vCenter's
@@ -30,8 +31,18 @@ the page.
 | `configuring` | VM is up; **install + configure your software here** | **Yes — the main reason to open it** |
 | `generalizing` | Sysprep / cloud-init clean is running (2–5 min) | **Yes** (useful to watch progress) |
 | `ready` | Template is generalized and ready to publish | No (staging VM cleaned up) |
+| `verifying` | **Automated smoke test** — Crucible clones a throwaway pod, boots it unattended, confirms it comes up, then destroys it | No |
 | `active` | Published — students can launch pods from it | No |
 | `error` | A worker job failed; check Last error in the wizard | No |
+
+> [!note]
+> **Publish is gated by a smoke test.** When you click Publish, the
+> template first enters `verifying`: Crucible clones a disposable VM
+> from the freshly-generalized image, powers it on, and waits for it to
+> boot unattended (VMware Tools + an IP lease). If it boots cleanly the
+> template auto-advances to `active`; if it fails to boot the template
+> returns to `ready` with the failure recorded — so a bricked image can
+> never reach students. The throwaway VM is always cleaned up.
 
 ---
 
@@ -93,9 +104,13 @@ the console button disappears.
 
 ## Step 5 — Publish
 
-Click **Publish to students**. The template becomes visible in the
-public catalog. **Unpublish** at any time to hide it without losing the
-generalized image.
+Click **Publish to students**. The template first enters `verifying`,
+where Crucible runs an automated smoke test (clone a throwaway pod →
+boot it unattended → confirm it comes up → destroy it). If it passes,
+the template becomes `active` and visible in the public catalog. If the
+smoke test fails, the template drops back to `ready` with the failure
+recorded — fix the image and Publish again. **Unpublish** an active
+template at any time to hide it without losing the generalized image.
 
 ---
 

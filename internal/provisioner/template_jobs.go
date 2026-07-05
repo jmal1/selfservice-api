@@ -300,6 +300,18 @@ func (p *Provisioner) GeneralizeTemplate(ctx context.Context, job *models.Job) e
 			fmt.Errorf("VMware Tools not running: %w", err))
 	}
 
+	// Step 1a (Windows only): fail-fast preflight BEFORE we invest time in
+	// unattend upload / BitLocker / sysprep. Aborts cleanly if the sysprep
+	// rearm count is exhausted (a guaranteed brick), warns on pending reboot.
+	if osType == "windows" {
+		p.publishProgress(job.ID, "preflight", "Running pre-sysprep preflight checks")
+		if err := p.vc.WindowsSysprepPreflight(ctx, payload.VMMoref,
+			payload.GuestUsername, payload.GuestPassword); err != nil {
+			return p.markTemplateError(ctx, payload.TemplateID,
+				fmt.Errorf("sysprep preflight failed: %w", err))
+		}
+	}
+
 	// Step 1b (Windows only): upload a fresh unattend.xml *before* sysprep.
 	// Sysprep scrubs plaintext passwords from any unattend.xml it processes,
 	// so a previously-generalized L2 has a poisoned copy on disk. We always
@@ -313,6 +325,23 @@ func (p *Provisioner) GeneralizeTemplate(ctx context.Context, job *models.Job) e
 			windowsUnattendGuestPath, assets.WindowsUnattendXML); err != nil {
 			return p.markTemplateError(ctx, payload.TemplateID,
 				fmt.Errorf("upload unattend.xml: %w", err))
+		}
+	}
+
+	// Step 1c (Windows only): ensure BitLocker is fully decrypted before
+	// sysprep. A BitLocker-protected volume generalizes fine but every L3
+	// clone then fails to boot (TPM-sealed key invalidated by the per-clone
+	// hardware change, no recovery password in the OOBE flow) — a "bricked"
+	// template the instructor only discovers hours later. Auto-decrypting
+	// here removes that sharp edge; it's a no-op when C: is already
+	// decrypted or BitLocker isn't present. Decryption of a mostly-empty
+	// template disk is typically a few minutes; cap at 30 min.
+	if osType == "windows" {
+		p.publishProgress(job.ID, "bitlocker_decrypt", "Ensuring BitLocker is fully decrypted (can take several minutes)")
+		if err := p.vc.EnsureBitLockerDecrypted(ctx, payload.VMMoref,
+			payload.GuestUsername, payload.GuestPassword, 30*time.Minute); err != nil {
+			return p.markTemplateError(ctx, payload.TemplateID,
+				fmt.Errorf("ensure BitLocker decrypted before sysprep: %w", err))
 		}
 	}
 
@@ -378,6 +407,157 @@ func (p *Provisioner) GeneralizeTemplate(ctx context.Context, job *models.Job) e
 	payload.GuestPassword = "[redacted]"
 
 	return nil
+}
+
+// TemplateVerifyPayload describes the work for a template_verify job. Kept
+// minimal — the worker reads OS/network/spec/assign_ip straight off the
+// template row so the payload can't drift from the source of truth.
+type TemplateVerifyPayload struct {
+	TemplateID uuid.UUID `json:"template_id"`
+	VMMoref    string    `json:"vm_moref"` // source: the template's base-image VM
+}
+
+// VerifyTemplate implements JobTypeTemplateVerify — the automated smoke
+// test that hard-gates publish.
+//
+// It clones the freshly-generalized base-image exactly the way a student
+// pod clone would (linked clone off the base-image snapshot), boots it,
+// and waits for VMware Tools (+ an IP if the template assigns one) to prove
+// the image actually comes up. The throwaway clone is always destroyed.
+//
+// Outcomes:
+//   - all checks pass → template_state verifying → active + is_active=true
+//     (the template becomes visible to students)
+//   - any check fails → verifying → ready (retryable), error surfaced in the
+//     job result so the instructor can fix the image and re-publish
+//   - DB/state-machine failure → verifying → error via markTemplateError
+//
+// This catches "bricked image" regressions (unbootable sysprep, no network,
+// BitLocker still on) BEFORE a student ever clones the template.
+func (p *Provisioner) VerifyTemplate(ctx context.Context, job *models.Job) error {
+	var payload TemplateVerifyPayload
+	if err := json.Unmarshal(job.Payload, &payload); err != nil {
+		return fmt.Errorf("parse template_verify payload: %w", err)
+	}
+	if payload.TemplateID == uuid.Nil {
+		return fmt.Errorf("template_id is required")
+	}
+	if payload.VMMoref == "" {
+		return fmt.Errorf("vm_moref is required")
+	}
+
+	tmpl, err := p.db.GetTemplateByID(ctx, payload.TemplateID)
+	if err != nil {
+		return fmt.Errorf("load template: %w", err)
+	}
+	if tmpl == nil {
+		return fmt.Errorf("template %s not found", payload.TemplateID)
+	}
+	if tmpl.TemplateState != models.TemplateStateVerifying {
+		return fmt.Errorf("template %s is in state %q, expected %q",
+			payload.TemplateID, tmpl.TemplateState, models.TemplateStateVerifying)
+	}
+
+	osType := strings.ToLower(tmpl.OSType)
+	network := tmpl.StagingNetwork
+	if network == "" {
+		network = "LabVMs-VLAN30"
+	}
+	vcpus := int32(tmpl.DefaultVCPUs)
+	if vcpus <= 0 {
+		vcpus = 2
+	}
+	ram := int64(tmpl.DefaultRAMMB)
+	if ram <= 0 {
+		ram = 4096
+	}
+	smokeName := fmt.Sprintf("smoke-%s-%d", tmpl.ID.String()[:8], time.Now().Unix())
+
+	// The throwaway clone is ALWAYS destroyed, on every return path. Uses a
+	// background context so cleanup still runs if the job context is
+	// cancelled. DestroyVM treats an already-deleted VM as success, so a
+	// double-destroy (defer + explicit) is harmless.
+	var cloneMoref string
+	defer func() {
+		if cloneMoref == "" {
+			return
+		}
+		if derr := p.vc.DestroyVM(context.Background(), cloneMoref); derr != nil {
+			p.logger.Warn("smoke clone cleanup failed (manual cleanup may be needed)",
+				"template_id", tmpl.ID, "moref", cloneMoref, "name", smokeName, "error", derr)
+		}
+	}()
+
+	// Step 1: clone the base-image the same way a pod clone does.
+	p.publishProgress(job.ID, "smoke_clone", fmt.Sprintf("Cloning base-image for smoke test (%s)", smokeName))
+	cloneMoref, err = p.vc.CloneVM(ctx, vcenter.CloneVMParams{
+		TemplateName: payload.VMMoref,
+		VMName:       smokeName,
+		VCPUs:        vcpus,
+		RAMmb:        ram,
+		Network:      network,
+		OSType:       osType,
+		Password:     generatePassword(12),
+	})
+	if err != nil {
+		return p.verifyFailedToReady(ctx, tmpl.ID,
+			fmt.Errorf("smoke clone failed (template may be unclonable): %w", err))
+	}
+
+	// Step 2: power on.
+	p.publishProgress(job.ID, "smoke_power_on", "Powering on smoke-test clone")
+	if err := p.vc.PowerOnVM(ctx, cloneMoref); err != nil {
+		return p.verifyFailedToReady(ctx, tmpl.ID,
+			fmt.Errorf("smoke clone power-on failed: %w", err))
+	}
+
+	// Step 3: wait for VMware Tools — proves the OS actually booted.
+	p.publishProgress(job.ID, "smoke_wait_tools", "Waiting for the clone to boot (VMware Tools, 5 min)")
+	if err := p.vc.WaitForTools(ctx, cloneMoref, 5*time.Minute); err != nil {
+		return p.verifyFailedToReady(ctx, tmpl.ID,
+			fmt.Errorf("smoke clone did not boot: VMware Tools never reported within 5m (image may be bricked — check generalize/sysprep and BitLocker): %w", err))
+	}
+
+	// Step 4: wait for an IP (only if this template assigns one) — proves
+	// networking + OOBE customization completed, not just that it powered on.
+	if tmpl.AssignIP {
+		p.publishProgress(job.ID, "smoke_wait_ip", "Waiting for the clone to get an IP (5 min)")
+		ip, err := p.vc.WaitForIP(ctx, cloneMoref, 5*time.Minute)
+		if err != nil {
+			return p.verifyFailedToReady(ctx, tmpl.ID,
+				fmt.Errorf("smoke clone got no IP within 5m (DHCP/network or OOBE failure): %w", err))
+		}
+		p.logger.Info("smoke clone got IP", "template_id", tmpl.ID, "ip", ip)
+	}
+
+	// Step 5: all checks passed — promote to active and make it visible.
+	p.publishProgress(job.ID, "publish", "Smoke test passed — publishing template")
+	if err := p.transitionTemplate(ctx, tmpl.ID, models.TemplateStateVerifying, models.TemplateStateActive); err != nil {
+		return p.markTemplateError(ctx, tmpl.ID, fmt.Errorf("promote verified template to active: %w", err))
+	}
+	if err := p.db.SetTemplateActive(ctx, tmpl.ID, true); err != nil {
+		// The state is already 'active'; failing to flip is_active means the
+		// template won't show to students. Surface loudly rather than
+		// silently ship a published-but-hidden template.
+		return fmt.Errorf("template promoted to active but failed to set is_active=true (unpublish/republish to fix): %w", err)
+	}
+
+	return nil
+}
+
+// verifyFailedToReady is the smoke-test failure path: it moves the template
+// back to `ready` (a safe, retryable state) so the instructor can fix the
+// image and re-publish, and returns the cause so the worker records it in
+// the job result. Best-effort on the state move — if it can't reach ready
+// we still surface the original cause.
+func (p *Provisioner) verifyFailedToReady(ctx context.Context, id uuid.UUID, cause error) error {
+	if err := templates.CanTransition(models.TemplateStateVerifying, models.TemplateStateReady); err == nil {
+		if uerr := p.db.UpdateTemplateLifecycleState(ctx, id, models.TemplateStateVerifying, models.TemplateStateReady); uerr != nil {
+			p.logger.Warn("verify: failed to move template back to ready after smoke failure",
+				"template_id", id, "error", uerr)
+		}
+	}
+	return cause
 }
 
 // transitionTemplate is a thin wrapper that consults the state machine

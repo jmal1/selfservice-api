@@ -24,9 +24,12 @@ func TestCanTransition_AllowedMoves(t *testing.T) {
 		{models.TemplateStateConfiguring, models.TemplateStateDraft},
 		{models.TemplateStateGeneralizing, models.TemplateStateReady},
 		{models.TemplateStateGeneralizing, models.TemplateStateError},
-		{models.TemplateStateReady, models.TemplateStateActive},
+		{models.TemplateStateReady, models.TemplateStateVerifying},
 		{models.TemplateStateReady, models.TemplateStateConfiguring},
 		{models.TemplateStateReady, models.TemplateStateDraft},
+		{models.TemplateStateVerifying, models.TemplateStateActive},
+		{models.TemplateStateVerifying, models.TemplateStateReady},
+		{models.TemplateStateVerifying, models.TemplateStateError},
 		{models.TemplateStateActive, models.TemplateStateReady},
 		{models.TemplateStateError, models.TemplateStateDraft},
 	}
@@ -118,7 +121,8 @@ func TestAllowedNextStates_ReturnsSortedSlice(t *testing.T) {
 		{models.TemplateStateProvisioning, []string{models.TemplateStateConfiguring, models.TemplateStateError}},
 		{models.TemplateStateConfiguring, []string{models.TemplateStateDraft, models.TemplateStateGeneralizing}},
 		{models.TemplateStateGeneralizing, []string{models.TemplateStateError, models.TemplateStateReady}},
-		{models.TemplateStateReady, []string{models.TemplateStateActive, models.TemplateStateConfiguring, models.TemplateStateDraft}},
+		{models.TemplateStateReady, []string{models.TemplateStateConfiguring, models.TemplateStateDraft, models.TemplateStateVerifying}},
+		{models.TemplateStateVerifying, []string{models.TemplateStateActive, models.TemplateStateError, models.TemplateStateReady}},
 		{models.TemplateStateActive, []string{models.TemplateStateReady}},
 		{models.TemplateStateError, []string{models.TemplateStateDraft}},
 	}

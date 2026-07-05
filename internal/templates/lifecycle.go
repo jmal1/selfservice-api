@@ -42,7 +42,8 @@ var ErrUnknownState = errors.New("unknown template state")
 //   provisioning  → configuring, error
 //   configuring   → generalizing, draft (cancel)
 //   generalizing  → ready, error
-//   ready         → active, configuring (re-enter), draft (discard)
+//   ready         → verifying, configuring (re-enter), draft (discard)
+//   verifying     → active (smoke passed), ready (smoke failed, retryable), error
 //   active        → ready (unpublish)
 //   error         → draft (retry/cleanup)
 var allowedTransitions = map[string]map[string]struct{}{
@@ -65,12 +66,25 @@ var allowedTransitions = map[string]map[string]struct{}{
 		models.TemplateStateError: {},
 	},
 	models.TemplateStateReady: {
-		models.TemplateStateActive: {},
+		// Publish now goes through an automated smoke test first: the
+		// verify worker clones the base-image, boots it, and only then
+		// promotes to `active`. There is deliberately NO direct
+		// ready→active edge so the smoke gate cannot be skipped.
+		models.TemplateStateVerifying: {},
 		// Re-enter configuration: destroys the base-image snapshot
 		// and powers the VM back on for further edits.
 		models.TemplateStateConfiguring: {},
 		// Discard from ready: VM never published, free to throw away.
 		models.TemplateStateDraft: {},
+	},
+	models.TemplateStateVerifying: {
+		// Smoke test passed: promote to active (worker also flips is_active).
+		models.TemplateStateActive: {},
+		// Smoke test failed: back to ready so the instructor can fix the
+		// image (re-configure/re-generalize) and verify again.
+		models.TemplateStateReady: {},
+		// Infrastructure failure during verify (clone/vCenter error).
+		models.TemplateStateError: {},
 	},
 	models.TemplateStateActive: {
 		// Unpublish: row is no longer offered to students but the

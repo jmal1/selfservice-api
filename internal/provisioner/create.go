@@ -92,6 +92,8 @@ func (p *Provisioner) ProcessJob(ctx context.Context, job *models.Job) error {
 		err = p.ProvisionTemplate(ctx, job)
 	case models.JobTypeTemplateGeneralize:
 		err = p.GeneralizeTemplate(ctx, job)
+	case models.JobTypeTemplateVerify:
+		err = p.VerifyTemplate(ctx, job)
 	default:
 		err = fmt.Errorf("unknown job type: %s", job.Type)
 	}
