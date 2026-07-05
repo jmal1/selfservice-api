@@ -268,6 +268,45 @@ func (c *Client) vmFromMoref(moref string) (*object.VirtualMachine, error) {
 	return object.NewVirtualMachine(c.client.Client, ref), nil
 }
 
+// ValidateGuestCredentials reports whether the given username/password are
+// accepted by the guest OS via VMware Tools. Returns nil when the guest
+// authenticates the credentials and a non-nil error otherwise — including
+// the "credentials rejected" case (InvalidGuestLogin), tools-not-ready, or
+// any transport error. Callers that poll (e.g. the template smoke gate
+// waiting for cloudbase-init / cloud-init to reset the account password)
+// should treat ANY error as "not yet / no" and retry until their own
+// deadline; this method deliberately does not retry internally.
+//
+// It performs no mutation and needs no elevated privileges — it is the
+// lightest guest operation available, which is why the smoke gate uses it
+// to confirm that guest customization actually switched the account to its
+// generated password (rather than a heavier RunScriptInGuest probe that
+// would itself depend on the very customization we're trying to verify).
+//
+// Pre-conditions: VM powered on with VMware Tools running.
+func (c *Client) ValidateGuestCredentials(ctx context.Context, moref, guestUser, guestPassword string) error {
+	if err := c.ensureConnected(ctx); err != nil {
+		return fmt.Errorf("ensure vCenter connection: %w", err)
+	}
+	vm, err := c.vmFromMoref(moref)
+	if err != nil {
+		return err
+	}
+	opsMgr := guest.NewOperationsManager(c.client.Client, vm.Reference())
+	authMgr, err := opsMgr.AuthManager(ctx)
+	if err != nil {
+		return fmt.Errorf("get guest auth manager: %w", err)
+	}
+	auth := &types.NamePasswordAuthentication{
+		Username: guestUser,
+		Password: guestPassword,
+	}
+	if err := authMgr.ValidateCredentials(ctx, auth); err != nil {
+		return fmt.Errorf("validate guest credentials for %q: %w", guestUser, err)
+	}
+	return nil
+}
+
 // UploadFileToGuest writes `data` to `guestPath` inside the target VM via
 // VMware Tools. Wraps the inner uploadGuestFile helper with connection
 // setup so callers outside this file (e.g. the provisioner's
