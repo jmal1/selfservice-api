@@ -411,6 +411,20 @@ func (q *Queries) SetTemplateVCenterVM(ctx context.Context, id uuid.UUID, vcente
 }
 
 
+// SetTemplateActive flips the templates.is_active flag. Called by the
+// template_verify worker on smoke-test success (active=true) so a template
+// only becomes visible to students AFTER an L3 clone was proven to boot.
+// The API's publish handler no longer flips is_active directly — the
+// verify gate owns that transition.
+func (q *Queries) SetTemplateActive(ctx context.Context, id uuid.UUID, active bool) error {
+	_, err := q.pool.Exec(ctx, `
+		UPDATE templates
+		SET is_active = $2, updated_at = NOW()
+		WHERE id = $1
+	`, id, active)
+	return err
+}
+
 // ListAllJobs returns all jobs ordered by creation time (admin).
 func (q *Queries) ListAllJobs(ctx context.Context) ([]models.Job, error) {
 	rows, err := q.pool.Query(ctx, `

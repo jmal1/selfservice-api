@@ -110,8 +110,13 @@ const (
 	TemplateStateConfiguring  = "configuring"
 	TemplateStateGeneralizing = "generalizing"
 	TemplateStateReady        = "ready"
-	TemplateStateActive       = "active"
-	TemplateStateError        = "error"
+	// TemplateStateVerifying runs an automated smoke test (clone the
+	// base-image, boot it, wait for Tools + IP, then destroy the clone)
+	// as a hard gate before a template can be published. A template only
+	// reaches `active` if this passes; on failure it returns to `ready`.
+	TemplateStateVerifying = "verifying"
+	TemplateStateActive    = "active"
+	TemplateStateError     = "error"
 )
 
 // AllTemplateStates is the canonical list of valid template lifecycle
@@ -122,6 +127,7 @@ var AllTemplateStates = []string{
 	TemplateStateConfiguring,
 	TemplateStateGeneralizing,
 	TemplateStateReady,
+	TemplateStateVerifying,
 	TemplateStateActive,
 	TemplateStateError,
 }
@@ -343,6 +349,7 @@ const (
 	// VM via GuestOperations, then snapshots the powered-off VM as base-image.
 	JobTypeTemplateProvision  = "template_provision"
 	JobTypeTemplateGeneralize = "template_generalize"
+	JobTypeTemplateVerify     = "template_verify"
 )
 
 // Job status constants.

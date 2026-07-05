@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -315,6 +316,171 @@ func (c *Client) UploadFileToGuest(ctx context.Context, moref, guestUser, guestP
 		httpClient := guestTransferClient(c.config.Insecure)
 		return uploadGuestFile(ctx, httpClient, fileMgr, auth, guestPath, data)
 	})
+}
+
+// EnsureBitLockerDecrypted makes sure the guest's C: volume is fully
+// decrypted before a Windows template is sysprepped. Sysprep/generalize
+// on a BitLocker-protected volume produces clones that fail to boot: the
+// per-clone hardware change invalidates the TPM-sealed key and there is no
+// recovery password wired into the OOBE flow, so the "bricked" template
+// isn't discovered until someone attempts an L3 clone hours later. This
+// helper removes that sharp edge by auto-decrypting instead of relying on
+// the instructor to remember `manage-bde -off C:` first.
+//
+// Behavior (all idempotent, safe to call every generalize run):
+//   - No BitLocker cmdlets / no protected volume  → no-op (returns nil).
+//   - Already FullyDecrypted                       → no-op.
+//   - Encrypted or mid-(en|de)cryption             → issues Disable-BitLocker
+//     if not already decrypting, then polls until VolumeStatus ==
+//     FullyDecrypted or the timeout elapses.
+//
+// The guest user must be an Administrator (Disable-BitLocker requires it);
+// the wizard already documents that requirement for generalize.
+func (c *Client) EnsureBitLockerDecrypted(ctx context.Context, moref, guestUser, guestPassword string, timeout time.Duration) error {
+	// Idempotent check+kickoff script. Prints one sentinel line:
+	//   BL:DECRYPTED       fully decrypted, safe to sysprep
+	//   BL:NONE            BitLocker feature/volume absent, nothing to do
+	//   BL:WORKING:<st>:<pct>   still (de|en)crypting; caller should poll
+	//   BL:DISABLE_ERR:<msg>    Disable-BitLocker call failed (surfaced in status)
+	const script = `$ErrorActionPreference = 'SilentlyContinue'
+$v = $null
+try { $v = Get-BitLockerVolume -MountPoint 'C:' -ErrorAction Stop } catch { Write-Output 'BL:NONE'; exit 0 }
+if ($null -eq $v) { Write-Output 'BL:NONE'; exit 0 }
+$status = [string]$v.VolumeStatus
+$pct = 0; try { $pct = [int]$v.EncryptionPercentage } catch {}
+if ($status -eq 'FullyDecrypted') { Write-Output 'BL:DECRYPTED'; exit 0 }
+if ($status -ne 'DecryptionInProgress') {
+  try { Disable-BitLocker -MountPoint 'C:' -ErrorAction Stop | Out-Null } catch { Write-Output ('BL:DISABLE_ERR:' + $_.Exception.Message) }
+}
+Write-Output ('BL:WORKING:' + $status + ':' + $pct)`
+
+	deadline := time.Now().Add(timeout)
+	lastStatus := "unknown"
+	for {
+		res, err := c.RunScriptInGuest(ctx, GuestExecRequest{
+			VMMoref:       moref,
+			GuestUser:     guestUser,
+			GuestPassword: guestPassword,
+			Language:      "powershell",
+			Script:        script,
+			Timeout:       2 * time.Minute,
+			RunID:         moref,
+			ActionSlug:    "bitlocker-decrypt",
+		})
+		if err != nil {
+			return fmt.Errorf("check BitLocker status on %s: %w", moref, err)
+		}
+		out := strings.TrimSpace(res.Stdout)
+		switch {
+		case strings.Contains(out, "BL:DECRYPTED"):
+			c.logger.Info("BitLocker fully decrypted", "moref", moref)
+			return nil
+		case strings.Contains(out, "BL:NONE"):
+			c.logger.Info("BitLocker not present on guest; nothing to decrypt", "moref", moref)
+			return nil
+		}
+		lastStatus = out
+		c.logger.Info("waiting for BitLocker decryption", "moref", moref, "status", out)
+		if time.Now().After(deadline) {
+			return fmt.Errorf("C: volume still not fully decrypted after %s (last status: %q)", timeout, lastStatus)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(20 * time.Second):
+		}
+	}
+}
+
+// WindowsSysprepPreflight runs cheap fail-fast checks in a Windows guest
+// *before* the generalize path invests any time in unattend upload,
+// BitLocker decryption, or the sysprep run itself. It catches the classic
+// "everything ran for 20 minutes then sysprep hard-failed and left the
+// image unbootable" trap.
+//
+// Fatal (returns an error, generalize aborts cleanly):
+//   - Sysprep rearm count exhausted (RemainingWindowsReArmCount == 0):
+//     `sysprep /generalize` WILL fail on a rearm-exhausted image, so there
+//     is no point continuing. The instructor must rebuild from an image
+//     with rearm budget left.
+//
+// Advisory (logged, non-fatal):
+//   - Pending reboot flags: sysprep usually still succeeds but is more
+//     likely to fail; we surface it so a later failure is easier to explain.
+//   - Rearm count undetermined (older OS / CIM class missing): we can't
+//     assert, so we proceed rather than block a legitimate build.
+func (c *Client) WindowsSysprepPreflight(ctx context.Context, moref, guestUser, guestPassword string) error {
+	const script = `$ErrorActionPreference = 'SilentlyContinue'
+$svc = Get-CimInstance -ClassName SoftwareLicensingService -ErrorAction SilentlyContinue
+$rearm = -1
+if ($svc -ne $null -and $svc.RemainingWindowsReArmCount -ne $null) { $rearm = [int]$svc.RemainingWindowsReArmCount }
+$pending = $false
+if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $pending = $true }
+if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $pending = $true }
+if (Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\PendingFileRenameOperations') { $pending = $true }
+Write-Output ('PREFLIGHT:REARM=' + $rearm + ';PENDINGREBOOT=' + $pending)`
+
+	res, err := c.RunScriptInGuest(ctx, GuestExecRequest{
+		VMMoref:       moref,
+		GuestUser:     guestUser,
+		GuestPassword: guestPassword,
+		Language:      "powershell",
+		Script:        script,
+		Timeout:       2 * time.Minute,
+		RunID:         moref,
+		ActionSlug:    "sysprep-preflight",
+	})
+	if err != nil {
+		// Don't block generalize on a flaky preflight probe — log and continue.
+		c.logger.Warn("sysprep preflight probe failed; continuing", "moref", moref, "error", err)
+		return nil
+	}
+	out := strings.TrimSpace(res.Stdout)
+	rearm, pending := parseSysprepPreflight(out)
+	if pending {
+		c.logger.Warn("sysprep preflight: guest reports a pending reboot; sysprep may be less reliable",
+			"moref", moref)
+	}
+	switch {
+	case rearm == 0:
+		return fmt.Errorf("sysprep rearm count is exhausted (RemainingWindowsReArmCount=0); "+
+			"sysprep /generalize will fail and brick the image — rebuild the template from a source "+
+			"with rearm budget remaining (preflight output: %q)", out)
+	case rearm < 0:
+		c.logger.Info("sysprep preflight: rearm count undetermined; proceeding", "moref", moref, "output", out)
+	default:
+		c.logger.Info("sysprep preflight OK", "moref", moref, "rearm_remaining", rearm, "pending_reboot", pending)
+	}
+	return nil
+}
+
+// parseSysprepPreflight extracts the rearm count and pending-reboot flag
+// from the "PREFLIGHT:REARM=<n>;PENDINGREBOOT=<bool>" sentinel line.
+// Returns rearm=-1 when it can't be parsed (treated as "undetermined").
+func parseSysprepPreflight(out string) (rearm int, pending bool) {
+	rearm = -1
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "PREFLIGHT:") {
+			continue
+		}
+		for _, part := range strings.Split(strings.TrimPrefix(line, "PREFLIGHT:"), ";") {
+			kv := strings.SplitN(part, "=", 2)
+			if len(kv) != 2 {
+				continue
+			}
+			key, val := strings.TrimSpace(kv[0]), strings.TrimSpace(kv[1])
+			switch key {
+			case "REARM":
+				if n, perr := strconv.Atoi(val); perr == nil {
+					rearm = n
+				}
+			case "PENDINGREBOOT":
+				pending = strings.EqualFold(val, "true")
+			}
+		}
+	}
+	return rearm, pending
 }
 
 // uploadGuestFile uploads a single file to the guest via the

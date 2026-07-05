@@ -16,6 +16,7 @@ func TestAllTemplateStatesContainsEveryStateConstant(t *testing.T) {
 		TemplateStateConfiguring:  true,
 		TemplateStateGeneralizing: true,
 		TemplateStateReady:        true,
+		TemplateStateVerifying:    true,
 		TemplateStateActive:       true,
 		TemplateStateError:        true,
 	}
@@ -51,6 +52,7 @@ func TestTemplateStateConstantsAreStable(t *testing.T) {
 		{TemplateStateConfiguring, "configuring"},
 		{TemplateStateGeneralizing, "generalizing"},
 		{TemplateStateReady, "ready"},
+		{TemplateStateVerifying, "verifying"},
 		{TemplateStateActive, "active"},
 		{TemplateStateError, "error"},
 	}
