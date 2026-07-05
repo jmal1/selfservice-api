@@ -1,10 +1,12 @@
 package provisioner
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -165,5 +167,55 @@ func TestTemplateGeneralizePayload_JSONRoundTripIncludesCredentials(t *testing.T
 	}
 	if rt != original {
 		t.Errorf("round-trip mismatch\nwant: %+v\ngot:  %+v", original, rt)
+	}
+}
+
+// TestPollGuestCredentials_SucceedsOnceValid proves the smoke-gate poll
+// tolerates transient failures (guest not ready / mid-reboot / still on the
+// bootstrap password) and returns nil as soon as the guest accepts the
+// credentials — the signal that cloudbase-init/cloud-init reset the account.
+func TestPollGuestCredentials_SucceedsOnceValid(t *testing.T) {
+	calls := 0
+	validate := func(context.Context) error {
+		calls++
+		if calls < 3 {
+			return errors.New("guest not ready yet")
+		}
+		return nil
+	}
+	if err := pollGuestCredentials(context.Background(), validate, time.Second, time.Millisecond); err != nil {
+		t.Fatalf("expected success once credentials valid, got %v", err)
+	}
+	if calls != 3 {
+		t.Errorf("expected 3 attempts before success, got %d", calls)
+	}
+}
+
+// TestPollGuestCredentials_TimesOutWithLastErr proves that when the guest
+// NEVER accepts the credentials (e.g. cloudbase-init disabled in the golden
+// image, so the password is never reset), the poll fails with the last
+// underlying error rather than hanging or falsely passing. This is the case
+// that must fail the publish gate instead of surfacing at L3.
+func TestPollGuestCredentials_TimesOutWithLastErr(t *testing.T) {
+	sentinel := errors.New("InvalidGuestLogin")
+	validate := func(context.Context) error { return sentinel }
+	err := pollGuestCredentials(context.Background(), validate, 5*time.Millisecond, time.Millisecond)
+	if err == nil {
+		t.Fatal("expected timeout error, got nil (broken image would pass the gate)")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Errorf("expected last underlying error to be surfaced, got %v", err)
+	}
+}
+
+// TestPollGuestCredentials_HonorsContextCancel ensures a cancelled job
+// context aborts the poll promptly instead of blocking for the full timeout.
+func TestPollGuestCredentials_HonorsContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	validate := func(context.Context) error { return errors.New("still failing") }
+	err := pollGuestCredentials(ctx, validate, time.Hour, 10*time.Millisecond)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled, got %v", err)
 	}
 }

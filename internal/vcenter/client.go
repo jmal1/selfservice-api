@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/url"
 	"strings"
 	"sync"
@@ -644,7 +645,7 @@ func (c *Client) GetGuestInfo(ctx context.Context, moref string) (*GuestInfo, er
 		vm := object.NewVirtualMachine(c.client.Client,
 			types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
 		return vm.Properties(ctx, vm.Reference(),
-			[]string{"name", "runtime.powerState", "guest.ipAddress", "guest.toolsRunningStatus"},
+			[]string{"name", "runtime.powerState", "guest.ipAddress", "guest.net", "guest.toolsRunningStatus"},
 			&props)
 	})
 	if err != nil {
@@ -653,12 +654,51 @@ func (c *Client) GetGuestInfo(ctx context.Context, moref string) (*GuestInfo, er
 
 	info := &GuestInfo{Name: props.Name}
 	if props.Guest != nil {
-		info.IPAddress = props.Guest.IpAddress
+		// Prefer a routable IPv4 from the per-NIC list. VMware Tools'
+		// guest.ipAddress is whatever the guest calls "primary", which on
+		// Windows is frequently the IPv6 link-local (fe80::…) — useless as an
+		// RDP/SSH target (mstsc can't dial a link-local without a zone index).
+		// Fall back to guest.ipAddress only if it's itself a usable IPv4.
+		info.IPAddress = pickGuestIPv4(props.Guest)
 		info.ToolsRunning = props.Guest.ToolsRunningStatus ==
 			string(types.VirtualMachineToolsRunningStatusGuestToolsRunning)
 	}
 	info.PoweredOn = props.Runtime.PowerState == types.VirtualMachinePowerStatePoweredOn
 	return info, nil
+}
+
+// pickGuestIPv4 returns the best routable IPv4 address VMware Tools reports
+// for a guest, or "" if none is known yet. It scans every NIC's addresses and
+// skips loopback, link-local (169.254.0.0/16), and unspecified addresses, as
+// well as all IPv6. If no per-NIC IPv4 qualifies it falls back to
+// guest.ipAddress, but only when that too is a usable IPv4 — never returning
+// an IPv6 link-local that the UI would turn into a dead RDP link.
+func pickGuestIPv4(guest *types.GuestInfo) string {
+	isRoutableV4 := func(s string) bool {
+		ip := net.ParseIP(strings.TrimSpace(s))
+		if ip == nil || ip.To4() == nil {
+			return false
+		}
+		return !ip.IsLoopback() && !ip.IsLinkLocalUnicast() && !ip.IsUnspecified()
+	}
+	for _, nic := range guest.Net {
+		if nic.IpConfig != nil {
+			for _, addr := range nic.IpConfig.IpAddress {
+				if isRoutableV4(addr.IpAddress) {
+					return addr.IpAddress
+				}
+			}
+		}
+		for _, addr := range nic.IpAddress {
+			if isRoutableV4(addr) {
+				return addr
+			}
+		}
+	}
+	if isRoutableV4(guest.IpAddress) {
+		return guest.IpAddress
+	}
+	return ""
 }
 
 // WebMKSTicket holds the result of a WebMKS ticket acquisition.

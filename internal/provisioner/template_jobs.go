@@ -490,6 +490,7 @@ func (p *Provisioner) VerifyTemplate(ctx context.Context, job *models.Job) error
 
 	// Step 1: clone the base-image the same way a pod clone does.
 	p.publishProgress(job.ID, "smoke_clone", fmt.Sprintf("Cloning base-image for smoke test (%s)", smokeName))
+	smokePassword := generatePassword(12)
 	cloneMoref, err = p.vc.CloneVM(ctx, vcenter.CloneVMParams{
 		TemplateName: payload.VMMoref,
 		VMName:       smokeName,
@@ -497,7 +498,7 @@ func (p *Provisioner) VerifyTemplate(ctx context.Context, job *models.Job) error
 		RAMmb:        ram,
 		Network:      network,
 		OSType:       osType,
-		Password:     generatePassword(12),
+		Password:     smokePassword,
 	})
 	if err != nil {
 		return p.verifyFailedToReady(ctx, tmpl.ID,
@@ -530,6 +531,37 @@ func (p *Provisioner) VerifyTemplate(ctx context.Context, job *models.Job) error
 		p.logger.Info("smoke clone got IP", "template_id", tmpl.ID, "ip", ip)
 	}
 
+	// Step 4b: for clone_with_customize templates, prove that guest
+	// customization actually reset the account password. This is the check
+	// that catches the "cloudbase-init disabled in the golden image" class
+	// of bug (June-2026 template): the clone boots and even gets an IP, but
+	// the Student/student account is still on its bootstrap password because
+	// nothing inside the guest consumed the injected guestinfo. Without this
+	// gate a broken image sails through to `active` and only fails when a
+	// human logs in at L3.
+	//
+	// The clone was cloned with `smokePassword`, which the provisioner
+	// injects via guestinfo for cloudbase-init (Windows) / cloud-init (Linux)
+	// to apply. We poll ValidateGuestCredentials with that password: it fails
+	// while the account is still on the bootstrap password (and during the
+	// customization reboot), and succeeds once the agent has applied it. A
+	// timeout means customization never ran → fail the gate.
+	if shouldGenerateGuestPassword(tmpl.Kind, osType) {
+		guestUser, _ := resolvePodVMCredentials(tmpl.Kind, osType, smokePassword, tmpl)
+		p.publishProgress(job.ID, "smoke_verify_customization",
+			"Verifying guest customization applied (account password reset)")
+		verr := pollGuestCredentials(ctx, func(c context.Context) error {
+			return p.vc.ValidateGuestCredentials(c, cloneMoref, guestUser, smokePassword)
+		}, 6*time.Minute, 15*time.Second)
+		if verr != nil {
+			return p.verifyFailedToReady(ctx, tmpl.ID, fmt.Errorf(
+				"guest customization did not apply: the clone booted but the %q account was never switched to its generated password within 6m — cloudbase-init/cloud-init likely isn't running on this image (verify the agent is installed + enabled and its config includes the VMware guestinfo metadata service and the user-data/local-scripts plugin): %w",
+				guestUser, verr))
+		}
+		p.logger.Info("smoke clone customization verified (password reset applied)",
+			"template_id", tmpl.ID, "guest_user", guestUser)
+	}
+
 	// Step 5: all checks passed — promote to active and make it visible.
 	p.publishProgress(job.ID, "publish", "Smoke test passed — publishing template")
 	if err := p.transitionTemplate(ctx, tmpl.ID, models.TemplateStateVerifying, models.TemplateStateActive); err != nil {
@@ -560,7 +592,39 @@ func (p *Provisioner) verifyFailedToReady(ctx context.Context, id uuid.UUID, cau
 	return cause
 }
 
-// transitionTemplate is a thin wrapper that consults the state machine
+// pollGuestCredentials repeatedly calls validate until it returns nil
+// (credentials accepted by the guest) or the timeout elapses, sleeping
+// `interval` between attempts. Transient errors — guest not ready, VMware
+// Tools mid-reboot, or the account still on its bootstrap password while
+// cloudbase-init/cloud-init is still running — are expected and swallowed
+// until the deadline. On timeout it returns the last error seen so the
+// caller can surface a useful cause.
+//
+// Pure (no vCenter/DB access of its own): the caller injects `validate`,
+// which keeps the smoke-gate timing logic unit-testable without a live
+// guest. Honors context cancellation between attempts.
+func pollGuestCredentials(ctx context.Context, validate func(context.Context) error, timeout, interval time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		if err := validate(ctx); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		if !time.Now().Before(deadline) {
+			if lastErr == nil {
+				lastErr = context.DeadlineExceeded
+			}
+			return lastErr
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(interval):
+		}
+	}
+}
 // before calling UpdateTemplateLifecycleState, so an illegal transition
 // fails fast with a clear error instead of going through the DB.
 func (p *Provisioner) transitionTemplate(ctx context.Context, id uuid.UUID, from, to string) error {
