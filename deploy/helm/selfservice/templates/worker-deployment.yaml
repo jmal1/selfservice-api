@@ -126,5 +126,12 @@ spec:
               value: {{ .Values.worker.orphanReconciler.interval | default "1h" | quote }}
             - name: WORKER_ORPHAN_RECONCILER_MIN_AGE
               value: {{ .Values.worker.orphanReconciler.minAge | default "1h" | quote }}
+            # OPNsense network reconciler: heals missing VLAN/interface/Kea
+            # bindings for active pods and releases stale vlan_pool
+            # allocations for terminal pods.
+            - name: WORKER_NETWORK_RECONCILER_ENABLED
+              value: {{ .Values.worker.networkReconciler.enabled | default false | quote }}
+            - name: WORKER_NETWORK_RECONCILER_INTERVAL
+              value: {{ .Values.worker.networkReconciler.interval | default "5m" | quote }}
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}

@@ -14,12 +14,12 @@ import (
 
 // Config holds OPNsense connection settings.
 type Config struct {
-	BaseURL   string // e.g., "https://10.10.10.60/api"
-	APIKey    string
-	APISecret string
-	SSHHost   string // e.g., "10.10.10.60:22"
-	SSHUser   string // e.g., "root"
-	SSHKey    []byte // private key PEM (or password-based via SSHPassword)
+	BaseURL     string // e.g., "https://10.10.10.60/api"
+	APIKey      string
+	APISecret   string
+	SSHHost     string // e.g., "10.10.10.60:22"
+	SSHUser     string // e.g., "root"
+	SSHKey      []byte // private key PEM (or password-based via SSHPassword)
 	SSHPassword string
 }
 
@@ -261,13 +261,12 @@ func (c *Client) RestartDHCP(ctx context.Context) error {
 	return err
 }
 
-// AddDHCPInterface adds an OPNsense interface to Kea's listened interfaces list.
-// Kea only serves DHCP on explicitly configured interfaces.
-func (c *Client) AddDHCPInterface(ctx context.Context, ifName string) error {
-	// Get current settings to find which interfaces are already selected
+// GetDHCPInterfaces returns the currently selected OPNsense interfaces in the
+// Kea DHCPv4 configuration.
+func (c *Client) GetDHCPInterfaces(ctx context.Context) ([]string, error) {
 	resp, err := c.doRequest(ctx, "GET", "/kea/dhcpv4/get", nil)
 	if err != nil {
-		return fmt.Errorf("get DHCP settings: %w", err)
+		return nil, fmt.Errorf("get DHCP settings: %w", err)
 	}
 
 	var settings struct {
@@ -281,16 +280,27 @@ func (c *Client) AddDHCPInterface(ctx context.Context, ifName string) error {
 		} `json:"dhcpv4"`
 	}
 	if err := json.Unmarshal(resp, &settings); err != nil {
-		return fmt.Errorf("parse DHCP settings: %w", err)
+		return nil, fmt.Errorf("parse DHCP settings: %w", err)
 	}
 
-	// Build comma-separated list of selected interfaces + the new one
 	var selected []string
 	for key, iface := range settings.DHCPV4.General.Interfaces {
 		if iface.Selected == 1 {
 			selected = append(selected, key)
 		}
 	}
+	return selected, nil
+}
+
+// AddDHCPInterface adds an OPNsense interface to Kea's listened interfaces list.
+// Kea only serves DHCP on explicitly configured interfaces.
+func (c *Client) AddDHCPInterface(ctx context.Context, ifName string) error {
+	selected, err := c.GetDHCPInterfaces(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Build comma-separated list of selected interfaces + the new one.
 	// Add the new interface if not already selected
 	found := false
 	for _, s := range selected {
