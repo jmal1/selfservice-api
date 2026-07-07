@@ -1131,15 +1131,17 @@ func (h *Handler) AdminUpdateTemplate(w http.ResponseWriter, r *http.Request) {
 // AdminDeleteTemplate deletes a template and (if it has a staging or
 // post-build VM in vCenter) destroys that VM first so we don't orphan
 // it. Refuses with 409 when a worker is actively building the VM
-// (states `provisioning` / `generalizing`) — the operator must wait
-// for that job to settle (or cancel it) before deleting, otherwise
-// the destroy here races the worker's clone/sysprep task.
+// (states `provisioning` / `generalizing`), when an ACTIVE pod still
+// depends on the template, or when a blueprint references it — in each
+// case the operator must resolve the dependency first.
 //
-// Order matters: destroy in vCenter FIRST, then DELETE the row. If
-// the vCenter call fails we keep the row so the operator can retry —
-// otherwise we'd leak the moref forever. If the row delete fails
-// after a successful destroy, the next retry sees `DestroyVM` return
-// nil (it's idempotent) and proceeds straight to the row delete.
+// Order matters: guard checks and the vCenter destroy happen BEFORE the
+// row delete. If the vCenter call fails we keep the row so the operator
+// can retry — otherwise we'd leak the moref forever. The row delete goes
+// through DeleteTemplateWithHistory, which also clears leftover pod_vms
+// rows from long-destroyed pods; without that the NOT NULL / NO ACTION
+// pod_vms_template_id_fkey rejects the delete with SQLSTATE 23503 and the
+// operator gets a 500 after the staging VM has already been destroyed.
 func (h *Handler) AdminDeleteTemplate(w http.ResponseWriter, r *http.Request) {
 	templateID, err := uuid.Parse(chi.URLParam(r, "templateID"))
 	if err != nil {
@@ -1161,6 +1163,33 @@ func (h *Handler) AdminDeleteTemplate(w http.ResponseWriter, r *http.Request) {
 
 	if refuse, reason := templateDeleteStateRefusal(tmpl.TemplateState); refuse {
 		h.writeStateConflict(w, tmpl, reason)
+		return
+	}
+
+	// Refuse (409) if an ACTIVE pod still depends on this template. Deleting
+	// it would strand a live student VM's provenance, and the destroyed-pod
+	// cleanup below would happily remove the live pod_vms row too. Historical
+	// (destroyed-pod) rows are fine — DeleteTemplateWithHistory mops those up.
+	if _, deps, derr := h.db.ListTemplateDependents(r.Context(), templateID); derr != nil {
+		h.logger.Error("delete template: list dependents failed", "error", derr, "template_id", templateID)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	} else if len(deps) > 0 {
+		http.Error(w, fmt.Sprintf("template is in use by %d active pod VM(s); destroy those pods before deleting the template", len(deps)),
+			http.StatusConflict)
+		return
+	}
+
+	// Refuse (409) if a blueprint references this template. blueprint_vms is a
+	// NOT NULL / NO ACTION FK, so this is a real dependency that would 500 the
+	// delete otherwise; the operator must detach it from the blueprint first.
+	if n, berr := h.db.CountTemplateBlueprintRefs(r.Context(), templateID); berr != nil {
+		h.logger.Error("delete template: count blueprint refs failed", "error", berr, "template_id", templateID)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	} else if n > 0 {
+		http.Error(w, fmt.Sprintf("template is used by %d blueprint VM definition(s); remove it from those blueprints before deleting", n),
+			http.StatusConflict)
 		return
 	}
 
@@ -1191,7 +1220,7 @@ func (h *Handler) AdminDeleteTemplate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := h.db.DeleteTemplate(r.Context(), templateID); err != nil {
+	if err := h.db.DeleteTemplateWithHistory(r.Context(), templateID); err != nil {
 		h.logger.Error("delete template failed", "error", err, "template_id", templateID)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
