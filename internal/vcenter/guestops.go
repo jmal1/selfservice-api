@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/vmware/govmomi/guest"
 	"github.com/vmware/govmomi/object"
@@ -246,16 +248,61 @@ func (c *Client) runScriptInGuestInner(ctx context.Context, req GuestExecRequest
 	// as the upload so we don't choke on the ESXi host's VMCA cert.
 	stdoutBytes, truncOut, err := downloadGuestFile(ctx, httpClient, fileMgr, auth, stdoutPath, maxGuestOutputBytes)
 	if err == nil {
-		result.Stdout = string(stdoutBytes)
+		result.Stdout = decodeGuestOutput(stdoutBytes)
 		result.TruncatedOut = result.TruncatedOut || truncOut
 	}
 	stderrBytes, truncErr, err := downloadGuestFile(ctx, httpClient, fileMgr, auth, stderrPath, maxGuestOutputBytes)
 	if err == nil {
-		result.Stderr = string(stderrBytes)
+		result.Stderr = decodeGuestOutput(stderrBytes)
 		result.TruncatedOut = result.TruncatedOut || truncErr
 	}
 
 	return result, nil
+}
+
+// decodeGuestOutput normalizes raw stdout/stderr bytes captured from a guest
+// script to a UTF-8 string. Windows PowerShell 5.1's file redirection
+// operators (`>`, `*>`, `2>`) write UTF-16LE **with a BOM**, so a literal
+// `strings.Contains(out, "BL:DECRYPTED")` against `string(bytes)` fails —
+// the bytes are `B\x00L\x00:\x00...` prefixed by the 0xFF 0xFE BOM. That is
+// exactly what silently defeated the BitLocker/preflight sentinel matching.
+//
+// We detect a UTF-16 (LE/BE) or UTF-8 BOM and decode accordingly; without a
+// BOM the bytes are returned unchanged (Linux/bash output is already UTF-8).
+func decodeGuestOutput(b []byte) string {
+	switch {
+	case len(b) >= 2 && b[0] == 0xFF && b[1] == 0xFE: // UTF-16LE BOM
+		return decodeUTF16(b[2:], false)
+	case len(b) >= 2 && b[0] == 0xFE && b[1] == 0xFF: // UTF-16BE BOM
+		return decodeUTF16(b[2:], true)
+	case len(b) >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF: // UTF-8 BOM
+		return string(b[3:])
+	default:
+		return string(b)
+	}
+}
+
+// decodeUTF16 decodes BOM-less UTF-16 bytes (LE unless bigEndian) to a UTF-8
+// string. A trailing odd byte (malformed / truncated) is dropped.
+func decodeUTF16(b []byte, bigEndian bool) string {
+	u16 := make([]uint16, 0, len(b)/2)
+	for i := 0; i+1 < len(b); i += 2 {
+		if bigEndian {
+			u16 = append(u16, uint16(b[i])<<8|uint16(b[i+1]))
+		} else {
+			u16 = append(u16, uint16(b[i+1])<<8|uint16(b[i]))
+		}
+	}
+	runes := utf16.Decode(u16)
+	var sb strings.Builder
+	sb.Grow(len(runes))
+	for _, r := range runes {
+		if r == utf8.RuneError {
+			r = '\uFFFD'
+		}
+		sb.WriteRune(r)
+	}
+	return sb.String()
 }
 
 // vmFromMoref returns a govmomi object.VirtualMachine for the given moref.
