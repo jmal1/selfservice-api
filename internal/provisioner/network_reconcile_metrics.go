@@ -70,6 +70,7 @@ func serializeNetworkReconcileCounts(c NetworkReconcileCounts) []byte {
 		{"interface", c.InterfacesRepaired},
 		{"subnet", c.SubnetsRepaired},
 		{"kea_binding", c.KeaBindingsRepaired},
+		{"firewall_rule", c.FirewallRulesRepaired},
 	} {
 		fmt.Fprintf(&b, "crucible_network_reconcile_repaired_total{kind=%q} %d\n", row.kind, row.value)
 	}
@@ -81,6 +82,10 @@ func serializeNetworkReconcileCounts(c NetworkReconcileCounts) []byte {
 	b.WriteString("# HELP crucible_network_reconcile_kea_restarted Whether Kea was restarted during this run (0 or 1).\n")
 	b.WriteString("# TYPE crucible_network_reconcile_kea_restarted gauge\n")
 	fmt.Fprintf(&b, "crucible_network_reconcile_kea_restarted %d\n", c.KeaRestarted)
+
+	b.WriteString("# HELP crucible_network_reconcile_firewall_applied Whether the firewall/NAT ruleset was reloaded during this run (0 or 1).\n")
+	b.WriteString("# TYPE crucible_network_reconcile_firewall_applied gauge\n")
+	fmt.Fprintf(&b, "crucible_network_reconcile_firewall_applied %d\n", c.FirewallApplied)
 
 	b.WriteString("# HELP crucible_network_reconcile_run_timestamp_seconds Unix time of the latest network reconciler run.\n")
 	b.WriteString("# TYPE crucible_network_reconcile_run_timestamp_seconds gauge\n")

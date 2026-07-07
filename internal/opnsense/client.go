@@ -450,6 +450,40 @@ func (c *Client) DeleteFirewallRule(ctx context.Context, uuid string) error {
 	return err
 }
 
+// FirewallRuleInfo is a subset of a firewall filter rule returned by search,
+// used for idempotency checks (e.g., "does a pass rule already exist for this
+// pod interface + subnet?").
+type FirewallRuleInfo struct {
+	UUID      string
+	Interface string // logical name(s); may be comma-joined, e.g. "opt4" or "lan,opt1"
+	Source    string // source_net, e.g. "10.100.3.0/24"
+	Action    string // "pass" or "block"
+}
+
+// GetFirewallRules lists automation firewall filter rules (for idempotency).
+func (c *Client) GetFirewallRules(ctx context.Context) ([]FirewallRuleInfo, error) {
+	resp, err := c.doRequest(ctx, "GET", "/firewall/filter/searchRule?current=1&rowCount=1000", nil)
+	if err != nil {
+		return nil, fmt.Errorf("search firewall rules: %w", err)
+	}
+	var result struct {
+		Rows []struct {
+			UUID      string `json:"uuid"`
+			Interface string `json:"interface"`
+			Source    string `json:"source_net"`
+			Action    string `json:"action"`
+		} `json:"rows"`
+	}
+	if err := json.Unmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("parse firewall rules: %w", err)
+	}
+	out := make([]FirewallRuleInfo, 0, len(result.Rows))
+	for _, r := range result.Rows {
+		out = append(out, FirewallRuleInfo{UUID: r.UUID, Interface: r.Interface, Source: r.Source, Action: r.Action})
+	}
+	return out, nil
+}
+
 // ApplyFirewall applies pending firewall changes.
 func (c *Client) ApplyFirewall(ctx context.Context) error {
 	_, err := c.doRequest(ctx, "POST", "/firewall/filter/apply", map[string]any{})

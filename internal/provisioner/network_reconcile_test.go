@@ -36,6 +36,12 @@ type fakeNetworkOPN struct {
 	addDHCPInterfaceCalls  []string
 	restartDHCPErr         error
 	restartDHPCCalls       int
+	firewallRules          []opnsense.FirewallRuleInfo
+	getFirewallErr         error
+	createFirewallErr      error
+	createFirewallCalls    []opnsense.FirewallRule
+	applyFirewallErr       error
+	applyFirewallCalls     int
 }
 
 func (f *fakeNetworkOPN) GetVLANByTag(_ context.Context, tag int) (*opnsense.VLAN, error) {
@@ -105,6 +111,31 @@ func (f *fakeNetworkOPN) AddDHCPInterface(_ context.Context, ifName string) erro
 func (f *fakeNetworkOPN) RestartDHCP(_ context.Context) error {
 	f.restartDHPCCalls++
 	return f.restartDHCPErr
+}
+
+func (f *fakeNetworkOPN) GetFirewallRules(_ context.Context) ([]opnsense.FirewallRuleInfo, error) {
+	if f.getFirewallErr != nil {
+		return nil, f.getFirewallErr
+	}
+	out := make([]opnsense.FirewallRuleInfo, len(f.firewallRules))
+	copy(out, f.firewallRules)
+	return out, nil
+}
+
+func (f *fakeNetworkOPN) CreateFirewallRule(_ context.Context, rule opnsense.FirewallRule) (string, error) {
+	if f.createFirewallErr != nil {
+		return "", f.createFirewallErr
+	}
+	f.createFirewallCalls = append(f.createFirewallCalls, rule)
+	f.firewallRules = append(f.firewallRules, opnsense.FirewallRuleInfo{
+		UUID: "fw-uuid", Interface: rule.Interface, Source: rule.Source, Action: rule.Action,
+	})
+	return "fw-uuid", nil
+}
+
+func (f *fakeNetworkOPN) ApplyFirewall(_ context.Context) error {
+	f.applyFirewallCalls++
+	return f.applyFirewallErr
 }
 
 type fakeNetworkSSH struct {
@@ -183,6 +214,12 @@ func TestReconcileNetwork_RepairsMissingInterfaceSubnetAndBinding(t *testing.T) 
 	if len(opn.addDHCPInterfaceCalls) != 1 || opn.addDHCPInterfaceCalls[0] != "opt4" {
 		t.Fatalf("expected AddDHCPInterface(opt4), got %+v", opn.addDHCPInterfaceCalls)
 	}
+	if counts.FirewallRulesRepaired != 1 || counts.FirewallApplied != 1 || opn.applyFirewallCalls != 1 {
+		t.Fatalf("expected one firewall rule created + one apply, got counts=%+v applyCalls=%d", counts, opn.applyFirewallCalls)
+	}
+	if len(opn.createFirewallCalls) != 1 || opn.createFirewallCalls[0].Interface != "opt4" || opn.createFirewallCalls[0].Source != row.Subnet {
+		t.Fatalf("expected pass rule on opt4 for %s, got %+v", row.Subnet, opn.createFirewallCalls)
+	}
 }
 
 func TestReconcileNetwork_HealthyActivePodNoChanges(t *testing.T) {
@@ -193,6 +230,7 @@ func TestReconcileNetwork_HealthyActivePodNoChanges(t *testing.T) {
 		vlans:                  map[int]*opnsense.VLAN{104: {Tag: "104"}},
 		dhcpSubnets:            map[string]*opnsense.DHCPSubnet{row.Subnet: {Subnet: row.Subnet}},
 		selectedDHCPInterfaces: []string{"opt7"},
+		firewallRules:          []opnsense.FirewallRuleInfo{{Interface: "opt7", Source: row.Subnet, Action: "pass"}},
 	}
 	ssh := &fakeNetworkSSH{
 		findByVLAN: map[int]string{104: "opt7"},
@@ -206,6 +244,9 @@ func TestReconcileNetwork_HealthyActivePodNoChanges(t *testing.T) {
 
 	if counts.InterfacesRepaired != 0 || counts.SubnetsRepaired != 0 || counts.KeaBindingsRepaired != 0 || counts.KeaRestarted != 0 {
 		t.Fatalf("expected no repairs/restart, got %+v", counts)
+	}
+	if counts.FirewallRulesRepaired != 0 || counts.FirewallApplied != 0 || opn.applyFirewallCalls != 0 {
+		t.Fatalf("expected no firewall changes, got counts=%+v applyCalls=%d", counts, opn.applyFirewallCalls)
 	}
 	if opn.restartDHPCCalls != 0 {
 		t.Fatalf("expected no Kea restart call, got %d", opn.restartDHPCCalls)
@@ -248,6 +289,7 @@ func TestReconcileNetwork_MixedSet(t *testing.T) {
 			activeNeedsBinding.Subnet: {Subnet: activeNeedsBinding.Subnet},
 		},
 		selectedDHCPInterfaces: []string{"opt9"},
+		firewallRules:          []opnsense.FirewallRuleInfo{{Interface: "opt9", Source: activeHealthy.Subnet, Action: "pass"}},
 	}
 	ssh := &fakeNetworkSSH{
 		findByVLAN: map[int]string{
@@ -267,6 +309,9 @@ func TestReconcileNetwork_MixedSet(t *testing.T) {
 	}
 	if counts.KeaBindingsRepaired != 1 || counts.KeaRestarted != 1 {
 		t.Fatalf("expected one binding repair + one restart, got %+v", counts)
+	}
+	if counts.FirewallRulesRepaired != 1 || counts.FirewallApplied != 1 {
+		t.Fatalf("expected one firewall rule repair (for opt10) + apply, got %+v", counts)
 	}
 }
 
@@ -363,8 +408,10 @@ func TestNetworkReconcilePusher_Push_SerializesExpectedMetrics(t *testing.T) {
 		`crucible_network_reconcile_repaired_total{kind="interface"} 1`,
 		`crucible_network_reconcile_repaired_total{kind="subnet"} 2`,
 		`crucible_network_reconcile_repaired_total{kind="kea_binding"} 3`,
+		`crucible_network_reconcile_repaired_total{kind="firewall_rule"} 0`,
 		`crucible_network_reconcile_errors_total 2`,
 		`crucible_network_reconcile_kea_restarted 1`,
+		`crucible_network_reconcile_firewall_applied 0`,
 		`crucible_network_reconcile_run_timestamp_seconds `,
 	} {
 		if !strings.Contains(gotBody, want) {
