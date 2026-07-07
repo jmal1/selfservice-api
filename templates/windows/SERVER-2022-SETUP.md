@@ -370,6 +370,16 @@ freshly rebuilt box; never sysprep an L1 that has already been generalized.
   a reboot — poll `vm.info` toolsRunningStatus instead (Step 1 gotcha).
 - **cloudbase-init / OOBE-on-clones / RDP / per-clone password:** identical to
   Windows 11 — see [SETUP.md](SETUP.md) Troubleshooting.
+- **`template_verify` fails "Student never switched to its generated password …
+  cloudbase-init likely isn't running" (Server SKUs):** Windows **Server**
+  silently SKIPS the unattend `FirstLogonCommands` when `SkipMachineOOBE`/
+  `SkipUserOOBE` are set (Windows 11 client still runs them), so cloudbase-init
+  was never re-enabled on the clone. Fixed centrally: the shared
+  `internal/provisioner/assets/windows-unattend.xml` now enables cloudbase-init
+  in the **`specialize` pass** (`RunSynchronousCommand` →
+  `sc config cloudbase-init start= delayed-auto`), which runs on all SKUs. If
+  you see this, make sure the provision-worker is running an image built after
+  that fix.
 
 ## Building the answer ISO
 
