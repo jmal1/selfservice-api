@@ -145,6 +145,38 @@ func main() {
 		Pusher: orphanPusher,
 	}
 
+	// Pod-VM DHCP IP reconciler. Keeps pod_vms.ip_address in sync with the
+	// live guest address for running, IP-assigned VMs — catching both a
+	// missed capture at provisioning (slow Windows OOBE) and later DHCP lease
+	// changes. Safe (only ever writes a live routable IPv4), so it's enabled
+	// by default. Set WORKER_IP_RECONCILER_ENABLED=false to opt out;
+	// WORKER_IP_RECONCILER_INTERVAL overrides the default 2m cadence.
+	ipReconcilerEnabled := true
+	if v := os.Getenv("WORKER_IP_RECONCILER_ENABLED"); v != "" {
+		ipReconcilerEnabled = strings.EqualFold(v, "true")
+	}
+	ipReconcilerInterval := 2 * time.Minute
+	if v := os.Getenv("WORKER_IP_RECONCILER_INTERVAL"); v != "" {
+		if parsed, err := time.ParseDuration(v); err == nil && parsed > 0 {
+			ipReconcilerInterval = parsed
+		} else {
+			logger.Warn("invalid WORKER_IP_RECONCILER_INTERVAL; using default 2m", "value", v, "error", err)
+		}
+	}
+	var ipReconcilerPusher *provisioner.IPReconcileCountPusher
+	if pgURL := os.Getenv("WORKER_PUSHGATEWAY_URL"); pgURL != "" {
+		job := os.Getenv("WORKER_PUSHGATEWAY_JOB")
+		if job == "" {
+			job = "crucible_provision_worker"
+		}
+		ipReconcilerPusher = &provisioner.IPReconcileCountPusher{
+			BaseURL:        pgURL,
+			Job:            job,
+			GroupingLabels: map[string]string{"layer": "api"},
+		}
+	}
+	ipReconcilerCfg := provisioner.IPReconcilerConfig{Pusher: ipReconcilerPusher}
+
 	// Worker ID for job claiming
 	workerID, err := os.Hostname()
 	if err != nil {
@@ -196,6 +228,15 @@ func main() {
 			"folder", orphanCfg.Folder, "interval", orphanInterval, "min_age", orphanMinAge)
 	}
 
+	// Pod-VM IP reconciler ticker (enabled by default; nil-safe).
+	var ipReconcilerTickerC <-chan time.Time
+	if ipReconcilerEnabled {
+		t := time.NewTicker(ipReconcilerInterval)
+		defer t.Stop()
+		ipReconcilerTickerC = t.C
+		logger.Info("pod-vm ip reconciler enabled", "interval", ipReconcilerInterval)
+	}
+
 	// Start expiration cron (checks for expired pods every 5 minutes)
 	go prov.StartExpirationCron(ctx)
 
@@ -214,6 +255,10 @@ func main() {
 			case <-orphanTickerC:
 				if _, err := prov.ReconcileVCenterOrphans(ctx, orphanCfg); err != nil {
 					logger.Error("orphan reconcile failed", "error", err)
+				}
+			case <-ipReconcilerTickerC:
+				if _, err := prov.ReconcilePodVMIPs(ctx, ipReconcilerCfg); err != nil {
+					logger.Error("pod-vm ip reconcile failed", "error", err)
 				}
 			}
 		}
