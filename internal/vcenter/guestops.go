@@ -656,7 +656,19 @@ func guestTempBase(language, guestUser, runID, actionSlug string) (string, error
 func buildGuestInvocation(language, scriptPath, stdoutPath, stderrPath string) (string, string) {
 	switch strings.ToLower(language) {
 	case "powershell", "pwsh":
-		args := fmt.Sprintf(`-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%s" *> "%s" 2> "%s"`,
+		// Use -Command (not -File) with the call operator so that the
+		// redirection operators are parsed and applied by PowerShell
+		// itself. With `-File script.ps1 *> out 2> err`, powershell.exe
+		// treats everything after the script path as positional ARGUMENTS
+		// to the script — the `*>`/`2>` tokens are never interpreted as
+		// redirection, VMware Tools' StartProgram provides no stdout pipe,
+		// and the .stdout file is never written. downloadGuestFile then
+		// 404s (error swallowed) and callers see empty output, which made
+		// every PowerShell guest step (sysprep preflight, BitLocker
+		// decryption wait) silently read "" and hang until timeout.
+		// Single-quoted paths are literal in PowerShell (backslashes and
+		// spaces are safe); guestTempBase rejects paths with quote chars.
+		args := fmt.Sprintf(`-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& '%s' *> '%s' 2> '%s'"`,
 			scriptPath, stdoutPath, stderrPath)
 		return `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`, args
 	default:
