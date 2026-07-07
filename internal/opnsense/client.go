@@ -14,12 +14,12 @@ import (
 
 // Config holds OPNsense connection settings.
 type Config struct {
-	BaseURL   string // e.g., "https://10.10.10.60/api"
-	APIKey    string
-	APISecret string
-	SSHHost   string // e.g., "10.10.10.60:22"
-	SSHUser   string // e.g., "root"
-	SSHKey    []byte // private key PEM (or password-based via SSHPassword)
+	BaseURL     string // e.g., "https://10.10.10.60/api"
+	APIKey      string
+	APISecret   string
+	SSHHost     string // e.g., "10.10.10.60:22"
+	SSHUser     string // e.g., "root"
+	SSHKey      []byte // private key PEM (or password-based via SSHPassword)
 	SSHPassword string
 }
 
@@ -261,13 +261,12 @@ func (c *Client) RestartDHCP(ctx context.Context) error {
 	return err
 }
 
-// AddDHCPInterface adds an OPNsense interface to Kea's listened interfaces list.
-// Kea only serves DHCP on explicitly configured interfaces.
-func (c *Client) AddDHCPInterface(ctx context.Context, ifName string) error {
-	// Get current settings to find which interfaces are already selected
+// GetDHCPInterfaces returns the currently selected OPNsense interfaces in the
+// Kea DHCPv4 configuration.
+func (c *Client) GetDHCPInterfaces(ctx context.Context) ([]string, error) {
 	resp, err := c.doRequest(ctx, "GET", "/kea/dhcpv4/get", nil)
 	if err != nil {
-		return fmt.Errorf("get DHCP settings: %w", err)
+		return nil, fmt.Errorf("get DHCP settings: %w", err)
 	}
 
 	var settings struct {
@@ -281,16 +280,27 @@ func (c *Client) AddDHCPInterface(ctx context.Context, ifName string) error {
 		} `json:"dhcpv4"`
 	}
 	if err := json.Unmarshal(resp, &settings); err != nil {
-		return fmt.Errorf("parse DHCP settings: %w", err)
+		return nil, fmt.Errorf("parse DHCP settings: %w", err)
 	}
 
-	// Build comma-separated list of selected interfaces + the new one
 	var selected []string
 	for key, iface := range settings.DHCPV4.General.Interfaces {
 		if iface.Selected == 1 {
 			selected = append(selected, key)
 		}
 	}
+	return selected, nil
+}
+
+// AddDHCPInterface adds an OPNsense interface to Kea's listened interfaces list.
+// Kea only serves DHCP on explicitly configured interfaces.
+func (c *Client) AddDHCPInterface(ctx context.Context, ifName string) error {
+	selected, err := c.GetDHCPInterfaces(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Build comma-separated list of selected interfaces + the new one.
 	// Add the new interface if not already selected
 	found := false
 	for _, s := range selected {
@@ -438,6 +448,40 @@ func (c *Client) CreateFirewallRule(ctx context.Context, rule FirewallRule) (str
 func (c *Client) DeleteFirewallRule(ctx context.Context, uuid string) error {
 	_, err := c.doRequest(ctx, "POST", "/firewall/filter/delRule/"+uuid, nil)
 	return err
+}
+
+// FirewallRuleInfo is a subset of a firewall filter rule returned by search,
+// used for idempotency checks (e.g., "does a pass rule already exist for this
+// pod interface + subnet?").
+type FirewallRuleInfo struct {
+	UUID      string
+	Interface string // logical name(s); may be comma-joined, e.g. "opt4" or "lan,opt1"
+	Source    string // source_net, e.g. "10.100.3.0/24"
+	Action    string // "pass" or "block"
+}
+
+// GetFirewallRules lists automation firewall filter rules (for idempotency).
+func (c *Client) GetFirewallRules(ctx context.Context) ([]FirewallRuleInfo, error) {
+	resp, err := c.doRequest(ctx, "GET", "/firewall/filter/searchRule?current=1&rowCount=1000", nil)
+	if err != nil {
+		return nil, fmt.Errorf("search firewall rules: %w", err)
+	}
+	var result struct {
+		Rows []struct {
+			UUID      string `json:"uuid"`
+			Interface string `json:"interface"`
+			Source    string `json:"source_net"`
+			Action    string `json:"action"`
+		} `json:"rows"`
+	}
+	if err := json.Unmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("parse firewall rules: %w", err)
+	}
+	out := make([]FirewallRuleInfo, 0, len(result.Rows))
+	for _, r := range result.Rows {
+		out = append(out, FirewallRuleInfo{UUID: r.UUID, Interface: r.Interface, Source: r.Source, Action: r.Action})
+	}
+	return out, nil
 }
 
 // ApplyFirewall applies pending firewall changes.

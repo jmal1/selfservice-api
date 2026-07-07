@@ -125,6 +125,51 @@ func (s *SSHClient) AssignInterface(ctx context.Context, vlanTag int, ipAddr str
 	return s.assignInterfacePHP(client, ifName, vlanDev, ipAddr)
 }
 
+// FindInterfaceByVLAN returns the OPNsense interface key (e.g., opt4) bound
+// to a VLAN tag, or empty string when no interface is assigned.
+func (s *SSHClient) FindInterfaceByVLAN(ctx context.Context, vlanTag int) (string, error) {
+	client, err := s.dial()
+	if err != nil {
+		return "", fmt.Errorf("SSH connect: %w", err)
+	}
+	defer client.Close()
+
+	phpScript := fmt.Sprintf(
+		"<?php\n"+
+			"require_once(\"config.inc\");\n"+
+			"$config = parse_config();\n"+
+			"$vlan_tag = %d;\n"+
+			"$vlan_dev = '';\n"+
+			"if (isset($config['vlans']['vlan'])) {\n"+
+			"    foreach ($config['vlans']['vlan'] as $v) {\n"+
+			"        if (isset($v['tag']) && intval($v['tag']) === $vlan_tag) {\n"+
+			"            $vlan_dev = $v['vlanif'];\n"+
+			"            break;\n"+
+			"        }\n"+
+			"    }\n"+
+			"}\n"+
+			"if ($vlan_dev === '') { exit(0); }\n"+
+			"foreach ($config['interfaces'] as $ifname => $iface) {\n"+
+			"    if (isset($iface['if']) && $iface['if'] === $vlan_dev) {\n"+
+			"        echo $ifname;\n"+
+			"        exit(0);\n"+
+			"    }\n"+
+			"}\n"+
+			"?>\n",
+		vlanTag,
+	)
+	if err := s.writePHPScript(client, "/tmp/ss_find_if_vlan.php", phpScript); err != nil {
+		return "", fmt.Errorf("write PHP script: %w", err)
+	}
+
+	output, err := s.runCommand(client, "/usr/local/bin/php /tmp/ss_find_if_vlan.php")
+	s.runCommandIgnoreError(client, "rm -f /tmp/ss_find_if_vlan.php")
+	if err != nil {
+		return "", fmt.Errorf("PHP find interface by VLAN: %w (output: %s)", err, output)
+	}
+	return strings.TrimSpace(output), nil
+}
+
 // assignInterfacePHP uses PHP to edit the OPNsense config directly.
 func (s *SSHClient) assignInterfacePHP(client *ssh.Client, ifName, vlanDev, ipAddr string) (string, error) {
 	// Use OPNsense's built-in PHP config utility

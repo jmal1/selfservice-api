@@ -50,6 +50,12 @@ worker:
     folder: ""
     interval: "1h"
     minAge: "1h"
+  # OPNsense + vlan_pool network reconciler. Converges VLAN/interface/DHCP
+  # state for non-terminal pods and releases vlan_pool allocations for
+  # terminal pods.
+  networkReconciler:
+    enabled: true
+    interval: "5m"
   resources:
     requests:
       cpu: 100m
