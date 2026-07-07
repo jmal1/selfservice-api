@@ -362,6 +362,44 @@ func (q *Queries) DeleteTemplate(ctx context.Context, id uuid.UUID) error {
 	return err
 }
 
+// DeleteTemplateWithHistory removes a template together with any lingering
+// pod_vms rows that still reference it. It exists because pod_vms.template_id
+// is a NOT NULL / NO ACTION foreign key: historical rows from long-destroyed
+// pods keep pointing at the template, so a plain DELETE FROM templates is
+// rejected with "violates foreign key constraint pod_vms_template_id_fkey"
+// (SQLSTATE 23503) and the operator gets a 500 — after the staging VM was
+// already destroyed. Callers MUST first ensure no ACTIVE pod depends on the
+// template (see ListTemplateDependents); this only mops up the leftover
+// destroyed-pod audit rows so the template row can go. Both deletes run in
+// one transaction so we never orphan half the delete.
+func (q *Queries) DeleteTemplateWithHistory(ctx context.Context, id uuid.UUID) error {
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, "DELETE FROM pod_vms WHERE template_id = $1", id); err != nil {
+		return fmt.Errorf("delete pod_vms history: %w", err)
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM templates WHERE id = $1", id); err != nil {
+		return fmt.Errorf("delete template: %w", err)
+	}
+	return tx.Commit(ctx)
+}
+
+// CountTemplateBlueprintRefs returns how many blueprint VM definitions
+// reference a template. blueprint_vms.template_id is a NOT NULL / NO ACTION
+// FK, so a blueprint reference is a genuine active dependency that would make
+// the template delete fail with SQLSTATE 23503; the delete handler refuses
+// (409) when this is > 0 rather than 500 or silently break the blueprint.
+func (q *Queries) CountTemplateBlueprintRefs(ctx context.Context, id uuid.UUID) (int, error) {
+	var n int
+	err := q.pool.QueryRow(ctx,
+		"SELECT COUNT(*) FROM blueprint_vms WHERE template_id = $1", id).Scan(&n)
+	return n, err
+}
+
 // UpdateTemplateLifecycleState transitions a template's template_state column.
 // Used exclusively by the T4 wizard worker jobs and the lifecycle-aware
 // API handlers. The caller MUST have validated the transition against
