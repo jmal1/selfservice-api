@@ -286,12 +286,19 @@ func (c *Client) WaitForTools(ctx context.Context, moref string, timeout time.Du
 		return err
 	}
 	deadline := time.Now().Add(timeout)
-	vm := object.NewVirtualMachine(c.client.Client,
-		types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
 
 	for {
+		// Re-derive the VM handle from the current client on every poll and
+		// wrap the read in withRetry: the session token can expire mid-loop
+		// (or a concurrent op can reconnect and swap out c.client), which
+		// otherwise surfaces a raw NotAuthenticated fault that gets
+		// misreported to the instructor as "VMware Tools not running".
 		var props mo.VirtualMachine
-		if err := vm.Properties(ctx, vm.Reference(), []string{"guest"}, &props); err != nil {
+		if err := c.withRetry(ctx, "read guest props", func() error {
+			vm := object.NewVirtualMachine(c.client.Client,
+				types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
+			return vm.Properties(ctx, vm.Reference(), []string{"guest"}, &props)
+		}); err != nil {
 			return fmt.Errorf("read guest props on %s: %w", moref, err)
 		}
 		if props.Guest != nil && props.Guest.ToolsRunningStatus == string(types.VirtualMachineToolsRunningStatusGuestToolsRunning) {
