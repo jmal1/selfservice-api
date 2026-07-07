@@ -137,6 +137,25 @@ func TestBuildGuestInvocation_PowerShellUsesExecutionPolicyBypass(t *testing.T) 
 	if !strings.Contains(args, "-NoProfile") {
 		t.Errorf("expected -NoProfile flag, got %q", args)
 	}
+	// Regression: must use -Command (not -File) so PowerShell parses and
+	// applies the stream redirection. With -File, the redirection tokens
+	// are passed as script arguments and the .stdout file is never
+	// written, so every PowerShell guest step read empty output and hung.
+	if !strings.Contains(args, "-Command") {
+		t.Errorf("expected -Command so redirection is parsed by PowerShell, got %q", args)
+	}
+	if strings.Contains(args, "-File") {
+		t.Errorf("-File must NOT be used: it turns redirection tokens into script args, got %q", args)
+	}
+	if !strings.Contains(args, `*> 'C:\Temp\x.out'`) {
+		t.Errorf("args missing all-stream redirect to stdout path: %q", args)
+	}
+	if !strings.Contains(args, `2> 'C:\Temp\x.err'`) {
+		t.Errorf("args missing stderr redirect: %q", args)
+	}
+	if !strings.Contains(args, `& 'C:\Temp\x.ps1'`) {
+		t.Errorf("args missing call-operator invocation of the script: %q", args)
+	}
 }
 
 // TestGuestTempBase covers the OS-appropriate temp path resolution that
