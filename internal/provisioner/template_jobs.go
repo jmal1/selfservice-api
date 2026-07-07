@@ -694,13 +694,35 @@ func generalizeScript(osType string) string {
 		// shutdown). -Wait:$false means PS returns immediately and
 		// the worker's waitForPowerOff catches the resulting power-off.
 		//
+		// Before launching sysprep we best-effort DISABLE Windows
+		// "reserved storage". On feature-updated Windows 11, sysprep
+		// /generalize otherwise fails with 0x800F0975
+		// ("SYSPRP Sysprep_Generalize_Windows... reserved storage")
+		// and — because we launch sysprep fire-and-forget — that
+		// failure is invisible: sysprep exits, the VM never powers
+		// off, and the worker's waitForPowerOff just times out after
+		// 10 minutes with a misleading "VM did not power off" error.
+		// Flipping ReserveManager\ActiveScenario + TiAttemptedInitialization
+		// to 0 and running `dism /Set-ReservedStorageState /State:Disabled`
+		// clears it with no reboot required. All of it is wrapped so it
+		// is a harmless no-op on Windows builds without reserved storage.
+		//
 		// /unattend: points sysprep at the file we uploaded in Step 1b
 		// so the OOBE pass on the *next* boot of any clone follows
 		// our script (creates Student, runs FirstLogonCommands,
 		// hands off to cloudbase-init for per-pod password injection).
 		// Without it sysprep ignores our file and the clone drops into
 		// interactive OOBE.
-		return `Start-Process -FilePath "C:\Windows\System32\Sysprep\sysprep.exe" -ArgumentList "/generalize","/oobe","/shutdown","/quiet","/unattend:C:\Windows\Panther\unattend.xml" -NoNewWindow`
+		return strings.Join([]string{
+			`$ErrorActionPreference = 'SilentlyContinue'`,
+			`$rm = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\ReserveManager'`,
+			`if (Test-Path $rm) {`,
+			`  Set-ItemProperty -Path $rm -Name 'ActiveScenario' -Value 0 -Type DWord -Force`,
+			`  Set-ItemProperty -Path $rm -Name 'TiAttemptedInitialization' -Value 0 -Type DWord -Force`,
+			`}`,
+			`& dism.exe /Online /Set-ReservedStorageState /State:Disabled | Out-Null`,
+			`Start-Process -FilePath "C:\Windows\System32\Sysprep\sysprep.exe" -ArgumentList "/generalize","/oobe","/shutdown","/quiet","/unattend:C:\Windows\Panther\unattend.xml" -NoNewWindow`,
+		}, "\n")
 	}
 	// Linux. Keep as POSIX-safe so it works under dash if /bin/sh is dash.
 	return strings.Join([]string{
