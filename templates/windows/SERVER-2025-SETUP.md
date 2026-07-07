@@ -225,8 +225,18 @@ clean pre-sysprep state — all of these should be clear/expected:
   `PendingFileRenameOperations`
 - `SkipRearm` = 1
 
-Finally empty temp + recycle bin:
-`Get-ChildItem C:\Windows\Temp,$env:TEMP -Recurse -Force | Remove-Item -Recurse -Force -EA SilentlyContinue; Clear-RecycleBin -Force`
+Finally empty temp + recycle bin **and remove build artifacts** (otherwise
+scripts/logs/installers bake into the image and every clone inherits them):
+
+```powershell
+Remove-Item C:\*.ps1, C:\wu-*, C:\cbinit.msi -Force -EA SilentlyContinue
+Get-ChildItem C:\Windows\Temp,$env:TEMP -Recurse -Force | Remove-Item -Recurse -Force -EA SilentlyContinue
+Clear-RecycleBin -Force -EA SilentlyContinue
+```
+
+> [!note] Do this BEFORE sysprep. Once generalized, the box must not be
+> powered on, so leftover `C:\` build files can no longer be cleaned and will
+> persist into every L2/L3 clone (harmless but untidy).
 
 ## Step 9: Sysprep ONCE (on a pristine box)
 
