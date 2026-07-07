@@ -193,11 +193,14 @@ with nothing new.
 
 ## Step 5: BitLocker — verify N/A
 
-Server 2022 without a vTPM does not auto-encrypt. Confirm anyway:
-`Get-BitLockerVolume` should show `FullyDecrypted` / `ProtectionStatus Off`.
+Server 2022 without a vTPM does not auto-encrypt. A stock **SERVERSTANDARD
+(Desktop Experience)** eval install does **not** include the BitLocker
+optional feature, so `Get-BitLockerVolume` is *not present* (the cmdlet errors
+with "not recognized") and `manage-bde -status C:` reports no BitLocker — both
+are the expected clean state (verified on the first build). Confirm with:
+`manage-bde -status C:` → no conversion/protection lines.
 If (unexpectedly) encrypted, `manage-bde -off C:` and wait, exactly as W11
 [SETUP.md](SETUP.md) Step 5 — an encrypted base image bricks every clone.
-(Server 2022 **does** ship the BitLocker cmdlets, unlike some Server SKUs.)
 
 ## Step 6: Install & configure cloudbase-init (identical to Windows 11)
 
@@ -290,19 +293,28 @@ state. If it does not power off, read
 
 ## Step 10: Detach CDs + register with Crucible
 
-1. In vSphere, **disconnect both CDs** (svc account lacks device.connect;
-   this is a manual step). Leave them as devices, just disconnected.
-2. Crucible portal → **Admin → Templates → New Template**:
-   - **Name:** `student-windows-server-2022` (versioned slug)
+1. **Detach both CDs.** The svc account lacks `device.connect` (runtime
+   connect toggle) but **can eject** — `govc device.cdrom.eject -vm <VM>
+   -device cdrom-3000` / `cdrom-3001` removes the ISO backing and leaves the
+   device disconnected (empty ATAPI). No manual UI step needed.
+2. Register via the Crucible portal **Admin → Templates → New Template** (or an
+   equivalent DB insert — `AdminCreateTemplate` is a plain insert + folder-cache
+   invalidation, no side effects). **Mirror the live `Windows Server 2025` row
+   exactly** — that template uses `source_type = manual` with the **VM name** in
+   `vcenter_template`, NOT `clone_vcenter` + moref:
+   - **Name:** `Windows Server 2022`
    - **OS type:** `windows`
-   - **Source type:** `clone_vcenter`
-   - **Source ref:** this VM's moref (e.g. `vm-XXXX`)
-3. Submit. Do **not** mark as template or snapshot.
-
-> [!note] Match the live `student-windows-server-2025` row
-> Before registering, confirm how the 2025 template is actually stored (source
-> type / `vcenter_template` / `vcenter_vm_id`) and mirror it exactly so both
-> Windows Server images provision through the identical code path.
+   - **kind:** `clone_with_customize`
+   - **Source type:** `manual`
+   - **vcenter_template:** `student-windows-server-2022` (the VM *name*; the
+     wizard/provisioner resolves the source VM by name for manual templates)
+   - **vcenter_vm_id / source_ref:** empty
+   - **Defaults:** 4 vCPU / 4096 MB / 60 GB, `Student` / `Changeme123!`,
+     staging_network `PG-VM-Lab`, `assign_ip=true`, `is_active=true`,
+     `template_state=active`, `is_internal=false`
+3. If you inserted directly, `kubectl -n selfservice rollout restart
+   deployment/selfservice-api` to refresh the templates folder cache. Do **not**
+   mark the VM as a vSphere template or snapshot it (the wizard snapshots at L2).
 
 ## Step 11: Smoke-test one L2 wizard run
 
@@ -316,14 +328,17 @@ pipeline works for WS2022 (verifies `SkipRearm` lets re-sysprep succeed):
 3. Step 3 generalize: enter `Student` / `Changeme123!`, wait for power-off +
    `base-image` snapshot → template state `ready`
 
-## Step 12: Backups + docs (repo rule §5)
+## Step 12: Backups + docs
 
-Add the VM to ghettoVCB on whichever host holds it and record it:
-
-- `esxi1`: `/vmfs/volumes/datastore1-esxi1/ghettoVCB-vms.txt`
-- `esxi2`: `/vmfs/volumes/datastore1-esxi2/ghettoVCB-vms.txt`
-- Update `current/00-Infrastructure-Overview.md` and
-  `archive/VM-Backup-Strategy.md` in the Homelab vault.
+> [!note] L1 gold-image templates are **excluded** from ghettoVCB by convention
+> The ghettoVCB list on `esxi1` holds only service VMs (DNSv01, authv01,
+> mgmtv01, netbirdv01, k3sv01, stagingv01). The existing Windows template
+> gold images (`student-windows-server-2025`, `student-windows-11`) are **not**
+> backed up — they are fully reproducible from this runbook + the answer ISO,
+> and Crucible snapshots handle L2. Mirror that: do **not** add
+> `student-windows-server-2022` to ghettoVCB. (If you decide gold images *should*
+> be backed up, add it to both hosts' lists and update
+> `current/00-Infrastructure-Overview.md` + `archive/VM-Backup-Strategy.md`.)
 
 ## Monthly / quarterly L2 rebuild (the whole point)
 
