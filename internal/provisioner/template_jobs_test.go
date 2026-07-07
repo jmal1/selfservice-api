@@ -59,6 +59,26 @@ func TestGeneralizeScript_WindowsRunsSysprep(t *testing.T) {
 	}
 }
 
+// TestPowerOffTimeout locks in that Windows gets a much longer power-off wait
+// than Linux. Sysprep's generalize pass on feature-updated Windows 11 can take
+// 12-20 min before the guest powers off; a 10-min wait (the old value) marked
+// the template 'error' while sysprep was still finishing, producing a
+// successfully-generalized-but-errored template. Linux shutdown is seconds.
+func TestPowerOffTimeout(t *testing.T) {
+	if got := powerOffTimeout("windows"); got < 20*time.Minute {
+		t.Errorf("windows powerOffTimeout = %s, want >= 20m (sysprep on Win11 is slow)", got)
+	}
+	if got := powerOffTimeout("Windows"); got < 20*time.Minute {
+		t.Errorf("powerOffTimeout should be case-insensitive; Windows = %s", got)
+	}
+	if got := powerOffTimeout("linux"); got != 10*time.Minute {
+		t.Errorf("linux powerOffTimeout = %s, want 10m", got)
+	}
+	if powerOffTimeout("windows") <= powerOffTimeout("linux") {
+		t.Errorf("windows wait must exceed linux wait")
+	}
+}
+
 func TestGeneralizeScript_UnknownOSDefaultsToLinux(t *testing.T) {
 	got := generalizeScript("plan9")
 	if !strings.Contains(got, "shutdown -h now") {

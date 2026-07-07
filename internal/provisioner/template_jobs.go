@@ -293,6 +293,30 @@ func (p *Provisioner) GeneralizeTemplate(ctx context.Context, job *models.Job) e
 			payload.TemplateID, tmpl.TemplateState, models.TemplateStateGeneralizing)
 	}
 
+	// Step 0 (recovery / idempotency): if the VM is already powered off when
+	// this job starts, a *previous* generalize run's sysprep almost certainly
+	// completed and shut the guest down AFTER that run's waitForPowerOff
+	// deadline elapsed. Sysprep on feature-updated Windows 11 routinely takes
+	// 12-20 min to finish its generalize pass before it powers the VM off; a
+	// run that gave up at 10 min was marked 'error' even though the guest went
+	// on to finish generalizing and shut itself down cleanly a minute or two
+	// later. Re-running the full pipeline would then fail immediately at
+	// WaitForTools (VM is off) and could never recover. Detect that here and
+	// resume at the snapshot step instead of trying to sysprep an
+	// already-generalized, powered-off image.
+	//
+	// In the normal flow the VM is powered ON and running when generalize
+	// begins (it was just configured), so this branch is a no-op. A GetVM
+	// error is non-fatal here — fall through to the normal path, which will
+	// surface any real vCenter problem with better context.
+	if props, gerr := p.vc.GetVM(ctx, payload.VMMoref); gerr == nil &&
+		props.Runtime.PowerState == "poweredOff" {
+		p.logger.Warn("generalize: VM already powered off at job start; assuming a "+
+			"prior sysprep completed and resuming at snapshot",
+			"template_id", payload.TemplateID, "vm_moref", payload.VMMoref)
+		return p.finalizeGeneralizedTemplate(ctx, job, &payload, snapshotName)
+	}
+
 	// Step 1: tools sanity check
 	p.publishProgress(job.ID, "verify_tools", "Verifying VMware Tools is running")
 	if err := p.vc.WaitForTools(ctx, payload.VMMoref, 30*time.Second); err != nil {
@@ -380,13 +404,41 @@ func (p *Provisioner) GeneralizeTemplate(ctx context.Context, job *models.Job) e
 		}
 	}
 
-	// Step 3: wait for shutdown (10 min)
-	p.publishProgress(job.ID, "wait_shutdown", "Waiting for VM to power off (10 min)")
-	if err := p.waitForPowerOff(ctx, payload.VMMoref, 10*time.Minute); err != nil {
+	// Step 3: wait for shutdown. The generalize command shuts the VM down as
+	// its final step, but on Windows that step is sysprep's generalize pass,
+	// which on a feature-updated Windows 11 routinely takes 12-20 min before
+	// it powers the guest off. A too-short wait here marks the template
+	// 'error' while sysprep is still finishing — the guest then powers off a
+	// minute later, leaving a successfully-generalized-but-'error' template
+	// that only the Step 0 recovery branch can pick back up. Give Windows a
+	// generous 25 min; Linux shutdown is near-instant so 10 min is plenty.
+	powerOffWait := powerOffTimeout(osType)
+	p.publishProgress(job.ID, "wait_shutdown", fmt.Sprintf("Waiting for VM to power off (up to %s)", powerOffWait))
+	if err := p.waitForPowerOff(ctx, payload.VMMoref, powerOffWait); err != nil {
 		return p.markTemplateError(ctx, payload.TemplateID,
 			fmt.Errorf("VM did not power off after generalize: %w (check the guest console)", err))
 	}
 
+	return p.finalizeGeneralizedTemplate(ctx, job, &payload, snapshotName)
+}
+
+// powerOffTimeout returns how long GeneralizeTemplate waits for the guest to
+// power itself off after the generalize command runs. Windows sysprep's
+// generalize pass on feature-updated Windows 11 routinely takes 12-20 min, so
+// it gets a generous window; Linux `shutdown -h now` powers off in seconds.
+func powerOffTimeout(osType string) time.Duration {
+	if strings.ToLower(osType) == "windows" {
+		return 25 * time.Minute
+	}
+	return 10 * time.Minute
+}
+
+// finalizeGeneralizedTemplate runs the terminal steps shared by the normal
+// generalize path and the Step 0 "VM already powered off" recovery path:
+// snapshot the powered-off VM as the base image, advance the template to
+// 'ready', and scrub credentials from the in-process payload struct so the
+// worker's success result doesn't echo them.
+func (p *Provisioner) finalizeGeneralizedTemplate(ctx context.Context, job *models.Job, payload *TemplateGeneralizePayload, snapshotName string) error {
 	// Step 4: snapshot
 	p.publishProgress(job.ID, "create_snapshot", fmt.Sprintf("Snapshotting as %q", snapshotName))
 	if _, err := p.vc.CreateVMSnapshot(ctx, payload.VMMoref, snapshotName,
