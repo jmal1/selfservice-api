@@ -228,11 +228,23 @@
              \setup64.exe at a CD root. Deliberately do NOT match a bare
              \setup.exe at a root — that is the Windows install ISO's own
              Setup.exe and would relaunch Windows Setup. Silent syntax is
-             `/S /v"/qn REBOOT=R"` (no space between /v and the quote). If none
-             is found, install Tools via vSphere per SERVER-2022-SETUP.md step 2;
-             the govc-driven prep cannot start until Tools is running. -->
+             `/S /v"/qn REBOOT=ReallySuppress"` (no space between /v and the
+             quote). If none is found, install Tools via vSphere per
+             SERVER-2022-SETUP.md step 2; the govc-driven prep cannot start
+             until Tools is running.
+
+             This is a PowerShell -EncodedCommand (base64, UTF-16LE) rather than
+             an inline `cmd /c "..."` for-loop: the cmd form's nested
+             `/v"/qn ..."` double quotes prematurely close the outer `cmd /c "..."`
+             quote and silently break the loop, so Tools never installed (this
+             bit the first WS2022 build — Tools had to be installed manually).
+             The encoded form has zero quoting to mangle. Decoded script:
+               foreach($d in 68..76){$L=[char]$d;foreach($p in
+                 'vmtools\setup64.exe','vmtools\setup.exe','setup64.exe'){
+                 $f="${L}:\$p";if(Test-Path $f){Start-Process -FilePath $f
+                 -ArgumentList '/S /v"/qn REBOOT=ReallySuppress"' -Wait;exit}}} -->
         <SynchronousCommand wcm:order="2">
-          <CommandLine>cmd /c "for %d in (D E F G H I J K L) do @(if exist %d:\vmtools\setup64.exe (start /wait %d:\vmtools\setup64.exe /S /v"/qn REBOOT=R") else if exist %d:\vmtools\setup.exe (start /wait %d:\vmtools\setup.exe /S /v"/qn REBOOT=R") else if exist %d:\setup64.exe (start /wait %d:\setup64.exe /S /v"/qn REBOOT=R"))"</CommandLine>
+          <CommandLine>powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand ZgBvAHIAZQBhAGMAaAAoACQAZAAgAGkAbgAgADYAOAAuAC4ANwA2ACkAewAkAEwAPQBbAGMAaABhAHIAXQAkAGQAOwBmAG8AcgBlAGEAYwBoACgAJABwACAAaQBuACAAJwB2AG0AdABvAG8AbABzAFwAcwBlAHQAdQBwADYANAAuAGUAeABlACcALAAnAHYAbQB0AG8AbwBsAHMAXABzAGUAdAB1AHAALgBlAHgAZQAnACwAJwBzAGUAdAB1AHAANgA0AC4AZQB4AGUAJwApAHsAJABmAD0AIgAkAHsATAB9ADoAXAAkAHAAIgA7AGkAZgAoAFQAZQBzAHQALQBQAGEAdABoACAAJABmACkAewBTAHQAYQByAHQALQBQAHIAbwBjAGUAcwBzACAALQBGAGkAbABlAFAAYQB0AGgAIAAkAGYAIAAtAEEAcgBnAHUAbQBlAG4AdABMAGkAcwB0ACAAJwAvAFMAIAAvAHYAIgAvAHEAbgAgAFIARQBCAE8ATwBUAD0AUgBlAGEAbABsAHkAUwB1AHAAcAByAGUAcwBzACIAJwAgAC0AVwBhAGkAdAA7AGUAeABpAHQAfQB9AH0A</CommandLine>
           <Description>Install VMware Tools silently from answer/tools ISO</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
