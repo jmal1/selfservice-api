@@ -53,7 +53,7 @@ Go to **Admin → Templates → New**. Fill in:
 - **Name** — human-friendly, will be shown to students
 - **OS type** — `ubuntu`, `windows`, `kali`, etc. (drives the generalize behavior)
 - **Source** — clone from an existing Crucible template, or paste a vCenter VM moref
-- **Staging network** — defaults to `LabVMs-VLAN30`; only change if you know why
+- **Staging network** — defaults to `PG-VM-Lab` (the VLAN 30 port group on every host); only change if you know why
 
 Click **Create draft**. You'll land on the wizard page for the new template.
 
