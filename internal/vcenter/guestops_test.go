@@ -6,6 +6,42 @@ import (
 	"time"
 )
 
+func TestDecodeGuestOutput(t *testing.T) {
+	// UTF-16LE with BOM — exactly what Windows PowerShell 5.1 `*>`/`>`
+	// redirection writes; this is what defeated the BitLocker sentinel.
+	utf16le := []byte{0xFF, 0xFE}
+	for _, r := range "BL:DECRYPTED\r\n" {
+		utf16le = append(utf16le, byte(r), 0x00)
+	}
+	// UTF-16BE with BOM.
+	utf16be := []byte{0xFE, 0xFF}
+	for _, r := range "BL:NONE" {
+		utf16be = append(utf16be, 0x00, byte(r))
+	}
+	cases := []struct {
+		name string
+		in   []byte
+		want string
+	}{
+		{"utf16le_bom", utf16le, "BL:DECRYPTED\r\n"},
+		{"utf16be_bom", utf16be, "BL:NONE"},
+		{"utf8_bom", append([]byte{0xEF, 0xBB, 0xBF}, []byte("hi")...), "hi"},
+		{"plain_utf8", []byte("plain output"), "plain output"},
+		{"empty", []byte{}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := decodeGuestOutput(tc.in); got != tc.want {
+				t.Errorf("decodeGuestOutput(%v) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+	// Regression: the sentinel match must succeed on decoded UTF-16 output.
+	if !strings.Contains(decodeGuestOutput(utf16le), "BL:DECRYPTED") {
+		t.Error("decoded UTF-16LE output must contain the BL:DECRYPTED sentinel")
+	}
+}
+
 func TestValidateGuestRequest_HappyPath(t *testing.T) {
 	req := GuestExecRequest{
 		VMMoref:       "vm-1234",
