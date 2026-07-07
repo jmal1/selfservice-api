@@ -141,8 +141,8 @@
     {
       "path": "docs/instructor/templates.md",
       "title": "Building a Template",
-      "size": 6994,
-      "sha256": "10b0b799d8fbc627d424e4b52e87fc942bccd73db3b982a3b95a402618e4e285",
+      "size": 7029,
+      "sha256": "e66b47fbf3349f5a277111a0f5f1c1ac334c2e3b3034c3bb03285f10772a14b7",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/glossary.md",
@@ -268,5 +268,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 169117
+  "total_bytes": 169152
 }

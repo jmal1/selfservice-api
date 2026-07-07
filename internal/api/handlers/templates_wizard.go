@@ -141,7 +141,7 @@ func (h *Handler) AdminCreateTemplateDraft(w http.ResponseWriter, r *http.Reques
 
 	stagingNetwork := req.StagingNetwork
 	if stagingNetwork == "" {
-		stagingNetwork = "LabVMs-VLAN30" // canonical staging port group; see vault docs
+		stagingNetwork = "PG-VM-Lab" // canonical VLAN 30 staging port group present on every host
 	}
 
 	userID := middleware.UserIDFromContext(r.Context())

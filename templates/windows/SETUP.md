@@ -30,7 +30,7 @@ The platform uses a 3-level template hierarchy:
 - Windows 11 Pro ISO mounted on the VM (currently in OOBE state)
 - This repo cloned (you'll need `internal/provisioner/assets/windows-unattend.xml`)
 - A port group with internet egress for the build phase (the lab uses
-  `Mgmt-VLAN10` or `LabVMs-VLAN30` — both have NAT to the internet via
+  `Mgmt-VLAN10` or `PG-VM-Lab` (VLAN 30) — both have NAT to the internet via
   the home gateway)
 
 ## Step 1: Complete OOBE with a throwaway admin
@@ -54,7 +54,7 @@ The VM needs internet access to download cloudbase-init and (optionally)
 apply Windows Updates. From vCenter:
 
 1. Edit Settings → Network adapter 1 → set to `Mgmt-VLAN10` (or
-   `LabVMs-VLAN30` — either works)
+   `PG-VM-Lab` (VLAN 30) — either works)
 2. Apply
 3. In the guest, verify with `ping 8.8.8.8` — should respond. If not,
    confirm the adapter shows "Connected" in vCenter and that the guest

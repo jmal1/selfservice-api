@@ -39,12 +39,12 @@ ALTER TABLE templates
     ADD COLUMN IF NOT EXISTS source_ref TEXT NOT NULL DEFAULT '';
 
 -- Network the template VM is attached to during the configuring phase.
--- Defaults to LabVMs-VLAN30 (the existing VLAN 30 port group present on
--- every ESXi host, with DHCP from OPNsense and internet access for
--- installer downloads). Authors can override per template if they need
--- to test against a particular pod-style network.
+-- Defaults to PG-VM-Lab (the existing VLAN 30 port group present on
+-- every ESXi host, with DHCP and internet access for installer
+-- downloads). Authors can override per template if they need to test
+-- against a particular pod-style network.
 ALTER TABLE templates
-    ADD COLUMN IF NOT EXISTS staging_network TEXT NOT NULL DEFAULT 'LabVMs-VLAN30';
+    ADD COLUMN IF NOT EXISTS staging_network TEXT NOT NULL DEFAULT 'PG-VM-Lab';
 
 -- Constrain template_state to the documented enum. Anything else means a
 -- corrupted row and we want a hard error, not silent acceptance.

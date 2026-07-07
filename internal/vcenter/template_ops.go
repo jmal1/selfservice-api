@@ -350,7 +350,7 @@ func (c *Client) attachNetworkAdapterInner(ctx context.Context, moref, network s
 	// Construct the NIC backing directly by name rather than going through
 	// c.finder.Network(). The finder only sees vCenter-level networks
 	// (Distributed Virtual Port Groups, opaque networks), not per-host
-	// standard vSwitch port groups like "LabVMs-VLAN30" — which is what
+	// standard vSwitch port groups like "PG-VM-Lab" — which is what
 	// the rest of the Crucible plumbing uses. The student-pod clone path
 	// (client.go cloneAndCustomize) does the same thing for the same
 	// reason. vCenter resolves the DeviceName on the target host when the

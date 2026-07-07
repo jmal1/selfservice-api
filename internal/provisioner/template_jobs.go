@@ -461,7 +461,7 @@ func (p *Provisioner) VerifyTemplate(ctx context.Context, job *models.Job) error
 	osType := strings.ToLower(tmpl.OSType)
 	network := tmpl.StagingNetwork
 	if network == "" {
-		network = "LabVMs-VLAN30"
+		network = "PG-VM-Lab"
 	}
 	vcpus := int32(tmpl.DefaultVCPUs)
 	if vcpus <= 0 {
