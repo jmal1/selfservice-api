@@ -46,6 +46,17 @@ func TestGeneralizeScript_WindowsRunsSysprep(t *testing.T) {
 			t.Errorf("Windows generalize script missing %q\nscript:\n%s", r, got)
 		}
 	}
+	// Reserved-storage must be disabled BEFORE sysprep, or feature-updated
+	// Windows 11 sysprep fails with 0x800F0975 and (fire-and-forget) the
+	// VM silently never powers off -> 10-min wait_shutdown timeout.
+	for _, r := range []string{"ReserveManager", "ActiveScenario", "/Set-ReservedStorageState /State:Disabled"} {
+		if !strings.Contains(got, r) {
+			t.Errorf("Windows generalize script missing reserved-storage prep %q\nscript:\n%s", r, got)
+		}
+	}
+	if i, j := strings.Index(got, "/Set-ReservedStorageState"), strings.Index(got, "sysprep.exe"); i < 0 || j < 0 || i > j {
+		t.Errorf("reserved-storage disable must run before sysprep (idx dism=%d sysprep=%d)\nscript:\n%s", i, j, got)
+	}
 }
 
 func TestGeneralizeScript_UnknownOSDefaultsToLinux(t *testing.T) {
