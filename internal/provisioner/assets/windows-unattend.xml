@@ -36,6 +36,30 @@
       xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
       <UserAuthentication>0</UserAuthentication>
     </component>
+
+    <!-- Enable cloudbase-init on clone first boot in a SKU-agnostic way.
+         The FirstLogonCommands below (oobeSystem pass) are SILENTLY SKIPPED on
+         Windows *Server* SKUs when SkipMachineOOBE/SkipUserOOBE are set, so on
+         Server 2022/2025 the cloudbase-init service was never re-enabled and
+         the per-clone Student password was never applied (guest auth failed,
+         template_verify + real pods broke). The specialize pass runs on ALL
+         SKUs, so we set the service to delayed-auto here: it then starts ~2 min
+         into the OOBE boot, once VMware Tools + guestinfo metadata are ready.
+         Redundant-but-harmless on Windows 11 (its FirstLogonCommands already
+         start the service immediately; cloudbase-init is idempotent per
+         instance id). -->
+    <component name="Microsoft-Windows-Deployment" processorArchitecture="amd64"
+      publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+      xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>cmd.exe /c sc config cloudbase-init start= delayed-auto</Path>
+          <Description>Enable cloudbase-init (FirstLogonCommands are skipped on Server SKUs)</Description>
+          <WillReboot>Never</WillReboot>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
   </settings>
 
   <!-- OOBE pass: runs during first boot experience -->
