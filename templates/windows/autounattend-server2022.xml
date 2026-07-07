@@ -220,16 +220,19 @@
           <Description>Administrator password never expires (build safety)</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
-        <!-- Install VMware Tools with NO internet. Scan drive letters D..L for
-             the tools installer. The real filename on VMware's tools ISO is
-             setup64.exe (NOT setup.exe) and it may sit at the ISO root OR under
-             a bundled \vmtools\ folder. The silent syntax is `/S /v"/qn
-             REBOOT=R"` with NO space between /v and the quote. If neither path
-             is found (answer ISO built without Tools), install Tools manually
-             via vSphere "Install VMware Tools" + reboot per SERVER-2022-SETUP.md
-             step 2. The govc-driven prep cannot start until Tools is running. -->
+        <!-- Install VMware Tools with NO internet from the bundled answer ISO.
+             Scan drive letters D..L. The bundled Tools tree lives under
+             \vmtools\ and its installer is setup.exe (modern Tools 12.x/13.x
+             dropped the separate setup64.exe); older media used setup64.exe.
+             Check \vmtools\setup64.exe, then \vmtools\setup.exe, then a bare
+             \setup64.exe at a CD root. Deliberately do NOT match a bare
+             \setup.exe at a root — that is the Windows install ISO's own
+             Setup.exe and would relaunch Windows Setup. Silent syntax is
+             `/S /v"/qn REBOOT=R"` (no space between /v and the quote). If none
+             is found, install Tools via vSphere per SERVER-2022-SETUP.md step 2;
+             the govc-driven prep cannot start until Tools is running. -->
         <SynchronousCommand wcm:order="2">
-          <CommandLine>cmd /c "for %d in (D E F G H I J K L) do @(if exist %d:\vmtools\setup64.exe start /wait %d:\vmtools\setup64.exe /S /v"/qn REBOOT=R" &amp; if exist %d:\setup64.exe start /wait %d:\setup64.exe /S /v"/qn REBOOT=R")"</CommandLine>
+          <CommandLine>cmd /c "for %d in (D E F G H I J K L) do @(if exist %d:\vmtools\setup64.exe (start /wait %d:\vmtools\setup64.exe /S /v"/qn REBOOT=R") else if exist %d:\vmtools\setup.exe (start /wait %d:\vmtools\setup.exe /S /v"/qn REBOOT=R") else if exist %d:\setup64.exe (start /wait %d:\setup64.exe /S /v"/qn REBOOT=R"))"</CommandLine>
           <Description>Install VMware Tools silently from answer/tools ISO</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
