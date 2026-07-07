@@ -177,6 +177,39 @@ func main() {
 	}
 	ipReconcilerCfg := provisioner.IPReconcilerConfig{Pusher: ipReconcilerPusher}
 
+	// Optional: OPNsense network reconciler. Every interval it re-asserts the
+	// VLAN, OPNsense interface, Kea DHCP subnet + binding, firewall pass rule
+	// and outbound NAT for every active pod, and releases leaked vlan_pool
+	// allocations from destroyed pods. Self-heals the class of drift that caused
+	// the 2026-07-07 pod DHCP + internet outage. Enabled by default; set
+	// WORKER_NETWORK_RECONCILER_ENABLED=false to opt out.
+	// WORKER_NETWORK_RECONCILER_INTERVAL overrides the default 5m cadence.
+	networkReconcilerEnabled := true
+	if v := os.Getenv("WORKER_NETWORK_RECONCILER_ENABLED"); v != "" {
+		networkReconcilerEnabled = strings.EqualFold(v, "true")
+	}
+	networkReconcilerInterval := 5 * time.Minute
+	if v := os.Getenv("WORKER_NETWORK_RECONCILER_INTERVAL"); v != "" {
+		if parsed, err := time.ParseDuration(v); err == nil {
+			networkReconcilerInterval = parsed
+		} else {
+			logger.Warn("invalid WORKER_NETWORK_RECONCILER_INTERVAL; using default 5m", "value", v, "error", err)
+		}
+	}
+	var networkReconcilerPusher *provisioner.NetworkReconcilePusher
+	if pgURL := os.Getenv("WORKER_PUSHGATEWAY_URL"); pgURL != "" {
+		job := os.Getenv("WORKER_PUSHGATEWAY_JOB")
+		if job == "" {
+			job = "crucible_provision_worker"
+		}
+		networkReconcilerPusher = &provisioner.NetworkReconcilePusher{
+			BaseURL:        pgURL,
+			Job:            job,
+			GroupingLabels: map[string]string{"layer": "api"},
+		}
+	}
+	networkReconcilerCfg := provisioner.NetworkReconcilerConfig{Pusher: networkReconcilerPusher}
+
 	// Worker ID for job claiming
 	workerID, err := os.Hostname()
 	if err != nil {
@@ -237,6 +270,21 @@ func main() {
 		logger.Info("pod-vm ip reconciler enabled", "interval", ipReconcilerInterval)
 	}
 
+	// OPNsense network reconciler ticker (enabled by default; nil-safe).
+	var networkReconcilerTickerC <-chan time.Time
+	if networkReconcilerEnabled {
+		t := time.NewTicker(networkReconcilerInterval)
+		defer t.Stop()
+		networkReconcilerTickerC = t.C
+		logger.Info("opnsense network reconciler enabled", "interval", networkReconcilerInterval)
+		// Heal any existing network drift promptly on startup.
+		go func() {
+			if _, err := prov.ReconcileNetwork(ctx, networkReconcilerCfg); err != nil {
+				logger.Error("initial network reconcile failed", "error", err)
+			}
+		}()
+	}
+
 	// Start expiration cron (checks for expired pods every 5 minutes)
 	go prov.StartExpirationCron(ctx)
 
@@ -259,6 +307,10 @@ func main() {
 			case <-ipReconcilerTickerC:
 				if _, err := prov.ReconcilePodVMIPs(ctx, ipReconcilerCfg); err != nil {
 					logger.Error("pod-vm ip reconcile failed", "error", err)
+				}
+			case <-networkReconcilerTickerC:
+				if _, err := prov.ReconcileNetwork(ctx, networkReconcilerCfg); err != nil {
+					logger.Error("network reconcile failed", "error", err)
 				}
 			}
 		}
