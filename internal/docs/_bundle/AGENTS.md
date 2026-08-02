@@ -457,7 +457,7 @@ The Admin UI's script editor sends your action body to `POST /api/v1/admin/scrip
 
 The validator runs in two layers:
 - **Client-side (300 ms debounce):** `sh-syntax` WASM in the browser catches syntax-level errors instantly with zero server load.
-- **Server-side (2000 ms debounce + on Save):** real `shellcheck` runs in the API pod for the full SC**** rule library. Admin-only, 64 KB cap, 30 req/min rate limit, 3 s timeout.
+- **Server-side (2000 ms debounce + on Save):** real `shellcheck` runs in the API pod for the full SC**** rule library. Instructor-accessible (the whole admin panel except the Audit Log is open to the `lab-instructors` group), 64 KB cap, 30 req/min rate limit, 3 s timeout.
 
 Source: [`internal/scriptvalidator/wrap.go`](internal/scriptvalidator/wrap.go), [`internal/scriptvalidator/detect.go`](internal/scriptvalidator/detect.go), [`internal/scriptvalidator/validator.go`](internal/scriptvalidator/validator.go).
 

@@ -172,23 +172,39 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 			// section; this just hands the UI the URL + metadata.
 			r.Get("/{templateID}/console/ticket", h.TemplateBuildConsoleTicket)
 
-			// Template CRUD + access + playlists — admin only.
-			r.Group(func(r chi.Router) {
-				r.Use(middleware.RequireRole(models.RoleAdmin))
-				r.Get("/", h.AdminListTemplates)
-				r.Post("/", h.AdminCreateTemplate)
-				r.Patch("/{templateID}", h.AdminUpdateTemplate)
-				r.Delete("/{templateID}", h.AdminDeleteTemplate)
-				r.Post("/{templateID}/access", h.AdminSetTemplateAccess)
-				r.Get("/{templateID}/dependents", h.AdminListTemplateDependents)
-				r.Get("/{templateID}/playlists", h.AdminGetTemplatePlaylists)
-				r.Post("/{templateID}/playlists", h.AdminSetTemplatePlaylists)
-			})
+			// Template CRUD + access + playlists — instructor-accessible
+			// (lab-instructors get the full admin surface; the block guard
+			// above already requires RoleInstructor).
+			r.Get("/", h.AdminListTemplates)
+			r.Post("/", h.AdminCreateTemplate)
+			r.Patch("/{templateID}", h.AdminUpdateTemplate)
+			r.Delete("/{templateID}", h.AdminDeleteTemplate)
+			r.Post("/{templateID}/access", h.AdminSetTemplateAccess)
+			r.Get("/{templateID}/dependents", h.AdminListTemplateDependents)
+			r.Get("/{templateID}/playlists", h.AdminGetTemplatePlaylists)
+			r.Post("/{templateID}/playlists", h.AdminSetTemplatePlaylists)
 		})
 
-		// Admin routes
+		// Admin routes.
+		//
+		// The block guard is RoleInstructor: lab-instructors get the full
+		// admin surface (users, templates, blueprints, actions, workflows,
+		// playlists, runs, VLAN pool, jobs, health). The only endpoints that
+		// remain admin-only are the Audit Log and active-Sessions listings,
+		// carved out in the RoleAdmin group below. RequireRole is level-based
+		// (RoleInstructor=2 < RoleAdmin=3), so admins still pass everywhere.
 		r.Route("/admin", func(r chi.Router) {
-			r.Use(middleware.RequireRole(models.RoleAdmin))
+			r.Use(middleware.RequireRole(models.RoleInstructor))
+
+			// Audit log + active sessions — admin only. Instructor actions
+			// are still recorded in the audit log by each handler; instructors
+			// just cannot read it.
+			r.Group(func(r chi.Router) {
+				r.Use(middleware.RequireRole(models.RoleAdmin))
+				r.Get("/audit", h.AdminListAuditLog)
+				r.Get("/audit/search", h.AdminSearchAuditLog)
+				r.Get("/sessions", h.AdminListSessions)
+			})
 
 			// Platform health dashboard — probes all backend dependencies
 			// (db, nats, vcenter, opnsense, engine) in parallel with a 5s
@@ -205,10 +221,6 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 			r.Get("/vcenter/templates-folder", h.AdminListVCenterTemplatesFolder)
 
 			r.Get("/jobs", h.AdminListJobs)
-			r.Get("/audit", h.AdminListAuditLog)
-			r.Get("/audit/search", h.AdminSearchAuditLog)
-
-			r.Get("/sessions", h.AdminListSessions)
 
 			r.Get("/vlans", h.AdminListVLANPool)
 			r.Post("/vlans", h.AdminAddVLAN)
