@@ -42,11 +42,12 @@ func (d DatabaseConfig) DSN() string {
 }
 
 type OIDCConfig struct {
-	IssuerURL    string
-	ClientID     string
-	ClientSecret string
-	RedirectURL  string
-	Scopes       []string
+	IssuerURL             string
+	ClientID              string
+	ClientSecret          string
+	RedirectURL           string
+	Scopes                []string
+	PostLogoutRedirectURI string
 }
 
 type NATSConfig struct {
@@ -113,11 +114,12 @@ func Load() (*Config, error) {
 			SSLMode:  getEnv("DB_SSLMODE", "disable"),
 		},
 		OIDC: OIDCConfig{
-			IssuerURL:    getEnv("OIDC_ISSUER_URL", ""),
-			ClientID:     getEnv("OIDC_CLIENT_ID", ""),
-			ClientSecret: getEnv("OIDC_CLIENT_SECRET", ""),
-			RedirectURL:  getEnv("OIDC_REDIRECT_URL", ""),
-			Scopes:       []string{"openid", "profile", "email", "groups"},
+			IssuerURL:             getEnv("OIDC_ISSUER_URL", ""),
+			ClientID:              getEnv("OIDC_CLIENT_ID", ""),
+			ClientSecret:          getEnv("OIDC_CLIENT_SECRET", ""),
+			RedirectURL:           getEnv("OIDC_REDIRECT_URL", ""),
+			Scopes:                []string{"openid", "profile", "email", "groups"},
+			PostLogoutRedirectURI: getEnv("OIDC_POST_LOGOUT_REDIRECT_URI", "https://crucible.jmal.io/login"),
 		},
 		NATS: NATSConfig{
 			URL: getEnv("NATS_URL", "nats://localhost:4222"),
