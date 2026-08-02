@@ -35,6 +35,12 @@ func (q *Queries) Pool() *pgxpool.Pool {
 // prompt the operator to re-load and reconcile.
 var ErrTemplateStale = errors.New("template was modified by another user")
 
+// ErrImageUploadStale is returned by the image_uploads guarded status
+// transitions when the row is not in the expected state — e.g. two
+// clients raced an import, or a retry arrived after the first attempt
+// already moved the row. Handlers should surface HTTP 409.
+var ErrImageUploadStale = errors.New("image upload is not in the expected state")
+
 // templateSelectCols is the canonical list of columns returned by every
 // Template SELECT / INSERT RETURNING / UPDATE RETURNING. Keep in lockstep
 // with scanTemplate so the order matches the Scan() argument list.
@@ -46,6 +52,7 @@ const templateSelectCols = `id, name, vcenter_template, os_type, default_vcpus, 
 		default_username, default_password, kind, assign_ip, is_active,
 		template_state, created_by, vcenter_vm_id, source_type, source_ref, staging_network,
 		is_internal,
+		unattend_mode, unattend_config, guest_id,
 		created_at, updated_at`
 
 // scanTemplate populates t from a row whose columns are in templateSelectCols
@@ -58,6 +65,7 @@ func scanTemplate(row pgx.Row, t *models.Template) error {
 		&t.DefaultUsername, &t.DefaultPassword, &t.Kind, &t.AssignIP, &t.IsActive,
 		&t.TemplateState, &t.CreatedBy, &t.VCenterVMID, &t.SourceType, &t.SourceRef, &t.StagingNetwork,
 		&t.IsInternal,
+		&t.UnattendMode, &t.UnattendConfig, &t.GuestID,
 		&t.CreatedAt, &t.UpdatedAt,
 	)
 }

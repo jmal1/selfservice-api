@@ -220,6 +220,31 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 			// vCenter folder browser for template registration UI (cached 5 min).
 			r.Get("/vcenter/templates-folder", h.AdminListVCenterTemplatesFolder)
 
+			// ISO catalog: browses the ISO datastore so the template
+			// wizard can offer images that were placed there outside
+			// Crucible, alongside ones uploaded via /admin/images.
+			//
+			// This lives under /admin/vcenter/* (next to its sibling
+			// above) rather than under /admin/templates/vcenter/* because
+			// the /admin/templates prefix is a separate chi.Route block —
+			// see the NOTE above and the comment on that block.
+			r.Get("/vcenter/isos", h.AdminListVCenterISOs)
+
+			// Image uploads (Epic A): browser → MinIO → vCenter.
+			//
+			// Nested inside this block on purpose so it inherits the
+			// RequireRole(RoleInstructor) guard above. Students must
+			// never reach these — the `image_upload_rbac` synthetic
+			// asserts a 403 for the student role continuously.
+			r.Route("/images", func(r chi.Router) {
+				r.Get("/", h.AdminListImages)
+				r.Post("/", h.AdminCreateImageUpload)
+				r.Get("/{imageID}", h.AdminGetImage)
+				r.Delete("/{imageID}", h.AdminDeleteImage)
+				r.Post("/{imageID}/complete", h.AdminCompleteImageUpload)
+				r.Post("/{imageID}/import", h.AdminImportImage)
+			})
+
 			r.Get("/jobs", h.AdminListJobs)
 
 			r.Get("/vlans", h.AdminListVLANPool)
