@@ -20,6 +20,7 @@ package runner_test
 
 import (
 	"encoding/json"
+	"os"
 	"reflect"
 	"sort"
 	"strings"
@@ -242,5 +243,94 @@ func TestContract_ActionEvent_UnixSocket(t *testing.T) {
 	endRaw, _ := json.Marshal(end)
 	if !strings.Contains(string(endRaw), `"status":"pass"`) || !strings.Contains(string(endRaw), `"duration_ms":250`) {
 		t.Errorf("action_end lost critical fields: %s", endRaw)
+	}
+}
+
+// TestRunnerContract_PathsUnchanged guards the path constants that the runner
+// contract depends on. These values are baked into the Dockerfile install layout
+// and must not drift without a coordinated image + engine change.
+//
+// The three path anchors this test locks:
+//   - /opt/crucible      -- install root (binary at /bin, actions lib at /lib)
+//   - /tmp               -- container WORKDIR; sidecar socket and context live here
+//
+// If any of these exact constant values change, the Dockerfile must be updated
+// in the same commit or the runner container will silently mis-behave at runtime.
+func TestRunnerContract_PathsUnchanged(t *testing.T) {
+	if runner.DefaultConfigPath != "/opt/crucible/runner-config.json" {
+		t.Errorf("DefaultConfigPath = %q; want /opt/crucible/runner-config.json\n"+
+			"The binary (/opt/crucible/bin) and actions lib (/opt/crucible/lib/actions.sh) share this install root.",
+			runner.DefaultConfigPath)
+	}
+	if runner.DefaultSocketPath != "/tmp/crucible-sidecar.sock" {
+		t.Errorf("DefaultSocketPath = %q; want /tmp/crucible-sidecar.sock\n"+
+			"Socket must remain in /tmp (the container WORKDIR).",
+			runner.DefaultSocketPath)
+	}
+	if runner.DefaultContextPath != "/tmp/crucible-context.json" {
+		t.Errorf("DefaultContextPath = %q; want /tmp/crucible-context.json\n"+
+			"Context file must remain in /tmp (the container WORKDIR).",
+			runner.DefaultContextPath)
+	}
+}
+
+// TestRunnerDockerfile_ContractPreserved reads deploy/runner/Dockerfile from disk
+// and asserts that the Kali rebase preserved all runner contract paths and that
+// the size-busting packages are absent. This test fails the build if a future
+// Dockerfile edit moves the binary, drops the ENTRYPOINT, or adds a banned package.
+func TestRunnerDockerfile_ContractPreserved(t *testing.T) {
+	data, err := os.ReadFile("../../deploy/runner/Dockerfile")
+	if err != nil {
+		t.Fatalf("could not read Dockerfile: %v", err)
+	}
+	content := string(data)
+
+	mustContain := []struct {
+		needle string
+		reason string
+	}{
+		{"kalilinux/kali-rolling", "runtime stage must be based on kali-rolling"},
+		{"/opt/crucible/bin", "runner binary must be installed at /opt/crucible/bin"},
+		{"/opt/crucible/lib", "actions library must be installed at /opt/crucible/lib"},
+		{"ENTRYPOINT", "ENTRYPOINT directive must be present"},
+		{"crucible-runner", "ENTRYPOINT must invoke crucible-runner"},
+		{"WORKDIR /tmp", "WORKDIR must be /tmp (executor sidecar socket and context live there)"},
+		{`ENV PATH="/opt/crucible/bin`, "PATH must include /opt/crucible/bin"},
+		{"FATAL: required runner tooling missing", "Dockerfile must verify assessment tools resolve on PATH after install"},
+	}
+	for _, tc := range mustContain {
+		if !strings.Contains(content, tc.needle) {
+			t.Errorf("Dockerfile missing %q: %s", tc.needle, tc.reason)
+		}
+	}
+
+	// Strip comment lines before checking for banned packages: the Dockerfile's
+	// own comment block warns "do not add X" using the exact package names, which
+	// would produce false positives if we scanned the full file text.
+	var nonCommentLines []string
+	for _, line := range strings.Split(content, "\n") {
+		if !strings.HasPrefix(strings.TrimSpace(line), "#") {
+			nonCommentLines = append(nonCommentLines, line)
+		}
+	}
+	installContent := strings.Join(nonCommentLines, "\n")
+
+	mustNotContain := []struct {
+		needle string
+		reason string
+	}{
+		{"metasploit-framework", "metasploit adds several GB -- keep image under 3 GB"},
+		{"kali-linux-large", "kali-linux-large meta-package exceeds the 3 GB size target"},
+		{"kali-linux-everything", "kali-linux-everything meta-package exceeds the 3 GB size target"},
+		// A previous draft installed assessment tools in a loop that turned an
+		// apt failure into an echoed warning, so a kali-rolling package rename
+		// would ship a green-but-toolless image and corrupt student results.
+		// Tool installs must fail the build.
+		{"WARNING: SKIPPED", "apt install failures must fail the build, never be downgraded to a log line"},
+	}
+	for _, tc := range mustNotContain {
+		if strings.Contains(installContent, tc.needle) {
+			t.Errorf("Dockerfile must NOT install %q: %s", tc.needle, tc.reason)
+		}
 	}
 }
