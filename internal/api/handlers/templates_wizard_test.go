@@ -298,3 +298,65 @@ func noopLogger(t *testing.T) *slog.Logger {
 	t.Helper()
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
+
+// TestLinuxContractPublishError_BlocksLiveUbuntuDefect guards the publish
+// gate. The shapes below are not hypothetical: the live "Ubuntu 24.04 Server"
+// template is active in production with an empty default_username, which is
+// exactly case 1. Without this gate that template boots green through the
+// smoke test and then rejects every password the UI shows a student.
+func TestLinuxContractPublishError_BlocksLiveUbuntuDefect(t *testing.T) {
+	tests := []struct {
+		name        string
+		tmpl        models.Template
+		wantBlocked bool
+		wantInMsg   string
+	}{
+		{
+			name:        "linux with empty default_username is blocked",
+			tmpl:        models.Template{OSType: "linux", DefaultUsername: "", DefaultPassword: "pw"},
+			wantBlocked: true,
+			wantInMsg:   "default_username",
+		},
+		{
+			name:        "linux with non-student default_username is blocked",
+			tmpl:        models.Template{OSType: "linux", DefaultUsername: "ubuntu", DefaultPassword: "pw"},
+			wantBlocked: true,
+			wantInMsg:   "student",
+		},
+		{
+			name:        "compliant linux template publishes",
+			tmpl:        models.Template{OSType: "linux", DefaultUsername: "student", DefaultPassword: "pw"},
+			wantBlocked: false,
+		},
+		{
+			name:        "windows is never subject to the linux contract",
+			tmpl:        models.Template{OSType: "windows", DefaultUsername: ""},
+			wantBlocked: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			msg, blocked := linuxContractPublishError(&tc.tmpl)
+
+			if blocked != tc.wantBlocked {
+				t.Fatalf("blocked = %v, want %v (msg=%q)", blocked, tc.wantBlocked, msg)
+			}
+			if !tc.wantBlocked {
+				if msg != "" {
+					t.Errorf("msg = %q, want empty when not blocked", msg)
+				}
+				return
+			}
+			// A 409 body an instructor cannot act on is nearly as bad as no
+			// gate at all, so assert the message actually names the field
+			// and carries a fix rather than merely being non-empty.
+			if !strings.Contains(msg, tc.wantInMsg) {
+				t.Errorf("msg = %q, want it to mention %q", msg, tc.wantInMsg)
+			}
+			if !strings.Contains(msg, "fix:") {
+				t.Errorf("msg = %q, want it to include a remediation hint", msg)
+			}
+		})
+	}
+}

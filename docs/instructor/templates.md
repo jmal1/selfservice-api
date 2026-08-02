@@ -114,6 +114,125 @@ template at any time to hide it without losing the generalized image.
 
 ---
 
+## Linux template contract
+
+> [!danger]
+> **A Linux template that violates this contract still clones and boots —
+> the student just silently cannot log in.** There is no error in the
+> wizard, no failed job, no alert. The pod shows "running" and green, and
+> the failure surfaces only when the student tries to SSH or open the
+> console and their password is refused. Get these four things right
+> *before* you Generalize.
+
+Crucible clones your template per student and injects a **unique per-pod
+password** over VMware guestinfo. That injection only works if the guest
+image satisfies the contract below. The publish gate validates the parts
+it can see from the template row (e.g. a blank `default_username`), but
+the guest-internal pieces are yours to get right inside the build console.
+
+### The four requirements
+
+**1. open-vm-tools installed and running.** Without it the guestinfo
+payload Crucible writes is never read, so the password is never applied.
+
+```bash
+sudo apt-get install -y open-vm-tools
+sudo systemctl enable --now open-vm-tools
+command -v vmware-rpctool   # must print a path
+```
+
+**2. cloud-init ≥ 21.3 with the VMware datasource enabled.** Crucible's
+customization is delivered through cloud-init's VMware datasource. Create
+`/etc/cloud/cloud.cfg.d/99-crucible.cfg` with exactly:
+
+```yaml
+datasource_list: [ VMware, NoCloud, None ]
+system_info:
+  default_user:
+    name: student
+    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+    shell: /bin/bash
+```
+
+> [!danger]
+> **The cloud-init default user MUST be `student`.** Crucible writes a
+> bare top-level `password:` into the `#cloud-config` payload, and
+> cloud-init applies that password to the **default user only**. Crucible
+> then tells the student to log in as `student`. If your default user is
+> `ubuntu`, `admin`, or anything else, the injected password lands on an
+> account the student is never told about — the student's `student` login
+> has no password and is refused. This is the most common silent failure,
+> and it is exactly what the publish gate flags when `default_username`
+> is empty or is set to something other than `student` on a customized
+> template.
+
+**3. SSH host keys must regenerate after generalize.** Generalize runs
+`rm -f /etc/ssh/ssh_host_*`. If nothing regenerates them on next boot,
+sshd fails to start and the student cannot SSH in. Ubuntu/Debian ship
+`ssh-keygen.service` which does this automatically — confirm it is
+enabled. If it is missing, install this oneshot unit:
+
+```ini
+# /etc/systemd/system/regenerate-ssh-host-keys.service
+[Unit]
+Description=Regenerate SSH host keys
+Before=ssh.service
+ConditionPathExists=!/etc/ssh/ssh_host_ed25519_key
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ssh-keygen -A
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable regenerate-ssh-host-keys.service
+```
+
+> [!note]
+> On **Ubuntu 24.04** the SSH daemon unit is `ssh.service`, **not**
+> `sshd.service`. Order any host-key regeneration `Before=ssh.service`.
+
+**4. apt proxy pointed at the staging cache.** So package installs during
+build go through the lab's apt-cacher-ng. Create
+`/etc/apt/apt.conf.d/01proxy`:
+
+```
+Acquire::http::Proxy "http://10.10.30.20:3142";
+```
+
+> [!warning]
+> **Linux Mint does not ship cloud-init.** A Mint template will never
+> receive the injected password through the flow above. Either install
+> and configure cloud-init (requirements 1–2) so it behaves like Ubuntu,
+> **or** mark the template as not-customizable (`clone_no_customize` /
+> `registered_existing_vm`) and set static `default_username` /
+> `default_password` on the template row so Crucible surfaces real,
+> working credentials to the student. A customized Mint template with no
+> cloud-init is a guaranteed silent lockout.
+
+### Verify before publishing
+
+Open the build console, log in, and run these inside the guest. All four
+must look right before you Generalize:
+
+```bash
+command -v vmware-rpctool                        # open-vm-tools present (req 1)
+cloud-init --version                             # must be >= 21.3 (req 2)
+systemctl is-enabled ssh                         # ssh.service enabled (req 3)
+cat /etc/cloud/cloud.cfg.d/99-crucible.cfg       # default_user.name: student (req 2)
+```
+
+Also confirm the template row's **default_username is `student`** (for a
+customized template) or holds real static credentials (for a
+non-customized one). The wizard's publish gate blocks a blank or
+non-`student` username on a customized Linux template for exactly this
+reason.
+
+---
+
 ## Console access rules
 
 Who can open the build console for a given template?

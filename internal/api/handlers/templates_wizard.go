@@ -295,14 +295,40 @@ func (h *Handler) AdminGeneralizeTemplate(w http.ResponseWriter, r *http.Request
 	}
 }
 
+// linuxContractPublishError decides whether a template may be published, and
+// builds the operator-facing message when it may not.
+//
+// Split out from AdminPublishTemplate so the decision and its wording are
+// unit-testable: the handler itself needs a live database to reach this
+// point, which would otherwise make the gate untestable and therefore easy
+// to silently delete. Returns blocked=false for every non-Linux template.
+func linuxContractPublishError(tmpl *models.Template) (string, bool) {
+	violations := templates.ValidateLinuxTemplateContract(tmpl)
+	if len(violations) == 0 {
+		return "", false
+	}
+	parts := make([]string, 0, len(violations))
+	for _, v := range violations {
+		parts = append(parts, fmt.Sprintf("%s: %s (fix: %s)", v.Field, v.Problem, v.Fix))
+	}
+	return "template violates the Linux guest-image contract, so students would be unable to log in — " +
+		strings.Join(parts, "; "), true
+}
+
 // AdminPublishTemplate (POST /admin/templates/:id/publish) — wizard step 5.
 //
-// Hard smoke gate: this no longer flips the template live directly. It
-// transitions ready → verifying and enqueues a template_verify job that
-// clones the base-image, boots it, and only promotes the template to
-// `active` (setting is_active) if that succeeds. On smoke failure the
-// template returns to `ready`. This guarantees no student ever clones a
-// template that was never proven to boot.
+// Two gates run here, and they catch different failures:
+//
+//   - The Linux guest-image contract (synchronous, below) catches a template
+//     that boots fine but that no student can log into.
+//   - The hard smoke gate (asynchronous) means this no longer flips the
+//     template live directly. It transitions ready → verifying and enqueues a
+//     template_verify job that clones the base-image, boots it, and only
+//     promotes the template to `active` (setting is_active) if that succeeds.
+//     On smoke failure the template returns to `ready`.
+//
+// Together they guarantee no student ever clones a template that was never
+// proven to boot, or that boots but rejects the credentials it hands out.
 func (h *Handler) AdminPublishTemplate(w http.ResponseWriter, r *http.Request) {
 	tmpl, ok := h.requireTemplateInState(w, r, models.TemplateStateReady)
 	if !ok {
@@ -310,6 +336,17 @@ func (h *Handler) AdminPublishTemplate(w http.ResponseWriter, r *http.Request) {
 	}
 	if tmpl.VCenterVMID == "" {
 		http.Error(w, "template has no vCenter VM / base-image to verify (generalize never completed)", http.StatusConflict)
+		return
+	}
+	// Linux guest-image contract gate. The smoke test below proves the VM
+	// boots; it does NOT prove a student can log in. Per-clone credentials
+	// are injected via cloud-init's default user, so a Linux template whose
+	// default_username is empty or is not "student" yields a VM that boots
+	// perfectly and then refuses every password the UI shows the student.
+	// That failure is invisible until a student hits it, so block it here
+	// rather than after publish.
+	if msg, blocked := linuxContractPublishError(tmpl); blocked {
+		http.Error(w, msg, http.StatusConflict)
 		return
 	}
 	payload := map[string]any{
