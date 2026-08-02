@@ -190,6 +190,31 @@ var WikiIndexRBAC = synthetic.CheckFunc{
 	},
 }
 
+// AdminAudit403 asserts that a non-admin synthetic user is rejected from the
+// audit-log route with 403. The Audit Log (and active-Sessions listing) is the
+// one admin surface deliberately withheld from instructors when lab-instructors
+// were granted the rest of the admin panel; this check guards that carve-out.
+// It runs as the prod synthetic (student) role, so it also catches any
+// regression that would expose the audit trail to lower roles.
+var AdminAudit403 = synthetic.CheckFunc{
+	NameVal:        "admin_audit_403",
+	TitleVal:       "RBAC: Non-Admin Cannot Read Audit Log",
+	DescriptionVal: "Calls /api/v1/admin/audit as a non-admin (student) user and requires a 403. Guards the admin-only carve-out for the audit log after instructors gained the rest of the admin surface.",
+	SeverityVal:    synthetic.SeverityCritical,
+	RunFn: func(ctx context.Context, c *synthetic.Client) (int, error) {
+		resp, err := c.Do(ctx, http.MethodGet, "/api/v1/admin/audit", nil)
+		if err != nil {
+			return 0, err
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		if resp.StatusCode != http.StatusForbidden {
+			return resp.StatusCode, fmt.Errorf("admin/audit returned %d, want 403", resp.StatusCode)
+		}
+		return resp.StatusCode, nil
+	},
+}
+
 // All returns the canonical list of synthetic checks the monitor runs each
 // cycle. Ordering does not matter — checks run sequentially and results are
 // pushed atomically. Add new checks here.
@@ -199,6 +224,7 @@ func All() []synthetic.Check {
 		AuthMe,
 		PodsList,
 		AdminListUsers403,
+		AdminAudit403,
 		PodTestingDashboard404,
 		WikiIndexRBAC,
 	}

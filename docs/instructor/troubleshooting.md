@@ -6,6 +6,21 @@ field guide for the second case.
 
 ---
 
+## "I get 403 Forbidden from an admin page or endpoint"
+
+Members of the **`lab-instructors`** group have the full admin panel:
+Overview, Users, Templates, Blueprints, Actions, Workflows, Playlists,
+Runs, VLAN Pool, Jobs, and Health. If you get a `403` on any of those,
+something is wrong — check that your account is actually in `lab-instructors`
+(sign out and back in to refresh your session's group claim), then report it.
+
+The **one** place a `403` is expected and correct is the **Audit Log**
+(`/admin/audit`) and the active-Sessions view — those stay admin-only. Your
+own actions are still written to the audit log; you just can't read it back.
+If you need an audit trail, ask a platform admin.
+
+---
+
 ## "My workflow always passes — even on a fresh, untouched pod"
 
 This is the worst kind of bug because students think they've succeeded.

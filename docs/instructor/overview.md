@@ -11,6 +11,15 @@ grade them with **assessments** that run automated checks.
 
 This document explains how the pieces fit together.
 
+> [!note] What you can access
+> Members of the **`lab-instructors`** group get the **full admin panel**
+> — Overview, Users, Templates, Blueprints, Actions, Workflows, Playlists,
+> Runs, VLAN Pool, Jobs, and Health — the same surface an admin sees, with
+> one exception: the **Audit Log** (and the active-Sessions view) stays
+> admin-only. Your own actions are still recorded in the audit log even
+> though you can't read it. If you hit a `403 Forbidden` anywhere other than
+> `/admin/audit`, it's a bug — report it.
+
 ---
 
 ## The mental model in one picture
@@ -58,17 +67,18 @@ This document explains how the pieces fit together.
 
 | Noun | What it is | Who owns it | Lives in |
 |---|---|---|---|
-| **Template** | A frozen vSphere VM image, ready to clone | Admin | vCenter + Crucible DB |
+| **Template** | A frozen vSphere VM image, ready to clone | Instructor / Admin | vCenter + Crucible DB |
 | **Blueprint** | A recipe for a multi-VM pod (which templates, which NICs) | Instructor / Admin | Crucible DB |
-| **Pod** | The actual cloned VMs running for one student | Student deploys, Admin oversees | vCenter |
+| **Pod** | The actual cloned VMs running for one student | Student deploys, Instructor/Admin oversee | vCenter |
 | **Workflow** | One bash script that grades one thing | **Instructor** | Crucible DB |
 | **Playlist** | Ordered list of workflows, presented as a lab | **Instructor** | Crucible DB |
 | **Action** | A reusable, parameterised one-step grading helper | Instructor / Admin | Crucible DB |
 
 > [!tip]
 > If you're new, you'll spend ~90% of your time writing **workflows** and
-> ~10% adding reusable **actions** to the library. Templates, blueprints
-> and pods are infrastructure concerns — usually handled by an admin.
+> ~10% adding reusable **actions** to the library. You *can* also manage
+> templates, blueprints, users, and the VLAN pool from the admin panel, but
+> those are infrastructure concerns you'll usually touch far less often.
 
 ---
 

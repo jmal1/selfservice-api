@@ -199,6 +199,7 @@ func TestAll_StableNames(t *testing.T) {
 		"auth_me":                   true,
 		"pods_list":                 true,
 		"admin_list_users_403":      true,
+		"admin_audit_403":           true,
 		"pod_testing_dashboard_404": true,
 		"wiki_index_rbac":           true,
 	}
