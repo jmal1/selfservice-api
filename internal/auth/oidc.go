@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -44,12 +45,14 @@ type SessionClaims struct {
 
 // Provider handles OIDC authentication with Authentik.
 type Provider struct {
-	oidcProvider *oidc.Provider
-	oauth2Config oauth2.Config
-	verifier     *oidc.IDTokenVerifier
-	queries      *database.Queries
-	jwtSecret    []byte
-	logger       *slog.Logger
+	oidcProvider          *oidc.Provider
+	oauth2Config          oauth2.Config
+	verifier              *oidc.IDTokenVerifier
+	queries               *database.Queries
+	jwtSecret             []byte
+	logger                *slog.Logger
+	endSessionEndpoint    string
+	postLogoutRedirectURI string
 }
 
 // NewProvider creates a new OIDC authentication provider.
@@ -69,13 +72,29 @@ func NewProvider(ctx context.Context, cfg config.OIDCConfig, queries *database.Q
 
 	verifier := provider.Verifier(&oidc.Config{ClientID: cfg.ClientID})
 
+	// Read Authentik's non-standard end_session_endpoint from the discovery
+	// document. It's absent from the go-oidc typed endpoints, so pull it out
+	// of the raw provider metadata. Absence is tolerated: LogoutHandler falls
+	// back to a JSON logout response when this is empty.
+	var discovery struct {
+		EndSessionEndpoint string `json:"end_session_endpoint"`
+	}
+	if err := provider.Claims(&discovery); err != nil {
+		logger.Warn("failed to read OIDC discovery claims; end_session_endpoint unavailable", "error", err)
+	}
+	if discovery.EndSessionEndpoint == "" {
+		logger.Warn("OIDC discovery has no end_session_endpoint; logout will not terminate the IdP session")
+	}
+
 	return &Provider{
-		oidcProvider: provider,
-		oauth2Config: oauth2Cfg,
-		verifier:     verifier,
-		queries:      queries,
-		jwtSecret:    jwtSecret,
-		logger:       logger,
+		oidcProvider:          provider,
+		oauth2Config:          oauth2Cfg,
+		verifier:              verifier,
+		queries:               queries,
+		jwtSecret:             jwtSecret,
+		logger:                logger,
+		endSessionEndpoint:    discovery.EndSessionEndpoint,
+		postLogoutRedirectURI: cfg.PostLogoutRedirectURI,
 	}, nil
 }
 
@@ -173,7 +192,7 @@ func (p *Provider) CallbackHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Create server-side session
 	sessionID := uuid.New()
-	if err := p.queries.CreateSession(r.Context(), sessionID, dbUser.ID, r.RemoteAddr, r.UserAgent()); err != nil {
+	if err := p.queries.CreateSession(r.Context(), sessionID, dbUser.ID, r.RemoteAddr, r.UserAgent(), rawIDToken); err != nil {
 		p.logger.Error("failed to create session", "error", err)
 		// Non-fatal: continue without server-side session tracking
 	}
@@ -216,11 +235,27 @@ func (p *Provider) CallbackHandler(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
 }
 
-// LogoutHandler clears the session.
+// LogoutHandler clears the local session and returns the Authentik
+// end-session URL so the browser can terminate the OIDC SSO session too.
+//
+// The frontend calls POST /auth/logout via fetch, reads `logout_url` from the
+// JSON response, and navigates the browser there (a top-level navigation is
+// required so Authentik can clear its own SSO cookie and then redirect to the
+// configured post_logout_redirect_uri). A fetch alone cannot terminate the IdP
+// session, which is why we hand the URL back rather than emitting a 302 that a
+// fetch would silently follow without touching the SSO cookie.
+//
+// When no id_token was persisted or the IdP exposes no end_session_endpoint,
+// we fall back to the plain {"status":"logged_out"} response.
 func (p *Provider) LogoutHandler(w http.ResponseWriter, r *http.Request) {
+	var idToken string
+
 	// Deactivate server-side session if present
 	if claims, err := p.ValidateSession(r); err == nil {
 		if sid, err := uuid.Parse(claims.SessionID); err == nil {
+			if tok, err := p.queries.GetSessionIDToken(r.Context(), sid); err == nil {
+				idToken = tok
+			}
 			_ = p.queries.DeactivateSession(r.Context(), sid)
 		}
 		if uid, err := uuid.Parse(claims.UserID); err == nil {
@@ -232,14 +267,58 @@ func (p *Provider) LogoutHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Clear the session cookie with the same attributes it was issued with so
+	// browsers reliably overwrite it (a mismatched HttpOnly/Secure/SameSite can
+	// leave the original cookie in place).
 	http.SetCookie(w, &http.Cookie{
-		Name:   "session",
-		Value:  "",
-		Path:   "/",
-		MaxAge: -1,
+		Name:     "session",
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
 	})
+
+	resp := map[string]string{"status": "logged_out"}
+	if logoutURL := p.buildEndSessionURL(idToken); logoutURL != "" {
+		resp["logout_url"] = logoutURL
+	}
+
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "logged_out"})
+	json.NewEncoder(w).Encode(resp)
+}
+
+// buildEndSessionURL constructs the Authentik end_session_endpoint URL with the
+// id_token_hint and post_logout_redirect_uri query parameters. Returns "" when
+// the IdP advertised no end_session_endpoint (the caller then omits it and the
+// SSO session is left untouched — best effort).
+func (p *Provider) buildEndSessionURL(idToken string) string {
+	if p.endSessionEndpoint == "" {
+		return ""
+	}
+	u, err := url.Parse(p.endSessionEndpoint)
+	if err != nil {
+		p.logger.Error("failed to parse end_session_endpoint", "error", err)
+		return ""
+	}
+	q := u.Query()
+	if idToken != "" {
+		q.Set("id_token_hint", idToken)
+	}
+	if p.postLogoutRedirectURI != "" {
+		q.Set("post_logout_redirect_uri", p.postLogoutRedirectURI)
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+// SessionIsActive reports whether the given server-side session is still active.
+// The auth middleware uses this so a JWT for a logged-out/revoked session is
+// rejected before its 8h expiry.
+func (p *Provider) SessionIsActive(ctx context.Context, sessionID uuid.UUID) (bool, error) {
+	return p.queries.IsSessionActive(ctx, sessionID)
 }
 
 // ValidateSession extracts and validates the session JWT from a request.

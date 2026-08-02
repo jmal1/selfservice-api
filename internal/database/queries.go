@@ -1180,12 +1180,18 @@ func (q *Queries) ListTemplateDependents(ctx context.Context, templateID uuid.UU
 
 // --- User Sessions ---
 
-// CreateSession inserts a new active session row.
-func (q *Queries) CreateSession(ctx context.Context, id uuid.UUID, userID uuid.UUID, ip, userAgent string) error {
+// CreateSession inserts a new active session row. idToken is the raw OIDC
+// id_token persisted so it can later be replayed to Authentik's
+// end_session_endpoint as the id_token_hint on logout; pass "" when unknown.
+func (q *Queries) CreateSession(ctx context.Context, id uuid.UUID, userID uuid.UUID, ip, userAgent, idToken string) error {
+	var tokenArg any
+	if idToken != "" {
+		tokenArg = idToken
+	}
 	_, err := q.pool.Exec(ctx, `
-		INSERT INTO user_sessions (id, user_id, ip_address, user_agent)
-		VALUES ($1, $2, $3, $4)
-	`, id, userID, ip, userAgent)
+		INSERT INTO user_sessions (id, user_id, ip_address, user_agent, id_token)
+		VALUES ($1, $2, $3, $4, $5)
+	`, id, userID, ip, userAgent, tokenArg)
 	return err
 }
 
@@ -1195,6 +1201,42 @@ func (q *Queries) DeactivateSession(ctx context.Context, sessionID uuid.UUID) er
 		UPDATE user_sessions SET is_active = false WHERE id = $1
 	`, sessionID)
 	return err
+}
+
+// IsSessionActive reports whether the given session row exists and is still
+// active. Used by the auth middleware to reject a revoked/logged-out session
+// that still carries an unexpired JWT.
+func (q *Queries) IsSessionActive(ctx context.Context, sessionID uuid.UUID) (bool, error) {
+	var active bool
+	err := q.pool.QueryRow(ctx, `
+		SELECT is_active FROM user_sessions WHERE id = $1
+	`, sessionID).Scan(&active)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return active, nil
+}
+
+// GetSessionIDToken returns the raw OIDC id_token stored for a session, or an
+// empty string if none was persisted. Used on logout to build the id_token_hint.
+func (q *Queries) GetSessionIDToken(ctx context.Context, sessionID uuid.UUID) (string, error) {
+	var token *string
+	err := q.pool.QueryRow(ctx, `
+		SELECT id_token FROM user_sessions WHERE id = $1
+	`, sessionID).Scan(&token)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
+	if token == nil {
+		return "", nil
+	}
+	return *token, nil
 }
 
 // TouchSession updates last_activity for a session.

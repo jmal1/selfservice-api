@@ -46,6 +46,19 @@ func Auth(provider *auth.Provider) func(http.Handler) http.Handler {
 			ctx = audit.WithClientIP(ctx, r.RemoteAddr)
 			if claims.SessionID != "" {
 				if sid, err := uuid.Parse(claims.SessionID); err == nil {
+					// Reject a JWT whose server-side session has been
+					// deactivated (logout/revocation) even though the JWT
+					// itself hasn't expired. Empty SessionID (e.g. synthetic
+					// monitor tokens) skips this check by design.
+					active, err := provider.SessionIsActive(r.Context(), sid)
+					if err != nil {
+						http.Error(w, "internal error", http.StatusInternalServerError)
+						return
+					}
+					if !active {
+						http.Error(w, "unauthorized", http.StatusUnauthorized)
+						return
+					}
 					ctx = context.WithValue(ctx, sessionIDKey, sid)
 				}
 			}
