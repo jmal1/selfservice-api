@@ -15,6 +15,7 @@ import (
 	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/models"
 	events "github.com/jmal1/selfservice-api/internal/nats"
+	"github.com/jmal1/selfservice-api/internal/objectstore"
 	"github.com/jmal1/selfservice-api/internal/opnsense"
 	"github.com/jmal1/selfservice-api/internal/rollback"
 	"github.com/jmal1/selfservice-api/internal/vcenter"
@@ -33,6 +34,23 @@ type Provisioner struct {
 	// the current count to Pushgateway so the
 	// CruciblePodsStuckInDestroyFailed alert can fire within 15m. Nil disables.
 	DestroyFailedPusher *DestroyFailedPusher
+
+	// Image-import dependencies, set via EnableImageImport. They are optional
+	// so a worker deployed without an object store still starts and serves
+	// every other job type; image_import jobs then fail loudly with a clear
+	// message rather than nil-panicking mid-upload.
+	objects  imageObjectStore
+	pipeline *PipelineMetrics
+	imageCfg ImageImportConfig
+}
+
+// EnableImageImport wires the dependencies needed to process image_import jobs.
+// Called by the worker at startup once an object store is configured; when it
+// is not called, ImportImage returns an explanatory error instead of panicking.
+func (p *Provisioner) EnableImageImport(objects *objectstore.Client, metrics *PipelineMetrics, cfg ImageImportConfig) {
+	p.objects = objects
+	p.pipeline = metrics
+	p.imageCfg = cfg
 }
 
 // New creates a provisioner with all required clients.
@@ -94,6 +112,8 @@ func (p *Provisioner) ProcessJob(ctx context.Context, job *models.Job) error {
 		err = p.GeneralizeTemplate(ctx, job)
 	case models.JobTypeTemplateVerify:
 		err = p.VerifyTemplate(ctx, job)
+	case models.JobTypeImageImport:
+		err = p.ImportImage(ctx, job)
 	default:
 		err = fmt.Errorf("unknown job type: %s", job.Type)
 	}

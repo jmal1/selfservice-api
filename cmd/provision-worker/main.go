@@ -12,6 +12,7 @@ import (
 	"github.com/jmal1/selfservice-api/internal/config"
 	"github.com/jmal1/selfservice-api/internal/database"
 	events "github.com/jmal1/selfservice-api/internal/nats"
+	"github.com/jmal1/selfservice-api/internal/objectstore"
 	"github.com/jmal1/selfservice-api/internal/opnsense"
 	"github.com/jmal1/selfservice-api/internal/provisioner"
 	"github.com/jmal1/selfservice-api/internal/vcenter"
@@ -97,6 +98,50 @@ func main() {
 			GroupingLabels: map[string]string{"layer": "api"},
 		}
 		logger.Info("destroy_failed pushgateway enabled", "url", pgURL, "job", job)
+	}
+
+	// Optional: image_import support. Requires an object store to stage the
+	// browser-uploaded ISO/OVA. When unset the worker still starts and serves
+	// every other job type; image_import jobs then fail with an actionable
+	// message instead of nil-panicking part-way through a multi-GB stream.
+	if cfg.ObjectStore.Endpoint != "" {
+		objects, err := objectstore.New(objectstore.Config{
+			Endpoint:  cfg.ObjectStore.Endpoint,
+			AccessKey: cfg.ObjectStore.AccessKey,
+			SecretKey: cfg.ObjectStore.SecretKey,
+			Bucket:    cfg.ObjectStore.Bucket,
+			Prefix:    cfg.ObjectStore.Prefix,
+			UseSSL:    cfg.ObjectStore.UseSSL,
+		})
+		if err != nil {
+			logger.Error("object store init failed; image_import disabled", "error", err)
+		} else {
+			var pipeline *provisioner.PipelineMetrics
+			if pgURL := os.Getenv("WORKER_PUSHGATEWAY_URL"); pgURL != "" {
+				job := os.Getenv("WORKER_PUSHGATEWAY_JOB")
+				if job == "" {
+					job = "crucible_provision_worker"
+				}
+				pipeline = provisioner.NewPipelineMetrics(pgURL, job, map[string]string{"layer": "api"})
+			}
+			// Imported OVAs land in the first configured Student-VMs pool;
+			// empty lets vCenter pick the datacenter default.
+			ovaPool := ""
+			if len(cfg.VCenter.ResourcePools) > 0 {
+				ovaPool = cfg.VCenter.ResourcePools[0]
+			}
+			prov.EnableImageImport(objects, pipeline, provisioner.ImageImportConfig{
+				ISODatastore:    cfg.VCenter.ISODatastore,
+				ISOFolder:       cfg.VCenter.ISOFolder,
+				OVAFolder:       cfg.VCenter.TemplatesFolder,
+				OVADatastore:    cfg.VCenter.Datastore,
+				OVAResourcePool: ovaPool,
+			})
+			logger.Info("image_import enabled",
+				"endpoint", cfg.ObjectStore.Endpoint,
+				"bucket", cfg.ObjectStore.Bucket,
+				"iso_datastore", cfg.VCenter.ISODatastore)
+		}
 	}
 
 	// Optional: vCenter orphan reconciler. Scans the configured Student-VMs
