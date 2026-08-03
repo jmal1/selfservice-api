@@ -35,7 +35,7 @@ func TestCallbackClient_ReportAction(t *testing.T) {
 		Action:   "Test Action",
 		Status:   "pass",
 		ExitCode: 0,
-		Duration: 500 * time.Millisecond,
+		Duration: FromDuration(500 * time.Millisecond),
 	}
 	client.ReportAction("test-workflow", action)
 

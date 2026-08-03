@@ -200,7 +200,7 @@ func (d *VMwareToolsDispatcher) recordWorkflowResult(ctx context.Context, run *m
 		Status:   status,
 		Message:  message,
 		ExitCode: exitCode,
-		Duration: duration,
+		Duration: runner.FromDuration(duration),
 	}
 
 	if ctx, ok := buildActionContext(stdout, stderr, timedOut, truncated); ok {

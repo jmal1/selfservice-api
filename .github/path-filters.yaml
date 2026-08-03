@@ -67,7 +67,14 @@ synthetic-api-monitor:
   - 'internal/synthetic/**'
 
 crucible-runner:
+  # deploy/runner/Dockerfile does NOT just package a bash library: its builder
+  # stage runs `go build ./cmd/crucible-runner/`. Listing only deploy/runner/**
+  # here meant a change to the runner's Go code did not rebuild the runner
+  # image, so the next deploy silently shipped a stale runner binary while
+  # every other component picked the change up. See TestPathFilters_*.
   - 'deploy/runner/**'
+  - 'cmd/crucible-runner/**'
+  - 'internal/runner/**'
 
 # Also drive whether the Go `test` job has to run. Any Go source change
 # triggers it; deploy/runner-only changes (which only contain a Dockerfile

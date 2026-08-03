@@ -68,7 +68,7 @@ func TestActionPayload_Marshal(t *testing.T) {
 			Action:   "Check SSH",
 			Status:   "pass",
 			ExitCode: 0,
-			Duration: 250 * time.Millisecond,
+			Duration: runner.FromDuration(250 * time.Millisecond),
 		},
 	}
 
@@ -104,7 +104,7 @@ func TestCompletePayload_Marshal(t *testing.T) {
 				ActionResults: []runner.ActionOutput{
 					{Action: "action-1", Status: "pass", ExitCode: 0},
 				},
-				TotalDuration: 5 * time.Second,
+				TotalDuration: runner.FromDuration(5 * time.Second),
 			},
 		},
 	}

@@ -2,7 +2,6 @@ package runner
 
 import (
 	"encoding/json"
-	"time"
 )
 
 // RunnerConfig is the JSON configuration loaded from /opt/crucible/runner-config.json.
@@ -71,7 +70,7 @@ type ActionOutput struct {
 	Status   string          `json:"status"`    // pass, fail, error, timeout, skipped
 	Message  string          `json:"message"`   // student-safe message
 	ExitCode int             `json:"exit_code"`
-	Duration time.Duration   `json:"duration_ms"`
+	Duration Millis          `json:"duration_ms"`
 	Context  json.RawMessage `json:"context,omitempty"`
 }
 
@@ -83,7 +82,7 @@ type WorkflowRunResult struct {
 	Message       string         `json:"message"` // last student message
 	ActionResults []ActionOutput `json:"action_results"`
 	SetupOutput   *ActionOutput  `json:"setup_output,omitempty"`
-	TotalDuration time.Duration  `json:"total_duration_ms"`
+	TotalDuration Millis         `json:"total_duration_ms"`
 }
 
 // CallbackActionPayload is POSTed to the engine for each action result.

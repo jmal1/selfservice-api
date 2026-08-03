@@ -34,7 +34,7 @@ func (e *Executor) RunWorkflow(ctx context.Context, wf WorkflowDef) WorkflowRunR
 		WorkflowName: wf.Name,
 	}
 	start := time.Now()
-	defer func() { result.TotalDuration = time.Since(start) }()
+	defer func() { result.TotalDuration = FromDuration(time.Since(start)) }()
 
 	// Create shared working directory
 	workdir, err := os.MkdirTemp("", "crucible-*")
@@ -182,7 +182,7 @@ func (e *Executor) RunWorkflow(ctx context.Context, wf WorkflowDef) WorkflowRunR
 				"workflow", wf.Slug,
 				"status", result.Status,
 				"actions", len(result.ActionResults),
-				"duration_ms", result.TotalDuration.Milliseconds(),
+				"duration_ms", result.TotalDuration.Duration().Milliseconds(),
 			)
 
 			return result
@@ -209,7 +209,7 @@ func (e *Executor) runSetup(ctx context.Context, wf WorkflowDef, env []string, w
 
 	output := ActionOutput{
 		Action:   "setup",
-		Duration: duration,
+		Duration: FromDuration(duration),
 	}
 
 	if err != nil {
