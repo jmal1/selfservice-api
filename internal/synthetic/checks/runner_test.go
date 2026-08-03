@@ -39,6 +39,12 @@ type runnerSmokeFakeAPI struct {
 	runTerminalAfter    int    // GET calls before run becomes terminal (default 1)
 	runResultCount      int    // number of results to include in terminal response (default 1)
 
+	// runResultStatuses, when non-nil, overrides runResultCount and emits one
+	// workflow result per entry with that entry's status. This is what lets a
+	// test model the failure the check actually exists to catch: a run that
+	// finishes cleanly while the assessments inside it failed.
+	runResultStatuses []string
+
 	// Observed values — inspected by tests.
 	createPodCalls     int
 	deleteCalls        int
@@ -166,10 +172,24 @@ func (f *runnerSmokeFakeAPI) handler() http.Handler {
 
 			var results []map[string]any
 			if status == "completed" || status == "failed" {
-				for i := 0; i < f.runResultCount; i++ {
+				statuses := f.runResultStatuses
+				if statuses == nil {
+					statuses = make([]string, f.runResultCount)
+					for i := range statuses {
+						statuses[i] = "pass"
+					}
+				}
+				for i, st := range statuses {
 					results = append(results, map[string]any{
-						"id":     fmt.Sprintf("result-%d", i+1),
-						"status": "pass",
+						"id":              fmt.Sprintf("result-%d", i+1),
+						"workflow_id":     fmt.Sprintf("wf-%d", i+1),
+						"execution_order": i,
+						"status":          st,
+						// Mirrors production: GetTestingRun strips action_results
+						// and instructor_output for the student-role synthetic
+						// user, so student_message is the only diagnostic text
+						// the check can see.
+						"student_message": "",
 					})
 				}
 			}
@@ -338,6 +358,111 @@ func TestRunnerSmoke_ZeroResults(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "zero results") {
 		t.Errorf("error %q must mention zero results so an on-call can distinguish this from a status failure", err)
+	}
+}
+
+// ---- workflow-result status guard ----------------------------------------
+
+// TestRunnerSmoke_FailingWorkflowResultFailsTheCheck is the guard for the
+// hollow-check failure mode found in production on 2026-08-03.
+//
+// The engine marks a run "completed" when the runner reports back, NOT when the
+// assessments succeeded — finalizeRun in engine.go says so explicitly ("we don't
+// need to decide pass-vs-fail at the run level"). So every failure this check
+// exists to detect — the Multus NAD missing, no CNI dhcp lease on net1, the
+// target unreachable on the pod VLAN, nmap absent from the Kali image — arrives
+// as a run with status "completed" carrying results whose status is "fail".
+//
+// Asserting only the run status and result COUNT therefore reported those as
+// GREEN. That is strictly worse than having no check at all, because the board
+// actively asserts a broken path is healthy.
+func TestRunnerSmoke_FailingWorkflowResultFailsTheCheck(t *testing.T) {
+	fake := newRunnerSmokeFakeAPI()
+	fake.runTerminalStatus = "completed" // the run itself finished fine
+	fake.runResultStatuses = []string{"fail"}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	_, err := RunnerSmoke(runnerSmokeTestCfg("")).Run(context.Background(), synthetic.NewClient(srv.URL, ""))
+	if err == nil {
+		t.Fatal("a run that COMPLETED with a failing workflow result MUST fail the check. " +
+			"'completed' means the runner reported back, not that the assessment passed — if this " +
+			"passes, runner_smoke stays green while Multus, the DHCP lease, or nmap are broken")
+	}
+	if !strings.Contains(err.Error(), "did not pass") {
+		t.Errorf("error %q must say the results did not pass, so an on-call can tell this apart "+
+			"from a run-level status failure or a zero-results failure", err)
+	}
+	if !strings.Contains(err.Error(), "wf-1") {
+		t.Errorf("error %q must name the failing workflow — a count alone forces the on-call "+
+			"to go digging in the database", err)
+	}
+}
+
+// TestRunnerSmoke_SkippedWorkflowResultFailsTheCheck covers the watchdog path.
+// When the runner pod dies mid-run, remaining workflows are recorded "skipped"
+// and the run still closes out as "completed". A check that only asks "did it
+// finish?" cannot see that at all.
+func TestRunnerSmoke_SkippedWorkflowResultFailsTheCheck(t *testing.T) {
+	fake := newRunnerSmokeFakeAPI()
+	fake.runTerminalStatus = "completed"
+	fake.runResultStatuses = []string{"pass", "skipped"}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	_, err := RunnerSmoke(runnerSmokeTestCfg("")).Run(context.Background(), synthetic.NewClient(srv.URL, ""))
+	if err == nil {
+		t.Fatal("a 'skipped' workflow result MUST fail the check — it means the runner died mid-run " +
+			"and the remaining assessments never executed")
+	}
+	if !strings.Contains(err.Error(), "1 of 2") {
+		t.Errorf("error %q must report how many of how many results failed, so a single flaky "+
+			"workflow reads differently from a total runner outage", err)
+	}
+}
+
+// TestRunnerSmoke_EmptyResultStatusFailsTheCheck pins the default. A result row
+// carrying no status at all is a contract violation; treating an unrecognised or
+// absent value as a pass is exactly how a check rots into decoration.
+func TestRunnerSmoke_EmptyResultStatusFailsTheCheck(t *testing.T) {
+	fake := newRunnerSmokeFakeAPI()
+	fake.runTerminalStatus = "completed"
+	fake.runResultStatuses = []string{""}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	_, err := RunnerSmoke(runnerSmokeTestCfg("")).Run(context.Background(), synthetic.NewClient(srv.URL, ""))
+	if err == nil {
+		t.Fatal("a workflow result with an EMPTY status MUST fail the check — anything that is not " +
+			"explicitly 'pass' has not been proven to work")
+	}
+	if !strings.Contains(err.Error(), "<empty>") {
+		t.Errorf("error %q must render the empty status visibly rather than as a blank gap", err)
+	}
+}
+
+// TestRunnerSmoke_OnlyPassIsAccepted pins the accepted set in both directions so
+// widening it later is a deliberate, visible edit rather than a quiet drift.
+func TestRunnerSmoke_OnlyPassIsAccepted(t *testing.T) {
+	if successResultStatus != "pass" {
+		t.Fatalf("successResultStatus = %q, want \"pass\" (models.ResultStatusPass)", successResultStatus)
+	}
+	// Every other status the API can emit must be rejected. Sourced from
+	// models.ResultStatus* in internal/models/workflow_models.go.
+	for _, st := range []string{"pending", "running", "fail", "error", "timeout", "skipped", "cancelled"} {
+		t.Run(st, func(t *testing.T) {
+			fake := newRunnerSmokeFakeAPI()
+			fake.runTerminalStatus = "completed"
+			fake.runResultStatuses = []string{st}
+			srv := httptest.NewServer(fake.handler())
+			defer srv.Close()
+
+			_, err := RunnerSmoke(runnerSmokeTestCfg("")).Run(context.Background(), synthetic.NewClient(srv.URL, ""))
+			if err == nil {
+				t.Fatalf("workflow result status %q MUST fail runner_smoke; only %q proves the "+
+					"Kali runner path actually worked", st, successResultStatus)
+			}
+		})
 	}
 }
 
