@@ -19,6 +19,7 @@ type Engine struct {
 	nats       *events.Client
 	k8s        *K8sClient
 	dispatcher *VMwareToolsDispatcher
+	metrics    *RunnerMetrics
 	engineID   string
 	engineURL  string
 	logger     *slog.Logger
@@ -43,6 +44,14 @@ func New(queries *Queries, natsClient *events.Client, k8sClient *K8sClient, engi
 // just less helpfully).
 func (e *Engine) WithVMwareToolsDispatcher(d *VMwareToolsDispatcher) *Engine {
 	e.dispatcher = d
+	return e
+}
+
+// WithRunnerMetrics attaches a RunnerMetrics recorder. Optional: if not set
+// all metric calls are no-ops (nil-safe) so the engine works without
+// Pushgateway configured.
+func (e *Engine) WithRunnerMetrics(m *RunnerMetrics) *Engine {
+	e.metrics = m
 	return e
 }
 
@@ -391,6 +400,7 @@ func (e *Engine) checkForTimeouts(ctx context.Context) {
 			e.logger.Error("timeout watchdog: failed to update run", "run_id", run.ID, "error", err)
 		}
 
+		e.metrics.RecordRunnerJob("timeout")
 		e.publishRunEvent(run.PodID.String(), run.ID.String(), "timeout", errMsg)
 	}
 }

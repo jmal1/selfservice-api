@@ -10,8 +10,8 @@
     {
       "path": "AGENTS.md",
       "title": "AGENTS.md — Crucible AI Authoring Reference",
-      "size": 28770,
-      "sha256": "a47c05f5338cdfeae840cccde6fbf6de4824818f5f34ce2cc142f52d34fd2ea1",
+      "size": 28288,
+      "sha256": "40462460819b5ded9d9e56ad54b8f9d822dae135e3d6f9dacb06cd577df2ecf6",
       "is_markdown": true,
       "links_out": [
         "deploy/runner/actions.sh",
@@ -91,8 +91,8 @@
     {
       "path": "docs/instructor/overview.md",
       "title": "Crucible for Instructors — Overview",
-      "size": 8219,
-      "sha256": "3ebc4dd3a7c36ba630a6b7ab0f2ed3db95d1c41adfe5783e8abedbdcacf43edb",
+      "size": 8043,
+      "sha256": "ebe95115fbef806b7959994851d5e25d28be50aabef81fd0e8a87287d94d8c10",
       "is_markdown": true,
       "links_out": [
         "AGENTS.md",
@@ -156,8 +156,8 @@
     {
       "path": "docs/instructor/troubleshooting.md",
       "title": "Troubleshooting",
-      "size": 6948,
-      "sha256": "511395127db04259afb384d0776fd5695363e176e1c66ae8a29705e132504a72",
+      "size": 6736,
+      "sha256": "3e4b1fc6a56bf1651c0b07ae62b63a8dbb8c9e00b8696a28d9fa2f550122104c",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/actions.md",
@@ -190,8 +190,8 @@
     {
       "path": "internal/api/routes/routes.go",
       "title": "routes.go (Go)",
-      "size": 11380,
-      "sha256": "4806a6ee5634df5ffeec285187d0642d9290f65e01fced46266561c9d0ac1b91",
+      "size": 12212,
+      "sha256": "61f9387a74364678dab6c36db23d459e8946bb97c7f4966218881a6f0dd7c147",
       "is_markdown": false,
       "from_seed": false
     },
@@ -222,8 +222,8 @@
     {
       "path": "internal/engine/engine.go",
       "title": "engine.go (Go)",
-      "size": 14662,
-      "sha256": "07733d469c1135138a0e37ddae92306c347686c7916e2cbd5fae467a32e76e9e",
+      "size": 14557,
+      "sha256": "1da3a13dc22faf9b24243329a168f36eb04be4925c6e6396a71518052cb19666",
       "is_markdown": false,
       "from_seed": false
     },
@@ -268,5 +268,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 175961
+  "total_bytes": 175818
 }
