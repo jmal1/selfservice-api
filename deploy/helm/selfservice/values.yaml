@@ -185,6 +185,16 @@ engine:
   # workflow even starts. CrucibleRunnerProvisionSlow alerts well before
   # this trips. See internal/engine/k8s.go.
   runnerActiveDeadlineSeconds: 900
+  # Pushgateway for runner metrics (provision duration, job outcomes, cleanup
+  # failures, orphaned resources). The engine is a short-lived-job orchestrator
+  # with no scrapable steady state, so it pushes rather than being scraped —
+  # same pattern as the synthetic monitors.
+  #
+  # Leaving this empty is not "metrics off by default"; it silently disables
+  # the entire RunnerMetrics path, which is how runner observability shipped
+  # dead. Keep it set.
+  pushgatewayURL: "http://pushgateway.observability:9091"
+  pushgatewayJob: "crucible_engine"
   resources:
     requests:
       cpu: 100m

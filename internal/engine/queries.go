@@ -236,15 +236,27 @@ func GenerateCallbackToken() (string, error) {
 }
 
 // GetPodVLANTag returns the VLAN tag assigned to a pod.
+//
+// Despite its name, pods.vlan_id stores the VLAN *tag* (e.g. 119), not a
+// foreign key into vlan_pool.id — see CreatePod/DeployBlueprint, which both do
+// `UPDATE pods SET vlan_id = $1` with the tag returned by CheckoutVLAN. Reading
+// the column directly is therefore both correct and cheaper than a join.
+//
+// This previously read `JOIN vlans v ON p.vlan_id = v.id`, which was wrong
+// twice over: there has never been a table called `vlans` (it is `vlan_pool`),
+// and joining a tag against a serial primary key would have silently returned
+// some *other* pod's VLAN even if the table name had been right. Every
+// kali_runner assessment failed at this line. See TestEngineSQLReferencesOnlyRealTables.
 func (q *Queries) GetPodVLANTag(ctx context.Context, podID uuid.UUID) (int, error) {
 	var vlanTag int
 	err := q.pool.QueryRow(ctx, `
-		SELECT v.vlan_tag FROM pods p
-		JOIN vlans v ON p.vlan_id = v.id
-		WHERE p.id = $1
+		SELECT vlan_id FROM pods WHERE id = $1
 	`, podID).Scan(&vlanTag)
 	if err != nil {
 		return 0, fmt.Errorf("get pod VLAN tag: %w", err)
+	}
+	if vlanTag == 0 {
+		return 0, fmt.Errorf("pod %s has no VLAN allocated (vlan_id=0)", podID)
 	}
 	return vlanTag, nil
 }
@@ -270,11 +282,20 @@ func (q *Queries) GetRunTargetInfo(ctx context.Context, podID uuid.UUID) (runner
 		return target, pod, fmt.Errorf("get target VM: %w", err)
 	}
 
-	// Get pod network info
+	// Get pod network info.
+	//
+	// Reads pods.subnet directly rather than joining a VLAN table: pods.subnet
+	// is populated at checkout time (see CreatePod) and pods.vlan_id holds the
+	// VLAN tag itself, not a foreign key.
+	//
+	// This previously read `SELECT v.subnet, COALESCE(p.pod_index, 0) FROM pods p
+	// JOIN vlans v ON p.vlan_id = v.id`, which could never have run: there is no
+	// `vlans` table (it is `vlan_pool`) and `pods.pod_index` was dropped by
+	// migration 000003. Pod index is now carried by the VLAN tag, which is the
+	// pod's unique numeric network identifier.
 	err = q.pool.QueryRow(ctx, `
-		SELECT v.subnet, COALESCE(p.pod_index, 0)
+		SELECT COALESCE(p.subnet, ''), COALESCE(p.vlan_id, 0)
 		FROM pods p
-		JOIN vlans v ON p.vlan_id = v.id
 		WHERE p.id = $1
 	`, podID).Scan(&pod.Subnet, &pod.Index)
 	if err != nil {

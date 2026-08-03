@@ -10,8 +10,8 @@
     {
       "path": "AGENTS.md",
       "title": "AGENTS.md — Crucible AI Authoring Reference",
-      "size": 28469,
-      "sha256": "8df185304fdea62ad813a66871c72d96353fa454cef6b18f735b0e31d96c8323",
+      "size": 28695,
+      "sha256": "62fe17d7e674abb1512a6db1a545a67a864c534c34c3001d78df26ee5a48c660",
       "is_markdown": true,
       "links_out": [
         "deploy/runner/actions.sh",
@@ -268,5 +268,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 173566
+  "total_bytes": 173792
 }

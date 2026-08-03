@@ -106,6 +106,18 @@ func (h *Handler) CreateTestingRun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "playlist_id or workflow_ids required", http.StatusBadRequest)
 		return
 	}
+	// The engine resolves a run's workflows solely from its playlist
+	// (see engine.executeRun), and runs.playlist_id is the only selection we
+	// persist — there is nowhere to record an ad-hoc workflow list. Accepting
+	// workflow_ids therefore produced a 202 for a run that was guaranteed to
+	// fail asynchronously with "run <id> has no playlist", which is far worse
+	// than refusing it outright. Reject it honestly until the engine supports
+	// ad-hoc selection. No caller relies on this: the UI only ever sends
+	// playlist_id.
+	if req.PlaylistID == nil {
+		http.Error(w, "ad-hoc workflow_ids are not supported yet; supply playlist_id", http.StatusBadRequest)
+		return
+	}
 
 	// Check for active run on this pod
 	hasActive, err := h.db.HasActiveRun(r.Context(), podID)
