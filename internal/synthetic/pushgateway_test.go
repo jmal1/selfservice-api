@@ -75,6 +75,41 @@ func TestSerializeResults_EmptyBatch(t *testing.T) {
 	}
 }
 
+// TestSerializeResults_EmitsRegisteredCount is the guard for the silent
+// coverage-loss class described in the metric's own comment: because
+// PushResults POSTs and Pushgateway replaces a family wholesale, a check that
+// stops being registered leaves NO series behind, and `1 - success > 0` cannot
+// match a series that is absent. This counter is the only signal that survives
+// such a drop, so it must be emitted unconditionally and must track len(results).
+func TestSerializeResults_EmitsRegisteredCount(t *testing.T) {
+	body := string(serializeResults([]Result{
+		{Name: "a", Title: "A", Severity: SeverityCritical, Success: true},
+		{Name: "b", Title: "B", Severity: SeverityWarning, Success: true},
+		{Name: "c", Title: "C", Severity: SeverityWarning, Success: false},
+	}))
+	if !strings.Contains(body, "# TYPE crucible_synthetic_checks_registered gauge") {
+		t.Errorf("missing TYPE line for crucible_synthetic_checks_registered:\n%s", body)
+	}
+	if !strings.Contains(body, "crucible_synthetic_checks_registered 3") {
+		t.Errorf("expected registered count of 3:\n%s", body)
+	}
+
+	// Dropping a check must move the counter, otherwise the alert
+	// (delta(...[1h]) < 0) can never fire and the guard is decorative.
+	fewer := string(serializeResults([]Result{
+		{Name: "a", Title: "A", Severity: SeverityCritical, Success: true},
+	}))
+	if !strings.Contains(fewer, "crucible_synthetic_checks_registered 1") {
+		t.Errorf("expected registered count of 1 after dropping checks:\n%s", fewer)
+	}
+
+	// Emitted even with no checks at all — a monitor that registered nothing is
+	// exactly the case we most need to see.
+	if !strings.Contains(string(serializeResults(nil)), "crucible_synthetic_checks_registered 0") {
+		t.Error("registered count must still be emitted for an empty batch")
+	}
+}
+
 // TestPushgateway_PushResults_PostsCorrectURLAndContentType exercises the
 // happy path against a fake server that mimics Pushgateway's URL contract.
 func TestPushgateway_PushResults_PostsCorrectURLAndContentType(t *testing.T) {
