@@ -37,6 +37,7 @@ api-gateway:
   - 'internal/docs/**'
   - 'internal/middleware/**'
   - 'internal/objectstore/**'
+  - 'internal/runnertools/**'
   - 'internal/scriptvalidator/**'
   - 'internal/templates/**'
   - 'internal/unattend/**'
@@ -75,6 +76,13 @@ crucible-runner:
   - 'deploy/runner/**'
   - 'cmd/crucible-runner/**'
   - 'internal/runner/**'
+  # internal/runnertools is NOT a Go dependency of cmd/crucible-runner -- the
+  # Dockerfile COPYs internal/runnertools/tools.txt and derives both the apt
+  # install list and the verification loop from it. TestPathFilters_* walks the
+  # Go import graph and therefore cannot see this edge, so it is listed by hand.
+  # Without it, adding a tool to the manifest would not rebuild the image that
+  # is supposed to contain the tool.
+  - 'internal/runnertools/**'
 
 # Also drive whether the Go `test` job has to run. Any Go source change
 # triggers it; deploy/runner-only changes (which only contain a Dockerfile

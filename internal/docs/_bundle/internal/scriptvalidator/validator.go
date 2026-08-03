@@ -217,6 +217,13 @@ func (v *Validator) runShellcheck(ctx context.Context, script string, opts Optio
 	// so the line/column numbers map directly to what the user sees.
 	findings = append(findings, undeclaredCTXFindings(script, opts)...)
 
+	// CRU0002 — commands the runner image does not provide. shellcheck has no
+	// notion of which binaries exist on the target, so `gobuster ...` lints
+	// perfectly clean and then exits 127 during a graded assessment, where the
+	// student sees a red check that nothing they do can turn green. Same
+	// coordinate space as CRU0001: run against the ORIGINAL user script.
+	findings = append(findings, unknownCommandFindings(script)...)
+
 	res := &Result{
 		Language:     "bash",
 		Findings:     findings,

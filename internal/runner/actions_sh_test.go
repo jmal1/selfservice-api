@@ -381,3 +381,78 @@ func TestActionsSh_MissingLibraryDoesNotBreakSourcing(t *testing.T) {
 		t.Fatalf("sourcing actions.sh failed with no library present:\n%s", out)
 	}
 }
+
+// lastActionEnd returns the final action_end event, failing the test if none
+// was emitted.
+func lastActionEnd(t *testing.T, events []runner.ActionEvent) runner.ActionEvent {
+	t.Helper()
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Event == "action_end" {
+			return events[i]
+		}
+	}
+	t.Fatalf("no action_end event emitted; events: %+v", events)
+	return runner.ActionEvent{}
+}
+
+func TestActionsSh_MissingCommandProducesActionableError(t *testing.T) {
+	// Exit 127 is the most misleading status this runner can produce: to a
+	// student it is indistinguishable from "your service is misconfigured",
+	// when in fact the workflow asked for a tool that is not in the image and
+	// nothing the student does can turn the check green.
+	end := lastActionEnd(t, sidecarEvents(t, demoLibrary,
+		"run_action \"Scan\" definitely-not-a-real-command --flag || true\n"))
+
+	if end.Status != "error" {
+		t.Errorf("status = %q, want \"error\": a missing tool is an infrastructure "+
+			"defect, not a failed check, and the UI renders the two differently", end.Status)
+	}
+	if !strings.Contains(end.Message, "definitely-not-a-real-command") {
+		t.Errorf("student message must name the missing command so the instructor "+
+			"can act on the report, got %q", end.Message)
+	}
+	if !strings.Contains(end.Message, "not with your work") {
+		t.Errorf("student message must make clear this is not the student's fault, got %q", end.Message)
+	}
+	if end.ExitCode != 127 {
+		t.Errorf("exit_code = %d, want 127", end.ExitCode)
+	}
+}
+
+func TestActionsSh_MissingCommandInsideLibraryActionDoesNotBlameTheAction(t *testing.T) {
+	// When a *library action* (a shell function) wraps a missing binary, exit
+	// 127 propagates out of a function that plainly does exist. Naming it would
+	// send the instructor looking for a function that is right there, so the
+	// message has to describe the situation instead.
+	lib := `wrapping_action() {
+    definitely-not-a-real-command
+}`
+	end := lastActionEnd(t, sidecarEvents(t, lib, "run_action \"Wrapped\" wrapping_action || true\n"))
+
+	if end.Status != "error" {
+		t.Errorf("status = %q, want \"error\"", end.Status)
+	}
+	if strings.Contains(end.Message, "wrapping_action") {
+		t.Errorf("message blames the library action, which exists; the missing "+
+			"command is inside it. got %q", end.Message)
+	}
+	if !strings.Contains(end.Message, "not with your work") {
+		t.Errorf("message must still absolve the student, got %q", end.Message)
+	}
+}
+
+func TestActionsSh_MissingCommandDoesNotOverrideAnExplicitMessage(t *testing.T) {
+	// A library action that legitimately exits 127 after saying something
+	// specific must keep its own message -- replacing a precise diagnosis with
+	// the generic one would be a downgrade.
+	lib := `speaking_action() {
+    echo "STUDENT_MSG:port 8080 is closed on your web server"
+    return 127
+}`
+	end := lastActionEnd(t, sidecarEvents(t, lib, "run_action \"Speaks\" speaking_action || true\n"))
+
+	if end.Message != "port 8080 is closed on your web server" {
+		t.Errorf("action's own student message was overwritten by the exit-127 "+
+			"fallback, got %q", end.Message)
+	}
+}
