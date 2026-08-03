@@ -149,61 +149,6 @@ func TestTemplatePublicMarshalIncludesAllRequiredFields(t *testing.T) {
 	}
 }
 
-func TestPositiveControl_RawTemplateContainsPassword(t *testing.T) {
-	// Positive control: assert that a raw models.Template DOES leak the password.
-	// This proves the test is capable of detecting the vulnerability.
-	// If this test fails, it means the test itself is broken.
-
-	secretPassword := "SUPERSECRET-DO-NOT-LEAK"
-
-	tmpl := models.Template{
-		ID:              uuid.New(),
-		Name:            "Test Template",
-		VCenterTemplate: "test-vcenter",
-		OSType:          "ubuntu-22-04",
-		DefaultVCPUs:    2,
-		DefaultRAMMB:    2048,
-		DefaultDiskGB:   20,
-		MinVCPUs:        1,
-		MinRAMMB:        1024,
-		Description:     "A test template",
-		IconURL:         "https://example.com/icon.png",
-		DefaultUsername: "testuser",
-		DefaultPassword: secretPassword,
-		Kind:            "clone_no_customize",
-		AssignIP:        true,
-		IsActive:        true,
-		IsInternal:      false,
-		TemplateState:   "active",
-		CreatedBy:       nil,
-		VCenterVMID:     "vm-123",
-		SourceType:      "clone_template",
-		SourceRef:       "src-123",
-		StagingNetwork:  "lab-vlan",
-		UnattendMode:    "",
-		UnattendConfig:  nil,
-		GuestID:         "ubuntu64Guest",
-		CreatedAt:       time.Now(),
-		UpdatedAt:       time.Now(),
-	}
-
-	// Marshal the raw template (this should leak the password)
-	data, err := json.Marshal(tmpl)
-	if err != nil {
-		t.Fatalf("Failed to marshal Template: %v", err)
-	}
-
-	// Assert that the raw bytes DO contain the password
-	if !bytes.Contains(data, []byte(secretPassword)) {
-		t.Errorf("TESTBUG: marshalled models.Template does NOT contain the plaintext password %q; test is broken", secretPassword)
-	}
-
-	// Assert that the raw bytes DO contain the "default_password" key
-	if !bytes.Contains(data, []byte("default_password")) {
-		t.Error("TESTBUG: marshalled models.Template does NOT contain the key 'default_password'; test is broken")
-	}
-}
-
 func TestTemplatePublicFieldPreservation(t *testing.T) {
 	// Test that converting a Template to TemplatePublic preserves all fields
 	// except DefaultPassword.
@@ -342,5 +287,61 @@ func TestNewTemplatePublicList(t *testing.T) {
 
 	if result[0].ID != tmpl1.ID || result[1].ID != tmpl2.ID || result[2].ID != tmpl3.ID {
 		t.Error("IDs not preserved in list conversion")
+	}
+}
+
+// TestPositiveControl_RawTemplateContainsPassword is the positive control.
+// It verifies that a raw models.Template DOES leak the password when marshalled.
+// This proves the test infrastructure is capable of detecting the vulnerability;
+// without this, TestTemplatePublicMarshalDoesNotLeakPassword could pass for the
+// wrong reason (test infrastructure broken, not fix working).
+func TestPositiveControl_RawTemplateContainsPassword(t *testing.T) {
+	secretPassword := "SUPERSECRET-DO-NOT-LEAK"
+
+	tmpl := models.Template{
+		ID:              uuid.New(),
+		Name:            "Test Template",
+		VCenterTemplate: "test-vcenter",
+		OSType:          "ubuntu-22-04",
+		DefaultVCPUs:    2,
+		DefaultRAMMB:    2048,
+		DefaultDiskGB:   20,
+		MinVCPUs:        1,
+		MinRAMMB:        1024,
+		Description:     "A test template",
+		IconURL:         "https://example.com/icon.png",
+		DefaultUsername: "testuser",
+		DefaultPassword: secretPassword,
+		Kind:            "clone_no_customize",
+		AssignIP:        true,
+		IsActive:        true,
+		IsInternal:      false,
+		TemplateState:   "active",
+		CreatedBy:       nil,
+		VCenterVMID:     "vm-123",
+		SourceType:      "clone_template",
+		SourceRef:       "src-123",
+		StagingNetwork:  "lab-vlan",
+		UnattendMode:    "",
+		UnattendConfig:  nil,
+		GuestID:         "ubuntu64Guest",
+		CreatedAt:       time.Now(),
+		UpdatedAt:       time.Now(),
+	}
+
+	// Marshal the raw template (this should leak the password)
+	data, err := json.Marshal(tmpl)
+	if err != nil {
+		t.Fatalf("Failed to marshal Template: %v", err)
+	}
+
+	// Assert that the raw bytes DO contain the password
+	if !bytes.Contains(data, []byte(secretPassword)) {
+		t.Errorf("TESTBUG: marshalled models.Template does NOT contain the plaintext password %q; test is broken", secretPassword)
+	}
+
+	// Assert that the raw bytes DO contain the "default_password" key
+	if !bytes.Contains(data, []byte("default_password")) {
+		t.Error("TESTBUG: marshalled models.Template does NOT contain the key 'default_password'; test is broken")
 	}
 }
