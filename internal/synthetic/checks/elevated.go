@@ -58,6 +58,56 @@ func Elevated(cfg ElevatedConfig) []synthetic.Check {
 	}
 }
 
+// ElevatedIdentityConfigured is registered UNCONDITIONALLY, whether or not the
+// instructor identity exists. It is the guard for this package's own blind
+// spot.
+//
+// Skipping the elevated checks when the identity is missing keeps the monitor
+// running, but it makes the resulting coverage loss INVISIBLE. PushResults
+// POSTs the whole crucible_synthetic_check_success family each cycle, and
+// Pushgateway replaces a family wholesale on POST, so the three elevated
+// series do not go stale — they simply cease to exist. Every alert we have is
+// of the form `1 - crucible_synthetic_check_success > 0`, which cannot match a
+// series that is absent. The board would read a healthy 10/10 while silently
+// having stopped testing the entire authenticated admin surface.
+//
+// A metric that disappears is strictly worse than one that goes red, because
+// nothing is watching for its absence. So we emit a series that is always
+// present and flips to 0 instead.
+//
+// The k8s secret key this depends on is reconciled from Vault by External
+// Secrets Operator (creationPolicy: Owner). A `kubectl patch` of the Secret
+// reports success and is then silently reverted within seconds, so "someone
+// patched it back by hand" is a realistic way for this to regress.
+//
+// Severity is warning, not critical: losing elevated coverage is a monitoring
+// regression to fix on a weekday, not a student-facing outage. A fresh
+// environment that has never run the bootstrap SQL therefore gets one clearly
+// named warning telling it exactly what to configure, rather than three
+// confusingly absent checks.
+func ElevatedIdentityConfigured(cfg ElevatedConfig) synthetic.Check {
+	return synthetic.CheckFunc{
+		NameVal:  "elevated_identity_configured",
+		TitleVal: "Instructor Synthetic Identity Present",
+		DescriptionVal: "Reports whether the monitor has an instructor-role identity to run the " +
+			"authenticated admin-surface checks with. When this fails the three elevated checks " +
+			"(image_list_contract / iso_catalog_reachable / template_wizard_state_404) are NOT " +
+			"RUNNING AT ALL and their series are absent from Prometheus entirely -- so no other " +
+			"alert can tell you the admin surface stopped being tested. Fix: confirm the " +
+			"synthetic-instructor row exists (deploy/sql/synthetic-instructor-user.sql) and that " +
+			"Vault holds key instructor-user-id at secret/selfservice/selfservice-synthetic-user " +
+			"and that the ExternalSecret lists that key. Never kubectl-patch the Secret directly; " +
+			"External Secrets Operator owns it and silently reverts the patch.",
+		SeverityVal: synthetic.SeverityWarning,
+		RunFn: func(ctx context.Context, _ *synthetic.Client) (int, error) {
+			if _, err := cfg.client(); err != nil {
+				return 0, fmt.Errorf("elevated checks are DISABLED: %w; the admin-surface checks are absent from Prometheus, not failing", err)
+			}
+			return 0, nil
+		},
+	}
+}
+
 // imageListContract proves the /admin/images read path actually works for
 // someone allowed to use it.
 //

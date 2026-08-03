@@ -36,14 +36,43 @@
 --     env PGPASSWORD="$PW" psql -U selfservice -d selfservice \
 --     -f /tmp/synthetic-instructor-user.sql
 --
--- Then add the id to the EXISTING synthetic secret (do not create a second
--- secret; the CronJob reads both keys from selfservice-synthetic-user):
+-- Then make the id available to the CronJob. The k8s Secret
+-- `selfservice-synthetic-user` is OWNED by an ExternalSecret
+-- (creationPolicy: Owner), so `kubectl patch secret` reports success and is
+-- then SILENTLY REVERTED by External Secrets Operator within seconds. Write
+-- to Vault instead, then add the key to the ExternalSecret:
 --
---   IID=$(kubectl -n selfservice exec selfservice-postgresql-0 -- \
---     env PGPASSWORD="$PW" psql -U selfservice -d selfservice -tA \
---     -c "SELECT id FROM users WHERE username='synthetic-instructor'")
---   kubectl -n selfservice patch secret selfservice-synthetic-user \
---     --type merge -p "{\"stringData\":{\"instructor-user-id\":\"$IID\"}}"
+--   1. Vault (KV v2, path secret/selfservice/selfservice-synthetic-user):
+--      read the existing map, add `instructor-user-id`, write it back with a
+--      CAS version so a concurrent write cannot be clobbered.
+--
+--        IID=$(kubectl -n selfservice exec selfservice-postgresql-0 -- \
+--          env PGPASSWORD="$PW" psql -U selfservice -d selfservice -tA \
+--          -c "SELECT id FROM users WHERE username='synthetic-instructor'")
+--        vault kv patch secret/selfservice/selfservice-synthetic-user \
+--          instructor-user-id="$IID"
+--
+--   2. ExternalSecret: add a `data:` entry mapping secretKey
+--      `instructor-user-id` to property `instructor-user-id`. The manifest is
+--      recorded on k3sv01 at
+--      ~/k8s-manifests/selfservice-helm/synthetic-user-externalsecret.yaml
+--      (it had never been saved anywhere before 2026-08-03).
+--
+--        kubectl -n selfservice apply -f .../synthetic-user-externalsecret.yaml
+--        kubectl -n selfservice annotate externalsecret \
+--          selfservice-synthetic-user force-sync=$(date +%s) --overwrite
+--
+--   3. Verify the key actually landed -- this is the step that catches a
+--      reverted patch:
+--
+--        kubectl -n selfservice get secret selfservice-synthetic-user \
+--          -o jsonpath='{.data.instructor-user-id}' | base64 -d
+--
+-- If it is missing, the `elevated_identity_configured` synthetic check reports
+-- 0 and names this file. That check is registered unconditionally precisely so
+-- that a missing identity is visible: the three elevated checks would
+-- otherwise be ABSENT from Prometheus rather than failing, and no alert can
+-- match a series that does not exist.
 --
 -- Re-runnable: ON CONFLICT does nothing.
 INSERT INTO users (

@@ -37,16 +37,16 @@ import (
 // of truth; the K8s manifest in deploy/helm/selfservice/templates/synthetic-cronjob.yaml
 // MUST stay in sync.
 const (
-	envBaseURL       = "SYNTHETIC_BASE_URL"        // e.g. https://crucible.jmal.io
-	envJWTSecret     = "SYNTHETIC_JWT_SECRET"      // same HMAC the API uses
-	envUserID        = "SYNTHETIC_USER_ID"         // UUID of synthetic@lab.jmal.io DB row
-	envUsername      = "SYNTHETIC_USERNAME"        // synthetic
-	envRole          = "SYNTHETIC_ROLE"            // student (default) | instructor | admin
+	envBaseURL        = "SYNTHETIC_BASE_URL"        // e.g. https://crucible.jmal.io
+	envJWTSecret      = "SYNTHETIC_JWT_SECRET"      // same HMAC the API uses
+	envUserID         = "SYNTHETIC_USER_ID"         // UUID of synthetic@lab.jmal.io DB row
+	envUsername       = "SYNTHETIC_USERNAME"        // synthetic
+	envRole           = "SYNTHETIC_ROLE"            // student (default) | instructor | admin
 	envPushgatewayURL = "SYNTHETIC_PUSHGATEWAY_URL" // e.g. http://pushgateway.observability:9091
-	envJob           = "SYNTHETIC_JOB"             // pushgateway job label, default crucible_synthetic_api
-	envLayer         = "SYNTHETIC_LAYER"           // grouping label `layer`, default api
-	envLoopInterval  = "SYNTHETIC_LOOP_INTERVAL"   // optional duration; if set, runs forever
-	envCheckTimeout  = "SYNTHETIC_CHECK_TIMEOUT"   // optional duration, default 30s
+	envJob            = "SYNTHETIC_JOB"             // pushgateway job label, default crucible_synthetic_api
+	envLayer          = "SYNTHETIC_LAYER"           // grouping label `layer`, default api
+	envLoopInterval   = "SYNTHETIC_LOOP_INTERVAL"   // optional duration; if set, runs forever
+	envCheckTimeout   = "SYNTHETIC_CHECK_TIMEOUT"   // optional duration, default 30s
 
 	// envLifecycleEnabled enables the (expensive) pod_lifecycle check that
 	// creates + destroys a real pod. OFF by default so the binary is safe to
@@ -218,8 +218,17 @@ func run(logger *slog.Logger) error {
 	// student-side 403 assertions, which cannot distinguish "the route
 	// works" from "the route 503s because a dependency was never wired".
 	if !envBool(envJanitorMode) {
+		elevatedCfg := checks.ElevatedConfig{Client: instructorClient}
+
+		// Registered UNCONDITIONALLY, and deliberately outside the
+		// if/else below. A log line is not monitoring: nothing alerts on
+		// the absence of a Prometheus series, so skipping the elevated
+		// checks would drop coverage while the board stayed green. This
+		// emits a series that is always present and goes to 0 instead.
+		activeChecks = append(activeChecks, checks.ElevatedIdentityConfigured(elevatedCfg))
+
 		if instructorClient != nil {
-			elevated := checks.Elevated(checks.ElevatedConfig{Client: instructorClient})
+			elevated := checks.Elevated(elevatedCfg)
 			names := make([]string, 0, len(elevated))
 			for _, c := range elevated {
 				names = append(names, c.Name())
@@ -233,6 +242,7 @@ func run(logger *slog.Logger) error {
 			logger.Warn("elevated checks DISABLED: no instructor identity configured",
 				"env", envInstructorUserID,
 				"consequence", "the authenticated admin surface (/admin/images, /admin/vcenter/isos, wizard-state) is unmonitored; a 503 from an unwired dependency will look identical to a healthy deploy",
+				"alert", "elevated_identity_configured will report 0 until this is fixed",
 			)
 		}
 	}

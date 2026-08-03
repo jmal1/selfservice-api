@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -257,5 +259,83 @@ func TestElevated_StableNames(t *testing.T) {
 	}
 	for missing := range want {
 		t.Errorf("expected elevated check %q not returned", missing)
+	}
+}
+
+// -- elevated_identity_configured ------------------------------------------
+//
+// This meta-check exists because a check that DISAPPEARS is invisible.
+// PushResults POSTs the whole crucible_synthetic_check_success family and
+// Pushgateway replaces a family wholesale, so a skipped elevated check leaves
+// no series at all -- and `1 - crucible_synthetic_check_success > 0` cannot
+// match a series that does not exist. These tests pin both directions.
+
+func TestElevatedIdentityConfigured_PassesWhenClientPresent(t *testing.T) {
+	c := ElevatedIdentityConfigured(ElevatedConfig{Client: synthetic.NewClient("http://x", "")})
+	if _, err := c.Run(context.Background(), nil); err != nil {
+		t.Fatalf("want pass with a configured client, got %v", err)
+	}
+}
+
+func TestElevatedIdentityConfigured_FailsWhenClientMissing(t *testing.T) {
+	c := ElevatedIdentityConfigured(ElevatedConfig{})
+	_, err := c.Run(context.Background(), nil)
+	if err == nil {
+		t.Fatal("want failure when no instructor identity is configured; a green series here " +
+			"means the admin-surface checks are absent and NOTHING is alerting on it")
+	}
+	// The message must say the checks are absent rather than failing: an
+	// on-call who reads "3 checks failing" looks at the API, while one who
+	// reads "not running" looks at the secret.
+	if !strings.Contains(err.Error(), "DISABLED") || !strings.Contains(err.Error(), "absent") {
+		t.Errorf("error must distinguish absent-from-failing, got: %v", err)
+	}
+}
+
+// TestElevatedIdentityConfigured_IsRegisteredUnconditionally guards the actual
+// mistake: registering the meta-check inside the same `if instructorClient !=
+// nil` branch as the checks it reports on. That would make it vanish in
+// exactly the situation it exists to detect -- a monitor for a missing thing
+// that goes missing along with it.
+func TestElevatedIdentityConfigured_IsRegisteredUnconditionally(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("..", "..", "..", "cmd", "synthetic-api-monitor", "main.go"))
+	if err != nil {
+		t.Fatalf("read monitor main: %v", err)
+	}
+	body := string(src)
+
+	call := strings.Index(body, "checks.ElevatedIdentityConfigured(")
+	if call < 0 {
+		t.Fatal("cmd/synthetic-api-monitor/main.go never calls checks.ElevatedIdentityConfigured; " +
+			"losing the instructor identity would silently drop 3 checks with no alert")
+	}
+	guard := strings.Index(body, "if instructorClient != nil {")
+	if guard < 0 {
+		t.Fatal("expected the instructorClient guard in main.go; update this test if it was restructured")
+	}
+	if call > guard {
+		t.Error("checks.ElevatedIdentityConfigured must be registered BEFORE (and outside) the " +
+			"`if instructorClient != nil` guard. Inside it, the meta-check disappears in precisely " +
+			"the case it is meant to report, which is how this blind spot was created originally.")
+	}
+}
+
+func TestElevatedIdentityConfigured_Metadata(t *testing.T) {
+	c := ElevatedIdentityConfigured(ElevatedConfig{})
+	if c.Name() != "elevated_identity_configured" {
+		t.Errorf("name %q is referenced by runbooks and dashboards; do not rename casually", c.Name())
+	}
+	// Warning, not critical: lost coverage is a weekday fix, and a fresh
+	// environment that has not run the bootstrap SQL must not page anyone.
+	if c.Severity() != synthetic.SeverityWarning {
+		t.Errorf("severity = %q, want warning", c.Severity())
+	}
+	if c.Title() == "" || c.Description() == "" {
+		t.Error("missing Title/Description")
+	}
+	for _, bad := range []string{",", "\"", "\n"} {
+		if strings.Contains(c.Title()+c.Description(), bad) {
+			t.Errorf("metadata contains %q, which corrupts Prometheus exposition labels", bad)
+		}
 	}
 }
