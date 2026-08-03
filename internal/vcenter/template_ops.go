@@ -526,17 +526,9 @@ func (c *Client) createBlankVMInner(ctx context.Context, p BlankVMParams) (strin
 	}
 	dsRef := ds.Reference()
 
-	var pool *object.ResourcePool
-	if p.ResourcePool != "" {
-		pool, err = c.finder.ResourcePool(ctx, p.ResourcePool)
-		if err != nil {
-			return "", fmt.Errorf("find resource pool %q: %w", p.ResourcePool, err)
-		}
-	} else {
-		pool, err = c.finder.DefaultResourcePool(ctx)
-		if err != nil {
-			return "", fmt.Errorf("resolve default resource pool (specify ResourcePool): %w", err)
-		}
+	pool, err := c.resolvePlacementPool(ctx, p.ResourcePool, p.VCPUs, p.RAMmb)
+	if err != nil {
+		return "", err
 	}
 
 	firmware := p.Firmware
