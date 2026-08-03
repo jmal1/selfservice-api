@@ -2,7 +2,11 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -10,6 +14,9 @@ import (
 
 	"github.com/jmal1/selfservice-api/internal/models"
 )
+
+// contextKey is a type for context keys (matches middleware/auth.go pattern).
+type contextKey string
 
 func TestTemplatePublicMarshalDoesNotLeakPassword(t *testing.T) {
 	// Test that marshalling a TemplatePublic built from a Template with
@@ -343,5 +350,130 @@ func TestPositiveControl_RawTemplateContainsPassword(t *testing.T) {
 	// Assert that the raw bytes DO contain the "default_password" key
 	if !bytes.Contains(data, []byte("default_password")) {
 		t.Error("TESTBUG: marshalled models.Template does NOT contain the key 'default_password'; test is broken")
+	}
+}
+
+// fakeTemplateLister is a test double for templateLister.
+type fakeTemplateLister struct {
+	templates []models.Template
+	err       error
+}
+
+func (f *fakeTemplateLister) ListTemplatesForUser(ctx context.Context, userID uuid.UUID, role string) ([]models.Template, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.templates, nil
+}
+
+func (f *fakeTemplateLister) ListExplicitTemplateAccessForUser(ctx context.Context, userID uuid.UUID) (map[uuid.UUID]struct{}, error) {
+	// Return an empty map; templates are not filtered as internal in this test.
+	// If the template were internal and had no explicit access, it would be
+	// filtered out before serialization — but our test template is not internal
+	// (IsInternal: false), so it passes through regardless.
+	return map[uuid.UUID]struct{}{}, nil
+}
+
+// TestListTemplatesHandlerDoesNotLeakPassword is an integration test that drives
+// the ListTemplates handler end-to-end with a fake database. It verifies that
+// the wire response (HTTP body bytes) does NOT contain the template password.
+// This guards against the handler accidentally reverting to serializing the raw
+// models.Template instead of the DTO.
+func TestListTemplatesHandlerDoesNotLeakPassword(t *testing.T) {
+	secretPassword := "SENTINEL-PW-DO-NOT-LEAK"
+
+	// Build a template with the distinctive secret password
+	tmpl := models.Template{
+		ID:              uuid.New(),
+		Name:            "Sensitive Template",
+		VCenterTemplate: "prod-template",
+		OSType:          "ubuntu-22-04",
+		DefaultVCPUs:    4,
+		DefaultRAMMB:    4096,
+		DefaultDiskGB:   50,
+		MinVCPUs:        2,
+		MinRAMMB:        2048,
+		Description:     "A template with a real password",
+		IconURL:         "https://example.com/prod-icon.png",
+		DefaultUsername: "ubuntu",
+		DefaultPassword: secretPassword,
+		Kind:            "clone_no_customize",
+		AssignIP:        true,
+		IsActive:        true,
+		IsInternal:      false,
+		TemplateState:   "active",
+		CreatedBy:       nil,
+		VCenterVMID:     "vm-prod-123",
+		SourceType:      "clone_template",
+		SourceRef:       "prod-src-123",
+		StagingNetwork:  "prod-vlan",
+		UnattendMode:    "",
+		UnattendConfig:  nil,
+		GuestID:         "ubuntu64Guest",
+		CreatedAt:       time.Now(),
+		UpdatedAt:       time.Now(),
+	}
+
+	// Create a fake database that returns our sensitive template
+	fake := &fakeTemplateLister{
+		templates: []models.Template{tmpl},
+		err:       nil,
+	}
+
+	// Create a handler with the fake wired in
+	h := &Handler{
+		db:       nil, // Not used; fake overrides it
+		templates: fake,
+		logger:   slog.New(slog.NewTextHandler(nil, nil)),
+	}
+
+	// Create a student-role request context using the same key values as middleware
+	// See internal/middleware/auth.go for the context key definitions
+	userID := uuid.New()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/templates", nil)
+	
+	ctx := context.WithValue(req.Context(), contextKey("user_id"), userID)
+	ctx = context.WithValue(ctx, contextKey("role"), models.RoleStudent)
+	req = req.WithContext(ctx)
+
+	// Capture the response
+	rec := httptest.NewRecorder()
+
+	// Call the handler
+	h.ListTemplates(rec, req)
+
+	// Verify HTTP status is OK
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", rec.Code)
+	}
+
+	// Get the raw response bytes
+	body := rec.Body.Bytes()
+
+	// Assert the password does NOT appear in the wire bytes
+	if bytes.Contains(body, []byte(secretPassword)) {
+		t.Errorf("FAIL: HTTP response body contains plaintext password %q; DTO leak detected", secretPassword)
+	}
+
+	// Assert the default_password key does NOT appear in the wire bytes
+	if bytes.Contains(body, []byte("default_password")) {
+		t.Errorf("FAIL: HTTP response body contains key 'default_password'; DTO leak detected")
+	}
+
+	// Sanity check: verify other fields are still present
+	if !bytes.Contains(body, []byte("\"name\"")) {
+		t.Error("SANITY FAIL: response missing 'name' field")
+	}
+	if !bytes.Contains(body, []byte("\"default_username\"")) {
+		t.Error("SANITY FAIL: response missing 'default_username' field")
+	}
+
+	// CRITICAL: Assert that the template was actually serialized (not filtered out).
+	// If the fake returned an empty list or the template was filtered away,
+	// the response would be an empty array, and we'd pass this test for the
+	// wrong reason (no secrets to leak = test passes even if the fix is reverted).
+	// This guard prevents that trap.
+	if !bytes.Contains(body, []byte("Sensitive Template")) {
+		t.Error("TRAP: response does not contain template name; template was filtered out or list is empty")
 	}
 }

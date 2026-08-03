@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"time"
 
@@ -8,6 +9,13 @@ import (
 
 	"github.com/jmal1/selfservice-api/internal/models"
 )
+
+// templateLister is the narrow slice of the database that ListTemplates needs.
+// Declared here so the handler can be tested without a live pgxpool.
+type templateLister interface {
+	ListTemplatesForUser(ctx context.Context, userID uuid.UUID, role string) ([]models.Template, error)
+	ListExplicitTemplateAccessForUser(ctx context.Context, userID uuid.UUID) (map[uuid.UUID]struct{}, error)
+}
 
 // TemplatePublic is the student-facing DTO for a template. It contains all
 // publicly-readable template fields except DefaultPassword, which is stripped
