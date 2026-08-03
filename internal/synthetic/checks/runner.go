@@ -151,11 +151,33 @@ func isTerminalRunStatus(s string) bool {
 	return true
 }
 
+// successResultStatus is the only workflow-result status this check accepts.
+//
+// Mirrors models.ResultStatusPass. Kept as a local constant rather than an
+// import for the same reason as successRunStatus above: this package stays free
+// of a models dependency, and a deliberate rename fails the contract test in
+// runner_contract_test.go instead of silently changing what "healthy" means.
+const successResultStatus = "pass"
+
+// runnerWorkflowResult is the subset of a workflow result this check asserts on.
+//
+// ActionResults and InstructorOutput are deliberately absent. The synthetic user
+// holds the student role, and GetTestingRun (handlers/testing.go) strips both
+// fields for non-instructor callers, so they arrive as null no matter what the
+// runner produced. The workflow-level Status is therefore the deepest signal
+// this check can see — which is precisely why it has to be asserted.
+type runnerWorkflowResult struct {
+	WorkflowID     string `json:"workflow_id"`
+	ExecutionOrder int    `json:"execution_order"`
+	Status         string `json:"status"`
+	StudentMessage string `json:"student_message"`
+}
+
 // runnerRunResponse is the subset of the run JSON we decode during polling.
-// We only need status and the results slice; the rest is ignored.
+// We need the run status and the per-workflow results; the rest is ignored.
 type runnerRunResponse struct {
-	Status  string            `json:"status"`
-	Results []json.RawMessage `json:"results"`
+	Status  string                 `json:"status"`
+	Results []runnerWorkflowResult `json:"results"`
 }
 
 // runRunnerSmoke is the actual implementation, factored out for testability.
@@ -281,6 +303,52 @@ func runRunnerSmoke(ctx context.Context, c *synthetic.Client, cfg RunnerSmokeCon
 			"run completed with zero results: the runner executed but produced no workflow outcomes " +
 				"(possible silent action failure or missing playlist assignment on the template)")
 	}
+
+	// 8b. Assert every workflow result actually PASSED.
+	//
+	// This is the assertion that gives the check its meaning, and it is NOT
+	// implied by run.Status. The engine marks a run "completed" when the runner
+	// reported back, not when the assessments succeeded — finalizeRun in
+	// engine.go says so outright: "we don't need to decide pass-vs-fail at the
+	// run level". So a run in which Multus never attached the NAD, the CNI dhcp
+	// lease never arrived on net1, or nmap was missing from the Kali image comes
+	// back "completed" with one result whose status is "fail". Asserting only
+	// the run status would report that as GREEN — a check that stays healthy
+	// while the exact path it exists to guard is broken.
+	//
+	// The playlist is version-controlled (deploy/sql/synthetic-runner-smoke-playlist.sql)
+	// precisely so it can serve as this check's assertion set: every workflow in
+	// it is expected to pass on a healthy lab. Anything else is a real failure,
+	// including "skipped", which is what the watchdog writes when the runner dies
+	// mid-run — the very scenario a "did it finish?" assertion cannot see.
+	var failed []string
+	for i, res := range run.Results {
+		if res.Status == successResultStatus {
+			continue
+		}
+		label := res.WorkflowID
+		if label == "" {
+			label = fmt.Sprintf("result[%d]", i)
+		}
+		detail := res.Status
+		if detail == "" {
+			// A result row carrying no status is a contract violation, not a
+			// pass. Name it explicitly so it is never mistaken for one.
+			detail = "<empty>"
+		}
+		if msg := strings.TrimSpace(res.StudentMessage); msg != "" {
+			detail += ": " + snippet([]byte(msg))
+		}
+		failed = append(failed, label+"="+detail)
+	}
+	if len(failed) > 0 {
+		return status, fmt.Errorf(
+			"run completed but %d of %d workflow results did not pass (%s): the Kali runner path is broken. "+
+				"Check the pod-VLAN NetworkAttachmentDefinition, the CNI dhcp lease on the runner's net1 "+
+				"interface, and the tooling in the runner image",
+			len(failed), len(run.Results), strings.Join(failed, ", "))
+	}
+	log.Info("runner_smoke: all workflow results passed", "result_count", len(run.Results))
 
 	// 9. Explicit destroy + poll so the check confirms the destroy path
 	// works too. The deferred destroy at step 4 also fires afterward, but
