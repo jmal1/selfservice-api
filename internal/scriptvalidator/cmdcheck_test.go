@@ -137,3 +137,42 @@ func TestCRU0002_IgnoresVariableAssignments(t *testing.T) {
 		t.Errorf("flagged a variable assignment as a command: %+v", got)
 	}
 }
+
+// TestCRU0002_IgnoresArrayAppends is a regression guard for a false positive
+// that fired on three of Crucible's own shipped library actions.
+//
+// Conditional array building is the idiomatic way to assemble curl/ssh
+// arguments, and because the append sits after `&&` the array name lands in
+// what cmdRe sees as command position. The linter reported `curl_args` and
+// `ssh_args` as uninstalled commands on http-get, http-post and ssh-exec --
+// perfectly valid actions that run fine in production.
+//
+// A linter that cries wolf on correct code is worse than no linter: it trains
+// instructors to dismiss CRU0002, including the times it is right.
+func TestCRU0002_IgnoresArrayAppends(t *testing.T) {
+	script := "local curl_args=(-s --max-time 10)\n" +
+		"[[ -n \"$cookies\" ]] && curl_args+=(-b \"/tmp/$cookies\")\n" +
+		"[[ -n \"$save\" ]] && curl_args+=(-c \"/tmp/$save\")\n" +
+		"msg+=\" appended\"\n" +
+		"curl \"${curl_args[@]}\" \"$url\"\n"
+	if got := codesFor(unknownCommandFindings(script), "CRU0002"); len(got) != 0 {
+		t.Errorf("flagged a bash array append as a command: %+v", got)
+	}
+}
+
+// TestMissingCommands_ReportsRealMissingTool keeps the exported wrapper honest.
+// It is what promotes CRU0002 from a warning to a build failure for the shipped
+// library corpus, so if it ever returned nothing the corpus guard in
+// internal/engine would pass no matter what the actions call.
+func TestMissingCommands_ReportsRealMissingTool(t *testing.T) {
+	got := MissingCommands("gobuster dir -u http://x\ncurl http://y\n")
+	if len(got) != 1 || got[0] != "gobuster" {
+		t.Fatalf("MissingCommands = %v, want exactly [gobuster] (curl IS installed)", got)
+	}
+
+	// And it must stay quiet on a script that only uses installed tools,
+	// otherwise the corpus guard would be permanently red and get deleted.
+	if got := MissingCommands("nmap -sT 10.0.0.1\ncurl -s http://x | jq .\n"); len(got) != 0 {
+		t.Errorf("MissingCommands flagged installed tools: %v", got)
+	}
+}

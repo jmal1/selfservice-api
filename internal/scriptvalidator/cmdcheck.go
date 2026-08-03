@@ -99,9 +99,21 @@ func unknownCommandFindings(userScript string) []Finding {
 		for _, m := range matches {
 			name := line[m[2]:m[3]]
 
-			// Skip variable assignments (FOO=bar) and flags.
+			// Skip variable assignments (FOO=bar) and appends (FOO+=bar,
+			// arr+=(elem)).
+			//
+			// The append form matters far more than it looks. Conditional array
+			// building is the idiomatic way to assemble curl/ssh arguments:
+			//
+			//	[[ -n "$cookies" ]] && curl_args+=(-b "/tmp/$cookies")
+			//
+			// and because that sits after `&&`, the array name lands in what the
+			// regex sees as command position. Without this branch every action
+			// written that way reports its own array as an uninstalled command —
+			// three of Crucible's own shipped library actions did — which is
+			// precisely the noise that trains instructors to ignore the linter.
 			rest := line[m[3]:]
-			if strings.HasPrefix(rest, "=") {
+			if strings.HasPrefix(rest, "=") || strings.HasPrefix(rest, "+=") {
 				continue
 			}
 			// Skip wrapper prefixes; the wrapped command is matched separately
@@ -146,6 +158,44 @@ func unknownCommandFindings(userScript string) []Finding {
 				"administrator to add it to the runner image.",
 		})
 	}
+	return out
+}
+
+// MissingCommands returns the sorted, de-duplicated set of commands a script
+// invokes that will not resolve at runtime in the assessment runner.
+//
+// This is the same analysis that powers the CRU0002 authoring-time warning,
+// exposed so callers can enforce it where a warning is not enough.
+//
+// The authoring-time path is deliberately advisory: it lints scripts an
+// instructor is still writing, where the manifest genuinely cannot know about a
+// tool the script installs itself, and blocking a save on a heuristic would be
+// worse than the problem it solves. That trade does NOT hold for Crucible's own
+// shipped library actions. Those are ours, they are sourced into every single
+// run as one file, and a missing tool in one of them is a graded assessment that
+// no student can pass. For that corpus the finding is a build failure, not a hint.
+func MissingCommands(script string) []string {
+	var out []string
+	seen := make(map[string]struct{})
+	for _, f := range unknownCommandFindings(script) {
+		// Finding.Message embeds the name; recover it from the column span so
+		// there is one extraction path rather than two that can disagree.
+		lines := strings.Split(script, "\n")
+		if f.Line-1 < 0 || f.Line-1 >= len(lines) {
+			continue
+		}
+		line := lines[f.Line-1]
+		if f.Column-1 < 0 || f.EndColumn-1 > len(line) || f.Column > f.EndColumn {
+			continue
+		}
+		name := line[f.Column-1 : f.EndColumn-1]
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	sort.Strings(out)
 	return out
 }
 
