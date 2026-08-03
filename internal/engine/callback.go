@@ -102,10 +102,14 @@ func getRun(r *http.Request) *models.Run {
 
 // handleAction receives an individual action result from the runner.
 func (s *CallbackServer) handleAction(w http.ResponseWriter, r *http.Request) {
+	cbResult := "success"
+	defer func() { s.engine.metrics.RecordCallback("action", cbResult) }()
+
 	run := getRun(r)
 
 	var payload runner.CallbackActionPayload
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		cbResult = "error"
 		http.Error(w, "invalid payload", http.StatusBadRequest)
 		return
 	}
@@ -120,6 +124,7 @@ func (s *CallbackServer) handleAction(w http.ResponseWriter, r *http.Request) {
 	// Append action result to workflow_results.action_results JSONB
 	if err := s.queries.AppendActionResult(r.Context(), run.ID, payload.WorkflowSlug, payload.Action); err != nil {
 		s.logger.Error("failed to append action result", "error", err)
+		cbResult = "error"
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -133,10 +138,14 @@ func (s *CallbackServer) handleAction(w http.ResponseWriter, r *http.Request) {
 
 // handleWorkflow receives a completed workflow result from the runner.
 func (s *CallbackServer) handleWorkflow(w http.ResponseWriter, r *http.Request) {
+	cbResult := "success"
+	defer func() { s.engine.metrics.RecordCallback("workflow", cbResult) }()
+
 	run := getRun(r)
 
 	var payload runner.CallbackWorkflowPayload
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		cbResult = "error"
 		http.Error(w, "invalid payload", http.StatusBadRequest)
 		return
 	}
@@ -164,6 +173,7 @@ func (s *CallbackServer) handleWorkflow(w http.ResponseWriter, r *http.Request) 
 	if err := s.queries.UpdateWorkflowResultBySlug(r.Context(), run.ID, result.WorkflowSlug,
 		result.Status, result.Message, instructorOutput, actionResults, &durationMs); err != nil {
 		s.logger.Error("failed to update workflow result", "error", err)
+		cbResult = "error"
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -182,10 +192,14 @@ func (s *CallbackServer) handleWorkflow(w http.ResponseWriter, r *http.Request) 
 
 // handleComplete receives the final run completion signal from the runner.
 func (s *CallbackServer) handleComplete(w http.ResponseWriter, r *http.Request) {
+	cbResult := "success"
+	defer func() { s.engine.metrics.RecordCallback("complete", cbResult) }()
+
 	run := getRun(r)
 
 	var payload runner.CallbackCompletePayload
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		cbResult = "error"
 		http.Error(w, "invalid payload", http.StatusBadRequest)
 		return
 	}
@@ -198,14 +212,18 @@ func (s *CallbackServer) handleComplete(w http.ResponseWriter, r *http.Request) 
 
 	// Mark the run as completed
 	finalStatus := models.RunStatusCompleted
+	jobResult := "success"
 	if payload.Status == "failed" {
 		finalStatus = models.RunStatusFailed
+		jobResult = "failed"
 	}
 	if err := s.queries.UpdateRunStatus(r.Context(), run.ID, finalStatus, nil); err != nil {
 		s.logger.Error("failed to update run status", "error", err)
+		cbResult = "error"
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	s.engine.metrics.RecordRunnerJob(jobResult)
 
 	// Final count update
 	if err := s.queries.UpdateRunCounts(r.Context(), run.ID); err != nil {
@@ -230,10 +248,14 @@ func (s *CallbackServer) handleComplete(w http.ResponseWriter, r *http.Request) 
 
 // handleHeartbeat receives a liveness heartbeat from the runner.
 func (s *CallbackServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
+	cbResult := "success"
+	defer func() { s.engine.metrics.RecordCallback("heartbeat", cbResult) }()
+
 	run := getRun(r)
 
 	var payload runner.CallbackHeartbeatPayload
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		cbResult = "error"
 		http.Error(w, "invalid payload", http.StatusBadRequest)
 		return
 	}

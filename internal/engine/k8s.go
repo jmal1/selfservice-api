@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -29,6 +30,7 @@ type K8sClient struct {
 	runnerImage   string
 	runnerNode    string
 	trunkNIC      string
+	metrics       *RunnerMetrics
 	logger        *slog.Logger
 }
 
@@ -93,6 +95,7 @@ type ProvisionResult struct {
 // ProvisionRunner creates the K8s Secret, NetworkAttachmentDefinition (if needed),
 // and Job for a runner execution.
 func (k *K8sClient) ProvisionRunner(ctx context.Context, runID, callbackToken string, vlanTag int, workflows []runner.WorkflowDef, target runner.TargetConfig, pod runner.PodConfig, engineURL string) (*ProvisionResult, error) {
+	start := time.Now()
 	resourceName := fmt.Sprintf("crucible-runner-%s", runID[:8])
 	nadName := fmt.Sprintf("pod-vlan-%d", vlanTag)
 
@@ -222,6 +225,9 @@ func (k *K8sClient) ProvisionRunner(ctx context.Context, runID, callbackToken st
 		return nil, fmt.Errorf("create job: %w", err)
 	}
 
+	k.metrics.ObserveRunnerProvision(time.Since(start))
+	k.metrics.incRunnerActive(1)
+
 	k.logger.Info("created runner job",
 		"name", resourceName,
 		"run_id", runID,
@@ -302,10 +308,15 @@ func (k *K8sClient) ensureNAD(ctx context.Context, name string, vlanTag int) err
 // The Job has TTLSecondsAfterFinished as a fallback, but we clean up
 // eagerly when the engine receives the completion callback.
 func (k *K8sClient) CleanupRunner(ctx context.Context, jobName, secretName string) error {
+	// The runner Job is finished (or being force-cleaned); decrement the active gauge
+	// regardless of whether the deletes succeed below.
+	k.metrics.incRunnerActive(-1)
+
 	var errs []string
 
 	// Delete the secret first (contains callback token + workflow scripts)
 	if err := k.clientset.CoreV1().Secrets(k.namespace).Delete(ctx, secretName, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
+		k.metrics.RecordCleanupFailure("secret")
 		errs = append(errs, fmt.Sprintf("delete secret %s: %v", secretName, err))
 	} else {
 		k.logger.Debug("deleted runner secret", "name", secretName)
@@ -316,6 +327,7 @@ func (k *K8sClient) CleanupRunner(ctx context.Context, jobName, secretName strin
 	if err := k.clientset.BatchV1().Jobs(k.namespace).Delete(ctx, jobName, metav1.DeleteOptions{
 		PropagationPolicy: &propagation,
 	}); err != nil && !errors.IsNotFound(err) {
+		k.metrics.RecordCleanupFailure("job")
 		errs = append(errs, fmt.Sprintf("delete job %s: %v", jobName, err))
 	} else {
 		k.logger.Debug("deleted runner job", "name", jobName)
@@ -356,10 +368,11 @@ func (k *K8sClient) CleanupOrphanedRunners(ctx context.Context) (int, error) {
 		k.logger.Info("cleaned up orphaned runner", "job", job.Name)
 	}
 
+	if cleaned > 0 {
+		k.metrics.RecordOrphansCleaned(cleaned)
+	}
 	return cleaned, nil
 }
-
-// DeleteRunnerPod kills the runner pod for a cancelled run.
 func (k *K8sClient) DeleteRunnerPod(ctx context.Context, jobName string) error {
 	// List pods owned by this job
 	pods, err := k.clientset.CoreV1().Pods(k.namespace).List(ctx, metav1.ListOptions{

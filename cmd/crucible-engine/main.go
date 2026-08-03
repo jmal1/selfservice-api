@@ -77,6 +77,23 @@ func main() {
 	queries := engine.NewQueries(pool)
 	eng := engine.New(queries, natsClient, k8sClient, engineID, k8sCfg.EngineURL, logger)
 
+	// Runner metrics. Optional: without a Pushgateway URL every recorder call
+	// is a nil-safe no-op and the engine behaves exactly as before. The
+	// recorder must be attached to BOTH the engine (job outcomes, callbacks)
+	// and the K8s client (provision timings, cleanup failures, orphans) —
+	// they record from different call sites.
+	var runnerMetrics *engine.RunnerMetrics
+	if pgURL := getEnv("ENGINE_PUSHGATEWAY_URL", ""); pgURL != "" {
+		runnerMetrics = engine.NewRunnerMetrics(pgURL, getEnv("ENGINE_PUSHGATEWAY_JOB", "crucible_engine"), nil)
+		eng = eng.WithRunnerMetrics(runnerMetrics)
+		if k8sClient != nil {
+			k8sClient = k8sClient.WithRunnerMetrics(runnerMetrics)
+		}
+		logger.Info("runner metrics enabled", "pushgateway", pgURL)
+	} else {
+		logger.Info("runner metrics disabled (ENGINE_PUSHGATEWAY_URL unset)")
+	}
+
 	// Wire vCenter client + GuestOperations dispatcher so workflows with
 	// execution_mode=vmware_tools can run in-process. If vCenter config is
 	// missing or connection fails we keep going — kali_runner workflows
@@ -136,6 +153,11 @@ func main() {
 
 	// Start orphan cleanup (every 5 min)
 	go eng.StartOrphanCleanup(ctx)
+
+	// Flush accumulated runner metrics to Pushgateway. Without this the
+	// recorders above only ever mutate in-process counters and nothing
+	// reaches Prometheus. No-op when metrics are disabled.
+	go runnerMetrics.RunPusher(ctx, 30*time.Second, logger)
 
 	// Polling fallback: check for runs every 30 seconds
 	ticker := time.NewTicker(30 * time.Second)
