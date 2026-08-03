@@ -1135,7 +1135,7 @@ func generalizeScript(osType, runID string) string {
 		"sudo apt-get clean 2>/dev/null || sudo dnf clean all 2>/dev/null || true",
 		"history -c 2>/dev/null || true",
 		"rm -f ~/.bash_history",
-		fmt.Sprintf("vmware-rpctool %q", "info-set "+generalizeSentinelKey+" "+runID),
+		fmt.Sprintf("sudo vmware-rpctool %q", "info-set "+generalizeSentinelKey+" "+runID),
 		"sudo shutdown -h now",
 	}, "\n")
 }

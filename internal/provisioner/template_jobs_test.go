@@ -741,6 +741,29 @@ func TestGeneralizeScript_LinuxStampsSentinelBeforeShutdown(t *testing.T) {
 	}
 }
 
+// TestGeneralizeScript_SentinelStampRunsAsRoot guards a foot-gun in the fix
+// itself. Setting a guestinfo variable goes through the VMware backdoor and
+// open-vm-tools restricts that to root; as the unprivileged build user the
+// command fails with permission denied. Because the script runs under `set -e`
+// and the stamp is deliberately NOT swallowed, an unprivileged stamp would
+// abort the script BEFORE `shutdown` -- leaving the VM powered on and turning
+// every Linux generalize into a hard failure. Every other privileged line in
+// this script already uses sudo.
+func TestGeneralizeScript_SentinelStampRunsAsRoot(t *testing.T) {
+	got := generalizeScript("linux", "run-1")
+	for _, line := range strings.Split(got, "\n") {
+		if !strings.Contains(line, "vmware-rpctool") {
+			continue
+		}
+		if !strings.HasPrefix(strings.TrimSpace(line), "sudo ") {
+			t.Fatalf("sentinel stamp does not run as root: %q\n"+
+				"info-set is root-only, so this aborts under `set -e` before the guest ever shuts down.", line)
+		}
+		return
+	}
+	t.Fatal("no vmware-rpctool line found to check")
+}
+
 // TestGeneralizeScript_SentinelIsRunScoped guards the specific trap a constant
 // sentinel would fall into: retrying generalize on a VM that already carries a
 // sentinel from a previous attempt would confirm instantly, even if this run
