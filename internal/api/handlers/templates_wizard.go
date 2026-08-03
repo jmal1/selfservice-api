@@ -306,6 +306,22 @@ func (h *Handler) AdminGeneralizeTemplate(w http.ResponseWriter, r *http.Request
 	if guestPass == "" {
 		guestPass = tmpl.DefaultPassword
 	}
+	// Last resort: an unattended ISO build baked its own credentials into the
+	// guest from unattend_config, and that is the authoritative record of what
+	// the account actually is. Demanding the operator re-enter credentials the
+	// platform generated itself is both pointless and error-prone -- they are
+	// not shown anywhere in the wizard, so the only way to satisfy the old
+	// check was to read them back out of the database by hand.
+	if guestUser == "" || guestPass == "" {
+		if u, p := unattendCredentials(tmpl); u != "" && p != "" {
+			if guestUser == "" {
+				guestUser = u
+			}
+			if guestPass == "" {
+				guestPass = p
+			}
+		}
+	}
 	if guestUser == "" || guestPass == "" {
 		http.Error(w,
 			"guest_username and guest_password are required (provide in body or set default_username/default_password on the template)",
@@ -334,6 +350,31 @@ func (h *Handler) AdminGeneralizeTemplate(w http.ResponseWriter, r *http.Request
 // unit-testable: the handler itself needs a live database to reach this
 // point, which would otherwise make the gate untestable and therefore easy
 // to silently delete. Returns blocked=false for every non-Linux template.
+// unattendCredentials recovers the guest account an unattended ISO install
+// created, from the template's unattend_config.
+//
+// For a cloudinit_cidata / autounattend build these ARE the real credentials:
+// the platform generated them, rendered them into the seed ISO, and the
+// installer created that account inside the guest. Nothing else in the system
+// knows them -- they are deliberately not copied to default_password, because
+// that column is the per-clone student credential rather than the build one.
+//
+// Returns ("", "") for anything it cannot parse; callers treat that as "no
+// fallback available" and fall through to the normal required-field error.
+func unattendCredentials(tmpl *models.Template) (string, string) {
+	if len(tmpl.UnattendConfig) == 0 {
+		return "", ""
+	}
+	var spec struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.Unmarshal(tmpl.UnattendConfig, &spec); err != nil {
+		return "", ""
+	}
+	return spec.Username, spec.Password
+}
+
 func linuxContractPublishError(tmpl *models.Template) (string, bool) {
 	violations := templates.ValidateLinuxTemplateContract(tmpl)
 	if len(violations) == 0 {

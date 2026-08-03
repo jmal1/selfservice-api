@@ -638,3 +638,42 @@ func TestLinuxContractPublishError_BlocksLiveUbuntuDefect(t *testing.T) {
 		})
 	}
 }
+
+// TestUnattendCredentials_RecoversTheGeneratedBuildAccount guards the fallback
+// that makes generalize usable for ISO-built templates.
+//
+// An unattended install generates its own guest credentials and records them in
+// unattend_config; they are never copied to default_password (that column is
+// the per-clone student credential). Before this fallback existed, POST
+// /generalize returned 400 "guest_username and guest_password are required" for
+// a template the platform had built itself, and the only way to proceed was to
+// read the password back out of the database by hand.
+func TestUnattendCredentials_RecoversTheGeneratedBuildAccount(t *testing.T) {
+	tmpl := &models.Template{
+		UnattendConfig: []byte(`{"hostname":"tpl","username":"student","password":"s3cr3t","time_zone":"America/New_York"}`),
+	}
+	u, p := unattendCredentials(tmpl)
+	if u != "student" || p != "s3cr3t" {
+		t.Fatalf("unattendCredentials = (%q, %q), want (student, s3cr3t); "+
+			"generalize will reject an ISO template whose credentials only the platform knows", u, p)
+	}
+}
+
+// A malformed or empty unattend_config must degrade to "no fallback", never to
+// a panic or to half-credentials that produce a confusing guest auth failure
+// deep inside the worker.
+func TestUnattendCredentials_UnusableConfigYieldsNoFallback(t *testing.T) {
+	for name, cfg := range map[string][]byte{
+		"nil":            nil,
+		"empty":          []byte(``),
+		"not json":       []byte(`this is not json`),
+		"no credentials": []byte(`{"hostname":"tpl"}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			u, p := unattendCredentials(&models.Template{UnattendConfig: cfg})
+			if u != "" || p != "" {
+				t.Fatalf("got (%q, %q), want empty so the caller falls through to the normal error", u, p)
+			}
+		})
+	}
+}

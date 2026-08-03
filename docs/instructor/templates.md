@@ -139,6 +139,21 @@ open to watch it happen.
 When state flips to `ready`, the staging VM is no longer interactive —
 the console button disappears.
 
+You are not asked for the guest's username and password. Crucible uses, in
+order: whatever you supply explicitly, then the template's
+`default_username` / `default_password`, then — for a template built by an
+**unattended ISO install** — the account the installer created, which the
+platform generated and recorded when it built the seed ISO. That last case
+matters because those credentials are not displayed anywhere in the wizard.
+
+> [!note]
+> **Reaching `ready` means the cleanup provably finished**, not just that the
+> VM powered off. On Linux the script stamps a completion marker that survives
+> the shutdown; if it is missing, the template goes to `error` rather than
+> `ready` even though the VM is off. See
+> [Generalize failed, or the template published but clones behave oddly](troubleshooting.md#generalize-failed-or-the-template-published-but-clones-behave-oddly)
+> for what each outcome means.
+
 ## Step 5 — Publish
 
 Click **Publish to students**. The template first enters `verifying`,
