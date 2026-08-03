@@ -24,9 +24,9 @@ import (
 
 // K8sClient wraps the Kubernetes client for runner pod lifecycle management.
 type K8sClient struct {
-	clientset     kubernetes.Interface
-	dynamicClient dynamic.Interface
-	namespace     string
+	clientset        kubernetes.Interface
+	dynamicClient    dynamic.Interface
+	namespace        string
 	runnerImage      string
 	runnerNode       string
 	trunkNIC         string
@@ -163,8 +163,8 @@ func (k *K8sClient) ProvisionRunner(ctx context.Context, runID, callbackToken st
 			Name:      secretName,
 			Namespace: k.namespace,
 			Labels: map[string]string{
-				"app":                    "crucible-runner",
-				"forge.crucible/run-id":  runID,
+				"app":                   "crucible-runner",
+				"forge.crucible/run-id": runID,
 			},
 		},
 		Data: map[string][]byte{
@@ -179,16 +179,16 @@ func (k *K8sClient) ProvisionRunner(ctx context.Context, runID, callbackToken st
 
 	// 3. Create Job
 	var activeDeadline int64 = runnerActiveDeadlineSeconds
-	var ttlAfterFinished int32 = 300   // 5 min cleanup
-	var backoffLimit int32 = 0         // No retries
+	var ttlAfterFinished int32 = 300 // 5 min cleanup
+	var backoffLimit int32 = 0       // No retries
 
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      resourceName,
 			Namespace: k.namespace,
 			Labels: map[string]string{
-				"app":                    "crucible-runner",
-				"forge.crucible/run-id":  runID,
+				"app":                   "crucible-runner",
+				"forge.crucible/run-id": runID,
 			},
 		},
 		Spec: batchv1.JobSpec{
@@ -198,8 +198,8 @@ func (k *K8sClient) ProvisionRunner(ctx context.Context, runID, callbackToken st
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
-						"app":                    "crucible-runner",
-						"forge.crucible/run-id":  runID,
+						"app":                   "crucible-runner",
+						"forge.crucible/run-id": runID,
 					},
 					Annotations: map[string]string{
 						"k8s.v1.cni.cncf.io/networks": nadName,
@@ -351,8 +351,8 @@ func (k *K8sClient) ensureNAD(ctx context.Context, name string, vlanTag int) err
 				"name":      name,
 				"namespace": k.namespace,
 				"labels": map[string]any{
-					"app":                      "crucible-runner",
-					"forge.crucible/vlan":      fmt.Sprintf("%d", vlanTag),
+					"app":                 "crucible-runner",
+					"forge.crucible/vlan": fmt.Sprintf("%d", vlanTag),
 				},
 			},
 			"spec": map[string]any{
