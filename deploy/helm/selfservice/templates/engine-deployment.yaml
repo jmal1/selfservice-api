@@ -59,6 +59,16 @@ spec:
               value: {{ .Values.engine.trunkNIC | default "ens34" | quote }}
             - name: ENGINE_CALLBACK_URL
               value: "http://{{ .Release.Name }}-engine.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.engine.port | default 8081 }}"
+            {{- if .Values.engine.pushgatewayURL }}
+            # Without this the engine logs "runner metrics disabled" and every
+            # RunnerMetrics call is a no-op, so runner provisioning duration,
+            # job outcomes, cleanup failures and orphan counts never reach
+            # Prometheus even though the code to record them exists.
+            - name: ENGINE_PUSHGATEWAY_URL
+              value: {{ .Values.engine.pushgatewayURL | quote }}
+            - name: ENGINE_PUSHGATEWAY_JOB
+              value: {{ .Values.engine.pushgatewayJob | default "crucible_engine" | quote }}
+            {{- end }}
           ports:
             - name: callback
               containerPort: {{ .Values.engine.port | default 8081 }}

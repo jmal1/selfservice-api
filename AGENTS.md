@@ -181,7 +181,7 @@ When the runner pod executes a workflow's `script`, it provides these helpers an
 | `CRUCIBLE_TARGET_USERNAME` | Default credentials for the target (set by template) |
 | `CRUCIBLE_TARGET_PASSWORD` | Default credentials for the target |
 | `CRUCIBLE_POD_SUBNET` | The pod's VLAN CIDR (e.g. `10.30.5.0/24`) |
-| `CRUCIBLE_POD_INDEX` | Numeric index of the pod within its blueprint |
+| `CRUCIBLE_POD_INDEX` | The pod's VLAN tag (e.g. `119`) — a stable numeric identifier unique to the pod's network. Previously documented as an index within a blueprint; the `pods.pod_index` column backing that was dropped in migration 000003, so the VLAN tag is now the pod's numeric identity. |
 | `CRUCIBLE_WORKDIR` | A per-workflow scratch directory; deleted after run |
 | `CRUCIBLE_SOCKET` | Unix socket the sidecar listens on (used by `run_action`) |
 | `CRUCIBLE_CONTEXT` | Path to the per-workflow JSON context file (used by `ctx_set`/`ctx_get`) |
