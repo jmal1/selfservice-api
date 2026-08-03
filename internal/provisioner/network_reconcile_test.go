@@ -386,8 +386,89 @@ func TestReconcileNetwork_IsIdempotent_NoDuplicatePassRules(t *testing.T) {
 	}
 }
 
-func TestReconcileNetwork_SearchRuleErrorSkipsFirewallRepair(t *testing.T) {
-	// Defensive: if listing rules fails (e.g. searchRule 500 during OOM), the
+// TestHasEquivalentPassRule_AgainstRealFilterGetParse is an end-to-end guard for
+// the reviewer's "false-green" concern: it runs the REAL
+// opnsense.GetFirewallRules against a production-shaped firewall/filter/get
+// payload (option-maps, multi-select interface, empty description) and asserts
+// the reconciler's content-signature dedup DETECTS the already-present pod rule
+// — proving the idempotency source is filter/get, not the near-empty searchRule.
+func TestHasEquivalentPassRule_AgainstRealFilterGetParse(t *testing.T) {
+	const filterGetBody = `{
+	  "filter": { "rules": { "rule": {
+	    "pod-opt3": {
+	      "enabled": "1", "sequence": "1",
+	      "interface":  {"opt3": {"value":"OPT3","selected":1}, "opt5": {"value":"OPT5","selected":0}},
+	      "direction":  {"in": {"value":"in","selected":1}, "out": {"value":"out","selected":0}},
+	      "action":     {"pass": {"value":"Pass","selected":1}, "block": {"value":"Block","selected":0}},
+	      "ipprotocol": {"inet": {"value":"IPv4","selected":1}, "inet6": {"value":"IPv6","selected":0}},
+	      "protocol":   {"any": {"value":"any","selected":1}, "TCP": {"value":"TCP","selected":0}},
+	      "source_net": "10.100.0.0/24", "source_port": "",
+	      "destination_net": "any", "destination_port": "", "description": ""
+	    },
+	    "mgmt": {
+	      "enabled": "1", "sequence": "2",
+	      "interface":  {"lan": {"value":"LAN","selected":"1"}, "opt1": {"value":"OPT1","selected":"1"}},
+	      "direction":  {"any": {"value":"any","selected":"1"}},
+	      "action":     {"pass": {"value":"Pass","selected":"1"}},
+	      "ipprotocol": {"inet": {"value":"IPv4","selected":"1"}},
+	      "protocol":   {"any": {"value":"any","selected":"1"}},
+	      "source_net": "10.10.10.0/24", "source_port": "",
+	      "destination_net": "10.100.0.0/16", "destination_port": "",
+	      "description": "Allow management VLAN to pod subnets"
+	    }
+	  }}}
+	}`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/firewall/filter/get" {
+			t.Errorf("idempotency list must use filter/get, got %s", r.URL.Path)
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
+		}
+		_, _ = io.WriteString(w, filterGetBody)
+	}))
+	defer srv.Close()
+
+	c := opnsense.New(opnsense.Config{BaseURL: srv.URL}, discardLogger())
+	rules, err := c.GetFirewallRules(context.Background())
+	if err != nil {
+		t.Fatalf("GetFirewallRules: %v", err)
+	}
+	if len(rules) != 2 {
+		t.Fatalf("expected 2 rules parsed from filter/get, got %d: %+v", len(rules), rules)
+	}
+
+	// The exact rule the reconciler would create for VLAN 100 on opt3 must be
+	// detected as already-present (so it is NOT re-created).
+	existing := opnsense.FirewallRule{
+		Enabled: "1", Action: "pass", Interface: "opt3", Direction: "in",
+		IPProtocol: "inet", Protocol: "any", Source: "10.100.0.0/24",
+		Destination: "any", Description: "Allow Pod VLAN 100 traffic",
+	}
+	if !hasEquivalentPassRule(rules, existing) {
+		t.Fatalf("expected existing pod rule (opt3) to be detected from filter/get; rules=%+v", rules)
+	}
+
+	// A pod rule for a DIFFERENT VLAN/interface is not present -> must NOT match,
+	// so the reconciler would (correctly) create it.
+	missing := existing
+	missing.Interface = "opt4"
+	missing.Source = "10.100.1.0/24"
+	if hasEquivalentPassRule(rules, missing) {
+		t.Fatalf("must not match a rule that is absent from filter/get; rules=%+v", rules)
+	}
+
+	// The management rule (lan,opt1) must not be mistaken for a pod pass rule.
+	mgmtShaped := existing
+	mgmtShaped.Interface = "opt3"
+	mgmtShaped.Destination = "10.100.0.0/16" // different destination than the pod rule
+	if hasEquivalentPassRule(rules, mgmtShaped) {
+		t.Fatalf("destination must be part of the signature; unexpected match; rules=%+v", rules)
+	}
+}
+
+func TestReconcileNetwork_ListErrorSkipsFirewallRepair(t *testing.T) {
+	// Defensive: if listing rules fails (e.g. filter/get 500 during OOM), the
 	// reconciler must skip firewall repair rather than blindly re-create rules.
 	podID := uuid.New()
 	row := allocatedVLANRow(121, podID, "active")
@@ -396,7 +477,7 @@ func TestReconcileNetwork_SearchRuleErrorSkipsFirewallRepair(t *testing.T) {
 		vlans:                  map[int]*opnsense.VLAN{121: {Tag: "121"}},
 		dhcpSubnets:            map[string]*opnsense.DHCPSubnet{row.Subnet: {Subnet: row.Subnet}},
 		selectedDHCPInterfaces: []string{"opt16"},
-		getFirewallErr:         errors.New("searchRule: 500 Internal Server Error"),
+		getFirewallErr:         errors.New("get firewall rules: API error 500: Internal Server Error"),
 	}
 	ssh := &fakeNetworkSSH{findByVLAN: map[int]string{121: "opt16"}}
 	db := &fakeNetworkDB{rows: []database.AllocatedVLAN{row}}
@@ -407,7 +488,7 @@ func TestReconcileNetwork_SearchRuleErrorSkipsFirewallRepair(t *testing.T) {
 	}
 
 	if len(opn.createFirewallCalls) != 0 {
-		t.Fatalf("expected NO firewall rule creation when searchRule fails, got %+v", opn.createFirewallCalls)
+		t.Fatalf("expected NO firewall rule creation when the rule listing fails, got %+v", opn.createFirewallCalls)
 	}
 	if counts.FirewallRulesRepaired != 0 || counts.FirewallApplied != 0 || opn.applyFirewallCalls != 0 {
 		t.Fatalf("expected no firewall changes/apply on list failure, got counts=%+v applyCalls=%d", counts, opn.applyFirewallCalls)
