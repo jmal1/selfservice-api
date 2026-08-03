@@ -645,9 +645,25 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 	}
 
 	// --- Step 8: Mark pod active ---
+	//
+	// Compare-and-swap on "provisioning" rather than an unconditional write. A destroy job
+	// runs independently of this one and can complete while we are still working -- vCenter
+	// can take minutes to report a VM's IP, and the destroy tears the VMs down in that
+	// window. Writing "active" unconditionally meant the slow create won simply by finishing
+	// last, resurrecting the pod as active with no VM behind it. Nothing detects that: the
+	// API, the UI and the quota accounting all trust this column.
 	p.publishProgress(job.ID, "pod_active", "Pod is active")
-	if err := p.db.UpdatePodStatus(ctx, pod.ID, "active", ""); err != nil {
+	applied, err := p.db.UpdatePodStatusFrom(ctx, pod.ID, []string{"provisioning"}, "active", "")
+	if err != nil {
 		return fmt.Errorf("update pod to active: %w", err)
+	}
+	if !applied {
+		// A destroy moved the pod out of "provisioning" underneath us. Leave its status
+		// alone -- destroy is the terminal intent and must win -- and report success, since
+		// failing the job here would only queue a retry against a pod that no longer exists.
+		p.logger.Warn("pod left provisioning during create; not marking active",
+			"pod_id", pod.ID, "vlan", vlanTag)
+		return nil
 	}
 
 	p.logger.Info("pod created successfully", "pod_id", pod.ID, "vlan", vlanTag)

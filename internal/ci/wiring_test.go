@@ -90,3 +90,58 @@ func TestCmdMains_WireOptionalDependencies(t *testing.T) {
 		})
 	}
 }
+
+// TestCreatePod_ActiveTransitionIsGuarded pins the compare-and-swap on the create
+// job's final status write.
+//
+// Pod create and pod destroy are independent worker jobs and can overlap. vCenter
+// routinely takes minutes to report a VM's IP, and a destroy issued during that wait
+// deletes the VMs and marks the pod destroyed. With an unconditional UPDATE the slow
+// create won purely by finishing last and re-marked the pod "active" -- with no VM
+// behind it.
+//
+// Observed in production on 2026-08-03: pod d0a994c6 was destroyed at 13:13:30, and
+// its still-running create job set it back to "active" at 13:15:06.
+//
+// The resulting ghost pod is silent by construction. The API, the UI and quota
+// accounting all trust pods.status, so the pod reads as healthy, consumes its owner's
+// quota indefinitely, and no reconciler reaps it -- every component believes the
+// column. That makes this strictly worse than a create that fails outright.
+//
+// This is a source-text guard for the same reason as the wiring table above: there is
+// no Postgres test harness in this repo, so the CAS itself cannot be exercised in a
+// unit test. Reverting the call to the unconditional variant would compile, pass every
+// other test, and silently restore the bug.
+func TestCreatePod_ActiveTransitionIsGuarded(t *testing.T) {
+	root := findRepoRoot(t)
+	relPath := "internal/provisioner/create.go"
+
+	data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(relPath)))
+	if err != nil {
+		t.Fatalf("read %s: %v", relPath, err)
+	}
+	src := string(data)
+
+	const guarded = `UpdatePodStatusFrom(ctx, pod.ID, []string{"provisioning"}, "active", "")`
+	if !strings.Contains(src, guarded) {
+		t.Errorf(
+			"%s does not perform its active transition via %s.\n"+
+				"Without the compare-and-swap, a create that finishes after a concurrent "+
+				"destroy resurrects the pod as active with no VM behind it.",
+			relPath, guarded,
+		)
+	}
+
+	// "UpdatePodStatusFrom(" does not contain "UpdatePodStatus(", so this matches only
+	// the unconditional variant.
+	const unguarded = `UpdatePodStatus(ctx, pod.ID, "active"`
+	if strings.Contains(src, unguarded) {
+		t.Errorf(
+			"%s writes the active status unconditionally via %s.\n"+
+				"That is the ghost-pod bug: destroy is the terminal intent and must win, "+
+				"so the transition to active must be conditional on the pod still being "+
+				"in \"provisioning\".",
+			relPath, unguarded,
+		)
+	}
+}

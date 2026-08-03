@@ -1003,6 +1003,31 @@ func (q *Queries) UpdatePodStatus(ctx context.Context, id uuid.UUID, status, err
 	return err
 }
 
+// UpdatePodStatusFrom transitions a pod to status only if it is currently in one of
+// fromStatuses, reporting whether the transition actually applied.
+//
+// This is a compare-and-swap, and it exists because pod create and pod destroy are
+// independent worker jobs that can overlap: vCenter can take minutes to report a VM's
+// IP, and a destroy issued in the meantime completes against the same pod. With an
+// unconditional UPDATE the slow create won simply by finishing last, resurrecting a
+// pod that destroy had already torn down into an "active" row with no VM behind it.
+// Such a ghost pod is invisible -- the API and UI report it healthy, it counts against
+// the owner's quota forever, and no reconciler removes it, because every component
+// trusts the status column.
+//
+// Only forward transitions guard themselves this way. Destroy deliberately writes
+// unconditionally: it is the terminal intent and must always win.
+func (q *Queries) UpdatePodStatusFrom(ctx context.Context, id uuid.UUID, fromStatuses []string, status, errMsg string) (bool, error) {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE pods SET status = $1, error_message = $2, updated_at = now()
+		WHERE id = $3 AND status = ANY($4)
+	`, status, errMsg, id, fromStatuses)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // ListDestroyFailedPods returns pods stuck in "destroy_failed" status.
 func (q *Queries) ListDestroyFailedPods(ctx context.Context) ([]models.Pod, error) {
 	rows, err := q.pool.Query(ctx, `
