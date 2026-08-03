@@ -300,10 +300,7 @@ func main() {
 			logger.Warn("invalid WORKER_IDLE_EVALUATOR_INTERVAL; using default 15m", "value", v, "error", err)
 		}
 	}
-	idleEvalDryRun := true // default ON — see comment above
-	if v := os.Getenv("WORKER_IDLE_EVALUATOR_DRY_RUN"); strings.EqualFold(v, "false") {
-		idleEvalDryRun = false
-	}
+	idleEvalDryRun := provisioner.ParseDryRunEnv(os.Getenv("WORKER_IDLE_EVALUATOR_DRY_RUN"))
 	var idleEvalPusher *provisioner.SuspendMetrics
 	if pgURL := os.Getenv("WORKER_PUSHGATEWAY_URL"); pgURL != "" {
 		job := os.Getenv("WORKER_PUSHGATEWAY_JOB")

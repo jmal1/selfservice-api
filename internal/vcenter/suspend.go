@@ -1,7 +1,7 @@
 package vcenter
 
 // VM performance and suspend operations — added by the idle-suspend feature
-// (migration 000026). Kept in a separate file so the diff on client.go stays
+// (migration 000025). Kept in a separate file so the diff on client.go stays
 // tight (that file is gofmt-dirty at HEAD on purpose).
 
 import (

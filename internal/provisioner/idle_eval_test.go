@@ -568,3 +568,42 @@ func TestMetricsProductionCallSites(t *testing.T) {
 		t.Errorf("lastRunUnix %d not in [%d, %d]", tsUnix, before.Unix(), after.Unix())
 	}
 }
+
+// TestParseDryRunEnv verifies the fail-closed semantics of ParseDryRunEnv.
+//
+// Dry-run must be ON for every input that is not an explicit, unambiguous
+// "false". A typo in a Helm values file (e.g. "yes", "1", "") must never be
+// the thing that enables live VM suspension.
+func TestParseDryRunEnv(t *testing.T) {
+	tests := []struct {
+		input   string
+		dryRun  bool // true = dry-run ON (safe), false = dry-run OFF (live)
+		comment string
+	}{
+		// --- dry-run ON (the safe side) ---
+		{"", true, "empty string → dry-run ON (default)"},
+		{"true", true, `"true" → dry-run ON`},
+		{"True", true, `"True" → dry-run ON`},
+		{"TRUE", true, `"TRUE" → dry-run ON`},
+		{"1", true, `"1" is not "false" → dry-run ON`},
+		{"yes", true, `"yes" is not "false" → dry-run ON`},
+		{"YES", true, `"YES" is not "false" → dry-run ON`},
+		{"0", true, `"0" is not "false" → dry-run ON`},
+		{"no", true, `"no" is not "false" → dry-run ON`},
+		{"off", true, `"off" is not "false" → dry-run ON`},
+		{"disabled", true, `unparseable value → dry-run ON`},
+
+		// --- dry-run OFF (only explicit "false", case-insensitive) ---
+		{"false", false, `"false" → dry-run OFF`},
+		{"False", false, `"False" → dry-run OFF`},
+		{"FALSE", false, `"FALSE" → dry-run OFF`},
+	}
+
+	for _, tc := range tests {
+		got := ParseDryRunEnv(tc.input)
+		if got != tc.dryRun {
+			t.Errorf("ParseDryRunEnv(%q) = %v, want %v — %s",
+				tc.input, got, tc.dryRun, tc.comment)
+		}
+	}
+}

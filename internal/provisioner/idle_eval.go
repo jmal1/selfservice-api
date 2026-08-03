@@ -28,16 +28,17 @@
 //     operator explicitly sets WORKER_IDLE_EVALUATOR_DRY_RUN=false after
 //     validating the decisions on live data.
 //   - Four hard refusal guards block suspension even when both signals are idle:
-//       1. VM has an active job in flight.
-//       2. Pod is provisioning or destroying.
-//       3. An assessment run is in flight targeting this VM.
-//       4. VMware Tools is not running — absent signal ≠ idle.
+//     1. VM has an active job in flight.
+//     2. Pod is provisioning or destroying.
+//     3. An assessment run is in flight targeting this VM.
+//     4. VMware Tools is not running — absent signal ≠ idle.
 package provisioner
 
 import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -46,6 +47,20 @@ import (
 	"github.com/jmal1/selfservice-api/internal/models"
 	"github.com/jmal1/selfservice-api/internal/vcenter"
 )
+
+// ParseDryRunEnv converts an environment-variable string to a dry-run bool.
+//
+// The function is fail-closed: dry-run is ON unless v is exactly the string
+// "false" (case-insensitive). Every other value — empty string, "yes", "1",
+// "TRUE", an unparseable value — leaves dry-run ON. This matters because a
+// typo in a Helm values file must never be the thing that causes a student's
+// VM to be suspended mid-exam.
+//
+// Accepted false values: "false", "False", "FALSE".
+// Everything else → true (dry-run ON).
+func ParseDryRunEnv(v string) bool {
+	return !strings.EqualFold(v, "false")
+}
 
 // Default idle-evaluation thresholds.
 const (

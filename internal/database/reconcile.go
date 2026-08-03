@@ -109,7 +109,7 @@ func (q *Queries) ListPodVMLinksByVCenterID(ctx context.Context) (map[string]Pod
 	return out, rows.Err()
 }
 
-// ---------- Idle-suspend support (migration 000026) ----------
+// ---------- Idle-suspend support (migration 000025) ----------
 
 // IdleSuspendCandidate is the minimal per-VM information the idle evaluator
 // needs. It avoids loading every PodVM column on every reconcile tick.

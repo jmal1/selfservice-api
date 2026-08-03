@@ -329,7 +329,7 @@ type PodVM struct {
 	CreatedAt         time.Time `json:"created_at" db:"created_at"`
 	TemplateName      string    `json:"template_name,omitempty"`
 	OSType            string    `json:"os_type,omitempty"`
-	// Activity tracking — set by migration 000026.
+	// Activity tracking — set by migration 000025.
 	LastConsoleAt  *time.Time `json:"last_console_at,omitempty" db:"last_console_at"`
 	LastActivityAt *time.Time `json:"last_activity_at,omitempty" db:"last_activity_at"`
 	SuspendedAt    *time.Time `json:"suspended_at,omitempty" db:"suspended_at"`
