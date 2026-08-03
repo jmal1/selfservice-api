@@ -75,6 +75,25 @@ const (
 	// long-running manual debugging sessions where you want synthetic pods
 	// to stick around.
 	envJanitorMaxAge = "SYNTHETIC_JANITOR_MAX_AGE"
+
+	// envInstructorUserID is the UUID of the dedicated instructor-role row
+	// (synthetic-instructor). When set, the monitor mints a SECOND session
+	// cookie for it and registers the checks in checks.Elevated().
+	//
+	// It is deliberately a separate user rather than an elevated role on
+	// the primary synthetic user: admin_list_users_403, admin_audit_403,
+	// wiki_index_rbac, pod_testing_dashboard_404 and image_upload_rbac all
+	// assert that the primary identity is REFUSED. Raising its role would
+	// leave all five passing while proving nothing.
+	//
+	// Unset is a supported configuration — the elevated checks are skipped
+	// with a warning, so the binary rolls out safely before the DB row
+	// exists.
+	envInstructorUserID = "SYNTHETIC_INSTRUCTOR_USER_ID"
+	// envInstructorUsername defaults to synthetic-instructor and MUST match
+	// the users row, because handlers and the audit log resolve the row by
+	// the JWT's user id.
+	envInstructorUsername = "SYNTHETIC_INSTRUCTOR_USERNAME"
 )
 
 func main() {
@@ -122,6 +141,23 @@ func run(logger *slog.Logger) error {
 	pg := synthetic.NewPushgateway(pushgatewayURL, job, map[string]string{
 		"layer": layer,
 	})
+
+	// Second, elevated identity. See envInstructorUserID for why this is a
+	// separate user row rather than a higher role on the primary one.
+	instructorID := os.Getenv(envInstructorUserID)
+	instructorName := envOr(envInstructorUsername, "synthetic-instructor")
+	var instructorClient *synthetic.Client
+	mintInstructorCookie := func() (string, error) {
+		return synthetic.MintSessionToken([]byte(jwtSecret), instructorID, instructorName,
+			"instructor", checkTimeout*time.Duration(len(checks.All())+1))
+	}
+	if instructorID != "" {
+		instructorCookie, err := mintInstructorCookie()
+		if err != nil {
+			return fmt.Errorf("mint instructor session token: %w", err)
+		}
+		instructorClient = synthetic.NewClient(baseURL, instructorCookie)
+	}
 
 	// Build the active check list. The expensive pod_lifecycle check is
 	// gated by SYNTHETIC_LIFECYCLE_ENABLED so the binary can be rolled out
@@ -177,6 +213,30 @@ func run(logger *slog.Logger) error {
 		activeChecks = append(activeChecks, checks.PodLifecycle(cfg))
 	}
 
+	// Elevated (instructor-role) checks. Skipped loudly rather than
+	// silently: without them the admin surface is covered only by the
+	// student-side 403 assertions, which cannot distinguish "the route
+	// works" from "the route 503s because a dependency was never wired".
+	if !envBool(envJanitorMode) {
+		if instructorClient != nil {
+			elevated := checks.Elevated(checks.ElevatedConfig{Client: instructorClient})
+			names := make([]string, 0, len(elevated))
+			for _, c := range elevated {
+				names = append(names, c.Name())
+			}
+			logger.Info("registering elevated checks",
+				"instructor_user", instructorName,
+				"checks", strings.Join(names, ","),
+			)
+			activeChecks = append(activeChecks, elevated...)
+		} else {
+			logger.Warn("elevated checks DISABLED: no instructor identity configured",
+				"env", envInstructorUserID,
+				"consequence", "the authenticated admin surface (/admin/images, /admin/vcenter/isos, wizard-state) is unmonitored; a 503 from an unwired dependency will look identical to a healthy deploy",
+			)
+		}
+	}
+
 	runner := synthetic.NewRunner(client, pg, activeChecks, logger)
 	// pod_lifecycle needs its own timeout budget — it polls for minutes.
 	// Use the larger of (configured CheckTimeout) or (ready + destroy + 60s).
@@ -227,6 +287,15 @@ func run(logger *slog.Logger) error {
 		cookie, err = mintCookie()
 		if err != nil {
 			return fmt.Errorf("re-mint session token: %w", err)
+		}
+		if instructorClient != nil {
+			ic, err := mintInstructorCookie()
+			if err != nil {
+				return fmt.Errorf("re-mint instructor session token: %w", err)
+			}
+			// Elevated checks hold this pointer, so mutating in place
+			// refreshes them too.
+			instructorClient.SessionCookie = ic
 		}
 	}
 }

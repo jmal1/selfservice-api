@@ -58,6 +58,26 @@ spec:
                     secretKeyRef:
                       name: {{ .Values.secrets.jwt }}
                       key: jwt-secret
+                # Elevated (instructor-role) identity. Deliberately a
+                # SEPARATE users row rather than a higher role on the
+                # primary synthetic user: admin_list_users_403,
+                # admin_audit_403, wiki_index_rbac,
+                # pod_testing_dashboard_404 and image_upload_rbac all
+                # assert the primary identity is REFUSED, so elevating it
+                # would leave five checks passing while proving nothing.
+                #
+                # optional: true means a cluster whose secret predates the
+                # instructor row starts cleanly and logs a warning, rather
+                # than CrashLoopBackOff-ing the whole monitor.
+                # Bootstrap the row with deploy/sql/synthetic-instructor-user.sql.
+                - name: SYNTHETIC_INSTRUCTOR_USER_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.synthetic.secretName }}
+                      key: instructor-user-id
+                      optional: true
+                - name: SYNTHETIC_INSTRUCTOR_USERNAME
+                  value: {{ .Values.synthetic.instructorUsername | quote }}
                 {{- if .Values.synthetic.lifecycle.enabled }}
                 - name: SYNTHETIC_LIFECYCLE_ENABLED
                   value: "true"

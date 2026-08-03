@@ -231,6 +231,12 @@ synthetic:
   # synthetic user row in the users table. Bootstrap via the SQL in
   # deploy/sql/synthetic-user.sql.
   secretName: selfservice-synthetic-user
+  # Username claim for the elevated identity. MUST match the users row
+  # created by deploy/sql/synthetic-instructor-user.sql. The UUID itself
+  # lives in the same secret as the primary user, under key
+  # `instructor-user-id`; when that key is absent the elevated checks are
+  # skipped with a warning rather than failing the monitor.
+  instructorUsername: "synthetic-instructor"
   resources:
     requests:
       cpu: 25m

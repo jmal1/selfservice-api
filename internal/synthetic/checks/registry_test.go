@@ -202,6 +202,7 @@ func TestAll_StableNames(t *testing.T) {
 		"admin_audit_403":           true,
 		"pod_testing_dashboard_404": true,
 		"wiki_index_rbac":           true,
+		"image_upload_rbac":         true,
 	}
 	for _, c := range All() {
 		if !wantNames[c.Name()] {

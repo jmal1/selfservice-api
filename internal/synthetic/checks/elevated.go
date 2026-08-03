@@ -1,0 +1,202 @@
+package checks
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+
+	"github.com/jmal1/selfservice-api/internal/synthetic"
+)
+
+// ElevatedConfig carries an instructor-role client for the checks that must
+// probe an authenticated admin surface rather than merely prove a student is
+// refused.
+//
+// Why a second identity exists at all: the monitor mints one session JWT per
+// cycle, and the production synthetic user is deliberately a STUDENT so that
+// admin_list_users_403, admin_audit_403, wiki_index_rbac,
+// pod_testing_dashboard_404 and image_upload_rbac all assert a real denial.
+// Elevating that single user would silently turn five RBAC checks into
+// tautologies — they would still pass, while proving nothing. So instead we
+// mint a second cookie for a separate, dedicated instructor row
+// (synthetic-instructor) whose OIDC subject cannot be produced by Authentik
+// and whose pod/vCPU/RAM quotas are zero, so it can read the admin surface
+// and provision nothing.
+//
+// See WikiIndexRBAC's docstring for the limitation this removes.
+type ElevatedConfig struct {
+	// Client is the instructor-role client. Elevated checks use THIS
+	// client and deliberately ignore the one the Runner passes to Run(),
+	// because the Runner's client is the student identity.
+	Client *synthetic.Client
+}
+
+// errNoElevatedClient is returned rather than falling back to the runner's
+// student client. A silent fallback would turn every elevated check into a
+// "403 != 200" failure whose message pointed at the endpoint instead of at
+// the misconfiguration, which is a materially worse page at 3am.
+func (cfg ElevatedConfig) client() (*synthetic.Client, error) {
+	if cfg.Client == nil {
+		return nil, fmt.Errorf("elevated check has no instructor client configured (SYNTHETIC_INSTRUCTOR_USER_ID unset?)")
+	}
+	return cfg.Client, nil
+}
+
+// Elevated returns the checks that require an instructor-role identity.
+//
+// The caller registers these only when an instructor client is available;
+// cmd/synthetic-api-monitor logs loudly and skips them otherwise, so a
+// half-configured deploy shows up as "4 checks" rather than as four
+// mysteriously failing ones.
+func Elevated(cfg ElevatedConfig) []synthetic.Check {
+	return []synthetic.Check{
+		imageListContract(cfg),
+		isoCatalogReachable(cfg),
+		templateWizardState404(cfg),
+	}
+}
+
+// imageListContract proves the /admin/images read path actually works for
+// someone allowed to use it.
+//
+// The specific failure this is built for is a 503. Both AdminListImages and
+// AdminListVCenterISOs return "not configured" 503s when their optional
+// dependency was never wired in cmd/api-gateway — the dead-wiring class that
+// hit five separate lanes during this feature's development (and once in
+// Helm, where values.yaml declared an objectstore block that no template
+// consumed). A 503 here is indistinguishable from a healthy deploy to every
+// other check in the catalog, because nothing else touches the route with
+// credentials that get past the role gate.
+func imageListContract(cfg ElevatedConfig) synthetic.Check {
+	return synthetic.CheckFunc{
+		NameVal:        "image_list_contract",
+		TitleVal:       "Image Library Responds",
+		DescriptionVal: "Lists /admin/images as an instructor and requires 200 with a JSON array. A 503 here means the object store was never wired into the API process even though the deploy looked healthy.",
+		SeverityVal:    synthetic.SeverityWarning,
+		RunFn: func(ctx context.Context, _ *synthetic.Client) (int, error) {
+			c, err := cfg.client()
+			if err != nil {
+				return 0, err
+			}
+			resp, err := c.Do(ctx, http.MethodGet, "/api/v1/admin/images", nil)
+			if err != nil {
+				return 0, err
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+
+			switch resp.StatusCode {
+			case http.StatusOK:
+			case http.StatusServiceUnavailable:
+				return resp.StatusCode, fmt.Errorf(
+					"image library returned 503 — the object store is not wired into the API process (check OBJECTSTORE_* env and WithImageStore in cmd/api-gateway)")
+			case http.StatusForbidden:
+				return resp.StatusCode, fmt.Errorf(
+					"image library returned 403 to the instructor identity — the synthetic instructor user is missing, inactive, or no longer has role=instructor")
+			default:
+				return resp.StatusCode, fmt.Errorf(
+					"image library returned %d, want 200: %s", resp.StatusCode, snippet(body))
+			}
+
+			// A nil slice marshals to `null`, which is a legitimate empty
+			// library. An object would mean the response shape changed.
+			var items []json.RawMessage
+			if err := json.Unmarshal(body, &items); err != nil {
+				return resp.StatusCode, fmt.Errorf(
+					"image library body is not a JSON array: %w (body=%s)", err, snippet(body))
+			}
+			return resp.StatusCode, nil
+		},
+	}
+}
+
+// isoCatalogReachable proves the wizard's ISO picker can still browse the
+// vCenter datastore.
+//
+// This is the check that would have caught the vCenter credential rotation
+// that previously broke datastore browsing. The handler maps a vCenter error
+// to 502 and an unwired dependency to 503, so the two failure modes are
+// distinguishable from the metric alone.
+func isoCatalogReachable(cfg ElevatedConfig) synthetic.Check {
+	return synthetic.CheckFunc{
+		NameVal:        "iso_catalog_reachable",
+		TitleVal:       "ISO Catalog (vCenter Datastore)",
+		DescriptionVal: "Browses the vCenter ISO datastore via /admin/vcenter/isos as an instructor. A 502 means vCenter rejected us (usually a rotated credential); a 503 means the lister was never wired.",
+		SeverityVal:    synthetic.SeverityWarning,
+		RunFn: func(ctx context.Context, _ *synthetic.Client) (int, error) {
+			c, err := cfg.client()
+			if err != nil {
+				return 0, err
+			}
+			resp, err := c.Do(ctx, http.MethodGet, "/api/v1/admin/vcenter/isos", nil)
+			if err != nil {
+				return 0, err
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+
+			switch resp.StatusCode {
+			case http.StatusOK:
+				return resp.StatusCode, nil
+			case http.StatusBadGateway:
+				return resp.StatusCode, fmt.Errorf(
+					"ISO catalog returned 502 — vCenter rejected the datastore browse (rotated credential, or the datastore name drifted from NAS-BackupsAndISOS): %s", snippet(body))
+			case http.StatusServiceUnavailable:
+				return resp.StatusCode, fmt.Errorf(
+					"ISO catalog returned 503 — the vCenter ISO lister is not wired into the API process")
+			case http.StatusForbidden:
+				return resp.StatusCode, fmt.Errorf(
+					"ISO catalog returned 403 to the instructor identity — the synthetic instructor user is missing, inactive, or no longer has role=instructor")
+			default:
+				return resp.StatusCode, fmt.Errorf(
+					"ISO catalog returned %d, want 200: %s", resp.StatusCode, snippet(body))
+			}
+		},
+	}
+}
+
+// templateWizardState404 asserts a missing template yields 404, never 500.
+//
+// This is the same nil-deref class as pod_testing_dashboard_404, but that
+// check can only be written against a route a student may reach. The wizard
+// state endpoint sits behind RequireRole(instructor), so as a student it
+// returns 403 before the handler ever runs — a student-token version of this
+// check would pass forever while the handler panicked on every real call.
+// That is exactly why it needs the elevated identity.
+func templateWizardState404(cfg ElevatedConfig) synthetic.Check {
+	return synthetic.CheckFunc{
+		NameVal:        "template_wizard_state_404",
+		TitleVal:       "Missing Template Returns 404 (not 500)",
+		DescriptionVal: "Requests wizard state for a phantom template UUID as an instructor and requires 404. Watches for the nil-deref class that produced 500s for missing pods in GetTestingDashboard.",
+		SeverityVal:    synthetic.SeverityCritical,
+		RunFn: func(ctx context.Context, _ *synthetic.Client) (int, error) {
+			c, err := cfg.client()
+			if err != nil {
+				return 0, err
+			}
+			const phantom = "00000000-0000-0000-0000-000000000000"
+			resp, err := c.Do(ctx, http.MethodGet, "/api/v1/admin/templates/"+phantom+"/wizard-state", nil)
+			if err != nil {
+				return 0, err
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+
+			switch resp.StatusCode {
+			case http.StatusNotFound:
+				return resp.StatusCode, nil
+			case http.StatusInternalServerError:
+				return resp.StatusCode, fmt.Errorf(
+					"phantom template wizard-state returned 500 (the nil-deref bug this check watches for): %s", snippet(body))
+			case http.StatusForbidden:
+				return resp.StatusCode, fmt.Errorf(
+					"phantom template wizard-state returned 403 — the instructor identity is broken, so this check is no longer reaching the handler it exists to guard")
+			default:
+				return resp.StatusCode, fmt.Errorf(
+					"phantom template wizard-state returned %d, want 404: %s", resp.StatusCode, snippet(body))
+			}
+		},
+	}
+}
