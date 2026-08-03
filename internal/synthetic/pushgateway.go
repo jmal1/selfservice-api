@@ -143,6 +143,23 @@ func serializeResults(results []Result) []byte {
 		fmt.Fprintf(&b, `crucible_synthetic_check_info{check=%q,title=%q,description=%q,severity=%q} 1`+"\n",
 			r.Name, sanitizeLabel(r.Title), sanitizeLabel(r.Description), string(r.Severity))
 	}
+	// Metric: crucible_synthetic_checks_registered — how many checks this cycle
+	// actually ran.
+	//
+	// This is the generic guard for a failure mode that is otherwise invisible.
+	// PushResults POSTs each metric family, and Pushgateway REPLACES a family
+	// wholesale on POST, so a check that stops being registered does not go
+	// stale — its series ceases to exist. Every alert we have is shaped like
+	// `1 - crucible_synthetic_check_success > 0`, which cannot match an absent
+	// series, so silently dropping a check reads as a perfectly green board.
+	//
+	// Per-feature meta-checks (see checks.ElevatedIdentityConfigured) cover one
+	// case each and have to be remembered every time. This counter covers ALL of
+	// them at once, and alerting on a DECREASE rather than on a fixed threshold
+	// means it never needs updating as checks are added.
+	b.WriteString("# HELP crucible_synthetic_checks_registered Number of checks executed in this run. A decrease means coverage was silently lost.\n")
+	b.WriteString("# TYPE crucible_synthetic_checks_registered gauge\n")
+	fmt.Fprintf(&b, "crucible_synthetic_checks_registered %d\n", len(results))
 	// Metric: crucible_synthetic_run_timestamp_seconds — unix time of this push.
 	// Used by alerts that want to fire if results are stale (no recent push).
 	b.WriteString("# HELP crucible_synthetic_run_timestamp_seconds Unix time of the latest synthetic run.\n")
