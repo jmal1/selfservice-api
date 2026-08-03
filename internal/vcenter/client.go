@@ -948,6 +948,50 @@ func (c *Client) selectBestPool(ctx context.Context, vcpus int32, ramMB int64) (
 	return best.pool, nil
 }
 
+// resolvePlacementPool picks the resource pool for a VM that has no source VM
+// to inherit placement from — a blank ISO shell or an imported OVA.
+//
+// The explicit path is honoured first, then the pools this deployment is
+// actually configured with, and only then vSphere's notion of a "default"
+// pool. That last fallback used to be the only one, and it is a trap: with
+// more than one cluster in the datacenter, DefaultResourcePool cannot choose
+// and fails with "default resource pool resolves to multiple instances,
+// please specify" — an error that names no config key and no caller. No
+// production caller sets ResourcePool (nothing builds a
+// TemplateProvisionPayload with a pool), so every ISO template build on a
+// multi-cluster vCenter failed there, which is exactly how this was found.
+//
+// Going through selectBestPool also means a template shell lands via the same
+// RAM-weighted placement as every pod VM, rather than wherever vSphere would
+// have guessed.
+func (c *Client) resolvePlacementPool(ctx context.Context, explicitPath string, vcpus int32, ramMB int64) (*object.ResourcePool, error) {
+	if explicitPath != "" {
+		pool, err := c.finder.ResourcePool(ctx, explicitPath)
+		if err != nil {
+			return nil, fmt.Errorf("find resource pool %q: %w", explicitPath, err)
+		}
+		return pool, nil
+	}
+
+	if len(c.config.ResourcePools) > 0 {
+		pool, err := c.selectBestPool(ctx, vcpus, ramMB)
+		if err == nil {
+			return pool, nil
+		}
+		// Configured but unusable (renamed, or vCenter refused the stats
+		// lookup). Say so, then still try the default so a half-broken
+		// config degrades instead of hard-failing.
+		c.logger.Warn("configured resource pools unusable, falling back to datacenter default",
+			"pools", c.config.ResourcePools, "error", err)
+	}
+
+	pool, err := c.finder.DefaultResourcePool(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("resolve resource pool (set the params' ResourcePool or vcenter VCENTER_RESOURCE_POOLS config; the datacenter default is ambiguous with multiple clusters): %w", err)
+	}
+	return pool, nil
+}
+
 // selectBestPoolInSourceCluster is the same RAM-based selection as
 // selectBestPool but constrained to resource pools that live in the
 // same cluster as the source host. Used by template clones because

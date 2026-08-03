@@ -89,17 +89,13 @@ func (c *Client) ImportOVA(ctx context.Context, p OVAImportParams) (string, erro
 		return "", fmt.Errorf("find datastore %q: %w", p.Datastore, err)
 	}
 
-	var pool *object.ResourcePool
-	if p.ResourcePool != "" {
-		pool, err = c.finder.ResourcePool(ctx, p.ResourcePool)
-		if err != nil {
-			return "", fmt.Errorf("find resource pool %q: %w", p.ResourcePool, err)
-		}
-	} else {
-		pool, err = c.finder.DefaultResourcePool(ctx)
-		if err != nil {
-			return "", fmt.Errorf("resolve default resource pool (specify ResourcePool): %w", err)
-		}
+	// An imported OVA has no source VM either, so it hits the same
+	// multi-cluster placement trap as a blank ISO shell. Size hints come from
+	// the OVF's own resource section when present; they only steer the
+	// RAM-weighted choice between pools, so 0 is safe.
+	pool, err := c.resolvePlacementPool(ctx, p.ResourcePool, 0, 0)
+	if err != nil {
+		return "", err
 	}
 
 	var folder *object.Folder
