@@ -71,10 +71,12 @@ wiki-bundle: ## Build the instructor wiki bundle (run after editing seeds)
 verify-wiki: ## Fail if wiki bundle is out of date (CI guard)
 	@tmp=$$(mktemp -d) && \
 		$(GO) run ./cmd/wiki-bundler -repo-root . -out $$tmp $(addprefix -seed ,$(WIKI_SEEDS)) && \
-		diff -r $$tmp $(WIKI_OUT) > /dev/null 2>&1 || { \
+		diff -r $$tmp $(WIKI_OUT) > $$tmp.diff 2>&1 || { \
 			echo "FAIL: $(WIKI_OUT) is stale. Run 'make wiki-bundle' and commit."; \
-			rm -rf $$tmp; exit 1; \
+			echo "--- differences (fresh build vs committed) ---"; \
+			head -c 4000 $$tmp.diff; \
+			rm -rf $$tmp $$tmp.diff; exit 1; \
 		}; \
-		rm -rf $$tmp; \
+		rm -rf $$tmp $$tmp.diff; \
 		echo "OK: wiki bundle is up to date"
 
