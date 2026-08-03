@@ -127,37 +127,30 @@ func (f *fakeNetworkOPN) CreateFirewallRule(_ context.Context, rule opnsense.Fir
 		return "", f.createFirewallErr
 	}
 	f.createFirewallCalls = append(f.createFirewallCalls, rule)
-	// Simulate how OPNsense's firewall/filter/searchRule renders a rule on
-	// read-back: enum/interface fields come back with different casing and the
-	// description is dropped. The reconciler's dedup must survive this, so the
-	// fake must reproduce it (a verbatim round-trip would hide the real bug).
-	f.firewallRules = append(f.firewallRules, opnsenseSearchRuleReadback(rule, "fw-uuid"))
+	// Model the canonical shape opnsense.GetFirewallRules yields from a
+	// firewall/filter/get read-back of a rule created via addRule (lower-cased,
+	// sorted interface set, empty ports, description dropped). A verbatim
+	// round-trip of the create struct would hide the real bug.
+	f.firewallRules = append(f.firewallRules, opnsenseFilterGetReadback(rule, "fw-uuid"))
 	return "fw-uuid", nil
 }
 
-// opnsenseSearchRuleReadback models the lossy/formatted representation the
-// OPNsense search API returns for a rule created via addRule: action and
-// interface are re-cased and the description is not surfaced.
-func opnsenseSearchRuleReadback(rule opnsense.FirewallRule, uuid string) opnsense.FirewallRuleInfo {
+// opnsenseFilterGetReadback models the canonical FirewallRuleInfo that
+// opnsense.GetFirewallRules produces for a rule created via addRule, after
+// parsing firewall/filter/get and canonicalizing its option-map/plain fields.
+func opnsenseFilterGetReadback(rule opnsense.FirewallRule, uuid string) opnsense.FirewallRuleInfo {
 	return opnsense.FirewallRuleInfo{
 		UUID:        uuid,
-		Interface:   strings.ToUpper(rule.Interface),
-		Direction:   rule.Direction,
-		IPProtocol:  rule.IPProtocol,
-		Protocol:    strings.ToUpper(rule.Protocol),
-		Source:      rule.Source,
-		Destination: rule.Destination,
-		Action:      capitalizeFirst(rule.Action), // matches OPNsense display casing, e.g. "pass" -> "Pass"
+		Interface:   canonicalInterfaceList(rule.Interface),
+		Direction:   canonicalField(rule.Direction),
+		IPProtocol:  canonicalField(rule.IPProtocol),
+		Protocol:    canonicalField(rule.Protocol),
+		Source:      canonicalField(rule.Source),
+		Destination: canonicalField(rule.Destination),
+		Action:      canonicalField(rule.Action),
+		// firewall/filter/get drops the description and the reconciler sets no
+		// ports; leave SourcePort/DestinationPort empty.
 	}
-}
-
-// capitalizeFirst upper-cases the first rune of s (ASCII), leaving the rest as
-// is. Used only to simulate OPNsense's display casing in tests.
-func capitalizeFirst(s string) string {
-	if s == "" {
-		return s
-	}
-	return strings.ToUpper(s[:1]) + s[1:]
 }
 
 func (f *fakeNetworkOPN) ApplyFirewall(_ context.Context) error {
@@ -217,7 +210,7 @@ func (f *fakeNetworkDB) ReleaseVLAN(_ context.Context, podID uuid.UUID) error {
 // Used to pre-seed "healthy" fixtures the way the live firewall would report
 // them (re-cased fields, no description).
 func podPassRuleReadback(ifName, subnet string) opnsense.FirewallRuleInfo {
-	return opnsenseSearchRuleReadback(opnsense.FirewallRule{
+	return opnsenseFilterGetReadback(opnsense.FirewallRule{
 		Enabled:     "1",
 		Action:      "pass",
 		Interface:   ifName,

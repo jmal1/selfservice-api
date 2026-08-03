@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -288,35 +289,42 @@ func isTerminalPodStatus(status string) bool {
 
 // firewallRuleSignature reduces a to-be-created FirewallRule to the canonical
 // content signature used for idempotency comparisons. It mirrors the
-// normalization opnsense.GetFirewallRules applies to rules read back from the
-// OPNsense search API (lower-cased/trimmed enum fields, canonical interface
-// list) so a rule we intend to create compares equal to the same rule already
-// present on the firewall — regardless of how OPNsense renders it on read-back.
+// normalization opnsense.GetFirewallRules applies to rules read back from
+// firewall/filter/get (lower-cased/trimmed enum fields, canonical interface set)
+// so a rule we intend to create compares equal to the same rule already present
+// on the firewall.
 func firewallRuleSignature(rule opnsense.FirewallRule) opnsense.FirewallRuleInfo {
 	return opnsense.FirewallRuleInfo{
 		Interface:   canonicalInterfaceList(rule.Interface),
 		Direction:   canonicalField(rule.Direction),
 		IPProtocol:  canonicalField(rule.IPProtocol),
 		Protocol:    canonicalField(rule.Protocol),
-		Source:      strings.TrimSpace(rule.Source),
-		Destination: strings.TrimSpace(rule.Destination),
+		Source:      canonicalField(rule.Source),
+		Destination: canonicalField(rule.Destination),
 		Action:      canonicalField(rule.Action),
+		// The reconciler never sets source/destination ports on the pod pass
+		// rule, so they are empty in the signature and must be empty on the
+		// existing rule too for a match.
+		SourcePort:      "",
+		DestinationPort: "",
 	}
 }
 
 // hasEquivalentPassRule reports whether a content-equivalent rule for the
-// desired rule already exists. Matching is by CONTENT signature — interface,
-// action, direction, protocol, ipprotocol, source and destination — NOT by
-// description or UUID, both of which OPNsense normalizes/omits on read-back.
-// This is the idempotency guard that prevents the reconciler from re-adding an
-// identical per-VLAN pass rule every cycle (root cause of the 2026-08-02
-// config.xml bloat / OPNsense OOM incident).
+// desired rule already exists. Matching is by CONTENT signature — interface-set,
+// action, direction, ipprotocol, protocol, source(+port) and destination(+port)
+// — NOT by description, uuid or sequence, all of which OPNsense
+// normalizes/omits. This is the idempotency guard that prevents the reconciler
+// from re-adding an identical per-VLAN pass rule every cycle (root cause of the
+// 2026-08-02 config.xml bloat / OPNsense OOM incident).
 func hasEquivalentPassRule(rules []opnsense.FirewallRuleInfo, desired opnsense.FirewallRule) bool {
 	want := firewallRuleSignature(desired)
 	for _, r := range rules {
 		if canonicalField(r.Action) != want.Action ||
-			strings.TrimSpace(r.Source) != want.Source ||
-			strings.TrimSpace(r.Destination) != want.Destination ||
+			canonicalField(r.Source) != want.Source ||
+			canonicalField(r.SourcePort) != want.SourcePort ||
+			canonicalField(r.Destination) != want.Destination ||
+			canonicalField(r.DestinationPort) != want.DestinationPort ||
 			canonicalField(r.Protocol) != want.Protocol ||
 			canonicalField(r.Direction) != want.Direction ||
 			canonicalField(r.IPProtocol) != want.IPProtocol {
@@ -335,7 +343,8 @@ func canonicalField(v string) string {
 }
 
 // canonicalInterfaceList normalizes a (possibly comma-joined) interface value
-// into a canonical comma-joined lower-cased list with each member trimmed.
+// into a canonical, sorted, comma-joined lower-cased list with each member
+// trimmed and empties dropped. Sorting makes the interface set order-insensitive.
 func canonicalInterfaceList(v string) string {
 	parts := strings.Split(v, ",")
 	out := make([]string, 0, len(parts))
@@ -344,6 +353,7 @@ func canonicalInterfaceList(v string) string {
 			out = append(out, p)
 		}
 	}
+	sort.Strings(out)
 	return strings.Join(out, ",")
 }
 
