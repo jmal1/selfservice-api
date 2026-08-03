@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -65,6 +66,11 @@ func main() {
 		RunnerNode:  getEnv("RUNNER_NODE", "k3sv03"),
 		TrunkNIC:    getEnv("RUNNER_TRUNK_NIC", "ens224"),
 		EngineURL:   getEnv("ENGINE_CALLBACK_URL", "http://crucible-engine.selfservice.svc.cluster.local:8081"),
+		// Crucible's GHCR packages are private, so the runner Job needs the same
+		// pull secret every Helm-managed workload gets. Defaulted rather than
+		// left empty: an unset value here fails at pull time with a 401 that
+		// looks like a registry outage, ~10 minutes after the run starts.
+		ImagePullSecrets: splitAndTrim(getEnv("RUNNER_IMAGE_PULL_SECRETS", "ghcr-pull-secret")),
 	}
 
 	var k8sClient *engine.K8sClient
@@ -200,4 +206,17 @@ func getEnvInt(key string, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+// splitAndTrim parses a comma-separated env value into a clean slice, dropping
+// empty entries so a trailing comma or an all-whitespace value yields nil
+// rather than a secret reference named "".
+func splitAndTrim(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
