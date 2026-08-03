@@ -47,12 +47,22 @@ type PodConfig struct {
 }
 
 // ActionEvent is the JSON message received on the Unix socket from run_action in actions.sh.
+//
+// Message carries the student-facing explanation with the event rather than
+// leaving the executor to scrape it out of the workflow's stdout. The two
+// travel over independent channels — the Unix socket and the process's stdout
+// pipe — and run_action necessarily sends the event before it echoes the
+// output, so a stdout-only harvest loses the message whenever the Go reader has
+// not yet drained the pipe. That race is invisible in tests (which write both
+// synchronously) and shows up in production as an action that fails with no
+// explanation at all.
 type ActionEvent struct {
-	Event      string `json:"event"`       // action_start, action_end
+	Event      string `json:"event"`             // action_start, action_end
 	Action     string `json:"action"`
-	Status     string `json:"status"`      // pass, fail (only on action_end)
-	ExitCode   int    `json:"exit_code"`   // (only on action_end)
-	DurationMs int    `json:"duration_ms"` // (only on action_end)
+	Status     string `json:"status"`            // pass, fail (only on action_end)
+	ExitCode   int    `json:"exit_code"`         // (only on action_end)
+	DurationMs int    `json:"duration_ms"`       // (only on action_end)
+	Message    string `json:"message,omitempty"` // student-safe message (only on action_end)
 }
 
 // ActionOutput is the structured result of a single action execution.

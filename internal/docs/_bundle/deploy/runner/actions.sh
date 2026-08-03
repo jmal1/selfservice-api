@@ -41,6 +41,30 @@ _name_to_prefix() {
     echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g' | sed 's/__*/_/g' | sed 's/^_//;s/_$//'
 }
 
+# Escape a string for embedding in a JSON string literal.
+#
+# Event payloads used to be built by splicing shell variables straight into a
+# JSON template. That is fine until a value contains a quote, a backslash or a
+# newline — and the student message, which is derived from an action's output,
+# routinely can. A malformed payload does not error: the sidecar fails to
+# decode it, logs at debug level, and the action's result silently never
+# arrives, so the workflow reports fewer actions than it ran.
+#
+# Done with parameter expansion rather than jq deliberately. jq is installed and
+# build-verified in the runner image, but the event path is how results reach
+# the engine at all; making it depend on an external binary means that if the
+# binary is ever missing the failure mode is total, silent result loss. Backslash
+# must be substituted first, or it would double-escape the escapes added after it.
+_json_escape() {
+    local s="${1-}"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
 # Send event to sidecar via Unix socket
 _sidecar_send() {
     local payload="$1"
@@ -65,7 +89,7 @@ run_action() {
     local timeout_sec="${ACTION_TIMEOUT:-30}"
 
     # Notify sidecar: action starting
-    _sidecar_send "{\"event\":\"action_start\",\"action\":\"$name\"}"
+    _sidecar_send "{\"event\":\"action_start\",\"action\":\"$(_json_escape "$name")\"}"
 
     local start_time exit_code output
     start_time=$(date +%s%N)
@@ -141,12 +165,31 @@ run_action() {
         done
     fi
 
-    # Extract student message from output
+    # Extract the student-facing message the action produced.
+    #
+    # Library action bodies report problems by setting LAST_STUDENT_MSG, which
+    # the dispatch above re-emits on stdout as "STUDENT_MSG:...". Hand-written
+    # workflow scripts echo the same marker directly. Either way it ends up in
+    # "$output", and it must be attached to the event below — NOT left for the
+    # executor to scrape out of the workflow's stdout. The socket event and the
+    # stdout pipe are independent channels, and this event is necessarily sent
+    # before the output is echoed, so a stdout-only harvest races the Go reader
+    # and loses the message.
+    #
+    # Trimming is done with sed, not `xargs`. xargs does shell-style word
+    # splitting: it strips quotes and treats backslashes as escapes, so
+    #   Expected "200" but got C:\path
+    # arrives as
+    #   Expected 200 but got C:path
+    # and an odd number of quotes makes xargs fail outright with "unmatched
+    # double quote", losing the message entirely. Student messages routinely
+    # quote expected values and Windows paths.
     local student_msg=""
-    student_msg=$(echo "$output" | grep -oP '(?<=STUDENT_MSG:).*' | tail -1 | xargs) || true
+    student_msg=$(echo "$output" | grep -oP '(?<=STUDENT_MSG:).*' | tail -1 \
+        | sed 's/^[[:space:]]*//; s/[[:space:]]*$//') || true
 
     # Notify sidecar: action complete
-    _sidecar_send "{\"event\":\"action_end\",\"action\":\"$name\",\"status\":\"$status\",\"exit_code\":$exit_code,\"duration_ms\":$duration_ms}"
+    _sidecar_send "{\"event\":\"action_end\",\"action\":\"$(_json_escape "$name")\",\"status\":\"$status\",\"message\":\"$(_json_escape "$student_msg")\",\"exit_code\":$exit_code,\"duration_ms\":$duration_ms}"
 
     # Print output for debugging (visible in instructor_output)
     if [ -n "$output" ]; then

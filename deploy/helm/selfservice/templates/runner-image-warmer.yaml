@@ -1,0 +1,84 @@
+{{- /*
+Nil-safe on purpose. If a values override drops the runnerImageWarmer block, the
+naive `.Values.engine.runnerImageWarmer.enabled` raises a nil-pointer error that
+fails the *entire* chart render — one missing optional key would block a deploy
+of the API, worker and UI too. Defaulting to off degrades to "slow first run",
+which is the failure mode this warmer exists to soften, not one it can cause.
+*/ -}}
+{{- if (.Values.engine.runnerImageWarmer | default dict).enabled }}
+{{- /*
+Keeps the runner image resident on the runner node.
+
+Assessment runner Jobs are ephemeral and pull `runnerImage` on creation. A cold
+pull of the ~1 GB Kali image measured 528 s on k3sv03 — 59 % of the 900 s
+ActiveDeadlineSeconds budget, spent before a single check runs. The run survived,
+but the margin is thin enough that a slower registry day kills a student's
+assessment with a timeout that has nothing to do with their work.
+
+This DaemonSet holds the image on the node so the pull is paid once at deploy
+time instead of by whichever student happens to run first. Holding it also pins
+it against kubelet image garbage collection, which matters because k3sv03 runs
+on an 18 GB root filesystem at 65 % use — an eviction would silently reintroduce
+the stall long after anyone could connect it to a deploy.
+
+It deliberately runs the real `runnerImage` rather than a smaller placeholder:
+the point is to have *these* layers on disk. `sleep infinity` as nobody with all
+capabilities dropped keeps it inert; it carries no Multus annotation and so never
+touches a pod VLAN.
+
+Because the tag is floating (`:latest`), a new push does not change this pod's
+spec, so Helm alone will not restart it. deploy.sh issues a `rollout restart`
+after upgrade — without that the warmer would keep a *stale* image warm, which is
+worse than not having one.
+*/}}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ .Release.Name }}-runner-image-warmer
+  labels:
+    app.kubernetes.io/name: selfservice-runner-image-warmer
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: runner-image-warmer
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: selfservice-runner-image-warmer
+      app.kubernetes.io/component: runner-image-warmer
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: selfservice-runner-image-warmer
+        app.kubernetes.io/component: runner-image-warmer
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      nodeSelector:
+        kubernetes.io/hostname: {{ .Values.engine.runnerNode | quote }}
+      tolerations:
+        - key: role
+          operator: Equal
+          value: runner
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+      containers:
+        - name: warmer
+          image: {{ .Values.engine.runnerImage | quote }}
+          imagePullPolicy: Always
+          command: ["sleep", "infinity"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 1m
+              memory: 8Mi
+            limits:
+              memory: 32Mi
+{{- end }}

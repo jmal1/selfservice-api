@@ -1,11 +1,16 @@
 package runner_test
 
 import (
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/jmal1/selfservice-api/internal/runner"
 )
 
 // These tests execute deploy/runner/actions.sh for real, rather than asserting
@@ -45,8 +50,30 @@ func actionsShSource(t *testing.T) string {
 // the whole test would fail for reasons unrelated to what it checks.
 func runActionsShScript(t *testing.T, library, body string) string {
 	t.Helper()
+	return runActionsShScriptVars(t, library, body, nil)
+}
+
+// runActionsShScriptVars is runActionsShScript with extra shell variables
+// defined for the body.
+//
+// Values are injected base64-encoded and decoded inside bash rather than passed
+// through the process environment. Two reasons: `bash` on a developer machine
+// may be WSL, which does not inherit the Windows environment at all — so an
+// env-passed value silently arrives empty and the test asserts nothing, which is
+// exactly how this helper failed the first time — and base64 is pure ASCII, so
+// the test's own quoting can never be mistaken for the escaping under test. The
+// `; printf X` / `%X` pair preserves trailing newlines, which command
+// substitution would otherwise strip.
+func runActionsShScriptVars(t *testing.T, library, body string, vars map[string]string) string {
+	t.Helper()
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skip("bash not available")
+	}
+
+	var decls strings.Builder
+	for k, v := range vars {
+		enc := base64.StdEncoding.EncodeToString([]byte(v))
+		fmt.Fprintf(&decls, "%s=$(printf '%%s' '%s' | base64 -d; printf X); %s=${%s%%X}\n", k, enc, k, k)
 	}
 
 	script := "set -uo pipefail\n" +
@@ -59,6 +86,7 @@ func runActionsShScript(t *testing.T, library, body string) string {
 		"export CRUCIBLE_CONTEXT=\"$tmpdir/context.json\"\n" +
 		"export CRUCIBLE_SOCKET=\"$tmpdir/no-such.sock\"\n" +
 		"source \"$CRUCIBLE_ACTIONS_LIB\"\n" +
+		decls.String() +
 		body
 
 	cmd := exec.Command("bash", "-s")
@@ -178,6 +206,154 @@ func TestActionsSh_ActionBodyFailureDoesNotAbortViaSetE(t *testing.T) {
 	}
 	if !strings.Contains(out, "RC_NONZERO") {
 		t.Errorf("body's own `return 1` must still surface as a failure, got:\n%s", out)
+	}
+}
+
+// sidecarEvents runs body with _sidecar_send replaced by a capture shim and
+// returns the decoded event payloads.
+//
+// The shim is installed *after* actions.sh is sourced, which works because bash
+// resolves function calls at call time. Capturing the real payload is the point:
+// these tests are about the bytes that reach the sidecar, and asserting on
+// anything less would not have caught a payload that the sidecar cannot decode.
+func sidecarEvents(t *testing.T, library, body string) []runner.ActionEvent {
+	t.Helper()
+	out := runActionsShScript(t, library,
+		"_sidecar_send() { echo \"SIDECAR_EVENT:$1\"; }\n"+body)
+
+	var events []runner.ActionEvent
+	for _, line := range strings.Split(out, "\n") {
+		raw, ok := strings.CutPrefix(strings.TrimSpace(line), "SIDECAR_EVENT:")
+		if !ok {
+			continue
+		}
+		var ev runner.ActionEvent
+		if err := json.Unmarshal([]byte(raw), &ev); err != nil {
+			t.Fatalf("sidecar payload is not decodable JSON — the sidecar would drop this\n"+
+				"event entirely and the action would never be reported.\npayload: %s\nerror: %v\nfull output:\n%s",
+				raw, err, out)
+		}
+		events = append(events, ev)
+	}
+	if len(events) == 0 {
+		t.Fatalf("no sidecar events captured; output was:\n%s", out)
+	}
+	return events
+}
+
+func actionEndEvent(t *testing.T, events []runner.ActionEvent) runner.ActionEvent {
+	t.Helper()
+	for _, ev := range events {
+		if ev.Event == "action_end" {
+			return ev
+		}
+	}
+	t.Fatalf("no action_end event among %d events", len(events))
+	return runner.ActionEvent{}
+}
+
+func TestActionsSh_ActionEndCarriesStudentMessage(t *testing.T) {
+	// The student message must travel ON the event, not be left for the executor
+	// to scrape out of the workflow's stdout.
+	//
+	// run_action necessarily sends the event before it echoes the action's
+	// output, and the socket and the stdout pipe are independent channels, so a
+	// stdout-only harvest races the Go reader draining the pipe. In production
+	// that race is routinely lost: the observed symptom was a failing action
+	// whose message field was empty even though "STUDENT_MSG:Web server returned
+	// 000 instead of 200" was sitting in the captured body.
+	ev := actionEndEvent(t, sidecarEvents(t, demoLibrary,
+		"run_action \"Demo\" demo_action --value bad || true\n"))
+
+	if ev.Status != "fail" {
+		t.Errorf("status = %q, want fail", ev.Status)
+	}
+	if ev.Message != "Expected good, got 'bad'." {
+		t.Errorf("action_end carried message %q; the student sees a failed check with no reason", ev.Message)
+	}
+}
+
+func TestActionsSh_ActionEndOmitsMessageOnPass(t *testing.T) {
+	// A passing check must not carry a stale or blank explanation.
+	ev := actionEndEvent(t, sidecarEvents(t, demoLibrary,
+		"run_action \"Demo\" demo_action --value good || true\n"))
+
+	if ev.Status != "pass" {
+		t.Errorf("status = %q, want pass", ev.Status)
+	}
+	if ev.Message != "" {
+		t.Errorf("passing action carried message %q, want empty", ev.Message)
+	}
+}
+
+func TestActionsSh_EventPayloadSurvivesJSONMetacharacters(t *testing.T) {
+	// Action names come from instructor-authored workflow scripts and student
+	// messages are derived from command output, so both can contain quotes and
+	// backslashes. Splicing them into a JSON template unescaped produces a
+	// payload the sidecar cannot decode — and a decode failure is silent: the
+	// action's result simply never arrives, so the run reports fewer actions
+	// than it actually executed.
+	lib := `nasty_action() {
+    LAST_STUDENT_MSG='Expected "200" but got C:\path\to\nothing	(tab)'
+    return 1
+}`
+	ev := actionEndEvent(t, sidecarEvents(t, lib,
+		"run_action 'Check \"quoted\" C:\\path' nasty_action || true\n"))
+
+	if ev.Action != `Check "quoted" C:\path` {
+		t.Errorf("action name mangled in transit: %q", ev.Action)
+	}
+	if !strings.Contains(ev.Message, `Expected "200"`) || !strings.Contains(ev.Message, `C:\path\to`) {
+		t.Errorf("student message mangled in transit: %q", ev.Message)
+	}
+}
+
+func TestJSONEscape_ProducesValidJSON(t *testing.T) {
+	cases := map[string]string{
+		"plain":                  "all good",
+		"double quote":           `he said "no"`,
+		"backslash":              `C:\Users\student`,
+		"trailing backslash":     `trailing\`,
+		"escaped looking":        `\"not really escaped\"`,
+		"newline":                "line one\nline two",
+		"carriage return":        "line one\rline two",
+		"tab":                    "col1\tcol2",
+		"everything":             "a\"b\\c\nd\te\rf",
+		"empty":                  "",
+		"json injection attempt": `x","event":"action_start","injected":"`,
+	}
+
+	for name, in := range cases {
+		t.Run(name, func(t *testing.T) {
+			// Feed the input through the environment so the test's own quoting
+			// cannot be mistaken for the escaping under test.
+			out := runActionsShScriptVars(t, "",
+				"printf 'ESCAPED:{\"v\":\"%s\"}\\n' \"$(_json_escape \"$CRUCIBLE_TEST_INPUT\")\"\n",
+				map[string]string{"CRUCIBLE_TEST_INPUT": in})
+
+			var raw string
+			for _, line := range strings.Split(out, "\n") {
+				if v, ok := strings.CutPrefix(strings.TrimSpace(line), "ESCAPED:"); ok {
+					raw = v
+				}
+			}
+			if raw == "" {
+				t.Fatalf("no escaped output captured:\n%s", out)
+			}
+
+			var decoded struct {
+				V string `json:"v"`
+			}
+			if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+				t.Fatalf("_json_escape produced a value that breaks the JSON literal.\n"+
+					"input:  %q\npayload: %s\nerror: %v", in, raw, err)
+			}
+			// Newline/CR/tab survive as themselves through JSON; the escaping is
+			// lossless, not merely valid.
+			if decoded.V != in {
+				t.Errorf("round-trip changed the value.\ninput:  %q\noutput: %q", in, decoded.V)
+			}
+		})
 	}
 }
 

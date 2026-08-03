@@ -86,6 +86,53 @@ func TestUnixSocket_ActionEvents(t *testing.T) {
 	sidecar.Close()
 }
 
+func TestUnixSocket_ActionEndPropagatesStudentMessage(t *testing.T) {
+	// run_action puts the student-facing message on the action_end event
+	// precisely so the executor does not have to scrape it out of the workflow's
+	// stdout — the socket and the stdout pipe are independent channels and the
+	// event is sent first, so the scrape loses the race. If the sidecar drops
+	// the field on the way through, that whole fix is inert and every failing
+	// library action reports a bare red X with no reason.
+	dir := t.TempDir()
+	socketPath := filepath.Join(dir, "test.sock")
+	contextPath := filepath.Join(dir, "context.json")
+	os.WriteFile(contextPath, []byte("{}"), 0644)
+
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	callback := NewCallbackClient("http://localhost:9999", "tok", logger)
+	sidecar := NewSidecar(socketPath, contextPath, callback, logger)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	resultCh := make(chan ActionOutput, 10)
+	go func() { sidecar.Listen(ctx, "test-wf", resultCh) }()
+	time.Sleep(100 * time.Millisecond)
+
+	const msg = `Web server returned 000 instead of 200 for http://10.100.19.10:80`
+	sendEvent(t, socketPath, ActionEvent{
+		Event:      "action_end",
+		Action:     "HTTP Responds",
+		Status:     "fail",
+		ExitCode:   1,
+		DurationMs: 28,
+		Message:    msg,
+	})
+
+	select {
+	case result := <-resultCh:
+		if result.Message != msg {
+			t.Errorf("Message = %q, want %q — the student sees a failed check with no explanation",
+				result.Message, msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for action result")
+	}
+
+	cancel()
+	sidecar.Close()
+}
+
 func TestContextSnapshot(t *testing.T) {
 	dir := t.TempDir()
 	socketPath := filepath.Join(dir, "test.sock")
