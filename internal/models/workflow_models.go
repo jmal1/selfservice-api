@@ -168,6 +168,13 @@ type Run struct {
 	TriggeredBy     uuid.UUID  `json:"triggered_by" db:"triggered_by"`
 	RunnerVMID      *string    `json:"runner_vm_id" db:"runner_vm_id"`
 	RunnerVMName    *string    `json:"runner_vm_name" db:"runner_vm_name"`
+	// TargetPodVMID / TargetVMName / TargetVMIP identify the pod VM that was
+	// graded. Distinct from RunnerVM*, which name the ephemeral Kali runner Job.
+	// Name and IP are denormalized copies so the attribution survives pod
+	// teardown; TargetPodVMID goes NULL when the pod_vms row is deleted.
+	TargetPodVMID *uuid.UUID `json:"target_pod_vm_id" db:"target_pod_vm_id"`
+	TargetVMName  string     `json:"target_vm_name" db:"target_vm_name"`
+	TargetVMIP    string     `json:"target_vm_ip" db:"target_vm_ip"`
 	CallbackToken   string     `json:"-" db:"callback_token"`
 	Status          string     `json:"status" db:"status"`
 	TotalWorkflows  int        `json:"total_workflows" db:"total_workflows"`

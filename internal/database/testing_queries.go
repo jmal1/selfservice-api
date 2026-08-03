@@ -124,6 +124,7 @@ func (q *Queries) CreateRun(ctx context.Context, run *models.Run) error {
 func (q *Queries) GetRecentRunsForPod(ctx context.Context, podID uuid.UUID, limit int) ([]models.Run, error) {
 	rows, err := q.pool.Query(ctx, `
 		SELECT id, pod_id, playlist_id, triggered_by, status,
+		       target_pod_vm_id, target_vm_name, target_vm_ip,
 		       total_workflows, passed_workflows, failed_workflows,
 		       error_message, started_at, completed_at, created_at, updated_at
 		FROM runs WHERE pod_id = $1
@@ -138,6 +139,7 @@ func (q *Queries) GetRecentRunsForPod(ctx context.Context, podID uuid.UUID, limi
 	for rows.Next() {
 		var r models.Run
 		if err := rows.Scan(&r.ID, &r.PodID, &r.PlaylistID, &r.TriggeredBy, &r.Status,
+			&r.TargetPodVMID, &r.TargetVMName, &r.TargetVMIP,
 			&r.TotalWorkflows, &r.PassedWorkflows, &r.FailedWorkflows,
 			&r.ErrorMessage, &r.StartedAt, &r.CompletedAt,
 			&r.CreatedAt, &r.UpdatedAt); err != nil {
@@ -158,11 +160,13 @@ func (q *Queries) GetRun(ctx context.Context, runID uuid.UUID) (*models.Run, err
 	var r models.Run
 	err := q.pool.QueryRow(ctx, `
 		SELECT id, pod_id, playlist_id, triggered_by, runner_vm_id, runner_vm_name,
+		       target_pod_vm_id, target_vm_name, target_vm_ip,
 		       callback_token, status, total_workflows, passed_workflows, failed_workflows,
 		       error_message, started_at, completed_at, created_at, updated_at
 		FROM runs WHERE id = $1
 	`, runID).Scan(&r.ID, &r.PodID, &r.PlaylistID, &r.TriggeredBy,
-		&r.RunnerVMID, &r.RunnerVMName, &r.CallbackToken, &r.Status,
+		&r.RunnerVMID, &r.RunnerVMName,
+		&r.TargetPodVMID, &r.TargetVMName, &r.TargetVMIP, &r.CallbackToken, &r.Status,
 		&r.TotalWorkflows, &r.PassedWorkflows, &r.FailedWorkflows,
 		&r.ErrorMessage, &r.StartedAt, &r.CompletedAt,
 		&r.CreatedAt, &r.UpdatedAt)

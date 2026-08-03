@@ -291,26 +291,55 @@ func (q *Queries) GetPodVLANTag(ctx context.Context, podID uuid.UUID) (int, erro
 	return vlanTag, nil
 }
 
+// TargetVM identifies which pod VM an assessment run was executed against.
+//
+// This is deliberately separate from runner.TargetConfig: TargetConfig is
+// serialized into the Kali runner container's environment, and the pod_vms
+// primary key has no business being shipped to it. This struct stays engine-side
+// so the run record can name the machine that was graded.
+type TargetVM struct {
+	ID          uuid.UUID
+	DisplayName string
+	IP          string
+}
+
 // GetRunTargetInfo retrieves the primary target VM info and pod network config
-// for building the runner config. Returns the target (first VM with credentials)
-// and pod network metadata.
-func (q *Queries) GetRunTargetInfo(ctx context.Context, podID uuid.UUID) (runner.TargetConfig, runner.PodConfig, error) {
+// for building the runner config. Returns the target VM's connection details,
+// pod network metadata, and the identity of the pod_vms row that was chosen.
+//
+// Target selection is "the pod's primary VM", ordered by boot_order then
+// created_at, with pv.id as a final tiebreaker.
+//
+// The tiebreaker is load-bearing, not defensive. This previously ordered by
+// created_at alone, and CreatePod inserts every VM of a pod in one statement --
+// so a multi-VM pod's rows share an identical created_at to the microsecond, and
+// boot_order defaults to 0 for all of them. Postgres plans that ORDER BY as an
+// unstable quicksort, so with equal keys and no tiebreaker "the first VM" was
+// whichever row the sort happened to emit first. Same pod, same playlist, same
+// code could grade a different machine between runs. Because nothing recorded
+// the target either, that would have been invisible: a student's web-server
+// workflow could run against their database VM and simply report a failure.
+// pv.id is a unique primary key, so including it makes the ordering total.
+func (q *Queries) GetRunTargetInfo(ctx context.Context, podID uuid.UUID) (runner.TargetConfig, runner.PodConfig, TargetVM, error) {
 	var target runner.TargetConfig
 	var pod runner.PodConfig
+	var vm TargetVM
 
-	// Get the first VM in this pod with generated credentials
+	// Get the pod's primary VM, with its credentials and its identity.
 	err := q.pool.QueryRow(ctx, `
-		SELECT COALESCE(pv.ip_address, ''), COALESCE(t.os_type, 'linux'),
+		SELECT pv.id, COALESCE(pv.display_name, ''),
+		       COALESCE(pv.ip_address, ''), COALESCE(t.os_type, 'linux'),
 		       COALESCE(pv.generated_username, ''), COALESCE(pv.generated_password, '')
 		FROM pod_vms pv
 		JOIN templates t ON pv.template_id = t.id
 		WHERE pv.pod_id = $1
-		ORDER BY pv.created_at ASC
+		ORDER BY pv.boot_order ASC, pv.created_at ASC, pv.id ASC
 		LIMIT 1
-	`, podID).Scan(&target.IP, &target.OS, &target.Username, &target.Password)
+	`, podID).Scan(&vm.ID, &vm.DisplayName, &target.IP, &target.OS, &target.Username, &target.Password)
 	if err != nil {
-		return target, pod, fmt.Errorf("get target VM: %w", err)
+		return target, pod, vm, fmt.Errorf("get target VM: %w", err)
 	}
+	vm.IP = target.IP
 
 	// Get pod network info.
 	//
@@ -329,10 +358,10 @@ func (q *Queries) GetRunTargetInfo(ctx context.Context, podID uuid.UUID) (runner
 		WHERE p.id = $1
 	`, podID).Scan(&pod.Subnet, &pod.Index)
 	if err != nil {
-		return target, pod, fmt.Errorf("get pod network: %w", err)
+		return target, pod, vm, fmt.Errorf("get pod network: %w", err)
 	}
 
-	return target, pod, nil
+	return target, pod, vm, nil
 }
 
 // GetVMwareToolsTarget loads the moref + guest credentials needed to dispatch
@@ -375,6 +404,22 @@ func (q *Queries) SetRunnerPodName(ctx context.Context, runID uuid.UUID, jobName
 		UPDATE runs SET runner_vm_name = $2, updated_at = NOW()
 		WHERE id = $1
 	`, runID, jobName)
+	return err
+}
+
+// SetRunTarget records which pod VM this run was executed against.
+//
+// Name and IP are stored alongside the foreign key on purpose. Destroying a pod
+// deletes its pod_vms rows and nulls target_pod_vm_id, so without the
+// denormalized copies every historical run for that pod would silently lose the
+// answer to "which machine was this student graded on?" -- which is precisely
+// the question an instructor asks after the lab has been torn down.
+func (q *Queries) SetRunTarget(ctx context.Context, runID uuid.UUID, vm TargetVM) error {
+	_, err := q.pool.Exec(ctx, `
+		UPDATE runs
+		SET target_pod_vm_id = $2, target_vm_name = $3, target_vm_ip = $4, updated_at = NOW()
+		WHERE id = $1
+	`, runID, vm.ID, vm.DisplayName, vm.IP)
 	return err
 }
 

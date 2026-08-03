@@ -10,8 +10,8 @@
     {
       "path": "AGENTS.md",
       "title": "AGENTS.md — Crucible AI Authoring Reference",
-      "size": 30695,
-      "sha256": "92e6b1485204e0641d0a57b71c36255d4ee13d4a2b6bc2c34e38a41994331dff",
+      "size": 31429,
+      "sha256": "21c3414c1c2a905526d38057772637394eeab89f9a801baa7c2a88f748ebbfbe",
       "is_markdown": true,
       "links_out": [
         "deploy/runner/actions.sh",
@@ -127,8 +127,8 @@
     {
       "path": "docs/instructor/runner-environment.md",
       "title": "Runner Environment",
-      "size": 7654,
-      "sha256": "be5cc439a43a74629487ff437f6f99272013ebe76bc48ae8e43f423922982a2a",
+      "size": 8854,
+      "sha256": "a6a689d3e4abc5c9639c0c13512af24d0d057f5c0368b9424d34c0421435e46b",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/overview.md",
@@ -226,16 +226,16 @@
     {
       "path": "internal/engine/engine.go",
       "title": "engine.go (Go)",
-      "size": 17070,
-      "sha256": "cd15c085e91fdf53b0992f9e305f3a54dfa0440eb69dbba6060994bcaa85f4a4",
+      "size": 17572,
+      "sha256": "04c6ed3a41ccee3aeda5608c415a9079d2f3ea8f22b98465ee1288bae75ba889",
       "is_markdown": false,
       "from_seed": false
     },
     {
       "path": "internal/models/workflow_models.go",
       "title": "workflow_models.go (Go)",
-      "size": 9510,
-      "sha256": "8d301e63aeaa9b5907638dc20ef9223290d22230ce6834ad11909a59795f6e42",
+      "size": 10017,
+      "sha256": "dc7675bd6f8a55e8ff8819121166fbbad38c990b956fbab610ed3ff6c5ff40a4",
       "is_markdown": false,
       "from_seed": false
     },
@@ -280,5 +280,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 213479
+  "total_bytes": 216422
 }

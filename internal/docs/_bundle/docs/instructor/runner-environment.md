@@ -42,17 +42,38 @@ Don't guess paths or IPs — use the env vars.
 |---|---|---|
 | `CRUCIBLE_TARGET_IP` | Primary target VM's IP on the pod VLAN | `10.50.12.20` |
 | `CRUCIBLE_TARGET_USERNAME` | Default SSH user on the target | `student` |
-| `CRUCIBLE_TARGET_HOSTNAME` | Target's hostname | `target-01.pod-42.lab` |
+| `CRUCIBLE_TARGET_PASSWORD` | Default password for that user | |
 | `CRUCIBLE_TARGET_OS` | OS family hint | `linux` / `windows` |
-| `CRUCIBLE_POD_ID` | UUID of the student's pod | `c3f1...` |
-| `CRUCIBLE_RUN_ID` | UUID of the current assessment run | `9b21...` |
-| `CRUCIBLE_WORKFLOW_SLUG` | Slug of the running workflow | `telnet-blocked` |
-| `CRUCIBLE_PLAYLIST_SLUG` | Slug of the playlist (if any) | `ssh-hardening-week3` |
-| `CRUCIBLE_STUDENT_USERNAME` | The student's Crucible username | `jsmith` |
+| `CRUCIBLE_POD_SUBNET` | The pod's VLAN CIDR | `10.50.12.0/24` |
+| `CRUCIBLE_POD_INDEX` | The pod's VLAN tag, a stable number unique to the pod | `119` |
+| `CRUCIBLE_WORKDIR` | Per-workflow scratch directory, deleted after the run | |
+| `CRUCIBLE_SOCKET` | Socket `run_action` reports to | |
+| `CRUCIBLE_CONTEXT` | Per-workflow JSON context file | |
 
-If a pod has multiple targets, the secondary ones are exposed as
-`CRUCIBLE_TARGET_<SLOT>_IP` (e.g. `CRUCIBLE_TARGET_WEB_IP`,
-`CRUCIBLE_TARGET_DB_IP`). Slot names come from the blueprint.
+That is the complete list, plus `CTX_*` values from earlier actions and `PARAM_*`
+for library actions. `PATH`, `HOME`, `TERM` and `LANG` are inherited.
+
+> **Not provided:** `CRUCIBLE_TARGET_HOSTNAME`, `CRUCIBLE_POD_ID`,
+> `CRUCIBLE_RUN_ID`, `CRUCIBLE_WORKFLOW_SLUG`, `CRUCIBLE_PLAYLIST_SLUG`,
+> `CRUCIBLE_STUDENT_USERNAME` and per-slot variables like
+> `CRUCIBLE_TARGET_WEB_IP` were previously listed here but have never been set by
+> the runner. A script referencing one gets an **empty string**, and the script
+> validator declares these names so it will not warn you — so the mistake shows up
+> only as a confusing runtime failure (`ssh student@` with no host).
+
+Address the target with `CRUCIBLE_TARGET_IP`.
+
+### Which VM does a workflow run against?
+
+A workflow runs against **one** VM: the pod's *primary* VM, chosen by `boot_order`
+ascending, ties broken by creation time and then VM id. All of a pod's VMs are
+created together, so they normally share a creation time and `boot_order` of 0 —
+which means for a multi-VM pod you should **set `boot_order` in the blueprint** to
+declare which VM is the one being assessed. The tiebreaker guarantees the same VM
+is picked every run either way, but only `boot_order` makes that choice meaningful.
+
+The VM that was assessed is recorded on the run and displayed as **Assessed VM** on
+the run detail page, so a result can always be traced to the machine it came from.
 
 ---
 

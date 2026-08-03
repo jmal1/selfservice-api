@@ -234,9 +234,18 @@ func (e *Engine) executeRun(ctx context.Context, run *models.Run) error {
 		}
 
 		// Resolve target info
-		target, pod, err := e.queries.GetRunTargetInfo(ctx, run.PodID)
+		target, pod, targetVM, err := e.queries.GetRunTargetInfo(ctx, run.PodID)
 		if err != nil {
 			return fmt.Errorf("get target info: %w", err)
+		}
+
+		// Record which VM is being graded, before the runner starts rather than
+		// after it finishes. A run that times out or whose runner never starts is
+		// exactly the one an instructor needs to attribute, and writing this on
+		// the success path only would leave those runs unattributable.
+		if err := e.queries.SetRunTarget(ctx, run.ID, targetVM); err != nil {
+			e.logger.Warn("failed to record run target VM",
+				"run_id", run.ID, "target_vm", targetVM.DisplayName, "error", err)
 		}
 
 		// Build the action library so workflows can call library actions such as
