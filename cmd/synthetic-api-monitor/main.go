@@ -145,7 +145,10 @@ func run(logger *slog.Logger) error {
 	role := envOr(envRole, "student")
 	pushgatewayURL := mustEnv(envPushgatewayURL)
 	job := envOr(envJob, "crucible_synthetic_api")
-	layer := envOr(envLayer, "api")
+	layer, err := resolvePushLayer(envBool(envRunnerMode), os.Getenv(envLayer))
+	if err != nil {
+		return err
+	}
 
 	checkTimeout := 30 * time.Second
 	if v := os.Getenv(envCheckTimeout); v != "" {
@@ -245,11 +248,24 @@ func run(logger *slog.Logger) error {
 	} else if envBool(envRunnerMode) {
 		tmpl := os.Getenv(envRunnerTemplate)
 		if tmpl == "" {
-			return fmt.Errorf("%s=true but %s is empty", envRunnerMode, envRunnerTemplate)
+			// Warn loudly but DO NOT prevent registration. An unregistered
+			// check does not go stale — its Prometheus series ceases to exist.
+			// Every alert is of the form "1 - crucible_synthetic_check_success > 0",
+			// which cannot match an absent series. An absent runner_smoke means
+			// the entire Epic D path is INVISIBLE to alerting, not red.
+			// The RunFn itself will return an error on every tick until the env
+			// var is set, keeping the series present and the alert firing.
+			logger.Warn("SYNTHETIC_RUNNER_TEMPLATE is empty: runner_smoke will report failure every tick",
+				"env", envRunnerTemplate,
+				"consequence", "engine dispatch through Multus macvlan DHCP to Kali image pull is unmonitored until this is set",
+			)
 		}
 		playlistID := os.Getenv(envRunnerPlaylistID)
 		if playlistID == "" {
-			return fmt.Errorf("%s=true but %s is empty", envRunnerMode, envRunnerPlaylistID)
+			logger.Warn("SYNTHETIC_RUNNER_PLAYLIST_ID is empty: runner_smoke will report failure every tick",
+				"env", envRunnerPlaylistID,
+				"consequence", "engine dispatch through Multus macvlan DHCP to Kali image pull is unmonitored until this is set",
+			)
 		}
 		cfg := checks.DefaultRunnerSmokeConfig(tmpl, playlistID)
 		cfg.Logger = logger.With("component", "runner_smoke")
@@ -408,30 +424,77 @@ func envBool(key string) bool {
 	return false
 }
 
+// mainLayer is the Pushgateway grouping used by the primary */10 monitor,
+// which registers the full check catalog.
+const mainLayer = "api"
+
+// runnerLayer is the grouping used by the dedicated runner_smoke CronJob.
+const runnerLayer = "runner"
+
+// resolvePushLayer picks the Pushgateway grouping label for this process.
+//
+// This is a destructive-action guard, not a preference. Pushgateway REPLACES
+// an entire metric family within a grouping on POST (see PushResults), and
+// runner mode registers ONLY runner_smoke. If it shared the main "api"
+// grouping, its push would DELETE the other api-layer check series outright.
+//
+// That is the T1-5 failure mode in its most damaging form: every alert we
+// have is shaped `1 - crucible_synthetic_check_success > 0`, which cannot
+// match a series that is absent. The board would read a clean green while the
+// entire API surface had silently stopped being tested.
+//
+// Defaulting per-mode makes the ordinary deploy correct without anyone having
+// to remember an extra env var; refusing an explicit collision covers the
+// case where someone sets it by hand.
+func resolvePushLayer(runnerMode bool, explicit string) (string, error) {
+	if !runnerMode {
+		if explicit == "" {
+			return mainLayer, nil
+		}
+		return explicit, nil
+	}
+
+	layer := explicit
+	if layer == "" {
+		layer = runnerLayer
+	}
+	if layer == mainLayer {
+		return "", fmt.Errorf(
+			"%s=true with %s=%q would push a single-check family into the main %q "+
+				"grouping and delete every other %s-layer check series; use a distinct "+
+				"layer (default %q)",
+			envRunnerMode, envLayer, layer, mainLayer, mainLayer, runnerLayer)
+	}
+	return layer, nil
+}
+
 // lifecycleSafeTimeout returns a CheckTimeout that fits the most expensive
 // registered check. pod_lifecycle can legitimately run for ~10 minutes and
 // runner_smoke for ~20 minutes; the per-check timeout MUST exceed those sums
 // or the checks will always fail mid-run.
+//
+// It takes the MAXIMUM envelope over every registered check rather than
+// returning on the first match. Returning early makes the result depend on
+// registration order, so a future change that registers pod_lifecycle and
+// runner_smoke together would hand runner_smoke an 11-minute budget for a
+// 21-minute job — and it would fail every single cycle with a timeout that
+// looks exactly like a genuinely broken Kali runner.
 func lifecycleSafeTimeout(base time.Duration, all []synthetic.Check) time.Duration {
+	// Worst-case envelopes for the default configs:
+	//   pod_lifecycle: 8m ready + 90s destroy + ~90s pre-clean + HTTP overhead
+	//   runner_smoke:  8m ready + 10m run + 90s destroy + ~90s pre-clean + overhead
+	envelopes := map[string]time.Duration{
+		"pod_lifecycle": 11 * time.Minute,
+		"runner_smoke":  21 * time.Minute,
+	}
+
+	longest := base
 	for _, c := range all {
-		switch c.Name() {
-		case "pod_lifecycle":
-			// 11 minutes is the worst-case envelope for the default config
-			// (8m ready + 90s destroy + ~90s of pre-clean + HTTP overhead).
-			const lifecycleEnvelope = 11 * time.Minute
-			if base < lifecycleEnvelope {
-				return lifecycleEnvelope
-			}
-		case "runner_smoke":
-			// 21 minutes is the worst-case envelope for the default config
-			// (8m ready + 10m run + 90s destroy + ~90s pre-clean + overhead).
-			const runnerEnvelope = 21 * time.Minute
-			if base < runnerEnvelope {
-				return runnerEnvelope
-			}
+		if e, ok := envelopes[c.Name()]; ok && e > longest {
+			longest = e
 		}
 	}
-	return base
+	return longest
 }
 
 // probeSyntheticUser hits /auth/me once at startup. A 404 means the
