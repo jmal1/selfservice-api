@@ -167,6 +167,8 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 			r.Post("/{templateID}/cancel", h.AdminCancelTemplate)
 			r.Post("/{templateID}/retry", h.AdminRetryTemplate)
 
+			r.Get("/{templateID}/resolved-credentials", h.AdminGetResolvedCredentials)
+
 			// Build-VM console ticket (G4 / Phase G). The WS endpoint
 			// itself is registered above in the pre-Logger WebSocket
 			// section; this just hands the UI the URL + metadata.

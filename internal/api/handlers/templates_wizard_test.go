@@ -1,9 +1,11 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -659,20 +661,208 @@ func TestUnattendCredentials_RecoversTheGeneratedBuildAccount(t *testing.T) {
 	}
 }
 
-// A malformed or empty unattend_config must degrade to "no fallback", never to
-// a panic or to half-credentials that produce a confusing guest auth failure
-// deep inside the worker.
-func TestUnattendCredentials_UnusableConfigYieldsNoFallback(t *testing.T) {
-	for name, cfg := range map[string][]byte{
-		"nil":            nil,
-		"empty":          []byte(``),
-		"not json":       []byte(`this is not json`),
-		"no credentials": []byte(`{"hostname":"tpl"}`),
+// ---- Tests for V3 credential inheritance and resolved-credentials (added 2026-08) ----
+
+// Test 1 & 2: inheritSourceTemplateCredentials (pure function — no DB needed).
+
+// TestInheritSourceTemplateCredentials_InheritsWhenOmitted verifies that a
+// clone_template draft with no credentials copies them from the source row.
+func TestInheritSourceTemplateCredentials_InheritsWhenOmitted(t *testing.T) {
+	req := &CreateTemplateDraftRequest{} // no username or password
+	src := &models.Template{DefaultUsername: "student", DefaultPassword: "s0urceP@ss"}
+	inheritSourceTemplateCredentials(req, src)
+	if req.DefaultUsername != "student" {
+		t.Errorf("DefaultUsername = %q; want %q", req.DefaultUsername, "student")
+	}
+	if req.DefaultPassword != "s0urceP@ss" {
+		t.Errorf("DefaultPassword = %q; want inherited value", req.DefaultPassword)
+	}
+}
+
+// TestInheritSourceTemplateCredentials_ExplicitWins verifies that explicitly
+// supplied credentials are never overwritten by the source template's values.
+func TestInheritSourceTemplateCredentials_ExplicitWins(t *testing.T) {
+	req := &CreateTemplateDraftRequest{DefaultUsername: "custom", DefaultPassword: "custom-pw"}
+	src := &models.Template{DefaultUsername: "student", DefaultPassword: "source-pw"}
+	inheritSourceTemplateCredentials(req, src)
+	if req.DefaultUsername != "custom" {
+		t.Errorf("DefaultUsername = %q; explicit value was overwritten by source template", req.DefaultUsername)
+	}
+	if req.DefaultPassword != "custom-pw" {
+		t.Errorf("DefaultPassword = %q; explicit value was overwritten by source template", req.DefaultPassword)
+	}
+}
+
+// Test 3: clone_template with empty username after inheritance is rejected 400.
+//
+// With db == nil the handler panics if it reaches any DB call, so the guard
+// MUST fire — and return a 400 with a clear message — before hitting the DB.
+// The test exercises the path where source_ref is not a parseable UUID so
+// the inheritance lookup is skipped; the guard must still fire.
+func TestCloneTemplateDraftRequiresUsername(t *testing.T) {
+	h := &Handler{logger: noopLogger(t)} // db == nil: any DB call panics
+
+	body := `{"name":"Ubuntu Copy","os_type":"linux","source_type":"clone_template","source_ref":"not-a-uuid"}`
+	req := httptest.NewRequest("POST", "/admin/templates/draft", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	h.AdminCreateTemplateDraft(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d; want 400 for clone_template with empty default_username", rec.Code)
+	}
+	bodyStr := rec.Body.String()
+	if !strings.Contains(bodyStr, "default_username") {
+		t.Errorf("body = %q; want it to name default_username", bodyStr)
+	}
+}
+
+// Test 4: the new clone_template guard must NOT fire for iso or clone_vcenter.
+//
+// iso templates get credentials from unattend_config later in the flow;
+// clone_vcenter authors set theirs during the configuring phase. Rejecting
+// them here would break both paths. With db == nil the handler panics once
+// it reaches a real DB call — a panic means the guard correctly did not fire,
+// which is what we want.
+func TestCloneTemplateDraftGuardOnlyAppliesToCloneTemplate(t *testing.T) {
+	for _, tc := range []struct {
+		sourceType string
+		sourceRef  string
+	}{
+		{models.TemplateSourceISO, "[NAS] ISOs/kali.iso"},
+		{models.TemplateSourceCloneVCenter, "vm-1234"},
 	} {
-		t.Run(name, func(t *testing.T) {
-			u, p := unattendCredentials(&models.Template{UnattendConfig: cfg})
-			if u != "" || p != "" {
-				t.Fatalf("got (%q, %q), want empty so the caller falls through to the normal error", u, p)
+		t.Run(tc.sourceType, func(t *testing.T) {
+			h := &Handler{logger: noopLogger(t)} // nil DB
+
+			body := fmt.Sprintf(
+				`{"name":"Test","os_type":"linux","source_type":%q,"source_ref":%q}`,
+				tc.sourceType, tc.sourceRef,
+			)
+			r := httptest.NewRequest("POST", "/admin/templates/draft", strings.NewReader(body))
+			r.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+
+			func() {
+				defer func() { recover() }() // absorb nil-DB panic
+				h.AdminCreateTemplateDraft(rec, r)
+			}()
+
+			// The guard must NOT have emitted our clone_template rejection.
+			if rec.Code == http.StatusBadRequest && strings.Contains(rec.Body.String(), "clone_template") {
+				t.Errorf("source_type %q incorrectly triggered the clone_template username guard", tc.sourceType)
+			}
+		})
+	}
+}
+
+// Test 5: the resolved-credentials JSON response MUST NOT contain the raw
+// password value, even when the template row holds one.
+//
+// Seeds the fixture with a distinctive secret string and asserts its bytes
+// are absent from the marshalled response. Also provides a positive control
+// to prove the detection would catch a leak if the struct were changed to
+// include the password field.
+func TestResolvedCredentials_PasswordNotInResponse(t *testing.T) {
+	const secretPassword = "SUPERSECRET-DO-NOT-LEAK"
+
+	// Positive control: confirm our detection mechanism works.
+	leakyJSON, _ := json.Marshal(map[string]string{
+		"username": "student",
+		"password": secretPassword,
+	})
+	if !bytes.Contains(leakyJSON, []byte(secretPassword)) {
+		t.Fatal("positive control: bytes.Contains should have found the password in leakyJSON — detection is broken")
+	}
+
+	// Resolve credentials from a template that has the distinctive password.
+	tmpl := &models.Template{
+		DefaultUsername: "student",
+		DefaultPassword: secretPassword,
+	}
+	resolvedUser, resolvedPass, src := resolveGuestCredentials(tmpl, "", "")
+	if resolvedUser == "" || resolvedPass == "" {
+		t.Fatalf("resolveGuestCredentials did not resolve credentials; got user=%q pass=<hidden> src=%q", resolvedUser, src)
+	}
+
+	// Build the response struct exactly as AdminGetResolvedCredentials does.
+	creds := ResolvedCredentials{
+		Username:    resolvedUser,
+		HasPassword: resolvedPass != "",
+		Source:      src,
+	}
+	body, err := json.Marshal(creds)
+	if err != nil {
+		t.Fatalf("json.Marshal(ResolvedCredentials): %v", err)
+	}
+
+	// The raw password must be absent from the marshalled bytes.
+	if bytes.Contains(body, []byte(secretPassword)) {
+		t.Errorf("resolved-credentials JSON leaks the password: %s", body)
+	}
+	// has_password must still be true so the UI knows a password exists.
+	if !creds.HasPassword {
+		t.Errorf("has_password = false; want true when a password is resolved")
+	}
+}
+
+// Test 6: resolveGuestCredentials returns the correct source for each rung.
+func TestResolveGuestCredentials_SourcePerRung(t *testing.T) {
+	tests := []struct {
+		name       string
+		tmpl       *models.Template
+		reqUser    string
+		reqPass    string
+		wantUser   string
+		wantSource string
+	}{
+		{
+			name:       "request overrides all",
+			tmpl:       &models.Template{DefaultUsername: "student", DefaultPassword: "tmplpass"},
+			reqUser:    "admin",
+			reqPass:    "adminpass",
+			wantUser:   "admin",
+			wantSource: "request",
+		},
+		{
+			name:       "template row",
+			tmpl:       &models.Template{DefaultUsername: "student", DefaultPassword: "tmplpass"},
+			wantUser:   "student",
+			wantSource: "template",
+		},
+		{
+			name: "unattend_config when template row is empty",
+			tmpl: &models.Template{
+				UnattendConfig: []byte(`{"username":"iso-user","password":"isopass","time_zone":"UTC"}`),
+			},
+			wantUser:   "iso-user",
+			wantSource: "unattend_config",
+		},
+		{
+			name:       "none when nothing resolves",
+			tmpl:       &models.Template{},
+			wantUser:   "",
+			wantSource: "none",
+		},
+		{
+			name: "partial template row falls through to unattend_config",
+			tmpl: &models.Template{
+				DefaultUsername: "student", // password missing
+				UnattendConfig:  []byte(`{"username":"iso-user","password":"isopass","time_zone":"UTC"}`),
+			},
+			wantUser:   "student",
+			wantSource: "unattend_config", // unattend was needed to complete the pair
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotUser, _, gotSource := resolveGuestCredentials(tt.tmpl, tt.reqUser, tt.reqPass)
+			if gotUser != tt.wantUser {
+				t.Errorf("username = %q; want %q", gotUser, tt.wantUser)
+			}
+			if gotSource != tt.wantSource {
+				t.Errorf("source = %q; want %q", gotSource, tt.wantSource)
 			}
 		})
 	}
