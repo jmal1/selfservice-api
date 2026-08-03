@@ -20,19 +20,25 @@ package provisioner
 // real reuse value. The rollback engine handles partial failures.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
+	"path"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/models"
 	"github.com/jmal1/selfservice-api/internal/provisioner/assets"
 	"github.com/jmal1/selfservice-api/internal/templates"
+	"github.com/jmal1/selfservice-api/internal/unattend"
 	"github.com/jmal1/selfservice-api/internal/vcenter"
 )
 
@@ -61,19 +67,30 @@ const windowsUnattendGuestPath = `C:\Windows\Panther\unattend.xml`
 // SourceType is one of models.TemplateSource* constants. SourceRef's
 // meaning depends on SourceType:
 //   - clone_template / clone_vcenter: vCenter VM moref of the source
-//   - iso: datastore path to the ISO (not yet implemented; returns error)
+//   - iso: "[datastore] path/to/installer.iso" — the installer media a
+//     freshly-created blank VM boots from. See provisionTemplateFromISO.
 //
 // VMName must be unique within FolderPath. Convention is
 // tpl-{template-slug}-{6-char-hex}.
+//
+// DiskGB / GuestID / UnattendMode / UnattendConfig are only consulted by the
+// iso source path. DiskGB and GuestID size and identify the blank VM's shell;
+// UnattendMode selects the automated-install family (or "manual"/empty for a
+// hands-on console install), and UnattendConfig carries the mode-specific seed
+// knobs unmarshalled into an unattend.Spec.
 type TemplateProvisionPayload struct {
-	TemplateID     uuid.UUID `json:"template_id"`
-	SourceType     string    `json:"source_type"`
-	SourceRef      string    `json:"source_ref"`
-	VMName         string    `json:"vm_name"`
-	FolderPath     string    `json:"folder_path,omitempty"`
-	StagingNetwork string    `json:"staging_network"`
-	VCPUs          int32     `json:"vcpus,omitempty"`
-	RAMmb          int64     `json:"ram_mb,omitempty"`
+	TemplateID     uuid.UUID       `json:"template_id"`
+	SourceType     string          `json:"source_type"`
+	SourceRef      string          `json:"source_ref"`
+	VMName         string          `json:"vm_name"`
+	FolderPath     string          `json:"folder_path,omitempty"`
+	StagingNetwork string          `json:"staging_network"`
+	VCPUs          int32           `json:"vcpus,omitempty"`
+	RAMmb          int64           `json:"ram_mb,omitempty"`
+	DiskGB         int             `json:"disk_gb,omitempty"`
+	GuestID        string          `json:"guest_id,omitempty"`
+	UnattendMode   string          `json:"unattend_mode,omitempty"`
+	UnattendConfig json.RawMessage `json:"unattend_config,omitempty"`
 }
 
 // TemplateGeneralizePayload describes the work for a template_generalize job.
@@ -187,8 +204,13 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 		}
 		sourceMoref = payload.SourceRef
 	case models.TemplateSourceISO:
-		return p.markTemplateError(ctx, payload.TemplateID,
-			fmt.Errorf("ISO-based template provisioning is not yet implemented (T4 follow-up); use clone_template or clone_vcenter"))
+		// ISO installs diverge completely from the clone flow (create a blank
+		// VM, optionally attach a generated seed ISO, run the installer, then
+		// wait on a *long* deadline), so they get their own dependency-injected
+		// core rather than falling through to the clone steps below. It does its
+		// own error-state marking, so we return its result verbatim.
+		return provisionTemplateFromISO(ctx, p.vc, p.db, p.logger,
+			func(step, message string) { p.publishProgress(job.ID, step, message) }, payload)
 	default:
 		return p.markTemplateError(ctx, payload.TemplateID,
 			fmt.Errorf("unknown source_type %q (must be one of clone_template, clone_vcenter, iso)", payload.SourceType))
@@ -241,6 +263,240 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 	}
 
 	return nil
+}
+
+// isoInstallToolsTimeout bounds how long the unattended-install path waits for
+// VMware Tools to report in after the blank VM boots the installer. Unlike a
+// clone (which comes up in a couple of minutes), an OS install runs the whole
+// installer end to end — partitioning, package unpack, first boot — so it needs
+// a generous ceiling. A clone-length 5-minute wait would spuriously fail every
+// automated install.
+const isoInstallToolsTimeout = 60 * time.Minute
+
+// isoProvisionVCenter is the vCenter subset the iso template-provision path
+// needs. The real *vcenter.Client satisfies it (asserted below), so production
+// wiring stays a plain method call while tests inject a fake without a govmomi
+// simulator.
+type isoProvisionVCenter interface {
+	UploadToDatastore(ctx context.Context, datastore, remotePath string, r io.Reader, size int64, progress func(sent int64)) error
+	CreateBlankVM(ctx context.Context, p vcenter.BlankVMParams) (string, error)
+	PowerOnVM(ctx context.Context, moref string) error
+	WaitForTools(ctx context.Context, moref string, timeout time.Duration) error
+	DetachCDROMs(ctx context.Context, moref string) error
+}
+
+// isoProvisionDB is the database subset the iso template-provision path needs.
+type isoProvisionDB interface {
+	GetTemplateByID(ctx context.Context, id uuid.UUID) (*models.Template, error)
+	SetTemplateVCenterVM(ctx context.Context, id uuid.UUID, vcenterVMID string) error
+	UpdateTemplateLifecycleState(ctx context.Context, id uuid.UUID, from, to string) error
+}
+
+// Compile-time proof the real clients satisfy the narrow seams, so the
+// production delegation in ProvisionTemplate keeps type-checking.
+var (
+	_ isoProvisionVCenter = (*vcenter.Client)(nil)
+	_ isoProvisionDB      = (*database.Queries)(nil)
+)
+
+// provisionTemplateFromISO is the dependency-injected core for
+// source_type=iso. It creates a blank VM that boots the installer ISO named by
+// payload.SourceRef, optionally builds and attaches a seed ISO that drives an
+// unattended install, powers on, and advances the template to 'configuring'.
+//
+// Contract (each bullet is covered by template_jobs_test.go):
+//   - SourceRef MUST parse as a "[datastore] path" reference. A malformed ref
+//     is caught BEFORE any VM is created, so a typo never orphans a shell.
+//   - unattend_mode manual/empty skips the seed build AND WaitForTools (the OS
+//     is not installed yet, so Tools can never appear); it parks the template
+//     in 'configuring' for a hands-on console install.
+//   - Any other unattend_mode builds a seed ISO via unattend.BuildSeedISO and
+//     uploads it next to the installer. If the builder reports
+//     ErrPreseedRequiresRemaster (debian_preseed cannot be seeded from a second
+//     CD in pure Go) the job FAILS LOUDLY telling the operator to pick
+//     unattend_mode=manual — it never silently downgrades to a 60-minute wait
+//     for an automated install that was never going to run.
+//   - On the unattended path it waits isoInstallToolsTimeout for Tools, then
+//     DetachCDROMs so the finished template holds no ISO lock on the datastore.
+//
+// It marks the template 'error' (via the injected db) on any failure and
+// returns the cause, so the caller returns its result verbatim.
+func provisionTemplateFromISO(
+	ctx context.Context,
+	vc isoProvisionVCenter,
+	db isoProvisionDB,
+	logger *slog.Logger,
+	progress func(step, message string),
+	payload TemplateProvisionPayload,
+) error {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	prog := func(step, message string) {
+		if progress != nil {
+			progress(step, message)
+		}
+	}
+	markErr := func(cause error) error {
+		return markTemplateErrorViaDB(ctx, db, logger, payload.TemplateID, cause)
+	}
+
+	// Validate the installer reference up front. ParseDatastorePath is strict
+	// and returns actionable text; doing it here guarantees a bad ref never
+	// reaches CreateBlankVM (so no orphaned VM) and surfaces the fix to the
+	// operator instead of an opaque vCenter fault.
+	isoDatastore, isoRemote, err := vcenter.ParseDatastorePath(payload.SourceRef)
+	if err != nil {
+		return markErr(fmt.Errorf(
+			"source_ref %q is not a valid installer ISO datastore path for source_type=iso (want \"[datastore] path/to/installer.iso\"): %w",
+			payload.SourceRef, err))
+	}
+
+	// Decide whether this is an automated install. manual/empty means the
+	// operator installs the OS by hand over the console.
+	mode := strings.TrimSpace(payload.UnattendMode)
+	unattended := mode != "" && mode != models.UnattendModeManual
+
+	var seedISOPath string
+	if unattended {
+		spec, serr := unattendSpecFromPayload(payload)
+		if serr != nil {
+			return markErr(fmt.Errorf("parse unattend_config for unattend_mode=%s: %w", mode, serr))
+		}
+
+		prog("build_seed", fmt.Sprintf("Building %s seed ISO", mode))
+		seedName, seedData, berr := unattend.BuildSeedISO(spec)
+		if berr != nil {
+			// debian_preseed has no standalone seed ISO: debian-installer will
+			// not read a preseed from a second CD, and this codebase cannot
+			// remaster a bootable El Torito installer ISO in pure Go. Refuse
+			// LOUDLY rather than silently degrade to a manual install — a silent
+			// downgrade makes the operator wait isoInstallToolsTimeout for an
+			// automation that was never going to run.
+			if errors.Is(berr, unattend.ErrPreseedRequiresRemaster) {
+				return markErr(fmt.Errorf(
+					"unattend_mode=%s cannot be seeded in pure Go (debian-installer will not read a preseed from a second CD, and Crucible does not remaster the installer ISO here); set unattend_mode=manual and drive the installer over the VM console, or use an Ubuntu (cloudinit_cidata) / Windows (windows_autounattend) source instead: %w",
+					mode, berr))
+			}
+			return markErr(fmt.Errorf("build seed ISO for unattend_mode=%s: %w", mode, berr))
+		}
+
+		// Land the seed alongside the installer on the same datastore so both
+		// mount from one place; namespace it by VM name to avoid collisions
+		// between concurrent template builds sharing an ISO folder.
+		seedRemote := path.Join(path.Dir(isoRemote), payload.VMName+"-"+seedName)
+		prog("upload_seed", fmt.Sprintf("Uploading seed ISO to %s", vcenter.DatastorePath(isoDatastore, seedRemote)))
+		if uerr := vc.UploadToDatastore(ctx, isoDatastore, seedRemote,
+			bytes.NewReader(seedData), int64(len(seedData)), nil); uerr != nil {
+			return markErr(fmt.Errorf("upload seed ISO: %w", uerr))
+		}
+		seedISOPath = vcenter.DatastorePath(isoDatastore, seedRemote)
+	}
+
+	// Create the blank VM booting the installer ISO (and the seed as CD-ROM 1
+	// when present). CreateBlankVM validates every field before its first
+	// round-trip, so a bad DiskGB/GuestID/VCPU value never orphans a shell.
+	prog("create_vm", fmt.Sprintf("Creating blank VM %s to install from %s", payload.VMName, payload.SourceRef))
+	moref, err := vc.CreateBlankVM(ctx, vcenter.BlankVMParams{
+		VMName:      payload.VMName,
+		FolderPath:  payload.FolderPath,
+		Network:     payload.StagingNetwork,
+		GuestID:     payload.GuestID,
+		VCPUs:       payload.VCPUs,
+		RAMmb:       payload.RAMmb,
+		DiskGB:      payload.DiskGB,
+		ISOPath:     payload.SourceRef,
+		SeedISOPath: seedISOPath,
+	})
+	if err != nil {
+		return markErr(fmt.Errorf("create blank VM: %w", err))
+	}
+
+	// Persist the moref (mirrors the clone branch ordering) so a later
+	// generalize / cancel / resume can find the VM.
+	if err := db.SetTemplateVCenterVM(ctx, payload.TemplateID, moref); err != nil {
+		return markErr(fmt.Errorf("record vCenter VM ID: %w", err))
+	}
+
+	prog("power_on", "Powering on VM to begin install")
+	if err := vc.PowerOnVM(ctx, moref); err != nil {
+		return markErr(fmt.Errorf("power on: %w", err))
+	}
+
+	if unattended {
+		// An OS install runs the whole installer; give Tools a long deadline.
+		prog("wait_tools", fmt.Sprintf("Waiting up to %s for the unattended install to finish and VMware Tools to report in", isoInstallToolsTimeout))
+		if err := vc.WaitForTools(ctx, moref, isoInstallToolsTimeout); err != nil {
+			return markErr(fmt.Errorf(
+				"wait for VMware Tools after unattended install: %w (check the VM console — the autoinstall may have stalled or the seed was rejected)", err))
+		}
+		// Drop the CD-ROMs now that the OS is installed: a lingering ISO mount
+		// keeps a lock on the datastore file that blocks deleting or replacing
+		// the installer/seed later.
+		prog("detach_cdrom", "Detaching installer and seed ISOs")
+		if err := vc.DetachCDROMs(ctx, moref); err != nil {
+			return markErr(fmt.Errorf("detach CD-ROMs after install: %w", err))
+		}
+	} else {
+		// Manual install: the OS is NOT installed yet, so WaitForTools would
+		// always time out. Skip it and hand the VM (installer still mounted)
+		// to the operator.
+		prog("await_manual_install", "Blank VM is powered on with the installer ISO mounted — open the VM console (WebMKS) to install the OS, then run Generalize")
+	}
+
+	prog("update_state", "Marking template as configuring")
+	if err := transitionTemplateViaDB(ctx, db, payload.TemplateID,
+		models.TemplateStateProvisioning, models.TemplateStateConfiguring); err != nil {
+		return markErr(fmt.Errorf("advance to configuring: %w", err))
+	}
+
+	return nil
+}
+
+// unattendSpecFromPayload builds the unattend.Spec that drives seed generation.
+// The mode is authoritative from payload.UnattendMode; the remaining knobs
+// (hostname, credentials, locale, extra packages) come from UnattendConfig,
+// which is unmarshalled into the Spec's exported fields. A nil/empty config is
+// fine — unattend applies its own defaults (default user "student", etc.).
+func unattendSpecFromPayload(payload TemplateProvisionPayload) (unattend.Spec, error) {
+	var spec unattend.Spec
+	if len(payload.UnattendConfig) > 0 {
+		if err := json.Unmarshal(payload.UnattendConfig, &spec); err != nil {
+			return unattend.Spec{}, err
+		}
+	}
+	spec.Mode = payload.UnattendMode
+	return spec, nil
+}
+
+// transitionTemplateViaDB is the db-interface twin of
+// (p *Provisioner).transitionTemplate: it gate-checks the move through the pure
+// state machine before touching the row, so an illegal transition fails fast.
+func transitionTemplateViaDB(ctx context.Context, db isoProvisionDB, id uuid.UUID, from, to string) error {
+	if err := templates.CanTransition(from, to); err != nil {
+		return fmt.Errorf("state machine rejected %s→%s: %w", from, to, err)
+	}
+	return db.UpdateTemplateLifecycleState(ctx, id, from, to)
+}
+
+// markTemplateErrorViaDB is the db-interface twin of
+// (p *Provisioner).markTemplateError: best-effort move to 'error', returning the
+// original cause regardless so the job result surfaces the real problem.
+func markTemplateErrorViaDB(ctx context.Context, db isoProvisionDB, logger *slog.Logger, id uuid.UUID, cause error) error {
+	tmpl, err := db.GetTemplateByID(ctx, id)
+	if err != nil || tmpl == nil {
+		logger.Warn("could not load template for error transition", "template_id", id, "load_err", err)
+		return cause
+	}
+	if err := templates.CanTransition(tmpl.TemplateState, models.TemplateStateError); err != nil {
+		logger.Warn("cannot transition template to error", "template_id", id,
+			"current_state", tmpl.TemplateState, "err", err)
+		return cause
+	}
+	if err := db.UpdateTemplateLifecycleState(ctx, id, tmpl.TemplateState, models.TemplateStateError); err != nil {
+		logger.Warn("error transition failed", "template_id", id, "err", err)
+	}
+	return cause
 }
 
 // GeneralizeTemplate implements JobTypeTemplateGeneralize.
