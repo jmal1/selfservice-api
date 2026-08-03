@@ -9,6 +9,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -450,38 +452,125 @@ func (c *Client) DeleteFirewallRule(ctx context.Context, uuid string) error {
 	return err
 }
 
-// FirewallRuleInfo is a subset of a firewall filter rule returned by search,
-// used for idempotency checks (e.g., "does a pass rule already exist for this
-// pod interface + subnet?").
+// FirewallRuleInfo is a normalized content view of a firewall filter rule, used
+// for idempotency checks (e.g. "does a content-equivalent pass rule already
+// exist for this pod interface + subnet?").
+//
+// IMPORTANT: it is sourced from firewall/filter/get, NOT firewall/filter/searchRule.
+// searchRule only ever returns a single row (total:1) regardless of how many
+// rules exist — it never lists the per-VLAN pod pass rules — so deduping against
+// it made the reconciler blind and it re-added an identical rule every cycle
+// (the 2026-08-02 config.xml bloat / OPNsense OOM incident). filter/get is the
+// authoritative complete ruleset. Every field here is canonicalized (lower-cased,
+// trimmed; interface set sorted) so a rule's content signature compares reliably.
 type FirewallRuleInfo struct {
-	UUID      string
-	Interface string // logical name(s); may be comma-joined, e.g. "opt4" or "lan,opt1"
-	Source    string // source_net, e.g. "10.100.3.0/24"
-	Action    string // "pass" or "block"
+	UUID            string
+	Interface       string // canonical, sorted, comma-joined selected interface(s), e.g. "opt3" or "lan,opt1"
+	Direction       string // "in" / "out" / "any"
+	IPProtocol      string // "inet" / "inet6"
+	Protocol        string // "any", "tcp", ...
+	Source          string // source_net, e.g. "10.100.3.0/24", "any", or an alias like "lan"
+	SourcePort      string
+	Destination     string // destination_net
+	DestinationPort string
+	Action          string // "pass" or "block"
 }
 
-// GetFirewallRules lists automation firewall filter rules (for idempotency).
+// opnOption is a single entry in an OPNsense select-field option map, as returned
+// by firewall/filter/get: {"<key>": {"value":"<label>","selected":0|1}}.
+type opnOption struct {
+	Value    string          `json:"value"`
+	Selected json.RawMessage `json:"selected"`
+}
+
+// isSelected reports whether this option is the/an active selection. OPNsense
+// encodes "selected" as either a JSON number (1) or a quoted string ("1")
+// depending on version, so both are accepted.
+func (o opnOption) isSelected() bool {
+	s := strings.Trim(strings.TrimSpace(string(o.Selected)), `"`)
+	return s == "1" || strings.EqualFold(s, "true")
+}
+
+// filterGetRule mirrors one rule under filter.rules.rule in a firewall/filter/get
+// response. Select fields are option-maps; the rest are plain strings.
+type filterGetRule struct {
+	Interface       map[string]opnOption `json:"interface"`
+	Direction       map[string]opnOption `json:"direction"`
+	Action          map[string]opnOption `json:"action"`
+	IPProtocol      map[string]opnOption `json:"ipprotocol"`
+	Protocol        map[string]opnOption `json:"protocol"`
+	SourceNet       string               `json:"source_net"`
+	SourcePort      string               `json:"source_port"`
+	DestinationNet  string               `json:"destination_net"`
+	DestinationPort string               `json:"destination_port"`
+}
+
+// GetFirewallRules returns the COMPLETE set of firewall filter rules via
+// firewall/filter/get (used for reconciler idempotency). See FirewallRuleInfo
+// for why filter/get is used instead of searchRule.
+//
+// Live-verified fact (2026-08-02, fwpodv01): searchRule returns total:1
+// regardless of the actual rule count; firewall/filter/get is authoritative and
+// returns every rule. Do not switch this back to searchRule.
 func (c *Client) GetFirewallRules(ctx context.Context) ([]FirewallRuleInfo, error) {
-	resp, err := c.doRequest(ctx, "GET", "/firewall/filter/searchRule?current=1&rowCount=1000", nil)
+	resp, err := c.doRequest(ctx, "GET", "/firewall/filter/get", nil)
 	if err != nil {
-		return nil, fmt.Errorf("search firewall rules: %w", err)
+		return nil, fmt.Errorf("get firewall rules: %w", err)
 	}
 	var result struct {
-		Rows []struct {
-			UUID      string `json:"uuid"`
-			Interface string `json:"interface"`
-			Source    string `json:"source_net"`
-			Action    string `json:"action"`
-		} `json:"rows"`
+		Filter struct {
+			Rules struct {
+				Rule map[string]filterGetRule `json:"rule"`
+			} `json:"rules"`
+		} `json:"filter"`
 	}
 	if err := json.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("parse firewall rules: %w", err)
 	}
-	out := make([]FirewallRuleInfo, 0, len(result.Rows))
-	for _, r := range result.Rows {
-		out = append(out, FirewallRuleInfo{UUID: r.UUID, Interface: r.Interface, Source: r.Source, Action: r.Action})
+	out := make([]FirewallRuleInfo, 0, len(result.Filter.Rules.Rule))
+	for uuid, r := range result.Filter.Rules.Rule {
+		out = append(out, FirewallRuleInfo{
+			UUID:            strings.TrimSpace(uuid),
+			Interface:       selectedOptionSet(r.Interface),
+			Direction:       selectedOption(r.Direction),
+			IPProtocol:      selectedOption(r.IPProtocol),
+			Protocol:        selectedOption(r.Protocol),
+			Source:          canonicalFirewallField(r.SourceNet),
+			SourcePort:      canonicalFirewallField(r.SourcePort),
+			Destination:     canonicalFirewallField(r.DestinationNet),
+			DestinationPort: canonicalFirewallField(r.DestinationPort),
+			Action:          selectedOption(r.Action),
+		})
 	}
 	return out, nil
+}
+
+// selectedOptionSet returns the canonical, sorted, comma-joined set of selected
+// keys from an OPNsense multi-select option map (e.g. the interface field).
+func selectedOptionSet(m map[string]opnOption) string {
+	out := make([]string, 0, len(m))
+	for k, opt := range m {
+		if opt.isSelected() {
+			if k = canonicalFirewallField(k); k != "" {
+				out = append(out, k)
+			}
+		}
+	}
+	sort.Strings(out)
+	return strings.Join(out, ",")
+}
+
+// selectedOption returns the single selected key from an OPNsense select option
+// map (canonicalized). If several are somehow selected the result is still the
+// canonical sorted set, which keeps comparisons stable.
+func selectedOption(m map[string]opnOption) string {
+	return selectedOptionSet(m)
+}
+
+// canonicalFirewallField normalizes a firewall enum/string field to a stable
+// comparison form.
+func canonicalFirewallField(v string) string {
+	return strings.ToLower(strings.TrimSpace(v))
 }
 
 // ApplyFirewall applies pending firewall changes.
