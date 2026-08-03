@@ -176,7 +176,7 @@ When the runner pod executes a workflow's `script`, it provides these helpers an
 
 | Variable | Description |
 |---|---|
-| `CRUCIBLE_TARGET_IP` | Primary target VM IP on the pod VLAN |
+| `CRUCIBLE_TARGET_IP` | Primary target VM IP on the pod VLAN. See "Which VM is the target?" below. |
 | `CRUCIBLE_TARGET_OS` | One of `linux`, `windows`, `other` |
 | `CRUCIBLE_TARGET_USERNAME` | Default credentials for the target (set by template) |
 | `CRUCIBLE_TARGET_PASSWORD` | Default credentials for the target |
@@ -187,6 +187,19 @@ When the runner pod executes a workflow's `script`, it provides these helpers an
 | `CRUCIBLE_CONTEXT` | Path to the per-workflow JSON context file (used by `ctx_set`/`ctx_get`) |
 | `CTX_<PREFIX>_<FIELD>` | Sanitized values produced by previous actions (see §5.4) |
 | `PARAM_<UPPER_FIELD>` | Action parameters injected from `params` (library actions only) |
+
+**Which VM is the target?**
+
+A workflow runs against **one** VM: the pod's *primary* VM. It is chosen by
+`boot_order` ascending, ties broken by creation time and finally by VM id. Since
+every VM in a pod is created in a single operation, they normally share a
+creation time and a `boot_order` of 0 — so for a multi-VM pod the practical rule
+is **set `boot_order` on the blueprint to say which VM should be assessed**.
+Without that, the tiebreaker still guarantees the *same* VM every run, but which
+one it lands on is not meaningful.
+
+The VM that was assessed is recorded on the run and shown as **Assessed VM** on
+the run detail page, so you can always confirm what a given result refers to.
 
 ### 5.2 `run_action "<label>" <command...>`
 
