@@ -70,7 +70,7 @@ func TestUnixSocket_ActionEvents(t *testing.T) {
 		if result.ExitCode != 0 {
 			t.Errorf("ExitCode = %d, want 0", result.ExitCode)
 		}
-		if result.Duration != 250*time.Millisecond {
+		if result.Duration.Duration() != 250*time.Millisecond {
 			t.Errorf("Duration = %v, want %v", result.Duration, 250*time.Millisecond)
 		}
 	case <-time.After(2 * time.Second):

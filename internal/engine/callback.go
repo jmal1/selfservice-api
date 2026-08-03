@@ -156,7 +156,7 @@ func (s *CallbackServer) handleWorkflow(w http.ResponseWriter, r *http.Request) 
 		"workflow", result.WorkflowSlug,
 		"status", result.Status,
 		"actions", len(result.ActionResults),
-		"duration_ms", result.TotalDuration.Milliseconds(),
+		"duration_ms", result.TotalDuration.Duration().Milliseconds(),
 	)
 
 	// Build instructor output
@@ -169,7 +169,7 @@ func (s *CallbackServer) handleWorkflow(w http.ResponseWriter, r *http.Request) 
 	actionResults, _ := json.Marshal(result.ActionResults)
 
 	// Update workflow result in DB
-	durationMs := int(result.TotalDuration.Milliseconds())
+	durationMs := int(result.TotalDuration.Duration().Milliseconds())
 	if err := s.queries.UpdateWorkflowResultBySlug(r.Context(), run.ID, result.WorkflowSlug,
 		result.Status, result.Message, instructorOutput, actionResults, &durationMs); err != nil {
 		s.logger.Error("failed to update workflow result", "error", err)

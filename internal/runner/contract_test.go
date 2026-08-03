@@ -110,14 +110,20 @@ func TestContract_CallbackActionPayload(t *testing.T) {
 			Status:   "pass",
 			Message:  "port 22 is open",
 			ExitCode: 0,
-			Duration: 1234 * time.Millisecond,
+			Duration: runner.FromDuration(1234 * time.Millisecond),
 		},
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	want := `{"workflow_slug":"checks/port-22-open","action":{"action":"verify_ssh_listening","status":"pass","message":"port 22 is open","exit_code":0,"duration_ms":1234000000}}`
+	// duration_ms is 1234, not 1234000000. That distinction is the whole point:
+	// this literal previously read 1234000000 because ActionOutput.Duration was a
+	// plain time.Duration, which encoding/json writes as raw nanoseconds. The
+	// contract test froze the defect as if it were the intended shape, so the one
+	// guard meant to protect this payload was actively asserting the bug. Keep the
+	// value in milliseconds — the field name says ms and the UI divides by 1000.
+	want := `{"workflow_slug":"checks/port-22-open","action":{"action":"verify_ssh_listening","status":"pass","message":"port 22 is open","exit_code":0,"duration_ms":1234}}`
 	if string(raw) != want {
 		t.Errorf("CallbackActionPayload JSON shape changed.\n got:  %s\n want: %s", raw, want)
 	}
