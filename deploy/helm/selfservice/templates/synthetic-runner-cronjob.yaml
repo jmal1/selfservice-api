@@ -1,0 +1,108 @@
+{{- if and .Values.synthetic.enabled .Values.synthetic.runner.enabled -}}
+# Standalone Kali-runner smoke CronJob.
+#
+# Provisions a real pod, runs a 4-action playlist through the full
+# engine -> Multus macvlan -> CNI dhcp -> Kali runner path, asserts the
+# results came back, and destroys the pod. This is the ONLY continuous
+# proof that path works end to end; every other synthetic check stops at
+# the API boundary.
+#
+# Reuses the same synthetic-api-monitor image, secrets and pushgateway
+# plumbing as the regular monitor. SYNTHETIC_RUNNER_MODE=true replaces the
+# full check set with the single runner_smoke check.
+#
+# The env block below is written out EXPLICITLY rather than shared with the
+# */10 monitor. That is deliberate: SYNTHETIC_LIFECYCLE_ENABLED is a global
+# in values.yaml, and inheriting it used to silently shadow runner mode
+# (the binary registered the api check set while pushing under
+# layer="runner"). main.go now refuses that combination and warns, but not
+# re-introducing the shared block is the cheaper half of the fix.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ .Release.Name }}-synthetic-runner
+  labels:
+    app.kubernetes.io/name: selfservice-synthetic-runner
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: synthetic-monitor
+spec:
+  schedule: {{ .Values.synthetic.runner.schedule | quote }}
+  # Forbid, not Replace: a run in flight owns a real pod and a runner Job.
+  # Killing it mid-flight would orphan both, and the replacement would then
+  # trip the synthetic user's pod quota with a 409.
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  startingDeadlineSeconds: 120
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: {{ .Values.synthetic.runner.activeDeadlineSeconds | default 1500 }}
+      ttlSecondsAfterFinished: 1800
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: selfservice-synthetic-runner
+            app.kubernetes.io/component: synthetic-monitor
+        spec:
+          restartPolicy: Never
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: synthetic-runner
+              image: "{{ .Values.synthetic.image }}:{{ .Values.synthetic.imageTag | default .Values.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              env:
+                - name: SYNTHETIC_BASE_URL
+                  value: {{ .Values.synthetic.baseURL | quote }}
+                - name: SYNTHETIC_PUSHGATEWAY_URL
+                  value: {{ .Values.synthetic.pushgatewayURL | quote }}
+                - name: SYNTHETIC_JOB
+                  value: {{ .Values.synthetic.job | quote }}
+                # MUST NOT be "api". runner mode pushes a strict subset of
+                # the check family and Pushgateway replaces a family
+                # wholesale within a grouping on POST, so sharing the api
+                # grouping deletes the other 13 series -- and no alert can
+                # match a series that is absent, so the board goes green.
+                - name: SYNTHETIC_LAYER
+                  value: {{ .Values.synthetic.runner.layer | default "runner" | quote }}
+                - name: SYNTHETIC_USERNAME
+                  value: {{ .Values.synthetic.username | quote }}
+                - name: SYNTHETIC_ROLE
+                  value: {{ .Values.synthetic.role | quote }}
+                - name: SYNTHETIC_USER_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.synthetic.secretName }}
+                      key: user-id
+                - name: SYNTHETIC_JWT_SECRET
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.secrets.jwt }}
+                      key: jwt-secret
+                - name: SYNTHETIC_RUNNER_MODE
+                  value: "true"
+                - name: SYNTHETIC_RUNNER_TEMPLATE
+                  value: {{ .Values.synthetic.runner.template | quote }}
+                - name: SYNTHETIC_RUNNER_PLAYLIST_ID
+                  value: {{ .Values.synthetic.runner.playlistID | quote }}
+                - name: SYNTHETIC_RUNNER_READY_TIMEOUT
+                  value: {{ .Values.synthetic.runner.readyTimeout | default "8m" | quote }}
+                - name: SYNTHETIC_RUNNER_RUN_TIMEOUT
+                  value: {{ .Values.synthetic.runner.runTimeout | default "10m" | quote }}
+                - name: SYNTHETIC_RUNNER_DESTROY_TIMEOUT
+                  value: {{ .Values.synthetic.runner.destroyTimeout | default "90s" | quote }}
+              resources:
+                {{- toYaml .Values.synthetic.resources | nindent 16 }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                runAsNonRoot: true
+                runAsUser: 65534
+                runAsGroup: 65534
+                capabilities:
+                  drop:
+                    - ALL
+{{- end }}

@@ -273,7 +273,47 @@ synthetic:
     checkTimeout: "120s"
     # Distinct Pushgateway layer label keeps janitor results separate from
     # the regular */10 monitor in dashboards and alerts.
-    layer: "janitor"
+    layer: "janitor"  # Standalone Kali-runner smoke check. Provisions a real pod, runs a
+  # 4-action playlist through the engine -> Multus macvlan -> Kali runner
+  # path, asserts the results, and destroys the pod. This is the ONLY
+  # continuous proof that path works end to end.
+  #
+  # Expensive (a full pod lifecycle plus a runner Job), so it runs hourly
+  # rather than every 10 minutes.
+  #
+  # NOTE the layer label is deliberately NOT "api". runner mode registers a
+  # strict SUBSET of the check family, and PushResults POSTs the whole
+  # family -- Pushgateway replaces a family wholesale within a grouping on
+  # POST, so sharing the api grouping would DELETE the other 13 series.
+  # Every alert is shaped `1 - crucible_synthetic_check_success > 0`, which
+  # cannot match an absent series, so the board would read green rather
+  # than red. main.go defaults the layer per-mode and refuses an explicit
+  # collision; this key exists to make the intent visible, not to enable it.
+  runner:
+    enabled: false
+    # Hourly at :37 -- offset from the */10 monitor and the 04:17 janitor so
+    # three synthetic pods never contend for the same vCenter clone slot.
+    schedule: "37 * * * *"
+    # templates.name to clone (NOT vcenter_template). Wrong value = every
+    # run fails at resolve-template.
+    template: "synthetic-noop"
+    # Playlist UUID, seeded by deploy/sql/synthetic-runner-smoke-playlist.sql.
+    # The playlist IS this check's assertion set, so it is version-controlled
+    # and applied convergently rather than created by hand.
+    playlistID: "5e7c0a00-0000-4000-a000-000000000001"
+    readyTimeout: "8m"
+    # Covers a cold Kali image pull on k3sv03 plus workflow execution plus
+    # the callback. The runner Job's own ActiveDeadlineSeconds is 600s, so a
+    # pull slower than this surfaces as a runner timeout, not a check hang.
+    runTimeout: "10m"
+    destroyTimeout: "90s"
+    # Must exceed readyTimeout + runTimeout + destroyTimeout + overhead
+    # (8m + 10m + 90s = 19.5m). 1500s (25 min) leaves ~5 min headroom.
+    # lifecycleSafeTimeout() independently widens the per-check budget; this
+    # is the outer Kubernetes bound and must be the larger of the two or the
+    # pod is killed mid-run and the pod it created is leaked to the janitor.
+    activeDeadlineSeconds: 1500
+    layer: "runner"
 
 # Vault sidecar annotations (disabled for now)
 vault:

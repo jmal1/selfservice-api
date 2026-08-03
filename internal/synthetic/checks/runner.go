@@ -102,22 +102,53 @@ func RunnerSmoke(cfg RunnerSmokeConfig) synthetic.Check {
 // this check into a ten-minute timeout with a confusing message.
 const successRunStatus = "completed"
 
-// "error" is not a models.RunStatus* constant (no RunStatusError exists for
-// runs in workflow_models.go — that constant only exists for ResultStatus).
-// The engine may however set run.status="error" on unexpected panics or infra
-// failures that fall outside the normal workflow state machine. Treating it as
-// terminal-bad here prevents waitForRunTerminal from burning the full
-// RunTimeout and misleadingly reporting "timed out" when the run actually
-// ended immediately with an engine error.
-var terminalRunStatuses = []string{"completed", "failed", "cancelled", "timeout", "error"}
+// nonTerminalRunStatuses is the set of statuses a run can still MOVE ON from.
+// Anything else is treated as terminal.
+//
+// WHY A DENYLIST AND NOT AN ALLOWLIST OF TERMINAL STATUSES:
+//
+// This started as an allowlist, and an allowlist has a failure mode that is
+// specific to a poller: a status the list does not know about is not reported,
+// it is WAITED ON. The check burns the full 10-minute RunTimeout and then
+// reports "timed out waiting for terminal run status" — which reads like the
+// Kali runner hung, when in fact the run finished promptly and the prober
+// simply did not recognise the word. That sends the on-call reader to the
+// runner, the node, and the image pull, none of which are the problem.
+//
+// The in-progress states are the small, stable, well-understood end of this
+// contract; the finished states are the end that grows. Prod today enforces:
+//
+//	runs_status_check CHECK (status = ANY (ARRAY['pending','provisioning',
+//	    'running','completed','failed','cancelled','timeout']))
+//
+// so inverting the test means any status added by a future migration is
+// handled correctly on the day it ships, and is reported with its actual name.
+//
+// This also removes a previously-listed "error" status, which was unreachable:
+// it is not in the CHECK constraint above (verified against prod) and has no
+// models.RunStatus* constant, so the database would reject it. The comment
+// justifying it claimed the engine sets it on infra failures; engine.go
+// actually uses RunStatusFailed for exactly those cases.
+//
+// Still deliberately literals rather than models.RunStatus* imports: this is a
+// black-box prober, and following an internal rename silently is precisely the
+// regression it exists to catch.
+var nonTerminalRunStatuses = []string{"pending", "provisioning", "running"}
 
 func isTerminalRunStatus(s string) bool {
-	for _, t := range terminalRunStatuses {
+	// An empty status means the response did not carry one. Treat that as
+	// non-terminal so a malformed or partial payload results in continued
+	// polling rather than being mistaken for a finished run and asserted
+	// against as though it had failed.
+	if s == "" {
+		return false
+	}
+	for _, t := range nonTerminalRunStatuses {
 		if s == t {
-			return true
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 // runnerRunResponse is the subset of the run JSON we decode during polling.

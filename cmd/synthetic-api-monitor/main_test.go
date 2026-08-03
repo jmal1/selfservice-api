@@ -287,3 +287,116 @@ func TestResolveRunnerConfig_AppliesValidOverrides(t *testing.T) {
 		t.Errorf("template/playlist not carried into config: %+v", cfg)
 	}
 }
+
+// TestResolveMode_RunnerModeIsNotShadowedByLifecycle is the regression guard
+// for a defect that shipped and was only caught by running the thing for real.
+//
+// SYNTHETIC_LIFECYCLE_ENABLED=true is set once, globally, in values.yaml. Any
+// CronJob built from the shared env block inherits it. The mode selection used
+// to be an ordered if/else chain that tested lifecycle BEFORE runner mode, so
+// a runner CronJob deployed exactly as designed silently registered the
+// ordinary api check set instead of runner_smoke.
+//
+// The failure was invisible by construction: resolvePushLayer DOES honour
+// runner mode, so the push grouping said layer="runner" while the checks were
+// the api set. A brand-new, entirely green "runner" layer would have appeared
+// on the dashboard while the Kali-runner path was never exercised — and no
+// alert can fire for a series that does not exist.
+func TestResolveMode_RunnerModeIsNotShadowedByLifecycle(t *testing.T) {
+	// Exactly the env a runner CronJob gets when it inherits the shared block.
+	env := map[string]string{
+		"SYNTHETIC_LIFECYCLE_ENABLED":  "true",
+		"SYNTHETIC_LIFECYCLE_TEMPLATE": "synthetic-noop",
+		"SYNTHETIC_RUNNER_MODE":        "true",
+		"SYNTHETIC_RUNNER_TEMPLATE":    "synthetic-noop",
+		"SYNTHETIC_RUNNER_PLAYLIST_ID": "5e7c0a00-0000-4000-a000-000000000001",
+	}
+	m, err := resolveMode(func(k string) string { return env[k] })
+	if err != nil {
+		t.Fatalf("resolveMode: %v", err)
+	}
+	if m.kind != modeRunner {
+		t.Fatalf("kind = %v, want modeRunner.\n"+
+			"SYNTHETIC_LIFECYCLE_ENABLED is inherited from the shared env block by every "+
+			"CronJob, so if it can shadow runner mode then the runner CronJob silently "+
+			"registers the api check set, pushes it under layer=\"runner\", and "+
+			"runner_smoke never runs while the board reads green.", m.kind)
+	}
+	if m.lifecycleEnabled {
+		t.Error("lifecycleEnabled = true in a replacement mode; pod_lifecycle would run " +
+			"alongside runner_smoke and the runner grouping would carry a check the " +
+			"main monitor already owns")
+	}
+	if len(m.warnings) == 0 {
+		t.Error("no warning emitted for the ignored SYNTHETIC_LIFECYCLE_ENABLED.\n" +
+			"Silently ignoring inherited config is how this bug hid in the first place: " +
+			"the warning is the line that makes a misconfigured deploy diagnosable from " +
+			"the log instead of from a multi-hour investigation.")
+	}
+}
+
+// TestResolveMode_JanitorAndRunnerTogetherIsRefused asserts the binary refuses
+// an ambiguous configuration instead of silently resolving it by declaration
+// order. Both flags replace the ENTIRE check set, so quietly picking one means
+// the other's checks are absent from Prometheus — and absence cannot match
+// `1 - crucible_synthetic_check_success > 0`.
+func TestResolveMode_JanitorAndRunnerTogetherIsRefused(t *testing.T) {
+	env := map[string]string{
+		"SYNTHETIC_JANITOR_MODE": "true",
+		"SYNTHETIC_RUNNER_MODE":  "true",
+	}
+	if _, err := resolveMode(func(k string) string { return env[k] }); err == nil {
+		t.Fatal("two replacement modes set at once must be refused, not resolved by " +
+			"declaration order")
+	}
+}
+
+// TestResolveMode_DefaultAndJanitorStillBehave pins the pre-existing behaviour
+// so the refactor that introduced resolveMode cannot have changed it.
+func TestResolveMode_DefaultAndJanitorStillBehave(t *testing.T) {
+	tests := []struct {
+		name          string
+		env           map[string]string
+		wantKind      modeKind
+		wantLifecycle bool
+	}{
+		{
+			name:     "nothing set",
+			env:      map[string]string{},
+			wantKind: modeDefault,
+		},
+		{
+			name:          "lifecycle only",
+			env:           map[string]string{"SYNTHETIC_LIFECYCLE_ENABLED": "true"},
+			wantKind:      modeDefault,
+			wantLifecycle: true,
+		},
+		{
+			name:     "janitor replaces the set",
+			env:      map[string]string{"SYNTHETIC_JANITOR_MODE": "true"},
+			wantKind: modeJanitor,
+		},
+		{
+			name: "janitor also wins over inherited lifecycle",
+			env: map[string]string{
+				"SYNTHETIC_JANITOR_MODE":      "true",
+				"SYNTHETIC_LIFECYCLE_ENABLED": "true",
+			},
+			wantKind: modeJanitor,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m, err := resolveMode(func(k string) string { return tt.env[k] })
+			if err != nil {
+				t.Fatalf("resolveMode: %v", err)
+			}
+			if m.kind != tt.wantKind {
+				t.Errorf("kind = %v, want %v", m.kind, tt.wantKind)
+			}
+			if m.lifecycleEnabled != tt.wantLifecycle {
+				t.Errorf("lifecycleEnabled = %v, want %v", m.lifecycleEnabled, tt.wantLifecycle)
+			}
+		})
+	}
+}

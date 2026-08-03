@@ -40,20 +40,19 @@ func TestRunnerSmoke_TerminalStatusesMatchTheAPIContract(t *testing.T) {
 	}
 
 	// Every status the API can END on must be one runner_smoke recognises as
-	// terminal. A missing entry does not fail fast — it hangs until timeout.
+	// terminal. A missing entry does not fail fast — it hangs until RunTimeout
+	// and then reports a timeout, which reads like the Kali runner hung when
+	// the run in fact finished promptly.
 	//
-	// "error" has no models.RunStatus* constant (only ResultStatusError exists
-	// in models). It is included here because the engine may set it on
-	// unexpected infra failures; treating it as terminal-bad prevents a
-	// misleading "timed out" error when the run ended immediately.
-	wantTerminal := []string{
+	// runner_smoke classifies by exclusion (see nonTerminalRunStatuses), so
+	// this loop is really asserting that none of these ever drifts INTO the
+	// non-terminal set.
+	for _, want := range []string{
 		models.RunStatusCompleted,
 		models.RunStatusFailed,
 		models.RunStatusCancelled,
 		models.RunStatusTimeout,
-		"error", // no RunStatusError constant for runs; engine may set this on unexpected failure
-	}
-	for _, want := range wantTerminal {
+	} {
 		if !isTerminalRunStatus(want) {
 			t.Errorf("run status %q is terminal in the API but runner_smoke does not "+
 				"recognise it as terminal; the check would poll until RunTimeout and "+
@@ -62,7 +61,7 @@ func TestRunnerSmoke_TerminalStatusesMatchTheAPIContract(t *testing.T) {
 	}
 
 	// Conversely, a NON-terminal status must never be treated as terminal, or
-	// the check would grade a run that is still provisioning.
+	// the check would grade a run that has not finished.
 	for _, notTerminal := range []string{
 		models.RunStatusPending,
 		models.RunStatusProvisioning,
@@ -75,20 +74,52 @@ func TestRunnerSmoke_TerminalStatusesMatchTheAPIContract(t *testing.T) {
 		}
 	}
 
-	// Guard against the list silently growing stale in the other direction:
-	// an entry here that the API can never emit is dead weight that hides the
-	// fact nobody re-checked this list.
-	got := append([]string(nil), terminalRunStatuses...)
-	want := append([]string(nil), wantTerminal...)
+	// The non-terminal set is the whole contract now, so pin it exactly. It
+	// must be precisely the in-progress statuses in models, no more and no
+	// less: an extra entry means a finished run is polled forever, a missing
+	// one means an unfinished run is graded.
+	got := append([]string(nil), nonTerminalRunStatuses...)
+	want := []string{
+		models.RunStatusPending,
+		models.RunStatusProvisioning,
+		models.RunStatusRunning,
+	}
 	sort.Strings(got)
 	sort.Strings(want)
 	if len(got) != len(want) {
-		t.Fatalf("terminalRunStatuses = %v, want exactly %v", got, want)
+		t.Fatalf("nonTerminalRunStatuses = %v, want exactly %v", got, want)
 	}
 	for i := range got {
 		if got[i] != want[i] {
-			t.Fatalf("terminalRunStatuses = %v, want exactly %v", got, want)
+			t.Fatalf("nonTerminalRunStatuses = %v, want exactly %v", got, want)
 		}
+	}
+}
+
+// TestRunnerSmoke_UnknownStatusIsTerminalNotHung asserts the classification is
+// by EXCLUSION, which is the property that makes this check degrade sensibly.
+//
+// A poller with an allowlist of terminal statuses does not report a status it
+// does not know about — it WAITS on it, burns the full RunTimeout, and then
+// says "timed out waiting for terminal run status". That message sends the
+// reader to the runner, the node and the image pull, when the run actually
+// finished immediately. Classifying by exclusion means a status added by a
+// future migration is handled on the day it ships and is reported by name.
+func TestRunnerSmoke_UnknownStatusIsTerminalNotHung(t *testing.T) {
+	for _, s := range []string{"error", "aborted", "superseded", "expired"} {
+		if !isTerminalRunStatus(s) {
+			t.Errorf("unknown run status %q treated as non-terminal; runner_smoke "+
+				"would poll it until RunTimeout and report a misleading timeout "+
+				"instead of surfacing the real status", s)
+		}
+	}
+
+	// An absent status is the one case that must NOT be called terminal: a
+	// malformed or partial payload should keep polling, not be graded as a
+	// finished run that failed.
+	if isTerminalRunStatus("") {
+		t.Error("empty run status treated as terminal; a partial or malformed " +
+			"response would be graded as a finished run rather than polled again")
 	}
 }
 
