@@ -21,6 +21,12 @@ synthetic:
     readyTimeout: 3m
   janitor:
     enabled: true
+  # Hourly end-to-end proof of the Kali runner path (Multus NAD, CNI dhcp lease,
+  # pod-VLAN L3 reachability, nmap). Chart defaults already match prod: it clones
+  # the synthetic-noop template and runs the version-controlled playlist seeded by
+  # deploy/sql/synthetic-runner-smoke-playlist.sql.
+  runner:
+    enabled: true
 
 # Bitnami postgresql subchart image overrides.
 # We pin tag explicitly to avoid surprise major upgrades on chart upgrade.
