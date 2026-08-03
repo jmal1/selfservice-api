@@ -99,6 +99,42 @@ This must be the first non-comment line of every workflow script.
 
 ---
 
+## "Action status is `error`, message says a command is not available" (exit 127)
+
+A tool your workflow script calls is not installed in the assessment runner.
+
+| What the student sees | What the instructor sees |
+|---|---|
+| "This check could not run: the command `X` is not available in the assessment runner." | `status: error`, `exit_code: 127`, message names the missing command |
+
+The runner classifies exit 127 as `error` rather than `fail` to distinguish an infrastructure defect from a student mistake. The student's result panel says the problem is not their fault and asks them to report it.
+
+> [!warning]
+> The **workflow editor catches this at authoring time** (warning **CRU0002**) when you save a
+> script that calls a command not in the runner image. If you saw CRU0002 and dismissed it, that
+> is the same root cause surfacing at runtime.
+
+**Immediate fix:**
+
+1. Check [`internal/runnertools/tools.txt`](../../internal/runnertools/tools.txt) — does the
+   command you need appear there?
+2. If not, either:
+   - Switch to an equivalent tool that **is** in the image (see the
+     [Pre-installed tools table](runner-environment.md#pre-installed-tools)).
+   - Ask a platform admin to add it to `tools.txt` and rebuild the runner image.
+3. Do **not** `apt install` from the script — the runner has no internet egress, and
+   mutating a shared image mid-run would affect other running assessments.
+
+| Tools **not** in the image (common requests) |
+|---|
+| `gobuster`, `sqlmap`, `wfuzz`, `hashcat`, `tcpdump`, `mtr`, `iperf3`, `httpie`, `yq`, `xmlstarlet` |
+
+If the message reads *"a tool it depends on is not available"* (without naming it), the missing
+binary is inside a **library action** body. Trace which library action your script calls via
+`run_action`, then check that action's bash body for commands not in `tools.txt`.
+
+---
+
 ## "Action `foo-bar` not found"
 
 Either the slug is mistyped, the action is in a different deployment,
