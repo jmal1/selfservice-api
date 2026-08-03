@@ -24,6 +24,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
@@ -314,4 +315,53 @@ func escapeLabelValue(v string) string {
 func pipelinePushURL(base, job string, grouping map[string]string) string {
 	// Reuses the same URL shape as the sibling pushers in this package.
 	return destroyFailedPushURL(base, job, grouping)
+}
+
+// RunPusher flushes the accumulated metric families to Pushgateway every
+// interval until ctx is cancelled.
+//
+// This loop is what makes every Record*/Set* call above observable. Those
+// methods only mutate in-process counters; nothing reaches Prometheus until
+// Push serializes and POSTs them. Without this loop the whole family is
+// silently absent from Prometheus, and an absent series renders on a
+// dashboard exactly like a zero one -- "no image imports failed" and "the
+// importer has never run once" look identical. Recording without flushing is
+// therefore worse than having no metric at all, because it looks healthy.
+//
+// A push failure is logged and retried on the next tick rather than being
+// fatal: Pushgateway being down must not take the worker down with it.
+func (m *PipelineMetrics) RunPusher(ctx context.Context, interval time.Duration, logger *slog.Logger) {
+	if m == nil || m.BaseURL == "" {
+		return
+	}
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	log := logger.With("component", "pipeline_metrics_pusher")
+	log.Info("pipeline metrics pusher started", "interval", interval, "job", m.Job)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Final flush so counters accumulated since the last tick are not
+			// lost on a normal shutdown or rolling restart.
+			flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			if err := m.Push(flushCtx); err != nil {
+				log.Warn("final pipeline metrics push failed", "error", err)
+			}
+			cancel()
+			log.Info("pipeline metrics pusher stopped")
+			return
+		case <-ticker.C:
+			if err := m.Push(ctx); err != nil {
+				log.Warn("pipeline metrics push failed", "error", err)
+			}
+		}
+	}
 }

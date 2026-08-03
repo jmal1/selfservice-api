@@ -141,6 +141,21 @@ func main() {
 				"endpoint", cfg.ObjectStore.Endpoint,
 				"bucket", cfg.ObjectStore.Bucket,
 				"iso_datastore", cfg.VCenter.ISODatastore)
+
+			// Flush accumulated pipeline metrics. RecordImageImport and friends
+			// only mutate in-process counters; without this loop nothing ever
+			// reaches Prometheus and the pipeline dashboard stays empty, which
+			// is indistinguishable from "no imports have failed".
+			go pipeline.RunPusher(ctx, 30*time.Second, logger)
+
+			// Detect image_uploads rows abandoned in uploading/importing. Each
+			// one pins an object on a MinIO host with ~85 GB free on the same
+			// filesystem apt-cacher-ng uses, so a silent leak here eventually
+			// breaks Linux template builds too.
+			go prov.RunStuckUploadReconciler(ctx, provisioner.StuckUploadReconcilerConfig{
+				Interval:       envDuration(logger, "WORKER_STUCK_UPLOAD_INTERVAL", 5*time.Minute),
+				StaleThreshold: envDuration(logger, "WORKER_STUCK_UPLOAD_STALE_THRESHOLD", 30*time.Minute),
+			})
 		}
 	}
 
@@ -394,4 +409,21 @@ func processJobs(ctx context.Context, queries *database.Queries, prov *provision
 			logger.Info("job completed", "job_id", job.ID, "type", job.Type)
 		}
 	}
+}
+
+// envDuration reads a time.Duration from the environment, falling back to def
+// when unset, unparseable, or non-positive. A bad value is logged and ignored
+// rather than being fatal: a typo in one tuning knob must not stop the worker
+// from starting and processing jobs.
+func envDuration(logger *slog.Logger, key string, def time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	parsed, err := time.ParseDuration(v)
+	if err != nil || parsed <= 0 {
+		logger.Warn("invalid duration in env; using default", "key", key, "value", v, "default", def, "error", err)
+		return def
+	}
+	return parsed
 }
