@@ -404,9 +404,22 @@ func (e *Engine) checkForTimeouts(ctx context.Context) {
 	}
 
 	for _, run := range staleRuns {
+		// Snapshot the runner BEFORE CleanupRunner deletes the Job, because
+		// deleting the Job deletes the pods, and the pods are the only place
+		// the reason for the timeout is recorded. Recording an identical
+		// "Run timed out after 10 minutes" for an image-pull failure, a
+		// missing DHCP lease on the pod VLAN, an unschedulable node and a
+		// genuinely hung runner made every timeout un-diagnosable after the
+		// fact — the evidence was gone before anyone could look at it.
+		diagnostics := ""
+		if e.k8s != nil && run.RunnerVMName != nil {
+			diagnostics = e.k8s.DescribeRunner(ctx, *run.RunnerVMName)
+		}
+
 		e.logger.Warn("timeout watchdog: marking run as timed out",
 			"run_id", run.ID,
 			"status", run.Status,
+			"runner_diagnostics", diagnostics,
 		)
 
 		// Clean up K8s resources (delete Job, Secret)
@@ -415,8 +428,28 @@ func (e *Engine) checkForTimeouts(ctx context.Context) {
 		}
 
 		errMsg := "Run timed out after 10 minutes"
+		if diagnostics != "" {
+			errMsg += ". Runner state at timeout: " + diagnostics
+		}
 		if err := e.queries.UpdateRunStatus(ctx, run.ID, models.RunStatusTimeout, &errMsg); err != nil {
 			e.logger.Error("timeout watchdog: failed to update run", "run_id", run.ID, "error", err)
+		}
+
+		// A run that never reported leaves its workflow results sitting in
+		// 'pending' forever. The run row says timeout while its children claim
+		// to still be queued, so the testing UI renders a permanently
+		// in-progress assessment and UpdateRunCounts counts zero failures.
+		// A terminal run must not have non-terminal children.
+		if n, err := e.queries.TimeoutPendingWorkflowResults(ctx, run.ID, errMsg); err != nil {
+			e.logger.Error("timeout watchdog: failed to close workflow results",
+				"run_id", run.ID, "error", err)
+		} else if n > 0 {
+			e.logger.Warn("timeout watchdog: closed unreported workflow results",
+				"run_id", run.ID, "count", n)
+			if err := e.queries.UpdateRunCounts(ctx, run.ID); err != nil {
+				e.logger.Error("timeout watchdog: failed to update run counts",
+					"run_id", run.ID, "error", err)
+			}
 		}
 
 		e.metrics.RecordRunnerJob("timeout")
