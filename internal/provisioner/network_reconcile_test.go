@@ -127,10 +127,37 @@ func (f *fakeNetworkOPN) CreateFirewallRule(_ context.Context, rule opnsense.Fir
 		return "", f.createFirewallErr
 	}
 	f.createFirewallCalls = append(f.createFirewallCalls, rule)
-	f.firewallRules = append(f.firewallRules, opnsense.FirewallRuleInfo{
-		UUID: "fw-uuid", Interface: rule.Interface, Source: rule.Source, Action: rule.Action,
-	})
+	// Simulate how OPNsense's firewall/filter/searchRule renders a rule on
+	// read-back: enum/interface fields come back with different casing and the
+	// description is dropped. The reconciler's dedup must survive this, so the
+	// fake must reproduce it (a verbatim round-trip would hide the real bug).
+	f.firewallRules = append(f.firewallRules, opnsenseSearchRuleReadback(rule, "fw-uuid"))
 	return "fw-uuid", nil
+}
+
+// opnsenseSearchRuleReadback models the lossy/formatted representation the
+// OPNsense search API returns for a rule created via addRule: action and
+// interface are re-cased and the description is not surfaced.
+func opnsenseSearchRuleReadback(rule opnsense.FirewallRule, uuid string) opnsense.FirewallRuleInfo {
+	return opnsense.FirewallRuleInfo{
+		UUID:        uuid,
+		Interface:   strings.ToUpper(rule.Interface),
+		Direction:   rule.Direction,
+		IPProtocol:  rule.IPProtocol,
+		Protocol:    strings.ToUpper(rule.Protocol),
+		Source:      rule.Source,
+		Destination: rule.Destination,
+		Action:      capitalizeFirst(rule.Action), // matches OPNsense display casing, e.g. "pass" -> "Pass"
+	}
+}
+
+// capitalizeFirst upper-cases the first rune of s (ASCII), leaving the rest as
+// is. Used only to simulate OPNsense's display casing in tests.
+func capitalizeFirst(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
 }
 
 func (f *fakeNetworkOPN) ApplyFirewall(_ context.Context) error {
@@ -185,6 +212,23 @@ func (f *fakeNetworkDB) ReleaseVLAN(_ context.Context, podID uuid.UUID) error {
 	return nil
 }
 
+// podPassRuleReadback builds the OPNsense-search-formatted representation of the
+// per-VLAN pass rule the reconciler creates for a given interface + subnet.
+// Used to pre-seed "healthy" fixtures the way the live firewall would report
+// them (re-cased fields, no description).
+func podPassRuleReadback(ifName, subnet string) opnsense.FirewallRuleInfo {
+	return opnsenseSearchRuleReadback(opnsense.FirewallRule{
+		Enabled:     "1",
+		Action:      "pass",
+		Interface:   ifName,
+		Direction:   "in",
+		IPProtocol:  "inet",
+		Protocol:    "any",
+		Source:      subnet,
+		Destination: "any",
+	}, "fw-existing")
+}
+
 func TestReconcileNetwork_RepairsMissingInterfaceSubnetAndBinding(t *testing.T) {
 	podID := uuid.New()
 	row := allocatedVLANRow(103, podID, "active")
@@ -230,7 +274,7 @@ func TestReconcileNetwork_HealthyActivePodNoChanges(t *testing.T) {
 		vlans:                  map[int]*opnsense.VLAN{104: {Tag: "104"}},
 		dhcpSubnets:            map[string]*opnsense.DHCPSubnet{row.Subnet: {Subnet: row.Subnet}},
 		selectedDHCPInterfaces: []string{"opt7"},
-		firewallRules:          []opnsense.FirewallRuleInfo{{Interface: "opt7", Source: row.Subnet, Action: "pass"}},
+		firewallRules:          []opnsense.FirewallRuleInfo{podPassRuleReadback("opt7", row.Subnet)},
 	}
 	ssh := &fakeNetworkSSH{
 		findByVLAN: map[int]string{104: "opt7"},
@@ -289,7 +333,7 @@ func TestReconcileNetwork_MixedSet(t *testing.T) {
 			activeNeedsBinding.Subnet: {Subnet: activeNeedsBinding.Subnet},
 		},
 		selectedDHCPInterfaces: []string{"opt9"},
-		firewallRules:          []opnsense.FirewallRuleInfo{{Interface: "opt9", Source: activeHealthy.Subnet, Action: "pass"}},
+		firewallRules:          []opnsense.FirewallRuleInfo{podPassRuleReadback("opt9", activeHealthy.Subnet)},
 	}
 	ssh := &fakeNetworkSSH{
 		findByVLAN: map[int]string{
@@ -312,6 +356,71 @@ func TestReconcileNetwork_MixedSet(t *testing.T) {
 	}
 	if counts.FirewallRulesRepaired != 1 || counts.FirewallApplied != 1 {
 		t.Fatalf("expected one firewall rule repair (for opt10) + apply, got %+v", counts)
+	}
+}
+
+func TestReconcileNetwork_IsIdempotent_NoDuplicatePassRules(t *testing.T) {
+	// Regression test for the 2026-08-02 OPNsense config bloat incident: running
+	// the reconciler repeatedly must NOT re-create a content-equivalent per-VLAN
+	// pass rule. The fake models OPNsense's lossy/formatted search read-back
+	// (re-cased fields, dropped description), which is what defeated the old
+	// exact-string dedup and caused unbounded duplicates.
+	podID := uuid.New()
+	row := allocatedVLANRow(120, podID, "active")
+
+	opn := &fakeNetworkOPN{
+		vlans:                  map[int]*opnsense.VLAN{120: {Tag: "120"}},
+		dhcpSubnets:            map[string]*opnsense.DHCPSubnet{row.Subnet: {Subnet: row.Subnet}},
+		selectedDHCPInterfaces: []string{"opt15"},
+	}
+	ssh := &fakeNetworkSSH{findByVLAN: map[int]string{120: "opt15"}}
+	db := &fakeNetworkDB{rows: []database.AllocatedVLAN{row}}
+
+	const reconcilePasses = 3
+	for i := 0; i < reconcilePasses; i++ {
+		if _, err := reconcileNetwork(context.Background(), opn, ssh, db, discardLogger(), NetworkReconcilerConfig{}, time.Now); err != nil {
+			t.Fatalf("reconcileNetwork pass %d: %v", i, err)
+		}
+	}
+
+	if len(opn.createFirewallCalls) != 1 {
+		t.Fatalf("expected exactly ONE firewall rule created across %d reconcile passes, got %d: %+v",
+			reconcilePasses, len(opn.createFirewallCalls), opn.createFirewallCalls)
+	}
+	if len(opn.firewallRules) != 1 {
+		t.Fatalf("expected exactly one stored firewall rule (no duplicates), got %d: %+v",
+			len(opn.firewallRules), opn.firewallRules)
+	}
+}
+
+func TestReconcileNetwork_SearchRuleErrorSkipsFirewallRepair(t *testing.T) {
+	// Defensive: if listing rules fails (e.g. searchRule 500 during OOM), the
+	// reconciler must skip firewall repair rather than blindly re-create rules.
+	podID := uuid.New()
+	row := allocatedVLANRow(121, podID, "active")
+
+	opn := &fakeNetworkOPN{
+		vlans:                  map[int]*opnsense.VLAN{121: {Tag: "121"}},
+		dhcpSubnets:            map[string]*opnsense.DHCPSubnet{row.Subnet: {Subnet: row.Subnet}},
+		selectedDHCPInterfaces: []string{"opt16"},
+		getFirewallErr:         errors.New("searchRule: 500 Internal Server Error"),
+	}
+	ssh := &fakeNetworkSSH{findByVLAN: map[int]string{121: "opt16"}}
+	db := &fakeNetworkDB{rows: []database.AllocatedVLAN{row}}
+
+	counts, err := reconcileNetwork(context.Background(), opn, ssh, db, discardLogger(), NetworkReconcilerConfig{}, time.Now)
+	if err != nil {
+		t.Fatalf("reconcileNetwork: %v", err)
+	}
+
+	if len(opn.createFirewallCalls) != 0 {
+		t.Fatalf("expected NO firewall rule creation when searchRule fails, got %+v", opn.createFirewallCalls)
+	}
+	if counts.FirewallRulesRepaired != 0 || counts.FirewallApplied != 0 || opn.applyFirewallCalls != 0 {
+		t.Fatalf("expected no firewall changes/apply on list failure, got counts=%+v applyCalls=%d", counts, opn.applyFirewallCalls)
+	}
+	if counts.Errors != 1 {
+		t.Fatalf("expected one error recorded for the failed rule listing, got %+v", counts)
 	}
 }
 

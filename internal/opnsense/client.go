@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -451,13 +452,25 @@ func (c *Client) DeleteFirewallRule(ctx context.Context, uuid string) error {
 }
 
 // FirewallRuleInfo is a subset of a firewall filter rule returned by search,
-// used for idempotency checks (e.g., "does a pass rule already exist for this
-// pod interface + subnet?").
+// used for idempotency checks (e.g., "does a content-equivalent pass rule
+// already exist for this pod interface + subnet?").
+//
+// IMPORTANT: OPNsense's firewall/filter/searchRule endpoint returns *formatted*
+// field values that do not byte-equal the raw values submitted to addRule
+// (e.g. action rendered as "Pass", interface label casing, dropped descr).
+// GetFirewallRules canonicalizes every field here (lower-cased, trimmed) so
+// callers can compare a rule's content signature reliably. Comparing raw
+// search values against create-time values is what caused the 2026-08-02
+// duplicate-rule bloat incident.
 type FirewallRuleInfo struct {
-	UUID      string
-	Interface string // logical name(s); may be comma-joined, e.g. "opt4" or "lan,opt1"
-	Source    string // source_net, e.g. "10.100.3.0/24"
-	Action    string // "pass" or "block"
+	UUID        string
+	Interface   string // canonical logical name(s); may be comma-joined, e.g. "opt4" or "lan,opt1"
+	Direction   string // "in" / "out"
+	IPProtocol  string // "inet" / "inet6"
+	Protocol    string // "any", "tcp", ...
+	Source      string // source_net, e.g. "10.100.3.0/24"
+	Destination string // destination_net, e.g. "any"
+	Action      string // "pass" or "block"
 }
 
 // GetFirewallRules lists automation firewall filter rules (for idempotency).
@@ -468,10 +481,14 @@ func (c *Client) GetFirewallRules(ctx context.Context) ([]FirewallRuleInfo, erro
 	}
 	var result struct {
 		Rows []struct {
-			UUID      string `json:"uuid"`
-			Interface string `json:"interface"`
-			Source    string `json:"source_net"`
-			Action    string `json:"action"`
+			UUID        string `json:"uuid"`
+			Interface   string `json:"interface"`
+			Direction   string `json:"direction"`
+			IPProtocol  string `json:"ipprotocol"`
+			Protocol    string `json:"protocol"`
+			Source      string `json:"source_net"`
+			Destination string `json:"destination_net"`
+			Action      string `json:"action"`
 		} `json:"rows"`
 	}
 	if err := json.Unmarshal(resp, &result); err != nil {
@@ -479,9 +496,39 @@ func (c *Client) GetFirewallRules(ctx context.Context) ([]FirewallRuleInfo, erro
 	}
 	out := make([]FirewallRuleInfo, 0, len(result.Rows))
 	for _, r := range result.Rows {
-		out = append(out, FirewallRuleInfo{UUID: r.UUID, Interface: r.Interface, Source: r.Source, Action: r.Action})
+		out = append(out, FirewallRuleInfo{
+			UUID:        strings.TrimSpace(r.UUID),
+			Interface:   canonicalizeInterfaceList(r.Interface),
+			Direction:   canonicalFirewallField(r.Direction),
+			IPProtocol:  canonicalFirewallField(r.IPProtocol),
+			Protocol:    canonicalFirewallField(r.Protocol),
+			Source:      strings.TrimSpace(r.Source),
+			Destination: strings.TrimSpace(r.Destination),
+			Action:      canonicalFirewallField(r.Action),
+		})
 	}
 	return out, nil
+}
+
+// canonicalFirewallField normalizes a firewall enum/string field to a stable
+// comparison form. OPNsense's search endpoint may render these with different
+// casing than the value accepted by addRule (e.g. "Pass" vs "pass").
+func canonicalFirewallField(v string) string {
+	return strings.ToLower(strings.TrimSpace(v))
+}
+
+// canonicalizeInterfaceList normalizes a (possibly comma-joined) interface
+// value into a canonical, comma-joined lower-cased list with each member
+// trimmed. Empty members are dropped.
+func canonicalizeInterfaceList(v string) string {
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = canonicalFirewallField(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return strings.Join(out, ",")
 }
 
 // ApplyFirewall applies pending firewall changes.
