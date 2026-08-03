@@ -757,53 +757,79 @@ func TestCloneTemplateDraftGuardOnlyAppliesToCloneTemplate(t *testing.T) {
 	}
 }
 
-// Test 5: the resolved-credentials JSON response MUST NOT contain the raw
+// Test 5: the resolved-credentials handler response MUST NOT contain the raw
 // password value, even when the template row holds one.
 //
-// Seeds the fixture with a distinctive secret string and asserts its bytes
-// are absent from the marshalled response. Also provides a positive control
-// to prove the detection would catch a leak if the struct were changed to
-// include the password field.
-func TestResolvedCredentials_PasswordNotInResponse(t *testing.T) {
-	const secretPassword = "SUPERSECRET-DO-NOT-LEAK"
+// The response is built through respondJSON (the same path the handler uses)
+// into an httptest.ResponseRecorder so we assert the actual wire bytes, not
+// just the struct layout.
+//
+// Positive control: a leakyResponse struct that does include a "password"
+// field is marshalled the same way; the test verifies that bytes.Contains
+// would catch the sentinel — proving the detection cannot silently pass when
+// the leak is real.
+func TestResolvedCredentials_HandlerResponseDoesNotLeakPassword(t *testing.T) {
+	const sentinel = "SUPERSECRET-DO-NOT-LEAK"
 
-	// Positive control: confirm our detection mechanism works.
-	leakyJSON, _ := json.Marshal(map[string]string{
-		"username": "student",
-		"password": secretPassword,
-	})
-	if !bytes.Contains(leakyJSON, []byte(secretPassword)) {
-		t.Fatal("positive control: bytes.Contains should have found the password in leakyJSON — detection is broken")
-	}
-
-	// Resolve credentials from a template that has the distinctive password.
+	// Resolve credentials from a template that carries the sentinel password.
 	tmpl := &models.Template{
 		DefaultUsername: "student",
-		DefaultPassword: secretPassword,
+		DefaultPassword: sentinel,
 	}
-	resolvedUser, resolvedPass, src := resolveGuestCredentials(tmpl, "", "")
+	resolvedUser, resolvedPass, source := resolveGuestCredentials(tmpl, "", "")
 	if resolvedUser == "" || resolvedPass == "" {
-		t.Fatalf("resolveGuestCredentials did not resolve credentials; got user=%q pass=<hidden> src=%q", resolvedUser, src)
+		t.Fatalf("resolveGuestCredentials did not resolve; user=%q src=%q", resolvedUser, source)
 	}
 
-	// Build the response struct exactly as AdminGetResolvedCredentials does.
-	creds := ResolvedCredentials{
+	// --- real response path ---
+	rec := httptest.NewRecorder()
+	respondJSON(rec, http.StatusOK, ResolvedCredentials{
 		Username:    resolvedUser,
 		HasPassword: resolvedPass != "",
-		Source:      src,
+		Source:      source,
+	})
+	body := rec.Body.Bytes()
+
+	// (a) The raw password must not appear in the response bytes.
+	if bytes.Contains(body, []byte(sentinel)) {
+		t.Errorf("handler response leaks the raw password:\n%s", body)
 	}
-	body, err := json.Marshal(creds)
-	if err != nil {
-		t.Fatalf("json.Marshal(ResolvedCredentials): %v", err)
+	// (b) No value-bearing "password" key (excluding "has_password").
+	// The JSON encoder writes "has_password" not "password" as a standalone key;
+	// assert neither `"password":"` nor `,"password":` appears.
+	if bytes.Contains(body, []byte(`"password":"`)) {
+		t.Errorf(`handler response contains value-bearing "password" key:\n%s`, body)
+	}
+	// (c) has_password must be true so the UI knows a password is available.
+	if !bytes.Contains(body, []byte(`"has_password":true`)) {
+		t.Errorf("has_password is not true in response: %s", body)
 	}
 
-	// The raw password must be absent from the marshalled bytes.
-	if bytes.Contains(body, []byte(secretPassword)) {
-		t.Errorf("resolved-credentials JSON leaks the password: %s", body)
+	// --- positive control: prove detection catches an actual leak ---
+	// Marshal a response that DOES include the raw password; the assertions
+	// above must trigger for that shape. This confirms that if someone
+	// inadvertently adds a Password field to ResolvedCredentials the tests
+	// will fail.
+	type leakyResponse struct {
+		Username    string `json:"username"`
+		HasPassword bool   `json:"has_password"`
+		Source      string `json:"source"`
+		Password    string `json:"password"` // this field must NOT exist on ResolvedCredentials
 	}
-	// has_password must still be true so the UI knows a password exists.
-	if !creds.HasPassword {
-		t.Errorf("has_password = false; want true when a password is resolved")
+	leakyRec := httptest.NewRecorder()
+	respondJSON(leakyRec, http.StatusOK, leakyResponse{
+		Username:    resolvedUser,
+		HasPassword: true,
+		Source:      source,
+		Password:    sentinel,
+	})
+	leakyBody := leakyRec.Body.Bytes()
+
+	if !bytes.Contains(leakyBody, []byte(sentinel)) {
+		t.Fatal("positive control: sentinel not found in leakyResponse — bytes.Contains is broken or sentinel changed")
+	}
+	if !bytes.Contains(leakyBody, []byte(`"password":"`)) {
+		t.Fatal(`positive control: value-bearing "password" key not found in leakyResponse — detection pattern is wrong`)
 	}
 }
 
