@@ -35,8 +35,8 @@
     {
       "path": "deploy/runner/actions.sh",
       "title": "actions.sh (Bash)",
-      "size": 9458,
-      "sha256": "6aa362f9380262233cf73c4df8bbfd9f5eaf3fe53aeb9baabde46709d4298f56",
+      "size": 11803,
+      "sha256": "1e874ae18995a716354689c553fb47eda3c431ce57564baff56046a41ea2058c",
       "is_markdown": false,
       "from_seed": false
     },
@@ -127,14 +127,14 @@
     {
       "path": "docs/instructor/runner-environment.md",
       "title": "Runner Environment",
-      "size": 5847,
-      "sha256": "e5b8b0e73dc5cfc7afe79b93c1c2527cc1b12b3da009b549d48f218850c907e5",
+      "size": 6760,
+      "sha256": "b00e0f7bcfe02f30f7ff78219b60c97924738f98756bba1b278b07e98568e8f8",
       "is_markdown": true,
       "links_out": [
-        "deploy/runner/actions.sh",
         "docs/instructor/overview.md",
         "docs/instructor/troubleshooting.md",
-        "docs/instructor/workflows.md"
+        "docs/instructor/workflows.md",
+        "internal/runnertools/tools.txt"
       ],
       "from_seed": false
     },
@@ -244,6 +244,14 @@
       "from_seed": false
     },
     {
+      "path": "internal/runnertools/tools.txt",
+      "title": "tools.txt (Text)",
+      "size": 3082,
+      "sha256": "523d6c7149865569c46c7e81391091a55627c1e4740096d88c6f3d998c8ccf78",
+      "is_markdown": false,
+      "from_seed": false
+    },
+    {
       "path": "internal/scriptvalidator/detect.go",
       "title": "detect.go (Go)",
       "size": 3077,
@@ -254,8 +262,8 @@
     {
       "path": "internal/scriptvalidator/validator.go",
       "title": "validator.go (Go)",
-      "size": 11167,
-      "sha256": "9d041b1402227f907c0707e87effc298da6818b895bfc6e09556f1ade6ec35a2",
+      "size": 11603,
+      "sha256": "a4d4b1e7d4092032c13c53ccf2dd56ab507473e9213a31d65f778e01a9668ed0",
       "is_markdown": false,
       "from_seed": false
     },
@@ -268,5 +276,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 182738
+  "total_bytes": 189514
 }

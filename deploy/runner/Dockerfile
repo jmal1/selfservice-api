@@ -49,65 +49,64 @@ FROM ${KALI_BASE} AS runtime
 # Avoid interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
 
+# The tool inventory is NOT written out here. It is derived from
+# internal/runnertools/tools.txt, which is the single source of truth shared
+# with the Go script validator.
+#
+# It used to be spelled out twice in this file — once as an apt list and once
+# as a `command -v` loop — plus a third, implicit copy in the heads of whoever
+# wrote the workflows. Those three could drift independently, and the drift was
+# silent in the worst direction: a tool present in the apt list but absent from
+# the verification loop would ship missing, and a tool absent from both could
+# still be called by a saved workflow and fail as a bare exit 127 during a
+# graded assessment.
+#
 # Packages are a HARD requirement. kali-rolling package names do drift, and an
 # earlier draft of this file swallowed install failures with a "WARNING: SKIPPED"
 # echo so a rename could not break the build. That is the wrong trade: a runner
 # image that builds green but silently lacks netexec/hydra does not fail loudly —
 # it produces wrong assessment results for students. A broken build is visible and
 # takes minutes to fix; a toolless runner is invisible and corrupts grades.
-# If CI fails here after a kali-rolling update, fix the package name. Do not
-# reintroduce a best-effort loop.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        bash \
-        ca-certificates \
-        curl \
-        wget \
-        jq \
-        socat \
-        iproute2 \
-        iputils-ping \
-        dnsutils \
-        netcat-openbsd \
-        openssh-client \
-        openssl \
-        git \
-        python3 \
-        python3-pip \
-        tzdata \
-        nmap \
-        smbclient \
-        netexec \
-        hydra \
-        enum4linux-ng \
-        impacket-scripts \
-        seclists \
-        nikto \
-        whatweb \
-        redis-tools \
-        ldap-utils \
-        smbmap \
+# If CI fails here after a kali-rolling update, fix the package name in
+# tools.txt. Do not reintroduce a best-effort loop.
+COPY internal/runnertools/tools.txt /opt/crucible/tools.txt
+
+RUN set -eu; \
+    pkgs=$(awk '!/^[[:space:]]*#/ && NF >= 2 {print $2}' /opt/crucible/tools.txt | sort -u); \
+    [ -n "$pkgs" ] || { echo "FATAL: tools.txt yielded no packages; manifest parse is broken" >&2; exit 1; }; \
+    echo "installing from manifest:" $pkgs; \
+    apt-get update \
+    && apt-get install -y --no-install-recommends $pkgs \
     && rm -rf /var/lib/apt/lists/*
 
-# Assert the tools actually resolve on PATH. Installing a package is not the same
-# as getting the command: Kali repackages routinely rename wrapper scripts while
-# keeping the package name stable, which apt reports as success. This is the check
-# that a workflow author actually depends on.
+# Assert the tools actually resolve. Installing a package is not the same as
+# getting the command: Kali repackages routinely rename wrapper scripts while
+# keeping the package name stable, which apt reports as success. This is the
+# check a workflow author actually depends on.
+#
+# Entries beginning with '/' are data paths (seclists wordlists, CA bundle,
+# zoneinfo) and are checked with `test -e`; everything else must resolve on PATH.
 RUN set -eu; \
     missing=""; \
-    for cmd in \
-        jq socat curl wget openssl ssh git python3 \
-        nmap smbclient netexec hydra enum4linux-ng nikto whatweb smbmap \
-        redis-cli ldapsearch impacket-secretsdump \
-    ; do \
-        command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd"; \
-    done; \
-    [ -d /usr/share/seclists ] || missing="$missing seclists(/usr/share/seclists)"; \
+    checked=0; \
+    while read -r check pkg _rest; do \
+        case "$check" in \
+            ''|\#*) continue ;; \
+        esac; \
+        [ -n "${pkg:-}" ] || continue; \
+        checked=$((checked + 1)); \
+        case "$check" in \
+            /*) [ -e "$check" ] || missing="$missing $check(from $pkg)" ;; \
+            *)  command -v "$check" >/dev/null 2>&1 || missing="$missing $check(from $pkg)" ;; \
+        esac; \
+    done < /opt/crucible/tools.txt; \
+    [ "$checked" -gt 0 ] || { echo "FATAL: tools.txt yielded no checks; manifest parse is broken" >&2; exit 1; }; \
     if [ -n "$missing" ]; then \
-        echo "FATAL: required runner tooling missing from PATH:$missing" >&2; \
+        echo "FATAL: required runner tooling missing:$missing" >&2; \
+        echo "Fix the package name in internal/runnertools/tools.txt." >&2; \
         exit 1; \
     fi; \
-    echo "runner tooling verified"
+    echo "runner tooling verified ($checked checks)"
 
 # Strip file capabilities from every binary in the image.
 #

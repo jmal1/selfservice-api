@@ -85,26 +85,43 @@ crucible-winrm "$CRUCIBLE_TARGET_IP" "Get-Service WinDefend"
 
 ## Pre-installed tools
 
-The runner is Kali Linux 2025.x with the standard pen-testing toolkit,
-plus a few Crucible-specific helpers. Highlights:
+The runner is Kali Linux with a **curated** toolkit — not the full Kali
+metapackage. The image is pulled fresh for every assessment run, so it is
+deliberately kept under 3 GB.
+
+The authoritative list is
+[`internal/runnertools/tools.txt`](../../internal/runnertools/tools.txt).
+The Dockerfile derives both its install list and its verification step from
+that file, and a guard test fails the build if this table drifts from it — so
+what you see here is what is actually in the image.
 
 | Category | Tools |
 |---|---|
-| Network | `nmap`, `nc`, `netcat`, `tcpdump`, `mtr`, `dig`, `host`, `iperf3` |
-| Web | `curl`, `wget`, `httpie`, `gobuster`, `wfuzz` |
-| Crypto | `openssl`, `ssh-keygen`, `gpg`, `hashcat` (CPU-only) |
-| Parsing | `jq`, `yq`, `xmlstarlet`, `awk`, `sed`, `grep` |
-| Crucible helpers | `/opt/crucible/lib/actions.sh`, `/opt/crucible/bin/crucible-winrm`, `/opt/crucible/bin/crucible-context` |
+| Shell & runtime | `bash`, `python3`, `pip3`, `git`, plus coreutils (`awk`, `sed`, `grep`, `cut`, `sort`) |
+| Network | `nmap`, `nc`, `socat`, `ping`, `ip`, `dig`, `ssh` |
+| Web | `curl`, `wget`, `nikto`, `whatweb` |
+| SMB / Active Directory | `smbclient`, `smbmap`, `netexec`, `enum4linux-ng`, `ldapsearch`, `impacket-secretsdump` |
+| Credentials | `hydra`, wordlists at `/usr/share/seclists` |
+| Data stores | `redis-cli` |
+| Crypto & parsing | `openssl`, `jq` |
+| Crucible helpers | `/opt/crucible/lib/actions.sh` (source this), `/opt/crucible/bin/crucible-runner` |
 
-The complete tool list is captured in the runner Dockerfile —
-[`deploy/runner/actions.sh`](../../deploy/runner/actions.sh) is the
-helper library you `source` at the top of every script.
+> [!warning]
+> Tools **not** in the image include `gobuster`, `wfuzz`, `hashcat`,
+> `tcpdump`, `mtr`, `iperf3`, `httpie`, `yq`, `xmlstarlet` and `sqlmap`.
+> Earlier versions of this page listed some of them by mistake. Calling one
+> exits **127** and the action is reported as an `error` naming the missing
+> command.
 
 > [!important]
-> If you need a tool that isn't in the runner image, **don't `apt
-> install` it from your script** (no internet anyway, and you'd be
-> mutating a shared image). File a request and we'll add it to the
-> image build.
+> If you need a tool that isn't in the runner image, **don't `apt install` it
+> from your script** (there is no internet egress from the runner anyway, and
+> you'd be mutating a shared image). Ask an admin to add one line to
+> `tools.txt` and rebuild.
+>
+> The workflow editor warns you at save time (**CRU0002**) when a script calls
+> a command the runner image does not provide, so you normally find out while
+> authoring rather than at grading time.
 
 ---
 

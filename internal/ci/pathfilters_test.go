@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -236,6 +237,25 @@ func TestPathFilters_CoverAllInternalPackages(t *testing.T) {
 //	all='["api-gateway",...,"crucible-runner"]'
 func TestPathFilters_BinaryChannelsCoversCIMatrix(t *testing.T) {
 	root := findRepoRoot(t)
+
+	for _, c := range ciMatrixComponents(t, root) {
+		if _, ok := binaryChannels[c]; !ok {
+			t.Errorf(
+				"ci.yaml builds component %q but binaryChannels does not list it, so\n"+
+					"TestPathFilters_CoverAllInternalPackages silently skips it and its\n"+
+					"image can stop rebuilding on a dependency change without any test failing.\n"+
+					"Add %q to binaryChannels in this file.",
+				c, c,
+			)
+		}
+	}
+}
+
+// ciMatrixComponents returns the authoritative list of components ci.yaml builds,
+// parsed from its `all='[...]'` line. Every guard that needs to enumerate
+// components reads it from here so none of them can drift from the workflow.
+func ciMatrixComponents(t *testing.T, root string) []string {
+	t.Helper()
 	data, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "ci.yaml"))
 	if err != nil {
 		t.Fatalf("read ci.yaml: %v", err)
@@ -253,18 +273,7 @@ func TestPathFilters_BinaryChannelsCoversCIMatrix(t *testing.T) {
 	if len(components) == 0 {
 		t.Fatal("ci.yaml component list is empty; parse is wrong")
 	}
-
-	for _, c := range components {
-		if _, ok := binaryChannels[c]; !ok {
-			t.Errorf(
-				"ci.yaml builds component %q but binaryChannels does not list it, so\n"+
-					"TestPathFilters_CoverAllInternalPackages silently skips it and its\n"+
-					"image can stop rebuilding on a dependency change without any test failing.\n"+
-					"Add %q to binaryChannels in this file.",
-				c, c,
-			)
-		}
-	}
+	return components
 }
 
 // deploy/ path listed in .github/path-filters.yaml refers to a directory that
@@ -313,4 +322,132 @@ func TestPathFilters_NoDanglingEntries(t *testing.T) {
 			len(failures), strings.Join(failures, "\n  "),
 		)
 	}
+}
+
+// dockerfileForComponent resolves each CI matrix component to its Dockerfile by
+// reading ci.yaml's "Resolve Dockerfile + target" step, so this cannot drift from
+// the workflow that actually builds the images.
+//
+// Today that step is: crucible-runner -> deploy/runner/Dockerfile, everything else
+// -> the root Dockerfile built with target=<component>.
+func dockerfileForComponent(t *testing.T, root string) map[string]string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "ci.yaml"))
+	if err != nil {
+		t.Fatalf("read ci.yaml: %v", err)
+	}
+	ci := string(data)
+
+	// Pin the two branches of the resolver. If the workflow grows a third
+	// Dockerfile, these assertions fail and this map has to be revisited --
+	// rather than silently checking the wrong file.
+	if !strings.Contains(ci, `file=deploy/runner/Dockerfile`) {
+		t.Fatal("ci.yaml no longer maps crucible-runner to deploy/runner/Dockerfile; " +
+			"update dockerfileForComponent to match the workflow")
+	}
+	if !strings.Contains(ci, `echo "file=Dockerfile"`) {
+		t.Fatal("ci.yaml no longer falls back to the root Dockerfile; " +
+			"update dockerfileForComponent to match the workflow")
+	}
+
+	out := map[string]string{}
+	for _, c := range ciMatrixComponents(t, root) {
+		if c == "crucible-runner" {
+			out[c] = "deploy/runner/Dockerfile"
+		} else {
+			out[c] = "Dockerfile"
+		}
+	}
+	return out
+}
+
+// copyRe matches a COPY instruction's arguments.
+var copyRe = regexp.MustCompile(`(?m)^\s*COPY\s+(.*)$`)
+
+// TestPathFilters_CoverDockerfileCopySources asserts that every repo path a
+// component's Dockerfile COPYs from is covered by that component's path-filter
+// channel.
+//
+// TestPathFilters_CoverAllInternalPackages walks the *Go import graph*, so it
+// structurally cannot see a dependency that exists only as a Dockerfile COPY.
+// crucible-runner has exactly such an edge: it COPYs internal/runnertools/tools.txt
+// and derives its entire apt install list and its `command -v` verification loop
+// from that file. Without the matching channel entry, adding a tool to the manifest
+// would not rebuild the image that is supposed to contain the tool, and the miss
+// would surface as an exit 127 mid-assessment rather than as a build failure.
+//
+// Deriving the requirement from the Dockerfiles means a future COPY edge is caught
+// automatically instead of relying on someone remembering. Verified by deleting the
+// 'internal/runnertools/**' entry from the crucible-runner channel.
+func TestPathFilters_CoverDockerfileCopySources(t *testing.T) {
+	root := findRepoRoot(t)
+	filters := loadFilters(t, root)
+
+	var missing []string
+	for component, dockerfile := range dockerfileForComponent(t, root) {
+		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(dockerfile)))
+		if err != nil {
+			t.Fatalf("read %s for component %q: %v", dockerfile, component, err)
+		}
+		globs, ok := filters[component]
+		if !ok {
+			t.Errorf("component %q has no channel in path-filters.yaml", component)
+			continue
+		}
+
+		for _, m := range copyRe.FindAllStringSubmatch(string(data), -1) {
+			args := strings.Fields(m[1])
+			if len(args) < 2 {
+				continue
+			}
+			srcs, fromStage := copySources(args)
+			if fromStage {
+				continue // intra-build stage copy; depends on no repo path
+			}
+			for _, src := range srcs {
+				// "." is the whole build context. A channel cannot
+				// meaningfully enumerate that, and for the root Dockerfile
+				// the effective dependency is the Go import graph, which
+				// TestPathFilters_CoverAllInternalPackages already covers.
+				if src == "." || src == "./" {
+					continue
+				}
+				if isCovered(globs, src) || isCovered(globs, path.Dir(src)) {
+					continue
+				}
+				// Root-level files like go.mod live in the 'shared' channel,
+				// which rebuilds everything.
+				if isCovered(filters["shared"], src) {
+					continue
+				}
+				missing = append(missing, fmt.Sprintf(
+					"  %s COPYs %q but the %q channel does not cover it\n"+
+						"    (add '%s/**' to the %q channel in .github/path-filters.yaml)",
+					dockerfile, src, component, path.Dir(src), component))
+			}
+		}
+	}
+
+	if len(missing) > 0 {
+		t.Errorf("path-filters.yaml is missing coverage for %d Dockerfile COPY source(s).\n"+
+			"A change to one of these will NOT rebuild the image that consumes it, so the\n"+
+			"next deploy ships an image built from stale inputs:\n%s",
+			len(missing), strings.Join(missing, "\n"))
+	}
+}
+
+// copySources splits a COPY instruction's arguments into its source paths,
+// reporting whether it is a --from=<stage> copy.
+func copySources(args []string) (srcs []string, fromStage bool) {
+	for _, a := range args[:len(args)-1] {
+		switch {
+		case strings.HasPrefix(a, "--from="):
+			return nil, true
+		case strings.HasPrefix(a, "--"):
+			continue // e.g. --chown, --chmod
+		default:
+			srcs = append(srcs, strings.Trim(a, `"`))
+		}
+	}
+	return srcs, false
 }

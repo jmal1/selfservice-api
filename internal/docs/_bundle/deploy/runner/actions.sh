@@ -84,6 +84,7 @@ _sidecar_send() {
 run_action() {
     local name="$1"
     shift
+    local cmd="$1"
     local prefix
     prefix=$(_name_to_prefix "$name")
     local timeout_sec="${ACTION_TIMEOUT:-30}"
@@ -187,6 +188,39 @@ run_action() {
     local student_msg=""
     student_msg=$(echo "$output" | grep -oP '(?<=STUDENT_MSG:).*' | tail -1 \
         | sed 's/^[[:space:]]*//; s/[[:space:]]*$//') || true
+
+    # Exit 127 means "command not found", and it is the single most misleading
+    # status this runner can produce. To a student it is indistinguishable from
+    # "your service is misconfigured": the check went red, with no explanation.
+    # In reality the workflow asked for a tool that is not in the runner image,
+    # which is an authoring/infrastructure defect and nothing the student can
+    # fix by changing their VM.
+    #
+    # We only synthesize a message when the action produced none of its own —
+    # a library action that legitimately exits 127 from an inner command has
+    # already said something more specific, and overwriting that would trade a
+    # precise message for a generic one.
+    #
+    # The authoring-time counterpart is CRU0002 in internal/scriptvalidator,
+    # which warns the instructor before the workflow is ever saved. This branch
+    # is the runtime backstop for the cases static analysis cannot see
+    # (dynamically constructed command names, tools removed from the image
+    # after a workflow was published).
+    if [ "$exit_code" -eq 127 ] && [ -z "$student_msg" ]; then
+        status="error"
+        if declare -F "$cmd" >/dev/null 2>&1; then
+            # `cmd` is a library action (a shell function), so the missing
+            # binary is somewhere inside its body. Naming `cmd` here would
+            # point the instructor at a function that exists.
+            student_msg="This check could not run because a tool it depends on is not available in the assessment runner. This is a problem with the assessment itself, not with your work — please report it to your instructor."
+            output="${output}
+ERROR:command not found (exit 127) inside library action '${cmd}'. A command it invokes is not installed in the runner image. Check the action body against internal/runnertools/tools.txt."
+        else
+            student_msg="This check could not run: the command '${cmd}' is not available in the assessment runner. This is a problem with the assessment itself, not with your work — please report it to your instructor."
+            output="${output}
+ERROR:command not found: ${cmd} (exit 127). '${cmd}' is not installed in the runner image. Add it to internal/runnertools/tools.txt and rebuild, or use a tool that is already present."
+        fi
+    fi
 
     # Notify sidecar: action complete
     _sidecar_send "{\"event\":\"action_end\",\"action\":\"$(_json_escape "$name")\",\"status\":\"$status\",\"message\":\"$(_json_escape "$student_msg")\",\"exit_code\":$exit_code,\"duration_ms\":$duration_ms}"

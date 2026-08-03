@@ -78,6 +78,26 @@ func fixtureShellcheckJSONFor(lines []int) string {
 }`, lines[0], lines[0], lines[1], lines[1], lines[2], lines[2])
 }
 
+// shellcheckOnly filters out Crucible's own static checks (CRU*) so tests that
+// exercise shellcheck-output parsing and line remapping assert on what they
+// actually mean.
+//
+// This is NOT a relaxed assertion: these tests drive a FAKE shellcheck runner
+// and verify that its output is parsed and remapped correctly. Validate() also
+// runs independent CRU0001/CRU0002 passes over the same script, and the
+// synthetic "line1/line2/..." fixtures legitimately trip CRU0002 because
+// "line1" really is not a command. Counting those toward a shellcheck-parsing
+// assertion would be measuring the wrong thing.
+func shellcheckOnly(findings []Finding) []Finding {
+	var out []Finding
+	for _, f := range findings {
+		if !strings.HasPrefix(f.Code, "CRU") {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
 func TestValidate_Bash_ParsesShellcheckOutput(t *testing.T) {
 	// User script is 5 lines; pick finding lines that fall inside that range.
 	userScript := "line1\nline2\nline3\nline4\nline5\n"
@@ -91,8 +111,9 @@ func TestValidate_Bash_ParsesShellcheckOutput(t *testing.T) {
 	if res.Language != "bash" {
 		t.Errorf("expected language=bash, got %q", res.Language)
 	}
-	if len(res.Findings) != 3 {
-		t.Fatalf("expected 3 findings, got %d: %+v", len(res.Findings), res.Findings)
+	sc := shellcheckOnly(res.Findings)
+	if len(sc) != 3 {
+		t.Fatalf("expected 3 shellcheck findings, got %d: %+v", len(sc), sc)
 	}
 	if !res.HasErrors {
 		t.Error("expected HasErrors=true (we have an SC1009 error)")
@@ -100,17 +121,17 @@ func TestValidate_Bash_ParsesShellcheckOutput(t *testing.T) {
 	if !res.HasWarnings {
 		t.Error("expected HasWarnings=true (we have an SC2086 warning)")
 	}
-	got := res.Findings[0]
+	got := sc[0]
 	// Column 5 in wrapped script — we tab-indent user lines by 1 — so user-
 	// space column is 4.
 	if got.Code != "SC2086" || got.Severity != SeverityWarning || got.Line != 3 || got.Column != 4 {
 		t.Errorf("finding[0] wrong: %+v", got)
 	}
-	if res.Findings[1].Code != "SC1009" || res.Findings[1].Severity != SeverityError || res.Findings[1].Line != 4 {
-		t.Errorf("finding[1] wrong: %+v", res.Findings[1])
+	if sc[1].Code != "SC1009" || sc[1].Severity != SeverityError || sc[1].Line != 4 {
+		t.Errorf("finding[1] wrong: %+v", sc[1])
 	}
-	if res.Findings[2].Severity != SeverityInfo || res.Findings[2].Line != 5 {
-		t.Errorf("finding[2] wrong: %+v", res.Findings[2])
+	if sc[2].Severity != SeverityInfo || sc[2].Line != 5 {
+		t.Errorf("finding[2] wrong: %+v", sc[2])
 	}
 }
 
@@ -222,10 +243,11 @@ func TestValidate_DefaultsEndLineAndColumn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(res.Findings) != 1 {
-		t.Fatalf("expected 1 finding, got %d: %+v", len(res.Findings), res.Findings)
+	sc := shellcheckOnly(res.Findings)
+	if len(sc) != 1 {
+		t.Fatalf("expected 1 shellcheck finding, got %d: %+v", len(sc), sc)
 	}
-	f := res.Findings[0]
+	f := sc[0]
 	if f.Line != 2 {
 		t.Errorf("Line remapping wrong: got %d, want 2", f.Line)
 	}
@@ -347,5 +369,42 @@ func TestValidate_TimeoutCancelsRunner(t *testing.T) {
 	// Should fire well before any plausible shellcheck runtime.
 	if elapsed > 500*time.Millisecond {
 		t.Errorf("validator did not cancel promptly; elapsed=%s", elapsed)
+	}
+}
+
+// TestValidate_WiresCRU0002 asserts the unknown-command check is reachable
+// through Validate, not merely implemented.
+//
+// The original CRU0002 tests all called unknownCommandFindings directly, so
+// deleting its call site in Validate left every one of them green -- the exact
+// dead-wiring failure class documented in internal/ci/wiring_test.go. Verified
+// by removing the call from Validate and watching this test fail.
+func TestValidate_WiresCRU0002(t *testing.T) {
+	v := NewValidator().WithRunner(fakeRunner(`{"comments":[]}`, "", 0, nil))
+
+	res, err := v.Validate(context.Background(), "bash", "sqlmap --url http://x\n")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var found *Finding
+	for i := range res.Findings {
+		if res.Findings[i].Code == "CRU0002" {
+			found = &res.Findings[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("Validate did not emit CRU0002 for a command absent from the runner image; "+
+			"the check is implemented but not wired into Validate, so instructors get no "+
+			"authoring-time warning and the action fails at runtime with exit 127. "+
+			"got findings: %+v", res.Findings)
+	}
+	if !strings.Contains(found.Message, "sqlmap") {
+		t.Errorf("CRU0002 message should name the missing command, got %q", found.Message)
+	}
+	if found.Severity != SeverityWarning {
+		t.Errorf("CRU0002 should be a warning (the manifest cannot know about "+
+			"self-installed tools), got %q", found.Severity)
 	}
 }
