@@ -287,6 +287,62 @@ bug, not a mistake on your end.
 
 ---
 
+## "Generalize failed, or the template published but clones behave oddly"
+
+Generalize runs its cleanup through VMware guest ops, which gives it **no
+tty**. If the build user cannot `sudo` without a password, the script
+aborts partway — and what it had already done still stands. Symptoms of a
+half-run generalize:
+
+| Symptom | What didn't run |
+|---|---|
+| Two clones get the **same DHCP lease**, or one steals the other's IP | `truncate -s 0 /etc/machine-id` |
+| `ssh` warns **REMOTE HOST IDENTIFICATION HAS CHANGED** between two pods, or accepts the same host key for both | `rm -f /etc/ssh/ssh_host_*` |
+| A clone's first boot doesn't apply the injected password | `cloud-init clean` |
+
+Check it in one line from the build console:
+
+```bash
+sudo -n true && echo "sudo OK"
+```
+
+If that does not print `sudo OK`, fix requirement 5 in the
+[Linux template contract](templates.md#linux-template-contract), then
+re-run Generalize. Being in the `sudo` group is **not** sufficient —
+Ubuntu's stock rule still demands a password.
+
+> [!warning]
+> These are the two failures that are **invisible on one clone**. A single
+> pod from a badly-generalized template looks perfect. Test with two pods
+> from the same template and compare `cat /etc/machine-id` and
+> `ssh-keyscan <ip>` — the values must differ.
+
+---
+
+## "apt is broken on my template or on every clone"
+
+If `apt-get update` fails on a template you built from an ISO, look at the
+proxy the installer wrote:
+
+```bash
+cat /etc/apt/apt.conf.d/90curtin-aptproxy
+```
+
+It must contain a bare URL:
+
+```
+Acquire::http::Proxy "http://10.10.30.20:3142";
+```
+
+Anything else — a Python-style dict, a stray `{`, an empty string — means
+apt has a syntactically valid config pointing at a nonexistent proxy, so
+**every** fetch fails while the file itself parses fine. Delete the file
+(or correct it to the line above) and re-run `apt-get update`. Report it
+if a freshly-provisioned template shows this: the generator writes that
+file, so it is a platform bug rather than something you did.
+
+---
+
 ## See also
 
 - [Building Workflows](workflows.md) — the basics

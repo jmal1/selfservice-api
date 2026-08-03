@@ -158,7 +158,7 @@ template at any time to hide it without losing the generalized image.
 > the student just silently cannot log in.** There is no error in the
 > wizard, no failed job, no alert. The pod shows "running" and green, and
 > the failure surfaces only when the student tries to SSH or open the
-> console and their password is refused. Get these four things right
+> console and their password is refused. Get these five things right
 > *before* you Generalize.
 
 Crucible clones your template per student and injects a **unique per-pod
@@ -167,7 +167,7 @@ image satisfies the contract below. The publish gate validates the parts
 it can see from the template row (e.g. a blank `default_username`), but
 the guest-internal pieces are yours to get right inside the build console.
 
-### The four requirements
+### The five requirements
 
 **1. open-vm-tools installed and running.** Without it the guestinfo
 payload Crucible writes is never read, so the password is never applied.
@@ -205,19 +205,28 @@ system_info:
 
 **3. SSH host keys must regenerate after generalize.** Generalize runs
 `rm -f /etc/ssh/ssh_host_*`. If nothing regenerates them on next boot,
-sshd fails to start and the student cannot SSH in. Ubuntu/Debian ship
-`ssh-keygen.service` which does this automatically — confirm it is
-enabled. If it is missing, install this oneshot unit:
+sshd fails its config test and the student cannot SSH in.
+
+> [!danger]
+> **Ubuntu 24.04 does NOT ship `ssh-keygen.service`.** Earlier versions of
+> this page said it did. Verified on a real 24.04.3 build:
+> `systemctl is-enabled ssh-keygen.service` returns **not-found**, ssh is
+> socket-activated through `ssh.socket`, and `ssh.service` only runs
+> `sshd -t`. cloud-init's `ssh` module *will* eventually recreate missing
+> host keys on a new instance, but it races socket activation — so a clone
+> can refuse connections until cloud-init catches up. **Install the unit
+> below; do not assume the distro does this for you.**
 
 ```ini
-# /etc/systemd/system/regenerate-ssh-host-keys.service
+# /etc/systemd/system/crucible-regen-ssh-hostkeys.service
 [Unit]
-Description=Regenerate SSH host keys
-Before=ssh.service
+Description=Regenerate missing OpenSSH host keys (Crucible)
 ConditionPathExists=!/etc/ssh/ssh_host_ed25519_key
+Before=ssh.service ssh.socket
 
 [Service]
 Type=oneshot
+RemainAfterExit=yes
 ExecStart=/usr/bin/ssh-keygen -A
 
 [Install]
@@ -225,12 +234,18 @@ WantedBy=multi-user.target
 ```
 
 ```bash
-sudo systemctl enable regenerate-ssh-host-keys.service
+sudo systemctl enable crucible-regen-ssh-hostkeys.service
 ```
+
+The `ConditionPathExists` guard makes it a no-op on every later boot, so
+it can never rotate a running pod's host key out from under an open
+session.
 
 > [!note]
 > On **Ubuntu 24.04** the SSH daemon unit is `ssh.service`, **not**
-> `sshd.service`. Order any host-key regeneration `Before=ssh.service`.
+> `sshd.service`, and it is socket-activated. Order host-key regeneration
+> `Before=ssh.service ssh.socket` — ordering before `ssh.service` alone is
+> not enough when the socket accepts the connection first.
 
 **4. apt proxy pointed at the staging cache.** So package installs during
 build go through the lab's apt-cacher-ng. Create
@@ -239,6 +254,50 @@ build go through the lab's apt-cacher-ng. Create
 ```
 Acquire::http::Proxy "http://10.10.30.20:3142";
 ```
+
+> [!warning]
+> Point **only** the http proxy at the cache. apt-cacher-ng is an HTTP
+> cache; routing `Acquire::https::Proxy` through it breaks https
+> repositories rather than caching them.
+>
+> On an ISO-built template the installer writes this file itself, as
+> `/etc/apt/apt.conf.d/90curtin-aptproxy`. Check that path too, and check
+> its **value** — a malformed proxy URL there is not a syntax error, so
+> apt only fails later, at every fetch.
+
+**5. The build user needs passwordless sudo.** Generalize runs
+`sudo cloud-init clean`, `sudo truncate -s 0 /etc/machine-id` and
+`sudo rm -f /etc/ssh/ssh_host_*` through VMware guest ops — with **no
+tty**, so a password prompt cannot be answered and the whole script
+aborts.
+
+> [!danger]
+> **Being in the `sudo` group is not enough, and the `sudo:` line in
+> `99-crucible.cfg` does not grant this.** cloud-init only applies
+> `system_info.default_user` when it *creates* the account. If the account
+> already exists — which it does on any ISO install, because the installer
+> created it — that block is ignored, the user lands in group `sudo`, and
+> Ubuntu's stock `%sudo ALL=(ALL:ALL) ALL` requires a password.
+
+```bash
+echo 'student ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/90-crucible-student
+sudo chmod 0440 /etc/sudoers.d/90-crucible-student
+sudo visudo -cf /etc/sudoers.d/90-crucible-student   # must print "parsed OK"
+sudo -n true && echo OK                              # the real test
+```
+
+The `chmod 0440` is not cosmetic: **sudo silently ignores a drop-in that
+is group- or world-writable** and tells you nothing. Always finish with
+`sudo -n true`.
+
+> [!tip]
+> **A `cloudinit_cidata` ISO build does all five of these for you.** If you
+> provision from an Ubuntu Server ISO with `unattend_mode=cloudinit_cidata`,
+> the generated autoinstall installs open-vm-tools and cloud-init, writes
+> `99-crucible.cfg`, installs and enables the host-key regeneration unit,
+> configures the apt proxy, and drops in passwordless sudo. Run the
+> verification block below anyway — it is cheap, and it is the only thing
+> that proves it.
 
 > [!warning]
 > **Linux Mint does not ship cloud-init.** A Mint template will never
@@ -252,15 +311,24 @@ Acquire::http::Proxy "http://10.10.30.20:3142";
 
 ### Verify before publishing
 
-Open the build console, log in, and run these inside the guest. All four
+Open the build console, log in, and run these inside the guest. All five
 must look right before you Generalize:
 
 ```bash
-command -v vmware-rpctool                        # open-vm-tools present (req 1)
-cloud-init --version                             # must be >= 21.3 (req 2)
-systemctl is-enabled ssh                         # ssh.service enabled (req 3)
-cat /etc/cloud/cloud.cfg.d/99-crucible.cfg       # default_user.name: student (req 2)
+command -v vmware-rpctool                            # open-vm-tools present (req 1)
+cloud-init --version                                 # must be >= 21.3 (req 2)
+cat /etc/cloud/cloud.cfg.d/99-crucible.cfg           # default_user.name: student (req 2)
+systemctl is-enabled crucible-regen-ssh-hostkeys     # must be "enabled" (req 3)
+grep -rh -i proxy /etc/apt/apt.conf.d/               # a bare URL, not a dict (req 4)
+sudo -n true && echo "sudo OK"                       # must print sudo OK (req 5)
 ```
+
+> [!danger]
+> **`sudo -n true` is the single most important line here.** It is the only
+> one that fails the way generalize fails: no tty, no prompt, non-zero
+> exit. If it does not print `sudo OK`, Generalize will abort partway and
+> leave the template with a populated `/etc/machine-id` and the original
+> SSH host keys — which means every clone shares them.
 
 Also confirm the template row's **default_username is `student`** (for a
 customized template) or holds real static credentials (for a
