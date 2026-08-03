@@ -956,7 +956,7 @@ func (h *Handler) ListTemplates(w http.ResponseWriter, r *http.Request) {
 		}
 		visible = append(visible, t)
 	}
-	respondJSON(w, http.StatusOK, visible)
+	respondJSON(w, http.StatusOK, newTemplatePublicList(visible))
 }
 
 // --- Job Handlers ---
