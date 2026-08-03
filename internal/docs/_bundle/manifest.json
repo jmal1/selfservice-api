@@ -141,8 +141,8 @@
     {
       "path": "docs/instructor/templates.md",
       "title": "Building a Template",
-      "size": 11368,
-      "sha256": "fb983c6eb5f7fcf6597dea891d8d665287bca874481350eefa3a9c0bdd2d98ac",
+      "size": 13482,
+      "sha256": "5673e31ad2c1e1ee22f7b00c7470f3859482191e9aedfdd2bec73bd34bc10d90",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/glossary.md",
@@ -156,8 +156,8 @@
     {
       "path": "docs/instructor/troubleshooting.md",
       "title": "Troubleshooting",
-      "size": 8802,
-      "sha256": "1c22a703f57b09dfe9b112f3709e67771b4561c27b15ad56553bfe17492173a4",
+      "size": 10782,
+      "sha256": "4f2b5a6485602138c749ac39b36c15fc6ecc7bf631b9e939b992b8829a24224b",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/actions.md",
@@ -276,5 +276,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 195213
+  "total_bytes": 199307
 }

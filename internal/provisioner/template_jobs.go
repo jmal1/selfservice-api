@@ -266,12 +266,17 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 }
 
 // isoInstallToolsTimeout bounds how long the unattended-install path waits for
-// VMware Tools to report in after the blank VM boots the installer. Unlike a
-// clone (which comes up in a couple of minutes), an OS install runs the whole
-// installer end to end — partitioning, package unpack, first boot — so it needs
-// a generous ceiling. A clone-length 5-minute wait would spuriously fail every
-// automated install.
+// the installer to finish. Unlike a clone (which comes up in a couple of
+// minutes), an OS install runs the whole installer end to end — partitioning,
+// package unpack, first boot — so it needs a generous ceiling. A clone-length
+// 5-minute wait would spuriously fail every automated install.
 const isoInstallToolsTimeout = 60 * time.Minute
+
+// isoInstalledBootTimeout bounds the *second* wait: after the install finishes
+// and the CD-ROMs are detached, the VM is booted off its new disk and we wait
+// for that system's VMware Tools. This is an ordinary first boot, so it gets an
+// ordinary deadline rather than the install-length one.
+const isoInstalledBootTimeout = 15 * time.Minute
 
 // isoProvisionVCenter is the vCenter subset the iso template-provision path
 // needs. The real *vcenter.Client satisfies it (asserted below), so production
@@ -281,6 +286,9 @@ type isoProvisionVCenter interface {
 	UploadToDatastore(ctx context.Context, datastore, remotePath string, r io.Reader, size int64, progress func(sent int64)) error
 	CreateBlankVM(ctx context.Context, p vcenter.BlankVMParams) (string, error)
 	PowerOnVM(ctx context.Context, moref string) error
+	// WaitForPowerOff, not WaitForTools, is the unattended install's completion
+	// signal — see the long comment at the call site.
+	WaitForPowerOff(ctx context.Context, moref string, timeout time.Duration) error
 	WaitForTools(ctx context.Context, moref string, timeout time.Duration) error
 	DetachCDROMs(ctx context.Context, moref string) error
 }
@@ -424,18 +432,43 @@ func provisionTemplateFromISO(
 	}
 
 	if unattended {
-		// An OS install runs the whole installer; give Tools a long deadline.
-		prog("wait_tools", fmt.Sprintf("Waiting up to %s for the unattended install to finish and VMware Tools to report in", isoInstallToolsTimeout))
-		if err := vc.WaitForTools(ctx, moref, isoInstallToolsTimeout); err != nil {
+		// Wait for the install to finish, NOT for Tools.
+		//
+		// The Ubuntu live-server ISO runs open-vm-tools in the installer
+		// environment and reports Tools ~40s after power-on, with nothing yet
+		// written to disk. The previous version of this code took that as
+		// "installed", detached the CD-ROMs out from under the running
+		// installer, and advanced the template to configuring with an empty
+		// disk — a silent success that produced an unusable template.
+		//
+		// The generated autoinstall sets "shutdown: poweroff", so a power-off
+		// is unambiguous: it can only happen once curtin has written the
+		// target system.
+		prog("wait_install", fmt.Sprintf("Waiting up to %s for the unattended install to finish (the VM powers itself off when done)", isoInstallToolsTimeout))
+		if err := vc.WaitForPowerOff(ctx, moref, isoInstallToolsTimeout); err != nil {
 			return markErr(fmt.Errorf(
-				"wait for VMware Tools after unattended install: %w (check the VM console — the autoinstall may have stalled or the seed was rejected)", err))
+				"wait for unattended install to finish: %w (check the VM console — the autoinstall may have stalled, or the seed was rejected)", err))
 		}
 		// Drop the CD-ROMs now that the OS is installed: a lingering ISO mount
 		// keeps a lock on the datastore file that blocks deleting or replacing
-		// the installer/seed later.
+		// the installer/seed later. Doing it while the VM is off also
+		// guarantees the next boot comes off the disk, not the installer.
 		prog("detach_cdrom", "Detaching installer and seed ISOs")
 		if err := vc.DetachCDROMs(ctx, moref); err != nil {
 			return markErr(fmt.Errorf("detach CD-ROMs after install: %w", err))
+		}
+		// Now boot the installed system and wait for its Tools. This is the
+		// first point at which "Tools are running" actually means the guest OS
+		// is up, and it is what the configuring stage needs in order to run
+		// guest commands.
+		prog("boot_installed", "Booting the installed system")
+		if err := vc.PowerOnVM(ctx, moref); err != nil {
+			return markErr(fmt.Errorf("power on installed system: %w", err))
+		}
+		prog("wait_tools", fmt.Sprintf("Waiting up to %s for the installed system's VMware Tools", isoInstalledBootTimeout))
+		if err := vc.WaitForTools(ctx, moref, isoInstalledBootTimeout); err != nil {
+			return markErr(fmt.Errorf(
+				"wait for VMware Tools after first boot of the installed system: %w (the install completed but the guest did not come up with open-vm-tools running)", err))
 		}
 	} else {
 		// Manual install: the OS is NOT installed yet, so WaitForTools would

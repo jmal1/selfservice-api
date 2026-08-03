@@ -66,6 +66,43 @@ and waits for VMware Tools. This is the slow step.
 As soon as state flips to `configuring`, the **Open Build Console**
 button appears.
 
+### Provisioning from an ISO
+
+If the source is an **ISO** rather than an existing VM, Provision builds a
+blank VM, attaches the installer ISO, and boots it. What happens next depends
+on the template's **unattended install mode**:
+
+| Mode | What Provision does | How long |
+|------|--------------------|----------|
+| `manual` | Boots the installer and stops. **You install the OS yourself** through the Build Console, then click Generalize. | Up to you |
+| `cloudinit_cidata` (Ubuntu Server) | Attaches a generated cloud-init seed CD and runs a **hands-off** autoinstall. No console input required. | 20–45 min |
+| `windows_autounattend` | Attaches a generated `autounattend.xml` seed CD and runs Windows Setup unattended. | 30–60 min |
+
+> [!note]
+> **An unattended install finishes when the VM powers itself off.**
+> The generated config ends with `shutdown: poweroff`, and the worker waits
+> for that — not for VMware Tools. This matters because the Ubuntu Server
+> installer runs VMware Tools *inside the installer environment*, roughly 40
+> seconds after power-on and long before anything is written to disk. Tools
+> appearing early is normal and is not a sign the install is done.
+>
+> Once the VM powers off, the worker detaches both CDs, boots the installed
+> system, waits for *its* Tools, and moves the template to `configuring`.
+
+> [!warning]
+> **Ubuntu autoinstall needs the confirmation prompt answered.** The Ubuntu
+> installer refuses to touch the disk until someone confirms, and normally
+> that requires an `autoinstall` kernel argument we cannot add from a seed CD.
+> Crucible answers the prompt automatically from inside the installer. If you
+> open the console and see `Continue with autoinstall? (yes|no)` sitting there
+> for more than a couple of minutes, that automation failed — answer `yes` to
+> unblock this build and report it, because every future build of that ISO
+> will stall the same way.
+
+Progress messages in the wizard tell you which phase you're in:
+`create_vm` → `power_on` → `wait_install` → `detach_cdrom` → `boot_installed`
+→ `wait_tools` → `configuring`.
+
 ## Step 3 — Configure (the new part)
 
 > [!tip]

@@ -245,6 +245,48 @@ cause usually falls out in minutes.
 
 ---
 
+## "My ISO template sat in `provisioning` for an hour, then errored"
+
+An unattended ISO install that never finishes almost always means the
+installer is waiting for input. Open the Build Console and look at the
+screen — the error message in the wizard says the same thing, but the
+console tells you *which* prompt.
+
+**`Continue with autoinstall? (yes|no)`**
+: The Ubuntu installer's safeguard before it wipes the disk. Crucible
+  normally answers this automatically from inside the installer
+  environment, so seeing it means that automation failed. Type `yes` to
+  unblock this build, then report it — every future build from that ISO
+  will stall identically until it's fixed.
+
+**A partition/disk prompt, or a language selection**
+: The seed CD wasn't read at all. Check that the template's
+  **unattended mode** matches the ISO: `cloudinit_cidata` only works with
+  the Ubuntu **Server** installer, not the Desktop ISO (different
+  installer entirely). A Desktop ISO must use `manual`.
+
+**A blank or frozen screen**
+: The VM booted from the wrong device. Re-run Provision; if it recurs,
+  the ISO itself may be corrupt — re-upload it.
+
+> [!note]
+> **VMware Tools showing "running" during an ISO install means nothing.**
+> The Ubuntu Server installer runs Tools inside its own live environment
+> about 40 seconds after power-on, with a completely empty disk. Crucible
+> deliberately ignores it and waits for the VM to **power itself off**,
+> which the generated config does when the install genuinely completes.
+> Don't use Tools status to judge whether an install is progressing.
+
+## "My ISO template reached `configuring` but the disk is empty"
+
+This shouldn't be possible any more, but if you see it: the template's
+staging VM booted to a "no operating system" / PXE screen. Set the
+template back to `error`, delete the staging VM, and re-provision. Report
+it — it means the install-complete signal misfired, which is a platform
+bug, not a mistake on your end.
+
+---
+
 ## See also
 
 - [Building Workflows](workflows.md) — the basics

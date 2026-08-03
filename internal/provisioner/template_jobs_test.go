@@ -276,12 +276,19 @@ func TestPollGuestCredentials_HonorsContextCancel(t *testing.T) {
 // fakeISOVC records every vCenter call the ISO path makes so a test can assert
 // which dependency ran, in what order, and with what arguments.
 type fakeISOVC struct {
-	createErr error
-	createRet string // moref returned by CreateBlankVM
-	waitErr   error
-	uploadErr error
-	detachErr error
-	powerErr  error
+	createErr   error
+	createRet   string // moref returned by CreateBlankVM
+	waitErr     error
+	powerOffErr error
+	uploadErr   error
+	detachErr   error
+	powerErr    error
+
+	// seq records the order of vCenter calls so a test can assert the ISO
+	// install sequence, not just that each call happened. Ordering is the
+	// whole contract here: detaching the installer media before the install
+	// finishes silently produces an empty-disk template.
+	seq []string
 
 	uploadCalls  int
 	uploadDS     string
@@ -297,12 +304,17 @@ type fakeISOVC struct {
 	waitMoref   string
 	waitTimeout time.Duration
 
+	powerOffCalls   int
+	powerOffMoref   string
+	powerOffTimeout time.Duration
+
 	detachCalls int
 	detachMoref string
 }
 
 func (f *fakeISOVC) UploadToDatastore(_ context.Context, datastore, remotePath string, r io.Reader, _ int64, _ func(sent int64)) error {
 	f.uploadCalls++
+	f.seq = append(f.seq, "upload")
 	f.uploadDS = datastore
 	f.uploadRemote = remotePath
 	if f.uploadErr != nil {
@@ -315,6 +327,7 @@ func (f *fakeISOVC) UploadToDatastore(_ context.Context, datastore, remotePath s
 
 func (f *fakeISOVC) CreateBlankVM(_ context.Context, p vcenter.BlankVMParams) (string, error) {
 	f.createCalls++
+	f.seq = append(f.seq, "create")
 	f.createParams = p
 	if f.createErr != nil {
 		return "", f.createErr
@@ -327,12 +340,25 @@ func (f *fakeISOVC) CreateBlankVM(_ context.Context, p vcenter.BlankVMParams) (s
 
 func (f *fakeISOVC) PowerOnVM(_ context.Context, moref string) error {
 	f.powerOnCalls++
+	f.seq = append(f.seq, "power_on")
 	f.powerOnMoref = moref
 	return f.powerErr
 }
 
+// WaitForPowerOff is the unattended install's completion signal: the generated
+// autoinstall sets "shutdown: poweroff", so the VM powering itself off is the
+// first moment the target disk is known to be written.
+func (f *fakeISOVC) WaitForPowerOff(_ context.Context, moref string, timeout time.Duration) error {
+	f.powerOffCalls++
+	f.seq = append(f.seq, "wait_power_off")
+	f.powerOffMoref = moref
+	f.powerOffTimeout = timeout
+	return f.powerOffErr
+}
+
 func (f *fakeISOVC) WaitForTools(_ context.Context, moref string, timeout time.Duration) error {
 	f.waitCalls++
+	f.seq = append(f.seq, "wait_tools")
 	f.waitMoref = moref
 	f.waitTimeout = timeout
 	return f.waitErr
@@ -340,6 +366,7 @@ func (f *fakeISOVC) WaitForTools(_ context.Context, moref string, timeout time.D
 
 func (f *fakeISOVC) DetachCDROMs(_ context.Context, moref string) error {
 	f.detachCalls++
+	f.seq = append(f.seq, "detach")
 	f.detachMoref = moref
 	return f.detachErr
 }
@@ -434,6 +461,9 @@ func TestProvisionTemplate_ISO_Manual(t *testing.T) {
 	if vc.waitCalls != 0 {
 		t.Errorf("manual install must NOT call WaitForTools; got %d calls", vc.waitCalls)
 	}
+	if vc.powerOffCalls != 0 {
+		t.Errorf("manual install must NOT wait for power-off (nothing will power the VM off); got %d calls", vc.powerOffCalls)
+	}
 	if vc.detachCalls != 0 {
 		t.Errorf("manual install must NOT detach CD-ROMs (installer is still needed); got %d calls", vc.detachCalls)
 	}
@@ -493,24 +523,92 @@ func TestProvisionTemplate_ISO_Unattended(t *testing.T) {
 	if vc.uploadDS != "NAS-BackupsAndISOS" {
 		t.Errorf("seed uploaded to datastore %q, want it beside the installer on %q", vc.uploadDS, "NAS-BackupsAndISOS")
 	}
-	if vc.waitCalls != 1 {
-		t.Fatalf("unattended install must wait for VMware Tools once, got %d calls", vc.waitCalls)
+	if vc.powerOffCalls != 1 {
+		t.Fatalf("unattended install must wait for the VM to power itself off exactly once, got %d calls", vc.powerOffCalls)
 	}
-	if vc.waitTimeout != isoInstallToolsTimeout {
-		t.Errorf("WaitForTools timeout = %s, want the long install deadline %s (a clone-length wait would fail every real install)", vc.waitTimeout, isoInstallToolsTimeout)
+	if vc.powerOffTimeout != isoInstallToolsTimeout {
+		t.Errorf("WaitForPowerOff timeout = %s, want the long install deadline %s (a clone-length wait would fail every real install)", vc.powerOffTimeout, isoInstallToolsTimeout)
 	}
-	if vc.waitTimeout <= 5*time.Minute {
-		t.Errorf("install-length WaitForTools timeout (%s) must be much longer than the clone path's 5m", vc.waitTimeout)
+	if vc.powerOffTimeout <= 5*time.Minute {
+		t.Errorf("install-length WaitForPowerOff timeout (%s) must be much longer than the clone path's 5m", vc.powerOffTimeout)
 	}
 	if vc.detachCalls != 1 {
-		t.Fatalf("unattended install must detach CD-ROMs after Tools appear, got %d calls", vc.detachCalls)
+		t.Fatalf("unattended install must detach CD-ROMs after the install finishes, got %d calls", vc.detachCalls)
 	}
 	if vc.detachMoref != "vm-iso-7788" {
 		t.Errorf("DetachCDROMs called on %q, want the created VM %q", vc.detachMoref, "vm-iso-7788")
 	}
+	// Tools are still waited for, but only AFTER the installed system is booted
+	// off its own disk — see TestProvisionTemplate_ISO_Unattended_WaitsForPowerOffNotTools.
+	if vc.waitCalls != 1 {
+		t.Fatalf("expected exactly one WaitForTools call (on the installed system), got %d", vc.waitCalls)
+	}
+	if vc.waitTimeout != isoInstalledBootTimeout {
+		t.Errorf("post-install WaitForTools timeout = %s, want the ordinary first-boot deadline %s", vc.waitTimeout, isoInstalledBootTimeout)
+	}
 	if got := db.finalState(); got != models.TemplateStateConfiguring {
 		t.Errorf("final template state = %q, want %q", got, models.TemplateStateConfiguring)
 	}
+}
+
+// TestProvisionTemplate_ISO_Unattended_WaitsForPowerOffNotTools is the
+// regression guard for a silent, template-destroying bug.
+//
+// The Ubuntu live-server installer ISO runs open-vm-tools in the *ephemeral
+// installer* environment: on a real build, Tools reported RUNNING 39 seconds
+// after power-on, with nothing yet written to the disk. The original code used
+// WaitForTools as the "install finished" signal, so it would have detached the
+// installer media out from under the running installer roughly a minute in and
+// advanced the template to 'configuring' with a completely empty disk — a
+// template that looks perfectly provisioned and has no OS.
+//
+// This asserts the ORDER, not just the calls: the install must complete
+// (power-off) before the media is detached, and Tools must only be consulted
+// after the installed system has been booted off its own disk.
+func TestProvisionTemplate_ISO_Unattended_WaitsForPowerOffNotTools(t *testing.T) {
+	payload := baseISOPayload()
+	payload.UnattendMode = models.UnattendModeCloudInitCIData
+	payload.UnattendConfig = json.RawMessage(`{"Hostname":"ubuntu-lab","Password":"S3edP@ss-not-a-real-secret"}`) // pragma: allowlist-secret
+	vc, db := newISOFakes(payload)
+
+	if err := provisionTemplateFromISO(context.Background(), vc, db, discardLogger(), nil, payload); err != nil {
+		t.Fatalf("unattended ISO provision returned error: %v", err)
+	}
+
+	want := []string{"upload", "create", "power_on", "wait_power_off", "detach", "power_on", "wait_tools"}
+	if len(vc.seq) != len(want) {
+		t.Fatalf("vCenter call sequence = %v, want %v", vc.seq, want)
+	}
+	for i := range want {
+		if vc.seq[i] != want[i] {
+			t.Fatalf("vCenter call sequence = %v, want %v (first difference at index %d)", vc.seq, want, i)
+		}
+	}
+
+	// Spell out the two orderings that carry the whole contract, so a failure
+	// names the production consequence rather than just an index.
+	offAt, detachAt, toolsAt := indexOf(vc.seq, "wait_power_off"), indexOf(vc.seq, "detach"), indexOf(vc.seq, "wait_tools")
+	if !(offAt < detachAt) {
+		t.Errorf("CD-ROMs detached at step %d but the install was only confirmed finished at step %d: "+
+			"detaching the installer media mid-install produces a template with an empty disk", detachAt, offAt)
+	}
+	if !(offAt < toolsAt) {
+		t.Errorf("WaitForTools ran at step %d, before the install completed at step %d: "+
+			"the Ubuntu live installer runs open-vm-tools ~40s after power-on, so Tools appearing "+
+			"does NOT mean the OS is installed", toolsAt, offAt)
+	}
+	if got := db.finalState(); got != models.TemplateStateConfiguring {
+		t.Errorf("final template state = %q, want %q", got, models.TemplateStateConfiguring)
+	}
+}
+
+func indexOf(xs []string, want string) int {
+	for i, x := range xs {
+		if x == want {
+			return i
+		}
+	}
+	return -1
 }
 
 // TestProvisionTemplate_ISO_BadSourceRef proves a malformed installer path is

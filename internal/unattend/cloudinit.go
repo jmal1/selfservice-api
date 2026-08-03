@@ -43,15 +43,17 @@ type ciApt struct {
 }
 
 type ciAutoinstall struct {
-	Version      int        `yaml:"version"`
-	Identity     ciIdentity `yaml:"identity"`
-	SSH          ciSSH      `yaml:"ssh"`
-	Packages     []string   `yaml:"packages"`
-	Locale       string     `yaml:"locale"`
-	Keyboard     ciKeyboard `yaml:"keyboard"`
-	Timezone     string     `yaml:"timezone"`
-	Apt          *ciApt     `yaml:"apt,omitempty"`
-	LateCommands []string   `yaml:"late-commands"`
+	Version       int        `yaml:"version"`
+	Identity      ciIdentity `yaml:"identity"`
+	SSH           ciSSH      `yaml:"ssh"`
+	Packages      []string   `yaml:"packages"`
+	Locale        string     `yaml:"locale"`
+	Keyboard      ciKeyboard `yaml:"keyboard"`
+	Timezone      string     `yaml:"timezone"`
+	Apt           *ciApt     `yaml:"apt,omitempty"`
+	EarlyCommands []string   `yaml:"early-commands"`
+	LateCommands  []string   `yaml:"late-commands"`
+	Shutdown      string     `yaml:"shutdown"`
 }
 
 type ciDocument struct {
@@ -71,6 +73,76 @@ system_info:
     sudo: ["ALL=(ALL) NOPASSWD:ALL"]
     shell: /bin/bash
 `
+
+// autoConfirmScript answers subiquity's destructive-operation safeguard.
+//
+// Delivering an autoinstall config over cloud-init is NOT enough to get a
+// hands-off install. subiquity blocks before it touches the disk and prints:
+//
+//	Confirmation is required to continue.
+//	Add 'autoinstall' to your kernel command line to avoid this
+//	Continue with autoinstall? (yes|no)
+//
+// and the only bypass is the kernel command line
+// (subiquity/server/controllers/install.py):
+//
+//	if not self.app.interactive:
+//	    if "autoinstall" in self.app.kernel_cmdline:
+//	        await self.model.confirm()
+//	self.app.update_state(ApplicationState.NEEDS_CONFIRMATION)
+//	if await self.model.wait_confirmation():
+//	    break
+//
+// We cannot set that argument: it lives in the installer ISO's GRUB config, and
+// remastering the ISO needs an El Torito boot-catalog writer we do not have
+// (see RemasterPreseedISO / ErrRemasterUnsupported). Observed consequence
+// before this existed: the VM booted, sat at the prompt indefinitely, and every
+// external signal said the install was progressing.
+//
+// So we answer the prompt from inside the ephemeral installer instead, using
+// subiquity's own client/server API (the same POST /meta/confirm the console
+// client issues when a human types "yes").
+//
+// Three deliberate properties:
+//
+//   - It waits for state NEEDS_CONFIRMATION before confirming. Confirming early
+//     would work — model.confirm() sets an asyncio.Event that wait_confirmation()
+//     later observes as already set — but it also broadcasts INSTALL_CONFIRMED,
+//     and firing that before the installer expects it is a needless risk.
+//   - It is written in python3, not curl. python3 is guaranteed present because
+//     subiquity itself is a python application; curl is not.
+//   - It can never fail the install. early-commands abort the run on a non-zero
+//     exit, so this backgrounds itself, swallows every error, and gives up after
+//     ~20 minutes. A failure here degrades to the old behaviour (the install
+//     waits at the prompt and the provisioner reports a timeout) rather than
+//     turning a recoverable stall into an immediate abort.
+const autoConfirmScript = `python3 -c '
+import socket, time
+SOCKETS = ["/run/subiquity/socket", "/run/subiquity/server.sock"]
+def call(path, verb):
+    for p in SOCKETS:
+        try:
+            c = socket.socket(socket.AF_UNIX)
+            c.settimeout(10)
+            c.connect(p)
+            c.sendall(("%s %s HTTP/1.1\r\nHost: l\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" % (verb, path)).encode())
+            buf = b""
+            while True:
+                chunk = c.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+            c.close()
+            return buf
+        except Exception:
+            pass
+    return b""
+for _ in range(240):
+    if b"NEEDS_CONFIRMATION" in call("/meta/status", "GET"):
+        call("/meta/confirm?tty=%22%2Fdev%2Ftty1%22", "POST")
+        break
+    time.sleep(5)
+' >/dev/null 2>&1 &`
 
 // buildCloudInitUserData renders the #cloud-config user-data document for an
 // Ubuntu autoinstall. The password is stored as a SHA-512 crypt hash, never
@@ -95,6 +167,16 @@ func buildCloudInitUserData(s Spec) (string, error) {
 		Locale:   s.Locale,
 		Keyboard: ciKeyboard{Layout: "us"},
 		Timezone: s.TimeZone,
+		EarlyCommands: []string{
+			autoConfirmScript,
+		},
+		// Power off rather than reboot when the install finishes. This is the
+		// provisioner's completion signal: the Ubuntu live-server ISO runs
+		// open-vm-tools in the *installer* environment and reports Tools within
+		// ~40 seconds of power-on, long before any OS exists on disk, so "Tools
+		// are up" cannot mean "the install is done". A clean power-off can only
+		// happen after curtin has finished writing the target system.
+		Shutdown: "poweroff",
 		LateCommands: []string{
 			// Install the Crucible cloud.cfg into the target system.
 			"curtin in-target --target=/target -- sh -c " +
