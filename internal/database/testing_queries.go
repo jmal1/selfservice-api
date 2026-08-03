@@ -16,6 +16,18 @@ import (
 // GetPlaylistsForPod resolves playlists for a pod using the two-level model:
 // 1. Check blueprint_vm_playlists for overrides
 // 2. Fall back to template_playlists defaults
+//
+// The override join keys blueprint_vm_playlists.vm_slot (INT, migration 000013)
+// against blueprint_vms.boot_order (INT, migration 000010). Migration 000013
+// introduced `vm_slot` to identify "a VM within a blueprint" but never added a
+// matching column, and `boot_order` is the only ordinal in blueprint_vms that
+// carries that meaning.
+//
+// This previously read `bv.slot`, a column no migration has ever created, so
+// the query failed with SQLSTATE 42703 for *every* pod. Because the error was
+// returned rather than swallowed, GET /pods/{id}/testing returned 500 and the
+// template_playlists fallback below was unreachable — the override feature has
+// never worked, and it took the working fallback down with it.
 func (q *Queries) GetPlaylistsForPod(ctx context.Context, podID uuid.UUID) ([]models.Playlist, error) {
 	// First try blueprint-level overrides
 	rows, err := q.pool.Query(ctx, `
@@ -24,7 +36,7 @@ func (q *Queries) GetPlaylistsForPod(ctx context.Context, podID uuid.UUID) ([]mo
 		FROM playlists p
 		JOIN blueprint_vm_playlists bvp ON p.id = bvp.playlist_id
 		JOIN pods pod ON pod.id = $1
-		JOIN blueprint_vms bv ON bv.blueprint_id = pod.blueprint_id AND bv.slot = bvp.vm_slot
+		JOIN blueprint_vms bv ON bv.blueprint_id = pod.blueprint_id AND bv.boot_order = bvp.vm_slot
 		JOIN pod_vms pv ON pv.pod_id = pod.id AND pv.template_id = bv.template_id
 		WHERE bvp.blueprint_id = pod.blueprint_id
 		  AND p.is_active = true
