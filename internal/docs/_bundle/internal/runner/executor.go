@@ -125,33 +125,55 @@ func (e *Executor) RunWorkflow(ctx context.Context, wf WorkflowDef) WorkflowRunR
 	go func() { done <- cmd.Wait() }()
 
 	result.Status = "pass"
+
+	// Handling an action result must be identical whether it arrives while bash
+	// is still running or during the post-exit drain below.
+	//
+	// It previously was not: the drain path only appended to ActionResults, so a
+	// failing action that landed there did not set result.Status, produced no
+	// student message, and was never reported incrementally to the engine.
+	//
+	// That is not an edge case. `run_action` writes its action_end event to the
+	// sidecar socket and then the script ends, so on the LAST action of every
+	// workflow both `resultCh` and `done` are ready at essentially the same
+	// moment — and Go's select picks uniformly at random between ready cases.
+	// A student's final check therefore had roughly a coin-flip chance of
+	// failing without failing its workflow, which is a silent grading error in
+	// the direction that is hardest to notice: too lenient.
+	handleAction := func(actionOut ActionOutput, propagate bool) {
+		if actionOut.Message == "" {
+			actionOut.Message = extractStudentMessage(stdoutBuf.String())
+		}
+
+		result.ActionResults = append(result.ActionResults, actionOut)
+
+		// Report action incrementally to engine
+		e.callback.ReportAction(wf.Slug, actionOut)
+
+		// Inject updated CTX_* env vars for the next action
+		// (the bash process inherits the original env, but new
+		// CTX_* vars are available via the sidecar snapshot)
+
+		if propagate && actionOut.Status != "pass" {
+			result.Status = actionOut.Status
+			if actionOut.Message != "" {
+				result.Message = actionOut.Message
+			}
+		}
+	}
+
 	for {
 		select {
 		case actionOut := <-resultCh:
-			// Extract student message from stdout
-			if actionOut.Message == "" {
-				actionOut.Message = extractStudentMessage(stdoutBuf.String())
-			}
-
-			result.ActionResults = append(result.ActionResults, actionOut)
-
-			// Report action incrementally to engine
-			e.callback.ReportAction(wf.Slug, actionOut)
-
-			// Inject updated CTX_* env vars for the next action
-			// (the bash process inherits the original env, but new
-			// CTX_* vars are available via the sidecar snapshot)
-
-			if actionOut.Status != "pass" {
-				result.Status = actionOut.Status
-				if actionOut.Message != "" {
-					result.Message = actionOut.Message
-				}
-			}
+			handleAction(actionOut, true)
 
 		case err := <-done:
-			// Bash process exited — drain remaining action events
-			sidecarCancel()
+			// Bash process exited — drain remaining action events.
+			//
+			// sidecarCancel is deliberately NOT called before the drain: it
+			// stops the listener, and any event still in flight on the socket
+			// would be lost rather than delivered. The drain's own timeout
+			// bounds how long we wait.
 			drainTimeout := time.After(2 * time.Second)
 		drainLoop:
 			for {
@@ -160,11 +182,12 @@ func (e *Executor) RunWorkflow(ctx context.Context, wf WorkflowDef) WorkflowRunR
 					if !ok {
 						break drainLoop
 					}
-					result.ActionResults = append(result.ActionResults, actionOut)
+					handleAction(actionOut, true)
 				case <-drainTimeout:
 					break drainLoop
 				}
 			}
+			sidecarCancel()
 
 			if err != nil && result.Status == "pass" {
 				if wfCtx.Err() == context.DeadlineExceeded {
