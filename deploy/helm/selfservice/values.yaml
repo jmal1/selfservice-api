@@ -100,12 +100,16 @@ secrets:
 #
 # endpoint MUST be https: the Crucible UI is served over TLS, so a
 # plain-http presigned PUT is blocked by the browser as mixed content.
-# Caddy on netbirdv01 fronts MinIO at s3.lab.jmal.io (internal only —
-# never add it to a public site block).
+# K3s Traefik + cert-manager (ClusterIssuer letsencrypt-prod, DNS-01 via Azure
+# DNS) terminate TLS for s3.lab.jmal.io, mirroring grafana.lab.jmal.io. This is
+# internal only: the A record lives solely in the lab BIND zone and resolves to
+# the Traefik VIP, never to MinIO directly.
 objectstore:
-  enabled: false
+  enabled: true
   endpoint: "https://s3.lab.jmal.io"
-  bucket: "crucible"
+  # The bucket is "isos"; Crucible namespaces its objects under the "crucible/"
+  # prefix below, which is also the boundary the service-account policy enforces.
+  bucket: "isos"
   prefix: "crucible"
   useSSL: true
   # Lifetime of a presigned upload URL. Short by design: a leaked URL is

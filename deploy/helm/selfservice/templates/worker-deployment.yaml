@@ -133,5 +133,29 @@ spec:
               value: {{ .Values.worker.networkReconciler.enabled | default false | quote }}
             - name: WORKER_NETWORK_RECONCILER_INTERVAL
               value: {{ .Values.worker.networkReconciler.interval | default "5m" | quote }}
+            {{- if .Values.objectstore.enabled }}
+            # The image_import job streams the staged object out of MinIO and
+            # into vCenter, so the worker needs the same credentials the API
+            # uses to presign. See api-deployment.yaml for why useSSL is not
+            # piped through `default`.
+            - name: OBJECTSTORE_ENDPOINT
+              value: {{ .Values.objectstore.endpoint | quote }}
+            - name: OBJECTSTORE_BUCKET
+              value: {{ .Values.objectstore.bucket | quote }}
+            - name: OBJECTSTORE_PREFIX
+              value: {{ .Values.objectstore.prefix | quote }}
+            - name: OBJECTSTORE_USE_SSL
+              value: {{ .Values.objectstore.useSSL | quote }}
+            - name: OBJECTSTORE_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.objectstore }}
+                  key: access-key
+            - name: OBJECTSTORE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.objectstore }}
+                  key: secret-key
+            {{- end }}
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}
