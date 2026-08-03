@@ -17,10 +17,12 @@
 package ci
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -33,11 +35,20 @@ import (
 // binaryChannels maps each deployed cmd binary to its channel name in
 // .github/path-filters.yaml.  wiki-bundler is omitted because it is a
 // build-time tool with no matrix entry in ci.yaml and no deployed image.
+//
+// This map must list every component in ci.yaml's build matrix.  It previously
+// omitted crucible-runner, which is exactly where the drift was: the runner
+// channel globbed only deploy/runner/**, even though that Dockerfile's builder
+// stage runs `go build ./cmd/crucible-runner/`.  A thorough-looking guard with
+// a hole in it is worse than no guard, so
+// TestPathFilters_BinaryChannelsCoversCIMatrix now enforces the map's own
+// completeness against ci.yaml.
 var binaryChannels = map[string]string{
 	"api-gateway":           "api-gateway",
 	"provision-worker":      "provision-worker",
 	"crucible-engine":       "crucible-engine",
 	"synthetic-api-monitor": "synthetic-api-monitor",
+	"crucible-runner":       "crucible-runner",
 }
 
 // findRepoRoot walks up from the test's working directory until it finds
@@ -211,7 +222,51 @@ func TestPathFilters_CoverAllInternalPackages(t *testing.T) {
 	}
 }
 
-// TestPathFilters_NoDanglingEntries verifies that every internal/, cmd/, and
+// TestPathFilters_BinaryChannelsCoversCIMatrix verifies that binaryChannels
+// above lists every component in ci.yaml's build matrix.
+//
+// Without this, the coverage guard silently skips whichever component someone
+// forgets to add — which is precisely how crucible-runner ended up with a
+// filter that never rebuilt it on a Go change.  The failure mode is a guard
+// that passes while the thing it guards is broken, so the completeness of the
+// map has to be enforced mechanically rather than by review.
+//
+// ci.yaml's authoritative list is the shell line:
+//
+//	all='["api-gateway",...,"crucible-runner"]'
+func TestPathFilters_BinaryChannelsCoversCIMatrix(t *testing.T) {
+	root := findRepoRoot(t)
+	data, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "ci.yaml"))
+	if err != nil {
+		t.Fatalf("read ci.yaml: %v", err)
+	}
+
+	m := regexp.MustCompile(`all='(\[[^']*\])'`).FindSubmatch(data)
+	if m == nil {
+		t.Fatal("could not find the `all='[...]'` component list in ci.yaml; " +
+			"if the matrix moved, update this test rather than deleting it")
+	}
+	var components []string
+	if err := json.Unmarshal(m[1], &components); err != nil {
+		t.Fatalf("parse component list %q: %v", m[1], err)
+	}
+	if len(components) == 0 {
+		t.Fatal("ci.yaml component list is empty; parse is wrong")
+	}
+
+	for _, c := range components {
+		if _, ok := binaryChannels[c]; !ok {
+			t.Errorf(
+				"ci.yaml builds component %q but binaryChannels does not list it, so\n"+
+					"TestPathFilters_CoverAllInternalPackages silently skips it and its\n"+
+					"image can stop rebuilding on a dependency change without any test failing.\n"+
+					"Add %q to binaryChannels in this file.",
+				c, c,
+			)
+		}
+	}
+}
+
 // deploy/ path listed in .github/path-filters.yaml refers to a directory that
 // exists on disk.  This catches typos and packages that were deleted without
 // cleaning the filter file.
