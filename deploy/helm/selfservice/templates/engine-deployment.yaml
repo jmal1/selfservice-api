@@ -57,6 +57,19 @@ spec:
               value: {{ .Values.engine.runnerNode | default "k3sv03" | quote }}
             - name: RUNNER_TRUNK_NIC
               value: {{ .Values.engine.trunkNIC | default "ens34" | quote }}
+            {{- if .Values.imagePullSecrets }}
+            # The runner Job's pod spec is built in Go, not by Helm, so it does
+            # not inherit the imagePullSecrets every other workload gets from
+            # the template above. Crucible's GHCR packages are private: without
+            # this the kubelet requests an anonymous token, gets 401, and the
+            # Job sits in ImagePullBackOff until ActiveDeadlineSeconds kills it.
+            {{- $pullSecretNames := list }}
+            {{- range .Values.imagePullSecrets }}
+            {{- $pullSecretNames = append $pullSecretNames .name }}
+            {{- end }}
+            - name: RUNNER_IMAGE_PULL_SECRETS
+              value: {{ join "," $pullSecretNames | quote }}
+            {{- end }}
             - name: ENGINE_CALLBACK_URL
               value: "http://{{ .Release.Name }}-engine.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.engine.port | default 8081 }}"
             {{- if .Values.engine.pushgatewayURL }}

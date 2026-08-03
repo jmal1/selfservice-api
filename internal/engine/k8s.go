@@ -27,11 +27,12 @@ type K8sClient struct {
 	clientset     kubernetes.Interface
 	dynamicClient dynamic.Interface
 	namespace     string
-	runnerImage   string
-	runnerNode    string
-	trunkNIC      string
-	metrics       *RunnerMetrics
-	logger        *slog.Logger
+	runnerImage      string
+	runnerNode       string
+	trunkNIC         string
+	imagePullSecrets []string
+	metrics          *RunnerMetrics
+	logger           *slog.Logger
 }
 
 // K8sConfig holds configuration for the K8s runner provisioner.
@@ -39,8 +40,43 @@ type K8sConfig struct {
 	Namespace   string // K8s namespace for runner resources (default: selfservice)
 	RunnerImage string // Container image for the runner (default: ghcr.io/jmal1/selfservice-crucible-runner:latest)
 	RunnerNode  string // Node selector for runner pods (default: k3sv03)
-	TrunkNIC    string // Host NIC for macvlan (default: ens34)
+	TrunkNIC    string // Host NIC carrying the pod VLAN trunk (default: ens224)
 	EngineURL   string // Internal URL for runner callbacks
+
+	// ImagePullSecrets names the dockerconfigjson Secrets used to pull
+	// RunnerImage. Every Crucible GHCR package is private, so without this the
+	// kubelet falls back to an anonymous token request and the pull fails with
+	// 401 Unauthorized. Each Helm-managed workload gets this from
+	// .Values.imagePullSecrets; the runner Job is built here in Go, so it must
+	// be passed through explicitly.
+	ImagePullSecrets []string
+}
+
+// runnerActiveDeadlineSeconds is the hard kill deadline for a runner Job.
+//
+// This was 600s. The Kali-based runner image (~1 GB) has to be pulled cold the
+// first time it runs on a node, and a cold pull plus the assessment itself did
+// not reliably fit inside 10 minutes. TestActiveDeadline_MatchesConfig guards
+// the value so it is not silently reverted.
+const runnerActiveDeadlineSeconds int64 = 900
+
+// imagePullSecretRefs converts secret names into LocalObjectReferences,
+// returning nil for an empty list so the pod spec stays unchanged when no
+// secrets are configured.
+func imagePullSecretRefs(names []string) []corev1.LocalObjectReference {
+	if len(names) == 0 {
+		return nil
+	}
+	refs := make([]corev1.LocalObjectReference, 0, len(names))
+	for _, n := range names {
+		if n = strings.TrimSpace(n); n != "" {
+			refs = append(refs, corev1.LocalObjectReference{Name: n})
+		}
+	}
+	if len(refs) == 0 {
+		return nil
+	}
+	return refs
 }
 
 // NewK8sClient creates a K8s client using in-cluster config.
@@ -61,26 +97,28 @@ func NewK8sClient(cfg K8sConfig, logger *slog.Logger) (*K8sClient, error) {
 	}
 
 	return &K8sClient{
-		clientset:     clientset,
-		dynamicClient: dynClient,
-		namespace:     cfg.Namespace,
-		runnerImage:   cfg.RunnerImage,
-		runnerNode:    cfg.RunnerNode,
-		trunkNIC:      cfg.TrunkNIC,
-		logger:        logger,
+		clientset:        clientset,
+		dynamicClient:    dynClient,
+		namespace:        cfg.Namespace,
+		runnerImage:      cfg.RunnerImage,
+		runnerNode:       cfg.RunnerNode,
+		trunkNIC:         cfg.TrunkNIC,
+		imagePullSecrets: cfg.ImagePullSecrets,
+		logger:           logger,
 	}, nil
 }
 
 // NewK8sClientFromClients creates a K8sClient from pre-existing clients (for testing).
 func NewK8sClientFromClients(clientset kubernetes.Interface, dynClient dynamic.Interface, cfg K8sConfig, logger *slog.Logger) *K8sClient {
 	return &K8sClient{
-		clientset:     clientset,
-		dynamicClient: dynClient,
-		namespace:     cfg.Namespace,
-		runnerImage:   cfg.RunnerImage,
-		runnerNode:    cfg.RunnerNode,
-		trunkNIC:      cfg.TrunkNIC,
-		logger:        logger,
+		clientset:        clientset,
+		dynamicClient:    dynClient,
+		namespace:        cfg.Namespace,
+		runnerImage:      cfg.RunnerImage,
+		runnerNode:       cfg.RunnerNode,
+		trunkNIC:         cfg.TrunkNIC,
+		imagePullSecrets: cfg.ImagePullSecrets,
+		logger:           logger,
 	}
 }
 
@@ -140,7 +178,7 @@ func (k *K8sClient) ProvisionRunner(ctx context.Context, runID, callbackToken st
 	k.logger.Info("created runner secret", "name", secretName, "run_id", runID)
 
 	// 3. Create Job
-	var activeDeadline int64 = 600     // 10 minutes hard kill
+	var activeDeadline int64 = runnerActiveDeadlineSeconds
 	var ttlAfterFinished int32 = 300   // 5 min cleanup
 	var backoffLimit int32 = 0         // No retries
 
@@ -168,7 +206,8 @@ func (k *K8sClient) ProvisionRunner(ctx context.Context, runID, callbackToken st
 					},
 				},
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyNever,
+					RestartPolicy:    corev1.RestartPolicyNever,
+					ImagePullSecrets: imagePullSecretRefs(k.imagePullSecrets),
 					Tolerations: []corev1.Toleration{
 						{
 							Key:      "role",
@@ -261,13 +300,40 @@ func (k *K8sClient) ensureNAD(ctx context.Context, name string, vlanTag int) err
 		return fmt.Errorf("check NAD: %w", err)
 	}
 
-	// Create the NAD
+	// Create the NAD.
+	//
+	// This uses the `vlan` CNI plugin, NOT `macvlan`.
+	//
+	// The original config was {"type":"macvlan","master":ens224,"vlan":<tag>,...}.
+	// The macvlan plugin has no `vlan` option, and CNI plugins ignore unknown
+	// JSON fields, so the tag was silently discarded: the plugin returned
+	// success and attached an UNTAGGED macvlan to the trunk NIC. Verified
+	// empirically on k3sv03 — invoking macvlan with "vlan":119 created no
+	// ens224.119 device and the interface's parent was ens224 itself. In
+	// production the runner then DHCP'd on the trunk's native VLAN and was
+	// handed a home-LAN address (192.168.68.109/22) instead of a pod-VLAN one,
+	// so it both leaked onto the wrong network and could never reach the
+	// student VM it was meant to assess.
+	//
+	// The `vlan` plugin creates a real 802.1Q sub-interface of master with the
+	// given vlanId and moves it into the container's netns. Verified on k3sv03:
+	// yields "vlan protocol 802.1Q id 119" and a DHCP lease of 10.100.19.11/24
+	// from the pod VLAN's gateway.
+	//
+	// A side effect worth knowing: the resulting interface inherits the parent
+	// vNIC's MAC rather than inventing one, so it does not depend on the
+	// vSphere vSwitch security exceptions (promiscuous / forged transmits /
+	// MAC changes) that a macvlan child requires.
+	//
+	// Because the plugin moves a single sub-interface into the netns, only one
+	// container per node may hold a given VLAN at a time. That matches the
+	// runner model: one VLAN per pod, and the engine refuses concurrent runs
+	// for the same pod.
 	nadConfig := map[string]any{
 		"cniVersion": "0.3.1",
-		"type":       "macvlan",
+		"type":       "vlan",
 		"master":     k.trunkNIC,
-		"vlan":       vlanTag,
-		"mode":       "bridge",
+		"vlanId":     vlanTag,
 		"ipam": map[string]any{
 			"type": "dhcp",
 		},

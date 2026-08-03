@@ -82,8 +82,8 @@ func TestProvisionRunner_CreatesJobAndSecret(t *testing.T) {
 	if job.Spec.Template.Annotations["k8s.v1.cni.cncf.io/networks"] != "pod-vlan-105" {
 		t.Error("job missing Multus network annotation")
 	}
-	if *job.Spec.ActiveDeadlineSeconds != 600 {
-		t.Errorf("ActiveDeadlineSeconds = %d, want 600", *job.Spec.ActiveDeadlineSeconds)
+	if *job.Spec.ActiveDeadlineSeconds != runnerActiveDeadlineSeconds {
+		t.Errorf("ActiveDeadlineSeconds = %d, want %d", *job.Spec.ActiveDeadlineSeconds, runnerActiveDeadlineSeconds)
 	}
 	if *job.Spec.TTLSecondsAfterFinished != 300 {
 		t.Errorf("TTLSecondsAfterFinished = %d, want 300", *job.Spec.TTLSecondsAfterFinished)
