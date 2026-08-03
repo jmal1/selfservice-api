@@ -39,6 +39,7 @@ api-gateway:
   - 'internal/objectstore/**'
   - 'internal/scriptvalidator/**'
   - 'internal/templates/**'
+  - 'internal/unattend/**'
   - 'internal/vcenter/**'
   - 'internal/vsphere/**'
   - 'internal/wikitypes/**'

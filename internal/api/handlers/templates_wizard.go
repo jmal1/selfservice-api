@@ -14,6 +14,7 @@ package handlers
 // "current_state" + "allowed_next_states" payload the UI can render.
 
 import (
+	"bytes"
 	stdcontext "context"
 	"crypto/rand"
 	"encoding/hex"
@@ -33,6 +34,7 @@ import (
 	"github.com/jmal1/selfservice-api/internal/middleware"
 	"github.com/jmal1/selfservice-api/internal/models"
 	"github.com/jmal1/selfservice-api/internal/templates"
+	"github.com/jmal1/selfservice-api/internal/unattend"
 )
 
 // CreateTemplateDraftRequest is the wizard step 1 payload.
@@ -60,6 +62,13 @@ type CreateTemplateDraftRequest struct {
 	VCPUs  int `json:"vcpus,omitempty"`
 	RAMMB  int `json:"ram_mb,omitempty"`
 	DiskGB int `json:"disk_gb,omitempty"`
+
+	// ISO-only fields. GuestID is the vSphere guest OS identifier (e.g.
+	// "ubuntu64Guest"). UnattendMode/UnattendConfig drive automated install;
+	// omit or leave empty for a manual console install.
+	GuestID        string          `json:"guest_id,omitempty"`
+	UnattendMode   string          `json:"unattend_mode,omitempty"`
+	UnattendConfig json.RawMessage `json:"unattend_config,omitempty"`
 }
 
 // WizardStateResponse is what GET /admin/templates/:id/wizard-state returns.
@@ -100,6 +109,13 @@ type WizardStateResponse struct {
 	BuildVMTools    bool   `json:"build_vm_tools_running,omitempty"`
 	DefaultUsername string `json:"default_username,omitempty"`
 	DefaultPassword string `json:"default_password,omitempty"`
+	// UnattendMode surfaces the ISO automation family so the UI can tell
+	// the operator whether a hands-off or a manual console install is
+	// expected. Only meaningful when SourceType == iso.
+	UnattendMode string `json:"unattend_mode,omitempty"`
+	// ConfiguringHint is set for ISO templates in the `configuring` state
+	// to tell the operator what to expect (manual console vs. automated).
+	ConfiguringHint string `json:"configuring_hint,omitempty"`
 }
 
 // vmNameSlugRe matches characters that aren't safe in a vCenter VM name.
@@ -134,9 +150,29 @@ func (h *Handler) AdminCreateTemplateDraft(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "source_type must be clone_template, clone_vcenter, or iso", http.StatusBadRequest)
 		return
 	}
-	if req.SourceType != models.TemplateSourceISO && req.SourceRef == "" {
-		http.Error(w, "source_ref is required for source_type "+req.SourceType, http.StatusBadRequest)
+	if req.SourceRef == "" {
+		switch req.SourceType {
+		case models.TemplateSourceISO:
+			http.Error(w,
+				`source_ref is required for iso: provide a datastore path, e.g. [NAS-BackupsAndISOS] ISOs/kali.iso`,
+				http.StatusBadRequest)
+		default:
+			http.Error(w, "source_ref is required for source_type "+req.SourceType, http.StatusBadRequest)
+		}
 		return
+	}
+	if err := validateUnattendMode(req.UnattendMode); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	unattendConfig, err := normalizeUnattendConfig(req.UnattendConfig)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	unattendMode := req.UnattendMode
+	if unattendMode == "" {
+		unattendMode = models.UnattendModeManual
 	}
 
 	stagingNetwork := req.StagingNetwork
@@ -190,9 +226,13 @@ func (h *Handler) AdminCreateTemplateDraft(w http.ResponseWriter, r *http.Reques
 		    source_ref = $4,
 		    staging_network = $5,
 		    created_by = $6,
-		    is_active = false
+		    is_active = false,
+		    guest_id = $7,
+		    unattend_mode = $8,
+		    unattend_config = $9
 		WHERE id = $1
-	`, tmpl.ID, models.TemplateStateDraft, req.SourceType, req.SourceRef, stagingNetwork, userID); err != nil {
+	`, tmpl.ID, models.TemplateStateDraft, req.SourceType, req.SourceRef, stagingNetwork, userID,
+		req.GuestID, unattendMode, unattendConfig); err != nil {
 		h.logger.Error("set draft state failed", "error", err, "template_id", tmpl.ID)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -229,15 +269,7 @@ func (h *Handler) AdminProvisionTemplate(w http.ResponseWriter, r *http.Request)
 	// Build payload from the template row. The instructor doesn't
 	// override hardware here — they pick it during draft creation.
 	vmName := buildTemplateVMName(tmpl.Name)
-	payload := map[string]any{
-		"template_id":     tmpl.ID,
-		"source_type":     tmpl.SourceType,
-		"source_ref":      tmpl.SourceRef,
-		"vm_name":         vmName,
-		"staging_network": tmpl.StagingNetwork,
-		"vcpus":           tmpl.DefaultVCPUs,
-		"ram_mb":          tmpl.DefaultRAMMB,
-	}
+	payload := buildProvisionPayload(tmpl, vmName)
 	if !h.advanceTemplateAndEnqueue(w, r, tmpl, models.TemplateStateDraft, models.TemplateStateProvisioning,
 		models.JobTypeTemplateProvision, payload, "template.provision") {
 		return
@@ -630,6 +662,16 @@ func (h *Handler) wizardState(ctx stdcontext.Context, tmpl *models.Template) Wiz
 		AssignIP:        tmpl.AssignIP,
 		DefaultUsername: tmpl.DefaultUsername,
 		DefaultPassword: tmpl.DefaultPassword,
+		UnattendMode:    tmpl.UnattendMode,
+	}
+	// ISO + configuring: tell the operator whether to expect an automated
+	// install or to drive the installer at the console themselves.
+	if tmpl.TemplateState == models.TemplateStateConfiguring && tmpl.SourceType == models.TemplateSourceISO {
+		if tmpl.UnattendMode == "" || tmpl.UnattendMode == models.UnattendModeManual {
+			resp.ConfiguringHint = "manual-install: connect to the VM console to drive the OS installer"
+		} else {
+			resp.ConfiguringHint = "automated-install: the provisioner will advance the template when the installer completes"
+		}
 	}
 	// Live VM info from vCenter (Phase H): best-effort, never blocks the
 	// wizard response on a transient vCenter hiccup. Only queried during
@@ -719,4 +761,66 @@ func ifNonEmpty(s, msg string) string {
 		return ""
 	}
 	return msg
+}
+
+// validateUnattendMode checks that mode is one of the known UnattendMode*
+// constants. An empty string is accepted (the column default is 'manual').
+// A non-empty unknown value is always rejected with an error — silently
+// coercing to 'manual' would make an automated install never happen.
+func validateUnattendMode(mode string) error {
+	if mode == "" {
+		return nil
+	}
+	if !models.ValidUnattendMode(mode) {
+		return fmt.Errorf("unattend_mode %q is not valid; must be one of: %s",
+			mode, strings.Join(models.AllUnattendModes, ", "))
+	}
+	return nil
+}
+
+// normalizeUnattendConfig validates raw against the unattend.Spec schema and
+// returns it byte-for-byte unchanged. A nil or empty input is normalised to {}
+// so callers can write the result directly to the unattend_config NOT NULL
+// JSONB column.
+//
+// Unknown fields are rejected deliberately. encoding/json matches field names
+// case-insensitively but does NOT ignore separators, so "timeZone" or
+// "aptProxy" would unmarshal to the zero value with no error and no log line —
+// the template would then silently build without the staging apt cache (slow at
+// best, a hard failure on a host with no direct internet) and nothing in the
+// failure would point at JSON casing. Failing here turns that whole class of
+// typo into a 400 at authoring time, while the instructor is still looking at
+// the form.
+func normalizeUnattendConfig(raw json.RawMessage) (json.RawMessage, error) {
+	if len(raw) == 0 {
+		return json.RawMessage("{}"), nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var spec unattend.Spec
+	if err := dec.Decode(&spec); err != nil {
+		return nil, fmt.Errorf("unattend_config is not valid: %w", err)
+	}
+	return raw, nil
+}
+
+// buildProvisionPayload assembles the template_provision job payload from
+// the template row. Extracted so it can be unit-tested without a database
+// fixture. All four ISO-specific fields (DiskGB, GuestID, UnattendMode,
+// UnattendConfig) are always included; the provisioner ignores them for
+// non-ISO source types.
+func buildProvisionPayload(tmpl *models.Template, vmName string) map[string]any {
+	return map[string]any{
+		"template_id":     tmpl.ID,
+		"source_type":     tmpl.SourceType,
+		"source_ref":      tmpl.SourceRef,
+		"vm_name":         vmName,
+		"staging_network": tmpl.StagingNetwork,
+		"vcpus":           tmpl.DefaultVCPUs,
+		"ram_mb":          tmpl.DefaultRAMMB,
+		"disk_gb":         tmpl.DefaultDiskGB,
+		"guest_id":        tmpl.GuestID,
+		"unattend_mode":   tmpl.UnattendMode,
+		"unattend_config": tmpl.UnattendConfig,
+	}
 }

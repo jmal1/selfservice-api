@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -297,6 +298,283 @@ func TestWizardStateSurvivesVCenterError(t *testing.T) {
 func noopLogger(t *testing.T) *slog.Logger {
 	t.Helper()
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// --- new tests for ISO / unattend fields ---
+
+// TestValidateUnattendMode covers every branch of validateUnattendMode.
+// Mutation tested: removing the ValidUnattendMode guard causes the "unknown"
+// case to return nil instead of an error, and the test catches it.
+func TestValidateUnattendMode(t *testing.T) {
+	validModes := []string{
+		models.UnattendModeManual,
+		models.UnattendModeCloudInitCIData,
+		models.UnattendModeDebianPreseed,
+		models.UnattendModeWindowsAutounattend,
+	}
+	for _, m := range validModes {
+		if err := validateUnattendMode(m); err != nil {
+			t.Errorf("validateUnattendMode(%q) = %v; want nil", m, err)
+		}
+	}
+	// empty → nil (column default handles it)
+	if err := validateUnattendMode(""); err != nil {
+		t.Errorf("validateUnattendMode(\"\") = %v; want nil", err)
+	}
+	// unknown → error (must not be silently coerced)
+	unknowns := []string{"auto", "preseed", "unattend", "MANUAL", "cloudinit"}
+	for _, bad := range unknowns {
+		if err := validateUnattendMode(bad); err == nil {
+			t.Errorf("validateUnattendMode(%q) = nil; want error", bad)
+		}
+	}
+}
+
+// TestNormalizeUnattendConfig covers the round-trip contract for the wire
+// format. The snake_case keys below come from unattend.Spec's JSON tags
+// (hostname, username, password, locale, time_zone, apt_proxy, extra_pkgs).
+// Getting these wrong fails silently — fields unmarshal to zero values with
+// no error — so we assert the blob is returned byte-for-byte unchanged.
+//
+// Mutation tested: returning `{}` instead of the original blob causes the
+// "unchanged" assertion to fail.
+func TestNormalizeUnattendConfig(t *testing.T) {
+	// nil / empty → normalised to {}
+	for _, empty := range []json.RawMessage{nil, {}, json.RawMessage("")} {
+		got, err := normalizeUnattendConfig(empty)
+		if err != nil {
+			t.Fatalf("normalizeUnattendConfig(empty) err = %v; want nil", err)
+		}
+		if string(got) != "{}" {
+			t.Errorf("normalizeUnattendConfig(empty) = %q; want {}", string(got))
+		}
+	}
+
+	// realistic snake_case blob — must survive unchanged (round-trip test)
+	realistic := `{"hostname":"kali-build","username":"student","password":"Changeme123!","locale":"en_US.UTF-8","time_zone":"America/New_York","apt_proxy":"","extra_pkgs":["nmap","wireshark"]}`
+	got, err := normalizeUnattendConfig(json.RawMessage(realistic))
+	if err != nil {
+		t.Fatalf("normalizeUnattendConfig(realistic) err = %v; want nil", err)
+	}
+	if string(got) != realistic {
+		t.Errorf("normalizeUnattendConfig: blob was mutated\n got:  %s\n want: %s", string(got), realistic)
+	}
+
+	// invalid JSON → error, not a panic or silent pass-through
+	if _, err := normalizeUnattendConfig(json.RawMessage(`{bad json`)); err == nil {
+		t.Error("normalizeUnattendConfig({bad json}) = nil error; want error")
+	}
+
+	// The separator trap (W2-9). encoding/json matches names case-insensitively
+	// but does NOT ignore separators, so each of these would previously have
+	// unmarshalled to the zero value with no error at all. They must now be
+	// rejected while the instructor is still looking at the form.
+	for _, wrong := range []string{
+		`{"timeZone":"America/New_York"}`, // camelCase instead of time_zone
+		`{"TimeZone":"America/New_York"}`, // PascalCase instead of time_zone
+		`{"aptProxy":"http://10.10.30.20:3142"}`,
+		`{"extraPkgs":["nmap"]}`,
+		`{"hostnmae":"typo"}`,           // ordinary typo
+		`{"mode":"debian_preseed"}`,     // unattend_mode is the source of truth
+		`{"password":"x","bogus":true}`, // one good key does not excuse a bad one
+	} {
+		if _, err := normalizeUnattendConfig(json.RawMessage(wrong)); err == nil {
+			t.Errorf("normalizeUnattendConfig(%s) = nil error; want rejection — "+
+				"this key would silently unmarshal to a zero value", wrong)
+		}
+	}
+
+	// A non-object is not a valid Spec either.
+	if _, err := normalizeUnattendConfig(json.RawMessage(`"just a string"`)); err == nil {
+		t.Error(`normalizeUnattendConfig("just a string") = nil error; want error`)
+	}
+}
+
+// TestBuildProvisionPayload asserts that all four ISO-specific fields
+// (disk_gb, guest_id, unattend_mode, unattend_config) are present in the
+// returned map with the values from the template row.
+//
+// Mutation tested: removing "disk_gb" from the returned map causes the
+// disk_gb assertion below to fail (key absent → zero value).
+func TestBuildProvisionPayload(t *testing.T) {
+	id := uuid.New()
+	config := json.RawMessage(`{"hostname":"test","locale":"en_US.UTF-8"}`)
+	tmpl := &models.Template{
+		ID:             id,
+		SourceType:     models.TemplateSourceISO,
+		SourceRef:      "[NAS-BackupsAndISOS] ISOs/kali.iso",
+		StagingNetwork: "PG-VM-Lab",
+		DefaultVCPUs:   2,
+		DefaultRAMMB:   4096,
+		DefaultDiskGB:  40,
+		GuestID:        "ubuntu64Guest",
+		UnattendMode:   models.UnattendModeCloudInitCIData,
+		UnattendConfig: config,
+	}
+	vmName := "tpl-kali-ab1234"
+	p := buildProvisionPayload(tmpl, vmName)
+
+	if p["disk_gb"] != 40 {
+		t.Errorf("disk_gb = %v; want 40", p["disk_gb"])
+	}
+	if p["guest_id"] != "ubuntu64Guest" {
+		t.Errorf("guest_id = %v; want ubuntu64Guest", p["guest_id"])
+	}
+	if p["unattend_mode"] != models.UnattendModeCloudInitCIData {
+		t.Errorf("unattend_mode = %v; want %q", p["unattend_mode"], models.UnattendModeCloudInitCIData)
+	}
+	// unattend_config must be the exact raw message, not re-encoded
+	got, ok := p["unattend_config"].(json.RawMessage)
+	if !ok {
+		t.Fatalf("unattend_config is %T; want json.RawMessage", p["unattend_config"])
+	}
+	if string(got) != string(config) {
+		t.Errorf("unattend_config = %q; want %q", string(got), string(config))
+	}
+	// baseline fields must still be present
+	if p["vm_name"] != vmName {
+		t.Errorf("vm_name = %v; want %q", p["vm_name"], vmName)
+	}
+	if p["source_ref"] != "[NAS-BackupsAndISOS] ISOs/kali.iso" {
+		t.Errorf("source_ref = %v; want datastore path", p["source_ref"])
+	}
+}
+
+// TestWizardStateISOConfiguringHint exercises the hint the operator sees
+// when an ISO template is parked in `configuring` waiting for the OS
+// installer to finish.
+//
+// Mutation tested: removing the ISO/configuring branch causes both hint
+// assertions to fail (empty string instead of the expected message).
+func TestWizardStateISOConfiguringHint(t *testing.T) {
+	h := &Handler{}
+
+	t.Run("manual mode gets console hint", func(t *testing.T) {
+		tmpl := &models.Template{
+			ID:            uuid.New(),
+			TemplateState: models.TemplateStateConfiguring,
+			SourceType:    models.TemplateSourceISO,
+			UnattendMode:  models.UnattendModeManual,
+		}
+		got := h.wizardState(context.Background(), tmpl)
+		if got.UnattendMode != models.UnattendModeManual {
+			t.Errorf("UnattendMode = %q; want manual", got.UnattendMode)
+		}
+		if !strings.Contains(got.ConfiguringHint, "console") {
+			t.Errorf("ConfiguringHint = %q; want it to mention console for manual mode", got.ConfiguringHint)
+		}
+	})
+
+	t.Run("empty mode also gets console hint (defaults to manual)", func(t *testing.T) {
+		tmpl := &models.Template{
+			ID:            uuid.New(),
+			TemplateState: models.TemplateStateConfiguring,
+			SourceType:    models.TemplateSourceISO,
+			UnattendMode:  "", // not yet normalised to 'manual' in the row
+		}
+		got := h.wizardState(context.Background(), tmpl)
+		if !strings.Contains(got.ConfiguringHint, "console") {
+			t.Errorf("ConfiguringHint = %q; want console hint for empty (manual) mode", got.ConfiguringHint)
+		}
+	})
+
+	t.Run("automated mode gets hands-off hint", func(t *testing.T) {
+		tmpl := &models.Template{
+			ID:            uuid.New(),
+			TemplateState: models.TemplateStateConfiguring,
+			SourceType:    models.TemplateSourceISO,
+			UnattendMode:  models.UnattendModeCloudInitCIData,
+		}
+		got := h.wizardState(context.Background(), tmpl)
+		if !strings.Contains(got.ConfiguringHint, "automated") {
+			t.Errorf("ConfiguringHint = %q; want automated hint for cloudinit_cidata", got.ConfiguringHint)
+		}
+	})
+
+	t.Run("non-ISO configuring has no hint", func(t *testing.T) {
+		tmpl := &models.Template{
+			ID:            uuid.New(),
+			TemplateState: models.TemplateStateConfiguring,
+			SourceType:    models.TemplateSourceCloneTemplate,
+			UnattendMode:  "",
+		}
+		got := h.wizardState(context.Background(), tmpl)
+		if got.ConfiguringHint != "" {
+			t.Errorf("ConfiguringHint = %q; want empty for non-ISO template", got.ConfiguringHint)
+		}
+	})
+}
+
+// TestISORequiresSourceRef verifies that ISO is no longer exempt from the
+// source_ref requirement. The handler is invoked with h.db == nil; if
+// validation is correct it returns 400 before any DB call. If the old
+// exemption is accidentally re-introduced the handler will reach the nil
+// DB and panic — causing the test to fail.
+//
+// Mutation tested: restoring `if req.SourceType != models.TemplateSourceISO &&
+// req.SourceRef == ""` causes the handler to skip the 400 and fall through
+// to the DB call, panicking with nil pointer dereference.
+func TestISORequiresSourceRef(t *testing.T) {
+	h := &Handler{logger: noopLogger(t)} // db == nil: any DB call panics
+
+	body := `{"name":"Kali","os_type":"linux","source_type":"iso","source_ref":""}`
+	req := httptest.NewRequest("POST", "/admin/templates/draft", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	h.AdminCreateTemplateDraft(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d; want 400 (ISO with empty source_ref must be rejected)", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "datastore") {
+		t.Errorf("body = %q; want a message mentioning datastore path", rec.Body.String())
+	}
+}
+
+// TestUnknownUnattendModeRejected verifies that the handler rejects an
+// unknown unattend_mode with 400 before touching the DB.
+//
+// Mutation tested: removing the validateUnattendMode call lets the unknown
+// mode reach the DB (nil → panic, test failure).
+func TestUnknownUnattendModeRejected(t *testing.T) {
+	h := &Handler{logger: noopLogger(t)} // db == nil
+
+	body := `{"name":"Win11","os_type":"windows","source_type":"iso","source_ref":"[DS] ISOs/win11.iso","unattend_mode":"auto"}`
+	req := httptest.NewRequest("POST", "/admin/templates/draft", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	h.AdminCreateTemplateDraft(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d; want 400 for unknown unattend_mode", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "unattend_mode") {
+		t.Errorf("body = %q; want error mentioning unattend_mode", rec.Body.String())
+	}
+}
+
+// TestInvalidUnattendConfigRejected verifies that syntactically broken
+// unattend_config JSON returns 400.
+//
+// Mutation tested: removing the normalizeUnattendConfig call lets the bad
+// blob reach the DB (nil → panic, test failure).
+func TestInvalidUnattendConfigRejected(t *testing.T) {
+	h := &Handler{logger: noopLogger(t)} // db == nil
+
+	body := `{"name":"Deb","os_type":"linux","source_type":"iso","source_ref":"[DS] ISOs/deb.iso","unattend_config":{bad}}`
+	req := httptest.NewRequest("POST", "/admin/templates/draft", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	h.AdminCreateTemplateDraft(rec, req)
+
+	// json.Decoder will catch {bad} when decoding the outer struct.
+	// Either 400 at decode time or 400 at normalizeUnattendConfig is correct.
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d; want 400 for invalid unattend_config JSON", rec.Code)
+	}
 }
 
 // TestLinuxContractPublishError_BlocksLiveUbuntuDefect guards the publish
