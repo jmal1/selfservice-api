@@ -239,15 +239,34 @@ func (e *Engine) executeRun(ctx context.Context, run *models.Run) error {
 			return fmt.Errorf("get target info: %w", err)
 		}
 
-		result, err := e.k8s.ProvisionRunner(ctx,
-			run.ID.String(),
-			run.CallbackToken,
-			vlanTag,
-			wfDefs,
-			target,
-			pod,
-			e.engineURL,
-		)
+		// Build the action library so workflows can call library actions such as
+		// `run_action "HTTP Responds" http_get …`. Without this the runner has
+		// only run_action/ctx_set/ctx_get from actions.sh and every library call
+		// dies with exit 127.
+		//
+		// A failure here fails the run rather than proceeding: silently shipping
+		// a runner with no library would reproduce the original defect, where
+		// workflows "ran", the Job exited 0, and every action failed for a
+		// reason no one could see.
+		libActions, err := e.queries.ListRunnerLibraryActions(ctx)
+		if err != nil {
+			return fmt.Errorf("list library actions: %w", err)
+		}
+		actionLibrary, err := buildActionLibrary(libActions)
+		if err != nil {
+			return fmt.Errorf("build action library: %w", err)
+		}
+
+		result, err := e.k8s.ProvisionRunner(ctx, RunnerSpec{
+			RunID:         run.ID.String(),
+			CallbackToken: run.CallbackToken,
+			EngineURL:     e.engineURL,
+			VLANTag:       vlanTag,
+			Workflows:     wfDefs,
+			Target:        target,
+			Pod:           pod,
+			ActionLibrary: actionLibrary,
+		})
 		if err != nil {
 			return fmt.Errorf("provision runner: %w", err)
 		}

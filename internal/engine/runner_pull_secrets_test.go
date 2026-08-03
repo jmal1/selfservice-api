@@ -25,16 +25,15 @@ func provisionForTest(t *testing.T, cfg K8sConfig) *batchv1.Job {
 	dynClient := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
 	k8s := NewK8sClientFromClients(clientset, dynClient, cfg, testLogger())
 
-	result, err := k8s.ProvisionRunner(
-		context.Background(),
-		"abcd1234-5678-9012-3456-789012345678",
-		"callback-token-abc",
-		119,
-		[]runner.WorkflowDef{{Slug: "wf", Name: "WF", Script: "true", TimeoutSeconds: 60}},
-		runner.TargetConfig{IP: "10.100.19.10", OS: "linux", Username: "student", Password: "pw"},
-		runner.PodConfig{Subnet: "10.100.19.0/24", Index: 1},
-		cfg.EngineURL,
-	)
+	result, err := k8s.ProvisionRunner(context.Background(), RunnerSpec{
+		RunID:         "abcd1234-5678-9012-3456-789012345678",
+		CallbackToken: "callback-token-abc",
+		EngineURL:     cfg.EngineURL,
+		VLANTag:       119,
+		Workflows:     []runner.WorkflowDef{{Slug: "wf", Name: "WF", Script: "true", TimeoutSeconds: 60}},
+		Target:        runner.TargetConfig{IP: "10.100.19.10", OS: "linux", Username: "student", Password: "pw"},
+		Pod:           runner.PodConfig{Subnet: "10.100.19.0/24", Index: 1},
+	})
 	if err != nil {
 		t.Fatalf("ProvisionRunner: %v", err)
 	}

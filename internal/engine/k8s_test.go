@@ -44,16 +44,15 @@ func TestProvisionRunner_CreatesJobAndSecret(t *testing.T) {
 	target := runner.TargetConfig{IP: "10.100.5.10", OS: "linux", Username: "student", Password: "pass"}
 	pod := runner.PodConfig{Subnet: "10.100.5.0/24", Index: 1}
 
-	result, err := k8s.ProvisionRunner(
-		context.Background(),
-		"abcd1234-5678-9012-3456-789012345678",
-		"callback-token-abc",
-		105,
-		workflows,
-		target,
-		pod,
-		cfg.EngineURL,
-	)
+	result, err := k8s.ProvisionRunner(context.Background(), RunnerSpec{
+		RunID:         "abcd1234-5678-9012-3456-789012345678",
+		CallbackToken: "callback-token-abc",
+		EngineURL:     cfg.EngineURL,
+		VLANTag:       105,
+		Workflows:     workflows,
+		Target:        target,
+		Pod:           pod,
+	})
 	if err != nil {
 		t.Fatalf("ProvisionRunner: %v", err)
 	}

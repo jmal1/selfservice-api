@@ -109,6 +109,44 @@ RUN set -eu; \
     fi; \
     echo "runner tooling verified"
 
+# Strip file capabilities from every binary in the image.
+#
+# Kali's nmap package ships /usr/lib/nmap/nmap with
+#   cap_net_bind_service,cap_net_admin,cap_net_raw=eip
+# so that unprivileged users can run SYN scans. Inside this container that
+# permitted set is NOT a subset of the process bounding set — CAP_NET_ADMIN
+# (bit 12) is absent from a default containerd bounding set — and execve()
+# refuses any file whose permitted caps exceed the bounding set. The result is
+# that EVERY nmap invocation fails with "Operation not permitted", including
+# unprivileged `-sT` connect scans that need no capability whatsoever.
+#
+# Removing the file caps is the right fix rather than granting NET_ADMIN to the
+# Job: the runner already executes as root with CAP_NET_RAW effective, so raw
+# sockets and SYN scans still work, and widening a Kali container's privileges
+# on a student VLAN to solve a problem that requires no privilege would be a
+# straightforwardly bad trade.
+#
+# The assertion is static (`getcap -r /` finds nothing) rather than a runtime
+# `nmap` smoke test, because buildkit runs with a wider capability set than the
+# deployed container — a runtime test here would pass while production stayed
+# broken, which is exactly how this defect survived in the first place.
+RUN set -eu; \
+    apt-get update && apt-get install -y --no-install-recommends libcap2-bin; \
+    scan="/usr /bin /sbin /lib /opt"; \
+    getcap -r $scan 2>/dev/null | while read -r line; do \
+        f=$(printf '%s' "$line" | cut -d' ' -f1); \
+        echo "stripping file capabilities from $f"; \
+        setcap -r "$f" || true; \
+    done; \
+    remaining=$(getcap -r $scan 2>/dev/null || true); \
+    if [ -n "$remaining" ]; then \
+        echo "FATAL: file capabilities still present after strip; execve() will refuse these binaries:" >&2; \
+        echo "$remaining" >&2; \
+        exit 1; \
+    fi; \
+    rm -rf /var/lib/apt/lists/*; \
+    echo "no file capabilities remain"
+
 # Create crucible directories
 RUN mkdir -p /opt/crucible/lib /opt/crucible/bin
 

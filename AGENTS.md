@@ -162,7 +162,7 @@ source /opt/crucible/lib/actions.sh
 set -euo pipefail
 ```
 
-This loads `run_action`, `ctx_set`, `ctx_get` and gives you safe failure semantics.
+This loads `run_action`, `ctx_set`, `ctx_get`, the generated **action library** (see §5.2b), and gives you safe failure semantics.
 
 `vmware_tools` scripts cannot source `/opt/crucible/lib/actions.sh` (the file doesn't exist inside the guest). Use plain bash/PowerShell and print `STUDENT_MSG:` lines for student-facing feedback. Exit non-zero on fail.
 
@@ -210,6 +210,40 @@ Exit codes the runner understands:
 - `0` → action `pass`
 - `124` → action `timeout` (from `timeout` command — leave this to the runner, don't catch it)
 - any other → action `fail`
+
+### 5.2b Calling a library action
+
+Library actions (`is_library: true`) are delivered to the runner as **bash functions** and can be
+called directly by `run_action`. The function name is the action's **slug with hyphens replaced by
+underscores**:
+
+| Slug | Function to call |
+|---|---|
+| `http-get` | `http_get` |
+| `port-open` | `port_open` |
+| `service-running` | `service_running` |
+| `ufw-rule-exists` | `ufw_rule_exists` |
+
+```bash
+source /opt/crucible/lib/actions.sh
+set -euo pipefail
+
+run_action "HTTPS responds" http_get --url "https://$CRUCIBLE_TARGET_IP/" --expect-status 200
+run_action "SSH is open"    port_open --host "$CRUCIBLE_TARGET_IP" --port 22
+```
+
+Pass the flags the action's own body parses — each library body has a `--flag value` argument loop;
+read the action in the library catalog (`docs/instructor/actions.md`) to see its accepted flags.
+
+How this works, and why it matters if you are changing the runner: the engine renders every
+non-Windows library action into `/opt/crucible/lib/library.sh` **per run** and `actions.sh` sources
+it. `run_action` detects a shell function with `declare -F` and re-enters bash inside the `timeout`
+so the function is callable — a plain `timeout http_get …` cannot work, because `timeout` `execve()`s
+its argument and a shell function is not an executable file. Windows library actions are excluded
+because their bodies are PowerShell and the library is sourced as a single bash file.
+
+Library bodies report problems by assigning `LAST_STUDENT_MSG` and `LAST_ERROR`; `run_action` emits
+those as `STUDENT_MSG:` / `ERROR:` lines on the action's behalf, so §5.3 applies unchanged.
 
 ### 5.3 Student vs instructor output
 

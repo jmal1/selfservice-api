@@ -21,6 +21,7 @@ package runner_test
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
@@ -216,7 +217,12 @@ func TestContract_CallbackHeartbeatPayload(t *testing.T) {
 // requires the runner image to know how to read it (zero-value safe for
 // older runners, but only if the new field is genuinely optional).
 func TestContract_RunnerConfig_FieldsFrozen(t *testing.T) {
-	approved := []string{"callback_token", "callback_url", "pod", "run_id", "target", "workflows"}
+	// action_library is optional and zero-value safe in both directions: an old
+	// runner ignores it (library actions keep failing exactly as they did
+	// before, no new breakage), and a new runner given an old engine's config
+	// simply materialises nothing. So no deploy-ordering constraint applies to
+	// this field specifically.
+	approved := []string{"action_library", "callback_token", "callback_url", "pod", "run_id", "target", "workflows"}
 	got := fieldNames(t, runner.RunnerConfig{})
 	if !reflect.DeepEqual(got, approved) {
 		t.Fatalf("RunnerConfig wire shape changed.\n got:      %v\n approved: %v\n\nThis file is consumed by the runner image at startup. Bump the runner image BEFORE the engine if you add a required field; otherwise existing runner pods fail at config-load.", got, approved)
@@ -384,5 +390,50 @@ func TestRunnerDockerfile_KaliBaseArgIsGlobal(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "ARG KALI_BASE=") {
 		t.Error("ARG KALI_BASE has no default value: CI does not pass --build-arg KALI_BASE, so the base name would be blank")
+	}
+}
+
+// TestRunnerDockerfile_StripsFileCapabilities guards the nmap fix.
+//
+// Kali's nmap package ships /usr/lib/nmap/nmap with
+// cap_net_bind_service,cap_net_admin,cap_net_raw=eip. Inside the runner
+// container CAP_NET_ADMIN is not in the bounding set, and execve() refuses any
+// file whose permitted capabilities exceed the bounding set — so EVERY nmap
+// invocation failed with "Operation not permitted", including unprivileged -sT
+// connect scans that need no capability at all.
+//
+// The Dockerfile's existing `command -v nmap` check passes on a completely
+// unusable binary, because PATH resolution is not executability. That is how
+// this survived: a green build, a verified tool list, and an nmap that could
+// never run. This test therefore asserts the strip step itself.
+//
+// It is deliberately a source-text assertion rather than a runtime probe:
+// buildkit runs with a wider capability set than the deployed container, so an
+// in-build `nmap -sT` smoke test would pass while production stayed broken.
+func TestRunnerDockerfile_StripsFileCapabilities(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "deploy", "runner", "Dockerfile"))
+	if err != nil {
+		t.Fatalf("read Dockerfile: %v", err)
+	}
+	src := string(data)
+
+	if !strings.Contains(src, "setcap -r") {
+		t.Error("Dockerfile no longer strips file capabilities (setcap -r); nmap will fail with " +
+			"\"Operation not permitted\" on every invocation, and the command -v check will not notice")
+	}
+	if !strings.Contains(src, "getcap -r") {
+		t.Error("Dockerfile no longer asserts that zero file capabilities remain; a future Kali package " +
+			"that sets caps would silently reintroduce the broken-nmap defect")
+	}
+	if !strings.Contains(src, "FATAL: file capabilities still present") {
+		t.Error("the capability assertion must fail the build loudly, not warn")
+	}
+
+	// The strip must run AFTER the package installs, or newly-installed
+	// binaries keep their capabilities.
+	capIdx := strings.Index(src, "setcap -r")
+	aptIdx := strings.LastIndex(src, "apt-get install -y --no-install-recommends \\")
+	if aptIdx >= 0 && capIdx >= 0 && capIdx < aptIdx {
+		t.Error("capability strip runs before the tool install; binaries installed afterwards would keep their caps")
 	}
 }
