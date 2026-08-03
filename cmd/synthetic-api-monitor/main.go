@@ -80,10 +80,16 @@ const (
 	// single runner_smoke check. This lets a separate less-frequent CronJob
 	// reuse the same image/secrets/pushgateway plumbing as the regular
 	// monitor without running the cheap probes the */10 CronJob already
-	// covers. WARNING: if SYNTHETIC_RUNNER_TEMPLATE or
-	// SYNTHETIC_RUNNER_PLAYLIST_ID is unset the binary exits with a clear
-	// error rather than silently registering nothing — a misconfigured
-	// deploy would leave the entire engine dispatch→Kali path unmonitored.
+	// covers.
+	//
+	// If SYNTHETIC_RUNNER_TEMPLATE or SYNTHETIC_RUNNER_PLAYLIST_ID is unset
+	// the check is STILL registered, with a warning, and fails loudly at
+	// runtime. It must not stop the binary: an unregistered check's series
+	// ceases to exist, and every alert is shaped
+	// `1 - crucible_synthetic_check_success > 0`, which cannot match an
+	// absent series. Exiting would therefore make the Kali-runner path
+	// invisible rather than red — and because Pushgateway retains the last
+	// pushed value indefinitely, the stale series would keep reading GREEN.
 	envRunnerMode = "SYNTHETIC_RUNNER_MODE"
 	// envRunnerTemplate is the templates.name to clone (NOT vcenter_template).
 	// Getting this wrong causes every runner_smoke run to fail at
@@ -145,7 +151,17 @@ func run(logger *slog.Logger) error {
 	role := envOr(envRole, "student")
 	pushgatewayURL := mustEnv(envPushgatewayURL)
 	job := envOr(envJob, "crucible_synthetic_api")
-	layer, err := resolvePushLayer(envBool(envRunnerMode), os.Getenv(envLayer))
+
+	// Resolve the mode ONCE, up front, and derive everything from it. The push
+	// grouping and the registered check set must never be able to disagree
+	// about which mode this is: a grouping that says layer="runner" while the
+	// api check set is registered is exactly the silent failure resolveMode
+	// documents.
+	mode, err := resolveMode(os.Getenv)
+	if err != nil {
+		return err
+	}
+	layer, err := resolvePushLayer(mode.kind == modeRunner, os.Getenv(envLayer))
 	if err != nil {
 		return err
 	}
@@ -193,18 +209,15 @@ func run(logger *slog.Logger) error {
 		instructorClient = synthetic.NewClient(baseURL, instructorCookie)
 	}
 
-	// Build the active check list. The expensive pod_lifecycle check is
-	// gated by SYNTHETIC_LIFECYCLE_ENABLED so the binary can be rolled out
-	// before the synthetic-noop template exists.
-	//
-	// SYNTHETIC_JANITOR_MODE takes precedence: when set, the binary acts as
-	// a standalone orphan sweeper and registers ONLY the synthetic_janitor
-	// check. This lets a separate daily CronJob reuse the same image,
-	// secrets, and pushgateway plumbing as the regular monitor without
-	// running any of the cheap probes (which the */10 monitor already
-	// covers).
+	// Build the active check list. See resolveMode for why this is not an
+	// ordered if/else chain over the raw env vars.
+	for _, w := range mode.warnings {
+		logger.Warn(w.msg, "env", w.env)
+	}
+
 	activeChecks := checks.All()
-	if envBool(envJanitorMode) {
+	switch mode.kind {
+	case modeJanitor:
 		cfg := checks.DefaultJanitorConfig()
 		cfg.Logger = logger.With("component", "synthetic_janitor")
 		if v := os.Getenv(envJanitorMaxAge); v != "" {
@@ -218,34 +231,8 @@ func run(logger *slog.Logger) error {
 			"max_age", cfg.MaxAge,
 		)
 		activeChecks = []synthetic.Check{checks.Janitor(cfg)}
-	} else if envBool(envLifecycleEnabled) {
-		tmpl := os.Getenv(envLifecycleTemplate)
-		if tmpl == "" {
-			return fmt.Errorf("%s=true but %s is empty", envLifecycleEnabled, envLifecycleTemplate)
-		}
-		cfg := checks.DefaultPodLifecycleConfig(tmpl)
-		cfg.Logger = logger.With("component", "pod_lifecycle")
-		if v := os.Getenv(envLifecycleReadyTimeout); v != "" {
-			d, err := time.ParseDuration(v)
-			if err != nil {
-				return fmt.Errorf("invalid %s=%q: %w", envLifecycleReadyTimeout, v, err)
-			}
-			cfg.ReadyTimeout = d
-		}
-		if v := os.Getenv(envLifecycleDestroyTimeout); v != "" {
-			d, err := time.ParseDuration(v)
-			if err != nil {
-				return fmt.Errorf("invalid %s=%q: %w", envLifecycleDestroyTimeout, v, err)
-			}
-			cfg.DestroyTimeout = d
-		}
-		logger.Info("registering pod_lifecycle check",
-			"template", tmpl,
-			"ready_timeout", cfg.ReadyTimeout,
-			"destroy_timeout", cfg.DestroyTimeout,
-		)
-		activeChecks = append(activeChecks, checks.PodLifecycle(cfg))
-	} else if envBool(envRunnerMode) {
+
+	case modeRunner:
 		cfg, warnings, err := resolveRunnerConfig(os.Getenv)
 		if err != nil {
 			return err
@@ -265,6 +252,36 @@ func run(logger *slog.Logger) error {
 			"destroy_timeout", cfg.DestroyTimeout,
 		)
 		activeChecks = []synthetic.Check{checks.RunnerSmoke(cfg)}
+
+	case modeDefault:
+		if mode.lifecycleEnabled {
+			tmpl := os.Getenv(envLifecycleTemplate)
+			if tmpl == "" {
+				return fmt.Errorf("%s=true but %s is empty", envLifecycleEnabled, envLifecycleTemplate)
+			}
+			cfg := checks.DefaultPodLifecycleConfig(tmpl)
+			cfg.Logger = logger.With("component", "pod_lifecycle")
+			if v := os.Getenv(envLifecycleReadyTimeout); v != "" {
+				d, err := time.ParseDuration(v)
+				if err != nil {
+					return fmt.Errorf("invalid %s=%q: %w", envLifecycleReadyTimeout, v, err)
+				}
+				cfg.ReadyTimeout = d
+			}
+			if v := os.Getenv(envLifecycleDestroyTimeout); v != "" {
+				d, err := time.ParseDuration(v)
+				if err != nil {
+					return fmt.Errorf("invalid %s=%q: %w", envLifecycleDestroyTimeout, v, err)
+				}
+				cfg.DestroyTimeout = d
+			}
+			logger.Info("registering pod_lifecycle check",
+				"template", tmpl,
+				"ready_timeout", cfg.ReadyTimeout,
+				"destroy_timeout", cfg.DestroyTimeout,
+			)
+			activeChecks = append(activeChecks, checks.PodLifecycle(cfg))
+		}
 	}
 
 	// Elevated (instructor-role) checks. Skipped loudly rather than
@@ -577,3 +594,107 @@ func probeSyntheticUser(client *synthetic.Client, logger *slog.Logger) {
 
 // (Used by tests of binary-level helpers.)
 var _ = strconv.Itoa
+
+// modeKind is which check set the binary registers this run.
+type modeKind int
+
+const (
+	// modeDefault registers checks.All(), optionally plus pod_lifecycle.
+	modeDefault modeKind = iota
+	// modeJanitor replaces the set with synthetic_janitor only.
+	modeJanitor
+	// modeRunner replaces the set with runner_smoke only.
+	modeRunner
+)
+
+// resolvedMode is the outcome of reading the mode env vars.
+type resolvedMode struct {
+	kind             modeKind
+	lifecycleEnabled bool
+	warnings         []configWarning
+}
+
+// resolveMode decides which check set to register.
+//
+// WHY THIS IS NOT AN ORDERED if/else CHAIN OVER THE RAW ENV VARS
+//
+// It used to be, and that shipped a live defect that this function exists to
+// make impossible.
+//
+// SYNTHETIC_LIFECYCLE_ENABLED=true is set once, globally, in values.yaml,
+// because the */10 monitor wants it. Any new CronJob built from the same env
+// block inherits it. The old chain tested lifecycle BEFORE runner mode, so a
+// runner CronJob deployed exactly as intended would silently fall into the
+// lifecycle branch: SYNTHETIC_RUNNER_MODE was read, found true, and then never
+// acted on.
+//
+// The result was not a crash or an error. It was worse:
+//
+//   - resolvePushLayer DOES honour runner mode, so the push grouping would say
+//     layer="runner".
+//   - The checks actually registered would be the ordinary api set.
+//   - runner_smoke would never run, and its series would never exist.
+//
+// So a brand-new "runner" layer would appear on the board, entirely green,
+// while the thing it was created to monitor — engine dispatch through Multus
+// macvlan DHCP to the Kali image pull — was never exercised at all. Every
+// alert is shaped `1 - crucible_synthetic_check_success > 0` and cannot match
+// an absent series, so nothing would ever have said so.
+//
+// Two properties fix that class of bug rather than this one instance:
+//
+//  1. The REPLACEMENT modes (janitor, runner) are resolved first and are
+//     mutually exclusive. Setting both is refused outright rather than
+//     resolved by declaration order, because "whichever I wrote first wins" is
+//     not a contract anyone can hold in their head.
+//  2. SYNTHETIC_LIFECYCLE_ENABLED is an ADDITIVE flag that only applies to the
+//     default mode, and being ignored by a replacement mode is WARNED about
+//     rather than shadowed silently. That warning is the line that would have
+//     turned this multi-hour investigation into a five-second one.
+func resolveMode(getenv func(string) string) (resolvedMode, error) {
+	envTruthy := func(k string) bool {
+		switch strings.ToLower(strings.TrimSpace(getenv(k))) {
+		case "1", "true", "yes", "on":
+			return true
+		}
+		return false
+	}
+
+	janitor := envTruthy(envJanitorMode)
+	runner := envTruthy(envRunnerMode)
+	lifecycle := envTruthy(envLifecycleEnabled)
+
+	if janitor && runner {
+		return resolvedMode{}, fmt.Errorf(
+			"%s and %s are both true, but each replaces the entire check set; "+
+				"set exactly one (refusing to guess, because silently picking one "+
+				"would leave the other's check set absent from Prometheus and no "+
+				"alert can match a series that does not exist)",
+			envJanitorMode, envRunnerMode)
+	}
+
+	m := resolvedMode{kind: modeDefault, lifecycleEnabled: lifecycle}
+	switch {
+	case janitor:
+		m.kind = modeJanitor
+	case runner:
+		m.kind = modeRunner
+	}
+
+	if lifecycle && m.kind != modeDefault {
+		which := envJanitorMode
+		if m.kind == modeRunner {
+			which = envRunnerMode
+		}
+		m.lifecycleEnabled = false
+		m.warnings = append(m.warnings, configWarning{
+			env: envLifecycleEnabled,
+			msg: "SYNTHETIC_LIFECYCLE_ENABLED is ignored because " + which +
+				" replaces the whole check set; this is expected when a replacement-mode " +
+				"CronJob inherits the shared env block, but if you meant to run pod_lifecycle " +
+				"here it is NOT running",
+		})
+	}
+
+	return m, nil
+}
