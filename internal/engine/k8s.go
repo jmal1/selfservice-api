@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"strings"
 	"time"
 
@@ -281,8 +282,16 @@ func (k *K8sClient) ProvisionRunner(ctx context.Context, runID, callbackToken st
 	}, nil
 }
 
-// ensureNAD creates a NetworkAttachmentDefinition for a VLAN if it doesn't exist.
+// ensureNAD creates or reconciles a NetworkAttachmentDefinition for a VLAN.
 // NADs are reusable across runs on the same VLAN.
+//
+// It deliberately reconciles the CNI *config*, not merely the NAD's existence.
+// The original implementation returned early whenever a NAD of the right name
+// was present, which meant a corrected config could never reach any VLAN that
+// had already been used. That turned a deployed fix into a silent no-op: after
+// shipping the macvlan->vlan correction below, pod-vlan-119 still carried the
+// broken untagged config and would have kept putting the runner on the wrong
+// network indefinitely.
 func (k *K8sClient) ensureNAD(ctx context.Context, name string, vlanTag int) error {
 	nadGVR := schema.GroupVersionResource{
 		Group:    "k8s.cni.cncf.io",
@@ -290,57 +299,31 @@ func (k *K8sClient) ensureNAD(ctx context.Context, name string, vlanTag int) err
 		Resource: "network-attachment-definitions",
 	}
 
-	// Check if NAD already exists
-	_, err := k.dynamicClient.Resource(nadGVR).Namespace(k.namespace).Get(ctx, name, metav1.GetOptions{})
+	configJSON, err := k.nadConfigJSON(vlanTag)
+	if err != nil {
+		return err
+	}
+
+	existing, err := k.dynamicClient.Resource(nadGVR).Namespace(k.namespace).Get(ctx, name, metav1.GetOptions{})
 	if err == nil {
-		k.logger.Debug("NAD already exists", "name", name)
-		return nil // Already exists
+		current, _, _ := unstructured.NestedString(existing.Object, "spec", "config")
+		if sameCNIConfig(current, configJSON) {
+			k.logger.Debug("NAD already correct", "name", name)
+			return nil
+		}
+		k.logger.Warn("NAD config drifted, updating",
+			"name", name, "vlan", vlanTag, "old", current, "new", configJSON)
+		if err := unstructured.SetNestedField(existing.Object, configJSON, "spec", "config"); err != nil {
+			return fmt.Errorf("set NAD config: %w", err)
+		}
+		if _, err := k.dynamicClient.Resource(nadGVR).Namespace(k.namespace).Update(ctx, existing, metav1.UpdateOptions{}); err != nil {
+			return fmt.Errorf("update NAD: %w", err)
+		}
+		k.logger.Info("updated NAD", "name", name, "vlan", vlanTag, "nic", k.trunkNIC)
+		return nil
 	}
 	if !errors.IsNotFound(err) {
 		return fmt.Errorf("check NAD: %w", err)
-	}
-
-	// Create the NAD.
-	//
-	// This uses the `vlan` CNI plugin, NOT `macvlan`.
-	//
-	// The original config was {"type":"macvlan","master":ens224,"vlan":<tag>,...}.
-	// The macvlan plugin has no `vlan` option, and CNI plugins ignore unknown
-	// JSON fields, so the tag was silently discarded: the plugin returned
-	// success and attached an UNTAGGED macvlan to the trunk NIC. Verified
-	// empirically on k3sv03 — invoking macvlan with "vlan":119 created no
-	// ens224.119 device and the interface's parent was ens224 itself. In
-	// production the runner then DHCP'd on the trunk's native VLAN and was
-	// handed a home-LAN address (192.168.68.109/22) instead of a pod-VLAN one,
-	// so it both leaked onto the wrong network and could never reach the
-	// student VM it was meant to assess.
-	//
-	// The `vlan` plugin creates a real 802.1Q sub-interface of master with the
-	// given vlanId and moves it into the container's netns. Verified on k3sv03:
-	// yields "vlan protocol 802.1Q id 119" and a DHCP lease of 10.100.19.11/24
-	// from the pod VLAN's gateway.
-	//
-	// A side effect worth knowing: the resulting interface inherits the parent
-	// vNIC's MAC rather than inventing one, so it does not depend on the
-	// vSphere vSwitch security exceptions (promiscuous / forged transmits /
-	// MAC changes) that a macvlan child requires.
-	//
-	// Because the plugin moves a single sub-interface into the netns, only one
-	// container per node may hold a given VLAN at a time. That matches the
-	// runner model: one VLAN per pod, and the engine refuses concurrent runs
-	// for the same pod.
-	nadConfig := map[string]any{
-		"cniVersion": "0.3.1",
-		"type":       "vlan",
-		"master":     k.trunkNIC,
-		"vlanId":     vlanTag,
-		"ipam": map[string]any{
-			"type": "dhcp",
-		},
-	}
-	configJSON, err := json.Marshal(nadConfig)
-	if err != nil {
-		return fmt.Errorf("marshal NAD config: %w", err)
 	}
 
 	nad := &unstructured.Unstructured{
@@ -356,18 +339,80 @@ func (k *K8sClient) ensureNAD(ctx context.Context, name string, vlanTag int) err
 				},
 			},
 			"spec": map[string]any{
-				"config": string(configJSON),
+				"config": configJSON,
 			},
 		},
 	}
 
-	_, err = k.dynamicClient.Resource(nadGVR).Namespace(k.namespace).Create(ctx, nad, metav1.CreateOptions{})
-	if err != nil {
+	if _, err := k.dynamicClient.Resource(nadGVR).Namespace(k.namespace).Create(ctx, nad, metav1.CreateOptions{}); err != nil {
 		return fmt.Errorf("create NAD: %w", err)
 	}
 
 	k.logger.Info("created NAD", "name", name, "vlan", vlanTag, "nic", k.trunkNIC)
 	return nil
+}
+
+// sameCNIConfig compares two CNI configs semantically, so that key ordering or
+// whitespace differences do not cause a pointless update on every run.
+func sameCNIConfig(a, b string) bool {
+	var ma, mb map[string]any
+	if err := json.Unmarshal([]byte(a), &ma); err != nil {
+		return false
+	}
+	if err := json.Unmarshal([]byte(b), &mb); err != nil {
+		return false
+	}
+	return reflect.DeepEqual(ma, mb)
+}
+
+// nadConfigJSON builds the CNI config attaching a runner to a pod VLAN.
+//
+// This uses the `vlan` CNI plugin, NOT `macvlan`.
+//
+// The original config was {"type":"macvlan","master":ens224,"vlan":<tag>,...}.
+// The macvlan plugin has no `vlan` option, and CNI plugins ignore unknown
+// JSON fields, so the tag was silently discarded: the plugin returned
+// success and attached an UNTAGGED macvlan to the trunk NIC. Verified
+// empirically on k3sv03 — invoking macvlan with "vlan":119 created no
+// ens224.119 device and the interface's parent was ens224 itself. In
+// production the runner then DHCP'd on the trunk's native VLAN and was
+// handed a home-LAN address (192.168.68.109/22) instead of a pod-VLAN one,
+// so it both leaked onto the wrong network and could never reach the
+// student VM it was meant to assess.
+//
+// The `vlan` plugin creates a real 802.1Q sub-interface of master with the
+// given vlanId and moves it into the container's netns. Verified on k3sv03:
+// yields "vlan protocol 802.1Q id 119" and a DHCP lease of 10.100.19.11/24
+// from the pod VLAN's gateway.
+//
+// A side effect worth knowing: the resulting interface inherits the parent
+// vNIC's MAC rather than inventing one, so it does not depend on the
+// vSphere vSwitch security exceptions (promiscuous / forged transmits /
+// MAC changes) that a macvlan child requires.
+//
+// Because the plugin moves a single sub-interface into the netns, only one
+// container per node may hold a given VLAN at a time. That matches the
+// runner model: one VLAN per pod, and the engine refuses concurrent runs
+// for the same pod.
+//
+// The `vlan` plugin binary is not part of k3s's bundled CNI set and must be
+// staged into /var/lib/rancher/k3s/data/cni on every runner node — see
+// k3sv03-Runner-Node-Runbook.
+func (k *K8sClient) nadConfigJSON(vlanTag int) (string, error) {
+	nadConfig := map[string]any{
+		"cniVersion": "0.3.1",
+		"type":       "vlan",
+		"master":     k.trunkNIC,
+		"vlanId":     vlanTag,
+		"ipam": map[string]any{
+			"type": "dhcp",
+		},
+	}
+	configJSON, err := json.Marshal(nadConfig)
+	if err != nil {
+		return "", fmt.Errorf("marshal NAD config: %w", err)
+	}
+	return string(configJSON), nil
 }
 
 // CleanupRunner deletes the K8s Secret and Job for a completed run.
