@@ -65,16 +65,29 @@ var (
 	ErrPreseedRequiresRemaster = errors.New("unattend: debian_preseed does not produce a standalone seed ISO; use RemasterPreseedISO")
 )
 
-// Spec describes the automation to bake into a seed ISO.
+// Spec describes an unattended install. JSON tags are explicit because this
+// is deserialized straight from the templates.unattend_config JSONB column,
+// which is authored by the API and the wizard UI.
+//
+// Without tags, Go matches JSON keys to field names case-insensitively but
+// NOT across separators, so idiomatic snake_case keys like "apt_proxy" and
+// "extra_pkgs" would silently unmarshal to zero values -- no error, no log,
+// just a template that builds without its apt cache and takes the slow path
+// (or fails outright on a host with no direct internet). Tagging the fields
+// makes the wire contract explicit and testable.
+//
+// Mode is deliberately json:"-": it is authoritative on the templates
+// .unattend_mode column and is set by the caller after unmarshalling, so
+// accepting it here too would create two sources of truth.
 type Spec struct {
-	Mode      string
-	Hostname  string
-	Username  string // defaults to "student" when empty
-	Password  string
-	Locale    string // defaults "en_US.UTF-8"
-	TimeZone  string // defaults "America/New_York"
-	AptProxy  string // e.g. "http://10.10.30.20:3142"
-	ExtraPkgs []string
+	Mode      string   `json:"-"`
+	Hostname  string   `json:"hostname"`
+	Username  string   `json:"username"` // defaults to "student" when empty
+	Password  string   `json:"password"`
+	Locale    string   `json:"locale"`    // defaults "en_US.UTF-8"
+	TimeZone  string   `json:"time_zone"` // defaults "America/New_York"
+	AptProxy  string   `json:"apt_proxy"` // e.g. "http://10.10.30.20:3142"
+	ExtraPkgs []string `json:"extra_pkgs"`
 }
 
 // withDefaults returns a copy of s with empty defaultable fields populated.

@@ -2,6 +2,7 @@ package unattend
 
 import (
 	"bytes"
+	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -377,4 +378,60 @@ func firstLine(b []byte) string {
 		return string(b[:i])
 	}
 	return string(b)
+}
+
+// TestSpec_JSONWireContract pins the key names accepted from the
+// templates.unattend_config JSONB column.
+//
+// This is a silent-failure guard, not a formatting nicety. Go matches
+// untagged fields case-insensitively but does not ignore separators, so
+// before these tags existed "apt_proxy" and "extra_pkgs" unmarshalled to
+// zero values with no error. The visible symptom would have been a Linux
+// template that quietly bypassed the apt cache on stagingv01 -- slow at
+// best, and a hard failure on a build host without direct internet.
+func TestSpec_JSONWireContract(t *testing.T) {
+	const payload = `{
+		"hostname":   "kali-tmpl",
+		"username":   "student",
+		"password":   "s3cret",
+		"locale":     "en_GB.UTF-8",
+		"time_zone":  "Europe/London",
+		"apt_proxy":  "http://10.10.30.20:3142",
+		"extra_pkgs": ["nmap", "curl"]
+	}`
+
+	var spec Spec
+	if err := json.Unmarshal([]byte(payload), &spec); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	for _, tc := range []struct{ field, got, want string }{
+		{"Hostname", spec.Hostname, "kali-tmpl"},
+		{"Username", spec.Username, "student"},
+		{"Password", spec.Password, "s3cret"},
+		{"Locale", spec.Locale, "en_GB.UTF-8"},
+		{"TimeZone", spec.TimeZone, "Europe/London"},
+		{"AptProxy", spec.AptProxy, "http://10.10.30.20:3142"},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %q, want %q", tc.field, tc.got, tc.want)
+		}
+	}
+	if len(spec.ExtraPkgs) != 2 || spec.ExtraPkgs[0] != "nmap" || spec.ExtraPkgs[1] != "curl" {
+		t.Errorf("ExtraPkgs = %v, want [nmap curl]", spec.ExtraPkgs)
+	}
+}
+
+// TestSpec_ModeIsNotTakenFromJSON keeps templates.unattend_mode the single
+// source of truth. A config blob that smuggles in its own mode must be
+// ignored, otherwise a template could render a different installer than the
+// column says it uses -- and the column is what the wizard branches on.
+func TestSpec_ModeIsNotTakenFromJSON(t *testing.T) {
+	var spec Spec
+	if err := json.Unmarshal([]byte(`{"Mode":"cloudinit_cidata","mode":"debian_preseed"}`), &spec); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if spec.Mode != "" {
+		t.Errorf("Mode = %q, want empty — mode must come from the column, not the config blob", spec.Mode)
+	}
 }
