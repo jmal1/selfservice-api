@@ -355,42 +355,51 @@ Ubuntu's stock rule still demands a password.
 
 ### How Crucible knows generalize actually finished
 
-Generalize's last act is to power the guest off, which kills the VMware Tools
-agent *while the platform is still talking to it*. So the guest-ops call
-**always** returns an error — even when everything worked. The message vCenter
-returns is:
+**On Linux the cleanup script does not power the guest off.** That is
+deliberate, and it is what makes completion provable:
 
-```
-ServerFaultCode: The guest operations agent could not be contacted.
-```
+1. A guest that powers itself off kills the VMware Tools agent *while the
+   platform is still talking to it*, so the guest-ops call returns an error
+   even on a perfect run. The message vCenter returns is:
 
-That exact message is also what you get when VMware Tools **never started at
-all**, so it cannot be used to tell success from failure.
+   ```
+   ServerFaultCode: The guest operations agent could not be contacted.
+   ```
 
-Instead, the Linux generalize script records its own completion. Its final
-command before `shutdown` stamps the job's ID into a `guestinfo` variable:
+   That exact message is also what you get when VMware Tools **never started
+   at all**, so it cannot be used to tell success from failure.
+
+2. `guestinfo` variables written by the guest live only in the **running** VM's
+   configuration — **vCenter clears them when the VM powers off.** So a marker
+   stamped by the script and then followed by a shutdown is erased by the very
+   shutdown it was meant to survive.
+
+Because the script simply exits, Crucible gets a real exit code back. It then
+corroborates that with a marker the script stamps as its final line, read
+**while the guest is still powered on**:
 
 ```bash
 vmware-rpctool "info-set guestinfo.crucible.generalize.job <job-id>"
 ```
 
-`guestinfo` lives in the VM's configuration rather than in the guest, so it
-survives the power-off and the platform reads it back afterwards. Because the
-value is the **job ID** and not a fixed word, a sentinel left over from an
-earlier generalize attempt on the same VM cannot be mistaken for this one.
+Only after both signals agree does the platform issue the shutdown itself.
+Because the value is the **job ID** and not a fixed word, a marker left over
+from an earlier generalize attempt on the same VM cannot be mistaken for this
+one.
 
 What that means for you:
 
 | Template state after Generalize | What it tells you |
 |---|---|
-| `ready` | The cleanup script ran to its final line. Trustworthy. |
-| `error`, *"generalize script did not run to completion"* | The guest went down **before** cleanup finished — usually the `sudo` problem above. Fix it and re-run Generalize; do not publish. |
-| `error`, *"completion could not be verified"* | vCenter was unreachable when the platform tried to confirm. The template may be fine; re-run Generalize to get a clean answer. |
+| `ready` | The cleanup script ran to its final line and the marker was confirmed. Trustworthy. |
+| `error`, *"generalize script failed"* | The script returned a non-zero exit code — usually the `sudo` problem above. The message carries the guest's own error. Fix it and re-run Generalize; do not publish. |
+| `error`, *"never stamped the completion sentinel"* | The script reported success but left no marker, so the cleanup cannot be shown to have run. Re-run Generalize; do not publish. |
 
 > [!note]
-> Windows is exempt from the sentinel. Sysprep is launched fire-and-forget and
+> Windows is exempt from the marker. Sysprep is launched fire-and-forget and
 > powers the machine off on its own schedule, so there is no opportunity to
-> stamp anything. Windows generalize still relies on the shutdown signal.
+> stamp anything and no window in which to read it. Windows generalize still
+> relies on the shutdown signal.
 
 ---
 

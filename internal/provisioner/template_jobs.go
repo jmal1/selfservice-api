@@ -676,9 +676,9 @@ func (p *Provisioner) GeneralizeTemplate(ctx context.Context, job *models.Job) e
 		RunID:         runID,
 		ActionSlug:    "template-generalize",
 	})
-	// RunScriptInGuest routinely returns an error here even when the script
-	// did exactly what it was supposed to, because the script's last act is to
-	// power the guest off and that kills the guest agent mid-call.
+	// On Windows the script's last act is to launch sysprep, which powers the
+	// guest off and kills the guest agent mid-call, so RunScriptInGuest
+	// routinely returns an error even on a perfectly good run.
 	//
 	// We used to decide which case we were in by pattern-matching the error
 	// string. That cannot work. vCenter reports "The guest operations agent
@@ -690,10 +690,11 @@ func (p *Provisioner) GeneralizeTemplate(ctx context.Context, job *models.Job) e
 	// list, and adding the string would have made the opposite failure
 	// (tools never started) silently succeed.
 	//
-	// Ask the guest instead. The script stamps generalizeSentinelKey with this
-	// job's ID as its final step, and guestinfo survives the power-off, so a
-	// matching sentinel is proof that the cleanup actually ran.
-	if err != nil {
+	// Linux no longer has this problem at all: its script does not power the
+	// guest off (see generalizeScript), so a real exit code always comes back
+	// and the sentinel is still readable. Only Windows needs the salvage
+	// logic below.
+	if osType == "windows" && err != nil {
 		switch confirmed, sErr := generalizeConfirmed(ctx, p.vc, payload.VMMoref, runID,
 			generalizeSentinelAttempts, generalizeSentinelInterval); {
 		case sErr != nil:
@@ -728,6 +729,58 @@ func (p *Provisioner) GeneralizeTemplate(ctx context.Context, job *models.Job) e
 		default:
 			return p.markTemplateError(ctx, payload.TemplateID,
 				fmt.Errorf("generalize script failed before VM shutdown: %w", err))
+		}
+	}
+
+	// Step 2a (Linux): the script kept the guest alive, so the exit code is a
+	// real verdict. Trust it, then corroborate with the sentinel while the
+	// guest is still up - which is the only window in which guestinfo written
+	// by the guest is readable at all.
+	if osType != "windows" {
+		if err != nil {
+			return p.markTemplateError(ctx, payload.TemplateID,
+				fmt.Errorf("generalize script failed: %w", err))
+		}
+		switch confirmed, sErr := generalizeConfirmed(ctx, p.vc, payload.VMMoref, runID,
+			generalizeSentinelAttempts, generalizeSentinelInterval); {
+		case sErr != nil:
+			// vCenter unreadable. The exit code already said the script ran to
+			// completion, so do not fail a probably-good template over a
+			// missing second opinion - but say so plainly.
+			p.logger.Warn("generalize sentinel unreadable; proceeding on exit code alone",
+				"template_id", payload.TemplateID, "sentinel_err", sErr)
+		case !confirmed:
+			// Exit code 0 but the guest never stamped. `set -e` means the
+			// stamp is the last thing the script does, so a zero exit without
+			// a stamp means the script body did not actually execute in the
+			// guest even though guest ops reported success.
+			return p.markTemplateError(ctx, payload.TemplateID,
+				fmt.Errorf("generalize reported success but the guest never stamped the completion "+
+					"sentinel %s, so the cleanup cannot be shown to have run; refusing to publish a "+
+					"template that may still carry a baked-in machine-id and SSH host keys",
+					generalizeSentinelKey))
+		default:
+			p.logger.Info("generalize script completed (exit code 0, sentinel confirmed)",
+				"template_id", payload.TemplateID)
+		}
+
+		// Step 2b (Linux): we power the guest off, rather than the script, so
+		// that everything above could be observed first. This call is expected
+		// to fail - shutdown kills the guest agent mid-request - and ignoring
+		// that error is only safe because completion is already proven.
+		p.publishProgress(job.ID, "shutdown_guest", "Shutting the guest down")
+		if _, offErr := p.vc.RunScriptInGuest(ctx, vcenter.GuestExecRequest{
+			VMMoref:       payload.VMMoref,
+			GuestUser:     payload.GuestUsername,
+			GuestPassword: payload.GuestPassword,
+			Language:      "bash",
+			Script:        "sudo shutdown -h now",
+			Timeout:       2 * time.Minute,
+			RunID:         runID,
+			ActionSlug:    "template-generalize-shutdown",
+		}); offErr != nil {
+			p.logger.Info("shutdown command returned an error (expected: it terminates its own agent)",
+				"template_id", payload.TemplateID, "error", offErr)
 		}
 	}
 
@@ -1122,10 +1175,36 @@ func generalizeScript(osType, runID string) string {
 	}
 	// Linux. Keep as POSIX-safe so it works under dash if /bin/sh is dash.
 	//
-	// The rpctool line must be the LAST thing before shutdown, and it must not
-	// be swallowed by `|| true`: if we cannot record completion then we do not
-	// get to claim completion. `set -e` already aborts before this point on any
-	// failed cleanup step, so reaching the stamp means the cleanup ran.
+	// NOTE: this script deliberately does NOT power the guest off. It used to
+	// end with `sudo shutdown -h now`, and that broke completion detection
+	// outright:
+	//
+	//   1. Powering off from inside kills the guest agent mid-call, so
+	//      RunScriptInGuest never returns an exit code. The worker was left
+	//      pattern-matching an error string that carries no information (see
+	//      the long comment at the call site).
+	//   2. The guestinfo sentinel added to replace that heuristic ALSO could
+	//      not survive, because guest-written guestinfo lives only in the
+	//      running VM's config.extraConfig and vCenter CLEARS IT ON POWER-OFF.
+	//      Verified on real hardware: a marker written via vmware-rpctool was
+	//      present in `govc vm.info -e` immediately before a guest-initiated
+	//      shutdown and absent immediately after, with nothing else changed.
+	//      So the stamp was always erased by the very shutdown it was supposed
+	//      to survive, and generalizeConfirmed could never return true on
+	//      Linux - it reported "did not run to completion" for runs that had
+	//      completed perfectly.
+	//
+	// Letting the script exit normally makes the whole question disappear:
+	// `set -e` plus a real exit code is an unambiguous verdict, the sentinel
+	// is readable while the guest is still up as a second signal, and the
+	// worker issues the power-off itself afterwards (see GeneralizeTemplate
+	// Step 2b). Windows keeps powering itself off because sysprep insists on
+	// it, which is why that branch is exempted from the sentinel check.
+	//
+	// The rpctool line must be the LAST thing, and it must not be swallowed by
+	// `|| true`: if we cannot record completion then we do not get to claim
+	// completion. `set -e` already aborts before this point on any failed
+	// cleanup step, so reaching the stamp means the cleanup ran.
 	return strings.Join([]string{
 		"set -e",
 		"sudo cloud-init clean --logs --seed || true",
@@ -1136,7 +1215,6 @@ func generalizeScript(osType, runID string) string {
 		"history -c 2>/dev/null || true",
 		"rm -f ~/.bash_history",
 		fmt.Sprintf("sudo vmware-rpctool %q", "info-set "+generalizeSentinelKey+" "+runID),
-		"sudo shutdown -h now",
 	}, "\n")
 }
 
@@ -1158,10 +1236,14 @@ const (
 // generalizeConfirmed reports whether the guest stamped this run's completion
 // sentinel.
 //
-// The guest may still be powering off when we ask, and the stamp is written
-// just before `shutdown -h now`, so a single immediate read can lose a race it
-// would win a second later. Poll briefly rather than treating the first empty
-// read as a verdict.
+// A guest write does not appear in config.extraConfig instantly - measured at
+// a few seconds on real hardware - so a single immediate read can lose a race
+// it would win a moment later. Poll briefly rather than treating the first
+// empty read as a verdict.
+//
+// This must only be called while the guest is still POWERED ON. vCenter clears
+// guest-written guestinfo when the VM powers off, so after a shutdown this
+// function returns false regardless of what the guest did.
 //
 // A sentinel carrying a DIFFERENT run ID is treated as absent, not as success:
 // that is a leftover from an earlier generalize attempt on the same VM, which
