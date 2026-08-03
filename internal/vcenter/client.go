@@ -28,7 +28,14 @@ type Config struct {
 	Datacenter    string   // e.g., "JMAL-Datacenter"
 	Datastore     string   // e.g., "NAS-vmstore"
 	VMFolder      string   // e.g., "Student-VMs"
-	ResourcePools []string // e.g., ["AMD-Cluster/Resources/Student-VMs", "Intel-Cluster/Resources/Student-VMs"]
+	// TemplateFolder is where template *build* VMs live, e.g.
+	// "/JMAL-Datacenter/vm/templates". It is deliberately separate from
+	// VMFolder: VMFolder holds ephemeral student pod VMs and is what the
+	// orphan reconciler scans, so a long-lived template shell parked there
+	// would be reported as an orphan forever. CreateBlankVM falls back to
+	// this when the caller does not name a folder.
+	TemplateFolder string
+	ResourcePools  []string // e.g., ["AMD-Cluster/Resources/Student-VMs", "Intel-Cluster/Resources/Student-VMs"]
 	Hosts         []string // ESXi hosts for port group operations
 	Insecure      bool     // skip TLS verification
 }
