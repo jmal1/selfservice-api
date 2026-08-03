@@ -116,12 +116,12 @@ The runner classifies exit 127 as `error` rather than `fail` to distinguish an i
 
 **Immediate fix:**
 
-1. Check [`internal/runnertools/tools.txt`](../../internal/runnertools/tools.txt) — does the
-   command you need appear there?
-2. If not, either:
-   - Switch to an equivalent tool that **is** in the image (see the
-     [Pre-installed tools table](runner-environment.md#pre-installed-tools)).
-   - Ask a platform admin to add it to `tools.txt` and rebuild the runner image.
+1. Check the [Pre-installed tools table](runner-environment.md#pre-installed-tools) — does the
+   command you need appear there? That table is the authoritative inventory and is guarded by a
+   test, so it cannot drift from the actual image.
+2. If it is not listed, either:
+   - Switch to an equivalent tool that **is** in the image.
+   - Ask a platform admin to add it to the runner tool manifest and rebuild the runner image.
 3. Do **not** `apt install` from the script — the runner has no internet egress, and
    mutating a shared image mid-run would affect other running assessments.
 
@@ -131,7 +131,7 @@ The runner classifies exit 127 as `error` rather than `fail` to distinguish an i
 
 If the message reads *"a tool it depends on is not available"* (without naming it), the missing
 binary is inside a **library action** body. Trace which library action your script calls via
-`run_action`, then check that action's bash body for commands not in `tools.txt`.
+`run_action`, then check that action's bash body against the pre-installed tools table.
 
 ---
 
