@@ -140,6 +140,17 @@ func runRunnerSmoke(ctx context.Context, c *synthetic.Client, cfg RunnerSmokeCon
 		"playlist_id", cfg.PlaylistID,
 	)
 
+	// Fail fast, before any network call, on config the operator must fix.
+	//
+	// main.go deliberately registers this check even when these are unset
+	// (an unregistered check's series ceases to exist and cannot match
+	// `1 - crucible_synthetic_check_success > 0`, so it would be invisible
+	// rather than red). That makes a clear, self-describing failure here
+	// part of the contract: this error text is the ONLY thing telling an
+	// operator which env var to set.
+	if strings.TrimSpace(cfg.TemplateName) == "" {
+		return 0, fmt.Errorf("template name is empty (set SYNTHETIC_RUNNER_TEMPLATE)")
+	}
 	if strings.TrimSpace(cfg.PlaylistID) == "" {
 		return 0, fmt.Errorf("playlist ID is empty (set SYNTHETIC_RUNNER_PLAYLIST_ID)")
 	}

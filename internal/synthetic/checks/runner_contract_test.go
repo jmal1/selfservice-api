@@ -1,10 +1,17 @@
 package checks
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"sort"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jmal1/selfservice-api/internal/models"
+	"github.com/jmal1/selfservice-api/internal/synthetic"
 )
 
 // TestRunnerSmoke_TerminalStatusesMatchTheAPIContract pins the run-status
@@ -82,5 +89,47 @@ func TestRunnerSmoke_TerminalStatusesMatchTheAPIContract(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("terminalRunStatuses = %v, want exactly %v", got, want)
 		}
+	}
+}
+
+// TestRunnerSmoke_EmptyTemplateNameFailsFast is the companion to
+// TestRunnerSmoke_EmptyPlaylistID.
+//
+// main.go registers runner_smoke even when its env vars are unset, because an
+// unregistered check's Prometheus series ceases to exist and therefore cannot
+// match `1 - crucible_synthetic_check_success > 0` — it would be invisible
+// rather than red. That design choice makes THIS error message the only thing
+// that tells an operator what to fix, so it must name the env var and it must
+// fire before any network call or pod is created.
+func TestRunnerSmoke_EmptyTemplateNameFailsFast(t *testing.T) {
+	// A server that answers every request with a teapot: reaching it at all
+	// is the bug, and 418 is a status no check under test ever accepts.
+	var reached int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&reached, 1)
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer srv.Close()
+
+	cfg := RunnerSmokeConfig{
+		TemplateName:   "", // deliberately empty
+		PlaylistID:     "0000-uuid",
+		ReadyTimeout:   2 * time.Second,
+		RunTimeout:     2 * time.Second,
+		DestroyTimeout: 2 * time.Second,
+		PreCleanMaxAge: time.Minute,
+	}
+	_, err := RunnerSmoke(cfg).Run(context.Background(), synthetic.NewClient(srv.URL, ""))
+	if err == nil {
+		t.Fatal("empty TemplateName must fail the check")
+	}
+	if !strings.Contains(err.Error(), "SYNTHETIC_RUNNER_TEMPLATE") {
+		t.Errorf("error %q must name the env var; it is the only thing telling an "+
+			"operator what to fix, since the check is registered regardless", err)
+	}
+	if n := atomic.LoadInt32(&reached); n != 0 {
+		t.Errorf("made %d HTTP request(s) before failing: a missing env var must be "+
+			"caught locally, not after a round-trip that yields a confusing "+
+			"'template not found'", n)
 	}
 }
