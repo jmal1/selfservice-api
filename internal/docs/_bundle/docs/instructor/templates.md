@@ -237,7 +237,7 @@ sshd fails its config test and the student cannot SSH in.
 [Unit]
 Description=Regenerate missing OpenSSH host keys (Crucible)
 ConditionPathExists=!/etc/ssh/ssh_host_ed25519_key
-Before=ssh.service ssh.socket
+Before=ssh.service
 
 [Service]
 Type=oneshot
@@ -255,6 +255,30 @@ sudo systemctl enable crucible-regen-ssh-hostkeys.service
 The `ConditionPathExists` guard makes it a no-op on every later boot, so
 it can never rotate a running pod's host key out from under an open
 session.
+
+> [!danger] Order before `ssh.service`, **never** before `ssh.socket`.
+> Adding `ssh.socket` to that `Before=` line looks stricter and is in fact a
+> **systemd ordering cycle** that disables SSH entirely. Because the unit is
+> `WantedBy=multi-user.target` it inherits `After=basic.target`, and
+> `basic.target` is ordered after `sockets.target`, which is ordered after
+> `ssh.socket`. systemd breaks the loop by *deleting a job* — and on a real
+> build it deleted `ssh.socket/start`, so nothing ever bound port 22 on the
+> template or on any clone made from it. The boot log is the giveaway:
+>
+> ```
+> sockets.target: Found ordering cycle on ssh.socket/start
+> sockets.target: Job ssh.socket/start deleted to break ordering cycle
+> ```
+>
+> Note the `ConditionPathExists` guard does **not** protect you here: systemd
+> resolves ordering cycles *before* it evaluates conditions, so a unit that
+> would have been skipped anyway still takes SSH down.
+>
+> Ordering before `ssh.service` is both cycle-free and sufficient. Under socket
+> activation `ssh.socket` only binds the port; `ssh.service` is what execs
+> `sshd` and reads the host keys. If a connection arrives before this unit has
+> run, systemd simply orders `ssh.service` after it, so `sshd` still never
+> starts without keys.
 
 > [!note]
 > On **Ubuntu 24.04** the SSH daemon unit is `ssh.service`, **not**
@@ -334,6 +358,8 @@ command -v vmware-rpctool                            # open-vm-tools present (re
 cloud-init --version                                 # must be >= 21.3 (req 2)
 cat /etc/cloud/cloud.cfg.d/99-crucible.cfg           # default_user.name: student (req 2)
 systemctl is-enabled crucible-regen-ssh-hostkeys     # must be "enabled" (req 3)
+systemctl is-active ssh.socket                       # must be "active" - see the ordering-cycle warning (req 3)
+journalctl -b | grep 'ordering cycle on ssh.socket'  # must print NOTHING (req 3)
 grep -rh -i proxy /etc/apt/apt.conf.d/               # a bare URL, not a dict (req 4)
 sudo -n true && echo "sudo OK"                       # must print sudo OK (req 5)
 ```

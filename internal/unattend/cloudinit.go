@@ -36,10 +36,32 @@ const cidataVolumeLabel = "CIDATA"
 //
 // The ConditionPathExists guard makes it a no-op on every subsequent boot, so it
 // can never rotate a working host key out from under a running pod.
+//
+// It orders itself before ssh.SERVICE and deliberately NOT before ssh.SOCKET.
+// Ordering before ssh.socket looks stricter but is a systemd ordering cycle,
+// and it took SSH down completely on the first real ISO build:
+//
+//	sockets.target: Found ordering cycle on ssh.socket/start
+//	sockets.target: Job ssh.socket/start deleted to break ordering cycle
+//
+// The cycle is: this unit is WantedBy=multi-user.target, so it inherits the
+// default After=basic.target; basic.target is After sockets.target; and
+// ssh.socket is Before=sockets.target. Asking to run before ssh.socket
+// therefore closes the loop, and systemd breaks it by DELETING ssh.socket's
+// start job - so nothing ever listens on port 22. Note the condition above was
+// false on that build (host keys existed), which did not help: systemd resolves
+// ordering cycles before it evaluates conditions, so a unit that gets skipped
+// anyway can still take SSH out.
+//
+// Ordering before ssh.service is both cycle-free and sufficient. Under socket
+// activation ssh.socket only binds the port; ssh.service is what execs sshd and
+// reads the host keys. A connection arriving before this unit has run triggers
+// ssh.service, which systemd then orders after us, so sshd still never starts
+// without keys.
 const crucibleSSHKeygenUnit = `[Unit]
 Description=Regenerate missing OpenSSH host keys (Crucible)
 ConditionPathExists=!/etc/ssh/ssh_host_ed25519_key
-Before=ssh.service ssh.socket
+Before=ssh.service
 
 [Service]
 Type=oneshot

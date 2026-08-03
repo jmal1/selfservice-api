@@ -418,6 +418,55 @@ file, so it is a platform bug rather than something you did.
 
 ---
 
+## "SSH is refused on my Linux template (or on every clone of it)"
+
+Symptom: the VM boots, VMware Tools report it as running, it holds a DHCP
+lease and you can reach it — but connecting to port 22 gives **connection
+refused** rather than a timeout. `systemctl is-active ssh` reports
+`inactive`, which is *normal* on Ubuntu 24.04 (SSH is socket-activated), so
+that alone is not the answer. Check the socket instead:
+
+```bash
+systemctl is-active ssh.socket        # want: active
+systemctl is-enabled ssh.socket       # want: enabled
+sudo ss -lnt | grep ':22'             # want: a LISTEN line
+```
+
+The revealing case is `enabled` **but** `inactive`, with no journal entries
+for the unit at all (`journalctl -u ssh.socket` prints `-- No entries --`).
+That means systemd never even tried to start it. Confirm with:
+
+```bash
+journalctl -b | grep -i 'ordering cycle'
+```
+
+If you see this, you have a **systemd ordering cycle**:
+
+```
+sockets.target: Found ordering cycle on ssh.socket/start
+sockets.target: Job ssh.socket/start deleted to break ordering cycle
+```
+
+systemd resolves a cycle by *deleting one of the jobs in it*, and here it
+deleted the job that binds port 22. Nothing errors, nothing is marked
+failed, and `systemctl list-units --failed` is empty — the port simply never
+opens.
+
+The usual cause is a custom unit that declares `Before=ssh.socket` while
+being pulled in by `multi-user.target` (which is ordered *after*
+`sockets.target`, which is ordered after `ssh.socket`). Crucible's own
+`crucible-regen-ssh-hostkeys.service` shipped with exactly that mistake once.
+The fix is to order before `ssh.service` and **not** `ssh.socket` — see the
+danger callout in [Templates](templates.md). A `ConditionPathExists` guard on
+the offending unit does not help: systemd resolves ordering cycles *before*
+it evaluates conditions, so a unit that gets skipped anyway can still take
+SSH down.
+
+Report it if a freshly-provisioned template shows this — the generator writes
+that unit, so it is a platform bug rather than something you did.
+
+---
+
 ## See also
 
 - [Building Workflows](workflows.md) — the basics
