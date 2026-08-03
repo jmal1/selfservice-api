@@ -10,6 +10,7 @@ package unattend
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -18,6 +19,68 @@ import (
 // cidataVolumeLabel is the exact volume label cloud-init's NoCloud datasource
 // looks for. Do not change this.
 const cidataVolumeLabel = "CIDATA"
+
+// crucibleSSHKeygenUnit recreates OpenSSH host keys when they are absent.
+//
+// generalizeScript() deletes /etc/ssh/ssh_host_* so that each clone gets its own
+// host identity (acceptance test C4-5: two clones of one template must present
+// DIFFERENT host key fingerprints). Ubuntu 24.04 ships nothing that puts them
+// back: there is no ssh-keygen.service, ssh.service only runs "sshd -t", and ssh
+// is socket-activated via ssh.socket. Verified on the first real ISO build -
+// "systemctl is-enabled ssh-keygen.service" returned not-found.
+//
+// cloud-init's cc_ssh module does generate missing host keys on a new instance,
+// but it races socket activation, so a clone can come up with sshd failing its
+// config test and refusing connections until cloud-init catches up. This unit
+// removes the race and does not depend on cloud-init running at all.
+//
+// The ConditionPathExists guard makes it a no-op on every subsequent boot, so it
+// can never rotate a working host key out from under a running pod.
+const crucibleSSHKeygenUnit = `[Unit]
+Description=Regenerate missing OpenSSH host keys (Crucible)
+ConditionPathExists=!/etc/ssh/ssh_host_ed25519_key
+Before=ssh.service ssh.socket
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/ssh-keygen -A
+
+[Install]
+WantedBy=multi-user.target
+`
+
+// sshKeygenUnitName is the systemd unit installed by crucibleSSHKeygenUnit.
+const sshKeygenUnitName = "crucible-regen-ssh-hostkeys.service"
+
+// sudoersPath is where the passwordless-sudo drop-in lands for a given user.
+// The 90- prefix puts it after Ubuntu's own drop-ins so it wins.
+func sudoersPath(username string) string {
+	return "/etc/sudoers.d/90-crucible-" + username
+}
+
+// safeUsernameRe is the subset of usernames this package will emit into a
+// sudoers file and a shell command. Deliberately stricter than useradd: these
+// values reach both YAML and "sh -c", so anything outside this set is refused
+// at generation time rather than escaped and hoped for.
+var safeUsernameRe = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
+
+// inTarget wraps a shell script so curtin runs it inside the installed system
+// rather than the installer environment.
+func inTarget(script string) string {
+	return "curtin in-target --target=/target -- sh -c " + shellQuote(script)
+}
+
+// writeFileScript emits a shell fragment that writes content to path with mode.
+func writeFileScript(path, content, mode string) string {
+	dir := "."
+	if i := strings.LastIndex(path, "/"); i > 0 {
+		dir = path[:i]
+	}
+	return "mkdir -p " + shellQuote(dir) +
+		" && printf '%s' " + shellQuote(content) + " > " + shellQuote(path) +
+		" && chmod " + mode + " " + shellQuote(path)
+}
 
 type ciIdentity struct {
 	Hostname string `yaml:"hostname"`
@@ -33,13 +96,23 @@ type ciKeyboard struct {
 	Layout string `yaml:"layout"`
 }
 
-type ciAptProxyPair struct {
-	HTTPProxy  string `yaml:"http_proxy"`
-	HTTPSProxy string `yaml:"https_proxy"`
-}
-
+// ciApt mirrors curtin's apt config, which subiquity passes straight through.
+//
+// Proxy is a SCALAR URL. It is emphatically not a mapping: curtin's schema puts
+// proxy / http_proxy / https_proxy side by side as sibling strings. Nesting
+// http_proxy under proxy does not fail - curtin stringifies whatever it is
+// given, so the installed system ends up with the literal Python dict repr
+//
+//	Acquire::http::Proxy "{'http_proxy': 'http://10.10.30.20:3142', ...}";
+//
+// in /etc/apt/apt.conf.d/90curtin-aptproxy, which breaks every apt command on
+// the template and on every student clone made from it. Observed in production
+// on the first real build. TestBuildSeedISO_CIData_AptProxyIsScalar guards it.
+//
+// Only the http proxy is set. The apt cache is apt-cacher-ng, and pointing
+// https_proxy at it breaks https repositories rather than caching them.
 type ciApt struct {
-	Proxy *ciAptProxyPair `yaml:"proxy,omitempty"`
+	Proxy string `yaml:"proxy,omitempty"`
 }
 
 type ciAutoinstall struct {
@@ -148,6 +221,11 @@ for _ in range(240):
 // Ubuntu autoinstall. The password is stored as a SHA-512 crypt hash, never
 // in plaintext.
 func buildCloudInitUserData(s Spec) (string, error) {
+	if !safeUsernameRe.MatchString(s.Username) {
+		return "", fmt.Errorf("unattend: username %q is not a safe POSIX username (must match %s); "+
+			"it is emitted into a sudoers file and a shell command", s.Username, safeUsernameRe)
+	}
+
 	hash, err := generateSHA512Crypt(s.Password)
 	if err != nil {
 		return "", fmt.Errorf("unattend: hash password: %w", err)
@@ -179,17 +257,43 @@ func buildCloudInitUserData(s Spec) (string, error) {
 		Shutdown: "poweroff",
 		LateCommands: []string{
 			// Install the Crucible cloud.cfg into the target system.
-			"curtin in-target --target=/target -- sh -c " +
-				shellQuote("mkdir -p /etc/cloud/cloud.cfg.d && printf '%s' "+
-					shellQuote(crucibleCloudCfg)+" > /etc/cloud/cloud.cfg.d/99-crucible.cfg"),
+			inTarget(writeFileScript("/etc/cloud/cloud.cfg.d/99-crucible.cfg", crucibleCloudCfg, "0644")),
+
+			// Grant the install user passwordless sudo.
+			//
+			// crucibleCloudCfg's system_info.default_user.sudo does NOT cover
+			// this: cloud-init only applies default_user when it CREATES the
+			// user, and subiquity's identity block has already created it. The
+			// user lands in group sudo, which Ubuntu's stock sudoers defines as
+			// "%sudo ALL=(ALL:ALL) ALL" - password required.
+			//
+			// That breaks the template pipeline outright. generalizeScript()
+			// runs "sudo cloud-init clean", "sudo truncate -s 0
+			// /etc/machine-id" and "sudo rm -f /etc/ssh/ssh_host_*" over VMware
+			// guest ops with no tty, under "set -e". Verified on the first real
+			// ISO build: "sudo -n true" returned "sudo: a password is required".
+			//
+			// visudo -cf is not decoration: an invalid file in sudoers.d breaks
+			// sudo for every user. Failing the install here is far better than
+			// shipping a template nobody can escalate on.
+			inTarget(writeFileScript(sudoersPath(s.Username),
+				s.Username+" ALL=(ALL) NOPASSWD:ALL\n", "0440") +
+				" && visudo -cf " + shellQuote(sudoersPath(s.Username))),
+
+			// Recreate SSH host keys on first boot of a clone (see
+			// crucibleSSHKeygenUnit). Enabled by hand rather than via
+			// "systemctl enable" semantics that need a running systemd: curtin
+			// runs in a chroot, so we create the wants symlink directly.
+			inTarget(writeFileScript("/etc/systemd/system/"+sshKeygenUnitName,
+				crucibleSSHKeygenUnit, "0644") +
+				" && mkdir -p /etc/systemd/system/multi-user.target.wants" +
+				" && ln -sf /etc/systemd/system/" + sshKeygenUnitName +
+				" /etc/systemd/system/multi-user.target.wants/" + sshKeygenUnitName),
 		},
 	}
 
 	if s.AptProxy != "" {
-		ai.Apt = &ciApt{Proxy: &ciAptProxyPair{
-			HTTPProxy:  s.AptProxy,
-			HTTPSProxy: s.AptProxy,
-		}}
+		ai.Apt = &ciApt{Proxy: s.AptProxy}
 	}
 
 	body, err := yaml.Marshal(ciDocument{Autoinstall: ai})
