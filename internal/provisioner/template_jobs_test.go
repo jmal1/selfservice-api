@@ -19,9 +19,12 @@ import (
 
 // TestGeneralizeScript_LinuxContainsCriticalSteps locks in the contract
 // that the Linux generalize script wipes machine-id, SSH host keys, and
-// cloud-init state, then shuts down. Any one of these missing means a
-// student VM cloned from this template would either fail to boot
-// (missing entropy) or, worse, share a machine-id with another student.
+// cloud-init state. Any one of these missing means a student VM cloned
+// from this template would either fail to boot (missing entropy) or,
+// worse, share a machine-id with another student.
+//
+// Note it deliberately does NOT require a shutdown line - see
+// TestGeneralizeScript_LinuxMustNotPowerItselfOff.
 func TestGeneralizeScript_LinuxContainsCriticalSteps(t *testing.T) {
 	got := generalizeScript("linux", "job-1")
 	required := []string{
@@ -29,7 +32,6 @@ func TestGeneralizeScript_LinuxContainsCriticalSteps(t *testing.T) {
 		"truncate -s 0 /etc/machine-id",
 		"/var/lib/dbus/machine-id",
 		"/etc/ssh/ssh_host_",
-		"shutdown -h now",
 	}
 	for _, r := range required {
 		if !strings.Contains(got, r) {
@@ -85,7 +87,7 @@ func TestPowerOffTimeout(t *testing.T) {
 
 func TestGeneralizeScript_UnknownOSDefaultsToLinux(t *testing.T) {
 	got := generalizeScript("plan9", "job-1")
-	if !strings.Contains(got, "shutdown -h now") {
+	if !strings.Contains(got, "truncate -s 0 /etc/machine-id") {
 		t.Errorf("unknown OS should fall back to Linux script, got:\n%s", got)
 	}
 }
@@ -681,7 +683,8 @@ func TestProvisionTemplate_ISO_RemasterUnsupportedFailsLoudly(t *testing.T) {
 // not be contacted" BOTH for a guest that shut itself down on purpose and for
 // a guest whose VMware Tools never started -- and it cost a full rebuild cycle
 // when a correct generalize run was marked 'error'. These tests lock in the
-// replacement: a run-scoped guestinfo sentinel that survives the power-off.
+// replacement: a run-scoped guestinfo sentinel, read while the guest is still
+// powered on (vCenter clears guest-written guestinfo on power-off).
 
 type fakeSentinelVC struct {
 	vals  []string
@@ -703,20 +706,18 @@ func (f *fakeSentinelVC) GetGuestInfoVar(_ context.Context, _, key string) (stri
 	return "", nil
 }
 
-// TestGeneralizeScript_LinuxStampsSentinelBeforeShutdown is the guard for the
-// whole mechanism: if the stamp is missing, or lands after shutdown (where it
-// can never execute), or is swallowed by `|| true` (so a failed stamp still
-// looks fine), then every Linux generalize run reports a false failure.
-func TestGeneralizeScript_LinuxStampsSentinelBeforeShutdown(t *testing.T) {
+// TestGeneralizeScript_LinuxStampsSentinel is the guard for the whole
+// mechanism: if the stamp is missing, or is swallowed by `|| true` (so a
+// failed stamp still looks fine), the worker cannot prove the cleanup ran.
+func TestGeneralizeScript_LinuxStampsSentinel(t *testing.T) {
 	const runID = "9f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f"
 	got := generalizeScript("linux", runID)
 
 	stamp := strings.Index(got, "vmware-rpctool")
 	if stamp < 0 {
 		t.Fatalf("linux generalize script never stamps the completion sentinel.\n"+
-			"Without it the worker cannot distinguish a guest that finished cleanup and\n"+
-			"powered off from one that died halfway, and every successful generalize is\n"+
-			"reported as an error.\ngot:\n%s", got)
+			"Without it the worker cannot distinguish a guest that finished cleanup\n"+
+			"from one that died halfway.\ngot:\n%s", got)
 	}
 	if !strings.Contains(got, generalizeSentinelKey) {
 		t.Errorf("stamp does not reference %s, so the worker will read a key nobody writes", generalizeSentinelKey)
@@ -725,18 +726,51 @@ func TestGeneralizeScript_LinuxStampsSentinelBeforeShutdown(t *testing.T) {
 		t.Errorf("stamp does not carry the run ID, so a sentinel left by an EARLIER generalize attempt would be accepted as this run's proof")
 	}
 
-	shutdown := strings.Index(got, "shutdown -h now")
-	if shutdown < 0 {
-		t.Fatal("linux generalize script no longer powers the guest off")
-	}
-	if stamp > shutdown {
-		t.Errorf("sentinel is stamped AFTER shutdown (stamp=%d shutdown=%d); it can never run, so completion is never provable", stamp, shutdown)
-	}
-
 	for _, line := range strings.Split(got, "\n") {
 		if strings.Contains(line, "vmware-rpctool") && strings.Contains(line, "|| true") {
 			t.Errorf("stamp is swallowed by `|| true`: %q\n"+
 				"A stamp that cannot fail is not evidence -- if we cannot record completion we must not claim it.", line)
+		}
+	}
+}
+
+// TestGeneralizeScript_LinuxMustNotPowerItselfOff is the regression guard for
+// a defect that made EVERY Linux ISO template generalize fail while the
+// cleanup itself was working perfectly.
+//
+// Guest-written guestinfo lives only in the running VM's config.extraConfig,
+// and vCenter CLEARS IT WHEN THE VM POWERS OFF. Verified on real hardware: a
+// marker written with vmware-rpctool was present in `govc vm.info -e`
+// immediately before a guest-initiated shutdown and absent immediately after,
+// with nothing else changed.
+//
+// So a script that stamps the sentinel and then powers itself off destroys its
+// own evidence: generalizeConfirmed can never return true, and the template is
+// marked 'error' with "did not run to completion" even though it completed.
+// The guest must stay up long enough for the worker to read the stamp; the
+// worker then issues the shutdown (GeneralizeTemplate Step 2b).
+//
+// Windows is exempt because sysprep insists on powering the machine off
+// itself, which is exactly why the Windows branch never stamps a sentinel and
+// falls back to the salvage path instead.
+func TestGeneralizeScript_LinuxMustNotPowerItselfOff(t *testing.T) {
+	got := generalizeScript("linux", "job-1")
+
+	// Assert the premise, so this test cannot pass vacuously if the script is
+	// ever gutted: it must still be the script that stamps the sentinel.
+	if !strings.Contains(got, "vmware-rpctool") {
+		t.Fatalf("premise broken: the linux script no longer stamps a sentinel, "+
+			"so this guard is testing nothing.\ngot:\n%s", got)
+	}
+
+	for _, banned := range []string{"shutdown", "poweroff", "halt", "systemctl poweroff"} {
+		if strings.Contains(got, banned) {
+			t.Errorf("linux generalize script contains %q.\n"+
+				"Powering the guest off from inside the script ERASES the guestinfo sentinel "+
+				"it just wrote (vCenter clears guest-written guestinfo on power-off), so "+
+				"generalizeConfirmed can never confirm and every successful generalize is "+
+				"reported as 'did not run to completion'. Let the worker power the guest off "+
+				"after it has read the stamp.\nscript:\n%s", banned, got)
 		}
 	}
 }

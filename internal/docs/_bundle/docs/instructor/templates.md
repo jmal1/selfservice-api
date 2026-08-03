@@ -148,9 +148,10 @@ matters because those credentials are not displayed anywhere in the wizard.
 
 > [!note]
 > **Reaching `ready` means the cleanup provably finished**, not just that the
-> VM powered off. On Linux the script stamps a completion marker that survives
-> the shutdown; if it is missing, the template goes to `error` rather than
-> `ready` even though the VM is off. See
+> VM powered off. On Linux the cleanup script deliberately leaves the guest
+> running so Crucible can collect a real exit code and read a completion
+> marker; the platform then powers the VM down itself. If either signal is
+> missing the template goes to `error` rather than `ready`. See
 > [Generalize failed, or the template published but clones behave oddly](troubleshooting.md#generalize-failed-or-the-template-published-but-clones-behave-oddly)
 > for what each outcome means.
 
