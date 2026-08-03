@@ -488,33 +488,107 @@ func (c *Client) DestroyVM(ctx context.Context, moref string) error {
 	})
 }
 
+// powerOnDiskReadyAttempts / powerOnDiskReadyDelay bound how long PowerOnVM
+// keeps retrying a power-on that failed because the VM's disk was not yet
+// readable. ~60s total, which comfortably covers the observed case without
+// turning a genuinely corrupt disk into a long stall.
+const (
+	powerOnDiskReadyAttempts = 20
+	powerOnDiskReadyDelay    = 3 * time.Second
+)
+
 // PowerOnVM powers on a VM.
 // Idempotent: returns nil if the VM is already powered on.
+//
+// A power-on issued immediately after CreateVM_Task can lose a race with the
+// datastore. The first ISO template build failed here with "The file specified
+// is not a virtual disk", 234ms after the VM was created; vmware.log named the
+// real reason:
+//
+//	VmfsExtentCommonOpen: possible extent truncation (?) realSize is 0,
+//	size in descriptor 83886080
+//	... failed to open: Size of extent in descriptor file larger than real size
+//
+// The descriptor was written and the flat extent was not yet materialized on
+// the NFS datastore. Powering the same VM on minutes later succeeded with no
+// other change, which is what identified this as a race rather than a bad
+// disk. Clones never hit it because the clone task does not return until the
+// data is written; only paths that build a VM from scratch — CreateBlankVM and
+// ImportOVA — power on against a disk the storage may still be allocating.
+//
+// Retrying is preferred to sleeping before the power-on: the readiness delay
+// depends on the datastore and the disk size, so any fixed sleep is either too
+// short on a busy NAS or wasted on every fast case.
 func (c *Client) PowerOnVM(ctx context.Context, moref string) error {
 	if err := c.ensureConnected(ctx); err != nil {
 		return err
 	}
 
 	return c.withRetry(ctx, "power on VM", func() error {
-		vm := object.NewVirtualMachine(c.client.Client,
-			types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
+		return retryWhileDiskNotReady(ctx, c.logger, moref, powerOnDiskReadyAttempts, powerOnDiskReadyDelay, func() error {
+			vm := object.NewVirtualMachine(c.client.Client,
+				types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
 
-		task, err := vm.PowerOn(ctx)
-		if err != nil {
-			if isAlreadyPoweredOnErr(err) {
-				return nil
+			task, err := vm.PowerOn(ctx)
+			if err != nil {
+				if isAlreadyPoweredOnErr(err) {
+					return nil
+				}
+				return fmt.Errorf("power on %s: %w", moref, err)
 			}
-			return fmt.Errorf("power on %s: %w", moref, err)
-		}
-		if err := task.Wait(ctx); err != nil {
-			if isAlreadyPoweredOnErr(err) {
-				return nil
+			if err := task.Wait(ctx); err != nil {
+				if isAlreadyPoweredOnErr(err) {
+					return nil
+				}
+				return err
 			}
-			return err
-		}
-		return nil
+			return nil
+		})
 	})
 }
+
+// retryWhileDiskNotReady calls powerOn until it succeeds, fails for a reason
+// other than an unreadable disk, or runs out of attempts. It is a free
+// function taking its delay so tests can drive it with delay=0 rather than
+// waiting out a real backoff.
+func retryWhileDiskNotReady(ctx context.Context, logger *slog.Logger, moref string, attempts int, delay time.Duration, powerOn func() error) error {
+	var err error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		err = powerOn()
+		if err == nil || !isDiskNotReadyErr(err) {
+			return err
+		}
+		if attempt == attempts {
+			break
+		}
+		if logger != nil {
+			logger.Warn("VM disk not readable yet, retrying power on",
+				"vm", moref, "attempt", attempt, "of", attempts, "error", err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+	return fmt.Errorf("disk still not readable after %d attempts over ~%s (the datastore may not have finished allocating the disk): %w",
+		attempts, time.Duration(attempts-1)*delay, err)
+}
+
+// isDiskNotReadyErr reports whether a power-on failure is the datastore not
+// having finished materializing the VM's disk. Deliberately narrow: it does
+// not match "Failed to lock the file", which means another host holds the
+// disk and is a genuinely different problem that retrying would only hide.
+func isDiskNotReadyErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "is not a virtual disk") ||
+		strings.Contains(msg, "Cannot open the disk") ||
+		strings.Contains(msg, "larger than real size")
+}
+
 
 // PowerOffVM powers off a VM.
 // Idempotent: returns nil if the VM was already deleted.
