@@ -317,6 +317,53 @@ func (c *Client) WaitForTools(ctx context.Context, moref string, timeout time.Du
 	}
 }
 
+// WaitForPowerOff polls a VM until it reports poweredOff, or the timeout
+// elapses.
+//
+// This is the completion signal for an ISO install, and it exists because the
+// obvious signal is wrong. The Ubuntu live-server installer ISO runs
+// open-vm-tools in the *ephemeral installer* environment, so WaitForTools
+// returns roughly 40 seconds after power-on — before the installer has written
+// a single byte to the disk. Using Tools to mean "the install finished"
+// produced a template whose disk was empty while every state transition
+// reported success, which is a far worse failure than a timeout.
+//
+// The generated autoinstall sets "shutdown: poweroff" precisely so that this
+// transition happens once, at a point that can only be reached after curtin has
+// finished writing the target system.
+func (c *Client) WaitForPowerOff(ctx context.Context, moref string, timeout time.Duration) error {
+	if err := c.ensureConnected(ctx); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(timeout)
+
+	for {
+		// Same reconnect-safety as WaitForTools: an install can run for the
+		// better part of an hour, which comfortably outlives a session token.
+		var props mo.VirtualMachine
+		if err := c.withRetry(ctx, "read runtime props", func() error {
+			vm := object.NewVirtualMachine(c.client.Client,
+				types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
+			return vm.Properties(ctx, vm.Reference(), []string{"runtime"}, &props)
+		}); err != nil {
+			return fmt.Errorf("read runtime props on %s: %w", moref, err)
+		}
+		if props.Runtime.PowerState == types.VirtualMachinePowerStatePoweredOff {
+			c.logger.Info("VM powered off", "moref", moref)
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out after %s waiting for %s to power off (current state: %q)",
+				timeout, moref, props.Runtime.PowerState)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Second):
+		}
+	}
+}
+
 func toolsStatusString(g *types.GuestInfo) string {
 	if g == nil {
 		return "unknown"
