@@ -175,19 +175,12 @@ func run(logger *slog.Logger) error {
 		checkTimeout = d
 	}
 
-	// Mint a session JWT good for one full check cycle. We mint a fresh one
-	// each cycle so a token leaked from a single run cannot be used long.
-	mintCookie := func() (string, error) {
-		// TTL is the per-cycle check timeout * checks + a safety margin.
-		return synthetic.MintSessionToken([]byte(jwtSecret), userID, username, role,
-			checkTimeout*time.Duration(len(checks.All())+1))
-	}
-
-	cookie, err := mintCookie()
-	if err != nil {
-		return fmt.Errorf("mint initial session token: %w", err)
-	}
-	client := synthetic.NewClient(baseURL, cookie)
+	// Session cookies are minted AFTER the active check set and the runner's
+	// per-check budget are known -- see sessionTokenTTL for why deriving the
+	// TTL from checks.All() was a real production defect. The clients are
+	// constructed here with an empty cookie and filled in by mintSessions
+	// below; nothing between here and that call issues a request.
+	client := synthetic.NewClient(baseURL, "")
 	pg := synthetic.NewPushgateway(pushgatewayURL, job, map[string]string{
 		"layer": layer,
 	})
@@ -197,16 +190,8 @@ func run(logger *slog.Logger) error {
 	instructorID := os.Getenv(envInstructorUserID)
 	instructorName := envOr(envInstructorUsername, "synthetic-instructor")
 	var instructorClient *synthetic.Client
-	mintInstructorCookie := func() (string, error) {
-		return synthetic.MintSessionToken([]byte(jwtSecret), instructorID, instructorName,
-			"instructor", checkTimeout*time.Duration(len(checks.All())+1))
-	}
 	if instructorID != "" {
-		instructorCookie, err := mintInstructorCookie()
-		if err != nil {
-			return fmt.Errorf("mint instructor session token: %w", err)
-		}
-		instructorClient = synthetic.NewClient(baseURL, instructorCookie)
+		instructorClient = synthetic.NewClient(baseURL, "")
 	}
 
 	// Build the active check list. See resolveMode for why this is not an
@@ -325,6 +310,37 @@ func run(logger *slog.Logger) error {
 	// Use the larger of (configured CheckTimeout) or (ready + destroy + 60s).
 	runner.CheckTimeout = lifecycleSafeTimeout(checkTimeout, activeChecks)
 
+	// Mint the session JWTs now that the real per-cycle budget is known. A
+	// fresh pair is minted each cycle so a token leaked from a single run
+	// cannot be used long.
+	sessionTTL := sessionTokenTTL(runner.CheckTimeout, checkTimeout, len(activeChecks))
+	mintSessions := func() error {
+		c, err := synthetic.MintSessionToken([]byte(jwtSecret), userID, username, role, sessionTTL)
+		if err != nil {
+			return fmt.Errorf("mint session token: %w", err)
+		}
+		client.SessionCookie = c
+		if instructorClient != nil {
+			ic, err := synthetic.MintSessionToken([]byte(jwtSecret), instructorID, instructorName,
+				"instructor", sessionTTL)
+			if err != nil {
+				return fmt.Errorf("mint instructor session token: %w", err)
+			}
+			// Elevated checks hold this pointer, so mutating in place
+			// refreshes them too.
+			instructorClient.SessionCookie = ic
+		}
+		return nil
+	}
+	if err := mintSessions(); err != nil {
+		return err
+	}
+	logger.Info("session tokens minted",
+		"ttl", sessionTTL,
+		"longest_check_budget", runner.CheckTimeout,
+		"active_checks", len(activeChecks),
+	)
+
 	// Phase 4: probe /auth/me once at startup so a stale synthetic UUID
 	// (i.e. the secret's user-id no longer matches a row in users) surfaces
 	// as a single clear warning instead of cascading 404s. Other checks
@@ -346,8 +362,6 @@ func run(logger *slog.Logger) error {
 	}
 
 	for {
-		// Refresh cookie each cycle in loop mode; for one-shot, we already have one.
-		client.SessionCookie = cookie
 		results := runner.RunOnce(ctx)
 		failed := 0
 		for _, r := range results {
@@ -367,20 +381,40 @@ func run(logger *slog.Logger) error {
 			return nil
 		case <-time.After(loopInterval):
 		}
-		cookie, err = mintCookie()
-		if err != nil {
-			return fmt.Errorf("re-mint session token: %w", err)
-		}
-		if instructorClient != nil {
-			ic, err := mintInstructorCookie()
-			if err != nil {
-				return fmt.Errorf("re-mint instructor session token: %w", err)
-			}
-			// Elevated checks hold this pointer, so mutating in place
-			// refreshes them too.
-			instructorClient.SessionCookie = ic
+		if err := mintSessions(); err != nil {
+			return err
 		}
 	}
+}
+
+// sessionTokenTTL returns how long the synthetic session JWT must stay valid to
+// cover one full check cycle.
+//
+// It MUST be derived from the timeouts the runner actually enforces, not from
+// the default check set. This used to be minted as
+//
+//	checkTimeout * (len(checks.All()) + 1)  ==  30s * 9  ==  4m30s
+//
+// while lifecycleSafeTimeout grants runner_smoke a 21-minute budget. Any
+// runner_smoke run exceeding 4m30s therefore died with "401 unauthorized"
+// instead of its real error.
+//
+// That is the worst possible failure mode for this particular check. A hung or
+// dead Kali runner is precisely what runner_smoke exists to detect, and a cold
+// ~3GB image pull on k3sv03 legitimately takes minutes -- so both the real
+// incident and the benign-but-slow case reported an auth error, sending the
+// on-call to Authentik and the JWT secret instead of to the runner.
+// pod_lifecycle has the same shape: an 11-minute budget against the same token.
+//
+// The envelope is "the single most expensive check runs its full budget, and
+// every other check takes the base timeout", plus a margin for HTTP overhead,
+// pre-clean and the Pushgateway write. It stays bounded by the work it
+// authorizes, so a leaked token still expires promptly.
+func sessionTokenTTL(longestCheck, base time.Duration, activeChecks int) time.Duration {
+	if activeChecks < 1 {
+		activeChecks = 1
+	}
+	return longestCheck + base*time.Duration(activeChecks) + 2*time.Minute
 }
 
 func mustEnv(key string) string {
