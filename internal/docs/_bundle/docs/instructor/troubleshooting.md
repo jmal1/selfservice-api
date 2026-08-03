@@ -353,6 +353,45 @@ Ubuntu's stock rule still demands a password.
 > from the same template and compare `cat /etc/machine-id` and
 > `ssh-keyscan <ip>` — the values must differ.
 
+### How Crucible knows generalize actually finished
+
+Generalize's last act is to power the guest off, which kills the VMware Tools
+agent *while the platform is still talking to it*. So the guest-ops call
+**always** returns an error — even when everything worked. The message vCenter
+returns is:
+
+```
+ServerFaultCode: The guest operations agent could not be contacted.
+```
+
+That exact message is also what you get when VMware Tools **never started at
+all**, so it cannot be used to tell success from failure.
+
+Instead, the Linux generalize script records its own completion. Its final
+command before `shutdown` stamps the job's ID into a `guestinfo` variable:
+
+```bash
+vmware-rpctool "info-set guestinfo.crucible.generalize.job <job-id>"
+```
+
+`guestinfo` lives in the VM's configuration rather than in the guest, so it
+survives the power-off and the platform reads it back afterwards. Because the
+value is the **job ID** and not a fixed word, a sentinel left over from an
+earlier generalize attempt on the same VM cannot be mistaken for this one.
+
+What that means for you:
+
+| Template state after Generalize | What it tells you |
+|---|---|
+| `ready` | The cleanup script ran to its final line. Trustworthy. |
+| `error`, *"generalize script did not run to completion"* | The guest went down **before** cleanup finished — usually the `sudo` problem above. Fix it and re-run Generalize; do not publish. |
+| `error`, *"completion could not be verified"* | vCenter was unreachable when the platform tried to confirm. The template may be fine; re-run Generalize to get a clean answer. |
+
+> [!note]
+> Windows is exempt from the sentinel. Sysprep is launched fire-and-forget and
+> powers the machine off on its own schedule, so there is no opportunity to
+> stamp anything. Windows generalize still relies on the shutdown signal.
+
 ---
 
 ## "apt is broken on my template or on every clone"

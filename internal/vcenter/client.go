@@ -888,6 +888,50 @@ type SnapshotInfo struct {
 }
 
 // ListVMSnapshots returns all snapshots for a VM.
+// GetGuestInfoVar reads a single guestinfo.* variable out of the VM's
+// extraConfig.
+//
+// This is deliberately read from config.extraConfig rather than through guest
+// operations, because extraConfig is part of the VM's configuration and stays
+// readable when the guest is POWERED OFF. That property is the whole point: it
+// lets a script inside the guest record "I finished" as its last act before
+// shutting the machine down, and lets us read that record afterwards. Guest
+// ops cannot do this, since the agent is gone the moment the guest goes down.
+//
+// A guest sets one of these with:
+//
+//	vmware-rpctool "info-set guestinfo.some.key some-value"
+//
+// Returns ("", nil) when the key is not present, since absence is a normal
+// answer here and not an error.
+func (c *Client) GetGuestInfoVar(ctx context.Context, moref, key string) (string, error) {
+	if err := c.ensureConnected(ctx); err != nil {
+		return "", err
+	}
+
+	var props mo.VirtualMachine
+	err := c.withRetry(ctx, "get guestinfo var", func() error {
+		vm := object.NewVirtualMachine(c.client.Client,
+			types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
+		return vm.Properties(ctx, vm.Reference(), []string{"config.extraConfig"}, &props)
+	})
+	if err != nil {
+		return "", fmt.Errorf("get guestinfo %q for %s: %w", key, moref, err)
+	}
+	if props.Config == nil {
+		return "", nil
+	}
+	for _, opt := range props.Config.ExtraConfig {
+		ov := opt.GetOptionValue()
+		if ov == nil || ov.Key != key {
+			continue
+		}
+		s, _ := ov.Value.(string)
+		return s, nil
+	}
+	return "", nil
+}
+
 func (c *Client) ListVMSnapshots(ctx context.Context, moref string) ([]SnapshotInfo, error) {
 	if err := c.ensureConnected(ctx); err != nil {
 		return nil, err

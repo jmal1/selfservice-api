@@ -660,7 +660,8 @@ func (p *Provisioner) GeneralizeTemplate(ctx context.Context, job *models.Job) e
 
 	// Step 2: run generalize script
 	p.publishProgress(job.ID, "run_generalize", fmt.Sprintf("Running %s generalization script", osType))
-	script := generalizeScript(osType)
+	runID := job.ID.String()
+	script := generalizeScript(osType, runID)
 	language := "bash"
 	if osType == "windows" {
 		language = "powershell"
@@ -672,22 +673,59 @@ func (p *Provisioner) GeneralizeTemplate(ctx context.Context, job *models.Job) e
 		Language:      language,
 		Script:        script,
 		Timeout:       3 * time.Minute,
-		RunID:         job.ID.String(),
+		RunID:         runID,
 		ActionSlug:    "template-generalize",
 	})
-	// RunScriptInGuest may return an error because the VM shut itself
-	// down mid-script — that's the EXPECTED outcome for generalize. Only
-	// swallow that flavor of error; everything else (auth failure, missing
-	// temp dir, tools crash, script syntax error) is a real failure and
-	// must surface immediately so the admin doesn't wait 10 minutes for
-	// waitForPowerOff to time out on a VM that was never going to shut
-	// down (see bug-generalize-error-swallow / bug-windows-guest-ops-temp-
-	// path discovered 2026-06-09 during the student-windows-11-v2 build).
+	// RunScriptInGuest routinely returns an error here even when the script
+	// did exactly what it was supposed to, because the script's last act is to
+	// power the guest off and that kills the guest agent mid-call.
+	//
+	// We used to decide which case we were in by pattern-matching the error
+	// string. That cannot work. vCenter reports "The guest operations agent
+	// could not be contacted." BOTH when the guest shut itself down as
+	// intended AND when VMware Tools never came up at all, so the message
+	// carries no information that separates success from failure. It cost a
+	// full rebuild cycle to learn that: a generalize run that completed
+	// correctly was marked 'error' because its message was not in the hint
+	// list, and adding the string would have made the opposite failure
+	// (tools never started) silently succeed.
+	//
+	// Ask the guest instead. The script stamps generalizeSentinelKey with this
+	// job's ID as its final step, and guestinfo survives the power-off, so a
+	// matching sentinel is proof that the cleanup actually ran.
 	if err != nil {
-		if isExpectedShutdownErr(err) {
-			p.logger.Info("generalize script connection lost mid-call (expected shutdown race)",
+		switch confirmed, sErr := generalizeConfirmed(ctx, p.vc, payload.VMMoref, runID,
+			generalizeSentinelAttempts, generalizeSentinelInterval); {
+		case sErr != nil:
+			// We could not reach vCenter to check. Fall back to the old
+			// heuristic rather than failing a probably-good template, but say
+			// clearly in the log that this outcome is unproven.
+			if isExpectedShutdownErr(err) {
+				p.logger.Warn("generalize completion UNVERIFIED: could not read sentinel, falling back to error-string heuristic",
+					"template_id", payload.TemplateID, "script_err", err, "sentinel_err", sErr)
+			} else {
+				return p.markTemplateError(ctx, payload.TemplateID,
+					fmt.Errorf("generalize script failed and completion could not be verified: %w (sentinel read failed: %v)", err, sErr))
+			}
+		case confirmed:
+			p.logger.Info("generalize script completed (sentinel confirmed) then powered the guest off",
 				"template_id", payload.TemplateID, "error", err)
-		} else {
+		case isExpectedShutdownErr(err):
+			// Looks like a shutdown race but the guest never stamped the
+			// sentinel. On Windows that is expected: sysprep is launched
+			// fire-and-forget and powers the machine off itself, so there is
+			// no opportunity to stamp. On Linux it means the script did not
+			// reach its final line.
+			if osType == "windows" {
+				p.logger.Info("generalize script connection lost mid-call (expected sysprep shutdown race)",
+					"template_id", payload.TemplateID, "error", err)
+			} else {
+				return p.markTemplateError(ctx, payload.TemplateID,
+					fmt.Errorf("generalize script did not run to completion: %w "+
+						"(no completion sentinel; the guest went down before cleanup finished, "+
+						"so machine-id and SSH host keys may still be baked into the template)", err))
+			}
+		default:
 			return p.markTemplateError(ctx, payload.TemplateID,
 				fmt.Errorf("generalize script failed before VM shutdown: %w", err))
 		}
@@ -1028,7 +1066,24 @@ func (p *Provisioner) waitForPowerOff(ctx context.Context, moref string, timeout
 //
 // These scripts assume the guest user has passwordless sudo (Linux) or
 // is an Administrator (Windows). The wizard UI documents this requirement.
-func generalizeScript(osType string) string {
+// generalizeSentinelKey is the guestinfo variable the Linux generalize script
+// stamps with the job ID as its final act before shutting the guest down.
+//
+// It exists because "the VM powered off" is NOT proof that generalize
+// succeeded. A VM is also powered off when the script died halfway, when
+// someone hit power-off in vCenter, or when the host evacuated it. Those cases
+// leave a template that looks generalized and is not: /etc/machine-id still
+// populated and the original SSH host keys still on disk, which every clone
+// then shares. That failure is invisible on one clone and only shows up when a
+// second student's pod collides with the first.
+//
+// The value is the job ID rather than a constant so a sentinel left behind by
+// an EARLIER generalize attempt cannot be mistaken for this one's.
+const generalizeSentinelKey = "guestinfo.crucible.generalize.job"
+
+// generalizeScript returns the OS-specific generalization script. runID is
+// stamped into the Linux sentinel; see generalizeSentinelKey.
+func generalizeScript(osType, runID string) string {
 	if osType == "windows" {
 		// PowerShell. Start-Process so PowerShell doesn't wait for
 		// sysprep (sysprep will kill the parent session as part of
@@ -1066,6 +1121,11 @@ func generalizeScript(osType string) string {
 		}, "\n")
 	}
 	// Linux. Keep as POSIX-safe so it works under dash if /bin/sh is dash.
+	//
+	// The rpctool line must be the LAST thing before shutdown, and it must not
+	// be swallowed by `|| true`: if we cannot record completion then we do not
+	// get to claim completion. `set -e` already aborts before this point on any
+	// failed cleanup step, so reaching the stamp means the cleanup ran.
 	return strings.Join([]string{
 		"set -e",
 		"sudo cloud-init clean --logs --seed || true",
@@ -1075,20 +1135,80 @@ func generalizeScript(osType string) string {
 		"sudo apt-get clean 2>/dev/null || sudo dnf clean all 2>/dev/null || true",
 		"history -c 2>/dev/null || true",
 		"rm -f ~/.bash_history",
+		fmt.Sprintf("sudo vmware-rpctool %q", "info-set "+generalizeSentinelKey+" "+runID),
 		"sudo shutdown -h now",
 	}, "\n")
 }
 
+// generalizeSentinelReader is the one-method vCenter subset the completion
+// check needs. Narrow on purpose: the real *vcenter.Client satisfies it, so
+// production stays a plain method call while tests can drive every branch
+// (found, absent, stale, unreadable) without a govmomi simulator.
+type generalizeSentinelReader interface {
+	GetGuestInfoVar(ctx context.Context, moref, key string) (string, error)
+}
+
+var _ generalizeSentinelReader = (*vcenter.Client)(nil)
+
+const (
+	generalizeSentinelAttempts = 6
+	generalizeSentinelInterval = 5 * time.Second
+)
+
+// generalizeConfirmed reports whether the guest stamped this run's completion
+// sentinel.
+//
+// The guest may still be powering off when we ask, and the stamp is written
+// just before `shutdown -h now`, so a single immediate read can lose a race it
+// would win a second later. Poll briefly rather than treating the first empty
+// read as a verdict.
+//
+// A sentinel carrying a DIFFERENT run ID is treated as absent, not as success:
+// that is a leftover from an earlier generalize attempt on the same VM, which
+// is exactly the case a constant-valued sentinel would get wrong.
+func generalizeConfirmed(ctx context.Context, vc generalizeSentinelReader, moref, runID string, attempts int, interval time.Duration) (bool, error) {
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		got, err := vc.GetGuestInfoVar(ctx, moref, generalizeSentinelKey)
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = nil
+			if strings.TrimSpace(got) == runID {
+				return true, nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-time.After(interval):
+		}
+	}
+	return false, lastErr
+}
+
 // isExpectedShutdownErr reports whether `err` looks like a benign
 // "the guest powered off mid-call" failure rather than a real fault.
-// VMware Tools reports a connection reset / "process disappeared"
-// flavor of error in this case.
+//
+// This is a HINT ONLY and must never be the sole basis for declaring
+// generalize successful. Every string below is also produced by genuine
+// failures - most importantly "the guest operations agent could not be
+// contacted", which vCenter returns both for a guest that shut itself down on
+// purpose and for a guest whose VMware Tools never started. Use
+// generalizeConfirmed for the actual verdict; this only decides how much
+// benefit of the doubt to give when the sentinel cannot be read at all.
 func isExpectedShutdownErr(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
-	hints := []string{"connection reset", "guest powered off", "tools not running", "operation was canceled"}
+	hints := []string{
+		"connection reset",
+		"guest powered off",
+		"tools not running",
+		"operation was canceled",
+		"guest operations agent could not be contacted",
+	}
 	for _, h := range hints {
 		if strings.Contains(msg, h) {
 			return true

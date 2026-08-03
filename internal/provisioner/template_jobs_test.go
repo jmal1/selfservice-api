@@ -23,7 +23,7 @@ import (
 // student VM cloned from this template would either fail to boot
 // (missing entropy) or, worse, share a machine-id with another student.
 func TestGeneralizeScript_LinuxContainsCriticalSteps(t *testing.T) {
-	got := generalizeScript("linux")
+	got := generalizeScript("linux", "job-1")
 	required := []string{
 		"cloud-init clean",
 		"truncate -s 0 /etc/machine-id",
@@ -44,7 +44,7 @@ func TestGeneralizeScript_LinuxContainsCriticalSteps(t *testing.T) {
 // clone gets the same SID, breaking AD) or won't shut down (worker
 // times out waiting for power-off).
 func TestGeneralizeScript_WindowsRunsSysprep(t *testing.T) {
-	got := generalizeScript("windows")
+	got := generalizeScript("windows", "job-1")
 	for _, r := range []string{"sysprep.exe", "/generalize", "/oobe", "/shutdown", `/unattend:C:\Windows\Panther\unattend.xml`} {
 		if !strings.Contains(got, r) {
 			t.Errorf("Windows generalize script missing %q\nscript:\n%s", r, got)
@@ -84,7 +84,7 @@ func TestPowerOffTimeout(t *testing.T) {
 }
 
 func TestGeneralizeScript_UnknownOSDefaultsToLinux(t *testing.T) {
-	got := generalizeScript("plan9")
+	got := generalizeScript("plan9", "job-1")
 	if !strings.Contains(got, "shutdown -h now") {
 		t.Errorf("unknown OS should fall back to Linux script, got:\n%s", got)
 	}
@@ -670,5 +670,186 @@ func TestProvisionTemplate_ISO_RemasterUnsupportedFailsLoudly(t *testing.T) {
 	}
 	if got := db.finalState(); got != models.TemplateStateError {
 		t.Errorf("final template state = %q, want %q", got, models.TemplateStateError)
+	}
+}
+// --- generalize completion sentinel -----------------------------------------
+//
+// Background: generalize's last act is to power the guest off, which kills the
+// guest agent mid-call, so RunScriptInGuest returns an error even on total
+// success. The original code decided success by pattern-matching that error
+// string. That is unsound -- vCenter emits "the guest operations agent could
+// not be contacted" BOTH for a guest that shut itself down on purpose and for
+// a guest whose VMware Tools never started -- and it cost a full rebuild cycle
+// when a correct generalize run was marked 'error'. These tests lock in the
+// replacement: a run-scoped guestinfo sentinel that survives the power-off.
+
+type fakeSentinelVC struct {
+	vals  []string
+	errs  []error
+	calls int
+	key   string
+}
+
+func (f *fakeSentinelVC) GetGuestInfoVar(_ context.Context, _, key string) (string, error) {
+	f.key = key
+	i := f.calls
+	f.calls++
+	if i < len(f.errs) && f.errs[i] != nil {
+		return "", f.errs[i]
+	}
+	if i < len(f.vals) {
+		return f.vals[i], nil
+	}
+	return "", nil
+}
+
+// TestGeneralizeScript_LinuxStampsSentinelBeforeShutdown is the guard for the
+// whole mechanism: if the stamp is missing, or lands after shutdown (where it
+// can never execute), or is swallowed by `|| true` (so a failed stamp still
+// looks fine), then every Linux generalize run reports a false failure.
+func TestGeneralizeScript_LinuxStampsSentinelBeforeShutdown(t *testing.T) {
+	const runID = "9f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f"
+	got := generalizeScript("linux", runID)
+
+	stamp := strings.Index(got, "vmware-rpctool")
+	if stamp < 0 {
+		t.Fatalf("linux generalize script never stamps the completion sentinel.\n"+
+			"Without it the worker cannot distinguish a guest that finished cleanup and\n"+
+			"powered off from one that died halfway, and every successful generalize is\n"+
+			"reported as an error.\ngot:\n%s", got)
+	}
+	if !strings.Contains(got, generalizeSentinelKey) {
+		t.Errorf("stamp does not reference %s, so the worker will read a key nobody writes", generalizeSentinelKey)
+	}
+	if !strings.Contains(got, runID) {
+		t.Errorf("stamp does not carry the run ID, so a sentinel left by an EARLIER generalize attempt would be accepted as this run's proof")
+	}
+
+	shutdown := strings.Index(got, "shutdown -h now")
+	if shutdown < 0 {
+		t.Fatal("linux generalize script no longer powers the guest off")
+	}
+	if stamp > shutdown {
+		t.Errorf("sentinel is stamped AFTER shutdown (stamp=%d shutdown=%d); it can never run, so completion is never provable", stamp, shutdown)
+	}
+
+	for _, line := range strings.Split(got, "\n") {
+		if strings.Contains(line, "vmware-rpctool") && strings.Contains(line, "|| true") {
+			t.Errorf("stamp is swallowed by `|| true`: %q\n"+
+				"A stamp that cannot fail is not evidence -- if we cannot record completion we must not claim it.", line)
+		}
+	}
+}
+
+// TestGeneralizeScript_SentinelStampRunsAsRoot guards a foot-gun in the fix
+// itself. Setting a guestinfo variable goes through the VMware backdoor and
+// open-vm-tools restricts that to root; as the unprivileged build user the
+// command fails with permission denied. Because the script runs under `set -e`
+// and the stamp is deliberately NOT swallowed, an unprivileged stamp would
+// abort the script BEFORE `shutdown` -- leaving the VM powered on and turning
+// every Linux generalize into a hard failure. Every other privileged line in
+// this script already uses sudo.
+func TestGeneralizeScript_SentinelStampRunsAsRoot(t *testing.T) {
+	got := generalizeScript("linux", "run-1")
+	for _, line := range strings.Split(got, "\n") {
+		if !strings.Contains(line, "vmware-rpctool") {
+			continue
+		}
+		if !strings.HasPrefix(strings.TrimSpace(line), "sudo ") {
+			t.Fatalf("sentinel stamp does not run as root: %q\n"+
+				"info-set is root-only, so this aborts under `set -e` before the guest ever shuts down.", line)
+		}
+		return
+	}
+	t.Fatal("no vmware-rpctool line found to check")
+}
+
+// TestGeneralizeScript_SentinelIsRunScoped guards the specific trap a constant
+// sentinel would fall into: retrying generalize on a VM that already carries a
+// sentinel from a previous attempt would confirm instantly, even if this run
+// died on its first line.
+func TestGeneralizeScript_SentinelIsRunScoped(t *testing.T) {
+	a := generalizeScript("linux", "run-aaa")
+	b := generalizeScript("linux", "run-bbb")
+	if a == b {
+		t.Fatal("generalize script is identical for two different runs; a stale sentinel from an earlier attempt would be mistaken for this run's completion")
+	}
+	if strings.Contains(b, "run-aaa") {
+		t.Error("script leaks a foreign run ID")
+	}
+}
+
+func TestGeneralizeConfirmed_MatchingSentinelConfirms(t *testing.T) {
+	vc := &fakeSentinelVC{vals: []string{"run-1"}}
+	ok, err := generalizeConfirmed(context.Background(), vc, "vm-1", "run-1", 3, time.Millisecond)
+	if err != nil || !ok {
+		t.Fatalf("matching sentinel must confirm: ok=%v err=%v", ok, err)
+	}
+	if vc.key != generalizeSentinelKey {
+		t.Errorf("read key %q, want %q", vc.key, generalizeSentinelKey)
+	}
+	if vc.calls != 1 {
+		t.Errorf("confirmed on read %d, want to stop at the first match", vc.calls)
+	}
+}
+
+// TestGeneralizeConfirmed_StaleSentinelIsNotConfirmation is the reason the
+// sentinel carries a run ID at all.
+func TestGeneralizeConfirmed_StaleSentinelIsNotConfirmation(t *testing.T) {
+	vc := &fakeSentinelVC{vals: []string{"an-older-run", "an-older-run", "an-older-run"}}
+	ok, err := generalizeConfirmed(context.Background(), vc, "vm-1", "this-run", 3, time.Millisecond)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ok {
+		t.Fatal("a sentinel from a PREVIOUS generalize attempt was accepted as this run's completion; " +
+			"a retry would publish a template whose machine-id and SSH host keys were never cleaned")
+	}
+}
+
+// TestGeneralizeConfirmed_PollsPastTheShutdownRace: the stamp is written
+// immediately before power-off, so the first read can legitimately miss it.
+func TestGeneralizeConfirmed_PollsPastTheShutdownRace(t *testing.T) {
+	vc := &fakeSentinelVC{vals: []string{"", "", "run-1"}}
+	ok, err := generalizeConfirmed(context.Background(), vc, "vm-1", "run-1", 5, time.Millisecond)
+	if err != nil || !ok {
+		t.Fatalf("must keep polling past an empty first read: ok=%v err=%v calls=%d", ok, err, vc.calls)
+	}
+}
+
+func TestGeneralizeConfirmed_AbsentSentinelIsNotConfirmation(t *testing.T) {
+	vc := &fakeSentinelVC{}
+	ok, err := generalizeConfirmed(context.Background(), vc, "vm-1", "run-1", 3, time.Millisecond)
+	if err != nil {
+		t.Fatalf("absence is a normal answer, not an error: %v", err)
+	}
+	if ok {
+		t.Fatal("no sentinel must not confirm completion")
+	}
+}
+
+// TestGeneralizeConfirmed_ReadFailureIsReportedNotSwallowed keeps "vCenter is
+// unreachable" distinguishable from "the guest did not finish". The call site
+// picks a different, deliberately weaker branch for the former.
+func TestGeneralizeConfirmed_ReadFailureIsReportedNotSwallowed(t *testing.T) {
+	boom := errors.New("vcenter unreachable")
+	vc := &fakeSentinelVC{errs: []error{boom, boom}}
+	ok, err := generalizeConfirmed(context.Background(), vc, "vm-1", "run-1", 2, time.Millisecond)
+	if ok {
+		t.Fatal("must not confirm when the sentinel could not be read")
+	}
+	if err == nil {
+		t.Fatal("a read failure must be reported so the caller can tell 'unknown' from 'did not finish'")
+	}
+}
+
+// TestIsExpectedShutdownErr_CoversTheGuestAgentMessage documents the message
+// that started all this. It is in the hint list, but ONLY as a hint -- the
+// sentinel is what actually decides, because this exact string is also what a
+// guest whose Tools never started produces.
+func TestIsExpectedShutdownErr_CoversTheGuestAgentMessage(t *testing.T) {
+	err := errors.New("ServerFaultCode: The guest operations agent could not be contacted.")
+	if !isExpectedShutdownErr(err) {
+		t.Error("the real-world generalize shutdown message must be recognised as a shutdown hint")
 	}
 }
