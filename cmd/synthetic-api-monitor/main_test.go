@@ -136,3 +136,154 @@ func TestResolvePushLayer_RunnerModeCannotClobberTheApiGrouping(t *testing.T) {
 		}
 	})
 }
+
+// TestResolveRunnerConfig_MissingEnvWarnsButNeverFails is the T1-5 regression
+// guard, and it is the most important test in this file.
+//
+// The tempting implementation returns an error when SYNTHETIC_RUNNER_TEMPLATE
+// or SYNTHETIC_RUNNER_PLAYLIST_ID is missing — "fail fast on bad config" is
+// normally right. Here it is exactly wrong, and the reason is not obvious
+// from reading the function.
+//
+// An unregistered check does not go stale; its Prometheus series ceases to
+// exist. PushResults POSTs the whole crucible_synthetic_check_success family
+// each cycle and Pushgateway replaces a family wholesale on POST. Every alert
+// we have is shaped `1 - crucible_synthetic_check_success > 0`, which cannot
+// match an ABSENT series.
+//
+// So an early return would leave the entire Epic D path — engine dispatch,
+// Multus, macvlan DHCP, the Kali image pull, the runner callback — INVISIBLE
+// to alerting rather than red. And because Pushgateway retains the last
+// pushed value indefinitely, a CronJob that begins failing this way leaves a
+// stale-but-GREEN series behind it. Silent loss of coverage is strictly worse
+// than an outage, because nothing ever tells you.
+//
+// This has already bitten twice (the elevated checks in T1-5, and the
+// SYNTHETIC_LIFECYCLE_ENABLED gate). Hence a test rather than a comment.
+func TestResolveRunnerConfig_MissingEnvWarnsButNeverFails(t *testing.T) {
+	tests := []struct {
+		name         string
+		env          map[string]string
+		wantWarnEnvs []string
+	}{
+		{
+			"nothing configured at all",
+			map[string]string{},
+			[]string{"SYNTHETIC_RUNNER_TEMPLATE", "SYNTHETIC_RUNNER_PLAYLIST_ID"},
+		},
+		{
+			"template set, playlist missing",
+			map[string]string{"SYNTHETIC_RUNNER_TEMPLATE": "synthetic-noop"},
+			[]string{"SYNTHETIC_RUNNER_PLAYLIST_ID"},
+		},
+		{
+			"playlist set, template missing",
+			map[string]string{"SYNTHETIC_RUNNER_PLAYLIST_ID": "0000-uuid"},
+			[]string{"SYNTHETIC_RUNNER_TEMPLATE"},
+		},
+		{
+			"fully configured warns about nothing",
+			map[string]string{
+				"SYNTHETIC_RUNNER_TEMPLATE":    "synthetic-noop",
+				"SYNTHETIC_RUNNER_PLAYLIST_ID": "0000-uuid",
+			},
+			nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, warnings, err := resolveRunnerConfig(func(k string) string { return tt.env[k] })
+
+			if err != nil {
+				t.Fatalf("resolveRunnerConfig returned error %v.\n"+
+					"Missing config MUST NOT stop runner_smoke being registered: an "+
+					"absent series cannot match `1 - crucible_synthetic_check_success > 0`, "+
+					"so the Epic D path would be invisible rather than red.", err)
+			}
+
+			var gotEnvs []string
+			for _, w := range warnings {
+				gotEnvs = append(gotEnvs, w.env)
+				if w.msg == "" {
+					t.Errorf("warning for %s has an empty message", w.env)
+				}
+			}
+			if strings.Join(gotEnvs, ",") != strings.Join(tt.wantWarnEnvs, ",") {
+				t.Errorf("warned about %v, want %v", gotEnvs, tt.wantWarnEnvs)
+			}
+
+			// The config must still be usable enough to construct a check,
+			// so registration can proceed and the RunFn can report the failure.
+			if cfg.ReadyTimeout <= 0 || cfg.RunTimeout <= 0 || cfg.DestroyTimeout <= 0 {
+				t.Errorf("timeouts must keep their defaults so the check can run and fail "+
+					"cleanly: ready=%v run=%v destroy=%v",
+					cfg.ReadyTimeout, cfg.RunTimeout, cfg.DestroyTimeout)
+			}
+		})
+	}
+}
+
+// TestResolveRunnerConfig_RejectsUnparseableDurations is the deliberate
+// counterpart: a typo'd duration IS a hard error.
+//
+// The distinction is not arbitrary. A missing template/playlist can be
+// reported through a check result, so it becomes a red series. A malformed
+// duration cannot — it would silently fall back to a default, and the
+// operator who set SYNTHETIC_RUNNER_RUN_TIMEOUT=10 (no unit) would never
+// learn their value was ignored.
+func TestResolveRunnerConfig_RejectsUnparseableDurations(t *testing.T) {
+	for _, key := range []string{
+		"SYNTHETIC_RUNNER_READY_TIMEOUT",
+		"SYNTHETIC_RUNNER_RUN_TIMEOUT",
+		"SYNTHETIC_RUNNER_DESTROY_TIMEOUT",
+	} {
+		t.Run(key, func(t *testing.T) {
+			env := map[string]string{
+				"SYNTHETIC_RUNNER_TEMPLATE":    "synthetic-noop",
+				"SYNTHETIC_RUNNER_PLAYLIST_ID": "0000-uuid",
+				key:                            "10", // missing unit
+			}
+			_, _, err := resolveRunnerConfig(func(k string) string { return env[k] })
+			if err == nil {
+				t.Fatalf("%s=%q must be rejected; silently falling back to the default "+
+					"means the operator's value is ignored with no signal", key, "10")
+			}
+			if !strings.Contains(err.Error(), key) {
+				t.Errorf("error %q must name the offending env var", err)
+			}
+		})
+	}
+}
+
+// TestResolveRunnerConfig_AppliesValidOverrides guards that the override path
+// is actually wired, not just validated. A parse that succeeds but is never
+// assigned is the dead-wiring pattern that has bitten this repo seven times.
+func TestResolveRunnerConfig_AppliesValidOverrides(t *testing.T) {
+	env := map[string]string{
+		"SYNTHETIC_RUNNER_TEMPLATE":        "synthetic-noop",
+		"SYNTHETIC_RUNNER_PLAYLIST_ID":     "0000-uuid",
+		"SYNTHETIC_RUNNER_READY_TIMEOUT":   "3m",
+		"SYNTHETIC_RUNNER_RUN_TIMEOUT":     "7m",
+		"SYNTHETIC_RUNNER_DESTROY_TIMEOUT": "45s",
+	}
+	cfg, warnings, err := resolveRunnerConfig(func(k string) string { return env[k] })
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("fully configured input warned: %v", warnings)
+	}
+	if cfg.ReadyTimeout != 3*time.Minute {
+		t.Errorf("ReadyTimeout = %v, want 3m — override parsed but never assigned", cfg.ReadyTimeout)
+	}
+	if cfg.RunTimeout != 7*time.Minute {
+		t.Errorf("RunTimeout = %v, want 7m — override parsed but never assigned", cfg.RunTimeout)
+	}
+	if cfg.DestroyTimeout != 45*time.Second {
+		t.Errorf("DestroyTimeout = %v, want 45s — override parsed but never assigned", cfg.DestroyTimeout)
+	}
+	if cfg.TemplateName != "synthetic-noop" || cfg.PlaylistID != "0000-uuid" {
+		t.Errorf("template/playlist not carried into config: %+v", cfg)
+	}
+}

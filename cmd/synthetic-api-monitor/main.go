@@ -246,53 +246,20 @@ func run(logger *slog.Logger) error {
 		)
 		activeChecks = append(activeChecks, checks.PodLifecycle(cfg))
 	} else if envBool(envRunnerMode) {
-		tmpl := os.Getenv(envRunnerTemplate)
-		if tmpl == "" {
-			// Warn loudly but DO NOT prevent registration. An unregistered
-			// check does not go stale — its Prometheus series ceases to exist.
-			// Every alert is of the form "1 - crucible_synthetic_check_success > 0",
-			// which cannot match an absent series. An absent runner_smoke means
-			// the entire Epic D path is INVISIBLE to alerting, not red.
-			// The RunFn itself will return an error on every tick until the env
-			// var is set, keeping the series present and the alert firing.
-			logger.Warn("SYNTHETIC_RUNNER_TEMPLATE is empty: runner_smoke will report failure every tick",
-				"env", envRunnerTemplate,
-				"consequence", "engine dispatch through Multus macvlan DHCP to Kali image pull is unmonitored until this is set",
+		cfg, warnings, err := resolveRunnerConfig(os.Getenv)
+		if err != nil {
+			return err
+		}
+		for _, w := range warnings {
+			logger.Warn(w.msg,
+				"env", w.env,
+				"consequence", runnerUnmonitoredConsequence,
 			)
 		}
-		playlistID := os.Getenv(envRunnerPlaylistID)
-		if playlistID == "" {
-			logger.Warn("SYNTHETIC_RUNNER_PLAYLIST_ID is empty: runner_smoke will report failure every tick",
-				"env", envRunnerPlaylistID,
-				"consequence", "engine dispatch through Multus macvlan DHCP to Kali image pull is unmonitored until this is set",
-			)
-		}
-		cfg := checks.DefaultRunnerSmokeConfig(tmpl, playlistID)
 		cfg.Logger = logger.With("component", "runner_smoke")
-		if v := os.Getenv(envRunnerReadyTimeout); v != "" {
-			d, err := time.ParseDuration(v)
-			if err != nil {
-				return fmt.Errorf("invalid %s=%q: %w", envRunnerReadyTimeout, v, err)
-			}
-			cfg.ReadyTimeout = d
-		}
-		if v := os.Getenv(envRunnerRunTimeout); v != "" {
-			d, err := time.ParseDuration(v)
-			if err != nil {
-				return fmt.Errorf("invalid %s=%q: %w", envRunnerRunTimeout, v, err)
-			}
-			cfg.RunTimeout = d
-		}
-		if v := os.Getenv(envRunnerDestroyTimeout); v != "" {
-			d, err := time.ParseDuration(v)
-			if err != nil {
-				return fmt.Errorf("invalid %s=%q: %w", envRunnerDestroyTimeout, v, err)
-			}
-			cfg.DestroyTimeout = d
-		}
 		logger.Info("runner mode: registering runner_smoke only",
-			"template", tmpl,
-			"playlist_id", playlistID,
+			"template", cfg.TemplateName,
+			"playlist_id", cfg.PlaylistID,
 			"ready_timeout", cfg.ReadyTimeout,
 			"run_timeout", cfg.RunTimeout,
 			"destroy_timeout", cfg.DestroyTimeout,
@@ -422,6 +389,85 @@ func envBool(key string) bool {
 		return true
 	}
 	return false
+}
+
+// runnerUnmonitoredConsequence spells out, in the log line itself, what is
+// left unmonitored when runner_smoke is misconfigured. Whoever reads this at
+// 2am should not have to open the source to find out what they lost.
+const runnerUnmonitoredConsequence = "engine dispatch through Multus macvlan DHCP to Kali image pull is unmonitored until this is set"
+
+// configWarning is a non-fatal configuration problem: the check still gets
+// registered, it just cannot pass.
+type configWarning struct {
+	env string
+	msg string
+}
+
+// resolveRunnerConfig builds the runner_smoke config from the environment.
+//
+// It returns WARNINGS, not errors, for missing template/playlist. That
+// distinction is the whole point of this function and it is load-bearing:
+//
+// An unregistered check does not go stale — its Prometheus series ceases to
+// exist. PushResults POSTs the whole crucible_synthetic_check_success family
+// each cycle and Pushgateway replaces a family wholesale on POST. Every alert
+// we have is shaped `1 - crucible_synthetic_check_success > 0`, which cannot
+// match an ABSENT series.
+//
+// So if this returned an error and the binary exited, a misconfigured deploy
+// would leave the entire Epic D path (engine dispatch → Multus → macvlan DHCP
+// → Kali image pull → callback) INVISIBLE to alerting rather than red. Worse,
+// Pushgateway retains the last pushed value indefinitely, so a CronJob that
+// starts failing this way leaves a stale-but-GREEN series behind it.
+//
+// Instead the check is always registered and its RunFn fails on every tick
+// with a message naming the missing env var — red, obvious, and self-describing.
+//
+// Genuinely unparseable durations DO return an error: those are typos in
+// otherwise-present config, they cannot be reported through a check result,
+// and failing fast is the only way to surface them.
+//
+// getenv is injected so this is testable without mutating process state.
+func resolveRunnerConfig(getenv func(string) string) (checks.RunnerSmokeConfig, []configWarning, error) {
+	var warnings []configWarning
+
+	tmpl := getenv(envRunnerTemplate)
+	if tmpl == "" {
+		warnings = append(warnings, configWarning{
+			env: envRunnerTemplate,
+			msg: "SYNTHETIC_RUNNER_TEMPLATE is empty: runner_smoke will report failure every tick",
+		})
+	}
+	playlistID := getenv(envRunnerPlaylistID)
+	if playlistID == "" {
+		warnings = append(warnings, configWarning{
+			env: envRunnerPlaylistID,
+			msg: "SYNTHETIC_RUNNER_PLAYLIST_ID is empty: runner_smoke will report failure every tick",
+		})
+	}
+
+	cfg := checks.DefaultRunnerSmokeConfig(tmpl, playlistID)
+
+	for _, o := range []struct {
+		env    string
+		target *time.Duration
+	}{
+		{envRunnerReadyTimeout, &cfg.ReadyTimeout},
+		{envRunnerRunTimeout, &cfg.RunTimeout},
+		{envRunnerDestroyTimeout, &cfg.DestroyTimeout},
+	} {
+		v := getenv(o.env)
+		if v == "" {
+			continue
+		}
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, warnings, fmt.Errorf("invalid %s=%q: %w", o.env, v, err)
+		}
+		*o.target = d
+	}
+
+	return cfg, warnings, nil
 }
 
 // mainLayer is the Pushgateway grouping used by the primary */10 monitor,
