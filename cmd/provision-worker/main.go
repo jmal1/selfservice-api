@@ -300,7 +300,19 @@ func main() {
 			logger.Warn("invalid WORKER_IDLE_EVALUATOR_INTERVAL; using default 15m", "value", v, "error", err)
 		}
 	}
-	idleEvalDryRun := provisioner.ParseDryRunEnv(os.Getenv("WORKER_IDLE_EVALUATOR_DRY_RUN"))
+	dryRunResult := provisioner.ParseDryRunEnv(os.Getenv("WORKER_IDLE_EVALUATOR_DRY_RUN"))
+	switch dryRunResult.Outcome {
+	case provisioner.DryRunOffExplicit:
+		logger.Info("idle evaluator: dry-run OFF — VM suspension is LIVE")
+	case provisioner.DryRunOnDefault:
+		logger.Info("idle evaluator: dry-run ON (default — WORKER_IDLE_EVALUATOR_DRY_RUN not set)")
+	case provisioner.DryRunOnUnrecognised:
+		logger.Warn("idle evaluator: WORKER_IDLE_EVALUATOR_DRY_RUN value is not recognised — "+
+			"dry-run remains ON and no VM will be suspended; "+
+			"the only accepted value to disable dry-run is \"false\"",
+			"value", dryRunResult.Raw,
+			"accepted_to_disable", "false")
+	}
 	var idleEvalPusher *provisioner.SuspendMetrics
 	if pgURL := os.Getenv("WORKER_PUSHGATEWAY_URL"); pgURL != "" {
 		job := os.Getenv("WORKER_PUSHGATEWAY_JOB")
@@ -310,7 +322,7 @@ func main() {
 		idleEvalPusher = provisioner.NewSuspendMetrics(pgURL, job, map[string]string{"layer": "api"})
 	}
 	idleEvalCfg := provisioner.IdleEvaluatorConfig{
-		DryRun: idleEvalDryRun,
+		DryRun: dryRunResult.DryRun,
 		Pusher: idleEvalPusher,
 	}
 
@@ -397,7 +409,7 @@ func main() {
 		idleEvalTickerC = t.C
 		logger.Info("idle vm evaluator enabled",
 			"interval", idleEvalInterval,
-			"dry_run", idleEvalDryRun)
+			"dry_run", dryRunResult.DryRun)
 		if idleEvalPusher != nil {
 			go idleEvalPusher.RunSuspendMetricsPusher(ctx, 30*time.Second, logger)
 		}

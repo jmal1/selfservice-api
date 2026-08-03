@@ -48,18 +48,46 @@ import (
 	"github.com/jmal1/selfservice-api/internal/vcenter"
 )
 
-// ParseDryRunEnv converts an environment-variable string to a dry-run bool.
+// DryRunParseOutcome classifies which of the three startup-log branches applies.
+type DryRunParseOutcome int
+
+const (
+	// DryRunOnDefault: env var is unset or empty — dry-run ON by default.
+	DryRunOnDefault DryRunParseOutcome = iota
+	// DryRunOffExplicit: env var is "false" (case-insensitive) — dry-run OFF, suspension live.
+	DryRunOffExplicit
+	// DryRunOnUnrecognised: env var is set but not a recognised value — dry-run ON,
+	// emit a WARN so the operator knows their value had no effect.
+	DryRunOnUnrecognised
+)
+
+// DryRunEnvResult is the structured result of ParseDryRunEnv. Callers log
+// based on Outcome; the bool DryRun is what actually gates suspension.
+type DryRunEnvResult struct {
+	DryRun  bool               // whether dry-run is active (true = safe, no mutations)
+	Outcome DryRunParseOutcome // which branch was taken (drives startup log level)
+	Raw     string             // the raw env value, reproduced verbatim in warnings
+}
+
+// ParseDryRunEnv parses WORKER_IDLE_EVALUATOR_DRY_RUN into a DryRunEnvResult.
 //
-// The function is fail-closed: dry-run is ON unless v is exactly the string
-// "false" (case-insensitive). Every other value — empty string, "yes", "1",
-// "TRUE", an unparseable value — leaves dry-run ON. This matters because a
-// typo in a Helm values file must never be the thing that causes a student's
-// VM to be suspended mid-exam.
+// Fail-closed: dry-run is ON for every value that is not an explicit,
+// unambiguous "false". This means "0", "yes", "1", "no", "off", "" — anything
+// that is not case-insensitively equal to "false" — leaves dry-run ON.
 //
-// Accepted false values: "false", "False", "FALSE".
-// Everything else → true (dry-run ON).
-func ParseDryRunEnv(v string) bool {
-	return !strings.EqualFold(v, "false")
+// The three outcomes let callers emit the right startup log:
+//   - DryRunOnDefault   → INFO  (unset or empty, safe default)
+//   - DryRunOffExplicit → INFO  ("false" — operator has deliberately armed suspension)
+//   - DryRunOnUnrecognised → WARN (set to something non-false; the operator likely
+//     intended to disable dry-run but the value was not accepted)
+func ParseDryRunEnv(v string) DryRunEnvResult {
+	if v == "" {
+		return DryRunEnvResult{DryRun: true, Outcome: DryRunOnDefault, Raw: v}
+	}
+	if strings.EqualFold(v, "false") {
+		return DryRunEnvResult{DryRun: false, Outcome: DryRunOffExplicit, Raw: v}
+	}
+	return DryRunEnvResult{DryRun: true, Outcome: DryRunOnUnrecognised, Raw: v}
 }
 
 // Default idle-evaluation thresholds.

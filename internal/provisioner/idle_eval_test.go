@@ -569,7 +569,8 @@ func TestMetricsProductionCallSites(t *testing.T) {
 	}
 }
 
-// TestParseDryRunEnv verifies the fail-closed semantics of ParseDryRunEnv.
+// TestParseDryRunEnv verifies the fail-closed semantics and correct Outcome
+// classification of ParseDryRunEnv.
 //
 // Dry-run must be ON for every input that is not an explicit, unambiguous
 // "false". A typo in a Helm values file (e.g. "yes", "1", "") must never be
@@ -577,33 +578,62 @@ func TestMetricsProductionCallSites(t *testing.T) {
 func TestParseDryRunEnv(t *testing.T) {
 	tests := []struct {
 		input   string
-		dryRun  bool // true = dry-run ON (safe), false = dry-run OFF (live)
+		dryRun  bool               // true = dry-run ON (safe), false = dry-run OFF (live)
+		outcome DryRunParseOutcome // expected branch classification
 		comment string
 	}{
-		// --- dry-run ON (the safe side) ---
-		{"", true, "empty string → dry-run ON (default)"},
-		{"true", true, `"true" → dry-run ON`},
-		{"True", true, `"True" → dry-run ON`},
-		{"TRUE", true, `"TRUE" → dry-run ON`},
-		{"1", true, `"1" is not "false" → dry-run ON`},
-		{"yes", true, `"yes" is not "false" → dry-run ON`},
-		{"YES", true, `"YES" is not "false" → dry-run ON`},
-		{"0", true, `"0" is not "false" → dry-run ON`},
-		{"no", true, `"no" is not "false" → dry-run ON`},
-		{"off", true, `"off" is not "false" → dry-run ON`},
-		{"disabled", true, `unparseable value → dry-run ON`},
+		// --- dry-run ON, unset/empty → DryRunOnDefault ---
+		{"", true, DryRunOnDefault, "empty string → dry-run ON (default)"},
 
-		// --- dry-run OFF (only explicit "false", case-insensitive) ---
-		{"false", false, `"false" → dry-run OFF`},
-		{"False", false, `"False" → dry-run OFF`},
-		{"FALSE", false, `"FALSE" → dry-run OFF`},
+		// --- dry-run ON, set but not recognised → DryRunOnUnrecognised ---
+		{"true", true, DryRunOnUnrecognised, `"true" is not "false" → dry-run ON, unrecognised`},
+		{"True", true, DryRunOnUnrecognised, `"True" → dry-run ON, unrecognised`},
+		{"TRUE", true, DryRunOnUnrecognised, `"TRUE" → dry-run ON, unrecognised`},
+		{"1", true, DryRunOnUnrecognised, `"1" → dry-run ON, unrecognised`},
+		{"yes", true, DryRunOnUnrecognised, `"yes" → dry-run ON, unrecognised`},
+		{"YES", true, DryRunOnUnrecognised, `"YES" → dry-run ON, unrecognised`},
+		{"0", true, DryRunOnUnrecognised, `"0" → dry-run ON, unrecognised (common operator trap)`},
+		{"no", true, DryRunOnUnrecognised, `"no" → dry-run ON, unrecognised`},
+		{"off", true, DryRunOnUnrecognised, `"off" → dry-run ON, unrecognised`},
+		{"disabled", true, DryRunOnUnrecognised, `"disabled" → dry-run ON, unrecognised`},
+
+		// --- dry-run OFF → DryRunOffExplicit ---
+		{"false", false, DryRunOffExplicit, `"false" → dry-run OFF (live)`},
+		{"False", false, DryRunOffExplicit, `"False" → dry-run OFF (live)`},
+		{"FALSE", false, DryRunOffExplicit, `"FALSE" → dry-run OFF (live)`},
 	}
 
 	for _, tc := range tests {
 		got := ParseDryRunEnv(tc.input)
-		if got != tc.dryRun {
-			t.Errorf("ParseDryRunEnv(%q) = %v, want %v — %s",
-				tc.input, got, tc.dryRun, tc.comment)
+		if got.DryRun != tc.dryRun {
+			t.Errorf("ParseDryRunEnv(%q).DryRun = %v, want %v — %s",
+				tc.input, got.DryRun, tc.dryRun, tc.comment)
+		}
+		if got.Outcome != tc.outcome {
+			t.Errorf("ParseDryRunEnv(%q).Outcome = %v, want %v — %s",
+				tc.input, got.Outcome, tc.outcome, tc.comment)
+		}
+		if got.Raw != tc.input {
+			t.Errorf("ParseDryRunEnv(%q).Raw = %q, want %q", tc.input, got.Raw, tc.input)
+		}
+	}
+}
+
+// TestParseDryRunEnv_UnrecognisedBranch specifically exercises the operator
+// trap: setting WORKER_IDLE_EVALUATOR_DRY_RUN=0 looks like "disable dry-run"
+// but must not. The DryRunOnUnrecognised outcome is what triggers the WARN
+// startup log that tells the operator their value had no effect.
+func TestParseDryRunEnv_UnrecognisedBranch(t *testing.T) {
+	traps := []string{"0", "1", "yes", "no", "off", "true", "True", "TRUE", "disabled"}
+	for _, v := range traps {
+		got := ParseDryRunEnv(v)
+		if !got.DryRun {
+			t.Errorf("ParseDryRunEnv(%q).DryRun = false — operator trap: dry-run must remain ON for this value", v)
+		}
+		if got.Outcome != DryRunOnUnrecognised {
+			t.Errorf("ParseDryRunEnv(%q).Outcome = %v, want DryRunOnUnrecognised — "+
+				"the WARN startup log that tells the operator their value had no effect must be triggered",
+				v, got.Outcome)
 		}
 	}
 }
