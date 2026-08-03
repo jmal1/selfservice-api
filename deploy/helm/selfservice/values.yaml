@@ -180,11 +180,19 @@ engine:
   runnerNode: "k3sv03"
   trunkNIC: "ens224"
   # Hard kill for a runner Job, in seconds. Raised from the original 600
-  # to accommodate the Kali base image: a cold pull of a ~2-3 GB image on
-  # k3sv03's first run can consume most of a 10-minute budget before the
-  # workflow even starts. CrucibleRunnerProvisionSlow alerts well before
-  # this trips. See internal/engine/k8s.go.
+  # to accommodate the Kali base image: a cold pull of the image on k3sv03's
+  # first run can consume most of a 10-minute budget before the workflow even
+  # starts — measured at 528s for the 1.06 GB image, i.e. 59% of this budget.
+  # CrucibleRunnerProvisionSlow alerts well before this trips.
+  # See internal/engine/k8s.go.
   runnerActiveDeadlineSeconds: 900
+  # Keeps runnerImage resident on runnerNode so a student's assessment never
+  # pays the cold pull, and so kubelet image GC cannot silently evict it (k3sv03
+  # has an 18 GB root filesystem). Costs one idle `sleep infinity` pod on the
+  # runner node. See templates/runner-image-warmer.yaml; deploy.sh must restart
+  # it after an upgrade because the :latest tag leaves the pod spec unchanged.
+  runnerImageWarmer:
+    enabled: true
   # Pushgateway for runner metrics (provision duration, job outcomes, cleanup
   # failures, orphaned resources). The engine is a short-lived-job orchestrator
   # with no scrapable steady state, so it pushes rather than being scraped —

@@ -233,7 +233,12 @@ func TestContract_RunnerConfig_FieldsFrozen(t *testing.T) {
 // emitted by run_action helpers in actions.sh. This is consumed by the
 // runner's sidecar; any rename breaks per-action progress reporting.
 func TestContract_ActionEvent_UnixSocket(t *testing.T) {
-	approved := []string{"action", "duration_ms", "event", "exit_code", "status"}
+	// `message` carries the student-facing explanation with the event instead of
+	// leaving the executor to scrape it out of the workflow's stdout, which
+	// races the Go reader draining the pipe. It is omitempty and zero-value
+	// safe: an old sidecar ignores it and falls back to the stdout scrape, a new
+	// sidecar given an old actions.sh sees "" and does the same.
+	approved := []string{"action", "duration_ms", "event", "exit_code", "message", "status"}
 	got := fieldNames(t, runner.ActionEvent{})
 	if !reflect.DeepEqual(got, approved) {
 		t.Fatalf("ActionEvent wire shape changed.\n got:      %v\n approved: %v", got, approved)
@@ -245,10 +250,13 @@ func TestContract_ActionEvent_UnixSocket(t *testing.T) {
 	if !strings.Contains(string(startRaw), `"event":"action_start"`) {
 		t.Errorf("action_start lost event tag: %s", startRaw)
 	}
-	end := runner.ActionEvent{Event: "action_end", Action: "verify_ssh", Status: "pass", ExitCode: 0, DurationMs: 250}
+	end := runner.ActionEvent{Event: "action_end", Action: "verify_ssh", Status: "fail", ExitCode: 1, DurationMs: 250, Message: "port 8080 is not responding"}
 	endRaw, _ := json.Marshal(end)
-	if !strings.Contains(string(endRaw), `"status":"pass"`) || !strings.Contains(string(endRaw), `"duration_ms":250`) {
+	if !strings.Contains(string(endRaw), `"status":"fail"`) || !strings.Contains(string(endRaw), `"duration_ms":250`) {
 		t.Errorf("action_end lost critical fields: %s", endRaw)
+	}
+	if !strings.Contains(string(endRaw), `"message":"port 8080 is not responding"`) {
+		t.Errorf("action_end dropped the student message: %s", endRaw)
 	}
 }
 

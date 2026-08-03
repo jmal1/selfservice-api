@@ -248,6 +248,7 @@ those as `STUDENT_MSG:` / `ERROR:` lines on the action's behalf, so §5.3 applie
 ### 5.3 Student vs instructor output
 
 - Print `STUDENT_MSG: <one-line message>` from stdout. The **last** such line in the action's output becomes the user-facing failure message. Use it for actionable remediation hints ("Service X is not running. Start with `sudo systemctl start X`").
+- The message is taken **verbatim** after trimming surrounding whitespace. Quotes, backslashes and Windows paths survive intact, so `STUDENT_MSG: Expected "200" but got C:\inetpub` reaches the student exactly as written. Only leading/trailing whitespace is removed; nothing else is re-quoted or word-split.
 - Everything else printed to stdout/stderr is captured as **instructor-only** output in `WorkflowResult.instructor_output`. Use it for debug info that students should never see (raw nmap output, full curl traces).
 - For library actions, `student_fail_hint` field is shown on fail and supports `{{ params.X }}` templating; prefer this over `STUDENT_MSG` for reusable actions.
 

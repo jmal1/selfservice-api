@@ -80,5 +80,47 @@ helm upgrade "$RELEASE" . \
 echo "==> revision:"
 helm list -n "$NAMESPACE" -o table | grep "$RELEASE"
 
+# Every workload here runs a floating `:latest` tag, so a rebuilt image leaves
+# the pod spec byte-identical and `helm upgrade` reports success without
+# restarting anything. That has bitten this deploy three times: `helm status:
+# deployed` while the old code kept serving. Restarting explicitly is the only
+# way `deploy.sh` actually deploys.
+#
+# The list is explicit rather than label-selected on purpose. The obvious
+# selector (app.kubernetes.io/instance=$RELEASE) also matches the postgresql and
+# nats subcharts, and this script must never bounce the database. The labels are
+# not consistent enough to filter on either — selfservice-engine carries no
+# instance label and selfservice-ui carries no component label. An explicit list
+# also fails loudly if a workload is renamed, instead of silently restarting
+# nothing.
+#
+# The runner-image warmer matters twice over: if it is not restarted it keeps a
+# *stale* runner image resident, which is worse than having no warmer at all.
+CHART_DEPLOYMENTS=(
+  "$RELEASE-api"
+  "$RELEASE-engine"
+  "$RELEASE-ui"
+  "$RELEASE-worker"
+)
+CHART_DAEMONSETS=(
+  "$RELEASE-runner-image-warmer"
+)
+
+echo "==> restarting workloads (floating :latest tags do not roll on their own)"
+for d in "${CHART_DEPLOYMENTS[@]}"; do
+  kubectl rollout restart "deployment/$d" -n "$NAMESPACE"
+done
+for ds in "${CHART_DAEMONSETS[@]}"; do
+  # Skipped rather than fatal: the warmer is optional (engine.runnerImageWarmer.enabled).
+  kubectl get "daemonset/$ds" -n "$NAMESPACE" >/dev/null 2>&1 \
+    && kubectl rollout restart "daemonset/$ds" -n "$NAMESPACE" \
+    || echo "    (daemonset/$ds not present, skipping)"
+done
+
+echo "==> waiting for rollouts"
+for d in "${CHART_DEPLOYMENTS[@]}"; do
+  kubectl rollout status "deployment/$d" -n "$NAMESPACE" --timeout=5m
+done
+
 echo "==> pod status:"
 kubectl get pods -n "$NAMESPACE" -o wide

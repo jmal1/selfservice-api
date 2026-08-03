@@ -148,6 +148,7 @@ func (s *Sidecar) handleConnection(conn net.Conn, workflowSlug string, resultCh 
 		resultCh <- ActionOutput{
 			Action:   event.Action,
 			Status:   event.Status,
+			Message:  event.Message,
 			ExitCode: event.ExitCode,
 			Duration: time.Duration(event.DurationMs) * time.Millisecond,
 			Context:  ctxData,
