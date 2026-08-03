@@ -14,6 +14,13 @@ type RunnerConfig struct {
 	Workflows     []WorkflowDef `json:"workflows"`
 	Target        TargetConfig `json:"target"`
 	Pod           PodConfig    `json:"pod"`
+
+	// ActionLibrary is a bash file of function definitions generated from the
+	// library actions in the database. The runner writes it to
+	// ActionLibraryPath at startup and actions.sh sources it, which is what
+	// makes `run_action "..." http_get ...` resolve. Without it every library
+	// action fails with exit 127.
+	ActionLibrary string `json:"action_library,omitempty"`
 }
 
 // WorkflowDef describes a single workflow to execute.

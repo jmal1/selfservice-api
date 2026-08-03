@@ -347,3 +347,42 @@ func (q *Queries) SetRunnerPodName(ctx context.Context, runID uuid.UUID, jobName
 	`, runID, jobName)
 	return err
 }
+
+// ListRunnerLibraryActions returns the library actions that can be injected
+// into a Kali runner as callable shell functions.
+//
+// Windows actions are excluded by supported_platforms, not by inspecting the
+// script. Their bodies are PowerShell, and because the generated library is
+// sourced as a single bash file, ONE unparseable body breaks every action in
+// the run rather than only its own. Filtering on declared platform is the
+// explicit, data-driven cut; sniffing the language would be a guess that fails
+// open.
+//
+// Actions with an empty script are skipped in SQL as well as in
+// buildActionLibrary, since `name() { }` is a bash syntax error with the same
+// blast radius.
+func (q *Queries) ListRunnerLibraryActions(ctx context.Context) ([]LibraryAction, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT slug, name, description, script
+		FROM actions
+		WHERE is_library = true
+		  AND slug IS NOT NULL
+		  AND btrim(script) <> ''
+		  AND NOT (supported_platforms @> '["windows"]'::jsonb)
+		ORDER BY slug
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list runner library actions: %w", err)
+	}
+	defer rows.Close()
+
+	var out []LibraryAction
+	for rows.Next() {
+		var a LibraryAction
+		if err := rows.Scan(&a.Slug, &a.Name, &a.Description, &a.Script); err != nil {
+			return nil, fmt.Errorf("scan library action: %w", err)
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}

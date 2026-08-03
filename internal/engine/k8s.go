@@ -157,26 +157,50 @@ type ProvisionResult struct {
 	PodName    string // Set after the pod starts
 }
 
+// RunnerSpec describes everything needed to provision one runner execution.
+//
+// This is a struct rather than a positional parameter list because the argument
+// count had already reached eight, four of which were bare strings. Adding the
+// action library as a ninth would have made a silent argument-order swap a
+// realistic mistake -- one that compiles cleanly and surfaces only as a runner
+// that cannot call home, which is precisely the class of failure that took the
+// longest to diagnose here.
+type RunnerSpec struct {
+	RunID         string
+	CallbackToken string
+	EngineURL     string
+	VLANTag       int
+	Workflows     []runner.WorkflowDef
+	Target        runner.TargetConfig
+	Pod           runner.PodConfig
+
+	// ActionLibrary is the generated bash function library (see
+	// buildActionLibrary). Empty is legal and simply means no library actions
+	// are injected.
+	ActionLibrary string
+}
+
 // ProvisionRunner creates the K8s Secret, NetworkAttachmentDefinition (if needed),
 // and Job for a runner execution.
-func (k *K8sClient) ProvisionRunner(ctx context.Context, runID, callbackToken string, vlanTag int, workflows []runner.WorkflowDef, target runner.TargetConfig, pod runner.PodConfig, engineURL string) (*ProvisionResult, error) {
+func (k *K8sClient) ProvisionRunner(ctx context.Context, spec RunnerSpec) (*ProvisionResult, error) {
 	start := time.Now()
-	resourceName := fmt.Sprintf("crucible-runner-%s", runID[:8])
-	nadName := fmt.Sprintf("pod-vlan-%d", vlanTag)
+	resourceName := fmt.Sprintf("crucible-runner-%s", spec.RunID[:8])
+	nadName := fmt.Sprintf("pod-vlan-%d", spec.VLANTag)
 
 	// 1. Ensure NetworkAttachmentDefinition exists for this VLAN
-	if err := k.ensureNAD(ctx, nadName, vlanTag); err != nil {
+	if err := k.ensureNAD(ctx, nadName, spec.VLANTag); err != nil {
 		return nil, fmt.Errorf("ensure NAD: %w", err)
 	}
 
 	// 2. Create Secret with runner config
 	runnerConfig := runner.RunnerConfig{
-		CallbackURL:   engineURL,
-		CallbackToken: callbackToken,
-		RunID:         runID,
-		Workflows:     workflows,
-		Target:        target,
-		Pod:           pod,
+		CallbackURL:   spec.EngineURL,
+		CallbackToken: spec.CallbackToken,
+		RunID:         spec.RunID,
+		Workflows:     spec.Workflows,
+		ActionLibrary: spec.ActionLibrary,
+		Target:        spec.Target,
+		Pod:           spec.Pod,
 	}
 
 	configJSON, err := json.Marshal(runnerConfig)
@@ -191,7 +215,7 @@ func (k *K8sClient) ProvisionRunner(ctx context.Context, runID, callbackToken st
 			Namespace: k.namespace,
 			Labels: map[string]string{
 				"app":                   "crucible-runner",
-				"forge.crucible/run-id": runID,
+				"forge.crucible/run-id": spec.RunID,
 			},
 		},
 		Data: map[string][]byte{
@@ -202,7 +226,7 @@ func (k *K8sClient) ProvisionRunner(ctx context.Context, runID, callbackToken st
 	if _, err := k.clientset.CoreV1().Secrets(k.namespace).Create(ctx, secret, metav1.CreateOptions{}); err != nil {
 		return nil, fmt.Errorf("create secret: %w", err)
 	}
-	k.logger.Info("created runner secret", "name", secretName, "run_id", runID)
+	k.logger.Info("created runner secret", "name", secretName, "run_id", spec.RunID)
 
 	// 3. Create Job
 	var activeDeadline int64 = runnerActiveDeadlineSeconds
@@ -215,7 +239,7 @@ func (k *K8sClient) ProvisionRunner(ctx context.Context, runID, callbackToken st
 			Namespace: k.namespace,
 			Labels: map[string]string{
 				"app":                   "crucible-runner",
-				"forge.crucible/run-id": runID,
+				"forge.crucible/run-id": spec.RunID,
 			},
 		},
 		Spec: batchv1.JobSpec{
@@ -226,7 +250,7 @@ func (k *K8sClient) ProvisionRunner(ctx context.Context, runID, callbackToken st
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
 						"app":                   "crucible-runner",
-						"forge.crucible/run-id": runID,
+						"forge.crucible/run-id": spec.RunID,
 					},
 					Annotations: map[string]string{
 						"k8s.v1.cni.cncf.io/networks": nadName,
@@ -320,8 +344,8 @@ func (k *K8sClient) ProvisionRunner(ctx context.Context, runID, callbackToken st
 
 	k.logger.Info("created runner job",
 		"name", resourceName,
-		"run_id", runID,
-		"vlan", vlanTag,
+		"run_id", spec.RunID,
+		"vlan", spec.VLANTag,
 		"node", k.runnerNode,
 	)
 

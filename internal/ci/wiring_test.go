@@ -47,6 +47,17 @@ var requiredWiring = map[string][]struct {
 		{"RunPusher", "image-import metrics never reach Pushgateway without the flush loop"},
 		{"RunStuckUploadReconciler", "without it crucible_image_uploads_stuck is never refreshed, so leaked uploads are never detected"},
 	},
+	"cmd/crucible-runner/main.go": {
+		{"MaterializeActionLibrary", "without it the engine-generated action library is never written to disk, so every library action (http_get, port_open, ssh_exec, …) fails with exit 127 — the original defect, in which workflows appeared to run, the Job exited 0, and no action could possibly pass"},
+	},
+	// Not a cmd/ main, but the same failure class: buildActionLibrary is a
+	// package-level func, so deleting its only call site still compiles and
+	// still passes every actionlibrary_test.go case (they call it directly).
+	// The feature would just silently stop shipping.
+	"internal/engine/engine.go": {
+		{"ListRunnerLibraryActions", "without it no library bodies are fetched and the runner is provisioned with an empty library"},
+		{"buildActionLibrary", "without it ActionLibrary is never populated on RunnerSpec and library actions revert to exit 127"},
+	},
 }
 
 func TestCmdMains_WireOptionalDependencies(t *testing.T) {

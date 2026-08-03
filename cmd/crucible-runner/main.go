@@ -36,7 +36,16 @@ func main() {
 		"workflows", len(cfg.Workflows),
 		"target_ip", cfg.Target.IP,
 		"callback_url", cfg.CallbackURL,
+		"action_library_bytes", len(cfg.ActionLibrary),
 	)
+
+	// Materialise the engine-generated action library before anything can source
+	// actions.sh. This is what makes library actions (http_get, port_open, …)
+	// callable; without it every one of them fails with exit 127.
+	if err := runner.MaterializeActionLibrary(cfg.ActionLibrary); err != nil {
+		logger.Error("failed to write action library", "path", runner.ActionLibraryPath, "error", err)
+		os.Exit(1)
+	}
 
 	// Create context with cancellation for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())

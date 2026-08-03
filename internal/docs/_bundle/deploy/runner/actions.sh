@@ -4,6 +4,10 @@
 
 set -euo pipefail
 
+# Path to this file, exported so run_action's re-entrant subshell can source it.
+# Overridable so the contract tests can exercise run_action against the repo copy
+# instead of requiring an installed runner image.
+export CRUCIBLE_ACTIONS_LIB="${CRUCIBLE_ACTIONS_LIB:-/opt/crucible/lib/actions.sh}"
 CRUCIBLE_SOCKET="${CRUCIBLE_SOCKET:-/tmp/crucible-sidecar.sock}"
 CRUCIBLE_CONTEXT="${CRUCIBLE_CONTEXT:-/tmp/crucible-context.json}"
 SIDECAR_FAILED=false
@@ -67,8 +71,50 @@ run_action() {
     start_time=$(date +%s%N)
     exit_code=0
 
-    # Execute the action command with timeout
-    output=$(timeout "$timeout_sec" "$@" 2>&1) || exit_code=$?
+    # Execute the action command with timeout.
+    #
+    # `timeout` is an external binary: it execve()s its argument, so it CANNOT
+    # run a shell function. Library actions (http_get, port_open, ssh_exec, …)
+    # are shell functions, so dispatching them through plain `timeout` fails with
+    #   timeout: failed to run command 'http_get': No such file or directory
+    # and exit code 127 — a "failure" that looks like a student misconfiguration
+    # but is really the runner being unable to call its own action library.
+    #
+    # For a function we therefore re-enter bash inside the timeout and re-source
+    # this file, which pulls in ctx_set/ctx_get and (via the guard at the bottom)
+    # the generated library. Re-sourcing rather than `export -f` avoids having to
+    # keep an export list in sync with whatever the engine injected.
+    #
+    # `set +e` in the subshell is deliberate. Action bodies are written to detect
+    # their own failures and set LAST_ERROR/LAST_STUDENT_MSG before `return 1`;
+    # under the inherited `set -e` the first non-zero command (a curl that cannot
+    # connect, say) would abort the body before it could produce that message,
+    # turning an actionable "Web server returned 000 instead of 200" into a bare
+    # non-zero exit.
+    #
+    # Context survives the subshell because ctx_set writes to $CRUCIBLE_CONTEXT
+    # on disk, not to shell state.
+    # The trailing emit of LAST_STUDENT_MSG/LAST_ERROR is load-bearing. Library
+    # action bodies report problems by assigning those two variables, but
+    # run_action harvests the student-facing message by grepping stdout for
+    # "STUDENT_MSG:" — and the body runs in a command-substitution subshell, so a
+    # plain variable assignment can never reach the caller. Without this, all 18
+    # library actions would fail with a correct exit code and no explanation at
+    # all, which is the difference between "Port 8080 is not responding on
+    # 10.100.19.10. Is the service running?" and a bare red X.
+    if declare -F "$1" >/dev/null 2>&1; then
+        output=$(timeout "$timeout_sec" bash -c '
+            source "$CRUCIBLE_ACTIONS_LIB"
+            set +e
+            "$@"
+            _rc=$?
+            [ -n "${LAST_STUDENT_MSG:-}" ] && echo "STUDENT_MSG:$LAST_STUDENT_MSG"
+            [ -n "${LAST_ERROR:-}" ] && echo "ERROR:$LAST_ERROR"
+            exit $_rc
+        ' crucible-action "$@" 2>&1) || exit_code=$?
+    else
+        output=$(timeout "$timeout_sec" "$@" 2>&1) || exit_code=$?
+    fi
 
     local end_time duration_ms
     end_time=$(date +%s%N)
@@ -109,3 +155,22 @@ run_action() {
 
     return $exit_code
 }
+
+# ---------------------------------------------------------------------------
+# Action library
+#
+# The engine generates /opt/crucible/lib/library.sh per run from the library
+# actions in the database and the runner materialises it before executing any
+# workflow. Sourcing it here is what makes `run_action "..." http_get ...`
+# resolve; without it every library action dies with exit 127.
+#
+# This MUST be an `if` block, not `[ -f x ] && source x`. This file runs under
+# `set -euo pipefail`, and a trailing `&&` chain whose test fails returns a
+# non-zero status from the last command, which aborts the sourcing script and
+# takes the whole workflow down whenever the library happens to be absent. An
+# `if` with no `else` branch returns 0.
+# ---------------------------------------------------------------------------
+if [ -f "${CRUCIBLE_ACTION_LIBRARY:-/opt/crucible/lib/library.sh}" ]; then
+    # shellcheck source=/dev/null
+    source "${CRUCIBLE_ACTION_LIBRARY:-/opt/crucible/lib/library.sh}"
+fi
