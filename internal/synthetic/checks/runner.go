@@ -89,6 +89,37 @@ func RunnerSmoke(cfg RunnerSmokeConfig) synthetic.Check {
 	}
 }
 
+// Run statuses as they appear on the wire.
+//
+// These are deliberately literals here rather than imports of
+// models.RunStatus*: this check is a black-box prober, and its job includes
+// noticing if the API ever stops reporting the values its clients expect.
+// Binding it to the internal constants would make it follow a breaking rename
+// silently, which is precisely the regression a synthetic exists to catch.
+//
+// TestRunnerSmoke_TerminalStatusesMatchTheAPIContract pins them to the model
+// constants so a deliberate change fails the build here rather than turning
+// this check into a ten-minute timeout with a confusing message.
+const successRunStatus = "completed"
+
+// "error" is not a models.RunStatus* constant (no RunStatusError exists for
+// runs in workflow_models.go — that constant only exists for ResultStatus).
+// The engine may however set run.status="error" on unexpected panics or infra
+// failures that fall outside the normal workflow state machine. Treating it as
+// terminal-bad here prevents waitForRunTerminal from burning the full
+// RunTimeout and misleadingly reporting "timed out" when the run actually
+// ended immediately with an engine error.
+var terminalRunStatuses = []string{"completed", "failed", "cancelled", "timeout", "error"}
+
+func isTerminalRunStatus(s string) bool {
+	for _, t := range terminalRunStatuses {
+		if s == t {
+			return true
+		}
+	}
+	return false
+}
+
 // runnerRunResponse is the subset of the run JSON we decode during polling.
 // We only need status and the results slice; the rest is ignored.
 type runnerRunResponse struct {
@@ -126,10 +157,17 @@ func runRunnerSmoke(ctx context.Context, c *synthetic.Client, cfg RunnerSmokeCon
 
 	// 2. Pre-clean: destroy orphan synthetic pods so they don't accumulate
 	// when a previous run was killed mid-flight.
+	//
+	// A pre-clean failure aborts the check rather than being swallowed. If
+	// orphans cannot be reaped they will exhaust the synthetic user's pod
+	// quota within a few cycles, and the resulting failure surfaces as an
+	// opaque quota error at pod creation. Failing here instead names the
+	// actual cause while it is still cheap to fix.
 	log.Info("runner_smoke: pre-cleaning orphans", "max_age", cfg.PreCleanMaxAge)
 	if status, err = preCleanOrphans(ctx, c, cfg.PreCleanMaxAge, log); err != nil {
-		log.Error("runner_smoke: pre-clean failed (continuing)", "http_status", status, "error", err.Error())
-		return status, fmt.Errorf("pre-clean (continuing): %w", err)
+		log.Error("runner_smoke: pre-clean failed; aborting before pod creation",
+			"http_status", status, "error", err.Error())
+		return status, fmt.Errorf("pre-clean orphan synthetic pods: %w", err)
 	}
 
 	// 3. Create the pod.
@@ -193,8 +231,8 @@ func runRunnerSmoke(ctx context.Context, c *synthetic.Client, cfg RunnerSmokeCon
 	// failure mode this check exists to catch: "completed with no results"
 	// is indistinguishable from success if you only assert the status, but
 	// it means every action the runner was supposed to execute was skipped.
-	if run.Status != "completed" {
-		return status, fmt.Errorf("run terminated with non-successful status %q (want %q)", run.Status, "completed")
+	if run.Status != successRunStatus {
+		return status, fmt.Errorf("run terminated with non-successful status %q (want %q)", run.Status, successRunStatus)
 	}
 	if len(run.Results) == 0 {
 		return status, fmt.Errorf(
@@ -235,7 +273,29 @@ func createTestingRun(ctx context.Context, c *synthetic.Client, podID, playlistI
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode != http.StatusAccepted {
+	switch resp.StatusCode {
+	case http.StatusAccepted:
+		// happy path — fall through to body parsing
+	case http.StatusConflict:
+		// 409 means a prior run never reached a terminal state on this pod.
+		// This is a configuration/cleanup problem ("check is chatty" or
+		// "previous run leaked"), NOT a runner failure. Distinguish it
+		// explicitly so an on-call doesn't hunt a phantom runner outage.
+		return "", resp.StatusCode, fmt.Errorf(
+			"POST /pods/%s/testing/run returned 409: an assessment is already running on this pod "+
+				"(a previous run may not have reached a terminal state; check the run dashboard or wait for it to complete)",
+			podID)
+	case http.StatusTooManyRequests:
+		// 429 means the per-(podID,userID) rate limit fired: max 3 runs/hour.
+		// This is a check-cadence problem, not a runner problem. Report it
+		// with enough context that an on-call can distinguish "runner broken"
+		// from "check is too chatty". The Retry-After header is 3600 s.
+		retryAfter := resp.Header.Get("Retry-After")
+		return "", resp.StatusCode, fmt.Errorf(
+			"POST /pods/%s/testing/run returned 429 rate limited (max 3 runs/hour per pod; Retry-After: %s): "+
+				"this means the check CronJob is firing too frequently or reusing a pod — it is NOT a runner failure",
+			podID, retryAfter)
+	default:
 		return "", resp.StatusCode, fmt.Errorf("POST /pods/%s/testing/run returned %d: %s",
 			podID, resp.StatusCode, snippet(body))
 	}
@@ -295,8 +355,7 @@ func waitForRunTerminal(
 		}
 		lastRunStatus = run.Status
 
-		switch run.Status {
-		case "completed", "failed", "cancelled", "timeout":
+		if isTerminalRunStatus(run.Status) {
 			return run, resp.StatusCode, nil
 		}
 
