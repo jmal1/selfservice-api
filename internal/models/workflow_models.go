@@ -86,32 +86,32 @@ type Workflow struct {
 
 // Action represents an ordered step within a workflow or a standalone library action.
 type Action struct {
-	ID                 uuid.UUID       `json:"id" db:"id"`
-	WorkflowID         *uuid.UUID      `json:"workflow_id,omitempty" db:"workflow_id"`
-	Name               string          `json:"name" db:"name"`
-	Slug               *string         `json:"slug,omitempty" db:"slug"`
-	Description        string          `json:"description" db:"description"`
-	ActionType         string          `json:"action_type" db:"action_type"`
-	ActionCategory     string          `json:"action_category" db:"action_category"`
-	Params             json.RawMessage `json:"params" db:"params"`
-	Script             string          `json:"script" db:"script"`
-	InputContext       json.RawMessage `json:"input_context" db:"input_context"`
-	OutputContext      json.RawMessage `json:"output_context" db:"output_context"`
-	ExecutionOrder     int             `json:"execution_order" db:"execution_order"`
-	TimeoutSeconds     int             `json:"timeout_seconds" db:"timeout_seconds"`
-	StudentFailHint    *string         `json:"student_fail_hint" db:"student_fail_hint"`
-	Points             *int            `json:"points" db:"points"`
-	Penalty            *int            `json:"penalty" db:"penalty"`
+	ID              uuid.UUID       `json:"id" db:"id"`
+	WorkflowID      *uuid.UUID      `json:"workflow_id,omitempty" db:"workflow_id"`
+	Name            string          `json:"name" db:"name"`
+	Slug            *string         `json:"slug,omitempty" db:"slug"`
+	Description     string          `json:"description" db:"description"`
+	ActionType      string          `json:"action_type" db:"action_type"`
+	ActionCategory  string          `json:"action_category" db:"action_category"`
+	Params          json.RawMessage `json:"params" db:"params"`
+	Script          string          `json:"script" db:"script"`
+	InputContext    json.RawMessage `json:"input_context" db:"input_context"`
+	OutputContext   json.RawMessage `json:"output_context" db:"output_context"`
+	ExecutionOrder  int             `json:"execution_order" db:"execution_order"`
+	TimeoutSeconds  int             `json:"timeout_seconds" db:"timeout_seconds"`
+	StudentFailHint *string         `json:"student_fail_hint" db:"student_fail_hint"`
+	Points          *int            `json:"points" db:"points"`
+	Penalty         *int            `json:"penalty" db:"penalty"`
 	IsLibrary          bool            `json:"is_library" db:"is_library"`
 	SupportedPlatforms json.RawMessage `json:"supported_platforms" db:"supported_platforms"`
 	CreatedAt          time.Time       `json:"created_at" db:"created_at"`
-	UpdatedAt          time.Time       `json:"updated_at" db:"updated_at"`
+	UpdatedAt       time.Time       `json:"updated_at" db:"updated_at"`
 }
 
 // WorkflowVersion is an immutable snapshot of a workflow for run pinning.
 type WorkflowVersion struct {
 	ID         uuid.UUID       `json:"id" db:"id"`
-	WorkflowID uuid.UUID       `json:"workflow_id" db:"workflow_id"`
+	WorkflowID uuid.UUID      `json:"workflow_id" db:"workflow_id"`
 	Version    int             `json:"version" db:"version"`
 	Script     string          `json:"script" db:"script"`
 	Actions    json.RawMessage `json:"actions" db:"actions"`
@@ -162,12 +162,12 @@ type BlueprintVMPlaylist struct {
 
 // Run represents one execution of a playlist against a pod.
 type Run struct {
-	ID           uuid.UUID  `json:"id" db:"id"`
-	PodID        uuid.UUID  `json:"pod_id" db:"pod_id"`
-	PlaylistID   *uuid.UUID `json:"playlist_id" db:"playlist_id"`
-	TriggeredBy  uuid.UUID  `json:"triggered_by" db:"triggered_by"`
-	RunnerVMID   *string    `json:"runner_vm_id" db:"runner_vm_id"`
-	RunnerVMName *string    `json:"runner_vm_name" db:"runner_vm_name"`
+	ID              uuid.UUID  `json:"id" db:"id"`
+	PodID           uuid.UUID  `json:"pod_id" db:"pod_id"`
+	PlaylistID      *uuid.UUID `json:"playlist_id" db:"playlist_id"`
+	TriggeredBy     uuid.UUID  `json:"triggered_by" db:"triggered_by"`
+	RunnerVMID      *string    `json:"runner_vm_id" db:"runner_vm_id"`
+	RunnerVMName    *string    `json:"runner_vm_name" db:"runner_vm_name"`
 	// TargetPodVMID / TargetVMName / TargetVMIP identify the pod VM that was
 	// graded. Distinct from RunnerVM*, which name the ephemeral Kali runner Job.
 	// Name and IP are denormalized copies so the attribution survives pod
@@ -176,23 +176,23 @@ type Run struct {
 	TargetVMName  string     `json:"target_vm_name" db:"target_vm_name"`
 	TargetVMIP    string     `json:"target_vm_ip" db:"target_vm_ip"`
 	// Populated via LEFT JOIN by the admin run queries; empty when the related row is gone.
-	TriggeredByUsername    string     `json:"triggered_by_username" db:"triggered_by_username"`
-	TriggeredByDisplayName string     `json:"triggered_by_display_name" db:"triggered_by_display_name"`
-	PodName                string     `json:"pod_name" db:"pod_name"`
-	PodStatus              string     `json:"pod_status" db:"pod_status"`
-	PlaylistName           string     `json:"playlist_name" db:"playlist_name"`
-	CallbackToken          string     `json:"-" db:"callback_token"`
-	Status                 string     `json:"status" db:"status"`
-	TotalWorkflows         int        `json:"total_workflows" db:"total_workflows"`
-	PassedWorkflows        int        `json:"passed_workflows" db:"passed_workflows"`
-	FailedWorkflows        int        `json:"failed_workflows" db:"failed_workflows"`
-	TotalPoints            *int       `json:"total_points" db:"total_points"`
-	EarnedPoints           *int       `json:"earned_points" db:"earned_points"`
-	ErrorMessage           *string    `json:"error_message" db:"error_message"`
-	StartedAt              *time.Time `json:"started_at" db:"started_at"`
-	CompletedAt            *time.Time `json:"completed_at" db:"completed_at"`
-	CreatedAt              time.Time  `json:"created_at" db:"created_at"`
-	UpdatedAt              time.Time  `json:"updated_at" db:"updated_at"`
+	TriggeredByUsername    string `json:"triggered_by_username" db:"triggered_by_username"`
+	TriggeredByDisplayName string `json:"triggered_by_display_name" db:"triggered_by_display_name"`
+	PodName                string `json:"pod_name" db:"pod_name"`
+	PodStatus              string `json:"pod_status" db:"pod_status"`
+	PlaylistName           string `json:"playlist_name" db:"playlist_name"`
+	CallbackToken   string     `json:"-" db:"callback_token"`
+	Status          string     `json:"status" db:"status"`
+	TotalWorkflows  int        `json:"total_workflows" db:"total_workflows"`
+	PassedWorkflows int        `json:"passed_workflows" db:"passed_workflows"`
+	FailedWorkflows int        `json:"failed_workflows" db:"failed_workflows"`
+	TotalPoints     *int       `json:"total_points" db:"total_points"`
+	EarnedPoints    *int       `json:"earned_points" db:"earned_points"`
+	ErrorMessage    *string    `json:"error_message" db:"error_message"`
+	StartedAt       *time.Time `json:"started_at" db:"started_at"`
+	CompletedAt     *time.Time `json:"completed_at" db:"completed_at"`
+	CreatedAt       time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at" db:"updated_at"`
 	// Loaded via join
 	Results []WorkflowResult `json:"results,omitempty" db:"-"`
 }

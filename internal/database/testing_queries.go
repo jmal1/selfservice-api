@@ -144,6 +144,23 @@ const getRunForAdminQuery = runAttributionSelect + `
 		WHERE r.id = $1
 `
 
+const getRunWithResultsQuery = `
+		SELECT r.id, r.pod_id, r.playlist_id, r.triggered_by, r.runner_vm_id, r.runner_vm_name,
+		       r.target_pod_vm_id, r.target_vm_name, r.target_vm_ip, r.callback_token,
+		       r.status, r.total_workflows, r.passed_workflows, r.failed_workflows,
+		       r.error_message, r.started_at, r.completed_at, r.created_at, r.updated_at,
+		       COALESCE(u.username, '') AS triggered_by_username,
+		       COALESCE(u.display_name, '') AS triggered_by_display_name,
+		       COALESCE(p.name, '') AS pod_name,
+		       COALESCE(p.status, '') AS pod_status,
+		       COALESCE(pl.name, '') AS playlist_name
+		FROM runs r
+		LEFT JOIN users u ON r.triggered_by = u.id
+		LEFT JOIN pods p ON r.pod_id = p.id
+		LEFT JOIN playlists pl ON r.playlist_id = pl.id
+		WHERE r.id = $1
+`
+
 func scanRunAttribution(scan func(dest ...any) error, r *models.Run) error {
 	return scan(
 		&r.ID, &r.PodID, &r.PlaylistID, &r.TriggeredBy, &r.Status,
@@ -222,8 +239,14 @@ func (q *Queries) GetRunForAdmin(ctx context.Context, runID uuid.UUID) (*models.
 
 // GetRunWithResults returns a run with all workflow results.
 func (q *Queries) GetRunWithResults(ctx context.Context, runID uuid.UUID) (*models.Run, error) {
-	run, err := q.GetRun(ctx, runID)
-	if err != nil {
+	var run models.Run
+	if err := q.pool.QueryRow(ctx, getRunWithResultsQuery, runID).Scan(
+		&run.ID, &run.PodID, &run.PlaylistID, &run.TriggeredBy, &run.RunnerVMID, &run.RunnerVMName,
+		&run.TargetPodVMID, &run.TargetVMName, &run.TargetVMIP, &run.CallbackToken,
+		&run.Status, &run.TotalWorkflows, &run.PassedWorkflows, &run.FailedWorkflows,
+		&run.ErrorMessage, &run.StartedAt, &run.CompletedAt, &run.CreatedAt, &run.UpdatedAt,
+		&run.TriggeredByUsername, &run.TriggeredByDisplayName, &run.PodName, &run.PodStatus, &run.PlaylistName,
+	); err != nil {
 		return nil, err
 	}
 
@@ -255,7 +278,7 @@ func (q *Queries) GetRunWithResults(ctx context.Context, runID uuid.UUID) (*mode
 		run.Results = append(run.Results, wr)
 	}
 
-	return run, nil
+	return &run, nil
 }
 
 // UpdateRunStatus updates the status of a run (used by API cancel handler).

@@ -33,6 +33,7 @@ func TestRunAttributionQueriesUseLeftJoins(t *testing.T) {
 	}{
 		{name: "ListAllRuns", query: listAllRunsQuery},
 		{name: "GetRunForAdmin", query: getRunForAdminQuery},
+		{name: "GetRunWithResults", query: getRunWithResultsQuery},
 	}
 
 	for _, tc := range tests {

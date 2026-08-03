@@ -216,17 +216,5 @@ func (h *Handler) AdminGetRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	adminRun, err := h.db.GetRunForAdmin(r.Context(), runID)
-	if err != nil {
-		http.Error(w, "run not found", http.StatusNotFound)
-		return
-	}
-
-	run.TriggeredByUsername = adminRun.TriggeredByUsername
-	run.TriggeredByDisplayName = adminRun.TriggeredByDisplayName
-	run.PodName = adminRun.PodName
-	run.PodStatus = adminRun.PodStatus
-	run.PlaylistName = adminRun.PlaylistName
-
 	respondJSON(w, http.StatusOK, run)
 }
