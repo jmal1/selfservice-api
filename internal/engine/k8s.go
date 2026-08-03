@@ -72,6 +72,21 @@ const runnerConfigSecretKey = "runner-config.json"
 // rather than the install root itself -- see the VolumeMount comment below.
 const runnerConfigMountPath = "/opt/crucible/" + runnerConfigSecretKey
 
+// podVLANTagBase maps a pod VLAN tag to its /24: tag 119 -> 10.100.19.0/24.
+// This is the same convention encoded in vlan_pool.subnet (migration 000003)
+// and in provisioner.createPod, and all three must agree.
+const podVLANTagBase = 100
+
+// runnerRangeStartHost/runnerRangeEndHost bound the host addresses host-local
+// may hand a runner on a pod VLAN. They sit ABOVE the OPNsense DHCP pool
+// (.10-.250) that student VMs draw from, so a runner can never take an address
+// a pod VM might be offered. Four addresses is deliberate headroom: the engine
+// refuses concurrent runs for one pod, so one is normally enough.
+const (
+	runnerRangeStartHost = 251
+	runnerRangeEndHost   = 254
+)
+
 // imagePullSecretRefs converts secret names into LocalObjectReferences,
 // returning nil for an empty list so the pod spec stays unchanged when no
 // secrets are configured.
@@ -433,14 +448,53 @@ func sameCNIConfig(a, b string) bool {
 // The `vlan` plugin binary is not part of k3s's bundled CNI set and must be
 // staged into /var/lib/rancher/k3s/data/cni on every runner node — see
 // k3sv03-Runner-Node-Runbook.
+//
+// IPAM is `host-local`, NOT `dhcp`, and deliberately declares no routes.
+//
+// With `dhcp`, OPNsense answered the lease with a router option, so the CNI
+// dhcp plugin returned a 0.0.0.0/0 route and the kernel installed a SECOND
+// default route on net1 — ahead of Flannel's. Nothing in the pod's routing
+// table covers the Service CIDR (10.43.0.0/16), so cluster DNS and the
+// engine's ClusterIP both fell through to that default, left via the pod
+// VLAN, and vanished. The runner ran its workflow perfectly and then could
+// not deliver a single result. Verified on k3sv03: with dhcp the pod gets
+// "default via 10.100.19.1 dev net1" first and the engine is unreachable;
+// with the config below it gets exactly one default (via Flannel), reaches
+// the engine (HTTP 200), and still reaches the target VM on the pod VLAN.
+//
+// Omitting "routes" is the whole fix: CNI only installs routes an IPAM plugin
+// returns, so host-local yields nothing but the connected /24. Neither of the
+// Multus-level knobs helps — "default-route" in the network annotation does
+// not strip a route the delegate already installed, and the dhcp plugin's
+// skipDefaultGateway is not honoured by v1.6.2. Both were tried on k3sv03.
+//
+// The address range is .251-.254, deliberately OUTSIDE the OPNsense DHCP pool
+// of .10-.250 that provisioner.createPod hands to student VMs, so a runner can
+// never collide with a pod VM. host-local keeps its allocations in node-local
+// state, so concurrent runners on one VLAN still get distinct addresses.
+// The subnet convention (10.100.<tag-100>.0/24) is the same one encoded in
+// vlan_pool.subnet and in provisioner.createPod.
 func (k *K8sClient) nadConfigJSON(vlanTag int) (string, error) {
+	octet := vlanTag - podVLANTagBase
+	if octet < 1 || octet > 254 {
+		return "", fmt.Errorf("vlan tag %d is outside the pod VLAN range %d-%d",
+			vlanTag, podVLANTagBase+1, podVLANTagBase+254)
+	}
+
 	nadConfig := map[string]any{
 		"cniVersion": "0.3.1",
 		"type":       "vlan",
 		"master":     k.trunkNIC,
 		"vlanId":     vlanTag,
 		"ipam": map[string]any{
-			"type": "dhcp",
+			"type": "host-local",
+			"ranges": []any{
+				[]any{map[string]any{
+					"subnet":     fmt.Sprintf("10.100.%d.0/24", octet),
+					"rangeStart": fmt.Sprintf("10.100.%d.%d", octet, runnerRangeStartHost),
+					"rangeEnd":   fmt.Sprintf("10.100.%d.%d", octet, runnerRangeEndHost),
+				}},
+			},
 		},
 	}
 	configJSON, err := json.Marshal(nadConfig)
