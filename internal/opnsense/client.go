@@ -508,6 +508,10 @@ type filterGetRule struct {
 // GetFirewallRules returns the COMPLETE set of firewall filter rules via
 // firewall/filter/get (used for reconciler idempotency). See FirewallRuleInfo
 // for why filter/get is used instead of searchRule.
+//
+// Live-verified fact (2026-08-02, fwpodv01): searchRule returns total:1
+// regardless of the actual rule count; firewall/filter/get is authoritative and
+// returns every rule. Do not switch this back to searchRule.
 func (c *Client) GetFirewallRules(ctx context.Context) ([]FirewallRuleInfo, error) {
 	resp, err := c.doRequest(ctx, "GET", "/firewall/filter/get", nil)
 	if err != nil {
