@@ -435,6 +435,71 @@ func TestRunnerSmoke_409OnCreateRun(t *testing.T) {
 	if !strings.Contains(err.Error(), "409") {
 		t.Errorf("error %q must include the status code so the on-call knows it was a conflict", err)
 	}
+	// Must distinguish "already running" from a generic runner failure so the
+	// on-call can tell the difference between a misconfigured check cadence and
+	// a broken runner without reading source code.
+	if !strings.Contains(err.Error(), "already running") {
+		t.Errorf("error %q must mention 'already running' to distinguish a conflict from a runner failure", err)
+	}
+}
+
+// ---- 429 (rate limit) on create run -------------------------------------
+
+// TestRunnerSmoke_429OnCreateRun guards that a 429 from POST /testing/run is
+// surfaced as a distinct error explaining rate-limiting. A 429 means the check
+// CronJob is too chatty or reusing a long-lived pod — it is NOT a runner
+// failure and must not be reported as one.
+func TestRunnerSmoke_429OnCreateRun(t *testing.T) {
+	fake := newRunnerSmokeFakeAPI()
+	fake.createRunHTTPStatus = http.StatusTooManyRequests
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	_, err := RunnerSmoke(runnerSmokeTestCfg("")).Run(context.Background(), synthetic.NewClient(srv.URL, ""))
+	if err == nil {
+		t.Fatal("a 429 from POST /testing/run must fail the check")
+	}
+	if !strings.Contains(err.Error(), "429") {
+		t.Errorf("error %q must include the status code", err)
+	}
+	// Must distinguish "rate limited" from a runner failure; conflating them
+	// sends someone hunting a phantom runner outage when the check is the problem.
+	if !strings.Contains(strings.ToLower(err.Error()), "rate") {
+		t.Errorf("error %q must mention rate limiting to distinguish it from a runner failure", err)
+	}
+}
+
+// ---- empty playlist ID guard ---------------------------------------------
+
+// TestRunnerSmoke_EmptyPlaylistID guards that a missing SYNTHETIC_RUNNER_PLAYLIST_ID
+// fails fast (before creating any pod) with a message naming the env var.
+// This prevents a confusing API 400 or 404 from being the first symptom.
+func TestRunnerSmoke_EmptyPlaylistID(t *testing.T) {
+	fake := newRunnerSmokeFakeAPI()
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	cfg := RunnerSmokeConfig{
+		TemplateName:   "synthetic-noop",
+		PlaylistID:     "", // deliberately empty
+		ReadyTimeout:   2 * time.Second,
+		RunTimeout:     2 * time.Second,
+		DestroyTimeout: 2 * time.Second,
+		PreCleanMaxAge: 1 * time.Minute,
+	}
+	_, err := RunnerSmoke(cfg).Run(context.Background(), synthetic.NewClient(srv.URL, ""))
+	if err == nil {
+		t.Fatal("empty PlaylistID must fail immediately")
+	}
+	if !strings.Contains(err.Error(), "SYNTHETIC_RUNNER_PLAYLIST_ID") {
+		t.Errorf("error %q must name the env var so an operator can fix it without reading source", err)
+	}
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.createPodCalls != 0 {
+		t.Errorf("createPodCalls=%d: must fail before creating any pod (no wasted quota)", fake.createPodCalls)
+	}
 }
 
 // ---- metadata guard ------------------------------------------------------
