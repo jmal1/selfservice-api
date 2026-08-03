@@ -191,7 +191,47 @@ Three things to check, in order:
 
 ---
 
-## When to ask for help
+## `runner_smoke` synthetic check is firing
+
+`runner_smoke` exercises the full Epic D path: engine dispatch → Kubernetes
+Job scheduling → Multus NAD attachment → macvlan DHCP lease → Kali image
+pull → action execution → callback → results persisted. When it fires, one
+of those links is broken.
+
+**First three things to check:**
+
+1. **Is the Kali runner Kubernetes Job scheduling?**
+   Check that the `crucible-engine` is dispatching runner Jobs and that the
+   Job lands on node `k3sv03`. A common cause is a recent change to the
+   Multus NetworkAttachmentDefinition (NAD) or the macvlan interface config.
+   Look at `kubectl -n crucible get jobs` for stuck or missing jobs and
+   `kubectl -n crucible describe job <name>` for scheduling errors.
+
+2. **Did the runner pull the Kali image successfully?**
+   A new node or an image tag change can cause a pull timeout that looks like
+   a stall rather than an error. Check `kubectl -n crucible get pods` for
+   `ImagePullBackOff` or `ErrImagePull`. The runner pod name matches the Job
+   name. The image is pinned in the engine Helm values under
+   `runner.image.tag`.
+
+3. **Did the callback reach the engine?**
+   The runner calls back to the engine API after each workflow completes. If
+   the run reached `running` state but never advanced to `completed` the
+   callback path is broken — check the engine logs for `run.callback` errors
+   and confirm the runner pod can reach the engine ClusterIP. A `completed`
+   run with **zero results** means the runner Job exited 0 but never called
+   back at all; this is the failure mode the `zero results` assertion was
+   specifically added to catch.
+
+> [!warning]
+> The `runner_smoke` check creates a real pod and dispatches a real Kali
+> runner Job. When investigating a failure, check that the synthetic pod
+> (`synthetic-noop-*`) was destroyed; if the check timed out mid-run the
+> deferred cleanup fires but may also fail. The daily `synthetic_janitor`
+> CronJob sweeps any leaked `synthetic-noop-*` pods, but you can trigger
+> it manually if quota pressure is urgent.
+
+---
 
 If you've checked the above and the workflow still misbehaves, capture:
 

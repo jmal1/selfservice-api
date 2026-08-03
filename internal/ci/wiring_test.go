@@ -53,6 +53,7 @@ var requiredWiring = map[string][]struct {
 	"cmd/synthetic-api-monitor/main.go": {
 		{"checks.Elevated", "without it the instructor-role checks are never registered, so the authenticated admin surface (/admin/images, /admin/vcenter/isos, wizard-state) is unmonitored — and a 503 from an unwired dependency looks identical to a healthy deploy, because every other admin check only asserts a student is refused"},
 		{"SYNTHETIC_INSTRUCTOR_USER_ID", "the elevated client must be minted from a dedicated instructor row; elevating the primary synthetic user instead would turn five RBAC checks into tautologies that pass while proving nothing"},
+		{"RunnerSmoke(", "without it the runner_smoke check is never registered in SYNTHETIC_RUNNER_MODE: engine dispatch through Multus macvlan DHCP to Kali image pull to action execution to callback to results persisted is completely unmonitored -- silent failures look identical to a healthy deploy"},
 	},
 	// Not a cmd/ main, but the same failure class: buildActionLibrary is a
 	// package-level func, so deleting its only call site still compiles and

@@ -156,8 +156,8 @@
     {
       "path": "docs/instructor/troubleshooting.md",
       "title": "Troubleshooting",
-      "size": 6736,
-      "sha256": "3e4b1fc6a56bf1651c0b07ae62b63a8dbb8c9e00b8696a28d9fa2f550122104c",
+      "size": 8802,
+      "sha256": "1c22a703f57b09dfe9b112f3709e67771b4561c27b15ad56553bfe17492173a4",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/actions.md",
@@ -238,8 +238,8 @@
     {
       "path": "internal/runner/executor.go",
       "title": "executor.go (Go)",
-      "size": 7371,
-      "sha256": "c663a174725a1e370d835df7f482cdc2f79bd43967fe413bcd028f6d1b5656ae",
+      "size": 8524,
+      "sha256": "05481a0197e2171dcb64e5195a6d11b0908c6db3ccc67285052cb5078426497d",
       "is_markdown": false,
       "from_seed": false
     },
@@ -276,5 +276,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 190408
+  "total_bytes": 193627
 }
