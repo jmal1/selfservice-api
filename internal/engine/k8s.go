@@ -61,6 +61,17 @@ type K8sConfig struct {
 // the value so it is not silently reverted.
 const runnerActiveDeadlineSeconds int64 = 900
 
+// runnerConfigSecretKey is the key inside the runner Secret AND the subPath used
+// to mount it. The two must stay equal: a subPath names a key within the volume,
+// so a mismatch mounts an empty directory over the config path and the runner
+// exits with "no such file or directory" on a path that visibly exists.
+const runnerConfigSecretKey = "runner-config.json"
+
+// runnerConfigMountPath is where the runner reads its config. It MUST equal
+// runner.DefaultConfigPath, and it MUST be a file path inside the install root
+// rather than the install root itself -- see the VolumeMount comment below.
+const runnerConfigMountPath = "/opt/crucible/" + runnerConfigSecretKey
+
 // imagePullSecretRefs converts secret names into LocalObjectReferences,
 // returning nil for an empty list so the pod spec stays unchanged when no
 // secrets are configured.
@@ -169,7 +180,7 @@ func (k *K8sClient) ProvisionRunner(ctx context.Context, runID, callbackToken st
 			},
 		},
 		Data: map[string][]byte{
-			"runner-config.json": configJSON,
+			runnerConfigSecretKey: configJSON,
 		},
 	}
 
@@ -236,8 +247,32 @@ func (k *K8sClient) ProvisionRunner(ctx context.Context, runID, callbackToken st
 							},
 							VolumeMounts: []corev1.VolumeMount{
 								{
-									Name:      "runner-config",
-									MountPath: "/opt/crucible",
+									Name: "runner-config",
+									// Mount the SINGLE config file, not the directory.
+									//
+									// /opt/crucible is the image's install root: the
+									// binary lives at /opt/crucible/bin/crucible-runner
+									// (and is on PATH) and the action library at
+									// /opt/crucible/lib/actions.sh. Mounting a volume at
+									// /opt/crucible replaces that whole directory, so the
+									// container's own ENTRYPOINT vanished and every run
+									// died before executing a single action with:
+									//
+									//   exec: "crucible-runner": executable file not
+									//   found in $PATH
+									//
+									// subPath grafts just runner-config.json into the
+									// existing directory, leaving bin/ and lib/ intact,
+									// and keeps the file exactly at
+									// runner.DefaultConfigPath so the runner contract is
+									// unchanged.
+									//
+									// subPath volumes do not receive later Secret updates.
+									// That is fine and in fact desirable here: the Secret
+									// is written once per run and must not mutate under a
+									// running assessment.
+									MountPath: runnerConfigMountPath,
+									SubPath:   runnerConfigSecretKey,
 									ReadOnly:  true,
 								},
 							},
