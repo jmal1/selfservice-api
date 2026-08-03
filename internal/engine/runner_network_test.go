@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"strconv"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -97,9 +98,146 @@ func TestEnsureNAD_UsesVLANPluginNotMacvlan(t *testing.T) {
 		t.Errorf("NAD master = %v, want %q", got, cfg.TrunkNIC)
 	}
 	ipam, ok := nadCfg["ipam"].(map[string]any)
-	if !ok || ipam["type"] != "dhcp" {
-		t.Errorf("NAD ipam = %v, want type dhcp", nadCfg["ipam"])
+	if !ok || ipam["type"] != "host-local" {
+		t.Errorf("NAD ipam = %v, want type host-local", nadCfg["ipam"])
 	}
+}
+
+// TestNADConfig_InstallsNoDefaultRoute guards the defect that let the runner
+// execute a whole assessment and then silently fail to deliver any result.
+//
+// With ipam=dhcp, OPNsense's router option made the CNI dhcp plugin return a
+// 0.0.0.0/0 route, so the pod ended up with TWO default routes and the pod
+// VLAN's won. Nothing routes the Service CIDR (10.43.0.0/16) explicitly, so
+// cluster DNS and the engine ClusterIP both followed that default out of net1
+// and died. The Job still exited 0.
+//
+// The fix is the ABSENCE of routes, which is easy to reintroduce by "helpfully"
+// adding a gateway, so assert the absence directly.
+func TestNADConfig_InstallsNoDefaultRoute(t *testing.T) {
+	cfg := testK8sConfig()
+	k8s, dynClient := newNADTestClient(t, cfg)
+
+	if err := k8s.ensureNAD(context.Background(), "pod-vlan-119", 119); err != nil {
+		t.Fatalf("ensureNAD: %v", err)
+	}
+	nadCfg := readNADConfig(t, dynClient, cfg.Namespace, "pod-vlan-119")
+
+	ipam, ok := nadCfg["ipam"].(map[string]any)
+	if !ok {
+		t.Fatalf("NAD has no ipam block: %v", nadCfg)
+	}
+	if ipam["type"] == "dhcp" {
+		t.Fatal("ipam is back to dhcp: OPNsense answers with a router option, so " +
+			"the pod gets a second default route via the pod VLAN and can no longer " +
+			"reach cluster DNS or the engine's ClusterIP")
+	}
+	if _, has := ipam["routes"]; has {
+		t.Errorf(`ipam declares "routes" (%v); any route here risks re-adding a `+
+			`default that shadows Flannel's and breaks the runner's callback`, ipam["routes"])
+	}
+	if _, has := ipam["gateway"]; has {
+		t.Error(`ipam declares "gateway"; the runner only ever talks to hosts on ` +
+			`its own /24, and a gateway invites a default route back in`)
+	}
+	// The default route must remain Flannel's, which means the NAD must not
+	// describe one anywhere in the config, at any nesting level.
+	raw, _ := json.Marshal(nadCfg)
+	if strings.Contains(string(raw), "0.0.0.0/0") {
+		t.Errorf("NAD config mentions 0.0.0.0/0: %s", raw)
+	}
+}
+
+// TestNADConfig_SubnetMatchesVLANConvention pins the tag->subnet mapping to the
+// one vlan_pool.subnet and provisioner.createPod use. If these ever diverge the
+// runner gets an address on a network its target VM is not on, and every action
+// fails with a connectivity error that looks like a broken target.
+func TestNADConfig_SubnetMatchesVLANConvention(t *testing.T) {
+	cfg := testK8sConfig()
+	k8s, _ := newNADTestClient(t, cfg)
+
+	for _, tc := range []struct {
+		tag        int
+		wantSubnet string
+	}{
+		{105, "10.100.5.0/24"},
+		{119, "10.100.19.0/24"},
+		{250, "10.100.150.0/24"},
+	} {
+		cfgJSON, err := k8s.nadConfigJSON(tc.tag)
+		if err != nil {
+			t.Fatalf("nadConfigJSON(%d): %v", tc.tag, err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(cfgJSON), &m); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		ipam := m["ipam"].(map[string]any)
+		r := ipam["ranges"].([]any)[0].([]any)[0].(map[string]any)
+		if r["subnet"] != tc.wantSubnet {
+			t.Errorf("vlan %d subnet = %v, want %s", tc.tag, r["subnet"], tc.wantSubnet)
+		}
+	}
+}
+
+// TestNADConfig_RangeAvoidsDHCPPool guards the collision the runner would
+// otherwise have with a student VM. OPNsense serves .10-.250 on every pod VLAN
+// (provisioner.createPod), so the runner's range must start above .250.
+func TestNADConfig_RangeAvoidsDHCPPool(t *testing.T) {
+	cfg := testK8sConfig()
+	k8s, _ := newNADTestClient(t, cfg)
+
+	cfgJSON, err := k8s.nadConfigJSON(119)
+	if err != nil {
+		t.Fatalf("nadConfigJSON: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(cfgJSON), &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	r := m["ipam"].(map[string]any)["ranges"].([]any)[0].([]any)[0].(map[string]any)
+
+	const opnsenseDHCPPoolEnd = 250 // provisioner.createPod: "10.100.%d.10-10.100.%d.250"
+	start, end := r["rangeStart"].(string), r["rangeEnd"].(string)
+	startHost := hostOctet(t, start)
+	endHost := hostOctet(t, end)
+
+	if startHost <= opnsenseDHCPPoolEnd {
+		t.Errorf("rangeStart %s is inside the OPNsense DHCP pool (.10-.%d); a runner "+
+			"could be handed the same address as a student VM", start, opnsenseDHCPPoolEnd)
+	}
+	if endHost > 254 {
+		t.Errorf("rangeEnd %s is the broadcast address or beyond", end)
+	}
+	if startHost > endHost {
+		t.Errorf("range %s-%s is inverted", start, end)
+	}
+}
+
+// TestNADConfig_RejectsOutOfRangeVLAN ensures a bad tag fails loudly rather
+// than producing a config for a subnet like 10.100.-5.0/24.
+func TestNADConfig_RejectsOutOfRangeVLAN(t *testing.T) {
+	cfg := testK8sConfig()
+	k8s, _ := newNADTestClient(t, cfg)
+
+	for _, tag := range []int{0, 100, 355, -1} {
+		if _, err := k8s.nadConfigJSON(tag); err == nil {
+			t.Errorf("nadConfigJSON(%d) = nil error, want rejection", tag)
+		}
+	}
+}
+
+func hostOctet(t *testing.T, addr string) int {
+	t.Helper()
+	parts := strings.Split(addr, ".")
+	if len(parts) != 4 {
+		t.Fatalf("malformed address %q", addr)
+	}
+	n, err := strconv.Atoi(parts[3])
+	if err != nil {
+		t.Fatalf("malformed address %q: %v", addr, err)
+	}
+	return n
 }
 
 // TestEnsureNAD_TagIsPlumbedThrough ensures the VLAN actually varies with the
@@ -200,7 +338,8 @@ func TestEnsureNAD_NoPointlessUpdateWhenAlreadyCorrect(t *testing.T) {
 
 	// Semantically identical to what nadConfigJSON emits, but key order and
 	// spacing differ.
-	equivalent := `{ "ipam": {"type":"dhcp"}, "master":"` + cfg.TrunkNIC + `", "vlanId":119, "type":"vlan", "cniVersion":"0.3.1" }`
+	equivalent := `{ "master":"` + cfg.TrunkNIC + `", "type":"vlan", "vlanId":119, "cniVersion":"0.3.1",
+	  "ipam": { "ranges": [ [ { "rangeEnd":"10.100.19.254", "subnet":"10.100.19.0/24", "rangeStart":"10.100.19.251" } ] ], "type":"host-local" } }`
 	seed := &unstructured.Unstructured{
 		Object: map[string]any{
 			"apiVersion": "k8s.cni.cncf.io/v1",
