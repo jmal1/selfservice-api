@@ -2,6 +2,14 @@
 # Kali Rolling + crucible-runner binary + actions.sh library
 # Built separately from the main Crucible images (uses Kali, not Alpine)
 
+# Kali base image, overridable to pin a digest:
+#   docker build --build-arg KALI_BASE=kalilinux/kali-rolling@sha256:<digest> ...
+#
+# This ARG MUST stay above the first FROM. An ARG declared after a FROM belongs
+# to that build stage, so `FROM ${KALI_BASE}` for stage 2 would expand to an
+# empty string and fail with "base name (${KALI_BASE}) should not be blank".
+ARG KALI_BASE=kalilinux/kali-rolling
+
 # --- Stage 1: Build the Go binary ---
 FROM golang:1.25-alpine AS builder
 
@@ -34,7 +42,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o /bin/crucible-runner ./cmd/crucible-run
 # after a new digest can take 1-2 minutes on a cold node. Plan maintenance windows
 # around image refreshes; consider a pre-pull DaemonSet if cold-start latency
 # becomes a problem against Job deadlines.
-ARG KALI_BASE=kalilinux/kali-rolling
+#
+# KALI_BASE is declared globally at the top of this file -- see the note there.
 FROM ${KALI_BASE} AS runtime
 
 # Avoid interactive prompts during package installation

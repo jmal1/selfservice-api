@@ -334,3 +334,55 @@ func TestRunnerDockerfile_ContractPreserved(t *testing.T) {
 		}
 	}
 }
+
+// TestRunnerDockerfile_KaliBaseArgIsGlobal guards a Docker scoping rule that is
+// invisible until an image is actually built.
+//
+// `FROM ${KALI_BASE}` only expands if KALI_BASE is a *global* ARG, declared
+// before the first FROM. An ARG declared after a FROM is scoped to that build
+// stage, so the variable expands to empty and buildx fails the whole image with
+// "base name (${KALI_BASE}) should not be blank". Nothing in `go build`,
+// `go vet` or `go test` can see this, and the runner image is the one Crucible
+// component whose build is gated behind the test job -- so it stayed broken
+// until the very first CI image build ran.
+func TestRunnerDockerfile_KaliBaseArgIsGlobal(t *testing.T) {
+	data, err := os.ReadFile("../../deploy/runner/Dockerfile")
+	if err != nil {
+		t.Fatalf("could not read Dockerfile: %v", err)
+	}
+
+	argIdx, firstFromIdx, usedInFrom := -1, -1, false
+	for i, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if argIdx == -1 && strings.HasPrefix(trimmed, "ARG KALI_BASE") {
+			argIdx = i
+		}
+		if strings.HasPrefix(trimmed, "FROM ") {
+			if firstFromIdx == -1 {
+				firstFromIdx = i
+			}
+			if strings.Contains(trimmed, "${KALI_BASE}") || strings.Contains(trimmed, "$KALI_BASE") {
+				usedInFrom = true
+			}
+		}
+	}
+
+	if !usedInFrom {
+		t.Skip("Dockerfile no longer parameterises its base image via KALI_BASE")
+	}
+	if argIdx == -1 {
+		t.Fatal("FROM uses ${KALI_BASE} but no ARG KALI_BASE is declared: the base name expands to empty and the image build fails")
+	}
+	if argIdx > firstFromIdx {
+		t.Errorf("ARG KALI_BASE is declared at line %d, after the first FROM at line %d: "+
+			"an ARG declared after a FROM is scoped to that build stage, so ${KALI_BASE} "+
+			"expands to empty and buildx fails with \"base name (${KALI_BASE}) should not be blank\". "+
+			"Move it above the first FROM", argIdx+1, firstFromIdx+1)
+	}
+	if !strings.Contains(string(data), "ARG KALI_BASE=") {
+		t.Error("ARG KALI_BASE has no default value: CI does not pass --build-arg KALI_BASE, so the base name would be blank")
+	}
+}
