@@ -56,6 +56,19 @@ worker:
   networkReconciler:
     enabled: true
     interval: "5m"
+  # Image-upload reconciler: refreshes crucible_image_uploads_stuck and
+  # crucible_template_stuck by scanning for rows wedged in a non-terminal
+  # state past staleThreshold. Feeds the CrucibleImageUploadStuck and
+  # CrucibleTemplateStuck alerts.
+  pipelineReconciler:
+    enabled: true
+    interval: "5m"
+    staleThreshold: "2h"
+  # Pushgateway job for the template/image pipeline metric families
+  # (crucible_image_*, crucible_template_*). Separate job label from
+  # pushgatewayJob above so the two metric sets can be scoped
+  # independently in alert rules.
+  pipelinePushgatewayJob: "crucible_pipeline"
   resources:
     requests:
       cpu: 100m
@@ -76,6 +89,41 @@ secrets:
   oidc: selfservice-oidc
   vcenter: selfservice-vcenter-creds
   opnsense: selfservice-opnsense-creds
+  # Scoped MinIO service account for image uploads. Keys: access-key,
+  # secret-key. Sourced from Vault at secret/crucible/minio — this is
+  # deliberately NOT the MinIO root credential, and its policy is bound
+  # to the crucible/* prefix of the bucket below.
+  objectstore: selfservice-objectstore-creds
+
+# Object storage (MinIO on stagingv01) used to stage browser uploads of
+# installer ISOs and OVAs before a worker job imports them into vCenter.
+#
+# endpoint MUST be https: the Crucible UI is served over TLS, so a
+# plain-http presigned PUT is blocked by the browser as mixed content.
+# K3s Traefik + cert-manager (ClusterIssuer letsencrypt-prod, DNS-01 via Azure
+# DNS) terminate TLS for s3.lab.jmal.io, mirroring grafana.lab.jmal.io. This is
+# internal only: the A record lives solely in the lab BIND zone and resolves to
+# the Traefik VIP, never to MinIO directly.
+objectstore:
+  enabled: true
+  endpoint: "https://s3.lab.jmal.io"
+  # The bucket is "isos"; Crucible namespaces its objects under the "crucible/"
+  # prefix below, which is also the boundary the service-account policy enforces.
+  bucket: "isos"
+  prefix: "crucible"
+  useSSL: true
+  # Lifetime of a presigned upload URL. Short by design: a leaked URL is
+  # a write primitive into the bucket.
+  presignTTL: "15m"
+  # Per-file upload cap. MinIO's data dir is on stagingv01's ROOT
+  # filesystem (~85 GB free, no dedicated volume) and shares it with
+  # apt-cacher-ng, which every Linux template build depends on. Do not
+  # raise this without giving MinIO its own volume first (P0-4).
+  maxUploadSize: "16Gi"
+  # Refuse new uploads that would leave less than this much free on the
+  # MinIO host, rather than discovering it partway through a multi-GB PUT.
+  minFreeSpace: "20Gi"
+  multipartPartSize: "64Mi"
 
 # vCenter configuration (non-secret values; credentials from K8s secret)
 vcenter:
@@ -91,6 +139,16 @@ vcenter:
   # NOTE: vCenter inventory paths are CASE-SENSITIVE — match the actual
   # folder name exactly (lowercase "templates" in this lab).
   templatesFolder: "/JMAL-Datacenter/vm/templates"
+  # Datastore that holds installer ISOs and OVAs uploaded through
+  # /admin/images, and the folder within it. Separate from
+  # `datastore` (which holds running VM disks) because ISOs live on
+  # the big NFS backup share.
+  #
+  # CASE-SENSITIVE and easy to get wrong: the real name ends in a
+  # capital "S" — NAS-BackupsAndISOS, not ...ISOs. Phase 0 finding P0-5
+  # caught this; the vault docs had it wrong.
+  isoDatastore: "NAS-BackupsAndISOS"
+  isoFolder: "ISOs"
   # vCenter credentials health probe (OP-1). Set healthPushgatewayURL to the
   # Pushgateway endpoint and the api-gateway will perform a fresh login
   # every healthInterval, pushing vsphere_login_success{user=...}. Catches
@@ -121,6 +179,12 @@ engine:
   runnerImage: "ghcr.io/jmal1/selfservice-crucible-runner:latest"
   runnerNode: "k3sv03"
   trunkNIC: "ens224"
+  # Hard kill for a runner Job, in seconds. Raised from the original 600
+  # to accommodate the Kali base image: a cold pull of a ~2-3 GB image on
+  # k3sv03's first run can consume most of a 10-minute budget before the
+  # workflow even starts. CrucibleRunnerProvisionSlow alerts well before
+  # this trips. See internal/engine/k8s.go.
+  runnerActiveDeadlineSeconds: 900
   resources:
     requests:
       cpu: 100m

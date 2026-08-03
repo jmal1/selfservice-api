@@ -33,7 +33,7 @@ This document explains how the pieces fit together.
                    ▼
             ┌──────────────┐
             │  BLUEPRINT   │  A recipe for a multi-VM lab
-            │  (a pod)     │  (e.g. "1× Ubuntu target + 1× Kali runner")
+            │  (a pod)     │  (e.g. "1× Ubuntu target + 1× Windows target")
             └──────┬───────┘
                    │  deployed by a student =
                    ▼
@@ -85,9 +85,11 @@ This document explains how the pieces fit together.
 ## How a single student "Run Assessment" plays out
 
 1. The student opens their pod page and clicks **Run** on a playlist.
-2. The engine (`selfservice-engine`) provisions a runner pod (a Kali VM)
-   on the student's VLAN. The runner has SSH access to every target VM
-   in the pod.
+2. The engine (`selfservice-engine`) provisions a runner pod — a Kali
+   *container*, not a VM in the student's pod — on the student's VLAN.
+   The runner has SSH access to every target VM in the pod. It is created
+   for the run and destroyed when the run finishes; students never log
+   into it and cannot schedule it.
 3. For each workflow in the playlist (in order):
    - The engine writes the workflow's `script` into the runner and
      `bash`-executes it with the standard environment variables (see

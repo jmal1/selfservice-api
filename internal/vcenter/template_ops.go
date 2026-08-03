@@ -393,3 +393,291 @@ func (c *Client) attachNetworkAdapterInner(ctx context.Context, moref, network s
 	c.logger.Info("attached NIC to staging network", "moref", moref, "network", network)
 	return nil
 }
+
+// BlankVMParams holds parameters for CreateBlankVM. Unlike the clone paths
+// above, this builds an empty VM from scratch — there is no source template
+// to clone from. That is the whole point of the ISO-template flow: the
+// instructor boots an OS installer ISO into a blank shell, installs
+// interactively via WebMKS, then we generalize the result into a template.
+type BlankVMParams struct {
+	// VMName is the desired inventory name of the new VM. Required.
+	VMName string
+	// FolderPath is the inventory path of the target folder (e.g.
+	// "JMAL-Datacenter/vm/Templates").
+	FolderPath string
+	// Datastore holds the VM's files and its system disk (e.g. "NAS-vmstore").
+	Datastore string
+	// ResourcePool is the inventory path of the target pool. If empty, the
+	// datacenter's default resource pool is used.
+	ResourcePool string
+	// Network is the port group name for the VMXNET3 NIC (e.g. "LabVMs-VLAN30").
+	Network string
+
+	// GuestID is the vSphere guest OS identifier, e.g. "ubuntu64Guest",
+	// "debian12_64Guest", "windows11_64Guest". It selects sensible device
+	// defaults and installer behavior.
+	GuestID string
+
+	// VCPUs / RAMmb / DiskGB size the shell. All must be > 0.
+	VCPUs  int32
+	RAMmb  int64
+	DiskGB int
+
+	// Firmware is "efi" (default when empty) or "bios".
+	Firmware string
+
+	// ISOPath is the installer ISO in "[datastore] path/file.iso" form. It
+	// becomes CD-ROM 0 and the first boot device. Required.
+	ISOPath string
+	// SeedISOPath is an optional second ISO (e.g. a cloud-init / autounattend
+	// seed) in "[datastore] path/file.iso" form. When non-empty it becomes
+	// CD-ROM 1.
+	SeedISOPath string
+}
+
+// CreateBlankVM creates an empty VM configured to boot an OS installer ISO and
+// returns the new VM's moref. The shell has a pvscsi controller with a single
+// thin system disk, a VMXNET3 NIC on the requested port group, and one or two
+// IDE CD-ROMs (ISOPath, and SeedISOPath when provided) with the CD-ROM ahead of
+// the disk in the boot order so the installer runs on first power-on.
+//
+// All validation happens before any vCenter round-trip, so a rejected request
+// never leaves an orphaned VM behind.
+func (c *Client) CreateBlankVM(ctx context.Context, p BlankVMParams) (string, error) {
+	if p.VMName == "" {
+		return "", fmt.Errorf("VM name required")
+	}
+	if p.ISOPath == "" {
+		return "", fmt.Errorf("ISO path required")
+	}
+	if p.DiskGB <= 0 {
+		return "", fmt.Errorf("disk size must be greater than 0 GB (got %d)", p.DiskGB)
+	}
+	if p.VCPUs <= 0 {
+		return "", fmt.Errorf("vCPU count must be greater than 0 (got %d)", p.VCPUs)
+	}
+	if p.RAMmb <= 0 {
+		return "", fmt.Errorf("RAM must be greater than 0 MB (got %d)", p.RAMmb)
+	}
+	// vSphere requires a guest OS identifier on create. Catching it here keeps
+	// the promise made above: an empty GuestID would otherwise surface as an
+	// opaque InvalidArgument fault from vCenter well after the caller has
+	// committed to the request.
+	if p.GuestID == "" {
+		return "", fmt.Errorf("guest ID required (e.g. \"ubuntu64Guest\", \"debian12_64Guest\", \"windows11_64Guest\")")
+	}
+	// The ISO paths come from operator input through the upload wizard, so
+	// validate their "[datastore] path" form here — before we create the VM —
+	// rather than letting a malformed backing surface as an opaque vCenter
+	// fault after the shell already exists.
+	if _, _, err := ParseDatastorePath(p.ISOPath); err != nil {
+		return "", fmt.Errorf("ISO path: %w", err)
+	}
+	if p.SeedISOPath != "" {
+		if _, _, err := ParseDatastorePath(p.SeedISOPath); err != nil {
+			return "", fmt.Errorf("seed ISO path: %w", err)
+		}
+	}
+
+	if err := c.ensureConnected(ctx); err != nil {
+		return "", err
+	}
+
+	var moref string
+	err := c.withRetry(ctx, "create blank VM", func() error {
+		var inner error
+		moref, inner = c.createBlankVMInner(ctx, p)
+		return inner
+	})
+	return moref, err
+}
+
+func (c *Client) createBlankVMInner(ctx context.Context, p BlankVMParams) (string, error) {
+	folder, err := c.finder.Folder(ctx, p.FolderPath)
+	if err != nil {
+		return "", fmt.Errorf("find folder %q: %w", p.FolderPath, err)
+	}
+
+	ds, err := c.finder.Datastore(ctx, p.Datastore)
+	if err != nil {
+		return "", fmt.Errorf("find datastore %q: %w", p.Datastore, err)
+	}
+	dsRef := ds.Reference()
+
+	var pool *object.ResourcePool
+	if p.ResourcePool != "" {
+		pool, err = c.finder.ResourcePool(ctx, p.ResourcePool)
+		if err != nil {
+			return "", fmt.Errorf("find resource pool %q: %w", p.ResourcePool, err)
+		}
+	} else {
+		pool, err = c.finder.DefaultResourcePool(ctx)
+		if err != nil {
+			return "", fmt.Errorf("resolve default resource pool (specify ResourcePool): %w", err)
+		}
+	}
+
+	firmware := p.Firmware
+	if firmware == "" {
+		firmware = string(types.GuestOsDescriptorFirmwareTypeEfi)
+	}
+
+	devices, err := blankVMDevices(dsRef, p)
+	if err != nil {
+		return "", err
+	}
+	deviceChange, err := devices.ConfigSpec(types.VirtualDeviceConfigSpecOperationAdd)
+	if err != nil {
+		return "", fmt.Errorf("build device change spec: %w", err)
+	}
+
+	spec := types.VirtualMachineConfigSpec{
+		Name:         p.VMName,
+		GuestId:      p.GuestID,
+		NumCPUs:      p.VCPUs,
+		MemoryMB:     p.RAMmb,
+		Firmware:     firmware,
+		DeviceChange: deviceChange,
+		Files: &types.VirtualMachineFileInfo{
+			VmPathName: fmt.Sprintf("[%s]", ds.Name()),
+		},
+		// Boot the installer media first, falling back to the (empty) system
+		// disk once the OS is installed and the ISO is detached.
+		BootOptions: &types.VirtualMachineBootOptions{
+			BootOrder: devices.BootOrder([]string{
+				object.DeviceTypeCdrom,
+				object.DeviceTypeDisk,
+			}),
+		},
+	}
+
+	task, err := folder.CreateVM(ctx, spec, pool, nil)
+	if err != nil {
+		return "", fmt.Errorf("create VM %q: %w", p.VMName, err)
+	}
+	info, err := task.WaitForResult(ctx, nil)
+	if err != nil {
+		return "", fmt.Errorf("wait create VM task: %w", err)
+	}
+	newRef, ok := info.Result.(types.ManagedObjectReference)
+	if !ok {
+		return "", fmt.Errorf("create VM task returned unexpected result type %T", info.Result)
+	}
+	c.logger.Info("blank VM created", "name", p.VMName, "moref", newRef.Value, "guest_id", p.GuestID)
+	return newRef.Value, nil
+}
+
+// blankVMDevices assembles the device list for a blank installer VM: a pvscsi
+// controller with a thin system disk, an IDE controller carrying the CD-ROM(s),
+// and a VMXNET3 NIC. It uses govmomi's VirtualDeviceList builders (the same
+// idiom as `govc vm.create`) so controller keys and unit numbers are assigned
+// consistently.
+func blankVMDevices(dsRef types.ManagedObjectReference, p BlankVMParams) (object.VirtualDeviceList, error) {
+	var devices object.VirtualDeviceList
+
+	scsi, err := devices.CreateSCSIController("pvscsi")
+	if err != nil {
+		return nil, fmt.Errorf("create pvscsi controller: %w", err)
+	}
+	devices = append(devices, scsi)
+
+	// IDE controller to host the CD-ROM(s). One controller has two slots,
+	// which is exactly enough for the installer ISO and the optional seed ISO.
+	ide, err := devices.CreateIDEController()
+	if err != nil {
+		return nil, fmt.Errorf("create IDE controller: %w", err)
+	}
+	devices = append(devices, ide)
+
+	// Thin system disk on the SCSI controller. CreateDisk already produces a
+	// VirtualDiskFlatVer2BackingInfo with ThinProvisioned=true and a persistent
+	// disk mode; we set the capacity and re-assert thin explicitly so the
+	// contract is obvious at the call site.
+	disk := devices.CreateDisk(scsi.(types.BaseVirtualController), dsRef, "")
+	disk.CapacityInKB = int64(p.DiskGB) * 1024 * 1024
+	if backing, ok := disk.Backing.(*types.VirtualDiskFlatVer2BackingInfo); ok {
+		backing.ThinProvisioned = types.NewBool(true)
+	}
+	devices = append(devices, disk)
+
+	// VMXNET3 NIC. Build the backing directly by port group name (like
+	// AttachNetworkAdapter above and the student-pod clone path) because
+	// finder.Network cannot see per-host standard vSwitch port groups; vCenter
+	// resolves the DeviceName on the target host when the create task lands.
+	nicBacking := &types.VirtualEthernetCardNetworkBackingInfo{
+		VirtualDeviceDeviceBackingInfo: types.VirtualDeviceDeviceBackingInfo{
+			DeviceName: p.Network,
+		},
+	}
+	nic, err := devices.CreateEthernetCard("vmxnet3", nicBacking)
+	if err != nil {
+		return nil, fmt.Errorf("create vmxnet3 NIC: %w", err)
+	}
+	devices = append(devices, nic)
+
+	// CD-ROM 0: the installer ISO and first boot device.
+	cdrom0, err := devices.CreateCdrom(ide.(types.BaseVirtualController))
+	if err != nil {
+		return nil, fmt.Errorf("create CD-ROM: %w", err)
+	}
+	devices.InsertIso(cdrom0, p.ISOPath)
+	devices = append(devices, cdrom0)
+
+	// CD-ROM 1: optional seed ISO (cloud-init / autounattend media).
+	if p.SeedISOPath != "" {
+		cdrom1, err := devices.CreateCdrom(ide.(types.BaseVirtualController))
+		if err != nil {
+			return nil, fmt.Errorf("create seed CD-ROM: %w", err)
+		}
+		devices.InsertIso(cdrom1, p.SeedISOPath)
+		devices = append(devices, cdrom1)
+	}
+
+	return devices, nil
+}
+
+// DetachCDROMs removes every CD-ROM device from the VM identified by moref.
+// A template that still has an ISO attached holds a lock on that datastore
+// file, which blocks deleting or replacing the ISO later — so the finalize
+// step detaches all CD-ROMs before the template is sealed. Idempotent: a VM
+// that already has no CD-ROMs is left unchanged.
+func (c *Client) DetachCDROMs(ctx context.Context, moref string) error {
+	if moref == "" {
+		return fmt.Errorf("moref required")
+	}
+	if err := c.ensureConnected(ctx); err != nil {
+		return err
+	}
+	return c.withRetry(ctx, "detach CD-ROMs", func() error {
+		return c.detachCDROMsInner(ctx, moref)
+	})
+}
+
+func (c *Client) detachCDROMsInner(ctx context.Context, moref string) error {
+	vm := object.NewVirtualMachine(c.client.Client,
+		types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
+	devices, err := vm.Device(ctx)
+	if err != nil {
+		return fmt.Errorf("list devices on %s: %w", moref, err)
+	}
+	cdroms := devices.SelectByType((*types.VirtualCdrom)(nil))
+	if len(cdroms) == 0 {
+		return nil
+	}
+	changes := make([]types.BaseVirtualDeviceConfigSpec, 0, len(cdroms))
+	for _, cd := range cdroms {
+		changes = append(changes, &types.VirtualDeviceConfigSpec{
+			Operation: types.VirtualDeviceConfigSpecOperationRemove,
+			Device:    cd,
+		})
+	}
+	task, err := vm.Reconfigure(ctx, types.VirtualMachineConfigSpec{DeviceChange: changes})
+	if err != nil {
+		return fmt.Errorf("reconfigure to remove CD-ROMs on %s: %w", moref, err)
+	}
+	if err := task.Wait(ctx); err != nil {
+		return fmt.Errorf("wait remove CD-ROMs on %s: %w", moref, err)
+	}
+	c.logger.Info("detached CD-ROMs", "moref", moref, "count", len(cdroms))
+	return nil
+}

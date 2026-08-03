@@ -10,13 +10,28 @@ import (
 
 // Config holds all application configuration.
 type Config struct {
-	Server   ServerConfig
-	Database DatabaseConfig
-	OIDC     OIDCConfig
-	NATS     NATSConfig
-	Vault    VaultConfig
-	VCenter  VCenterConfig
-	OPNsense OPNsenseConfig
+	Server      ServerConfig
+	Database    DatabaseConfig
+	OIDC        OIDCConfig
+	NATS        NATSConfig
+	Vault       VaultConfig
+	VCenter     VCenterConfig
+	OPNsense    OPNsenseConfig
+	ObjectStore ObjectStoreConfig
+}
+
+// ObjectStoreConfig holds the S3/MinIO settings used to stage browser-uploaded
+// installer images before they are imported into vCenter. Uploads are handed to
+// the browser as presigned URLs, so Endpoint must be the address the *browser*
+// can reach (and, because Crucible is served over HTTPS, it must itself be
+// HTTPS or the browser blocks the request as mixed content).
+type ObjectStoreConfig struct {
+	Endpoint  string
+	AccessKey string
+	SecretKey string
+	Bucket    string
+	Prefix    string
+	UseSSL    bool
 }
 
 type ServerConfig struct {
@@ -62,20 +77,27 @@ type VaultConfig struct {
 
 // VCenterConfig holds vCenter connection settings.
 type VCenterConfig struct {
-	URL           string
-	User          string
-	Password      string
-	Datacenter    string
-	Datastore     string
-	VMFolder      string
+	URL        string
+	User       string
+	Password   string
+	Datacenter string
+	Datastore  string
+	// ISODatastore holds installer media (ISOs) and is deliberately separate
+	// from Datastore, which holds VM disks. Conflating them uploads multi-GB
+	// installer images onto the VM datastore. Note the trailing capital "S" in
+	// the real name -- it is spelled NAS-BackupsAndISOS in vCenter.
+	ISODatastore string
+	// ISOFolder is the datastore-relative directory that uploaded ISOs land in.
+	ISOFolder string
+	VMFolder  string
 	// TemplatesFolder is the full inventory path to the vCenter folder housing
 	// golden-image VMs that admins can register as Crucible templates (e.g.,
 	// "/JMAL-Datacenter/vm/Templates"). Used by the admin folder-enumeration
 	// endpoint; not used by provisioning.
 	TemplatesFolder string
 	ResourcePools   []string
-	Hosts         []string
-	Insecure      bool
+	Hosts           []string
+	Insecure        bool
 
 	// HealthPushgatewayURL enables the in-process vCenter credentials
 	// health probe (see internal/vsphere/health). When set, the api-gateway
@@ -130,16 +152,18 @@ func Load() (*Config, error) {
 			Mount:   getEnv("VAULT_MOUNT", "kubernetes"),
 		},
 		VCenter: VCenterConfig{
-			URL:           getEnv("VCENTER_URL", "https://vcenter.lab.jmal.io/sdk"),
-			User:          getEnv("VCENTER_USER", ""),
-			Password:      getEnv("VCENTER_PASSWORD", ""),
-			Datacenter:    getEnv("VCENTER_DATACENTER", "JMAL-Datacenter"),
-			Datastore:     getEnv("VCENTER_DATASTORE", "NAS-vmstore"),
-			VMFolder:        getEnv("VCENTER_VM_FOLDER", "Student-VMs"),
-			TemplatesFolder: getEnv("VCENTER_TEMPLATES_FOLDER", "/JMAL-Datacenter/vm/Templates"),
-			ResourcePools:   splitEnv("VCENTER_RESOURCE_POOLS", "/JMAL-Datacenter/host/Intel-Cluster/Resources/Student-VMs,/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs"),
-			Hosts:         splitEnv("VCENTER_HOSTS", "esxi1.lab.jmal.io,esxi2.lab.jmal.io,nuc1.lab.jmal.io,nuc2.lab.jmal.io,nuc3.lab.jmal.io"),
-			Insecure:      getEnvBool("VCENTER_INSECURE", true),
+			URL:                  getEnv("VCENTER_URL", "https://vcenter.lab.jmal.io/sdk"),
+			User:                 getEnv("VCENTER_USER", ""),
+			Password:             getEnv("VCENTER_PASSWORD", ""),
+			Datacenter:           getEnv("VCENTER_DATACENTER", "JMAL-Datacenter"),
+			Datastore:            getEnv("VCENTER_DATASTORE", "NAS-vmstore"),
+			ISODatastore:         getEnv("VCENTER_ISO_DATASTORE", "NAS-BackupsAndISOS"),
+			ISOFolder:            getEnv("VCENTER_ISO_FOLDER", "ISOs"),
+			VMFolder:             getEnv("VCENTER_VM_FOLDER", "Student-VMs"),
+			TemplatesFolder:      getEnv("VCENTER_TEMPLATES_FOLDER", "/JMAL-Datacenter/vm/Templates"),
+			ResourcePools:        splitEnv("VCENTER_RESOURCE_POOLS", "/JMAL-Datacenter/host/Intel-Cluster/Resources/Student-VMs,/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs"),
+			Hosts:                splitEnv("VCENTER_HOSTS", "esxi1.lab.jmal.io,esxi2.lab.jmal.io,nuc1.lab.jmal.io,nuc2.lab.jmal.io,nuc3.lab.jmal.io"),
+			Insecure:             getEnvBool("VCENTER_INSECURE", true),
 			HealthPushgatewayURL: getEnv("VCENTER_HEALTH_PUSHGATEWAY_URL", ""),
 			HealthCheckInterval:  getEnvDuration("VCENTER_HEALTH_INTERVAL", 5*time.Minute),
 		},
@@ -150,6 +174,14 @@ func Load() (*Config, error) {
 			SSHHost:     getEnv("OPNSENSE_SSH_HOST", "10.10.10.60:22"),
 			SSHUser:     getEnv("OPNSENSE_SSH_USER", "root"),
 			SSHPassword: getEnv("OPNSENSE_SSH_PASSWORD", ""),
+		},
+		ObjectStore: ObjectStoreConfig{
+			Endpoint:  getEnv("OBJECTSTORE_ENDPOINT", ""),
+			AccessKey: getEnv("OBJECTSTORE_ACCESS_KEY", ""),
+			SecretKey: getEnv("OBJECTSTORE_SECRET_KEY", ""),
+			Bucket:    getEnv("OBJECTSTORE_BUCKET", "isos"),
+			Prefix:    getEnv("OBJECTSTORE_PREFIX", "crucible"),
+			UseSSL:    getEnvBool("OBJECTSTORE_USE_SSL", true),
 		},
 	}
 

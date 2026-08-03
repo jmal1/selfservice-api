@@ -36,6 +36,14 @@ type Handler struct {
 	// fields: nil pointers cause the corresponding probe to report
 	// "not_configured" instead of failing.
 	healthDeps HealthDeps
+
+	// Image upload fields (Epic A). Set via WithImageStore / WithVCenterISOs.
+	// nil means the feature is not configured; handlers return 503.
+	imageStore   ImageStore        // object-store surface for presign/complete/stat/delete
+	imgDB        imageDB           // image-specific DB queries (= h.db in production)
+	isoLister    VCenterISOLister  // vCenter ISO datastore browser
+	isoDatastore string            // which datastore to browse for ISOs
+	isoCache     *isoDatastoreCache // 5-minute ISO listing cache
 }
 
 // VCenterConsole is the interface for vCenter operations needed by the
@@ -86,6 +94,25 @@ func (h *Handler) WithVCenterFolders(vcf VCenterFolderEnumerator, templatesFolde
 		}
 		return out, nil
 	})
+	return h
+}
+
+// WithImageStore wires the object store for image uploads. In production
+// pass the *objectstore.Client; pass a fake ImageStore in tests.
+// h.db is reused as the imageDB so it must be set before calling this.
+func (h *Handler) WithImageStore(store ImageStore) *Handler {
+	h.imageStore = store
+	h.imgDB = h.db // *database.Queries satisfies imageDB structurally
+	return h
+}
+
+// WithVCenterISOs wires vCenter ISO datastore browsing backed by a
+// 5-minute cache. datastore is the vCenter-internal name
+// (e.g. "NAS-BackupsAndISOS" — note the trailing capital S).
+func (h *Handler) WithVCenterISOs(lister VCenterISOLister, datastore string) *Handler {
+	h.isoLister = lister
+	h.isoDatastore = datastore
+	h.isoCache = &isoDatastoreCache{ttl: 5 * time.Minute}
 	return h
 }
 

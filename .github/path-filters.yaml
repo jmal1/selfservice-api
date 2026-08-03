@@ -36,18 +36,22 @@ api-gateway:
   - 'internal/auth/**'
   - 'internal/docs/**'
   - 'internal/middleware/**'
+  - 'internal/objectstore/**'
   - 'internal/scriptvalidator/**'
   - 'internal/templates/**'
+  - 'internal/unattend/**'
   - 'internal/vcenter/**'
   - 'internal/vsphere/**'
   - 'internal/wikitypes/**'
 
 provision-worker:
   - 'cmd/provision-worker/**'
+  - 'internal/objectstore/**'
   - 'internal/opnsense/**'
   - 'internal/provisioner/**'
   - 'internal/rollback/**'
   - 'internal/templates/**'
+  - 'internal/unattend/**'
   - 'internal/vcenter/**'
 
 crucible-engine:

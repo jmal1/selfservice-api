@@ -197,3 +197,38 @@ func TestLifecycleCoversAllModelStates(t *testing.T) {
 		}
 	}
 }
+
+// TestTemplateLifecycle_NoDirectReadyToActive is the anti-brick regression
+// guard for the publish path.
+//
+// ready -> active must NOT be a legal edge. Publishing has to route through
+// verifying, which clones the template, boots the clone, waits for Tools and
+// an IP, and destroys it again. That gate is the only thing standing between
+// a silently-broken template and every student who provisions from it: a
+// template whose unattend password was scrubbed, or whose cloud-init never
+// runs, looks perfectly healthy in vCenter and fails only at first login.
+//
+// TestAllowedNextStates_ReturnsSortedSlice would also catch this by exact-set
+// equality, but it reads as a formatting assertion. This test states the
+// intent, so anyone tempted to add a "publish now" shortcut finds out why the
+// edge is missing rather than assuming it was an oversight.
+func TestTemplateLifecycle_NoDirectReadyToActive(t *testing.T) {
+	if err := CanTransition(models.TemplateStateReady, models.TemplateStateActive); err == nil {
+		t.Error("ready -> active is allowed; publish must route through verifying " +
+			"so the smoke test can reject a broken template before students clone it")
+	}
+
+	// The legal route must stay open, otherwise nothing can ever publish.
+	if err := CanTransition(models.TemplateStateReady, models.TemplateStateVerifying); err != nil {
+		t.Errorf("ready -> verifying must be allowed: %v", err)
+	}
+	if err := CanTransition(models.TemplateStateVerifying, models.TemplateStateActive); err != nil {
+		t.Errorf("verifying -> active must be allowed: %v", err)
+	}
+
+	// A failed smoke test has to be able to send the template back rather
+	// than stranding it in verifying forever.
+	if err := CanTransition(models.TemplateStateVerifying, models.TemplateStateReady); err != nil {
+		t.Errorf("verifying -> ready must be allowed so a failed verify can unwind: %v", err)
+	}
+}

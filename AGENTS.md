@@ -10,7 +10,7 @@
 
 ## 1. What Crucible is, in two paragraphs
 
-Crucible is a self-service VM lab for cybersecurity students. Instructors define **blueprints** (multi-VM pod recipes built from VM **templates**). Students click "Deploy" and get an isolated pod on its own VLAN with a runner Kali VM. Instructors author **automated assessments** that grade a student's pod (e.g. "did the student successfully harden SSH on their target VM?") by running scripts.
+Crucible is a self-service VM lab for cybersecurity students. Instructors define **blueprints** (multi-VM pod recipes built from VM **templates**). Students click "Deploy" and get an isolated pod on its own VLAN. Instructors author **automated assessments** that grade a student's pod (e.g. "did the student successfully harden SSH on their target VM?") by running scripts. Grading scripts execute in an ephemeral **Kali runner container** that the engine attaches to the pod's VLAN for the duration of a run — students are not given Kali VMs and cannot log into the runner.
 
 The grading layer has three nouns: **actions** (one shell-script step), **workflows** (an ordered list of actions, all running in one bash process), and **playlists** (ordered collection of workflows). When a student clicks "Run Assessment", the engine spins up a runner pod, executes the playlist's workflows against their pod, and stores pass/fail + per-action output in the database. Two execution modes exist: `kali_runner` (script runs on a Kali pod with network access to the target) and `vmware_tools` (script runs *inside* the target VM via VMware Tools — useful for "is service X running?" checks that need to be on-VM).
 

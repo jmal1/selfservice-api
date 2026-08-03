@@ -1,6 +1,7 @@
 package models
 
 import (
+	"encoding/json"
 	"time"
 
 	"github.com/google/uuid"
@@ -56,8 +57,21 @@ type Template struct {
 	SourceType     string     `json:"source_type" db:"source_type"`
 	SourceRef      string     `json:"source_ref" db:"source_ref"`
 	StagingNetwork string     `json:"staging_network" db:"staging_network"`
-	CreatedAt      time.Time  `json:"created_at" db:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at" db:"updated_at"`
+	// UnattendMode drives ISO-install automation (migration 000023). Only
+	// meaningful when SourceType == TemplateSourceISO. See the
+	// models.UnattendMode* constants and internal/unattend.
+	UnattendMode string `json:"unattend_mode" db:"unattend_mode"`
+	// UnattendConfig holds mode-specific knobs (locale, timezone, extra
+	// packages...) as raw JSON so the generators can evolve without a
+	// migration. Never contains a password — per-template credentials live
+	// in DefaultUsername/DefaultPassword.
+	UnattendConfig json.RawMessage `json:"unattend_config,omitempty" db:"unattend_config"`
+	// GuestID is the vSphere GuestOS identifier used when creating the
+	// blank VM for an ISO install (e.g. "ubuntu64Guest"). Ignored by every
+	// other source type.
+	GuestID   string    `json:"guest_id" db:"guest_id"`
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt time.Time `json:"updated_at" db:"updated_at"`
 }
 
 // VCenterRef returns the vCenter reference to clone FROM for this
@@ -154,6 +168,118 @@ const (
 	// source_ref holds the ISO's datastore path.
 	TemplateSourceISO = "iso"
 )
+
+// Unattended-install mode constants — keep in sync with the CHECK
+// constraint templates_unattend_mode_check in migration
+// 000023_image_uploads.up.sql and the generators in internal/unattend.
+//
+// Only meaningful when source_type='iso'.
+const (
+	// UnattendModeManual performs no automation: the blank VM boots the
+	// install ISO and an operator drives the installer over the WebMKS
+	// console. ProvisionTemplate skips WaitForTools and parks the template
+	// in `configuring`. This is the always-available fallback.
+	UnattendModeManual = "manual"
+
+	// UnattendModeCloudInitCIData attaches a second CD-ROM containing a
+	// cloud-init NoCloud seed (volume label CIDATA, files user-data and
+	// meta-data). Used for Ubuntu Server subiquity autoinstall.
+	UnattendModeCloudInitCIData = "cloudinit_cidata"
+
+	// UnattendModeDebianPreseed remasters the source install ISO to embed
+	// /preseed.cfg plus the boot parameters debian-installer needs to read
+	// it (it will not read a second CD unaided). Used for Kali/Debian.
+	UnattendModeDebianPreseed = "debian_preseed"
+
+	// UnattendModeWindowsAutounattend attaches a seed ISO with
+	// autounattend.xml at its root, which Windows Setup auto-detects on any
+	// removable media root.
+	UnattendModeWindowsAutounattend = "windows_autounattend"
+)
+
+// AllUnattendModes is the canonical ordered list, for validation and for
+// populating the wizard's mode selector.
+var AllUnattendModes = []string{
+	UnattendModeManual,
+	UnattendModeCloudInitCIData,
+	UnattendModeDebianPreseed,
+	UnattendModeWindowsAutounattend,
+}
+
+// ValidUnattendMode reports whether s is a known unattend mode.
+func ValidUnattendMode(s string) bool {
+	for _, m := range AllUnattendModes {
+		if m == s {
+			return true
+		}
+	}
+	return false
+}
+
+// Image upload lifecycle constants — keep in sync with the CHECK
+// constraint on image_uploads.status in migration 000023.
+//
+// pending -> uploading -> uploaded -> importing -> imported
+// with `error` reachable from any non-terminal state.
+const (
+	// ImageUploadPending is the row's state between creating the DB record
+	// and the browser starting its first part PUT.
+	ImageUploadPending = "pending"
+
+	// ImageUploadUploading means at least one part has been presigned and
+	// the client is streaming. Rows stuck here for >2h are leak candidates.
+	ImageUploadUploading = "uploading"
+
+	// ImageUploadUploaded means the multipart upload was completed and the
+	// object's real size was confirmed via Stat. Ready to import.
+	ImageUploadUploaded = "uploaded"
+
+	// ImageUploadImporting means the image_import worker job is streaming
+	// MinIO -> vCenter.
+	ImageUploadImporting = "importing"
+
+	// ImageUploadImported is terminal success. For ISOs datastore_path is
+	// set; for OVAs vcenter_vm_id is set. The MinIO object has been
+	// released at this point (stagingv01 disk is small — see migration
+	// 000023 header).
+	ImageUploadImported = "imported"
+
+	// ImageUploadError is terminal failure. error_message explains why and
+	// the MinIO object is deliberately retained so a retry is cheap.
+	ImageUploadError = "error"
+)
+
+// Image kind constants. Derived server-side from the filename extension —
+// never trusted from the client.
+const (
+	// ImageKindISO is installation media mounted as a CD-ROM.
+	ImageKindISO = "iso"
+
+	// ImageKindOVA is a packaged virtual appliance imported via OVF. The
+	// resulting VM lands in the Templates folder and is therefore already
+	// selectable through the existing clone_vcenter source type — OVA needs
+	// no new template source type.
+	ImageKindOVA = "ova"
+)
+
+// ImageUpload is a staged ISO/OVA on its way from the operator's browser
+// into vCenter. See migration 000023_image_uploads.up.sql.
+type ImageUpload struct {
+	ID             uuid.UUID  `json:"id" db:"id"`
+	Filename       string     `json:"filename" db:"filename"`
+	Kind           string     `json:"kind" db:"kind"`
+	SizeBytes      int64      `json:"size_bytes" db:"size_bytes"`
+	ChecksumSHA256 string     `json:"checksum_sha256" db:"checksum_sha256"`
+	ObjectKey      string     `json:"object_key" db:"object_key"`
+	UploadID       string     `json:"upload_id" db:"upload_id"`
+	Status         string     `json:"status" db:"status"`
+	DatastorePath  string     `json:"datastore_path" db:"datastore_path"`
+	VCenterVMID    string     `json:"vcenter_vm_id" db:"vcenter_vm_id"`
+	ErrorMessage   string     `json:"error_message" db:"error_message"`
+	UploadedBy     *uuid.UUID `json:"uploaded_by,omitempty" db:"uploaded_by"`
+	CreatedAt      time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at" db:"updated_at"`
+}
 
 // TemplateAccess controls which users/roles can use a template.
 type TemplateAccess struct {
@@ -350,6 +476,12 @@ const (
 	JobTypeTemplateProvision  = "template_provision"
 	JobTypeTemplateGeneralize = "template_generalize"
 	JobTypeTemplateVerify     = "template_verify"
+
+	// JobTypeImageImport streams a staged ISO/OVA out of MinIO and into
+	// vCenter — ISOs are uploaded to the NAS-BackupsAndISOS datastore,
+	// OVAs are deployed via OVF import into the Templates folder. Payload
+	// is provisioner.ImageImportPayload.
+	JobTypeImageImport = "image_import"
 )
 
 // Job status constants.

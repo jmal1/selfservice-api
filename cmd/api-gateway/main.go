@@ -16,6 +16,7 @@ import (
 	"github.com/jmal1/selfservice-api/internal/config"
 	"github.com/jmal1/selfservice-api/internal/database"
 	events "github.com/jmal1/selfservice-api/internal/nats"
+	"github.com/jmal1/selfservice-api/internal/objectstore"
 	"github.com/jmal1/selfservice-api/internal/vcenter"
 	vsphereHealth "github.com/jmal1/selfservice-api/internal/vsphere/health"
 )
@@ -96,6 +97,35 @@ func main() {
 	if vc, ok := vcClient.(*vcenter.Client); ok && vc != nil && cfg.VCenter.TemplatesFolder != "" {
 		handler.WithVCenterFolders(vc, cfg.VCenter.TemplatesFolder)
 		logger.Info("vCenter folder enumeration enabled", "folder", cfg.VCenter.TemplatesFolder)
+	}
+
+	// Image upload (Epic A). Optional: without an object store every
+	// /admin/images endpoint answers 503 "image upload not configured"
+	// rather than nil-panicking, so the gateway still serves everything else.
+	if cfg.ObjectStore.Endpoint != "" {
+		objects, err := objectstore.New(objectstore.Config{
+			Endpoint:  cfg.ObjectStore.Endpoint,
+			AccessKey: cfg.ObjectStore.AccessKey,
+			SecretKey: cfg.ObjectStore.SecretKey,
+			Bucket:    cfg.ObjectStore.Bucket,
+			Prefix:    cfg.ObjectStore.Prefix,
+			UseSSL:    cfg.ObjectStore.UseSSL,
+		})
+		if err != nil {
+			logger.Error("object store init failed — image upload disabled", "error", err)
+		} else {
+			handler.WithImageStore(objects)
+			logger.Info("image upload enabled",
+				"endpoint", cfg.ObjectStore.Endpoint, "bucket", cfg.ObjectStore.Bucket)
+		}
+	} else {
+		logger.Info("image upload disabled (object store not configured)")
+	}
+
+	// ISO datastore browsing for the template wizard's ISO picker.
+	if vc, ok := vcClient.(*vcenter.Client); ok && vc != nil && cfg.VCenter.ISODatastore != "" {
+		handler.WithVCenterISOs(vc, cfg.VCenter.ISODatastore)
+		logger.Info("vCenter ISO browsing enabled", "datastore", cfg.VCenter.ISODatastore)
 	}
 
 	// Pre-declare so the in-process vSphere probe (started below) can be

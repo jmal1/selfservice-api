@@ -164,5 +164,13 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # The instructor wiki at /wiki is served from internal/docs/_bundle, which
+      # embeds both the markdown docs AND source files like routes.go. Editing a
+      # seed (or a bundled source file) without re-running `make wiki-bundle`
+      # silently ships instructors and AI authoring agents a stale reference.
+      # This guard was documented as existing but was never actually wired into CI.
+      - name: Verify wiki bundle
+        run: make verify-wiki
+
       - name: Test
         run: go test ./... -v -race

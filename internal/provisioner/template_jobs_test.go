@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +13,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/jmal1/selfservice-api/internal/models"
+	"github.com/jmal1/selfservice-api/internal/unattend"
+	"github.com/jmal1/selfservice-api/internal/vcenter"
 )
 
 // TestGeneralizeScript_LinuxContainsCriticalSteps locks in the contract
@@ -134,6 +138,10 @@ func TestTemplateProvisionPayload_JSONRoundTrip(t *testing.T) {
 		StagingNetwork: "LabVMs-VLAN30",
 		VCPUs:          4,
 		RAMmb:          8192,
+		DiskGB:         40,
+		GuestID:        "ubuntu64Guest",
+		UnattendMode:   models.UnattendModeCloudInitCIData,
+		UnattendConfig: json.RawMessage(`{"Hostname":"kali-lab"}`),
 	}
 	b, err := json.Marshal(original)
 	if err != nil {
@@ -149,6 +157,10 @@ func TestTemplateProvisionPayload_JSONRoundTrip(t *testing.T) {
 		`"staging_network":"LabVMs-VLAN30"`,
 		`"vcpus":4`,
 		`"ram_mb":8192`,
+		`"disk_gb":40`,
+		`"guest_id":"ubuntu64Guest"`,
+		`"unattend_mode":"cloudinit_cidata"`,
+		`"unattend_config":{"Hostname":"kali-lab"}`,
 	} {
 		if !strings.Contains(string(b), want) {
 			t.Errorf("provision payload JSON missing %s\ngot: %s", want, b)
@@ -159,7 +171,9 @@ func TestTemplateProvisionPayload_JSONRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(b, &roundTripped); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if roundTripped != original {
+	// TemplateProvisionPayload now carries a json.RawMessage (UnattendConfig),
+	// so it is no longer comparable with ==; compare structurally.
+	if !reflect.DeepEqual(roundTripped, original) {
 		t.Errorf("round-trip mismatch\nwant: %+v\ngot:  %+v", original, roundTripped)
 	}
 }
@@ -248,5 +262,315 @@ func TestPollGuestCredentials_HonorsContextCancel(t *testing.T) {
 	err := pollGuestCredentials(ctx, validate, time.Hour, 10*time.Millisecond)
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("expected context.Canceled, got %v", err)
+	}
+}
+
+// ── ISO template-provision fakes ───────────────────────────────────────────
+//
+// These target the pure provisionTemplateFromISO function with in-package
+// fakes for vCenter and the database — the same idiom as image_jobs_test.go.
+// The real *vcenter.Client / *database.Queries satisfy the narrow interfaces
+// (asserted at compile time in template_jobs.go), so exercising the core here
+// covers the branching the source_type=iso path adds.
+
+// fakeISOVC records every vCenter call the ISO path makes so a test can assert
+// which dependency ran, in what order, and with what arguments.
+type fakeISOVC struct {
+	createErr error
+	createRet string // moref returned by CreateBlankVM
+	waitErr   error
+	uploadErr error
+	detachErr error
+	powerErr  error
+
+	uploadCalls  int
+	uploadDS     string
+	uploadRemote string
+
+	createCalls  int
+	createParams vcenter.BlankVMParams
+
+	powerOnCalls int
+	powerOnMoref string
+
+	waitCalls   int
+	waitMoref   string
+	waitTimeout time.Duration
+
+	detachCalls int
+	detachMoref string
+}
+
+func (f *fakeISOVC) UploadToDatastore(_ context.Context, datastore, remotePath string, r io.Reader, _ int64, _ func(sent int64)) error {
+	f.uploadCalls++
+	f.uploadDS = datastore
+	f.uploadRemote = remotePath
+	if f.uploadErr != nil {
+		return f.uploadErr
+	}
+	// Drain the seed bytes with a bounded buffer, mirroring the real upload.
+	_, _ = io.CopyBuffer(io.Discard, r, make([]byte, 32*1024))
+	return nil
+}
+
+func (f *fakeISOVC) CreateBlankVM(_ context.Context, p vcenter.BlankVMParams) (string, error) {
+	f.createCalls++
+	f.createParams = p
+	if f.createErr != nil {
+		return "", f.createErr
+	}
+	if f.createRet == "" {
+		return "vm-iso-0001", nil
+	}
+	return f.createRet, nil
+}
+
+func (f *fakeISOVC) PowerOnVM(_ context.Context, moref string) error {
+	f.powerOnCalls++
+	f.powerOnMoref = moref
+	return f.powerErr
+}
+
+func (f *fakeISOVC) WaitForTools(_ context.Context, moref string, timeout time.Duration) error {
+	f.waitCalls++
+	f.waitMoref = moref
+	f.waitTimeout = timeout
+	return f.waitErr
+}
+
+func (f *fakeISOVC) DetachCDROMs(_ context.Context, moref string) error {
+	f.detachCalls++
+	f.detachMoref = moref
+	return f.detachErr
+}
+
+// fakeISODB records lifecycle transitions and keeps the template's current
+// state in sync so markTemplateErrorViaDB (which re-reads the row) observes the
+// same state the code just moved it through.
+type fakeISODB struct {
+	tmpl   *models.Template
+	getErr error
+
+	setVMCalls  int
+	setVMMoref  string
+	transitions []string // "from->to"
+}
+
+func (f *fakeISODB) GetTemplateByID(_ context.Context, _ uuid.UUID) (*models.Template, error) {
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	return f.tmpl, nil
+}
+
+func (f *fakeISODB) SetTemplateVCenterVM(_ context.Context, _ uuid.UUID, vcenterVMID string) error {
+	f.setVMCalls++
+	f.setVMMoref = vcenterVMID
+	return nil
+}
+
+func (f *fakeISODB) UpdateTemplateLifecycleState(_ context.Context, _ uuid.UUID, from, to string) error {
+	if f.tmpl != nil && f.tmpl.TemplateState != from {
+		// Guard against a stale/incorrect transition source, exactly as the
+		// real optimistic-locking UPDATE would.
+		return errors.New("stale transition: have " + f.tmpl.TemplateState + " want " + from)
+	}
+	f.transitions = append(f.transitions, from+"->"+to)
+	if f.tmpl != nil {
+		f.tmpl.TemplateState = to
+	}
+	return nil
+}
+
+func (f *fakeISODB) finalState() string {
+	if f.tmpl == nil {
+		return ""
+	}
+	return f.tmpl.TemplateState
+}
+
+// baseISOPayload returns a valid source_type=iso payload; individual tests
+// tweak UnattendMode / SourceRef to exercise a branch.
+func baseISOPayload() TemplateProvisionPayload {
+	return TemplateProvisionPayload{
+		TemplateID:     uuid.New(),
+		SourceType:     models.TemplateSourceISO,
+		SourceRef:      "[NAS-BackupsAndISOS] ISOs/ubuntu-24.04-live-server.iso",
+		VMName:         "tpl-ubuntu-abc123",
+		FolderPath:     "JMAL-Datacenter/vm/Templates",
+		StagingNetwork: "LabVMs-VLAN30",
+		VCPUs:          2,
+		RAMmb:          4096,
+		DiskGB:         40,
+		GuestID:        "ubuntu64Guest",
+	}
+}
+
+func newISOFakes(payload TemplateProvisionPayload) (*fakeISOVC, *fakeISODB) {
+	return &fakeISOVC{}, &fakeISODB{
+		tmpl: &models.Template{
+			ID:            payload.TemplateID,
+			TemplateState: models.TemplateStateProvisioning,
+			SourceType:    models.TemplateSourceISO,
+		},
+	}
+}
+
+// TestProvisionTemplate_ISO_Manual proves the manual install path NEVER waits
+// for VMware Tools (the OS is not installed yet, so Tools can never appear) and
+// parks the template in 'configuring' for a hands-on console install. A
+// regression that re-enabled WaitForTools here would make every manual build
+// hang for the full timeout and then falsely error.
+func TestProvisionTemplate_ISO_Manual(t *testing.T) {
+	payload := baseISOPayload()
+	payload.UnattendMode = models.UnattendModeManual
+	vc, db := newISOFakes(payload)
+
+	err := provisionTemplateFromISO(context.Background(), vc, db, discardLogger(), nil, payload)
+	if err != nil {
+		t.Fatalf("manual ISO provision returned error: %v", err)
+	}
+
+	if vc.waitCalls != 0 {
+		t.Errorf("manual install must NOT call WaitForTools; got %d calls", vc.waitCalls)
+	}
+	if vc.detachCalls != 0 {
+		t.Errorf("manual install must NOT detach CD-ROMs (installer is still needed); got %d calls", vc.detachCalls)
+	}
+	if vc.uploadCalls != 0 {
+		t.Errorf("manual install must NOT build/upload a seed ISO; got %d uploads", vc.uploadCalls)
+	}
+	if vc.createCalls != 1 {
+		t.Errorf("expected exactly one CreateBlankVM call, got %d", vc.createCalls)
+	}
+	if vc.powerOnCalls != 1 {
+		t.Errorf("expected the VM to be powered on once, got %d", vc.powerOnCalls)
+	}
+	if got := db.finalState(); got != models.TemplateStateConfiguring {
+		t.Errorf("final template state = %q, want %q", got, models.TemplateStateConfiguring)
+	}
+	// The installer must be mounted with no seed CD for a manual install.
+	if vc.createParams.ISOPath != payload.SourceRef {
+		t.Errorf("CreateBlankVM ISOPath = %q, want %q", vc.createParams.ISOPath, payload.SourceRef)
+	}
+	if vc.createParams.SeedISOPath != "" {
+		t.Errorf("manual install must not attach a seed ISO, got SeedISOPath=%q", vc.createParams.SeedISOPath)
+	}
+}
+
+// TestProvisionTemplate_ISO_Unattended proves the unattended path builds+uploads
+// a seed ISO, waits for Tools on the LONG install-length deadline (not the
+// clone-length 5m), and then detaches the CD-ROMs so the finished template
+// holds no ISO lock on the datastore. Each of those is a distinct regression
+// guard: a short timeout would fail every real install; a skipped DetachCDROMs
+// would leave a datastore lock that blocks replacing the ISO later.
+func TestProvisionTemplate_ISO_Unattended(t *testing.T) {
+	payload := baseISOPayload()
+	payload.UnattendMode = models.UnattendModeCloudInitCIData
+	// unattend.BuildSeedISO(cloudinit_cidata) needs a password to hash into the
+	// autoinstall; supply it (and a hostname) via UnattendConfig.
+	payload.UnattendConfig = json.RawMessage(`{"Hostname":"ubuntu-lab","Password":"S3edP@ss-not-a-real-secret"}`) // pragma: allowlist-secret
+	vc, db := newISOFakes(payload)
+	vc.createRet = "vm-iso-7788"
+
+	err := provisionTemplateFromISO(context.Background(), vc, db, discardLogger(), nil, payload)
+	if err != nil {
+		t.Fatalf("unattended ISO provision returned error: %v", err)
+	}
+
+	if vc.uploadCalls != 1 {
+		t.Fatalf("expected the seed ISO to be uploaded exactly once, got %d", vc.uploadCalls)
+	}
+	if vc.createCalls != 1 {
+		t.Fatalf("expected exactly one CreateBlankVM call, got %d", vc.createCalls)
+	}
+	// The uploaded seed must be attached as CD-ROM 1 on the created VM, on the
+	// same datastore as the installer.
+	wantSeedPath := vcenter.DatastorePath(vc.uploadDS, vc.uploadRemote)
+	if vc.createParams.SeedISOPath != wantSeedPath {
+		t.Errorf("CreateBlankVM SeedISOPath = %q, want the uploaded seed %q", vc.createParams.SeedISOPath, wantSeedPath)
+	}
+	if vc.uploadDS != "NAS-BackupsAndISOS" {
+		t.Errorf("seed uploaded to datastore %q, want it beside the installer on %q", vc.uploadDS, "NAS-BackupsAndISOS")
+	}
+	if vc.waitCalls != 1 {
+		t.Fatalf("unattended install must wait for VMware Tools once, got %d calls", vc.waitCalls)
+	}
+	if vc.waitTimeout != isoInstallToolsTimeout {
+		t.Errorf("WaitForTools timeout = %s, want the long install deadline %s (a clone-length wait would fail every real install)", vc.waitTimeout, isoInstallToolsTimeout)
+	}
+	if vc.waitTimeout <= 5*time.Minute {
+		t.Errorf("install-length WaitForTools timeout (%s) must be much longer than the clone path's 5m", vc.waitTimeout)
+	}
+	if vc.detachCalls != 1 {
+		t.Fatalf("unattended install must detach CD-ROMs after Tools appear, got %d calls", vc.detachCalls)
+	}
+	if vc.detachMoref != "vm-iso-7788" {
+		t.Errorf("DetachCDROMs called on %q, want the created VM %q", vc.detachMoref, "vm-iso-7788")
+	}
+	if got := db.finalState(); got != models.TemplateStateConfiguring {
+		t.Errorf("final template state = %q, want %q", got, models.TemplateStateConfiguring)
+	}
+}
+
+// TestProvisionTemplate_ISO_BadSourceRef proves a malformed installer path is
+// rejected BEFORE any VM is created — the real assertion is that CreateBlankVM
+// recorded zero calls, so a typo can never orphan a half-built shell in vCenter.
+// The template must also land in 'error' with an actionable message.
+func TestProvisionTemplate_ISO_BadSourceRef(t *testing.T) {
+	payload := baseISOPayload()
+	payload.SourceRef = "NAS-BackupsAndISOS/ISOs/ubuntu.iso" // missing the [datastore] brackets
+	vc, db := newISOFakes(payload)
+
+	err := provisionTemplateFromISO(context.Background(), vc, db, discardLogger(), nil, payload)
+	if err == nil {
+		t.Fatal("expected an error for a malformed source_ref, got nil")
+	}
+	if vc.createCalls != 0 {
+		t.Fatalf("malformed source_ref must NOT create a VM; CreateBlankVM was called %d time(s)", vc.createCalls)
+	}
+	if vc.uploadCalls != 0 || vc.powerOnCalls != 0 || vc.waitCalls != 0 {
+		t.Errorf("no vCenter side effects expected on a bad ref (uploads=%d powerOn=%d waits=%d)", vc.uploadCalls, vc.powerOnCalls, vc.waitCalls)
+	}
+	if got := db.finalState(); got != models.TemplateStateError {
+		t.Errorf("final template state = %q, want %q", got, models.TemplateStateError)
+	}
+	// Actionable message: it should name the offending ref and the expected form.
+	if !strings.Contains(err.Error(), payload.SourceRef) || !strings.Contains(err.Error(), "[datastore]") {
+		t.Errorf("error should quote the bad ref and the expected \"[datastore] path\" form, got: %v", err)
+	}
+}
+
+// TestProvisionTemplate_ISO_RemasterUnsupportedFailsLoudly proves that when the
+// seed builder reports ErrPreseedRequiresRemaster (debian_preseed, which cannot
+// be seeded from a second CD in pure Go), the job FAILS instead of silently
+// downgrading to a manual install. A silent downgrade would make the operator
+// wait the full 60-minute Tools deadline for automation that was never going to
+// run. The regression guards are: (1) the returned error wraps the real
+// sentinel, (2) the message tells the operator to set unattend_mode=manual, and
+// (3) the code did NOT proceed to create the VM or wait for Tools.
+func TestProvisionTemplate_ISO_RemasterUnsupportedFailsLoudly(t *testing.T) {
+	payload := baseISOPayload()
+	payload.UnattendMode = models.UnattendModeDebianPreseed
+	vc, db := newISOFakes(payload)
+
+	err := provisionTemplateFromISO(context.Background(), vc, db, discardLogger(), nil, payload)
+	if err == nil {
+		t.Fatal("debian_preseed must fail loudly, got nil (silent downgrade to manual)")
+	}
+	if !errors.Is(err, unattend.ErrPreseedRequiresRemaster) {
+		t.Errorf("error must wrap the real unattend.ErrPreseedRequiresRemaster sentinel, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "manual") {
+		t.Errorf("error must tell the operator to set unattend_mode=manual, got: %v", err)
+	}
+	if vc.createCalls != 0 {
+		t.Errorf("must NOT create a VM when the seed cannot be built; CreateBlankVM called %d time(s)", vc.createCalls)
+	}
+	if vc.waitCalls != 0 {
+		t.Errorf("must NOT proceed to wait for Tools (the silent-downgrade bug); WaitForTools called %d time(s)", vc.waitCalls)
+	}
+	if got := db.finalState(); got != models.TemplateStateError {
+		t.Errorf("final template state = %q, want %q", got, models.TemplateStateError)
 	}
 }
