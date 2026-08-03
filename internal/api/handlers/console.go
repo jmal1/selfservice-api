@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -16,6 +17,11 @@ import (
 	"github.com/jmal1/selfservice-api/internal/middleware"
 	"github.com/jmal1/selfservice-api/internal/models"
 )
+
+// consoleHeartbeatInterval is how often a long-lived console session refreshes
+// last_activity_at. 15 minutes is well within the 6-hour idle threshold, so an
+// 8-hour continuous session never accumulates enough idle time to be suspended.
+const consoleHeartbeatInterval = 15 * time.Minute
 
 var wsUpgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
@@ -76,6 +82,7 @@ func (h *Handler) VMConsoleWS(w http.ResponseWriter, r *http.Request) {
 	h.runWebMKSProxy(w, r, runWebMKSProxyArgs{
 		VCenterVMID:     *vm.VCenterVMID,
 		DisplayName:     vm.DisplayName,
+		PodVMID:         &vmID,
 		AuditOpenEvent:  "console.open",
 		AuditCloseEvent: "console.close",
 		AuditOpts: []audit.Option{
@@ -95,8 +102,11 @@ func (h *Handler) VMConsoleWS(w http.ResponseWriter, r *http.Request) {
 // by the caller before invoking runWebMKSProxy — this helper assumes the
 // request is authorized and the vCenter VM ID is valid.
 type runWebMKSProxyArgs struct {
-	VCenterVMID     string         // vCenter VM moref to acquire a ticket for
-	DisplayName     string         // human-friendly name for logs/audit detail
+	VCenterVMID string // vCenter VM moref to acquire a ticket for
+	DisplayName string // human-friendly name for logs/audit detail
+	// PodVMID, when non-nil, causes the proxy to record console activity on
+	// the pod_vms row. Nil for template-build-VM consoles (no tracking needed).
+	PodVMID         *uuid.UUID
 	AuditOpenEvent  string         // e.g. "console.open" or "template.console.open"
 	AuditCloseEvent string         // e.g. "console.close" or "template.console.close"
 	AuditOpts       []audit.Option // resource/IP/details merged into both open+close events
@@ -188,6 +198,34 @@ func (h *Handler) runWebMKSProxy(w http.ResponseWriter, r *http.Request, args ru
 		"client_subprotocol", clientConn.Subprotocol(),
 	}, args.LogFields...)...)
 
+	// Console activity tracking (pod VMs only). Record open, send a
+	// periodic heartbeat every consoleHeartbeatInterval so a long-lived
+	// session is never marked idle mid-use, and record close when the
+	// proxy exits for any reason (clean close or abnormal disconnect).
+	// Using context.Background() for DB calls so a cancelled request
+	// context (e.g. browser navigating away) does not drop the write.
+	sessionDone := make(chan struct{})
+	if args.PodVMID != nil {
+		vmID := *args.PodVMID
+		if err := h.db.TouchVMConsoleAt(context.Background(), vmID, time.Now()); err != nil {
+			h.logger.Warn("console: touch open failed", append([]any{"error", err}, args.LogFields...)...)
+		}
+		go func() {
+			ticker := time.NewTicker(consoleHeartbeatInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					if err := h.db.TouchVMConsoleAt(context.Background(), vmID, time.Now()); err != nil {
+						h.logger.Warn("console: heartbeat touch failed", append([]any{"error", err}, args.LogFields...)...)
+					}
+				case <-sessionDone:
+					return
+				}
+			}
+		}()
+	}
+
 	// Bidirectional proxy
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -211,6 +249,14 @@ func (h *Handler) runWebMKSProxy(w http.ResponseWriter, r *http.Request, args ru
 	}()
 
 	wg.Wait()
+
+	// Signal the heartbeat goroutine to stop, then record close timestamp.
+	close(sessionDone)
+	if args.PodVMID != nil {
+		if err := h.db.TouchVMConsoleAt(context.Background(), *args.PodVMID, time.Now()); err != nil {
+			h.logger.Warn("console: touch close failed", append([]any{"error", err}, args.LogFields...)...)
+		}
+	}
 
 	// Audit: console closed (use background ctx because r.Context() may
 	// already be done when the WS closes)

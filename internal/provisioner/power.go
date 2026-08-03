@@ -47,6 +47,7 @@ func (p *Provisioner) PowerVM(ctx context.Context, job *models.Job, action strin
 			return fmt.Errorf("failed to start %s: %w", podVM.DisplayName, err)
 		}
 		_ = p.db.UpdatePodVMStatus(ctx, podVMID, "running")
+		_ = p.db.ClearVMSuspendedAt(ctx, podVMID)
 
 	case "stop":
 		if err := p.vc.PowerOffVM(ctx, moref); err != nil {

@@ -276,6 +276,47 @@ func main() {
 	}
 	networkReconcilerCfg := provisioner.NetworkReconcilerConfig{Pusher: networkReconcilerPusher}
 
+	// Idle VM suspend evaluator. Checks for running pod VMs that have been
+	// idle (no console activity AND low CPU/net) for longer than the configured
+	// threshold and suspends them to free cluster resources.
+	//
+	// DRY-RUN IS ON BY DEFAULT. The evaluator logs what it would suspend but
+	// makes no vCenter mutations until WORKER_IDLE_EVALUATOR_DRY_RUN=false is
+	// set explicitly, after an operator has validated the decisions on live data.
+	// Suspending a student mid-exam is the failure mode that matters; the code
+	// ships defaulting to safe.
+	//
+	// WORKER_IDLE_EVALUATOR_ENABLED=false disables the loop entirely.
+	// WORKER_IDLE_EVALUATOR_INTERVAL overrides the default 15-minute cadence.
+	idleEvalEnabled := true
+	if v := os.Getenv("WORKER_IDLE_EVALUATOR_ENABLED"); v != "" {
+		idleEvalEnabled = strings.EqualFold(v, "true")
+	}
+	idleEvalInterval := 15 * time.Minute
+	if v := os.Getenv("WORKER_IDLE_EVALUATOR_INTERVAL"); v != "" {
+		if parsed, err := time.ParseDuration(v); err == nil && parsed > 0 {
+			idleEvalInterval = parsed
+		} else {
+			logger.Warn("invalid WORKER_IDLE_EVALUATOR_INTERVAL; using default 15m", "value", v, "error", err)
+		}
+	}
+	idleEvalDryRun := true // default ON — see comment above
+	if v := os.Getenv("WORKER_IDLE_EVALUATOR_DRY_RUN"); strings.EqualFold(v, "false") {
+		idleEvalDryRun = false
+	}
+	var idleEvalPusher *provisioner.SuspendMetrics
+	if pgURL := os.Getenv("WORKER_PUSHGATEWAY_URL"); pgURL != "" {
+		job := os.Getenv("WORKER_PUSHGATEWAY_JOB")
+		if job == "" {
+			job = "crucible_provision_worker"
+		}
+		idleEvalPusher = provisioner.NewSuspendMetrics(pgURL, job, map[string]string{"layer": "api"})
+	}
+	idleEvalCfg := provisioner.IdleEvaluatorConfig{
+		DryRun: idleEvalDryRun,
+		Pusher: idleEvalPusher,
+	}
+
 	// Worker ID for job claiming
 	workerID, err := os.Hostname()
 	if err != nil {
@@ -351,6 +392,20 @@ func main() {
 		}()
 	}
 
+	// Idle VM suspend evaluator ticker (disabled by default via dry-run; nil-safe).
+	var idleEvalTickerC <-chan time.Time
+	if idleEvalEnabled {
+		t := time.NewTicker(idleEvalInterval)
+		defer t.Stop()
+		idleEvalTickerC = t.C
+		logger.Info("idle vm evaluator enabled",
+			"interval", idleEvalInterval,
+			"dry_run", idleEvalDryRun)
+		if idleEvalPusher != nil {
+			go idleEvalPusher.RunSuspendMetricsPusher(ctx, 30*time.Second, logger)
+		}
+	}
+
 	// Start expiration cron (checks for expired pods every 5 minutes)
 	go prov.StartExpirationCron(ctx)
 
@@ -377,6 +432,10 @@ func main() {
 			case <-networkReconcilerTickerC:
 				if _, err := prov.ReconcileNetwork(ctx, networkReconcilerCfg); err != nil {
 					logger.Error("network reconcile failed", "error", err)
+				}
+			case <-idleEvalTickerC:
+				if _, err := prov.EvaluateIdleVMs(ctx, idleEvalCfg); err != nil {
+					logger.Error("idle vm evaluation failed", "error", err)
 				}
 			}
 		}
