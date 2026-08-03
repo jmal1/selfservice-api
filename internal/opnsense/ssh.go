@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log/slog"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -109,10 +111,15 @@ func (s *SSHClient) AssignInterface(ctx context.Context, vlanTag int, ipAddr str
 		return "", fmt.Errorf("find VLAN device for tag %d: %w", vlanTag, err)
 	}
 
-	// Find next available opt interface
-	ifName, err := s.findNextInterface(client)
+	// Resolve which OPT interface this VLAN should live on. This is
+	// deliberately reuse-first: re-assigning a VLAN that already has an
+	// interface must land on the SAME interface, otherwise the network
+	// reconciler (which re-asserts desired state every 5 minutes) allocates a
+	// fresh interface on every pass and each pass clobbers the previous pod's
+	// gateway. See resolveInterfaceScript for the full history.
+	ifName, err := s.resolveInterface(client, vlanDev)
 	if err != nil {
-		return "", fmt.Errorf("find next interface: %w", err)
+		return "", fmt.Errorf("resolve interface for VLAN %d (dev %s): %w", vlanTag, vlanDev, err)
 	}
 
 	s.logger.Info("assigning OPNsense interface",
@@ -290,25 +297,88 @@ func (s *SSHClient) findVLANDevice(client *ssh.Client, vlanTag int) (string, err
 	return dev, nil
 }
 
-// findNextInterface determines the next available optN name.
-func (s *SSHClient) findNextInterface(client *ssh.Client) (string, error) {
-	// List existing interfaces from config
-	output, err := s.runCommand(client,
-		`grep -oP '<(opt\d+)>' /conf/config.xml | sort -u | tail -1`)
-	if err != nil || strings.TrimSpace(output) == "" {
-		return "opt1", nil // first optional interface
+// vlanDevRe bounds what may be interpolated into the PHP below. VLAN device
+// names come from OPNsense's own config, but this function writes a script that
+// runs as root on the firewall, so the value is validated at the boundary rather
+// than trusted because of where it came from.
+var vlanDevRe = regexp.MustCompile(`^[A-Za-z0-9_.]+$`)
+
+var optInterfaceRe = regexp.MustCompile(`^opt[0-9]+$`)
+
+// maxOptInterfaces bounds the search. Well above any plausible pod count, but
+// finite so a corrupt config cannot spin here.
+const maxOptInterfaces = 512
+
+// resolveInterfaceScript returns the PHP that picks the OPT interface a VLAN
+// device should be bound to. It is a pure function so the logic can be tested
+// without a firewall.
+//
+// It answers two questions in one round-trip, in this order:
+//
+//  1. Is an interface ALREADY bound to this VLAN device? If so, return it.
+//  2. Otherwise, return the LOWEST optN not currently in use.
+//
+// Both halves replaced a single line of shell that was wrong twice over:
+//
+//		grep -oP '<(opt\d+)>' /conf/config.xml | sort -u | tail -1
+//
+//	  - OPNsense is FreeBSD, and BSD grep has no -P. That command exited 2 every
+//	    single time, and the caller treated any error as "no interfaces exist" and
+//	    returned "opt1". So EVERY VLAN was assigned to opt1, each assignment
+//	    silently overwriting the previous pod's gateway. Crucible could only ever
+//	    have one working pod at a time, and the network reconciler re-broke it
+//	    every 5 minutes: 280 Kea restarts in 6 hours, with a real user's pod left
+//	    holding no gateway at all.
+//	  - Even with a working -P, `sort -u | tail -1` sorts LEXICOGRAPHICALLY, so
+//	    once opt10 exists it sorts before opt2 and the "next" interface would be
+//	    opt3 -- already taken. Hence the numeric scan here.
+//
+// Reuse-first (step 1) is what actually stops the thrash: the reconciler
+// re-asserts desired state on a timer, so assignment has to be idempotent.
+func resolveInterfaceScript(vlanDev string) string {
+	return "<?php\n" +
+		"require_once(\"config.inc\");\n" +
+		"$config = parse_config();\n" +
+		"$vlan_dev = '" + vlanDev + "';\n" +
+		"$ifaces = (isset($config['interfaces']) && is_array($config['interfaces'])) ? $config['interfaces'] : array();\n" +
+		"foreach ($ifaces as $ifname => $iface) {\n" +
+		"    if (isset($iface['if']) && $iface['if'] === $vlan_dev) { echo $ifname; exit(0); }\n" +
+		"}\n" +
+		"$used = array();\n" +
+		"foreach ($ifaces as $ifname => $iface) {\n" +
+		"    if (preg_match('/^opt([0-9]+)$/', $ifname, $m)) { $used[intval($m[1])] = true; }\n" +
+		"}\n" +
+		"for ($i = 1; $i <= " + strconv.Itoa(maxOptInterfaces) + "; $i++) {\n" +
+		"    if (!isset($used[$i])) { echo 'opt' . $i; exit(0); }\n" +
+		"}\n" +
+		"fwrite(STDERR, \"no free opt interface\\n\");\n" +
+		"exit(1);\n" +
+		"?>\n"
+}
+
+// resolveInterface returns the OPT interface name a VLAN device should use --
+// the one already bound to it, or the lowest free one.
+func (s *SSHClient) resolveInterface(client *ssh.Client, vlanDev string) (string, error) {
+	if !vlanDevRe.MatchString(vlanDev) {
+		return "", fmt.Errorf("refusing to use unsafe VLAN device name %q", vlanDev)
 	}
 
-	// Extract the highest opt number
-	trimmed := strings.TrimSpace(output)
-	trimmed = strings.TrimPrefix(trimmed, "<")
-	trimmed = strings.TrimSuffix(trimmed, ">")
-	// e.g., "opt5" -> "5"
-	numStr := strings.TrimPrefix(trimmed, "opt")
-	var num int
-	fmt.Sscanf(numStr, "%d", &num)
+	if err := s.writePHPScript(client, "/tmp/ss_resolve_if.php", resolveInterfaceScript(vlanDev)); err != nil {
+		return "", fmt.Errorf("write PHP script: %w", err)
+	}
+	output, err := s.runCommand(client, "/usr/local/bin/php /tmp/ss_resolve_if.php")
+	s.runCommandIgnoreError(client, "rm -f /tmp/ss_resolve_if.php")
+	if err != nil {
+		return "", fmt.Errorf("PHP resolve interface: %w (output: %s)", err, output)
+	}
 
-	return fmt.Sprintf("opt%d", num+1), nil
+	name := strings.TrimSpace(output)
+	// Fail loudly rather than defaulting. Silently defaulting to opt1 on error
+	// is the exact behaviour that caused the outage this function replaced.
+	if !optInterfaceRe.MatchString(name) {
+		return "", fmt.Errorf("unexpected interface name %q from OPNsense", name)
+	}
+	return name, nil
 }
 
 // UnassignInterfaceByVLAN finds and removes the interface assigned to a VLAN tag.
