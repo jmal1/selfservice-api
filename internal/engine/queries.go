@@ -226,6 +226,36 @@ func (q *Queries) UpdateWorkflowResult(ctx context.Context, resultID uuid.UUID, 
 	return err
 }
 
+// TimeoutPendingWorkflowResults marks every still-non-terminal workflow result
+// for a run as timed out, and returns how many rows it closed.
+//
+// The timeout watchdog marks the *run* terminal, but a run that never reported
+// has workflow results still sitting in 'pending' (the runner never called
+// back) or 'running' (it called back once and then died). Those rows outlive
+// the run forever: the testing UI renders them as an assessment still in
+// progress, and UpdateRunCounts — which counts only 'fail', 'error' and
+// 'timeout' as failures — reports zero failed workflows for a run that
+// completed nothing.
+//
+// An existing student_message is preserved. A result that made it to 'running'
+// may already carry partial output, and that output is more useful to the
+// student than the generic timeout text.
+func (q *Queries) TimeoutPendingWorkflowResults(ctx context.Context, runID uuid.UUID, studentMsg string) (int64, error) {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE workflow_results
+		SET status = $3,
+		    student_message = COALESCE(NULLIF(student_message, ''), $2),
+		    completed_at = NOW()
+		WHERE run_id = $1
+		  AND status IN ($4, $5)
+	`, runID, studentMsg, models.ResultStatusTimeout,
+		models.ResultStatusPending, models.ResultStatusRunning)
+	if err != nil {
+		return 0, fmt.Errorf("timeout pending workflow results: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // GenerateCallbackToken creates a cryptographically random callback token.
 func GenerateCallbackToken() (string, error) {
 	bytes := make([]byte, 32)
