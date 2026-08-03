@@ -146,3 +146,41 @@ func TestPipelineMetrics_PushSurfacesHTTPError(t *testing.T) {
 		t.Fatal("expected error on non-2xx response")
 	}
 }
+
+// --------------------------------------------------------------------------
+// Job retry pending gauge: follows the same Collected pattern as stuck gauges
+// --------------------------------------------------------------------------
+
+func TestPipelineMetrics_OmitsUncollectedRetryPendingGauge(t *testing.T) {
+	m := NewPipelineMetrics("", "", nil)
+	out := string(m.serialize())
+
+	// The gauge must be absent before SetJobRetryPending is ever called.
+	// An absent gauge is honest; a permanently-zero one is not (it would
+	// look like "nothing is waiting to retry" even when the reconciler is
+	// broken or has never run).
+	if strings.Contains(out, "crucible_job_retry_pending") {
+		t.Fatalf("expected crucible_job_retry_pending to be omitted before collection:\n%s", out)
+	}
+}
+
+func TestPipelineMetrics_EmitsRetryPendingGaugeAfterCollection(t *testing.T) {
+	m := NewPipelineMetrics("", "", nil)
+	m.SetJobRetryPending(7)
+	out := string(m.serialize())
+
+	if !strings.Contains(out, "crucible_job_retry_pending 7") {
+		t.Fatalf("expected crucible_job_retry_pending 7 after collection:\n%s", out)
+	}
+}
+
+func TestPipelineMetrics_EmitsZeroRetryPendingGaugeAfterCollection(t *testing.T) {
+	m := NewPipelineMetrics("", "", nil)
+	m.SetJobRetryPending(0)
+	out := string(m.serialize())
+
+	// Zero is a valid value once collected — means "reconciler ran, 0 sleeping".
+	if !strings.Contains(out, "crucible_job_retry_pending 0") {
+		t.Fatalf("expected crucible_job_retry_pending 0 after collection:\n%s", out)
+	}
+}

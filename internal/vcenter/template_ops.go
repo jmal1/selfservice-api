@@ -182,6 +182,18 @@ func (c *Client) cloneTemplateSourceVMInner(ctx context.Context, params Template
 	// `govc vm.clone` against student-windows-11 (a regular VM with a
 	// 3-deep snapshot chain and active linked-clone children) succeeds
 	// with neither flag set, so the minimal spec is the right call.
+	//
+	//   * Round 11 (2026-08-03): the "virtual disk is either corrupted or
+	//     not a supported format" fault was proven INTERMITTENT and
+	//     ENVIRONMENTAL — not a property of the source VM or the CloneSpec.
+	//     Evidence: job d62777e7 cloned student-ubuntu-2404 at 20:36:11
+	//     and failed; job a3ba9028 cloned the same source with identical
+	//     parameters at 20:37:19 and succeeded (68 seconds later). The
+	//     same clone run by hand with `govc` against two different
+	//     datastores also succeeded. vCenter's event log showed the failed
+	//     task erroring in ~1 s (a fast validation rejection, not an I/O
+	//     timeout). The fix is job-level retries with exponential backoff
+	//     (internal/provisioner/retryable.go), NOT another CloneSpec change.
 	cloneSpec := types.VirtualMachineCloneSpec{
 		Location: types.VirtualMachineRelocateSpec{
 			Datastore: &dsRef,

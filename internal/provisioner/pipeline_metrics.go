@@ -1,4 +1,4 @@
-// Metrics for the template + image pipeline. Mirrors the design of
+﻿// Metrics for the template + image pipeline. Mirrors the design of
 // DestroyFailedPusher and OrphanCountPusher: no prometheus client
 // dependency, hand-serialized text exposition, pushed to Pushgateway,
 // and a no-op when BaseURL is empty so the worker still does its job in
@@ -74,6 +74,12 @@ type PipelineMetrics struct {
 	templateStates         map[string]float64 // state
 	templateStuck          float64
 	templateStuckCollected bool
+
+	// Job retry metrics (migration 000026).
+	jobRetries                map[string]float64 // type|reason
+	jobRetryExhausted         map[string]float64 // type
+	jobRetryPending           float64            // gauge: jobs sleeping between retries
+	jobRetryPendingCollected  bool               // true once SetJobRetryPending has run
 }
 
 // NewPipelineMetrics returns an initialized collector. baseURL may be
@@ -97,6 +103,8 @@ func NewPipelineMetrics(baseURL, job string, grouping map[string]string) *Pipeli
 		templateJobDurSum:   map[string]float64{},
 		templateJobDurCount: map[string]float64{},
 		templateStates:      map[string]float64{},
+		jobRetries:          map[string]float64{},
+		jobRetryExhausted:   map[string]float64{},
 	}
 }
 
@@ -173,6 +181,36 @@ func (m *PipelineMetrics) SetTemplatesStuck(n int) {
 	defer m.mu.Unlock()
 	m.templateStuck = float64(n)
 	m.templateStuckCollected = true
+}
+
+// RecordJobRetry increments the retry counter for a job type and reason.
+// Called from processJobLifecycle whenever a retryable failure is rescheduled.
+// jobType is one of models.JobType*; reason is one of RetryReason*.
+func (m *PipelineMetrics) RecordJobRetry(jobType, reason string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.jobRetries[jobType+"|"+reason]++
+}
+
+// RecordJobRetryExhausted increments the exhausted counter: the job reached
+// max_retries and entered terminal 'failed' status.
+// Called from processJobLifecycle after the last allowed attempt fails.
+func (m *PipelineMetrics) RecordJobRetryExhausted(jobType string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.jobRetryExhausted[jobType]++
+}
+
+// SetJobRetryPending sets the gauge of jobs currently sleeping between retry
+// attempts. Refreshed by the retry-pending reconciler via CountRetryPendingJobs.
+// The gauge is emitted by serialize only after this method has been called at
+// least once — an uninitialized gauge is omitted entirely rather than
+// scraping as 0 (which would be indistinguishable from "nothing is waiting").
+func (m *PipelineMetrics) SetJobRetryPending(n int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.jobRetryPending = float64(n)
+	m.jobRetryPendingCollected = true
 }
 
 // Push serializes the current values and POSTs them. No-op when BaseURL
@@ -258,6 +296,24 @@ func (m *PipelineMetrics) serialize() []byte {
 		b.WriteString("# HELP crucible_template_stuck Templates sitting in a non-terminal lifecycle state past the staleness threshold.\n")
 		b.WriteString("# TYPE crucible_template_stuck gauge\n")
 		fmt.Fprintf(&b, "crucible_template_stuck %g\n", m.templateStuck)
+	}
+
+	writeCounter2(&b, "crucible_job_retries_total",
+		"Job retry attempts by job type and reason (transient_clone, connection, timeout, unavailable).",
+		"type", "reason", m.jobRetries)
+
+	writeCounter1(&b, "crucible_job_retry_exhausted_total",
+		"Jobs that reached max_retries and entered terminal failed status, by type.",
+		"type", m.jobRetryExhausted)
+
+	// Omit the gauge entirely until the reconciler has run at least once.
+	// An unset gauge reads as 0, which is indistinguishable from "nothing is
+	// waiting to retry" and cannot fire an alert — exactly the permanently-zero
+	// lie we are guarding against (see Collected pattern for the stuck gauges).
+	if m.jobRetryPendingCollected {
+		b.WriteString("# HELP crucible_job_retry_pending Jobs currently sleeping between retry attempts (next_attempt_at > now()).\n")
+		b.WriteString("# TYPE crucible_job_retry_pending gauge\n")
+		fmt.Fprintf(&b, "crucible_job_retry_pending %g\n", m.jobRetryPending)
 	}
 
 	b.WriteString("# HELP crucible_pipeline_run_timestamp_seconds Unix time of the latest pipeline metrics push.\n")

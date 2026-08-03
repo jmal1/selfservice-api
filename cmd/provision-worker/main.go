@@ -197,6 +197,20 @@ func main() {
 		}()
 	}
 
+	// Retry-pending gauge: keep crucible_job_retry_pending accurate. Jobs
+	// sleeping between retry attempts are invisible to ClaimJob but still exist
+	// in the DB; without this ticker the gauge never fires.
+	// Only runs when a pipeline (Pushgateway) is configured; otherwise there is
+	// nowhere to push and the query is pointless.
+	var retryPendingTickerC <-chan time.Time
+	if pipeline != nil {
+		t := time.NewTicker(envDuration(logger, "WORKER_RETRY_PENDING_INTERVAL", 30*time.Second))
+		defer t.Stop()
+		retryPendingTickerC = t.C
+		logger.Info("retry-pending reconciler enabled",
+			"interval", envDuration(logger, "WORKER_RETRY_PENDING_INTERVAL", 30*time.Second))
+	}
+
 	// Optional: vCenter orphan reconciler. Scans the configured Student-VMs
 	// folder against pod_vms on an hourly tick. Auto-destroys synthetic-noop-*
 	// VMs whose parent pod is already terminal; logs + counts everything else
@@ -484,6 +498,10 @@ func main() {
 					StaleThreshold: templateReconcilerStaleThreshold,
 				}); err != nil {
 					logger.Error("template reconcile failed", "error", err)
+				}
+			case <-retryPendingTickerC:
+				if err := prov.ReconcileRetryPending(ctx); err != nil {
+					logger.Error("retry-pending reconcile failed", "error", err)
 				}
 			}
 		}

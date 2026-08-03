@@ -61,6 +61,11 @@ func (s *pipelineMetricsSpy) Push(context.Context) error {
 	return s.pushErr
 }
 
+// Retry metric stubs — satisfy pipelineMetricsSink; not asserted in these tests.
+func (s *pipelineMetricsSpy) RecordJobRetry(_, _ string)    {}
+func (s *pipelineMetricsSpy) RecordJobRetryExhausted(_ string) {}
+func (s *pipelineMetricsSpy) SetJobRetryPending(_ int)        {}
+
 var _ pipelineMetricsSink = (*pipelineMetricsSpy)(nil)
 var _ templateReconcileMetrics = (*pipelineMetricsSpy)(nil)
 
@@ -103,6 +108,11 @@ type fakeJobStatusDB struct {
 func (f *fakeJobStatusDB) UpdateJobStatus(_ context.Context, _ uuid.UUID, status string, _ []byte) error {
 	f.updates = append(f.updates, status)
 	return f.err
+}
+
+// RetryJob stub — satisfies jobStatusUpdater; not asserted in these tests.
+func (f *fakeJobStatusDB) RetryJob(_ context.Context, _ uuid.UUID, _ time.Time) error {
+	return nil
 }
 
 var _ jobStatusUpdater = (*fakeJobStatusDB)(nil)
