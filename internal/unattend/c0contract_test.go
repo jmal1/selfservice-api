@@ -163,10 +163,64 @@ func TestBuildSeedISO_CIData_InstallsHostKeyRegenUnit(t *testing.T) {
 			"and could rotate a live pod's host key")
 	}
 	// Must beat socket activation, or a clone can refuse SSH until cloud-init
-	// happens to catch up.
-	if !strings.Contains(crucibleSSHKeygenUnit, "Before=ssh.service ssh.socket") {
-		t.Error("regen unit does not order itself before ssh.service and ssh.socket; " +
+	// happens to catch up. Ordering before ssh.service is what actually
+	// matters: ssh.socket only binds the port, ssh.service execs sshd and
+	// reads the host keys.
+	if !strings.Contains(crucibleSSHKeygenUnit, "Before=ssh.service") {
+		t.Error("regen unit does not order itself before ssh.service; " +
 			"a clone could accept a connection before its host keys exist")
+	}
+}
+
+// TestSSHKeygenUnit_NoOrderingCycleWithSocketsTarget guards the defect that took
+// SSH down on the first real ISO build.
+//
+// The unit is pulled in by multi-user.target, so systemd's default dependencies
+// give it After=basic.target, and basic.target is After sockets.target. Since
+// ssh.socket is Before=sockets.target, ANY "Before=ssh.socket" (or
+// "Before=sockets.target") on this unit closes an ordering cycle. systemd breaks
+// such a cycle by deleting a job, and on the real build it deleted
+// ssh.socket/start:
+//
+//	sockets.target: Found ordering cycle on ssh.socket/start
+//	sockets.target: Job ssh.socket/start deleted to break ordering cycle
+//
+// Result: nothing listened on port 22, on the template AND on every student
+// clone made from it. The ConditionPathExists guard does not save you - systemd
+// resolves ordering cycles before evaluating conditions.
+func TestSSHKeygenUnit_NoOrderingCycleWithSocketsTarget(t *testing.T) {
+	installTarget := ""
+	var beforeUnits []string
+	for _, line := range strings.Split(crucibleSSHKeygenUnit, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "Before="):
+			beforeUnits = append(beforeUnits, strings.Fields(strings.TrimPrefix(line, "Before="))...)
+		case strings.HasPrefix(line, "WantedBy="):
+			installTarget = strings.TrimSpace(strings.TrimPrefix(line, "WantedBy="))
+		}
+	}
+
+	// Assert the premise, so this test cannot pass vacuously if the unit is
+	// later re-attached to an early target where Before=ssh.socket would be
+	// legitimate.
+	if installTarget != "multi-user.target" {
+		t.Fatalf("this guard assumes WantedBy=multi-user.target (which implies After=basic.target, "+
+			"which is After sockets.target); got WantedBy=%q. Re-derive the cycle before "+
+			"relaxing the check below.", installTarget)
+	}
+	if len(beforeUnits) == 0 {
+		t.Fatal("no Before= line found in the regen unit; the guard below would be hollow")
+	}
+
+	for _, u := range beforeUnits {
+		if u == "ssh.socket" || u == "sockets.target" {
+			t.Errorf("regen unit declares Before=%s while WantedBy=multi-user.target. "+
+				"That is a systemd ordering cycle: multi-user.target -> After basic.target "+
+				"-> After sockets.target -> After ssh.socket -> After this unit. systemd "+
+				"breaks it by DELETING ssh.socket/start, so port 22 never binds on the "+
+				"template or on any clone of it. Order before ssh.service instead.", u)
+		}
 	}
 }
 
