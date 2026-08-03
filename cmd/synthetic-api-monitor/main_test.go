@@ -1,11 +1,13 @@
 package main
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jmal1/selfservice-api/internal/synthetic"
+	"github.com/jmal1/selfservice-api/internal/synthetic/checks"
 )
 
 // names builds a check set carrying only names — the timeout-envelope logic
@@ -398,5 +400,75 @@ func TestResolveMode_DefaultAndJanitorStillBehave(t *testing.T) {
 				t.Errorf("lifecycleEnabled = %v, want %v", m.lifecycleEnabled, tt.wantLifecycle)
 			}
 		})
+	}
+}
+
+// TestSessionTokenTTL_OutlivesEveryCheckBudget guards the defect found by D2
+// step 5: the session JWT was minted for checkTimeout*(len(checks.All())+1)
+// == 4m30s while lifecycleSafeTimeout granted runner_smoke a 21-minute budget,
+// so a slow or hung runner failed with "401 unauthorized" instead of its real
+// error -- pointing the on-call at Authentik rather than the Kali runner.
+//
+// The invariant: the token must outlive the largest budget the runner will
+// actually let a single check consume.
+func TestSessionTokenTTL_OutlivesEveryCheckBudget(t *testing.T) {
+	cases := []struct {
+		name          string
+		longest, base time.Duration
+		active        int
+	}{
+		{"runner mode: one check with a 21m budget", 21 * time.Minute, 30 * time.Second, 1},
+		{"default mode with pod_lifecycle (11m budget)", 11 * time.Minute, 30 * time.Second, 13},
+		{"default mode, no expensive checks", 30 * time.Second, 30 * time.Second, 8},
+		{"janitor mode", 30 * time.Second, 30 * time.Second, 1},
+		{"degenerate: no active checks", 30 * time.Second, 30 * time.Second, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sessionTokenTTL(tc.longest, tc.base, tc.active)
+			if got <= tc.longest {
+				t.Fatalf("TTL %s does not outlive the longest check budget %s: the token "+
+					"expires mid-check and the check reports 401 instead of its real failure",
+					got, tc.longest)
+			}
+		})
+	}
+}
+
+// TestSessionTokenTTL_BeatsTheShippedBug pins the specific production numbers.
+// The premise assertions matter: if checks.All() ever grows enough that the old
+// formula would have been adequate, this test would pass vacuously.
+func TestSessionTokenTTL_BeatsTheShippedBug(t *testing.T) {
+	const base = 30 * time.Second
+	const runnerBudget = 21 * time.Minute
+
+	buggy := base * time.Duration(len(checks.All())+1)
+	if buggy >= runnerBudget {
+		t.Fatalf("premise no longer holds: old formula %s already covered the %s runner budget",
+			buggy, runnerBudget)
+	}
+	if got := sessionTokenTTL(runnerBudget, base, 1); got <= buggy {
+		t.Fatalf("sessionTokenTTL returned %s, no better than the buggy %s", got, buggy)
+	}
+}
+
+// TestSessionTokenTTL_IsDerivedFromTheRunnerBudgetNotAllChecks is the wiring
+// guard (the W2-7 class): the pure function can be perfectly correct while
+// main() still feeds it the wrong inputs. Asserts the call site reads
+// runner.CheckTimeout, and that no mint is derived from checks.All() again.
+func TestSessionTokenTTL_IsDerivedFromTheRunnerBudgetNotAllChecks(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	body := string(src)
+
+	if !strings.Contains(body, "sessionTokenTTL(runner.CheckTimeout, checkTimeout, len(activeChecks))") {
+		t.Error("session TTL is no longer derived from runner.CheckTimeout and the ACTIVE check " +
+			"set; a replacement mode (runner/janitor) will mint a token too short for its own budget")
+	}
+	if strings.Contains(body, "len(checks.All())+1") {
+		t.Error("a session token is being minted from checks.All() again: in runner or janitor mode " +
+			"that is the wrong check set, and it reintroduces the 4m30s-token-vs-21m-budget bug")
 	}
 }
