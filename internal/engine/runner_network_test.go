@@ -142,3 +142,85 @@ func TestEnsureNAD_IsIdempotent(t *testing.T) {
 		t.Errorf("got %d NADs, want exactly 1 after two ensureNAD calls", len(list.Items))
 	}
 }
+
+// TestEnsureNAD_ReconcilesStaleMacvlanConfig is the guard for a trap that
+// would have made the macvlan->vlan fix a silent no-op in production.
+//
+// ensureNAD originally returned as soon as a NAD of the right name existed, so
+// any VLAN that had already been used kept its old CNI config forever. At the
+// time of the fix, pod-vlan-119 was live in the cluster carrying the broken
+// untagged macvlan config -- deploying the corrected code would have changed
+// nothing for it, and the runner would have kept landing on the home LAN while
+// every code-level check said the bug was fixed.
+func TestEnsureNAD_ReconcilesStaleMacvlanConfig(t *testing.T) {
+	cfg := testK8sConfig()
+	k8s, dynClient := newNADTestClient(t, cfg)
+
+	// The exact config observed in production before the fix.
+	stale := `{"cniVersion":"0.3.1","ipam":{"type":"dhcp"},"master":"ens224","mode":"bridge","type":"macvlan","vlan":119}`
+	seed := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "k8s.cni.cncf.io/v1",
+			"kind":       "NetworkAttachmentDefinition",
+			"metadata": map[string]any{
+				"name":      "pod-vlan-119",
+				"namespace": cfg.Namespace,
+			},
+			"spec": map[string]any{"config": stale},
+		},
+	}
+	if _, err := dynClient.Resource(nadGVRForTest()).Namespace(cfg.Namespace).
+		Create(context.Background(), seed, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("seed stale NAD: %v", err)
+	}
+
+	if err := k8s.ensureNAD(context.Background(), "pod-vlan-119", 119); err != nil {
+		t.Fatalf("ensureNAD: %v", err)
+	}
+
+	got := readNADConfig(t, dynClient, cfg.Namespace, "pod-vlan-119")
+	if got["type"] != "vlan" {
+		t.Errorf("stale NAD was not reconciled: type = %v, want \"vlan\". "+
+			"An existing NAD must be corrected, not skipped.", got["type"])
+	}
+	if _, stillHasMacvlanKey := got["vlan"]; stillHasMacvlanKey {
+		t.Error(`stale NAD still carries the macvlan-style "vlan" key`)
+	}
+	if v, ok := got["vlanId"].(float64); !ok || int(v) != 119 {
+		t.Errorf("reconciled NAD vlanId = %v, want 119", got["vlanId"])
+	}
+}
+
+// TestEnsureNAD_NoPointlessUpdateWhenAlreadyCorrect ensures reconciliation does
+// not rewrite the object on every single run. Key ordering must not count as
+// drift, or every run would issue an Update against the API server.
+func TestEnsureNAD_NoPointlessUpdateWhenAlreadyCorrect(t *testing.T) {
+	cfg := testK8sConfig()
+	k8s, dynClient := newNADTestClient(t, cfg)
+
+	// Semantically identical to what nadConfigJSON emits, but key order and
+	// spacing differ.
+	equivalent := `{ "ipam": {"type":"dhcp"}, "master":"` + cfg.TrunkNIC + `", "vlanId":119, "type":"vlan", "cniVersion":"0.3.1" }`
+	seed := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "k8s.cni.cncf.io/v1",
+			"kind":       "NetworkAttachmentDefinition",
+			"metadata":   map[string]any{"name": "pod-vlan-119", "namespace": cfg.Namespace},
+			"spec":       map[string]any{"config": equivalent},
+		},
+	}
+	if _, err := dynClient.Resource(nadGVRForTest()).Namespace(cfg.Namespace).
+		Create(context.Background(), seed, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("seed NAD: %v", err)
+	}
+
+	dynClient.ClearActions()
+	if err := k8s.ensureNAD(context.Background(), "pod-vlan-119", 119); err != nil {
+		t.Fatalf("ensureNAD: %v", err)
+	}
+	for _, a := range dynClient.Actions() {
+		if a.GetVerb() == "update" {
+			t.Error("ensureNAD issued an Update for a config that only differs in key order/whitespace")
+		}
+	}
+}
