@@ -146,6 +146,23 @@ func runPodLifecycle(ctx context.Context, c *synthetic.Client, cfg PodLifecycleC
 	}
 	log.Info("lifecycle: pod reached active")
 
+	// 5b. Probe the testing dashboard on the LIVE pod.
+	//
+	// pod_testing_dashboard_404 probes a phantom UUID, so it returns before
+	// the handler ever loads a pod, its blueprint, its workflow results or
+	// its playlists — it structurally cannot catch a 500 on a real pod, and
+	// a real pod is exactly where the 500 was observed in production. This
+	// is the only point in the whole catalog where a pod the synthetic user
+	// owns is known to exist, so the probe lives here rather than in its own
+	// check. The error is prefixed so an alert never misreads a dashboard
+	// regression as a provisioning failure.
+	log.Info("lifecycle: probing testing dashboard on live pod")
+	if status, err := probeTestingDashboard(ctx, c, podID); err != nil {
+		log.Error("lifecycle: testing dashboard probe failed", "http_status", status, "error", err.Error())
+		return status, fmt.Errorf("testing dashboard on live pod: %w", err)
+	}
+	log.Info("lifecycle: testing dashboard OK")
+
 	// 6. Delete.
 	log.Info("lifecycle: deleting pod")
 	if status, err := destroyPod(ctx, c, podID); err != nil {
@@ -325,6 +342,35 @@ func destroyPod(ctx context.Context, c *synthetic.Client, podID string) (int, er
 		return resp.StatusCode, nil
 	default:
 		return resp.StatusCode, fmt.Errorf("DELETE /pods/%s returned %d: %s", podID, resp.StatusCode, snippet(body))
+	}
+}
+
+// probeTestingDashboard issues GET /api/v1/pods/{id}/testing against a pod
+// that is known to exist and be owned by the caller, and requires 200.
+//
+// A 500 here is the production symptom that motivated this probe: the handler
+// joins the pod to its blueprint, workflow results and playlists, and any of
+// those joins can nil-deref on a real row while a phantom-UUID request short
+// circuits harmlessly at 404. 403 is also treated as a failure — the caller
+// owns this pod, so a refusal means ownership resolution regressed.
+func probeTestingDashboard(ctx context.Context, c *synthetic.Client, podID string) (int, error) {
+	resp, err := c.Do(ctx, http.MethodGet, "/api/v1/pods/"+podID+"/testing", nil)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return resp.StatusCode, nil
+	case http.StatusInternalServerError:
+		return resp.StatusCode, fmt.Errorf(
+			"returned 500 for a live, owned pod (the bug this probe exists for): %s", snippet(body))
+	case http.StatusNotFound:
+		return resp.StatusCode, fmt.Errorf(
+			"returned 404 for a pod that was just observed active — pod lookup in the testing handler disagrees with /pods")
+	default:
+		return resp.StatusCode, fmt.Errorf("returned %d, want 200: %s", resp.StatusCode, snippet(body))
 	}
 }
 

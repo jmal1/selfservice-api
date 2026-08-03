@@ -227,6 +227,7 @@ func All() []synthetic.Check {
 		AdminAudit403,
 		PodTestingDashboard404,
 		WikiIndexRBAC,
+		ImageUploadRBAC,
 	}
 }
 

@@ -23,22 +23,26 @@ import (
 // This is enough to exercise the Check's polling logic deterministically
 // without needing to inject a clock.
 type podLifecycleFakeAPI struct {
-	mu               sync.Mutex
-	templates        []map[string]string
-	pods             map[string]*fakePod
+	mu                sync.Mutex
+	templates         []map[string]string
+	pods              map[string]*fakePod
 	createActiveAfter int
-	destroyAfter     int
-	createCalls      int
-	deleteCalls      int
+	destroyAfter      int
+	createCalls       int
+	deleteCalls       int
+	// testingStatus is the status GET /pods/{id}/testing returns. 0 means
+	// 200. Set to 500 to reproduce the production bug the probe watches for.
+	testingStatus int
+	testingCalls  int
 }
 
 type fakePod struct {
-	ID          string
-	Name        string
-	Status      string
-	CreatedAt   time.Time
-	getCalls    int
-	deleteAt    *time.Time
+	ID        string
+	Name      string
+	Status    string
+	CreatedAt time.Time
+	getCalls  int
+	deleteAt  *time.Time
 }
 
 func newFakeLifecycleAPI() *podLifecycleFakeAPI {
@@ -93,6 +97,20 @@ func (f *podLifecycleFakeAPI) handler() http.Handler {
 				"job_id": "job-1",
 				"status": "pending",
 			})
+
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/pods/") && strings.HasSuffix(r.URL.Path, "/testing"):
+			f.testingCalls++
+			id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/pods/"), "/testing")
+			p, ok := f.pods[id]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			if f.testingStatus != 0 && f.testingStatus != http.StatusOK {
+				http.Error(w, "boom", f.testingStatus)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"pod_id": p.ID, "playlists": []any{}, "runs": []any{}})
 
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/pods/"):
 			id := strings.TrimPrefix(r.URL.Path, "/api/v1/pods/")
@@ -160,6 +178,81 @@ func TestPodLifecycle_HappyPath(t *testing.T) {
 	}
 	if fake.deleteCalls < 1 {
 		t.Errorf("deleteCalls=%d, want >=1 (the lifecycle delete)", fake.deleteCalls)
+	}
+	if fake.testingCalls != 1 {
+		t.Errorf("testingCalls=%d, want 1 — the live testing-dashboard probe did not run", fake.testingCalls)
+	}
+}
+
+// TestPodLifecycle_FailsWhenTestingDashboard500 reproduces the production
+// symptom: /pods/{id}/testing returns 500 for a real, owned pod while the
+// phantom-UUID check (pod_testing_dashboard_404) stays green because it never
+// reaches the code that dereferences pod data.
+func TestPodLifecycle_FailsWhenTestingDashboard500(t *testing.T) {
+	fake := newFakeLifecycleAPI()
+	fake.testingStatus = http.StatusInternalServerError
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	chk := PodLifecycle(PodLifecycleConfig{
+		TemplateName:   "synthetic-noop",
+		ReadyTimeout:   5 * time.Second,
+		DestroyTimeout: 2 * time.Second,
+		PreCleanMaxAge: 1 * time.Minute,
+	})
+	status, err := chk.Run(context.Background(), synthetic.NewClient(srv.URL, ""))
+	if err == nil {
+		t.Fatal("lifecycle must fail when the testing dashboard 500s on a live pod")
+	}
+	if status != http.StatusInternalServerError {
+		t.Errorf("status=%d, want 500", status)
+	}
+	// The stage prefix keeps an alert from misreading a dashboard regression
+	// as a provisioning failure.
+	if !strings.Contains(err.Error(), "testing dashboard on live pod") {
+		t.Errorf("error %q must name the failing stage", err)
+	}
+	// The pod must still be cleaned up even though the probe failed.
+	if fake.deleteCalls < 1 {
+		t.Errorf("deleteCalls=%d — a failed probe must not leak the pod", fake.deleteCalls)
+	}
+}
+
+// TestProbeTestingDashboard_StatusMapping pins each status to a distinct,
+// actionable message.
+func TestProbeTestingDashboard_StatusMapping(t *testing.T) {
+	cases := []struct {
+		code    int
+		wantErr bool
+		want    string
+	}{
+		{http.StatusOK, false, ""},
+		{http.StatusInternalServerError, true, "the bug this probe exists for"},
+		{http.StatusNotFound, true, "disagrees with /pods"},
+		{http.StatusForbidden, true, "want 200"},
+	}
+	for _, tc := range cases {
+		srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
+			"/api/v1/pods/p1/testing": func(w http.ResponseWriter, r *http.Request) {
+				if tc.code == http.StatusOK {
+					w.Write([]byte(`{}`))
+					return
+				}
+				http.Error(w, "x", tc.code)
+			},
+		})
+		_, err := probeTestingDashboard(context.Background(), synthetic.NewClient(srv.URL, ""), "p1")
+		if tc.wantErr && err == nil {
+			t.Errorf("status %d: expected an error", tc.code)
+			continue
+		}
+		if !tc.wantErr && err != nil {
+			t.Errorf("status %d: unexpected error %v", tc.code, err)
+			continue
+		}
+		if tc.wantErr && !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("status %d: error %q should contain %q", tc.code, err, tc.want)
+		}
 	}
 }
 

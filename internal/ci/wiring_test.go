@@ -50,6 +50,10 @@ var requiredWiring = map[string][]struct {
 	"cmd/crucible-runner/main.go": {
 		{"MaterializeActionLibrary", "without it the engine-generated action library is never written to disk, so every library action (http_get, port_open, ssh_exec, …) fails with exit 127 — the original defect, in which workflows appeared to run, the Job exited 0, and no action could possibly pass"},
 	},
+	"cmd/synthetic-api-monitor/main.go": {
+		{"checks.Elevated", "without it the instructor-role checks are never registered, so the authenticated admin surface (/admin/images, /admin/vcenter/isos, wizard-state) is unmonitored — and a 503 from an unwired dependency looks identical to a healthy deploy, because every other admin check only asserts a student is refused"},
+		{"SYNTHETIC_INSTRUCTOR_USER_ID", "the elevated client must be minted from a dedicated instructor row; elevating the primary synthetic user instead would turn five RBAC checks into tautologies that pass while proving nothing"},
+	},
 	// Not a cmd/ main, but the same failure class: buildActionLibrary is a
 	// package-level func, so deleting its only call site still compiles and
 	// still passes every actionlibrary_test.go case (they call it directly).
