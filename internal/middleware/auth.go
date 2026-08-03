@@ -72,13 +72,18 @@ func RequireRole(minRole string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			role := RoleFromContext(r.Context())
-			if !hasMinRole(role, minRole) {
+			if !HasMinRole(role, minRole) {
 				http.Error(w, "forbidden", http.StatusForbidden)
 				return
 			}
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// HasMinRole reports whether the actual role meets or exceeds the minimum required role.
+func HasMinRole(actual, minimum string) bool {
+	return hasMinRole(actual, minimum)
 }
 
 // UserIDFromContext extracts the user ID from the request context.

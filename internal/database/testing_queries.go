@@ -120,6 +120,41 @@ func (q *Queries) CreateRun(ctx context.Context, run *models.Run) error {
 	).Scan(&run.ID, &run.CreatedAt, &run.UpdatedAt)
 }
 
+const runAttributionSelect = `
+		SELECT r.id, r.pod_id, r.playlist_id, r.triggered_by, r.status,
+		       r.target_pod_vm_id, r.target_vm_name, r.target_vm_ip,
+		       COALESCE(u.username, '') AS triggered_by_username,
+		       COALESCE(u.display_name, '') AS triggered_by_display_name,
+		       COALESCE(p.name, '') AS pod_name,
+		       COALESCE(p.status, '') AS pod_status,
+		       COALESCE(pl.name, '') AS playlist_name,
+		       r.total_workflows, r.passed_workflows, r.failed_workflows,
+		       r.error_message, r.started_at, r.completed_at, r.created_at, r.updated_at
+		FROM runs r
+		LEFT JOIN users u ON r.triggered_by = u.id
+		LEFT JOIN pods p ON r.pod_id = p.id
+		LEFT JOIN playlists pl ON r.playlist_id = pl.id
+`
+
+const listAllRunsQuery = runAttributionSelect + `
+		ORDER BY r.created_at DESC LIMIT 200
+`
+
+const getRunForAdminQuery = runAttributionSelect + `
+		WHERE r.id = $1
+`
+
+func scanRunAttribution(scan func(dest ...any) error, r *models.Run) error {
+	return scan(
+		&r.ID, &r.PodID, &r.PlaylistID, &r.TriggeredBy, &r.Status,
+		&r.TargetPodVMID, &r.TargetVMName, &r.TargetVMIP,
+		&r.TriggeredByUsername, &r.TriggeredByDisplayName,
+		&r.PodName, &r.PodStatus, &r.PlaylistName,
+		&r.TotalWorkflows, &r.PassedWorkflows, &r.FailedWorkflows,
+		&r.ErrorMessage, &r.StartedAt, &r.CompletedAt, &r.CreatedAt, &r.UpdatedAt,
+	)
+}
+
 // GetRecentRunsForPod returns the N most recent runs for a pod.
 func (q *Queries) GetRecentRunsForPod(ctx context.Context, podID uuid.UUID, limit int) ([]models.Run, error) {
 	rows, err := q.pool.Query(ctx, `
@@ -171,6 +206,15 @@ func (q *Queries) GetRun(ctx context.Context, runID uuid.UUID) (*models.Run, err
 		&r.ErrorMessage, &r.StartedAt, &r.CompletedAt,
 		&r.CreatedAt, &r.UpdatedAt)
 	if err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
+// GetRunForAdmin returns a single run with attribution joins for the admin view.
+func (q *Queries) GetRunForAdmin(ctx context.Context, runID uuid.UUID) (*models.Run, error) {
+	var r models.Run
+	if err := scanRunAttribution(q.pool.QueryRow(ctx, getRunForAdminQuery, runID).Scan, &r); err != nil {
 		return nil, err
 	}
 	return &r, nil
@@ -231,12 +275,7 @@ func (q *Queries) UpdateRunStatus(ctx context.Context, runID uuid.UUID, status s
 
 // ListAllRuns returns all runs (admin view).
 func (q *Queries) ListAllRuns(ctx context.Context) ([]models.Run, error) {
-	rows, err := q.pool.Query(ctx, `
-		SELECT id, pod_id, playlist_id, triggered_by, status,
-		       total_workflows, passed_workflows, failed_workflows,
-		       error_message, started_at, completed_at, created_at, updated_at
-		FROM runs ORDER BY created_at DESC LIMIT 200
-	`)
+	rows, err := q.pool.Query(ctx, listAllRunsQuery)
 	if err != nil {
 		return nil, err
 	}
@@ -245,10 +284,7 @@ func (q *Queries) ListAllRuns(ctx context.Context) ([]models.Run, error) {
 	var runs []models.Run
 	for rows.Next() {
 		var r models.Run
-		if err := rows.Scan(&r.ID, &r.PodID, &r.PlaylistID, &r.TriggeredBy, &r.Status,
-			&r.TotalWorkflows, &r.PassedWorkflows, &r.FailedWorkflows,
-			&r.ErrorMessage, &r.StartedAt, &r.CompletedAt,
-			&r.CreatedAt, &r.UpdatedAt); err != nil {
+		if err := scanRunAttribution(rows.Scan, &r); err != nil {
 			return nil, err
 		}
 		runs = append(runs, r)

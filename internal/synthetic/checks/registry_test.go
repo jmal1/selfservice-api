@@ -139,6 +139,30 @@ func TestAdminListUsers403_FailsOn200(t *testing.T) {
 	}
 }
 
+func TestAdminRunDetail403_PassesOn403(t *testing.T) {
+	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
+		"/api/v1/admin/runs/00000000-0000-0000-0000-000000000000": func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(403)
+		},
+	})
+	status, err := AdminRunDetail403.Run(context.Background(), synthetic.NewClient(srv.URL, ""))
+	if err != nil || status != 403 {
+		t.Fatalf("403 should pass: status=%d err=%v", status, err)
+	}
+}
+
+func TestAdminRunDetail403_FailsOn200(t *testing.T) {
+	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
+		"/api/v1/admin/runs/00000000-0000-0000-0000-000000000000": func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(200)
+		},
+	})
+	_, err := AdminRunDetail403.Run(context.Background(), synthetic.NewClient(srv.URL, ""))
+	if err == nil {
+		t.Fatal("a 200 from the run-detail endpoint as a student MUST fail — that is the entire point of this check")
+	}
+}
+
 func TestPodTestingDashboard404_AcceptsBothExpectedCodes(t *testing.T) {
 	for _, code := range []int{http.StatusNotFound, http.StatusForbidden} {
 		t.Run(http.StatusText(code), func(t *testing.T) {
@@ -199,6 +223,7 @@ func TestAll_StableNames(t *testing.T) {
 		"auth_me":                   true,
 		"pods_list":                 true,
 		"admin_list_users_403":      true,
+		"admin_run_detail_403":      true,
 		"admin_audit_403":           true,
 		"pod_testing_dashboard_404": true,
 		"wiki_index_rbac":           true,
