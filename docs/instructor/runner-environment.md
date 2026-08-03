@@ -122,6 +122,20 @@ what you see here is what is actually in the image.
 > The workflow editor warns you at save time (**CRU0002**) when a script calls
 > a command the runner image does not provide, so you normally find out while
 > authoring rather than at grading time.
+>
+> CRU0002 looks only at **command position**, so ordinary shell plumbing is not
+> flagged: variable assignments (`TARGET=example.com`), bash array appends
+> (`curl_args+=(-b "$jar")`), comments, and single-quoted text are all ignored.
+> If you do see a CRU0002 warning naming something that clearly isn't a command,
+> that's a bug in the linter — report it rather than working around it. A linter
+> that cries wolf is one you'd rightly start ignoring.
+
+Crucible's own shipped library actions are held to a stronger version of the
+same rule: their tool dependencies are checked **at build time**, and a library
+action that calls a command missing from `tools.txt` fails CI rather than
+shipping. The difference is deliberate — a warning is the right level for your
+own drafts, but a missing tool in a shipped library action would exit 127
+in the middle of someone else's graded assessment.
 
 ---
 
