@@ -245,6 +245,27 @@ func (c *Client) Remove(ctx context.Context, key string) error {
 	return nil
 }
 
+// UsedBytes returns the total size of every object stored under the client's
+// configured prefix. It is used to bound how much Crucible stages at once;
+// the S3 API cannot report the host's actual filesystem free space.
+func (c *Client) UsedBytes(ctx context.Context) (int64, error) {
+	prefix := strings.Trim(strings.ReplaceAll(c.prefix, "\\", "/"), "/")
+	if prefix != "" {
+		prefix += "/"
+	}
+	var total int64
+	for obj := range c.core.Client.ListObjects(ctx, c.bucket, minio.ListObjectsOptions{
+		Prefix:    prefix,
+		Recursive: true,
+	}) {
+		if obj.Err != nil {
+			return 0, fmt.Errorf("objectstore: list %q: %w", prefix, obj.Err)
+		}
+		total += obj.Size
+	}
+	return total, nil
+}
+
 // EnsureBucket creates the configured bucket if it does not already exist.
 func (c *Client) EnsureBucket(ctx context.Context) error {
 	exists, err := c.core.BucketExists(ctx, c.bucket)
