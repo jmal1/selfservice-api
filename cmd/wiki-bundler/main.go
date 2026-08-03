@@ -142,7 +142,7 @@ func main() {
 		verbose  bool
 	)
 	flag.StringVar(&repoRoot, "repo-root", ".", "path to the selfservice-api repo root")
-	flag.StringVar(&outDir, "out", "internal/docs/_bundle", "output bundle directory (repo-relative)")
+	flag.StringVar(&outDir, "out", "internal/docs/_bundle", "output bundle directory (repo-relative, or an absolute path)")
 	flag.Var(&seeds, "seed", "seed markdown file (repo-relative); may be repeated")
 	flag.BoolVar(&verbose, "v", false, "verbose logging")
 	flag.Parse()
@@ -157,7 +157,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "wiki-bundler: bad -repo-root: %v\n", err)
 		os.Exit(1)
 	}
-	absOut := filepath.Join(absRoot, outDir)
+	absOut := resolveOutDir(absRoot, outDir)
 
 	manifest, err := computeClosure(absRoot, seeds, verbose)
 	if err != nil {
@@ -181,7 +181,24 @@ func main() {
 	}
 
 	fmt.Printf("wiki-bundler: bundled %d files (%d bytes) into %s\n",
-		len(manifest.Files), manifest.TotalBytes, outDir)
+		len(manifest.Files), manifest.TotalBytes, absOut)
+}
+
+// resolveOutDir turns the -out flag into the directory the bundle is actually
+// written to.
+//
+// A relative -out is interpreted against the repo root, which is the common
+// case (`-out internal/docs/_bundle`). An absolute -out must be honoured
+// as-is: filepath.Join("/repo", "/tmp/x") yields "/repo/tmp/x", so blindly
+// joining silently relocates the output inside the repo. That is precisely how
+// `make verify-wiki` — which passes `-out $(mktemp -d)` — came to compare the
+// committed bundle against an empty directory and fail unconditionally,
+// regardless of whether the bundle was actually stale.
+func resolveOutDir(absRoot, outDir string) string {
+	if filepath.IsAbs(outDir) {
+		return outDir
+	}
+	return filepath.Join(absRoot, outDir)
 }
 
 type linkRotError struct{ src, target string }
