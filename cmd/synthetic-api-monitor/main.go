@@ -76,6 +76,37 @@ const (
 	// to stick around.
 	envJanitorMaxAge = "SYNTHETIC_JANITOR_MAX_AGE"
 
+	// envRunnerMode, when truthy, replaces the entire check set with the
+	// single runner_smoke check. This lets a separate less-frequent CronJob
+	// reuse the same image/secrets/pushgateway plumbing as the regular
+	// monitor without running the cheap probes the */10 CronJob already
+	// covers. WARNING: if SYNTHETIC_RUNNER_TEMPLATE or
+	// SYNTHETIC_RUNNER_PLAYLIST_ID is unset the binary exits with a clear
+	// error rather than silently registering nothing — a misconfigured
+	// deploy would leave the entire engine dispatch→Kali path unmonitored.
+	envRunnerMode = "SYNTHETIC_RUNNER_MODE"
+	// envRunnerTemplate is the templates.name to clone (NOT vcenter_template).
+	// Getting this wrong causes every runner_smoke run to fail at
+	// resolve-template with "template not found", firing every CronJob tick.
+	envRunnerTemplate = "SYNTHETIC_RUNNER_TEMPLATE"
+	// envRunnerPlaylistID is the UUID of the playlist to run. The playlist
+	// endpoint (/api/v1/admin/playlists) requires RoleInstructor, so the
+	// student synthetic user cannot resolve a playlist by name at runtime;
+	// the UUID must be supplied directly. Getting this wrong means every
+	// POST /testing/run returns 400 (bad playlist) and no runner is ever
+	// dispatched — the engine dispatch path is unmonitored until fixed.
+	envRunnerPlaylistID = "SYNTHETIC_RUNNER_PLAYLIST_ID"
+	// envRunnerReadyTimeout overrides the default 8m timeout for waiting
+	// on pod active. Increase if vCenter is slow; decrease for tests.
+	envRunnerReadyTimeout = "SYNTHETIC_RUNNER_READY_TIMEOUT"
+	// envRunnerRunTimeout overrides the default 10m timeout for waiting on
+	// a terminal run state. Increase if Kali runner provisioning or workflow
+	// execution is slow; decrease for tests.
+	envRunnerRunTimeout = "SYNTHETIC_RUNNER_RUN_TIMEOUT"
+	// envRunnerDestroyTimeout overrides the default 90s timeout for waiting
+	// on pod destroyed.
+	envRunnerDestroyTimeout = "SYNTHETIC_RUNNER_DESTROY_TIMEOUT"
+
 	// envInstructorUserID is the UUID of the dedicated instructor-role row
 	// (synthetic-instructor). When set, the monitor mints a SECOND session
 	// cookie for it and registers the checks in checks.Elevated().
@@ -211,13 +242,55 @@ func run(logger *slog.Logger) error {
 			"destroy_timeout", cfg.DestroyTimeout,
 		)
 		activeChecks = append(activeChecks, checks.PodLifecycle(cfg))
+	} else if envBool(envRunnerMode) {
+		tmpl := os.Getenv(envRunnerTemplate)
+		if tmpl == "" {
+			return fmt.Errorf("%s=true but %s is empty", envRunnerMode, envRunnerTemplate)
+		}
+		playlistID := os.Getenv(envRunnerPlaylistID)
+		if playlistID == "" {
+			return fmt.Errorf("%s=true but %s is empty", envRunnerMode, envRunnerPlaylistID)
+		}
+		cfg := checks.DefaultRunnerSmokeConfig(tmpl, playlistID)
+		cfg.Logger = logger.With("component", "runner_smoke")
+		if v := os.Getenv(envRunnerReadyTimeout); v != "" {
+			d, err := time.ParseDuration(v)
+			if err != nil {
+				return fmt.Errorf("invalid %s=%q: %w", envRunnerReadyTimeout, v, err)
+			}
+			cfg.ReadyTimeout = d
+		}
+		if v := os.Getenv(envRunnerRunTimeout); v != "" {
+			d, err := time.ParseDuration(v)
+			if err != nil {
+				return fmt.Errorf("invalid %s=%q: %w", envRunnerRunTimeout, v, err)
+			}
+			cfg.RunTimeout = d
+		}
+		if v := os.Getenv(envRunnerDestroyTimeout); v != "" {
+			d, err := time.ParseDuration(v)
+			if err != nil {
+				return fmt.Errorf("invalid %s=%q: %w", envRunnerDestroyTimeout, v, err)
+			}
+			cfg.DestroyTimeout = d
+		}
+		logger.Info("runner mode: registering runner_smoke only",
+			"template", tmpl,
+			"playlist_id", playlistID,
+			"ready_timeout", cfg.ReadyTimeout,
+			"run_timeout", cfg.RunTimeout,
+			"destroy_timeout", cfg.DestroyTimeout,
+		)
+		activeChecks = []synthetic.Check{checks.RunnerSmoke(cfg)}
 	}
 
 	// Elevated (instructor-role) checks. Skipped loudly rather than
 	// silently: without them the admin surface is covered only by the
 	// student-side 403 assertions, which cannot distinguish "the route
 	// works" from "the route 503s because a dependency was never wired".
-	if !envBool(envJanitorMode) {
+	// Also skipped in runner mode: that CronJob is a dedicated runner sweep
+	// and elevated checks are already covered by the main */10 monitor.
+	if !envBool(envJanitorMode) && !envBool(envRunnerMode) {
 		elevatedCfg := checks.ElevatedConfig{Client: instructorClient}
 
 		// Registered UNCONDITIONALLY, and deliberately outside the
@@ -336,17 +409,26 @@ func envBool(key string) bool {
 }
 
 // lifecycleSafeTimeout returns a CheckTimeout that fits the most expensive
-// registered check. pod_lifecycle can legitimately run for ~10 minutes; the
-// per-check timeout MUST exceed its sum of ready + destroy budgets or the
-// check will always fail mid-run.
+// registered check. pod_lifecycle can legitimately run for ~10 minutes and
+// runner_smoke for ~20 minutes; the per-check timeout MUST exceed those sums
+// or the checks will always fail mid-run.
 func lifecycleSafeTimeout(base time.Duration, all []synthetic.Check) time.Duration {
-	const lifecycleName = "pod_lifecycle"
-	// 11 minutes is the worst-case envelope for the default config
-	// (8m ready + 90s destroy + ~90s of pre-clean + HTTP overhead).
-	const lifecycleEnvelope = 11 * time.Minute
 	for _, c := range all {
-		if c.Name() == lifecycleName && base < lifecycleEnvelope {
-			return lifecycleEnvelope
+		switch c.Name() {
+		case "pod_lifecycle":
+			// 11 minutes is the worst-case envelope for the default config
+			// (8m ready + 90s destroy + ~90s of pre-clean + HTTP overhead).
+			const lifecycleEnvelope = 11 * time.Minute
+			if base < lifecycleEnvelope {
+				return lifecycleEnvelope
+			}
+		case "runner_smoke":
+			// 21 minutes is the worst-case envelope for the default config
+			// (8m ready + 10m run + 90s destroy + ~90s pre-clean + overhead).
+			const runnerEnvelope = 21 * time.Minute
+			if base < runnerEnvelope {
+				return runnerEnvelope
+			}
 		}
 	}
 	return base
