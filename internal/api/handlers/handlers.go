@@ -44,6 +44,11 @@ type Handler struct {
 	isoLister    VCenterISOLister  // vCenter ISO datastore browser
 	isoDatastore string            // which datastore to browse for ISOs
 	isoCache     *isoDatastoreCache // 5-minute ISO listing cache
+
+	// templates is an optional override for database.Queries.ListTemplatesForUser.
+	// nil means the default h.db is used. For testing, this can be set to a fake
+	// implementation. See templateStore() accessor.
+	templates templateLister
 }
 
 // VCenterConsole is the interface for vCenter operations needed by the
@@ -114,6 +119,15 @@ func (h *Handler) WithVCenterISOs(lister VCenterISOLister, datastore string) *Ha
 	h.isoDatastore = datastore
 	h.isoCache = &isoDatastoreCache{ttl: 5 * time.Minute}
 	return h
+}
+
+// templateStore returns the templateLister to use for template lookups.
+// If h.templates is set (for testing), it is used; otherwise h.db is returned.
+func (h *Handler) templateStore() templateLister {
+	if h.templates != nil {
+		return h.templates
+	}
+	return h.db
 }
 
 // AdminListVCenterTemplatesFolder returns enumerated VMs in the configured
@@ -935,13 +949,13 @@ func (h *Handler) ListTemplates(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.UserIDFromContext(r.Context())
 	role := middleware.RoleFromContext(r.Context())
 
-	templates, err := h.db.ListTemplatesForUser(r.Context(), userID, role)
+	templates, err := h.templateStore().ListTemplatesForUser(r.Context(), userID, role)
 	if err != nil {
 		h.logger.Error("list templates failed", "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	explicit, err := h.db.ListExplicitTemplateAccessForUser(r.Context(), userID)
+	explicit, err := h.templateStore().ListExplicitTemplateAccessForUser(r.Context(), userID)
 	if err != nil {
 		h.logger.Error("list explicit template access failed", "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -956,7 +970,7 @@ func (h *Handler) ListTemplates(w http.ResponseWriter, r *http.Request) {
 		}
 		visible = append(visible, t)
 	}
-	respondJSON(w, http.StatusOK, visible)
+	respondJSON(w, http.StatusOK, newTemplatePublicList(visible))
 }
 
 // --- Job Handlers ---
