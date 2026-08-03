@@ -234,6 +234,63 @@ func TestInstructorDocs_ToolTableMatchesManifest(t *testing.T) {
 	}
 }
 
+// TestInstructorDocs_NotInImageTableStaysAccurate is the INVERSE of the guard
+// above, and it is needed because the two tables can drift in opposite
+// directions.
+//
+// docs/instructor/troubleshooting.md lists tools that are deliberately NOT in
+// the image, so an instructor hitting exit 127 can see at a glance that their
+// request is a known one. TestInstructorDocs_ToolTableMatchesManifest cannot
+// protect this list: that test fails when docs advertise a tool that is absent,
+// whereas this list breaks when a tool it calls absent is later ADDED.
+//
+// The failure mode is quiet and expensive. A platform admin adds gobuster to
+// tools.txt and rebuilds the image; every test in the repo still passes; and
+// this page goes on telling instructors that gobuster is unavailable. They
+// design around a restriction that no longer exists.
+//
+// Verified by adding `curl` (which IS installed) to the troubleshooting table
+// and watching this fail.
+func TestInstructorDocs_NotInImageTableStaysAccurate(t *testing.T) {
+	root := repoRoot(t)
+	path := filepath.Join(root, "docs", "instructor", "troubleshooting.md")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+
+	const marker = "Tools **not** in the image"
+	body := string(data)
+	start := strings.Index(body, marker)
+	if start < 0 {
+		t.Skip("troubleshooting.md no longer lists tools that are absent from the image")
+	}
+	section := body[start:]
+	if end := strings.Index(section, "\n\n"); end >= 0 {
+		section = section[:end]
+	}
+
+	var checked int
+	for _, m := range docsBacktickRe.FindAllStringSubmatch(section, -1) {
+		tool := strings.TrimSpace(m[1])
+		if tool == "" || strings.HasPrefix(tool, "/") {
+			continue
+		}
+		checked++
+		if runnertools.HasCommand(tool) {
+			t.Errorf("docs/instructor/troubleshooting.md tells instructors %q is NOT in the "+
+				"runner image, but it is now present in internal/runnertools/tools.txt.\n"+
+				"Instructors reading this page will avoid a tool they could be using.\n"+
+				"Remove %q from that table.", tool, tool)
+		}
+	}
+
+	if checked == 0 {
+		t.Fatal("parsed 0 tools from the troubleshooting table; the parse is broken, so this " +
+			"guard would pass no matter how badly the list drifted")
+	}
+}
+
 // TestManifest_NoCarriageReturns asserts tools.txt uses LF line endings.
 //
 // This is not style pedantry. The Dockerfile parses this file with awk and with
