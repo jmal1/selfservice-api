@@ -319,3 +319,97 @@ func TestDetachCDROMs_vcsim(t *testing.T) {
 		}
 	})
 }
+
+// --- Placement defaults (the bug that broke the first real ISO template build) ---
+//
+// Every test above hands CreateBlankVM an explicit FolderPath and Datastore.
+// Production does the opposite: nothing builds a TemplateProvisionPayload with
+// folder_path or a datastore, so the first live source_type=iso provision died
+// with `find folder "": folder '' not found` before creating anything. The
+// tests passed the whole time because they supplied the very inputs production
+// never supplies.
+//
+// These tests pin the defaults by leaving the fields EMPTY — the production
+// shape — so the gap cannot reopen.
+
+func TestCreateBlankVM_DefaultsFolderToTemplateFolder(t *testing.T) {
+	withSimulator(t, func(ctx context.Context, c *Client, vimc *vim25.Client) {
+		// TemplateFolder is what the worker sets from VCENTER_TEMPLATES_FOLDER.
+		c.config.TemplateFolder = simVMFolder
+		c.config.Datastore = simDatastore
+		// VMFolder deliberately points somewhere invalid: a template shell must
+		// never land in the student-pod folder, which the orphan reconciler
+		// scans. If the fallback order regresses, this fails rather than
+		// quietly parking templates where they get reported as orphans.
+		c.config.VMFolder = "/DC0/vm/does-not-exist"
+
+		p := baseBlankVMParams("blank-default-folder")
+		p.FolderPath = ""
+		p.Datastore = ""
+
+		moref, err := c.CreateBlankVM(ctx, p)
+		if err != nil {
+			t.Fatalf("CreateBlankVM with empty FolderPath/Datastore should fall back to config, got: %v", err)
+		}
+		if moref == "" {
+			t.Fatal("CreateBlankVM returned an empty moref")
+		}
+
+		// Prove it actually landed in the template folder rather than merely
+		// not erroring.
+		vm := object.NewVirtualMachine(vimc, types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
+		var mvm mo.VirtualMachine
+		if err := vm.Properties(ctx, vm.Reference(), []string{"parent", "name"}, &mvm); err != nil {
+			t.Fatalf("read VM parent: %v", err)
+		}
+		if mvm.Parent == nil {
+			t.Fatal("created VM has no parent folder")
+		}
+		wantFolder, err := c.finder.Folder(ctx, simVMFolder)
+		if err != nil {
+			t.Fatalf("resolve expected folder: %v", err)
+		}
+		if mvm.Parent.Value != wantFolder.Reference().Value {
+			t.Errorf("VM parent folder = %s, want %s (TemplateFolder)", mvm.Parent.Value, wantFolder.Reference().Value)
+		}
+	})
+}
+
+func TestCreateBlankVM_ExplicitFolderWinsOverConfig(t *testing.T) {
+	withSimulator(t, func(ctx context.Context, c *Client, vimc *vim25.Client) {
+		// A caller that names a folder must still be honored; the defaults are
+		// a fallback, not an override.
+		c.config.TemplateFolder = "/DC0/vm/does-not-exist"
+		c.config.Datastore = "no-such-datastore"
+
+		p := baseBlankVMParams("blank-explicit-folder")
+		if _, err := c.CreateBlankVM(ctx, p); err != nil {
+			t.Fatalf("explicit FolderPath/Datastore must take precedence over config, got: %v", err)
+		}
+	})
+}
+
+func TestCreateBlankVM_UnresolvableFolderErrorNamesTheFix(t *testing.T) {
+	withSimulator(t, func(ctx context.Context, c *Client, vimc *vim25.Client) {
+		// When nothing resolves, the operator needs to know WHICH knob to turn.
+		// The original message was `find folder "": folder '' not found`, which
+		// named no config key and sent the reader looking for a caller bug.
+		c.config.TemplateFolder = ""
+		c.config.VMFolder = ""
+		c.config.Datastore = simDatastore
+
+		p := baseBlankVMParams("blank-no-folder")
+		p.FolderPath = ""
+		p.Datastore = ""
+
+		_, err := c.CreateBlankVM(ctx, p)
+		if err == nil {
+			t.Fatal("CreateBlankVM with no resolvable folder should fail")
+		}
+		for _, want := range []string{"FolderPath", "TemplateFolder", "VMFolder"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q should mention %q so the operator knows what to configure", err, want)
+			}
+		}
+	})
+}

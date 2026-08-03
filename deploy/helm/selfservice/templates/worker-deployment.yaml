@@ -76,6 +76,14 @@ spec:
               value: {{ .Values.vcenter.datastore | quote }}
             - name: VCENTER_VM_FOLDER
               value: {{ .Values.vcenter.vmFolder | quote }}
+            {{- if .Values.vcenter.templatesFolder }}
+            # Where source_type=iso parks the blank template build VM. The API
+            # already gets this; the worker is the process that actually
+            # creates the VM, so without it here the two disagree and the
+            # worker silently falls back to the compiled-in default.
+            - name: VCENTER_TEMPLATES_FOLDER
+              value: {{ .Values.vcenter.templatesFolder | quote }}
+            {{- end }}
             - name: VCENTER_RESOURCE_POOLS
               value: {{ .Values.vcenter.resourcePools | quote }}
             - name: VCENTER_HOSTS

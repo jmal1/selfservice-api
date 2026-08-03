@@ -46,6 +46,7 @@ var requiredWiring = map[string][]struct {
 	"cmd/provision-worker/main.go": {
 		{"RunPusher", "image-import metrics never reach Pushgateway without the flush loop"},
 		{"RunStuckUploadReconciler", "without it crucible_image_uploads_stuck is never refreshed, so leaked uploads are never detected"},
+		{"TemplateFolder", "without it the vCenter client has no folder for source_type=iso template builds: CreateBlankVM resolves an empty path and every ISO template provision dies with `find folder \"\"` before creating anything -- the clone path hides this because it inherits the SOURCE VM's parent folder, and no ISO build had ever run"},
 	},
 	"cmd/crucible-runner/main.go": {
 		{"MaterializeActionLibrary", "without it the engine-generated action library is never written to disk, so every library action (http_get, port_open, ssh_exec, …) fails with exit 127 — the original defect, in which workflows appeared to run, the Job exited 0, and no action could possibly pass"},

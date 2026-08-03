@@ -50,15 +50,21 @@ func main() {
 
 	// Initialize vCenter client
 	vcClient := vcenter.New(vcenter.Config{
-		URL:           cfg.VCenter.URL,
-		User:          cfg.VCenter.User,
-		Password:      cfg.VCenter.Password,
-		Datacenter:    cfg.VCenter.Datacenter,
-		Datastore:     cfg.VCenter.Datastore,
-		VMFolder:      cfg.VCenter.VMFolder,
-		ResourcePools: cfg.VCenter.ResourcePools,
-		Hosts:         cfg.VCenter.Hosts,
-		Insecure:      cfg.VCenter.Insecure,
+		URL:        cfg.VCenter.URL,
+		User:       cfg.VCenter.User,
+		Password:   cfg.VCenter.Password,
+		Datacenter: cfg.VCenter.Datacenter,
+		Datastore:  cfg.VCenter.Datastore,
+		VMFolder:   cfg.VCenter.VMFolder,
+		// Template build VMs (source_type=iso creates a blank shell here)
+		// belong beside every other template, NOT in VMFolder — that folder
+		// holds ephemeral student pod VMs and is what the orphan reconciler
+		// scans. Without this the ISO path resolved an empty folder path and
+		// failed before creating anything.
+		TemplateFolder: cfg.VCenter.TemplatesFolder,
+		ResourcePools:  cfg.VCenter.ResourcePools,
+		Hosts:          cfg.VCenter.Hosts,
+		Insecure:       cfg.VCenter.Insecure,
 	}, logger)
 
 	if err := vcClient.Connect(ctx); err != nil {

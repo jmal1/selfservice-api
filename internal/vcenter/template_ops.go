@@ -493,14 +493,36 @@ func (c *Client) CreateBlankVM(ctx context.Context, p BlankVMParams) (string, er
 }
 
 func (c *Client) createBlankVMInner(ctx context.Context, p BlankVMParams) (string, error) {
-	folder, err := c.finder.Folder(ctx, p.FolderPath)
+	// Placement defaults. ResourcePool (below) and Firmware have always
+	// defaulted when unset; FolderPath and Datastore did not, and that
+	// asymmetry was a live bug: every production caller leaves FolderPath
+	// empty (nothing builds a TemplateProvisionPayload with folder_path), so
+	// the very first real ISO template build failed with
+	// `find folder "": folder '' not found` — an opaque message that names
+	// no config key and points at no fix. The blank-VM path cannot borrow the
+	// clone path's trick of inheriting the source VM's parent folder, because
+	// it has no source VM.
+	folderPath := p.FolderPath
+	if folderPath == "" {
+		folderPath = c.config.TemplateFolder
+	}
+	if folderPath == "" {
+		// Last resort so a half-configured deployment still lands the VM
+		// somewhere real instead of erroring out on an empty path.
+		folderPath = c.config.VMFolder
+	}
+	folder, err := c.finder.Folder(ctx, folderPath)
 	if err != nil {
-		return "", fmt.Errorf("find folder %q: %w", p.FolderPath, err)
+		return "", fmt.Errorf("find folder %q (set BlankVMParams.FolderPath or vcenter TemplateFolder/VMFolder config): %w", folderPath, err)
 	}
 
-	ds, err := c.finder.Datastore(ctx, p.Datastore)
+	datastore := p.Datastore
+	if datastore == "" {
+		datastore = c.config.Datastore
+	}
+	ds, err := c.finder.Datastore(ctx, datastore)
 	if err != nil {
-		return "", fmt.Errorf("find datastore %q: %w", p.Datastore, err)
+		return "", fmt.Errorf("find datastore %q (set BlankVMParams.Datastore or vcenter Datastore config): %w", datastore, err)
 	}
 	dsRef := ds.Reference()
 
