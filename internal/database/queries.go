@@ -320,7 +320,7 @@ func (q *Queries) ListExplicitTemplateAccessForUser(ctx context.Context, userID 
 func (q *Queries) ListAllTemplates(ctx context.Context) ([]models.Template, error) {
 	rows, err := q.pool.Query(ctx, `
 		SELECT `+templateSelectCols+`
-		FROM templates 
+		FROM templates t
 		`+TemplatePinOrderClause+`
 	`)
 	if err != nil {
@@ -1719,8 +1719,15 @@ func (q *Queries) ListExpiredPods(ctx context.Context) ([]uuid.UUID, error) {
 
 // --- Blueprints ---
 
-const blueprintSelectCols = `id, name, description, created_by, allow_vm_additions,
-		is_active, created_at, updated_at, pinned, pin_order, pinned_at, pinned_by`
+// blueprintSelectCols is the canonical column list for every Blueprint SELECT.
+//
+// Every column is qualified with the `b.` alias, and that is load-bearing rather
+// than stylistic: two of the three call sites JOIN another table that also has
+// an `id` column (blueprint_access, users), so an unqualified list makes the
+// query fail at runtime with `column reference "id" is ambiguous`. Any query
+// using this const must therefore alias the blueprints table as `b`.
+const blueprintSelectCols = `b.id, b.name, b.description, b.created_by, b.allow_vm_additions,
+		b.is_active, b.created_at, b.updated_at, b.pinned, b.pin_order, b.pinned_at, b.pinned_by`
 
 func scanBlueprint(row pgx.Row, b *models.Blueprint) error {
 	return row.Scan(
@@ -1730,14 +1737,23 @@ func scanBlueprint(row pgx.Row, b *models.Blueprint) error {
 }
 
 // ListBlueprintsForUser returns blueprints accessible to a user based on their role.
+//
+// Access is expressed with EXISTS rather than a LEFT JOIN + SELECT DISTINCT.
+// The join form is not viable alongside the pin ordering: DISTINCT requires
+// every ORDER BY expression to appear in the select list, and the pin clause
+// orders by CASE expressions that cannot. EXISTS also removes the row
+// multiplication that DISTINCT existed to undo, and matches the shape
+// ListTemplatesForUser already uses.
 func (q *Queries) ListBlueprintsForUser(ctx context.Context, userID uuid.UUID, role string) ([]models.Blueprint, error) {
 	rows, err := q.pool.Query(ctx, `
-		SELECT DISTINCT `+blueprintSelectCols+`
+		SELECT `+blueprintSelectCols+`
 		FROM blueprints b
-		LEFT JOIN blueprint_access ba ON b.id = ba.blueprint_id
 		WHERE b.is_active = true
-		  AND (ba.role = $1 OR ba.user_id = $2 OR $1 = 'admin'
-		       OR NOT EXISTS (SELECT 1 FROM blueprint_access WHERE blueprint_id = b.id))
+		  AND ($1 = 'admin'
+		       OR NOT EXISTS (SELECT 1 FROM blueprint_access ba WHERE ba.blueprint_id = b.id)
+		       OR EXISTS (SELECT 1 FROM blueprint_access ba
+		                  WHERE ba.blueprint_id = b.id
+		                    AND (ba.role = $1 OR ba.user_id = $2)))
 		`+BlueprintPinOrderClause+`
 	`, role, userID)
 	if err != nil {
@@ -1813,7 +1829,7 @@ func (q *Queries) GetBlueprintByID(ctx context.Context, id uuid.UUID) (*models.B
 	var bp models.Blueprint
 	err := scanBlueprint(q.pool.QueryRow(ctx, `
 		SELECT `+blueprintSelectCols+`
-		FROM blueprints WHERE id = $1
+		FROM blueprints b WHERE b.id = $1
 	`, id), &bp)
 	if err == pgx.ErrNoRows {
 		return nil, nil
