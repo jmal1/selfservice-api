@@ -133,6 +133,29 @@ var AdminListUsers403 = synthetic.CheckFunc{
 	},
 }
 
+// AdminRunDetail403 asserts that a student cannot read the instructor/admin
+// run-detail surface. A permission regression here would expose run history
+// and attribution data to the wrong role with no other obvious symptom.
+var AdminRunDetail403 = synthetic.CheckFunc{
+	NameVal:        "admin_run_detail_403",
+	TitleVal:       "RBAC: Student Cannot Read Run Detail",
+	DescriptionVal: "Calls /api/v1/admin/runs/{phantom-uuid} as a student-role user and requires a 403. Catches any regression that would expose instructor run detail to students.",
+	SeverityVal:    synthetic.SeverityCritical,
+	RunFn: func(ctx context.Context, c *synthetic.Client) (int, error) {
+		const phantom = "00000000-0000-0000-0000-000000000000"
+		resp, err := c.Do(ctx, http.MethodGet, "/api/v1/admin/runs/"+phantom, nil)
+		if err != nil {
+			return 0, err
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		if resp.StatusCode != http.StatusForbidden {
+			return resp.StatusCode, fmt.Errorf("admin run detail returned %d, want 403", resp.StatusCode)
+		}
+		return resp.StatusCode, nil
+	},
+}
+
 // PodTestingDashboardSmoke probes the /pods/{id}/testing endpoint that
 // produced the one observed prod 500 (see plan §"Track S motivation").
 // Without a specific synthetic pod ID this check probes a known-bad UUID and
@@ -224,6 +247,7 @@ func All() []synthetic.Check {
 		AuthMe,
 		PodsList,
 		AdminListUsers403,
+		AdminRunDetail403,
 		AdminAudit403,
 		PodTestingDashboard404,
 		WikiIndexRBAC,

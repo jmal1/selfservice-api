@@ -201,3 +201,20 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 	}
 	respondJSON(w, http.StatusOK, runs)
 }
+
+// AdminGetRun returns a single run with attribution and workflow results.
+func (h *Handler) AdminGetRun(w http.ResponseWriter, r *http.Request) {
+	runID, err := uuid.Parse(chi.URLParam(r, "runID"))
+	if err != nil {
+		http.Error(w, "invalid run ID", http.StatusBadRequest)
+		return
+	}
+
+	run, err := h.db.GetRunWithResults(r.Context(), runID)
+	if err != nil {
+		http.Error(w, "run not found", http.StatusNotFound)
+		return
+	}
+
+	respondJSON(w, http.StatusOK, run)
+}

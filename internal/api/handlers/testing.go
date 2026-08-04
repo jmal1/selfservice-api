@@ -61,7 +61,7 @@ func (h *Handler) GetTestingDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respondJSON(w, http.StatusOK, map[string]any{
-		"playlists": playlists,
+		"playlists":   playlists,
 		"recent_runs": runs,
 	})
 }
@@ -211,7 +211,17 @@ func (h *Handler) ListTestingRuns(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, runs)
 }
 
-// GetTestingRun returns a single run with results (student-filtered).
+// validateTestingRunAccess returns 0 when the caller may read the run for the
+// given pod owner. Students can only read their own runs; instructors and
+// admins can read any run.
+func validateTestingRunAccess(podOwnerID, userID uuid.UUID, role string) int {
+	if podOwnerID == userID || middleware.HasMinRole(role, models.RoleInstructor) {
+		return 0
+	}
+	return http.StatusForbidden
+}
+
+// GetTestingRun returns a single run with results (owner/instructor/admin view).
 func (h *Handler) GetTestingRun(w http.ResponseWriter, r *http.Request) {
 	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
 	if err != nil {
@@ -237,7 +247,7 @@ func (h *Handler) GetTestingRun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "pod not found", http.StatusNotFound)
 		return
 	}
-	if pod.OwnerID != userID && role != models.RoleAdmin {
+	if status := validateTestingRunAccess(pod.OwnerID, userID, role); status != 0 {
 		http.Error(w, "not your pod", http.StatusForbidden)
 		return
 	}
@@ -252,8 +262,8 @@ func (h *Handler) GetTestingRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Strip instructor-only fields for non-admin users
-	if role != models.RoleAdmin && role != models.RoleInstructor {
+	// Strip instructor-only fields for non-instructor callers.
+	if !middleware.HasMinRole(role, models.RoleInstructor) {
 		for i := range run.Results {
 			run.Results[i].InstructorOutput = nil
 			run.Results[i].ActionResults = nil

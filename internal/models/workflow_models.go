@@ -175,6 +175,12 @@ type Run struct {
 	TargetPodVMID *uuid.UUID `json:"target_pod_vm_id" db:"target_pod_vm_id"`
 	TargetVMName  string     `json:"target_vm_name" db:"target_vm_name"`
 	TargetVMIP    string     `json:"target_vm_ip" db:"target_vm_ip"`
+	// Populated via LEFT JOIN by the admin run queries; empty when the related row is gone.
+	TriggeredByUsername    string `json:"triggered_by_username" db:"triggered_by_username"`
+	TriggeredByDisplayName string `json:"triggered_by_display_name" db:"triggered_by_display_name"`
+	PodName                string `json:"pod_name" db:"pod_name"`
+	PodStatus              string `json:"pod_status" db:"pod_status"`
+	PlaylistName           string `json:"playlist_name" db:"playlist_name"`
 	CallbackToken   string     `json:"-" db:"callback_token"`
 	Status          string     `json:"status" db:"status"`
 	TotalWorkflows  int        `json:"total_workflows" db:"total_workflows"`

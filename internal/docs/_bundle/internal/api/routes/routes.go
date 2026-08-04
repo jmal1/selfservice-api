@@ -308,6 +308,7 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 
 			// Testing runs (admin view)
 			r.Get("/runs", h.AdminListRuns)
+			r.Get("/runs/{runID}", h.AdminGetRun)
 		})
 	})
 	}) // close r.Group for Logger/Compress
