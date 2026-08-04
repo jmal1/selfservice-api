@@ -187,6 +187,35 @@ smoke test fails, the template drops back to `ready` with the failure
 recorded — fix the image and Publish again. **Unpublish** an active
 template at any time to hide it without losing the generalized image.
 
+## Step 5.1 — Template Visibility (Instructor-Only Staging)
+
+When you publish a template, you can mark it as **"Instructor only"** to
+hide it from the student template picker while you stage or test it. This
+is useful when:
+
+- A template is nearly ready but still needs final tweaks or testing
+- You want instructors to test a new template before students access it
+- You're preparing a template for use in a future course
+
+**In the template edit dialog:**
+
+1. Look for the **Visibility** toggle (appears when editing or creating)
+2. Choose:
+   - **Public** (default) — template appears in the student template catalog
+   - **Instructor only** — template is hidden from students and only
+     visible to instructors and admins in the template picker
+
+> [!note]
+> **Visibility vs. Publish state are independent.** An active (published)
+> instructor-only template is fully functional — it just doesn't appear in the
+> student-facing catalog. An instructor can still click "Deploy" and use it
+> to create a pod for testing. Students **cannot** see instructor-only
+> templates in the list *or* reach them through any other path; attempting
+> to use one (if they knew its ID) results in a permission error.
+
+Once you're satisfied with the template, change it back to **Public** so
+students can access it.
+
 ---
 
 ## Linux template contract
@@ -443,6 +472,124 @@ its current state.
 > taken.
 
 See [troubleshooting.md](troubleshooting.md) for more general help.
+
+---
+
+## Template Health Checks
+
+Crucible runs automated health checks for every student-visible template every
+**12 hours** to catch silent rot — a template whose vCenter object was deleted,
+whose disk was moved, or whose base OS no longer boots — before students hit it
+during a lab session.
+
+### What gets checked
+
+Each cycle has two layers:
+
+| Layer | Frequency | What it does |
+|-------|-----------|--------------|
+| **Structural** | Every template, every 12h cycle | Verifies the vCenter VM/template object still exists in inventory. Cheap: one API call per template, no VM created. |
+| **Deep** | One template per 12h cycle, rotating | Clones the template → powers it on → waits for a guest IP → destroys the clone. Proves the full boot path works end-to-end. |
+
+Every template is deep-checked in turn, so the full rotation period is
+`12h × number_of_templates`. For a lab with 10 templates, each template gets a
+full deep check roughly every 5 days.
+
+### Anti-flap: when does "unhealthy" alert?
+
+A single bad 12-hour window never triggers an alert. Crucible requires
+**2 consecutive failing cycles** before marking a template unhealthy.
+
+- Within each cycle, each failing check is retried **3 times with exponential
+  backoff** (1 s, 2 s, 4 s) to absorb transient vCenter blips.
+- One passing cycle **immediately** clears the unhealthy state — recovery is
+  not delayed by the same confirmation window.
+
+This means the earliest an alert fires after a real breakage is approximately
+24 hours (two 12h cycles).
+
+### Checker-vs-template failures
+
+Crucible distinguishes between "this template is broken" and "the checker
+itself cannot reach vCenter." A vCenter outage sets a single
+`crucible_template_health_checker_up=0` metric — it does **not** mark every
+template unhealthy. Look for the `CrucibleTemplateHealthCheckerDown` alert
+first; if it's firing, the per-template status should be ignored until
+connectivity is restored.
+
+### Viewing health status
+
+Instructors can see per-template health at:
+
+```
+GET /api/v1/admin/templates/health
+```
+
+Each row includes:
+- `health_status` — `"healthy"`, `"unhealthy"`, or `"unknown"` (not yet checked)
+- `consecutive_failures` — how many back-to-back cycles have failed
+- `last_structural_check_at` — when the last structural check ran
+- `last_deep_check_at` — when the last full deep check ran
+- `last_error` — the most recent error message (truncated to 256 chars)
+
+Templates appear in this list as soon as they are active, with
+`health_status="unknown"` until the first check cycle completes.
+
+### Interpreting an unhealthy template
+
+`health_status = "unhealthy"` means the template failed **both** the last two
+12-hour cycles. The `last_error` field says what went wrong.
+
+**Common causes:**
+
+| `last_error` pattern | Likely cause |
+|----------------------|--------------|
+| `vCenter object "vm-XXXX" does not exist` | The template VM was deleted from vCenter inventory |
+| `clone failed: source VM "…" not found` | Same as above (deep check also detected it) |
+| `power-on failed: …` | Disk/config issue — the template VM exists but won't start |
+| `wait-for-IP failed: no IP within 10m` | OS boot hangs or guest tools not installed |
+
+**What to do:**
+1. Check the last error message at `GET /api/v1/admin/templates/health`.
+2. Open vCenter and verify the template VM exists at the expected path.
+3. If the VM is missing, re-publish the template through the wizard.
+4. If the VM exists but won't boot, attach a console and investigate the OS.
+
+Once the underlying issue is fixed, the health check will clear automatically
+on the next passing cycle (~12 hours). No manual reset is needed.
+
+### Orphan cleanup
+
+The deep check names its clone `crucible-healthcheck-<template-uuid>`. If the
+worker crashes mid-check, the clone may be left behind on the datastore.
+Crucible sweeps for these orphaned clones at worker startup and destroys any it
+finds. The distinctive prefix ensures the sweep cannot match a student pod VM.
+
+---
+
+See [troubleshooting.md](troubleshooting.md) for more general help.
+## Pinning templates and blueprints
+
+Templates and blueprints can be **pinned** to emphasize them. Pinned items appear in a dedicated **Pinned** section at the top of the template and blueprint picker, making them immediately visible to students without scrolling through a long list.
+
+### How pinning works
+
+- **Multiple pins allowed** — Pin as many templates or blueprints as you like.
+- **Ordered** — Pinned items appear in the order you set; drag them to reorder (or use up/down buttons on mobile).
+- **Still in main list** — Pinned items also stay in the normal alphabetical list below the Pinned section. Pinning is emphasis, not filtering.
+- **Instructor/admin only** — Only instructors (role ≥ instructor) can pin or unpin. Students see the Pinned section read-only.
+
+### When to pin
+
+Pin this week's material so students land on it immediately:
+
+- The lab template for the current module
+- The starter blueprint for an active project
+- A frequently-used tool or reference template
+
+### Viewing and managing pins
+
+In **Admin → Templates** or **Admin → Blueprints**, you'll see a **Pin** icon (📌) next to each item. Click it to pin; click again to unpin. Pinned items show a special **Pinned** badge, and you can drag them to reorder (or use ↑/↓ buttons). The order you set here is what students see in the Pinned section at the top of their picker.
 
 ---
 

@@ -53,11 +53,19 @@ type RunnerSmokeConfig struct {
 }
 
 // DefaultRunnerSmokeConfig returns production-tuned defaults.
+//
+// ReadyTimeout rationale: same as DefaultPodLifecycleConfig — the
+// synthetic-noop template reaches active in ~37 s on a healthy vCenter.
+// 2 minutes gives a 3.2× margin. With 2 attempts and 30 s backoff, worst-case
+// cycle time for the runner_smoke CronJob (30 min) is:
+//
+//	2 × (ReadyTimeout + RunTimeout + DestroyTimeout) + Backoff + overhead
+//	= 2 × (120 s + 600 s + 90 s) + 30 s + 60 s = 1710 s ≈ 28.5 min < 30 min ✓
 func DefaultRunnerSmokeConfig(templateName, playlistID string) RunnerSmokeConfig {
 	return RunnerSmokeConfig{
 		TemplateName:   templateName,
 		PlaylistID:     playlistID,
-		ReadyTimeout:   8 * time.Minute,
+		ReadyTimeout:   2 * time.Minute,
 		RunTimeout:     10 * time.Minute,
 		DestroyTimeout: 90 * time.Second,
 		PreCleanMaxAge: 5 * time.Minute,
