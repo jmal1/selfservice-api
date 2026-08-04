@@ -198,5 +198,32 @@ spec:
                   name: {{ .Values.secrets.objectstore }}
                   key: secret-key
             {{- end }}
+            # Leader election: gate periodic reconcilers to the elected replica.
+            # Disabled (false) reverts to single-replica behaviour where every
+            # replica runs reconcilers — only safe when replicaCount.worker is 1.
+            - name: WORKER_LEADER_ELECTION_ENABLED
+              value: {{ .Values.worker.leaderElection.enabled | default true | quote }}
+            - name: WORKER_LEADER_RETRY_INTERVAL
+              value: {{ .Values.worker.leaderElection.retryInterval | default "5s" | quote }}
+            # Pool cap for the worker's pgxpool. The worker is nearly single-
+            # threaded (sequential job claims + one reconciler at a time), so
+            # it needs far fewer connections than the default 20. Each replica
+            # also holds 1 dedicated leader-election connection outside the pool,
+            # so the per-replica ceiling is dbMaxConns + 1.
+            # Platform budget: api(20) + engine(20) + 4 × workers(5+1) = 64 / 100.
+            - name: DB_MAX_CONNS
+              value: {{ .Values.worker.dbMaxConns | default 5 | quote }}
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}
+      affinity:
+        podAntiAffinity:
+          # Preferred (not required): spread worker replicas across nodes for
+          # resilience without making pods unschedulable on small clusters.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: selfservice-api
+                    app.kubernetes.io/component: provision-worker
+                topologyKey: kubernetes.io/hostname

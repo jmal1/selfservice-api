@@ -87,6 +87,8 @@ var testOnlyWiringSeams = map[string]string{
 	"WithProvisionDB": "Injects a fake provisionDB so AdminProvisionTemplate can be driven without a " +
 		"live pgxpool. provisionStore() falls back to h.db when nil, so an unwired seam uses the " +
 		"real database — it fails closed.",
+	"WithRunsDB": "Injects a fake runsListDB so AdminListRuns can be driven without a live pgxpool. " +
+		"runsStore() falls back to h.db when nil, so an unwired seam uses the real database — it fails closed.",
 }
 
 // TestHandlerWiringGuardDetectsAnUnwiredMethod is the guard's own negative

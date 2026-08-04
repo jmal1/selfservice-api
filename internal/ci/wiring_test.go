@@ -45,7 +45,7 @@ var requiredWiring = map[string][]struct {
 	},
 	"cmd/provision-worker/main.go": {
 		{"RunPusher", "image-import metrics never reach Pushgateway without the flush loop"},
-		{"RunStuckUploadReconciler", "without it crucible_image_uploads_stuck is never refreshed, so leaked uploads are never detected"},
+		{"ReconcileStuckImageUploads", "without it crucible_image_uploads_stuck is never refreshed, so leaked uploads are never detected; the call site moved from RunStuckUploadReconciler (deleted) to the unified leader-gated select loop"},
 		{"TemplateFolder", "without it the vCenter client has no folder for source_type=iso template builds: CreateBlankVM resolves an empty path and every ISO template provision dies with `find folder \"\"` before creating anything -- the clone path hides this because it inherits the SOURCE VM's parent folder, and no ISO build had ever run"},
 		{"ReconcileTemplateHealth", "without it no template health checks run, crucible_template_health_* metrics are never pushed, and a silently-rotting template is invisible until students hit it live"},
 	},

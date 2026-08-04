@@ -1,0 +1,27 @@
+{{- /*
+  PodDisruptionBudget for the provision-worker Deployment.
+
+  minAvailable: 2 guarantees that at least 2 workers remain running during
+  voluntary disruptions (node drain, rolling upgrade). With 4 replicas this
+  allows the cluster to take down up to 2 pods at a time while keeping:
+    - at minimum 1 replica able to claim jobs
+    - at minimum 1 replica competing for the leader advisory lock
+
+  NOTE: this PDB only covers voluntary disruptions (kubectl drain, cluster
+  upgrades, Helm rolling restarts). It does not prevent involuntary pod
+  eviction due to OOMKill or node failure.
+*/}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .Release.Name }}-worker-pdb
+  labels:
+    app.kubernetes.io/name: selfservice-api
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: provision-worker
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: selfservice-api
+      app.kubernetes.io/component: provision-worker

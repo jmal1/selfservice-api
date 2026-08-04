@@ -10,6 +10,13 @@
 #   - ExternalSecrets: kubectl get externalsecret -n selfservice
 #   - Vault path: secret/selfservice/<secret-name>
 
+replicaCount:
+  # 4 worker replicas for job throughput. Periodic reconcilers (network,
+  # orphan, IP, etc.) run only on the elected leader via a Postgres
+  # session-scoped advisory lock; the job-claim loop runs on all 4.
+  # The PDB (worker-pdb.yaml) keeps minAvailable: 2 during rolling updates.
+  worker: 4
+
 # Synthetic monitoring: lifecycle + janitor are opt-in by chart default; both
 # are enabled in prod because the synthetic-noop template + grants exist here.
 synthetic:

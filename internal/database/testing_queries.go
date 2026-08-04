@@ -125,6 +125,9 @@ const runAttributionSelect = `
 		       r.target_pod_vm_id, r.target_vm_name, r.target_vm_ip,
 		       COALESCE(u.username, '') AS triggered_by_username,
 		       COALESCE(u.display_name, '') AS triggered_by_display_name,
+		       p.owner_id,
+		       COALESCE(po.username, '') AS pod_owner_username,
+		       COALESCE(po.display_name, '') AS pod_owner_display_name,
 		       COALESCE(p.name, '') AS pod_name,
 		       COALESCE(p.status, '') AS pod_status,
 		       COALESCE(pl.name, '') AS playlist_name,
@@ -133,6 +136,7 @@ const runAttributionSelect = `
 		FROM runs r
 		LEFT JOIN users u ON r.triggered_by = u.id
 		LEFT JOIN pods p ON r.pod_id = p.id
+		LEFT JOIN users po ON p.owner_id = po.id
 		LEFT JOIN playlists pl ON r.playlist_id = pl.id
 `
 
@@ -151,12 +155,16 @@ const getRunWithResultsQuery = `
 		       r.error_message, r.started_at, r.completed_at, r.created_at, r.updated_at,
 		       COALESCE(u.username, '') AS triggered_by_username,
 		       COALESCE(u.display_name, '') AS triggered_by_display_name,
+		       p.owner_id,
+		       COALESCE(po.username, '') AS pod_owner_username,
+		       COALESCE(po.display_name, '') AS pod_owner_display_name,
 		       COALESCE(p.name, '') AS pod_name,
 		       COALESCE(p.status, '') AS pod_status,
 		       COALESCE(pl.name, '') AS playlist_name
 		FROM runs r
 		LEFT JOIN users u ON r.triggered_by = u.id
 		LEFT JOIN pods p ON r.pod_id = p.id
+		LEFT JOIN users po ON p.owner_id = po.id
 		LEFT JOIN playlists pl ON r.playlist_id = pl.id
 		WHERE r.id = $1
 `
@@ -166,6 +174,8 @@ func scanRunAttribution(scan func(dest ...any) error, r *models.Run) error {
 		&r.ID, &r.PodID, &r.PlaylistID, &r.TriggeredBy, &r.Status,
 		&r.TargetPodVMID, &r.TargetVMName, &r.TargetVMIP,
 		&r.TriggeredByUsername, &r.TriggeredByDisplayName,
+		&r.PodOwnerID,
+		&r.PodOwnerUsername, &r.PodOwnerDisplayName,
 		&r.PodName, &r.PodStatus, &r.PlaylistName,
 		&r.TotalWorkflows, &r.PassedWorkflows, &r.FailedWorkflows,
 		&r.ErrorMessage, &r.StartedAt, &r.CompletedAt, &r.CreatedAt, &r.UpdatedAt,
@@ -245,7 +255,8 @@ func (q *Queries) GetRunWithResults(ctx context.Context, runID uuid.UUID) (*mode
 		&run.TargetPodVMID, &run.TargetVMName, &run.TargetVMIP, &run.CallbackToken,
 		&run.Status, &run.TotalWorkflows, &run.PassedWorkflows, &run.FailedWorkflows,
 		&run.ErrorMessage, &run.StartedAt, &run.CompletedAt, &run.CreatedAt, &run.UpdatedAt,
-		&run.TriggeredByUsername, &run.TriggeredByDisplayName, &run.PodName, &run.PodStatus, &run.PlaylistName,
+		&run.TriggeredByUsername, &run.TriggeredByDisplayName, &run.PodOwnerID,
+		&run.PodOwnerUsername, &run.PodOwnerDisplayName, &run.PodName, &run.PodStatus, &run.PlaylistName,
 	); err != nil {
 		return nil, err
 	}
@@ -299,6 +310,97 @@ func (q *Queries) UpdateRunStatus(ctx context.Context, runID uuid.UUID, status s
 // ListAllRuns returns all runs (admin view).
 func (q *Queries) ListAllRuns(ctx context.Context) ([]models.Run, error) {
 	rows, err := q.pool.Query(ctx, listAllRunsQuery)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var runs []models.Run
+	for rows.Next() {
+		var r models.Run
+		if err := scanRunAttribution(rows.Scan, &r); err != nil {
+			return nil, err
+		}
+		runs = append(runs, r)
+	}
+	return runs, nil
+}
+
+// RunsListFilter holds filter parameters for ListAllRunsFiltered.
+type RunsListFilter struct {
+	TriggeredBy   *uuid.UUID // exact match on triggered_by user UUID
+	TriggeredByStr string     // substring match on triggered_by username/display_name
+	PodOwner      *uuid.UUID // exact match on pod owner UUID
+	PodOwnerStr   string     // substring match on pod owner username/display_name
+	Status        string     // exact match on run status
+	From          *time.Time // created_at >= From
+	To            *time.Time // created_at <= To
+	Limit         int        // default 200, max 1000
+	Offset        int        // pagination offset
+}
+
+// ListAllRunsFiltered returns runs matching the provided filters (admin view).
+// Unmatched or empty filters are ignored gracefully.
+// Returns an empty slice if no runs match (never panics or 500s).
+func (q *Queries) ListAllRunsFiltered(ctx context.Context, filter RunsListFilter) ([]models.Run, error) {
+	if filter.Limit <= 0 || filter.Limit > 1000 {
+		filter.Limit = 200
+	}
+	if filter.Offset < 0 {
+		filter.Offset = 0
+	}
+
+	query := runAttributionSelect + " WHERE 1=1"
+	args := []interface{}{}
+	argIndex := 1
+
+	// Filter by triggered_by UUID or username/display_name substring
+	if filter.TriggeredBy != nil {
+		query += fmt.Sprintf(" AND r.triggered_by = $%d", argIndex)
+		args = append(args, *filter.TriggeredBy)
+		argIndex++
+	} else if filter.TriggeredByStr != "" {
+		query += fmt.Sprintf(" AND (u.username ILIKE $%d OR u.display_name ILIKE $%d)", argIndex, argIndex+1)
+		pattern := "%" + filter.TriggeredByStr + "%"
+		args = append(args, pattern, pattern)
+		argIndex += 2
+	}
+
+	// Filter by pod owner UUID or username/display_name substring
+	if filter.PodOwner != nil {
+		query += fmt.Sprintf(" AND p.owner_id = $%d", argIndex)
+		args = append(args, *filter.PodOwner)
+		argIndex++
+	} else if filter.PodOwnerStr != "" {
+		query += fmt.Sprintf(" AND (po.username ILIKE $%d OR po.display_name ILIKE $%d)", argIndex, argIndex+1)
+		pattern := "%" + filter.PodOwnerStr + "%"
+		args = append(args, pattern, pattern)
+		argIndex += 2
+	}
+
+	// Filter by status
+	if filter.Status != "" {
+		query += fmt.Sprintf(" AND r.status = $%d", argIndex)
+		args = append(args, filter.Status)
+		argIndex++
+	}
+
+	// Filter by date range
+	if filter.From != nil {
+		query += fmt.Sprintf(" AND r.created_at >= $%d", argIndex)
+		args = append(args, *filter.From)
+		argIndex++
+	}
+	if filter.To != nil {
+		query += fmt.Sprintf(" AND r.created_at <= $%d", argIndex)
+		args = append(args, *filter.To)
+		argIndex++
+	}
+
+	query += fmt.Sprintf(" ORDER BY r.created_at DESC LIMIT $%d OFFSET $%d", argIndex, argIndex+1)
+	args = append(args, filter.Limit, filter.Offset)
+
+	rows, err := q.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

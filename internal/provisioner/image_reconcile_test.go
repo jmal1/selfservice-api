@@ -130,32 +130,3 @@ func TestReconcileStuckUploads_QueryErrorDoesNotPublish(t *testing.T) {
 		t.Errorf("Push must NOT be called on query error; called %d times — pushing a stale or zero gauge would clear a firing alert during a DB outage", m.pushes)
 	}
 }
-
-// TestReconcileStuckUploads_RespectsContextCancel verifies that
-// RunStuckUploadReconciler exits promptly when its context is cancelled,
-// without panicking. A loop that ignores ctx.Done() would block worker
-// shutdown indefinitely.
-func TestReconcileStuckUploads_RespectsContextCancel(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-
-	prov := &Provisioner{} // db and pipeline are nil; the ticker won't fire
-	cfg := StuckUploadReconcilerConfig{
-		Interval:       10 * time.Hour, // will not fire during this test
-		StaleThreshold: 30 * time.Minute,
-	}
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		prov.RunStuckUploadReconciler(ctx, cfg)
-	}()
-
-	cancel()
-
-	select {
-	case <-done:
-		// loop exited cleanly — expected
-	case <-time.After(2 * time.Second):
-		t.Error("RunStuckUploadReconciler did not stop within 2s after context cancel")
-	}
-}
