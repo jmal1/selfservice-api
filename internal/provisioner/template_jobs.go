@@ -1118,8 +1118,17 @@ type revalidateL1CoreDB interface {
 }
 
 // revalidateL1CorePipeline is the narrow metrics surface for revalidateL1TemplateCore.
+//
+// SetTemplateLastValidated is included because the L1 trust reconciler only
+// refreshes that gauge on its own (weekly) tick. Without a push here, a
+// template that has just been validated successfully keeps reporting its
+// pre-validation timestamp — 0 for a never-validated template — until the next
+// reconcile, so CrucibleTemplateValidationStale fires for up to a full interval
+// *after* a passing run. Pushing on completion keeps the gauge in step with
+// templates.last_validated_at, which this function writes a few lines below.
 type revalidateL1CorePipeline interface {
 	RecordTemplateValidation(templateID, result string)
+	SetTemplateLastValidated(templateID string, unixSec float64)
 }
 
 // revalidateL1TemplateCore records the outcome of a completed smoke check for
@@ -1164,6 +1173,14 @@ func revalidateL1TemplateCore(
 			metricResult = "fail"
 		}
 		pipeline.RecordTemplateValidation(tmpl.ID.String(), metricResult)
+
+		// Mirror templates.last_validated_at, which is written above for BOTH
+		// outcomes. The staleness alert means "nobody has checked this
+		// template recently", not "the check failed" — failures are carried by
+		// RecordTemplateValidation's result label. Advancing the gauge on a
+		// failed run therefore avoids double-alerting on one fault while still
+		// letting the staleness alert catch a revalidation that stops running.
+		pipeline.SetTemplateLastValidated(tmpl.ID.String(), float64(now.Unix()))
 	}
 }
 

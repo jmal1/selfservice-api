@@ -4,9 +4,10 @@
 // is empty.
 //
 // Metrics exposed:
-//   crucible_vm_suspended_total{reason}      — counter: suspensions by reason
-//   crucible_vms_suspended                   — gauge: VMs currently suspended
-//   crucible_idle_evaluator_last_run_timestamp — gauge: Unix time of last evaluator pass
+//
+//	crucible_vm_suspended_total{reason}      — counter: suspensions by reason
+//	crucible_vms_suspended                   — gauge: VMs currently suspended
+//	crucible_idle_evaluator_last_run_timestamp — gauge: Unix time of last evaluator pass
 //
 // Each metric has a real production call site in the idle evaluator loop
 // (see idle_eval.go evaluateIdleVMs). The pusher loop makes those call sites
@@ -50,6 +51,19 @@ type SuspendMetrics struct {
 }
 
 // NewSuspendMetrics returns an initialized collector.
+//
+// lastRunUnix is seeded with the process start time rather than left at 0.
+// The staleness alert is `time() - crucible_idle_evaluator_last_run_timestamp > 1h`,
+// so a zero value reads as "last ran in 1970" and fires immediately on every
+// worker restart, staying lit until the first tick — up to a full evaluator
+// interval (15m in production) after each deploy.
+//
+// Simply not emitting the gauge until the first pass is NOT an option: an
+// alert of the form "value too old" cannot match an absent series, so omitting
+// it would make the rule permanently unable to fire — trading a noisy alert for
+// a blind one. Seeding keeps the series present from the first push, makes a
+// restart read ~0s stale, and still lets a genuinely dead evaluator cross the
+// threshold on schedule.
 func NewSuspendMetrics(baseURL, job string, grouping map[string]string) *SuspendMetrics {
 	if job == "" {
 		job = "crucible_provision_worker"
@@ -59,6 +73,7 @@ func NewSuspendMetrics(baseURL, job string, grouping map[string]string) *Suspend
 		Job:            job,
 		GroupingLabels: grouping,
 		suspendTotal:   map[string]float64{},
+		lastRunUnix:    float64(time.Now().Unix()),
 	}
 }
 
