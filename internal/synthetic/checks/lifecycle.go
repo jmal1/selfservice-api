@@ -49,10 +49,22 @@ type PodLifecycleConfig struct {
 }
 
 // DefaultPodLifecycleConfig returns the production-tuned defaults.
+//
+// ReadyTimeout rationale: the synthetic-noop template completes in ~37 s on
+// a healthy vCenter. 120 s (2 min) is 3.2× the observed median — generous
+// enough to tolerate normal variance but tight enough to leave room for a
+// full retry within the 10-minute CronJob schedule. The previous default of
+// 8 minutes was sized for a worst-case cold clone of a full Ubuntu template;
+// the noop template is intentionally lightweight, so that headroom is gone.
+//
+// Worst-case pod_lifecycle cycle time with 2 attempts and 30 s backoff:
+//
+//	2 × (ReadyTimeout + DestroyTimeout) + Backoff + overhead
+//	= 2 × (120 s + 90 s) + 30 s + 60 s = 510 s ≈ 8.5 min < 10 min ✓
 func DefaultPodLifecycleConfig(templateName string) PodLifecycleConfig {
 	return PodLifecycleConfig{
 		TemplateName:   templateName,
-		ReadyTimeout:   8 * time.Minute,
+		ReadyTimeout:   2 * time.Minute,
 		DestroyTimeout: 90 * time.Second,
 		PreCleanMaxAge: 5 * time.Minute,
 	}

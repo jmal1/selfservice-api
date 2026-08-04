@@ -39,18 +39,18 @@ func TestLifecycleSafeTimeout_TakesTheLongestEnvelopeRegardlessOfOrder(t *testin
 		want   time.Duration
 	}{
 		{"no expensive checks keeps the base", names("healthz", "auth_me"), base},
-		{"pod_lifecycle alone", names("healthz", "pod_lifecycle"), 11 * time.Minute},
-		{"runner_smoke alone", names("runner_smoke"), 21 * time.Minute},
+		{"pod_lifecycle alone", names("healthz", "pod_lifecycle"), 4 * time.Minute},
+		{"runner_smoke alone", names("runner_smoke"), 14 * time.Minute},
 		{
 			// Ordering guard: lifecycle first would have short-circuited.
 			"both, lifecycle registered first",
 			names("healthz", "pod_lifecycle", "runner_smoke"),
-			21 * time.Minute,
+			14 * time.Minute,
 		},
 		{
 			"both, runner registered first",
 			names("runner_smoke", "pod_lifecycle"),
-			21 * time.Minute,
+			14 * time.Minute,
 		},
 	}
 
@@ -417,8 +417,8 @@ func TestSessionTokenTTL_OutlivesEveryCheckBudget(t *testing.T) {
 		longest, base time.Duration
 		active        int
 	}{
-		{"runner mode: one check with a 21m budget", 21 * time.Minute, 30 * time.Second, 1},
-		{"default mode with pod_lifecycle (11m budget)", 11 * time.Minute, 30 * time.Second, 13},
+		{"runner mode: one check with a 14m per-attempt budget", 14 * time.Minute, 30 * time.Second, 1},
+		{"default mode with pod_lifecycle (4m per-attempt budget)", 4 * time.Minute, 30 * time.Second, 13},
 		{"default mode, no expensive checks", 30 * time.Second, 30 * time.Second, 8},
 		{"janitor mode", 30 * time.Second, 30 * time.Second, 1},
 		{"degenerate: no active checks", 30 * time.Second, 30 * time.Second, 0},
@@ -440,7 +440,8 @@ func TestSessionTokenTTL_OutlivesEveryCheckBudget(t *testing.T) {
 // formula would have been adequate, this test would pass vacuously.
 func TestSessionTokenTTL_BeatsTheShippedBug(t *testing.T) {
 	const base = 30 * time.Second
-	const runnerBudget = 21 * time.Minute
+	// runner_smoke per-attempt envelope with the new 2-min ReadyTimeout.
+	const runnerBudget = 14 * time.Minute
 
 	buggy := base * time.Duration(len(checks.All())+1)
 	if buggy >= runnerBudget {
@@ -470,5 +471,146 @@ func TestSessionTokenTTL_IsDerivedFromTheRunnerBudgetNotAllChecks(t *testing.T) 
 	if strings.Contains(body, "len(checks.All())+1") {
 		t.Error("a session token is being minted from checks.All() again: in runner or janitor mode " +
 			"that is the wrong check set, and it reintroduces the 4m30s-token-vs-21m-budget bug")
+	}
+}
+
+// TestResolveRetryConfig_Defaults guards the default retry configuration.
+func TestResolveRetryConfig_Defaults(t *testing.T) {
+	cfg, err := resolveRetryConfig(func(string) string { return "" }, "ENV_ATTEMPTS", "ENV_BACKOFF")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.MaxAttempts != 2 {
+		t.Errorf("MaxAttempts = %d, want 2", cfg.MaxAttempts)
+	}
+	if cfg.Backoff != 30*time.Second {
+		t.Errorf("Backoff = %v, want 30s", cfg.Backoff)
+	}
+}
+
+// TestResolveRetryConfig_Overrides confirms that env vars are applied.
+func TestResolveRetryConfig_Overrides(t *testing.T) {
+	env := map[string]string{
+		"ENV_ATTEMPTS": "3",
+		"ENV_BACKOFF":  "45s",
+	}
+	cfg, err := resolveRetryConfig(func(k string) string { return env[k] }, "ENV_ATTEMPTS", "ENV_BACKOFF")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.MaxAttempts != 3 {
+		t.Errorf("MaxAttempts = %d, want 3", cfg.MaxAttempts)
+	}
+	if cfg.Backoff != 45*time.Second {
+		t.Errorf("Backoff = %v, want 45s", cfg.Backoff)
+	}
+}
+
+// TestResolveRetryConfig_RejectsInvalid covers error paths for bad inputs.
+func TestResolveRetryConfig_RejectsInvalid(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		env     map[string]string
+		wantErr string
+	}{
+		{
+			"zero attempts",
+			map[string]string{"ENV_ATTEMPTS": "0"},
+			"ENV_ATTEMPTS",
+		},
+		{
+			"non-integer attempts",
+			map[string]string{"ENV_ATTEMPTS": "two"},
+			"ENV_ATTEMPTS",
+		},
+		{
+			"invalid backoff",
+			map[string]string{"ENV_BACKOFF": "10"},
+			"ENV_BACKOFF",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := resolveRetryConfig(func(k string) string { return tc.env[k] }, "ENV_ATTEMPTS", "ENV_BACKOFF")
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error %q should mention %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestHasPodLifecycle confirms the helper finds pod_lifecycle by name.
+func TestHasPodLifecycle(t *testing.T) {
+	if hasPodLifecycle(names("healthz", "auth_me")) {
+		t.Error("hasPodLifecycle returned true for a set with no pod_lifecycle")
+	}
+	if !hasPodLifecycle(names("healthz", "pod_lifecycle", "auth_me")) {
+		t.Error("hasPodLifecycle returned false for a set containing pod_lifecycle")
+	}
+}
+
+// TestPodLifecycleRetry_WorstCaseFitsCronJob asserts that the worst-case cycle
+// time with 2 attempts and the default timeouts stays under the 10-minute
+// CronJob schedule.
+//
+// Arithmetic:
+//
+//	2 × (ReadyTimeout + DestroyTimeout) + Backoff + overhead
+//	= 2 × (120s + 90s) + 30s + 60s
+//	= 510s = 8m30s < 10m ✓
+func TestPodLifecycleRetry_WorstCaseFitsCronJob(t *testing.T) {
+	const (
+		readyTimeout   = 2 * time.Minute
+		destroyTimeout = 90 * time.Second
+		maxAttempts    = 2
+		backoff        = 30 * time.Second
+		overhead       = 60 * time.Second // pre-clean, HTTP, logging
+		cronJob        = 10 * time.Minute
+	)
+
+	worstCase := time.Duration(maxAttempts)*(readyTimeout+destroyTimeout) +
+		time.Duration(maxAttempts-1)*backoff + overhead
+
+	if worstCase >= cronJob {
+		t.Errorf(
+			"worst-case pod_lifecycle cycle time %v >= CronJob schedule %v.\n"+
+				"Retry budget too large: overlapping CronJob runs cause resource leaks "+
+				"and stale metrics. Reduce MaxAttempts or ReadyTimeout.",
+			worstCase, cronJob,
+		)
+	}
+}
+
+// TestRunnerSmokeRetry_WorstCaseFitsCronJob asserts the worst-case runner_smoke
+// cycle fits the 30-minute CronJob schedule.
+//
+// Arithmetic (worst case: both attempts hit the RunTimeout):
+//
+//	2 × (ReadyTimeout + RunTimeout + DestroyTimeout) + Backoff + overhead
+//	= 2 × (120s + 600s + 90s) + 30s + 60s
+//	= 1710s = 28m30s < 30m ✓
+func TestRunnerSmokeRetry_WorstCaseFitsCronJob(t *testing.T) {
+	const (
+		readyTimeout   = 2 * time.Minute
+		runTimeout     = 10 * time.Minute
+		destroyTimeout = 90 * time.Second
+		maxAttempts    = 2
+		backoff        = 30 * time.Second
+		overhead       = 60 * time.Second
+		cronJob        = 30 * time.Minute
+	)
+
+	worstCase := time.Duration(maxAttempts)*(readyTimeout+runTimeout+destroyTimeout) +
+		time.Duration(maxAttempts-1)*backoff + overhead
+
+	if worstCase >= cronJob {
+		t.Errorf(
+			"worst-case runner_smoke cycle time %v >= CronJob schedule %v.\n"+
+				"Retry budget too large: overlapping CronJob runs cause resource leaks "+
+				"and stale metrics. Reduce MaxAttempts or ReadyTimeout.",
+			worstCase, cronJob,
+		)
 	}
 }

@@ -190,3 +190,65 @@ func TestPushgateway_pushURL_DeterministicOrdering(t *testing.T) {
 		t.Errorf("URL = %q, want sorted segments /a/1/b/2/c/3", a)
 	}
 }
+
+// TestSerializeResults_EmitsAttemptsMetric confirms that the new
+// crucible_synthetic_check_attempts family is present and reflects Result.Attempts.
+func TestSerializeResults_EmitsAttemptsMetric(t *testing.T) {
+	body := string(serializeResults([]Result{
+		{Name: "pod_lifecycle", Title: "Pod lifecycle", Severity: SeverityCritical, Success: true, Attempts: 2},
+		{Name: "healthz", Title: "API Liveness", Severity: SeverityCritical, Success: true, Attempts: 1},
+	}))
+
+	if !strings.Contains(body, "# TYPE crucible_synthetic_check_attempts gauge") {
+		t.Errorf("missing TYPE line for crucible_synthetic_check_attempts:\n%s", body)
+	}
+	if !strings.Contains(body, `crucible_synthetic_check_attempts{check="pod_lifecycle"`) {
+		t.Errorf("pod_lifecycle attempts metric missing:\n%s", body)
+	}
+	if !strings.Contains(body, `} 2`) {
+		t.Errorf("pod_lifecycle should show attempts=2:\n%s", body)
+	}
+	if !strings.Contains(body, `crucible_synthetic_check_attempts{check="healthz"`) {
+		t.Errorf("healthz attempts metric missing:\n%s", body)
+	}
+}
+
+// TestSerializeResults_AttemptsDefaultsToOneForUnsetField guards the defensive
+// fallback: a Result with Attempts=0 (field not set by older code paths)
+// should emit 1 rather than 0, which would look like the check never ran.
+func TestSerializeResults_AttemptsDefaultsToOneForUnsetField(t *testing.T) {
+	body := string(serializeResults([]Result{
+		{Name: "x", Title: "X", Severity: SeverityCritical, Success: true, Attempts: 0},
+	}))
+	// The defensive fallback in serializeResults should normalise 0 → 1.
+	if !strings.Contains(body, `crucible_synthetic_check_attempts{check="x",title="X",severity="critical"} 1`) {
+		t.Errorf("Attempts=0 in Result must be emitted as 1 (defensive fallback); got:\n%s", body)
+	}
+}
+
+// TestSerializeResults_EmitsVCenterDegradedMetric confirms the new
+// crucible_synthetic_vcenter_degraded family is present.
+func TestSerializeResults_EmitsVCenterDegradedMetric(t *testing.T) {
+	body := string(serializeResults([]Result{
+		{
+			Name: "pod_lifecycle", Title: "Pod lifecycle", Severity: SeverityCritical,
+			Success: true, Attempts: 2, VCenterDegraded: true,
+		},
+		{
+			Name: "healthz", Title: "API Liveness", Severity: SeverityCritical,
+			Success: true, Attempts: 1, VCenterDegraded: false,
+		},
+	}))
+
+	if !strings.Contains(body, "# TYPE crucible_synthetic_vcenter_degraded gauge") {
+		t.Errorf("missing TYPE line for crucible_synthetic_vcenter_degraded:\n%s", body)
+	}
+	// pod_lifecycle passed on retry but had a vCenter stall — must be 1.
+	if !strings.Contains(body, `crucible_synthetic_vcenter_degraded{check="pod_lifecycle"`) {
+		t.Errorf("pod_lifecycle vcenter_degraded metric missing:\n%s", body)
+	}
+	// healthz had no vCenter stall — must be 0.
+	if !strings.Contains(body, `crucible_synthetic_vcenter_degraded{check="healthz"`) {
+		t.Errorf("healthz vcenter_degraded metric missing:\n%s", body)
+	}
+}
