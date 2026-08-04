@@ -63,6 +63,11 @@ type Handler struct {
 	// AdminProvisionTemplate end-to-end without a real pgxpool. See provisionStore().
 	provDB provisionDB
 
+	// runsDB is an optional override for the narrow DB surface used by
+	// AdminListRuns. nil means h.db is used. Tests inject a fake via
+	// WithRunsDB. See runsStore().
+	runsDB runsListDB
+
 	// Preflight checks. Set via WithPreflightVCenter. nil = not configured;
 	// AdminPreflightTemplate returns 503 and the provision gate is skipped.
 	vcPreflight  PreflightVCenter
@@ -205,6 +210,29 @@ func (h *Handler) provisionStore() provisionDB {
 // end-to-end without a real database connection. Do not call from production code.
 func (h *Handler) WithProvisionDB(db provisionDB) *Handler {
 	h.provDB = db
+	return h
+}
+
+// runsListDB is the narrow slice of *database.Queries that AdminListRuns needs.
+// Declaring it as an interface lets tests inject a fake without a live pgxpool
+// — see Handler.runsStore() and WithRunsDB.
+type runsListDB interface {
+	ListAllRunsFiltered(ctx context.Context, filter database.RunsListFilter) ([]models.Run, error)
+}
+
+// runsStore returns the runsListDB in use. h.runsDB is non-nil only in
+// tests; production code always falls through to h.db.
+func (h *Handler) runsStore() runsListDB {
+	if h.runsDB != nil {
+		return h.runsDB
+	}
+	return h.db
+}
+
+// WithRunsDB injects a fake runsListDB for testing AdminListRuns without a real
+// database connection. Do not call from production code.
+func (h *Handler) WithRunsDB(db runsListDB) *Handler {
+	h.runsDB = db
 	return h
 }
 

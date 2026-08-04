@@ -346,6 +346,13 @@ func (p *Provider) ValidateSession(r *http.Request) (*SessionClaims, error) {
 	return claims, nil
 }
 
+// NewTestProvider returns a *Provider whose only configured field is jwtSecret.
+// Use in unit tests that need to sign or verify session JWTs without a live
+// OIDC endpoint or database. Do not call from production code.
+func NewTestProvider(jwtSecret []byte) *Provider {
+	return &Provider{jwtSecret: jwtSecret}
+}
+
 // RefreshSessionCookie re-issues the session JWT if it's past the halfway point of its TTL.
 // This creates a sliding window so active users don't get logged out.
 func (p *Provider) RefreshSessionCookie(w http.ResponseWriter, claims *SessionClaims) {

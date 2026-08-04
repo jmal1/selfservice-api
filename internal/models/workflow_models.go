@@ -178,6 +178,9 @@ type Run struct {
 	// Populated via LEFT JOIN by the admin run queries; empty when the related row is gone.
 	TriggeredByUsername    string `json:"triggered_by_username" db:"triggered_by_username"`
 	TriggeredByDisplayName string `json:"triggered_by_display_name" db:"triggered_by_display_name"`
+	PodOwnerID             *uuid.UUID `json:"pod_owner_id,omitempty" db:"pod_owner_id"`
+	PodOwnerUsername       string `json:"pod_owner_username" db:"pod_owner_username"`
+	PodOwnerDisplayName    string `json:"pod_owner_display_name" db:"pod_owner_display_name"`
 	PodName                string `json:"pod_name" db:"pod_name"`
 	PodStatus              string `json:"pod_status" db:"pod_status"`
 	PlaylistName           string `json:"playlist_name" db:"playlist_name"`
