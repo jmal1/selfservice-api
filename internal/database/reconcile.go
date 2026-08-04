@@ -125,10 +125,19 @@ type IdleSuspendCandidate struct {
 // ListRunningPodVMsForIdleEval returns running pod_vms that belong to active
 // pods and have a vCenter reference. These are the candidates the idle
 // evaluator inspects on each tick.
+//
+// last_activity_at is COALESCEd to created_at deliberately. A NULL here means
+// "no activity has ever been recorded", which the evaluator reads as infinitely
+// idle — so before migration 000028 a VM created seconds ago was immediately
+// eligible for suspension. created_at is the earliest moment the VM could
+// plausibly have been used, so falling back to it can only ever DELAY a
+// suspension, never cause one. 000028 also sets a column DEFAULT; this COALESCE
+// is the second layer, so an insert path that bypasses the default still cannot
+// produce a VM that looks infinitely idle.
 func (q *Queries) ListRunningPodVMsForIdleEval(ctx context.Context) ([]IdleSuspendCandidate, error) {
 	rows, err := q.pool.Query(ctx, `
 		SELECT pv.id, pv.pod_id, p.status, pv.vcenter_vm_id,
-		       pv.display_name, pv.last_activity_at
+		       pv.display_name, COALESCE(pv.last_activity_at, pv.created_at)
 		FROM pod_vms pv
 		JOIN pods p ON pv.pod_id = p.id
 		WHERE pv.status = 'running'
