@@ -1714,8 +1714,7 @@ func (q *Queries) ListBlueprintsForUser(ctx context.Context, userID uuid.UUID, r
 		WHERE b.is_active = true
 		  AND (ba.role = $1 OR ba.user_id = $2 OR $1 = 'admin'
 		       OR NOT EXISTS (SELECT 1 FROM blueprint_access WHERE blueprint_id = b.id))
-		ORDER BY b.pinned DESC, CASE WHEN b.pinned THEN b.pin_order ELSE 0 END ASC,
-		         CASE WHEN b.pinned THEN b.pinned_at ELSE NULL END DESC NULLS LAST, b.name ASC
+		`+BlueprintPinOrderClause+`
 	`, role, userID)
 	if err != nil {
 		return nil, err
@@ -1752,8 +1751,7 @@ func (q *Queries) ListAllBlueprints(ctx context.Context) ([]models.Blueprint, er
 		       u.id, u.username, u.email, COALESCE(u.display_name, ''), u.role
 		FROM blueprints b
 		JOIN users u ON u.id = b.created_by
-		ORDER BY b.pinned DESC, CASE WHEN b.pinned THEN b.pin_order ELSE 0 END ASC,
-		         CASE WHEN b.pinned THEN b.pinned_at ELSE NULL END DESC NULLS LAST, b.name ASC
+		`+BlueprintPinOrderClause+`
 	`)
 	if err != nil {
 		return nil, err
