@@ -66,6 +66,10 @@ func (s *pipelineMetricsSpy) RecordJobRetry(_, _ string)    {}
 func (s *pipelineMetricsSpy) RecordJobRetryExhausted(_ string) {}
 func (s *pipelineMetricsSpy) SetJobRetryPending(_ int)        {}
 
+// L1 trust-tier validation stubs — satisfy pipelineMetricsSink.
+func (s *pipelineMetricsSpy) RecordTemplateValidation(_, _ string) {}
+func (s *pipelineMetricsSpy) SetTemplateLastValidated(_ string, _ float64) {}
+
 var _ pipelineMetricsSink = (*pipelineMetricsSpy)(nil)
 var _ templateReconcileMetrics = (*pipelineMetricsSpy)(nil)
 

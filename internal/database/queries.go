@@ -53,7 +53,8 @@ const templateSelectCols = `id, name, vcenter_template, os_type, default_vcpus, 
 		template_state, created_by, vcenter_vm_id, source_type, source_ref, staging_network,
 		is_internal,
 		unattend_mode, unattend_config, guest_id,
-		created_at, updated_at`
+		created_at, updated_at,
+		trust_tier, last_validated_at, last_validation_result`
 
 // scanTemplate populates t from a row whose columns are in templateSelectCols
 // order. Centralizes the column ordering so adding a column in the future
@@ -67,6 +68,7 @@ func scanTemplate(row pgx.Row, t *models.Template) error {
 		&t.IsInternal,
 		&t.UnattendMode, &t.UnattendConfig, &t.GuestID,
 		&t.CreatedAt, &t.UpdatedAt,
+		&t.TrustTier, &t.LastValidatedAt, &t.LastValidationResult,
 	)
 }
 
@@ -1245,6 +1247,75 @@ func (q *Queries) ListTemplateDependents(ctx context.Context, templateID uuid.UU
 		vms = append(vms, vm)
 	}
 	return templateName, vms, rows.Err()
+}
+
+// SetTemplateValidationState records the outcome of a template_revalidate job.
+// Both last_validated_at and last_validation_result are updated together so
+// queries can efficiently find templates whose most recent run was a failure.
+func (q *Queries) SetTemplateValidationState(ctx context.Context, id uuid.UUID, result string, validatedAt time.Time) error {
+	_, err := q.pool.Exec(ctx, `
+		UPDATE templates
+		SET last_validated_at = $2, last_validation_result = $3, updated_at = NOW()
+		WHERE id = $1
+	`, id, validatedAt, result)
+	return err
+}
+
+// ListStaleL1Templates returns active templates with trust_tier='l1' whose
+// last_validated_at is NULL or older than olderThan. These are candidates for
+// a new template_revalidate job enqueued by the L1 trust-validation reconciler.
+func (q *Queries) ListStaleL1Templates(ctx context.Context, olderThan time.Duration) ([]models.Template, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT `+templateSelectCols+`
+		FROM templates
+		WHERE trust_tier = 'l1'
+		  AND is_active = true
+		  AND (
+		      last_validated_at IS NULL
+		      OR last_validated_at < now() - $1::interval
+		  )
+		ORDER BY COALESCE(last_validated_at, '-infinity'::timestamptz) ASC
+	`, fmt.Sprintf("%d seconds", int(olderThan.Seconds())))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []models.Template
+	for rows.Next() {
+		var t models.Template
+		if err := scanTemplate(rows, &t); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// ListAllActiveL1Templates returns all active templates with trust_tier='l1'.
+// Used by the L1 trust-validation reconciler to populate the per-template
+// staleness gauge on every pass — not just for templates that are overdue.
+func (q *Queries) ListAllActiveL1Templates(ctx context.Context) ([]models.Template, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT `+templateSelectCols+`
+		FROM templates
+		WHERE trust_tier = 'l1' AND is_active = true
+		ORDER BY name
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []models.Template
+	for rows.Next() {
+		var t models.Template
+		if err := scanTemplate(rows, &t); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
 }
 
 // --- User Sessions ---

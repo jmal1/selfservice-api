@@ -36,6 +36,9 @@ type pipelineMetricsSink interface {
 	RecordJobRetry(jobType, reason string)
 	RecordJobRetryExhausted(jobType string)
 	SetJobRetryPending(n int)
+	// L1 trust-tier revalidation metrics — added with migration 000027.
+	RecordTemplateValidation(templateID, result string)
+	SetTemplateLastValidated(templateID string, unixSec float64)
 	Push(ctx context.Context) error
 }
 
@@ -149,6 +152,8 @@ func (p *Provisioner) ProcessJob(ctx context.Context, job *models.Job) error {
 			return p.GeneralizeTemplate(ctx, job)
 		case models.JobTypeTemplateVerify:
 			return p.VerifyTemplate(ctx, job)
+		case models.JobTypeTemplateRevalidate:
+			return p.RevalidateL1Template(ctx, job)
 		case models.JobTypeImageImport:
 			return p.ImportImage(ctx, job)
 		case models.JobTypeVMSuspend:
@@ -161,7 +166,8 @@ func (p *Provisioner) ProcessJob(ctx context.Context, job *models.Job) error {
 
 func isTemplateJobType(jobType string) bool {
 	switch jobType {
-	case models.JobTypeTemplateProvision, models.JobTypeTemplateGeneralize, models.JobTypeTemplateVerify:
+	case models.JobTypeTemplateProvision, models.JobTypeTemplateGeneralize,
+		models.JobTypeTemplateVerify, models.JobTypeTemplateRevalidate:
 		return true
 	default:
 		return false

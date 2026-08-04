@@ -372,6 +372,21 @@ func main() {
 		Pusher: idleEvalPusher,
 	}
 
+	// L1 trust-tier revalidation reconciler. Periodically enqueues
+	// template_revalidate jobs for active L1 templates whose last_validated_at
+	// is NULL or older than the configured interval.
+	// Enabled by default when a Pushgateway is configured (metrics are the
+	// whole point); set WORKER_L1_VALIDATION_ENABLED=false to opt out.
+	// WORKER_L1_VALIDATION_INTERVAL overrides the default 168h (weekly) cadence.
+	l1ValidationEnabled := pipeline != nil // requires metrics to be useful
+	if v := os.Getenv("WORKER_L1_VALIDATION_ENABLED"); v != "" {
+		l1ValidationEnabled = strings.EqualFold(v, "true")
+	}
+	l1ValidationInterval := envDuration(logger, "WORKER_L1_VALIDATION_INTERVAL", 168*time.Hour)
+	l1ValidationCfg := provisioner.L1TrustValidationReconcilerConfig{
+		Interval: l1ValidationInterval,
+	}
+
 	// Worker ID for job claiming
 	workerID, err := os.Hostname()
 	if err != nil {
@@ -461,6 +476,24 @@ func main() {
 		}
 	}
 
+	// L1 trust-validation reconciler ticker. Enabled when WORKER_L1_VALIDATION_ENABLED
+	// is true (defaults to true when a pipeline/Pushgateway is configured).
+	var l1ValidationTickerC <-chan time.Time
+	if l1ValidationEnabled {
+		t := time.NewTicker(l1ValidationInterval)
+		defer t.Stop()
+		l1ValidationTickerC = t.C
+		logger.Info("l1 trust validation reconciler enabled",
+			"interval", l1ValidationInterval)
+		// Run once immediately on startup so the staleness gauge is populated
+		// before the first tick fires.
+		go func() {
+			if _, err := prov.ReconcileL1TrustValidation(ctx, l1ValidationCfg); err != nil {
+				logger.Error("initial l1 trust validation reconcile failed", "error", err)
+			}
+		}()
+	}
+
 	// Start expiration cron (checks for expired pods every 5 minutes)
 	go prov.StartExpirationCron(ctx)
 
@@ -502,6 +535,10 @@ func main() {
 			case <-retryPendingTickerC:
 				if err := prov.ReconcileRetryPending(ctx); err != nil {
 					logger.Error("retry-pending reconcile failed", "error", err)
+				}
+			case <-l1ValidationTickerC:
+				if _, err := prov.ReconcileL1TrustValidation(ctx, l1ValidationCfg); err != nil {
+					logger.Error("l1 trust validation reconcile failed", "error", err)
 				}
 			}
 		}

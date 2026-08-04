@@ -80,6 +80,11 @@ type PipelineMetrics struct {
 	jobRetryExhausted         map[string]float64 // type
 	jobRetryPending           float64            // gauge: jobs sleeping between retries
 	jobRetryPendingCollected  bool               // true once SetJobRetryPending has run
+
+	// L1 trust-tier revalidation metrics (migration 000027).
+	templateValidation             map[string]float64 // template_id|result — counter
+	templateLastValidated          map[string]float64 // template_id — gauge (unix seconds)
+	templateLastValidatedCollected bool               // true once SetTemplateLastValidated has run
 }
 
 // NewPipelineMetrics returns an initialized collector. baseURL may be
@@ -105,6 +110,8 @@ func NewPipelineMetrics(baseURL, job string, grouping map[string]string) *Pipeli
 		templateStates:      map[string]float64{},
 		jobRetries:          map[string]float64{},
 		jobRetryExhausted:   map[string]float64{},
+		templateValidation:  map[string]float64{},
+		templateLastValidated: map[string]float64{},
 	}
 }
 
@@ -213,6 +220,27 @@ func (m *PipelineMetrics) SetJobRetryPending(n int) {
 	m.jobRetryPendingCollected = true
 }
 
+// RecordTemplateValidation counts a completed L1 revalidation run.
+// result is "pass" or "fail". Called by RevalidateL1Template on every run
+// so failures appear as a rising counter that can alert.
+func (m *PipelineMetrics) RecordTemplateValidation(templateID, result string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.templateValidation[templateID+"|"+result]++
+}
+
+// SetTemplateLastValidated records the Unix timestamp of the most recent
+// completed validation run for a template (pass or fail). Called by the L1
+// trust-validation reconciler after each pass so the staleness gauge stays
+// accurate. The gauge family is omitted entirely until this method has been
+// called at least once — see the Collected pattern for imageUploadsStuck.
+func (m *PipelineMetrics) SetTemplateLastValidated(templateID string, unixSec float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.templateLastValidated[templateID] = unixSec
+	m.templateLastValidatedCollected = true
+}
+
 // Push serializes the current values and POSTs them. No-op when BaseURL
 // is empty.
 func (m *PipelineMetrics) Push(ctx context.Context) error {
@@ -314,6 +342,20 @@ func (m *PipelineMetrics) serialize() []byte {
 		b.WriteString("# HELP crucible_job_retry_pending Jobs currently sleeping between retry attempts (next_attempt_at > now()).\n")
 		b.WriteString("# TYPE crucible_job_retry_pending gauge\n")
 		fmt.Fprintf(&b, "crucible_job_retry_pending %g\n", m.jobRetryPending)
+	}
+
+	writeCounter2(&b, "crucible_template_validation_total",
+		"L1 template revalidation outcomes by template_id and result (pass/fail).",
+		"template_id", "result", m.templateValidation)
+
+	// Omit the staleness gauge family until the L1 trust-validation reconciler
+	// has run at least once. Before that, an absent series is honest ("never
+	// validated") rather than a false "0 = recently validated". Matches the
+	// Collected pattern used by imageUploadsStuck and jobRetryPending above.
+	if m.templateLastValidatedCollected {
+		writeGauge1(&b, "crucible_template_last_validated_timestamp",
+			"Unix timestamp of the most recent completed L1 validation run per template (pass or fail). Alert when now()-value exceeds the validation interval.",
+			"template_id", m.templateLastValidated)
 	}
 
 	b.WriteString("# HELP crucible_pipeline_run_timestamp_seconds Unix time of the latest pipeline metrics push.\n")

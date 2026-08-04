@@ -72,6 +72,11 @@ type Template struct {
 	GuestID   string    `json:"guest_id" db:"guest_id"`
 	CreatedAt time.Time `json:"created_at" db:"created_at"`
 	UpdatedAt time.Time `json:"updated_at" db:"updated_at"`
+	// TrustTier controls periodic smoke-clone revalidation (migration 000027).
+	// See TemplateTrustTier* constants. Default is "untrusted".
+	TrustTier            string     `json:"trust_tier" db:"trust_tier"`
+	LastValidatedAt      *time.Time `json:"last_validated_at,omitempty" db:"last_validated_at"`
+	LastValidationResult *string    `json:"last_validation_result,omitempty" db:"last_validation_result"`
 }
 
 // VCenterRef returns the vCenter reference to clone FROM for this
@@ -145,6 +150,25 @@ var AllTemplateStates = []string{
 	TemplateStateActive,
 	TemplateStateError,
 }
+
+// TemplateTrustTier constants — keep in sync with the CHECK constraint
+// added by migration 000027_l1_trust_tier.up.sql.
+const (
+	// TemplateTrustTierL1 enables periodic smoke-clone revalidation.
+	// The reconciler (internal/provisioner/trust_validation_reconcile.go)
+	// enqueues a template_revalidate job whenever last_validated_at is NULL
+	// or older than the configured interval. On failure, an alert fires but
+	// the template remains published (alert-only policy).
+	TemplateTrustTierL1 = "l1"
+
+	// TemplateTrustTierDerived indicates the template inherits its quality
+	// signal from a parent template. Reserved for future use.
+	TemplateTrustTierDerived = "derived"
+
+	// TemplateTrustTierUntrusted is the default for all templates; no
+	// automated revalidation is performed.
+	TemplateTrustTierUntrusted = "untrusted"
+)
 
 // Template source type constants — keep in sync with the CHECK constraint
 // in migration 000018_template_lifecycle.up.sql.
@@ -486,6 +510,11 @@ const (
 	JobTypeTemplateProvision  = "template_provision"
 	JobTypeTemplateGeneralize = "template_generalize"
 	JobTypeTemplateVerify     = "template_verify"
+	// JobTypeTemplateRevalidate is enqueued by the L1 trust-tier reconciler
+	// for periodic smoke-clone checks on already-published templates.
+	// On failure the template stays published; only the metric and
+	// last_validation_result are updated (alert-only policy, migration 000027).
+	JobTypeTemplateRevalidate = "template_revalidate"
 
 	// JobTypeImageImport streams a staged ISO/OVA out of MinIO and into
 	// vCenter — ISOs are uploaded to the NAS-BackupsAndISOS datastore,
