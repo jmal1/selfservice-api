@@ -157,6 +157,14 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 			r.Route("/admin/templates", func(r chi.Router) {
 				r.Use(middleware.RequireRole(models.RoleInstructor))
 
+				// Template health status — all student-visible templates with
+				// their last check timestamps and pass/fail state. The checker
+				// runs every 12h; rows appear here after the first cycle.
+				// Protected at RoleInstructor: students must never read this.
+				// The template_health_status_rbac synthetic check asserts a 403
+				// for student callers continuously.
+				r.Get("/health", h.AdminListTemplateHealth)
+
 				// Wizard (T4) — instructor-accessible.
 				r.Post("/draft", h.AdminCreateTemplateDraft)
 				r.Get("/{templateID}/wizard-state", h.AdminGetWizardState)

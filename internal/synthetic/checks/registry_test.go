@@ -248,6 +248,7 @@ func TestAll_StableNames(t *testing.T) {
 		"pod_testing_dashboard_404":    true,
 		"wiki_index_rbac":              true,
 		"image_upload_rbac":            true,
+		"template_health_status_rbac":  true,
 		"template_pin_rbac":            true,
 		"template_visibility_enforced": true,
 	}
