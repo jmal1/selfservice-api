@@ -2,6 +2,7 @@
   "seeds": [
     "docs/instructor/overview.md",
     "docs/instructor/templates.md",
+    "docs/instructor/playlists.md",
     "AGENTS.md",
     "docs/ai-prompts/build-workflow.md",
     "docs/ai/build-workflow-prompt.md"
@@ -122,7 +123,7 @@
         "docs/instructor/workflows.md",
         "docs/instructor/workflows.md"
       ],
-      "from_seed": false
+      "from_seed": true
     },
     {
       "path": "docs/instructor/runner-environment.md",
