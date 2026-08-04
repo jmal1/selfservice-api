@@ -113,6 +113,14 @@ type fakeHealthVC struct {
 	// cloneErrors controls what CloneForHealthCheck returns per moref.
 	cloneErr error
 
+	// cloneTransient is a queue of errors returned by successive
+	// CloneForHealthCheck calls before falling through to normal behaviour.
+	cloneTransient []error
+
+	// cloneCalls counts CloneForHealthCheck invocations, so a test can
+	// assert the deep check actually retried rather than merely succeeded.
+	cloneCalls int
+
 	// powerOnErr controls PowerOnVM.
 	powerOnErr error
 
@@ -162,6 +170,18 @@ func (f *fakeHealthVC) VMExists(_ context.Context, ref string) (bool, error) {
 }
 
 func (f *fakeHealthVC) CloneForHealthCheck(_ context.Context, params vcenter.HealthCheckCloneParams) (*vcenter.HealthCheckCloneResult, error) {
+	f.mu.Lock()
+	f.cloneCalls++
+	// Consume one queued transient clone failure, if any. Lets a test model
+	// the documented "fails now, succeeds 68s later" environmental fault.
+	if len(f.cloneTransient) > 0 {
+		err := f.cloneTransient[0]
+		f.cloneTransient = f.cloneTransient[1:]
+		f.mu.Unlock()
+		return nil, err
+	}
+	f.mu.Unlock()
+
 	if f.cloneErr != nil {
 		return nil, f.cloneErr
 	}
@@ -242,23 +262,24 @@ var _ templateHealthMetrics = (*fakeHealthMetrics)(nil)
 func makeTemplate(id, ref string) models.Template {
 	uid, _ := uuid.Parse(id)
 	return models.Template{
-		ID:              uid,
-		Name:            "tpl-" + id[:8],
-		VCenterVMID:     ref,
-		TemplateState:   models.TemplateStateActive,
-		IsActive:        true,
-		IsInternal:      false,
-		DefaultVCPUs:    2,
-		DefaultRAMMB:    1024,
+		ID:            uid,
+		Name:          "tpl-" + id[:8],
+		VCenterVMID:   ref,
+		TemplateState: models.TemplateStateActive,
+		IsActive:      true,
+		IsInternal:    false,
+		DefaultVCPUs:  2,
+		DefaultRAMMB:  1024,
 	}
 }
 
 func defaultCfg() TemplateHealthReconcilerConfig {
 	return TemplateHealthReconcilerConfig{
-		Interval:         12 * time.Hour,
-		DeepCheckTimeout: 5 * time.Second,
-		MaxRetries:       3,
-		RetryBaseDelay:   1 * time.Millisecond, // fast in tests
+		Interval:           12 * time.Hour,
+		DeepCheckTimeout:   5 * time.Second,
+		MaxRetries:         3,
+		RetryBaseDelay:     1 * time.Millisecond, // fast in tests
+		DeepRetryBaseDelay: 1 * time.Millisecond, // fast in tests (prod default 30s)
 	}
 }
 
@@ -654,4 +675,3 @@ func TestTruncateErr(t *testing.T) {
 		t.Errorf("truncated string should end with '...', got %q", got)
 	}
 }
-

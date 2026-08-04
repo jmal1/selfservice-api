@@ -82,6 +82,21 @@ type TemplateHealthReconcilerConfig struct {
 	// (exponential backoff). Default 1s.
 	RetryBaseDelay time.Duration
 
+	// DeepRetryBaseDelay is the initial retry delay for the deep check.
+	// Deliberately much larger than RetryBaseDelay: a structural check
+	// retries a read-only property fetch, where a 1s/2s backoff is ample.
+	// The deep check retries a full clone against the "virtual disk is
+	// either corrupted or not a supported format" fault, which
+	// internal/vcenter/template_ops.go documents (Round 11, 2026-08-03) as
+	// intermittent and environmental rather than a property of the source
+	// VM or the CloneSpec. The recorded evidence is a clone of
+	// student-ubuntu-2404 failing and the identical clone succeeding 68s
+	// later, so a 1s/2s backoff would retry entirely inside the failure
+	// window and report a healthy template as broken.
+	//
+	// Default 30s, giving attempts at t=0, t+30s, t+90s.
+	DeepRetryBaseDelay time.Duration
+
 	// Pusher, if set, receives metrics after each cycle.
 	Pusher *TemplateHealthPusher
 }
@@ -260,6 +275,9 @@ func reconcileTemplateHealth(
 	if cfg.RetryBaseDelay <= 0 {
 		cfg.RetryBaseDelay = 1 * time.Second
 	}
+	if cfg.DeepRetryBaseDelay <= 0 {
+		cfg.DeepRetryBaseDelay = 30 * time.Second
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -406,7 +424,19 @@ func reconcileTemplateHealth(
 				"template", deepTarget.Name)
 		} else {
 			start := time.Now()
-			deepErr := runDeepCheck(ctx, vc, deepTarget, cfg, log)
+			// The deep check is a full clone → power-on → wait-for-IP. It is
+			// the single most failure-prone operation in this codebase, and
+			// internal/vcenter/template_ops.go documents its dominant fault
+			// ("virtual disk is either corrupted or not a supported format")
+			// as intermittent and environmental, with job-level retry as the
+			// prescribed remedy. Without this retry a healthy template is
+			// reported broken on the first transient blip — the exact
+			// erroneous alert this feature exists to avoid. Each attempt
+			// runs under its own DeepCheckTimeout and its own deferred
+			// destroy, so a failed attempt cannot leak a clone into the next.
+			_, deepErr := retryWithBackoff(ctx, cfg.MaxRetries, cfg.DeepRetryBaseDelay, func() error {
+				return runDeepCheck(ctx, vc, deepTarget, cfg, log)
+			})
 			durSec := time.Since(start).Seconds()
 			counts.DeepChecked = true
 
@@ -452,6 +482,19 @@ func reconcileTemplateHealth(
 				metrics.RecordDeepResult(deepTarget.Name, durSec, deepErr == nil)
 				metrics.SetHealthStatus(deepTarget.Name, "deep", healthVal)
 				metrics.SetLastCheckTimestamp(deepTarget.Name, float64(now.Unix()))
+			}
+
+			// Log the error, not just the boolean. Without this the operator
+			// sees only `passed:false` and has to go read last_error out of
+			// Postgres to find out why — which is exactly what happened on
+			// the first production cycle of this feature.
+			if deepErr != nil {
+				log.Error("deep check failed after retries",
+					"template", deepTarget.Name,
+					"attempts", cfg.MaxRetries,
+					"duration_ms", int(durSec*1000),
+					"error", deepErr,
+				)
 			}
 
 			log.Info("deep check complete",
