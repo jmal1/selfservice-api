@@ -42,6 +42,17 @@ synthetic:
     # 2700s (45 min) gives 270s margin and fits the hourly schedule.
     activeDeadlineSeconds: 2700
 
+# Template health checks (roadmap J-2). Enabled in prod: structural checks run
+# against every student-visible template every 12h, plus one rotating deep
+# clone-boot-destroy check. Leader-gated, so exactly one of the 4 worker
+# replicas executes it. Retries + the 2-consecutive-cycle alert condition mean
+# a transient NFS blip cannot page.
+worker:
+  templateHealth:
+    enabled: true
+    interval: "12h"
+    deepTimeout: "10m"
+
 # Bitnami postgresql subchart image overrides.
 # We pin tag explicitly to avoid surprise major upgrades on chart upgrade.
 postgresql:
