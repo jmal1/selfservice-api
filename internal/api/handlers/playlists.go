@@ -3,10 +3,13 @@ package handlers
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/middleware"
 	"github.com/jmal1/selfservice-api/internal/models"
 )
@@ -192,13 +195,71 @@ func (h *Handler) AdminSetBlueprintVMPlaylists(w http.ResponseWriter, r *http.Re
 	respondJSON(w, http.StatusOK, map[string]string{"status": "updated"})
 }
 
-// AdminListRuns returns all runs across all pods (admin view).
+// AdminListRuns returns all runs across all pods (admin view), with optional filtering.
 func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
-	runs, err := h.db.ListAllRuns(r.Context())
+	q := r.URL.Query()
+
+	filter := database.RunsListFilter{}
+
+	// Parse triggered_by filter (UUID or username/display_name substring)
+	if triggeredBy := q.Get("triggered_by"); triggeredBy != "" {
+		if id, err := uuid.Parse(triggeredBy); err == nil {
+			filter.TriggeredBy = &id
+		} else {
+			filter.TriggeredByStr = triggeredBy
+		}
+	}
+
+	// Parse pod_owner filter (UUID or username/display_name substring)
+	if podOwner := q.Get("pod_owner"); podOwner != "" {
+		if id, err := uuid.Parse(podOwner); err == nil {
+			filter.PodOwner = &id
+		} else {
+			filter.PodOwnerStr = podOwner
+		}
+	}
+
+	// Parse status filter
+	if status := q.Get("status"); status != "" {
+		filter.Status = status
+	}
+
+	// Parse from/to date range (RFC3339 format)
+	if from := q.Get("from"); from != "" {
+		if t, err := time.Parse(time.RFC3339, from); err == nil {
+			filter.From = &t
+		}
+	}
+	if to := q.Get("to"); to != "" {
+		if t, err := time.Parse(time.RFC3339, to); err == nil {
+			filter.To = &t
+		}
+	}
+
+	// Parse pagination (limit and offset)
+	if limit := q.Get("limit"); limit != "" {
+		if n, err := strconv.Atoi(limit); err == nil && n > 0 {
+			filter.Limit = n
+		}
+	}
+	if offset := q.Get("offset"); offset != "" {
+		if n, err := strconv.Atoi(offset); err == nil && n >= 0 {
+			filter.Offset = n
+		}
+	}
+
+	runs, err := h.db.ListAllRunsFiltered(r.Context(), filter)
 	if err != nil {
+		h.logger.Error("admin list runs failed", "error", err)
 		http.Error(w, "failed to list runs", http.StatusInternalServerError)
 		return
 	}
+
+	// Always return non-nil slice to match API expectations
+	if runs == nil {
+		runs = []models.Run{}
+	}
+
 	respondJSON(w, http.StatusOK, runs)
 }
 
