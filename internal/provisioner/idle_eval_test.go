@@ -688,3 +688,47 @@ func TestEvaluatorHandlesPartialToolsStatusResult(t *testing.T) {
 		t.Errorf("expected 0 errors for a partial-tools-map tick, got %d", counts.Errors)
 	}
 }
+
+// TestNilActivityTimestampIsNeverSuspended is the negative control for the
+// most dangerous defect auto-suspend has had: a pod_vms row whose
+// last_activity_at is NULL.
+//
+// Before migration 000028 the column had no DEFAULT and no writer on the INSERT
+// path, so EVERY newly-provisioned VM started as NULL — and the evaluator read
+// NULL as "no activity ever recorded", i.e. idle since the beginning of time.
+// A VM created seconds ago was therefore instantly eligible for suspension, on
+// the very first tick where its CPU happened to look quiet, before the student
+// had even connected. This was found in production: a freshly created pod
+// showed up as a suspend candidate within minutes of being provisioned.
+//
+// Setup is deliberately the WORST case: tools running, utilisation idle, every
+// other guard satisfied. The ONLY thing standing between this VM and a wrongful
+// suspend is the nil check. Delete guard 5 in idle_eval.go and this test fails.
+func TestNilActivityTimestampIsNeverSuspended(t *testing.T) {
+	const moref = "vm-nilactivity"
+	c := makeCandidate(moref, nil) // never had an activity timestamp
+
+	db := newFakeDB()
+	db.candidates = []database.IdleSuspendCandidate{c}
+
+	vc := newFakeVC()
+	vc.toolsRunning[moref] = true
+	vc.perfSamples[moref] = idleSample()
+
+	counts, err := evaluateIdleVMs(context.Background(), vc, db, nil, IdleEvaluatorConfig{DryRun: false})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if counts.Suspended != 0 {
+		t.Errorf("a VM with NULL last_activity_at must never be suspended, got Suspended=%d", counts.Suspended)
+	}
+	if counts.ActivityUnknown != 1 {
+		t.Errorf("expected ActivityUnknown=1, got %d", counts.ActivityUnknown)
+	}
+	if _, suspended := db.suspended[c.PodVMID]; suspended {
+		t.Error("SetVMSuspended must not be called for a VM with no activity clock")
+	}
+	if vc.suspendedMorefs[moref] != 0 {
+		t.Errorf("SuspendVM must not be called for a VM with no activity clock, got %d calls", vc.suspendedMorefs[moref])
+	}
+}

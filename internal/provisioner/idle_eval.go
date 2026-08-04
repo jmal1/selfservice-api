@@ -145,11 +145,16 @@ type IdleEvalCounts struct {
 	ToolsMissing  int // Tools not running — not idle (guard 4)
 	PerfMissing   int // no perf data — not idle (guard 4 variant)
 	ActivityFresh int // last_activity_at within threshold — not idle
-	RefusedJob    int // active job in flight (guard 1)
-	RefusedPod    int // pod provisioning/destroying (guard 2)
-	RefusedRun    int // assessment run in flight (guard 3)
-	Suspended     int // suspended (or would-be suspended in dry-run)
-	Errors        int // DB or vCenter error during processing
+	// ActivityUnknown counts VMs with no activity timestamp at all. These are
+	// refused, never suspended. A non-zero value means rows are being created
+	// without an idle clock (see migration 000028) — it should be 0 in steady
+	// state, so it is worth alerting on rather than hiding.
+	ActivityUnknown int
+	RefusedJob      int // active job in flight (guard 1)
+	RefusedPod      int // pod provisioning/destroying (guard 2)
+	RefusedRun      int // assessment run in flight (guard 3)
+	Suspended       int // suspended (or would-be suspended in dry-run)
+	Errors          int // DB or vCenter error during processing
 }
 
 // EvaluateIdleVMs is the Provisioner-bound entry point. The provision-worker
@@ -257,8 +262,24 @@ func evaluateIdleVMs(
 		}
 		threshold := time.Duration(timeoutSecs) * time.Second
 
+		// Guard 5: an unknown activity clock is not evidence of idleness.
+		//
+		// last_activity_at is NULL for any row created before migration 000028
+		// and for any insert path that bypasses the column DEFAULT. Reading NULL
+		// as "idle since the beginning of time" is the most dangerous possible
+		// interpretation: it makes a freshly-provisioned VM instantly eligible
+		// for suspension, before the student has even connected. Unknown must
+		// mean "do not act", because the cost of a wrong suspend is destroyed
+		// student work while the cost of a missed suspend is some idle RAM.
+		if c.LastActivityAt == nil {
+			vmLog.Warn("idle-eval: refuse — no activity timestamp recorded; " +
+				"treating unknown as active (see migration 000028)")
+			counts.ActivityUnknown++
+			continue
+		}
+
 		// Check last_activity_at freshness.
-		if c.LastActivityAt != nil && now.Sub(*c.LastActivityAt) < threshold {
+		if now.Sub(*c.LastActivityAt) < threshold {
 			vmLog.Debug("idle-eval: not idle — last_activity_at within threshold",
 				"last_activity_at", c.LastActivityAt, "threshold", threshold)
 			counts.ActivityFresh++
@@ -297,15 +318,10 @@ func evaluateIdleVMs(
 			continue
 		}
 
-		// All guards passed. Build the suspend reason.
-		var activityAge string
-		if c.LastActivityAt != nil {
-			activityAge = now.Sub(*c.LastActivityAt).Round(time.Minute).String()
-		} else {
-			activityAge = "never"
-		}
+		// All guards passed. Build the suspend reason. LastActivityAt is
+		// guaranteed non-nil here: guard 5 refuses any VM without a clock.
 		reason := fmt.Sprintf("idle: no console activity and low CPU/net for %s (threshold %s)",
-			activityAge, threshold)
+			now.Sub(*c.LastActivityAt).Round(time.Minute), threshold)
 
 		if cfg.DryRun {
 			vmLog.Info("idle-eval: DRY-RUN — would suspend",
@@ -362,6 +378,7 @@ func evaluateIdleVMs(
 		"tools_missing", counts.ToolsMissing,
 		"perf_missing", counts.PerfMissing,
 		"activity_fresh", counts.ActivityFresh,
+		"activity_unknown", counts.ActivityUnknown,
 		"errors", counts.Errors,
 	)
 
