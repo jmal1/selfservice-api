@@ -318,15 +318,33 @@ func (h *Handler) AdminCreateTemplateDraft(w http.ResponseWriter, r *http.Reques
 // Transitions draft → provisioning and enqueues a template_provision
 // job. Returns 202 Accepted with the new job ID and updated wizard
 // state.
+//
+// Preflight gate: before enqueuing, runs all 11 preflight checks. If any
+// block-severity check fails, returns 409 with the full result list.
+// Warnings never block. An admin may set override_preflight_blocks=true in
+// the request body to bypass a blocking failure (logged + audited).
 func (h *Handler) AdminProvisionTemplate(w http.ResponseWriter, r *http.Request) {
 	tmpl, ok := h.requireTemplateInState(w, r, models.TemplateStateDraft)
 	if !ok {
 		return
 	}
 
-	// Build payload from the template row. The instructor doesn't
-	// override hardware here — they pick it during draft creation.
+	// Parse optional body for the admin override flag.
+	var req ProvisionWithPreflightRequest
+	if r.Body != nil && r.Body != http.NoBody {
+		_ = json.NewDecoder(r.Body).Decode(&req) // body is optional; ignore decode errors
+	}
+
+	// Build the target VM name up front so PF-09 (name-free check) can
+	// verify it before the job is enqueued.
 	vmName := buildTemplateVMName(tmpl.Name)
+
+	// Preflight gate. If vcPreflight is nil (not configured), the gate is a
+	// no-op and provisioning proceeds unchanged.
+	if _, blocked := h.runPreflightGate(w, r, tmpl, vmName, req.OverridePreflightBlocks); blocked {
+		return
+	}
+
 	payload := buildProvisionPayload(tmpl, vmName)
 	if !h.advanceTemplateAndEnqueue(w, r, tmpl, models.TemplateStateDraft, models.TemplateStateProvisioning,
 		models.JobTypeTemplateProvision, payload, "template.provision") {

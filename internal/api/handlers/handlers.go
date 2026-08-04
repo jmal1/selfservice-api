@@ -21,6 +21,7 @@ import (
 	"github.com/jmal1/selfservice-api/internal/models"
 	events "github.com/jmal1/selfservice-api/internal/nats"
 	"github.com/jmal1/selfservice-api/internal/vcenter"
+	"github.com/jmal1/selfservice-api/internal/vcenter/preflight"
 )
 
 // Handler holds shared dependencies for all API handlers.
@@ -50,6 +51,11 @@ type Handler struct {
 	// nil means the default h.db is used. For testing, this can be set to a fake
 	// implementation. See templateStore() accessor.
 	templates templateLister
+
+	// Preflight checks. Set via WithPreflightVCenter. nil = not configured;
+	// AdminPreflightTemplate returns 503 and the provision gate is skipped.
+	vcPreflight  PreflightVCenter
+	preflightCfg PreflightConfig
 }
 
 type imageUploadMetrics interface {
@@ -140,6 +146,21 @@ func (h *Handler) templateStore() templateLister {
 		return h.templates
 	}
 	return h.db
+}
+
+// PreflightVCenter is a type alias so the handlers package can name the
+// interface without importing the preflight package directly in every file.
+type PreflightVCenter = preflight.PreflightVCenter
+
+// WithPreflightVCenter wires the vCenter preflight surface and its static
+// configuration. Call this from main after connecting to vCenter to enable
+// the preflight checks on the provision endpoint and the standalone
+// /preflight endpoint. If not called, preflight is skipped and
+// AdminPreflightTemplate returns 503.
+func (h *Handler) WithPreflightVCenter(vc PreflightVCenter, cfg PreflightConfig) *Handler {
+	h.vcPreflight = vc
+	h.preflightCfg = cfg
+	return h
 }
 
 // AdminListVCenterTemplatesFolder returns enumerated VMs in the configured
