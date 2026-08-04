@@ -716,10 +716,34 @@ func main() {
 				}
 				// Health-check clones from a crashed previous leader are swept
 				// here rather than at startup so exactly one replica does it.
+				// The catch-up cycle runs after the sweep, in the same
+				// goroutine, so it can never race the sweep into deleting its
+				// own in-flight clone.
 				if healthReconcilerEnabled {
 					go func() {
 						if _, err := vcClient.SweepHealthCheckOrphans(ctx, cfg.VCenter.TemplatesFolder); err != nil {
 							logger.Warn("health-check orphan sweep failed", "error", err)
+						}
+						// The 12h ticker is created at process start and reset
+						// by every restart. This service deploys several times
+						// a day, so without a catch-up pass the reconciler
+						// would never actually fire. IfDue consults persisted
+						// state, so frequent deploys do not each trigger a
+						// vCenter clone.
+						counts, ran, err := prov.ReconcileTemplateHealthIfDue(ctx, healthReconcilerCfg)
+						if err != nil {
+							logger.Error("template health catch-up on leader acquisition failed", "error", err)
+							return
+						}
+						if ran {
+							logger.Info("template health catch-up cycle complete",
+								"templates", counts.Templates,
+								"healthy", counts.Healthy,
+								"unhealthy", counts.Unhealthy,
+								"deep_checked", counts.DeepChecked)
+						} else {
+							logger.Info("template health catch-up skipped; a cycle ran within the interval",
+								"interval", healthReconcilerCfg.Interval)
 						}
 					}()
 				}
