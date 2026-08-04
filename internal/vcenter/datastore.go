@@ -23,6 +23,8 @@ import (
 	"time"
 
 	"github.com/vmware/govmomi/object"
+	"github.com/vmware/govmomi/property"
+	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/soap"
 	"github.com/vmware/govmomi/vim25/types"
 )
@@ -250,6 +252,35 @@ func DatastorePath(datastore, remotePath string) string {
 		return fmt.Sprintf("[%s]", datastore)
 	}
 	return fmt.Sprintf("[%s] %s", datastore, remotePath)
+}
+
+// GetDatastoreFreeBytes returns the free space in bytes on the named
+// datastore. It is used by the import worker to gate import attempts on
+// available capacity — uploading a 5 GB ISO to a nearly-full datastore
+// would break every in-flight template build.
+func (c *Client) GetDatastoreFreeBytes(ctx context.Context, datastore string) (int64, error) {
+	if datastore == "" {
+		return 0, fmt.Errorf("GetDatastoreFreeBytes: datastore name is required")
+	}
+	var freeBytes int64
+	err := c.withRetry(ctx, "get datastore free bytes", func() error {
+		ds, err := c.finder.Datastore(ctx, datastore)
+		if err != nil {
+			return fmt.Errorf("find datastore %q: %w", datastore, err)
+		}
+
+		pc := property.DefaultCollector(c.client.Client)
+		var dsMo mo.Datastore
+		if err := pc.RetrieveOne(ctx, ds.Reference(), []string{"summary"}, &dsMo); err != nil {
+			return fmt.Errorf("retrieve datastore summary for %q: %w", datastore, err)
+		}
+		freeBytes = dsMo.Summary.FreeSpace
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return freeBytes, nil
 }
 
 // ParseDatastorePath splits "[datastore] path/file.iso" into its parts.

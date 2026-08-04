@@ -163,7 +163,9 @@ func imageListContract(cfg ElevatedConfig) synthetic.Check {
 }
 
 // isoCatalogReachable proves the wizard's ISO picker can still browse the
-// vCenter datastore.
+// vCenter datastore, and that the response carries the `source` field that
+// the wizard relies on to distinguish pipeline-uploaded ISOs from ones found
+// directly on the datastore.
 //
 // This is the check that would have caught the vCenter credential rotation
 // that previously broke datastore browsing. The handler maps a vCenter error
@@ -173,7 +175,7 @@ func isoCatalogReachable(cfg ElevatedConfig) synthetic.Check {
 	return synthetic.CheckFunc{
 		NameVal:        "iso_catalog_reachable",
 		TitleVal:       "ISO Catalog (vCenter Datastore)",
-		DescriptionVal: "Browses the vCenter ISO datastore via /admin/vcenter/isos as an instructor. A 502 means vCenter rejected us (usually a rotated credential); a 503 means the lister was never wired.",
+		DescriptionVal: "Browses the vCenter ISO datastore via /admin/vcenter/isos as an instructor. A 502 means vCenter rejected us (usually a rotated credential); a 503 means the lister was never wired. Also verifies the response carries an 'isos' array whose entries include the 'source' field.",
 		SeverityVal:    synthetic.SeverityWarning,
 		RunFn: func(ctx context.Context, _ *synthetic.Client) (int, error) {
 			c, err := cfg.client()
@@ -185,10 +187,28 @@ func isoCatalogReachable(cfg ElevatedConfig) synthetic.Check {
 				return 0, err
 			}
 			defer resp.Body.Close()
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 16384))
 
 			switch resp.StatusCode {
 			case http.StatusOK:
+				// Verify the response shape: the 'isos' key must be present (not 'files'),
+				// and any entries must carry the 'source' field. This catches a silent
+				// regression where the handler reverts to the old response shape.
+				var parsed struct {
+					ISOs []map[string]any `json:"isos"`
+				}
+				if err := json.Unmarshal(body, &parsed); err != nil {
+					return resp.StatusCode, fmt.Errorf(
+						"ISO catalog returned 200 but body is not valid JSON: %v — body: %s",
+						err, snippet(body))
+				}
+				for i, entry := range parsed.ISOs {
+					if _, hasSource := entry["source"]; !hasSource {
+						return resp.StatusCode, fmt.Errorf(
+							"ISO catalog entry %d is missing the 'source' field — the merged response shape may have reverted: %v",
+							i, entry)
+					}
+				}
 				return resp.StatusCode, nil
 			case http.StatusBadGateway:
 				return resp.StatusCode, fmt.Errorf(

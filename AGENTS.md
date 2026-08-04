@@ -519,7 +519,91 @@ Source: [`internal/scriptvalidator/wrap.go`](internal/scriptvalidator/wrap.go), 
 
 ---
 
-## 14. Where the source of truth lives (for your reference, do not modify)
+## 15. Image Upload → Auto-Import → Wizard Flow
+
+This section documents the full lifecycle for getting an ISO or OVA into vCenter so it can be referenced by a template. This is an **operational** flow (not authoring), but it is documented here because AI agents sometimes need to explain it to instructors.
+
+### 15.1 Lifecycle overview
+
+```
+Browser upload → MinIO staging → auto-import job → vCenter
+                                                        ↓
+                                        ISO: [NAS-BackupsAndISOS] ISOs/<file>
+                                        OVA: vCenter Templates folder (VM moref)
+```
+
+**Statuses** (stored in `image_uploads.status`):
+
+| Status | Meaning |
+|--------|---------|
+| `pending` | DB row created; browser not yet uploading |
+| `uploading` | At least one presigned part has been issued |
+| `uploaded` | Multipart complete; file confirmed in MinIO. Auto-import job enqueued. |
+| `importing` | Worker is streaming file from MinIO to vCenter |
+| `imported` | Terminal success. ISO: `datastore_path` set. OVA: `vcenter_vm_id` set. MinIO object deleted. |
+| `error` | Terminal failure. `error_message` explains why. MinIO object **retained** for cheap retry. |
+
+### 15.2 Auto-import
+
+After `POST /api/v1/admin/images/{id}/complete` finalises the multipart upload and the byte count is confirmed, the API **automatically enqueues an `image_import` job**. Instructors do not need to take any further action after uploading.
+
+- The import job is enqueued at upload completion, not on a delay.
+- If the job enqueue fails (e.g. NATS is temporarily down), the upload is still safe in MinIO. The instructor can trigger import manually via `POST /api/v1/admin/images/{id}/import`.
+- Completing the same upload twice (client retry) is safe: if the row is already past `uploaded`, the second complete returns 200 without re-enqueuing.
+
+### 15.3 ISO picker in the template wizard
+
+The template creation wizard's "ISO install" step calls `GET /api/v1/admin/vcenter/isos`, which returns a **merged** list of ISOs from two sources:
+
+```json
+{
+  "isos": [
+    {
+      "name": "kali-2024.4.iso",
+      "path": "[NAS-BackupsAndISOS] ISOs/kali-2024.4.iso",
+      "source": "datastore",
+      "disabled": false
+    },
+    {
+      "name": "mint.iso",
+      "path": "[NAS-BackupsAndISOS] ISOs/mint.iso",
+      "source": "uploaded",
+      "status": "imported",
+      "disabled": false,
+      "image_id": "..."
+    },
+    {
+      "name": "ubuntu.iso",
+      "source": "uploaded",
+      "status": "importing",
+      "disabled": true
+    },
+    {
+      "name": "fedora.iso",
+      "source": "uploaded",
+      "status": "error",
+      "error_message": "no space left on device",
+      "disabled": true,
+      "image_id": "..."
+    }
+  ]
+}
+```
+
+- `source="datastore"`: found on the vCenter ISO datastore by the datastore browser.
+- `source="uploaded"`: came through the image upload pipeline. `status` mirrors `image_uploads.status`.
+- `disabled=true`: entry is not yet selectable (still importing, or errored). The wizard renders these greyed-out with a status label so instructors know what is in progress.
+- De-duplication: if an uploaded ISO's `datastore_path` matches a file already returned by the datastore browser, only the datastore entry is kept (the datastore listing is canonical).
+
+### 15.4 OVA behaviour
+
+OVAs are imported into vCenter's Templates folder as a VM (moref stored in `vcenter_vm_id`). They are **not** mounted as CD-ROM media and **never appear** in the ISO picker. To use an OVA-sourced VM as a template source, use the `clone_vcenter` template source type.
+
+### 15.5 Error retry
+
+If an import fails (`status=error`), the MinIO object is retained so retry is cheap. The instructor can retry via `POST /api/v1/admin/images/{id}/import` without re-uploading the file. The API resets the status from `error` → `uploaded` and enqueues a fresh import job.
+
+---
 
 - Workflow/Action/Playlist Go models: [`internal/models/workflow_models.go`](internal/models/workflow_models.go)
 - DB schema (the actual CHECK constraints): [`internal/database/migrations/000012_assessment_engine.up.sql`](internal/database/migrations/000012_assessment_engine.up.sql), [`000014_action_library.up.sql`](internal/database/migrations/000014_action_library.up.sql), [`000015_action_platforms.up.sql`](internal/database/migrations/000015_action_platforms.up.sql)

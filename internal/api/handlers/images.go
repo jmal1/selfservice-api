@@ -128,11 +128,40 @@ type imageDB interface {
 	CreateImageUpload(ctx context.Context, img *models.ImageUpload) error
 	GetImageUploadByID(ctx context.Context, id uuid.UUID) (*models.ImageUpload, error)
 	ListImageUploads(ctx context.Context) ([]models.ImageUpload, error)
+	ListImageUploadsByStatus(ctx context.Context, statuses []string) ([]models.ImageUpload, error)
+	UpdateImageUploadStatus(ctx context.Context, id uuid.UUID, from, to string) error
 	SetImageUploadUploaded(ctx context.Context, id uuid.UUID, sizeBytes int64) error
 	SetImageUploadError(ctx context.Context, id uuid.UUID, msg string) error
 	DeleteImageUpload(ctx context.Context, id uuid.UUID) error
 	CountTemplatesReferencingImage(ctx context.Context, datastorePath, vcenterVMID string) (int, error)
 	CreateJob(ctx context.Context, jobType string, payload []byte) (*models.Job, error)
+}
+
+// ISOEntry is one entry in the /admin/vcenter/isos response. It covers both
+// ISOs discovered on the vCenter datastore (source="datastore") and ISOs that
+// were uploaded through the image pipeline (source="uploaded"). Uploaded ISOs
+// that are still in transit appear with disabled=true so the wizard can show
+// them without making them selectable.
+type ISOEntry struct {
+	Name         string     `json:"name"`
+	Path         string     `json:"path"`
+	FolderPath   string     `json:"folder_path,omitempty"`
+	SizeBytes    int64      `json:"size_bytes,omitempty"`
+	ModifiedTime *time.Time `json:"modified_time,omitempty"`
+	// Source distinguishes entries: "uploaded" = came through the image pipeline,
+	// "datastore" = found directly on the vCenter datastore by file browser.
+	Source string `json:"source"`
+	// Disabled is true when the entry is not yet usable as a template source
+	// (e.g. still importing, or stuck in error). The wizard shows disabled
+	// entries greyed-out rather than omitting them so instructors can see that
+	// an import is in progress rather than wondering if their upload was lost.
+	Disabled bool `json:"disabled"`
+	// Status is populated for uploaded entries and mirrors image_uploads.status.
+	Status string `json:"status,omitempty"`
+	// ErrorMessage is set when Status=="error".
+	ErrorMessage string `json:"error_message,omitempty"`
+	// ImageID is the image_uploads.id for uploaded entries.
+	ImageID string `json:"image_id,omitempty"`
 }
 
 // ImageStore is the narrow object-store interface the image handlers need.
@@ -356,6 +385,23 @@ func (h *Handler) AdminCompleteImageUpload(w http.ResponseWriter, r *http.Reques
 
 	if err := h.imgDB.SetImageUploadUploaded(r.Context(), imageID, info.Size); err != nil {
 		if errors.Is(err, database.ErrImageUploadStale) {
+			// The row is not in pending/uploading. This can happen when the
+			// complete endpoint is called a second time (client retry). Re-fetch
+			// to determine whether the row is already past 'uploaded' (in which
+			// case we treat this as an idempotent success) or in a truly
+			// unexpected state (error → 409).
+			current, rerr := h.imgDB.GetImageUploadByID(r.Context(), imageID)
+			if rerr == nil {
+				switch current.Status {
+				case models.ImageUploadUploaded,
+					models.ImageUploadImporting,
+					models.ImageUploadImported:
+					// Import is already queued or done. Return the current row
+					// so the client can see what happened without re-enqueueing.
+					respondJSON(w, http.StatusOK, current)
+					return
+				}
+			}
 			h.recordImageUpload(img.Kind, "failed")
 			http.Error(w, "upload is in unexpected state", http.StatusConflict)
 			return
@@ -366,6 +412,38 @@ func (h *Handler) AdminCompleteImageUpload(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	h.recordImageUpload(img.Kind, "completed")
+
+	// Auto-enqueue the image_import job. Both ISOs and OVAs are imported
+	// automatically so the instructor never has to take a separate "Import"
+	// step. The job is idempotent on the worker side (requires status==uploaded
+	// before doing any work), and the stale-check above already ensures we
+	// only reach this point once per upload.
+	//
+	// Failure to enqueue is logged but NOT fatal: the upload is safe in MinIO
+	// and the instructor can trigger import manually from /admin/images.
+	jobPayload, _ := json.Marshal(map[string]string{"image_upload_id": imageID.String()})
+	job, enqErr := h.imgDB.CreateJob(r.Context(), models.JobTypeImageImport, jobPayload)
+	if enqErr != nil {
+		h.logger.Error("auto-enqueue image import failed; upload succeeded but import not started",
+			"error", enqErr, "id", imageID)
+	} else {
+		if h.events != nil {
+			if err := h.events.PublishJobCreated(job.ID, job.Type); err != nil {
+				h.logger.Warn("failed to publish auto-enqueued import job event",
+					"error", err, "job_id", job.ID)
+			}
+		}
+		if h.db != nil {
+			audit.Log(r.Context(), h.db, "image.import.auto_enqueued",
+				audit.Resource("image_upload", imageID),
+				audit.IP(r.RemoteAddr),
+				audit.Detail("job_id", job.ID.String()),
+				audit.Detail("object_key", img.ObjectKey),
+				audit.Detail("filename", img.Filename),
+				audit.Detail("size_bytes", fmt.Sprintf("%d", info.Size)),
+			)
+		}
+	}
 
 	fresh, _ := h.imgDB.GetImageUploadByID(r.Context(), imageID)
 	if fresh == nil {
@@ -400,14 +478,42 @@ func (h *Handler) AdminImportImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if img.Status != models.ImageUploadUploaded {
+	if img.Status != models.ImageUploadUploaded && img.Status != models.ImageUploadError {
 		respondJSON(w, http.StatusConflict, map[string]any{
 			"error":           "invalid_status",
 			"current_status":  img.Status,
 			"required_status": models.ImageUploadUploaded,
-			"message":         "image must be in 'uploaded' status to import",
+			"message":         "image must be in 'uploaded' or 'error' status to import; use 'error' to retry a failed import without re-uploading",
 		})
 		return
+	}
+
+	// Defense-in-depth: the object key is set server-side, but verify it
+	// hasn't been corrupted (e.g. by a DB write racing with a rename).
+	if !strings.HasPrefix(img.ObjectKey, "crucible/") {
+		h.logger.Error("image object key does not start with crucible/ prefix; refusing import",
+			"id", imageID, "object_key", img.ObjectKey)
+		http.Error(w, "invalid object key: key does not match expected prefix", http.StatusInternalServerError)
+		return
+	}
+
+	// For error rows, reset to 'uploaded' so the import worker picks it up.
+	// The MinIO object is deliberately retained on failure (see image_jobs.go)
+	// so a retry is cheap — no re-upload needed.
+	if img.Status == models.ImageUploadError {
+		if img.ObjectKey == "" {
+			respondJSON(w, http.StatusConflict, map[string]any{
+				"error":   "no_staged_object",
+				"message": "cannot retry: the staged object is no longer available (was deleted after a successful import?)",
+			})
+			return
+		}
+		if err := h.imgDB.UpdateImageUploadStatus(r.Context(), imageID,
+			models.ImageUploadError, models.ImageUploadUploaded); err != nil {
+			h.logger.Error("reset error row to uploaded failed", "error", err, "id", imageID)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	payload, _ := json.Marshal(map[string]string{"image_upload_id": imageID.String()})
@@ -559,7 +665,14 @@ func (h *Handler) recordImageUpload(kind, result string) {
 }
 
 // AdminListVCenterISOs browses the ISO datastore so the wizard can offer
-// ISOs that were placed there outside Crucible.
+// ISOs that were placed there outside Crucible, merging in any ISOs that
+// were uploaded through the image pipeline. The response uses the "isos"
+// key (not "files") and each entry carries a "source" field so the wizard
+// can visually distinguish pipeline-uploaded ISOs from ones placed directly
+// on the datastore.
+//
+// OVAs are intentionally excluded: they cannot be mounted as CD-ROM media
+// and must be deployed via OVF import, which is a separate flow.
 func (h *Handler) AdminListVCenterISOs(w http.ResponseWriter, r *http.Request) {
 	if h.isoLister == nil {
 		http.Error(w, "vCenter ISO browsing not configured", http.StatusServiceUnavailable)
@@ -591,8 +704,95 @@ func (h *Handler) AdminListVCenterISOs(w http.ResponseWriter, r *http.Request) {
 		cached = false
 	}
 
+	// Build the merged list. Start with entries we found on the datastore.
+	// Track by datastore path so we can de-dup against uploaded rows.
+	seenByPath := make(map[string]bool, len(files))
+	isos := make([]ISOEntry, 0, len(files))
+	for _, f := range files {
+		seenByPath[f.Path] = true
+		mod := f.ModifiedTime
+		isos = append(isos, ISOEntry{
+			Name:         f.Name,
+			Path:         f.Path,
+			FolderPath:   f.FolderPath,
+			SizeBytes:    f.SizeBytes,
+			ModifiedTime: &mod,
+			Source:       "datastore",
+		})
+	}
+
+	// Layer in uploaded ISOs from the image pipeline. Rows with status
+	// 'imported' and a non-empty datastore_path are authoritative — they
+	// may not yet be visible to the cache. In-flight rows (uploading,
+	// uploaded, importing) and error rows are surfaced as disabled entries
+	// so the instructor knows what is happening without having to check a
+	// separate page.
+	if h.imgDB != nil {
+		allStatuses := []string{
+			models.ImageUploadUploading,
+			models.ImageUploadUploaded,
+			models.ImageUploadImporting,
+			models.ImageUploadImported,
+			models.ImageUploadError,
+		}
+		uploadedRows, lErr := h.imgDB.ListImageUploadsByStatus(r.Context(), allStatuses)
+		if lErr != nil {
+			h.logger.Warn("failed to list uploaded images for ISO merge; proceeding with datastore-only list",
+				"error", lErr)
+		} else {
+			for _, u := range uploadedRows {
+				// OVAs are never mounted as CD-ROMs; exclude them.
+				if u.Kind != models.ImageKindISO {
+					continue
+				}
+
+				switch u.Status {
+				case models.ImageUploadImported:
+					// If we already have this path from the datastore listing,
+					// skip — the datastore entry is canonical.
+					if seenByPath[u.DatastorePath] {
+						continue
+					}
+					if u.DatastorePath == "" {
+						continue
+					}
+					name := u.Filename
+					isos = append(isos, ISOEntry{
+						Name:    name,
+						Path:    u.DatastorePath,
+						Source:  "uploaded",
+						ImageID: u.ID.String(),
+						Status:  u.Status,
+					})
+					seenByPath[u.DatastorePath] = true
+
+				case models.ImageUploadUploading,
+					models.ImageUploadUploaded,
+					models.ImageUploadImporting:
+					isos = append(isos, ISOEntry{
+						Name:     u.Filename,
+						Source:   "uploaded",
+						Disabled: true,
+						Status:   u.Status,
+						ImageID:  u.ID.String(),
+					})
+
+				case models.ImageUploadError:
+					isos = append(isos, ISOEntry{
+						Name:         u.Filename,
+						Source:       "uploaded",
+						Disabled:     true,
+						Status:       u.Status,
+						ErrorMessage: u.ErrorMessage,
+						ImageID:      u.ID.String(),
+					})
+				}
+			}
+		}
+	}
+
 	respondJSON(w, http.StatusOK, map[string]any{
-		"files":             files,
+		"isos":              isos,
 		"datastore":         h.isoDatastore,
 		"cached":            cached,
 		"cache_age_seconds": age,
