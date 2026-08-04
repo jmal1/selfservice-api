@@ -239,20 +239,18 @@ func TestAll_StableNames(t *testing.T) {
 	// changes. If you intentionally rename a check, update the alert YAML in
 	// the Grafana provisioning then update this test.
 	wantNames := map[string]bool{
-		"healthz":                         true,
-		"auth_me":                         true,
-		"pods_list":                       true,
-		"admin_list_users_403":            true,
-		"admin_run_detail_403":            true,
-		"admin_audit_403":                 true,
-		"blueprint_vm_playlists_contract": true,
-		"pod_testing_dashboard_404":       true,
-		"wiki_index_rbac":                 true,
-		"image_upload_rbac":               true,
-		"template_health_status_rbac":     true,
-		"template_pin_rbac":               true,
-		"template_visibility_enforced":    true,
-		"admin_runs_filter_contract":      true,
+		"healthz":                      true,
+		"auth_me":                      true,
+		"pods_list":                    true,
+		"admin_list_users_403":         true,
+		"admin_run_detail_403":         true,
+		"admin_audit_403":              true,
+		"pod_testing_dashboard_404":    true,
+		"wiki_index_rbac":              true,
+		"image_upload_rbac":            true,
+		"template_health_status_rbac":  true,
+		"template_pin_rbac":            true,
+		"template_visibility_enforced": true,
 	}
 	for _, c := range All() {
 		if !wantNames[c.Name()] {
@@ -279,46 +277,5 @@ func TestAll_HasFriendlyMetadata(t *testing.T) {
 		if len(c.Title()) > 60 {
 			t.Errorf("check %q Title() = %q is too long (>60 chars; keep it pill-sized)", c.Name(), c.Title())
 		}
-	}
-}
-
-func TestAdminRunsFilterContract_PassesOnEmptyArray(t *testing.T) {
-	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
-		"/api/v1/admin/runs": func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(200)
-			w.Write([]byte(`[]`))
-		},
-	})
-	status, err := AdminRunsFilterContract.Run(context.Background(), synthetic.NewClient(srv.URL, ""))
-	if err != nil || status != 200 {
-		t.Fatalf("empty array with 200 should pass: status=%d err=%v", status, err)
-	}
-}
-
-func TestAdminRunsFilterContract_FailsOn500(t *testing.T) {
-	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
-		"/api/v1/admin/runs": func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(500)
-		},
-	})
-	_, err := AdminRunsFilterContract.Run(context.Background(), synthetic.NewClient(srv.URL, ""))
-	if err == nil {
-		t.Fatal("a 500 from admin/runs filter MUST fail")
-	}
-}
-
-func TestAdminRunsFilterContract_FailsOnIgnoredFilter(t *testing.T) {
-	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
-		"/api/v1/admin/runs": func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(200)
-			// Return non-empty array, which indicates filter was ignored
-			w.Write([]byte(`[{"id":"fake"}]`))
-		},
-	})
-	_, err := AdminRunsFilterContract.Run(context.Background(), synthetic.NewClient(srv.URL, ""))
-	if err == nil {
-		t.Fatal("a non-empty array when filtering should fail (indicates filter was silently ignored)")
 	}
 }

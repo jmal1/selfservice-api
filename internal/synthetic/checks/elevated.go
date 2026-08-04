@@ -48,13 +48,114 @@ func (cfg ElevatedConfig) client() (*synthetic.Client, error) {
 //
 // The caller registers these only when an instructor client is available;
 // cmd/synthetic-api-monitor logs loudly and skips them otherwise, so a
-// half-configured deploy shows up as "4 checks" rather than as four
+// half-configured deploy shows up as "6 checks" rather than as five
 // mysteriously failing ones.
 func Elevated(cfg ElevatedConfig) []synthetic.Check {
 	return []synthetic.Check{
 		imageListContract(cfg),
 		isoCatalogReachable(cfg),
 		templateWizardState404(cfg),
+		adminRunsFilterContract(cfg),
+		blueprintVMPlaylistsContract(cfg),
+	}
+}
+
+// adminRunsFilterContract asserts that /admin/runs honours an unmatched
+// triggered_by filter: 200 with an empty array, not 500 and not every run.
+//
+// This lives here, not in All(), because /admin/runs is instructor-gated. It
+// originally shipped on the student client, where it could only ever observe
+// the 403 from the RBAC middleware — so it went red the moment it was deployed
+// and could never have gone green, no matter how correct the endpoint was.
+//
+// The two failure modes it exists to catch are only reachable past the gate:
+// a nil-deref 500 when the filter matches nothing, and a filter that is parsed
+// then silently ignored (which returns every run in the system to a caller who
+// asked for one user's). The empty-array assertion is what distinguishes them —
+// a 200 alone would pass in both the correct case and the ignored-filter case.
+func adminRunsFilterContract(cfg ElevatedConfig) synthetic.Check {
+	return synthetic.CheckFunc{
+		NameVal:        "admin_runs_filter_contract",
+		TitleVal:       "Admin Runs Filter Contract",
+		DescriptionVal: "Calls /api/v1/admin/runs as an instructor with an unmatched triggered_by filter and requires 200 plus an empty array. Catches 500s on unmatched filters and filters being parsed but silently ignored.",
+		SeverityVal:    synthetic.SeverityWarning,
+		RunFn: func(ctx context.Context, _ *synthetic.Client) (int, error) {
+			c, err := cfg.client()
+			if err != nil {
+				return 0, err
+			}
+			// A UUID that cannot belong to any user, so the correct answer is
+			// unambiguously "no runs".
+			const phantom = "00000000-0000-0000-0000-000000000000"
+			resp, err := c.Do(ctx, http.MethodGet, "/api/v1/admin/runs?triggered_by="+phantom, nil)
+			if err != nil {
+				return 0, err
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+
+			if resp.StatusCode == http.StatusForbidden {
+				return resp.StatusCode, fmt.Errorf(
+					"admin/runs returned 403 to the instructor identity — this check is running with the wrong client, or the instructor role lost access to /admin/runs")
+			}
+			if resp.StatusCode != http.StatusOK {
+				return resp.StatusCode, fmt.Errorf("admin/runs with unmatched filter returned %d, want 200: %s", resp.StatusCode, snippet(body))
+			}
+			var arr []any
+			if err := json.Unmarshal(body, &arr); err != nil {
+				return resp.StatusCode, fmt.Errorf("admin/runs response is not a JSON array: %w", err)
+			}
+			if len(arr) != 0 {
+				return resp.StatusCode, fmt.Errorf("admin/runs with unmatched filter returned %d items, want 0 — the filter is being ignored and every run is exposed", len(arr))
+			}
+			return resp.StatusCode, nil
+		},
+	}
+}
+
+// blueprintVMPlaylistsContract asserts that resolving VM playlists for a
+// blueprint that does not exist returns 404, not 500.
+//
+// Also moved off the student client, and for a subtler reason than the runs
+// check: it accepted "404 or 403", and as a student it received 403 on every
+// cycle. It therefore passed continuously while proving nothing — the request
+// was rejected by the RBAC middleware and never reached the handler, so the
+// nil-deref in blueprint resolution that the check exists to detect was
+// structurally unreachable.
+//
+// Past the gate, 403 is no longer an acceptable answer, so it is asserted
+// strictly: 404 only.
+func blueprintVMPlaylistsContract(cfg ElevatedConfig) synthetic.Check {
+	return synthetic.CheckFunc{
+		NameVal:        "blueprint_vm_playlists_contract",
+		TitleVal:       "Missing Blueprint Playlists Returns 404 (not 500)",
+		DescriptionVal: "Probes /admin/blueprints/{phantom-uuid}/vm-playlists as an instructor and requires 404. Watches for nil-deref bugs in blueprint playlist resolution.",
+		SeverityVal:    synthetic.SeverityWarning,
+		RunFn: func(ctx context.Context, _ *synthetic.Client) (int, error) {
+			c, err := cfg.client()
+			if err != nil {
+				return 0, err
+			}
+			const phantom = "00000000-0000-0000-0000-000000000000"
+			resp, err := c.Do(ctx, http.MethodGet, "/api/v1/admin/blueprints/"+phantom+"/vm-playlists", nil)
+			if err != nil {
+				return 0, err
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+
+			if resp.StatusCode == http.StatusInternalServerError {
+				return resp.StatusCode, fmt.Errorf("phantom blueprint vm-playlists returned 500 (nil-deref in resolution): %s", snippet(body))
+			}
+			if resp.StatusCode == http.StatusForbidden {
+				return resp.StatusCode, fmt.Errorf(
+					"phantom blueprint vm-playlists returned 403 to the instructor identity — the request never reached the handler, so this check is proving nothing")
+			}
+			if resp.StatusCode != http.StatusNotFound {
+				return resp.StatusCode, fmt.Errorf("phantom blueprint vm-playlists returned %d, want 404: %s", resp.StatusCode, snippet(body))
+			}
+			return resp.StatusCode, nil
+		},
 	}
 }
 

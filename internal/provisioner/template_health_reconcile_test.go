@@ -23,6 +23,7 @@ type fakeHealthDB struct {
 	templates []models.Template
 	states    map[uuid.UUID]*database.TemplateHealthState
 	deepOrder []uuid.UUID // controlled least-recently-checked order
+	newestErr error       // forces GetNewestTemplateHealthCheckTime to fail
 }
 
 func newFakeHealthDB(templates []models.Template) *fakeHealthDB {
@@ -77,6 +78,28 @@ func (f *fakeHealthDB) UpsertTemplateHealthState(_ context.Context, state databa
 	copy := state
 	f.states[state.TemplateID] = &copy
 	return nil
+}
+
+// GetNewestTemplateHealthCheckTime mirrors the production MAX() query over the
+// fake's stored state, so due/not-due tests exercise real bookkeeping rather
+// than a hand-set flag.
+func (f *fakeHealthDB) GetNewestTemplateHealthCheckTime(_ context.Context) (*time.Time, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.newestErr != nil {
+		return nil, f.newestErr
+	}
+	var newest *time.Time
+	for _, s := range f.states {
+		if s.LastStructuralCheckAt == nil {
+			continue
+		}
+		if newest == nil || s.LastStructuralCheckAt.After(*newest) {
+			t := *s.LastStructuralCheckAt
+			newest = &t
+		}
+	}
+	return newest, nil
 }
 
 // fakeHealthVC implements templateHealthVCenter.

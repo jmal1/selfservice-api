@@ -187,33 +187,6 @@ var PodTestingDashboard404 = synthetic.CheckFunc{
 	},
 }
 
-// BlueprintVMPlaylistsContract404 asserts that a nonexistent blueprint returns 404
-// (not 500) from the blueprint VM playlists resolution endpoint. This catches the
-// nil-deref regression class: if blueprint existence checking is skipped, a nil
-// pointer dereference would return 500.
-var BlueprintVMPlaylistsContract404 = synthetic.CheckFunc{
-	NameVal:        "blueprint_vm_playlists_contract",
-	TitleVal:       "Missing Blueprint Playlists Returns 404 (not 500)",
-	DescriptionVal: "Probes /admin/blueprints/{phantom-uuid}/vm-playlists and requires 404. Watches for nil-deref bugs in blueprint resolution logic.",
-	SeverityVal:    synthetic.SeverityWarning,
-	RunFn: func(ctx context.Context, c *synthetic.Client) (int, error) {
-		const phantom = "00000000-0000-0000-0000-000000000000"
-		resp, err := c.Do(ctx, http.MethodGet, "/api/v1/admin/blueprints/"+phantom+"/vm-playlists", nil)
-		if err != nil {
-			return 0, err
-		}
-		defer resp.Body.Close()
-		_, _ = io.Copy(io.Discard, resp.Body)
-		if resp.StatusCode == http.StatusInternalServerError {
-			return resp.StatusCode, fmt.Errorf("phantom blueprint vm-playlists endpoint returned 500 (nil-deref bug)")
-		}
-		if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusForbidden {
-			return resp.StatusCode, fmt.Errorf("phantom blueprint vm-playlists endpoint returned %d, want 404 or 403", resp.StatusCode)
-		}
-		return resp.StatusCode, nil
-	},
-}
-
 // WikiIndexRBAC asserts that a non-instructor synthetic user is rejected from
 // the wiki index with 403. The wiki contains internal authoring docs scoped
 // to instructors and admins; a permission regression would surface here.
@@ -367,39 +340,6 @@ var TemplateVisibilityEnforced = synthetic.CheckFunc{
 	},
 }
 
-// AdminRunsFilterContract asserts that the /admin/runs endpoint with an
-// unmatched filter returns 200 with an empty array (not 500 or silently
-// returning all runs). This catches both nil-deref/500 on unmatched filters
-// and silently ignoring filters (which would return all runs instead).
-var AdminRunsFilterContract = synthetic.CheckFunc{
-	NameVal:        "admin_runs_filter_contract",
-	TitleVal:       "Admin Runs Filter Contract",
-	DescriptionVal: "Calls /api/v1/admin/runs with an unmatched triggered_by filter and requires 200 + empty array. Catches 500s on missing filters and filters being silently ignored.",
-	SeverityVal:    synthetic.SeverityWarning,
-	RunFn: func(ctx context.Context, c *synthetic.Client) (int, error) {
-		// Use a deterministic UUID that will never have a run
-		const phantom = "00000000-0000-0000-0000-000000000000"
-		resp, err := c.Do(ctx, http.MethodGet, "/api/v1/admin/runs?triggered_by="+phantom, nil)
-		if err != nil {
-			return 0, err
-		}
-		defer resp.Body.Close()
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		if resp.StatusCode != http.StatusOK {
-			return resp.StatusCode, fmt.Errorf("admin/runs with unmatched filter returned %d, want 200", resp.StatusCode)
-		}
-		// Should return a JSON array (possibly empty)
-		var arr []any
-		if err := json.Unmarshal(body, &arr); err != nil {
-			return resp.StatusCode, fmt.Errorf("admin/runs response is not a JSON array: %w", err)
-		}
-		if len(arr) != 0 {
-			return resp.StatusCode, fmt.Errorf("admin/runs with unmatched filter returned %d items, want 0 (filter may be silently ignored)", len(arr))
-		}
-		return resp.StatusCode, nil
-	},
-}
-
 // All returns the canonical list of synthetic checks the monitor runs each
 // cycle. Ordering does not matter — checks run sequentially and results are
 // pushed atomically. Add new checks here.
@@ -411,10 +351,8 @@ func All() []synthetic.Check {
 		AdminListUsers403,
 		AdminRunDetail403,
 		AdminAudit403,
-		AdminRunsFilterContract,
 		TemplateVisibilityEnforced,
 		PodTestingDashboard404,
-		BlueprintVMPlaylistsContract404,
 		WikiIndexRBAC,
 		ImageUploadRBAC,
 		TemplateHealthStatusRBAC,

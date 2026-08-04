@@ -23,25 +23,38 @@ type TemplateHealthState struct {
 	UpdatedAt              time.Time  `json:"updated_at"`
 }
 
-// ListStudentVisibleTemplates returns all templates that are student-facing:
-// is_active = true, is_internal = false, template_state = 'active'.
+// StudentVisibleTemplateFilter is the WHERE predicate defining "a template a
+// student can actually see". It is a const rather than inline SQL so a test can
+// assert on it directly — asserting by reading the .go file off disk is
+// path-fragile and cannot pass on both Windows and Linux CI.
 //
-// This is the canonical shared query used by the health checker to determine
-// which templates to check. Using it here means the health checker
-// automatically respects both the existing is_internal filter (migration 000019,
-// hides synthetic-noop) and any future visibility controls added to the
-// templates table — the two code paths stay in sync with no change to the
-// checker.
+// Every predicate here must mirror the student branch of ListTemplatesForUser.
+const StudentVisibleTemplateFilter = `
+		  is_active = true
+		  AND is_internal = false
+		  AND template_state = 'active'
+		  AND visibility = 'public'`
+
+// ListStudentVisibleTemplates returns all templates that are student-facing,
+// per StudentVisibleTemplateFilter.
 //
-// Callers must not add their own is_internal / template_state filtering on top
-// of this result — the filter is already applied here.
+// This is the canonical query used by the health checker to decide which
+// templates to check.
+//
+// The visibility predicate is deliberately explicit. An earlier revision of
+// this comment claimed the query "automatically respects any future visibility
+// controls"; that was never true of raw SQL, and when migration 000029 added
+// the visibility column this query silently kept health-checking
+// instructor_only templates. Alerting on a template no student can reach is
+// exactly the noise the health checker exists to avoid.
+//
+// Callers must not add their own is_internal / template_state / visibility
+// filtering on top of this result — the filter is already applied here.
 func (q *Queries) ListStudentVisibleTemplates(ctx context.Context) ([]models.Template, error) {
 	rows, err := q.pool.Query(ctx, `
 		SELECT `+templateSelectCols+`
 		FROM templates
-		WHERE is_active = true
-		  AND is_internal = false
-		  AND template_state = 'active'
+		WHERE `+StudentVisibleTemplateFilter+`
 		ORDER BY name
 	`)
 	if err != nil {
@@ -112,6 +125,32 @@ func (q *Queries) GetTemplateHealthState(ctx context.Context, templateID uuid.UU
 		return nil, err
 	}
 	return &s, nil
+}
+
+// GetNewestTemplateHealthCheckTime returns the most recent structural check
+// timestamp across all templates, or nil when no cycle has ever completed.
+//
+// This exists so the worker can decide, on leader acquisition, whether a cycle
+// is actually due. The reconciler is driven by a 12h time.Ticker that restarts
+// from zero every time the worker process restarts; this platform deploys
+// several times a day, so a ticker-only reconciler would in practice never
+// fire at all. Persisted state is the only restart-durable clock available.
+//
+// Structural (not deep) is the right column: the structural pass runs for every
+// template on every cycle, so its max is the true "when did a cycle last run",
+// whereas last_deep_check_at only advances for the one round-robin template.
+func (q *Queries) GetNewestTemplateHealthCheckTime(ctx context.Context) (*time.Time, error) {
+	var newest *time.Time
+	err := q.pool.QueryRow(ctx, `
+		SELECT MAX(last_structural_check_at) FROM template_health_state
+	`).Scan(&newest)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return newest, nil
 }
 
 // ListTemplateHealthStates returns health state rows for all student-visible

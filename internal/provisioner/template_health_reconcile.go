@@ -101,6 +101,7 @@ type templateHealthDB interface {
 	GetLeastRecentlyDeepCheckedTemplate(ctx context.Context) (*models.Template, error)
 	GetTemplateHealthState(ctx context.Context, templateID uuid.UUID) (*database.TemplateHealthState, error)
 	UpsertTemplateHealthState(ctx context.Context, state database.TemplateHealthState) error
+	GetNewestTemplateHealthCheckTime(ctx context.Context) (*time.Time, error)
 }
 
 // templateHealthVCenter is the narrow vCenter surface the health reconciler
@@ -128,35 +129,62 @@ var _ templateHealthDB = (*database.Queries)(nil)
 var _ templateHealthVCenter = (*vcenter.Client)(nil)
 var _ templateHealthMetrics = (*TemplateHealthPusher)(nil)
 
-// RunTemplateHealthReconciler runs the health check loop until ctx is cancelled.
-// Started as a goroutine by the provision worker.
-func (p *Provisioner) RunTemplateHealthReconciler(ctx context.Context, cfg TemplateHealthReconcilerConfig) {
-	if cfg.Interval <= 0 {
-		cfg.Interval = 12 * time.Hour
-	}
-	logger := p.logger
-	if logger == nil {
-		logger = slog.Default()
-	}
-	logger.Info("template health reconciler started",
-		"interval", cfg.Interval,
-		"deep_check_timeout", cfg.DeepCheckTimeout,
-		"max_retries", cfg.MaxRetries)
+// NOTE: there is deliberately no RunTemplateHealthReconciler loop here.
+//
+// One used to exist and was never called — the provision worker drives this
+// reconciler from its own select loop so the run can be leader-gated. It was
+// removed rather than left in place because it carried the same ticker-only
+// defect this change fixes (a 12h time.Ticker with no immediate first run,
+// which never fires on a service that restarts more often than the interval).
+// Leaving a second, unreferenced copy of that bug in the tree invites it back.
 
-	ticker := time.NewTicker(cfg.Interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			logger.Info("template health reconciler stopped")
-			return
-		case <-ticker.C:
-			if _, err := p.ReconcileTemplateHealth(ctx, cfg); err != nil {
-				logger.Error("template health reconcile failed", "error", err)
-			}
-		}
+// ReconcileTemplateHealthIfDue runs a health cycle only when one is actually
+// due — that is, when no cycle has ever completed, or the most recent one
+// finished longer ago than cfg.Interval. It reports whether it ran.
+//
+// The worker calls this on leader acquisition. Without it the feature is dead
+// on arrival: the reconciler's only other trigger is a 12h time.Ticker created
+// at process start, and this platform ships several deploys a day, so the
+// ticker is reset long before it ever fires.
+//
+// The due-check is what makes an unconditional catch-up pass safe. Every cycle
+// performs one real clone → power-on → destroy against vCenter, so running
+// unconditionally on every leader acquisition would turn each deploy — and each
+// leader failover — into another clone, against the same NFS 4.1 datastores
+// whose clone failures this check exists to detect.
+//
+// A failure to read the clock is reported, not swallowed, and does NOT run the
+// cycle: an unreadable clock is indistinguishable from "just ran", and the
+// ticker remains as a backstop.
+func (p *Provisioner) ReconcileTemplateHealthIfDue(ctx context.Context, cfg TemplateHealthReconcilerConfig) (TemplateHealthCounts, bool, error) {
+	due, err := templateHealthCycleDue(ctx, p.db, cfg.Interval)
+	if err != nil {
+		return TemplateHealthCounts{}, false, err
 	}
+	if !due {
+		return TemplateHealthCounts{}, false, nil
+	}
+
+	counts, err := p.ReconcileTemplateHealth(ctx, cfg)
+	return counts, true, err
+}
+
+// templateHealthCycleDue reports whether a health cycle should run now: true
+// when no cycle has ever completed, or the newest recorded structural check is
+// older than interval. Factored out of the Provisioner method so it can be
+// tested against the same fake DB the reconciler tests use.
+func templateHealthCycleDue(ctx context.Context, db templateHealthDB, interval time.Duration) (bool, error) {
+	if interval <= 0 {
+		interval = 12 * time.Hour
+	}
+	newest, err := db.GetNewestTemplateHealthCheckTime(ctx)
+	if err != nil {
+		return false, fmt.Errorf("read last template health check time: %w", err)
+	}
+	if newest == nil {
+		return true, nil
+	}
+	return time.Since(*newest) >= interval, nil
 }
 
 // ReconcileTemplateHealth is the Provisioner-bound entry point. The provision

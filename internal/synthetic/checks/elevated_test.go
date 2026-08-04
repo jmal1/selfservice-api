@@ -60,10 +60,14 @@ func TestElevated_UsesConfiguredClientNotRunners(t *testing.T) {
 		"/api/v1/admin/templates/00000000-0000-0000-0000-000000000000/wizard-state": func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNotFound)
 		},
+		"/api/v1/admin/runs": func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`[]`)) },
+		"/api/v1/admin/blueprints/00000000-0000-0000-0000-000000000000/vm-playlists": func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		},
 	})
 	all := Elevated(ElevatedConfig{Client: synthetic.NewClient(good.URL, "instructor-cookie")})
-	if len(all) != 3 {
-		t.Fatalf("Elevated() returned %d checks, want 3", len(all))
+	if len(all) != 5 {
+		t.Fatalf("Elevated() returned %d checks, want 5", len(all))
 	}
 	for _, c := range all {
 		if _, err := c.Run(context.Background(), poisonClient(t)); err != nil {
@@ -273,9 +277,11 @@ func TestElevated_HasFriendlyMetadata(t *testing.T) {
 // constructor and never appear in All().
 func TestElevated_StableNames(t *testing.T) {
 	want := map[string]bool{
-		"image_list_contract":       true,
-		"iso_catalog_reachable":     true,
-		"template_wizard_state_404": true,
+		"image_list_contract":             true,
+		"iso_catalog_reachable":           true,
+		"template_wizard_state_404":       true,
+		"admin_runs_filter_contract":      true,
+		"blueprint_vm_playlists_contract": true,
 	}
 	for _, c := range Elevated(ElevatedConfig{Client: synthetic.NewClient("http://x", "")}) {
 		if !want[c.Name()] {
@@ -363,5 +369,115 @@ func TestElevatedIdentityConfigured_Metadata(t *testing.T) {
 		if strings.Contains(c.Title()+c.Description(), bad) {
 			t.Errorf("metadata contains %q, which corrupts Prometheus exposition labels", bad)
 		}
+	}
+}
+
+// -- admin_runs_filter_contract --------------------------------------------
+//
+// This check shipped on the student client and asserted 200 on an
+// instructor-gated route, so in production it observed only the RBAC
+// middleware's 403: red on the first cycle, and incapable of ever going green.
+// These tests pin the contract now that it runs with the instructor identity.
+
+func elevatedCfg(url string) ElevatedConfig {
+	return ElevatedConfig{Client: synthetic.NewClient(url, "")}
+}
+
+func TestAdminRunsFilterContract_PassesOnEmptyArray(t *testing.T) {
+	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
+		"/api/v1/admin/runs": func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			w.Write([]byte(`[]`))
+		},
+	})
+	status, err := adminRunsFilterContract(elevatedCfg(srv.URL)).Run(context.Background(), nil)
+	if err != nil || status != 200 {
+		t.Fatalf("empty array with 200 should pass: status=%d err=%v", status, err)
+	}
+}
+
+func TestAdminRunsFilterContract_FailsOn500(t *testing.T) {
+	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
+		"/api/v1/admin/runs": func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(500) },
+	})
+	if _, err := adminRunsFilterContract(elevatedCfg(srv.URL)).Run(context.Background(), nil); err == nil {
+		t.Fatal("a 500 from admin/runs filter MUST fail")
+	}
+}
+
+// The assertion that distinguishes "filter works" from "filter parsed and
+// ignored". A 200-only check would pass in both cases, and the ignored-filter
+// case leaks every run in the system to a caller who asked for one user's.
+func TestAdminRunsFilterContract_FailsOnIgnoredFilter(t *testing.T) {
+	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
+		"/api/v1/admin/runs": func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			w.Write([]byte(`[{"id":"fake"}]`))
+		},
+	})
+	if _, err := adminRunsFilterContract(elevatedCfg(srv.URL)).Run(context.Background(), nil); err == nil {
+		t.Fatal("a non-empty array when filtering should fail (the filter is being ignored)")
+	}
+}
+
+// The regression guard for the bug being fixed: if this check is ever moved
+// back onto the student client, it sees 403. That must fail loudly, and the
+// message must point at the identity rather than at the endpoint.
+func TestAdminRunsFilterContract_FailsOn403WithIdentityHint(t *testing.T) {
+	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
+		"/api/v1/admin/runs": func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(403) },
+	})
+	_, err := adminRunsFilterContract(elevatedCfg(srv.URL)).Run(context.Background(), nil)
+	if err == nil {
+		t.Fatal("403 must fail: the check would be running as the wrong identity")
+	}
+	if !strings.Contains(err.Error(), "identity") {
+		t.Errorf("403 error should point at the identity, not the endpoint; got: %v", err)
+	}
+}
+
+// -- blueprint_vm_playlists_contract ---------------------------------------
+//
+// This one is the subtler failure: it accepted "404 or 403" and, as a student,
+// received 403 every cycle. It passed continuously while proving nothing --
+// the request never reached the handler, so the nil-deref it exists to catch
+// was structurally unreachable. Past the gate, 403 is not an acceptable answer.
+
+func TestBlueprintVMPlaylistsContract_PassesOn404(t *testing.T) {
+	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
+		"/api/v1/admin/blueprints/00000000-0000-0000-0000-000000000000/vm-playlists": func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(404)
+		},
+	})
+	status, err := blueprintVMPlaylistsContract(elevatedCfg(srv.URL)).Run(context.Background(), nil)
+	if err != nil || status != 404 {
+		t.Fatalf("404 should pass: status=%d err=%v", status, err)
+	}
+}
+
+func TestBlueprintVMPlaylistsContract_FailsOn500(t *testing.T) {
+	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
+		"/api/v1/admin/blueprints/00000000-0000-0000-0000-000000000000/vm-playlists": func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(500)
+		},
+	})
+	if _, err := blueprintVMPlaylistsContract(elevatedCfg(srv.URL)).Run(context.Background(), nil); err == nil {
+		t.Fatal("a 500 is the nil-deref this check exists to catch and MUST fail")
+	}
+}
+
+// The tautology guard. Before this change a 403 counted as a pass, so the
+// check was green for its entire life while testing nothing.
+func TestBlueprintVMPlaylistsContract_FailsOn403(t *testing.T) {
+	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
+		"/api/v1/admin/blueprints/00000000-0000-0000-0000-000000000000/vm-playlists": func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(403)
+		},
+	})
+	_, err := blueprintVMPlaylistsContract(elevatedCfg(srv.URL)).Run(context.Background(), nil)
+	if err == nil {
+		t.Fatal("403 must fail: it means the request never reached the handler, so the check proves nothing")
 	}
 }
