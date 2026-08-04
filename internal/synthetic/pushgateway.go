@@ -134,6 +134,33 @@ func serializeResults(results []Result) []byte {
 		fmt.Fprintf(&b, `crucible_synthetic_check_http_status{check=%q,title=%q,severity=%q} %d`+"\n",
 			r.Name, sanitizeLabel(r.Title), string(r.Severity), r.HTTPStatus)
 	}
+	// Metric: crucible_synthetic_check_attempts — gauge of how many attempts
+	// the runner needed. 1 means first-try pass or first-try fail with no
+	// retry policy. Values >1 mean a retry was applied. A check that
+	// consistently shows attempts>1 is a leading indicator of infrastructure
+	// degradation even while crucible_synthetic_check_success stays 1.
+	b.WriteString("# HELP crucible_synthetic_check_attempts Number of attempts the runner made for this check in the last cycle (1=first-try, 2=one retry, etc).\n")
+	b.WriteString("# TYPE crucible_synthetic_check_attempts gauge\n")
+	for _, r := range results {
+		attempts := r.Attempts
+		if attempts < 1 {
+			attempts = 1 // defensive: Attempts=0 means the field was not set
+		}
+		fmt.Fprintf(&b, `crucible_synthetic_check_attempts{check=%q,title=%q,severity=%q} %d`+"\n",
+			r.Name, sanitizeLabel(r.Title), string(r.Severity), attempts)
+	}
+	// Metric: crucible_synthetic_vcenter_degraded — 1 when at least one
+	// attempt in this cycle failed with a vCenter-attributable error. The
+	// check may still be green (Success=true) if a retry succeeded; this
+	// gauge stays 1 to surface vCenter wobble even when provisioning
+	// ultimately completed. Use this for a leading-indicator alert that fires
+	// before checks start fully failing.
+	b.WriteString("# HELP crucible_synthetic_vcenter_degraded 1 if any attempt in the last cycle was attributed to vCenter slowness or unreachability.\n")
+	b.WriteString("# TYPE crucible_synthetic_vcenter_degraded gauge\n")
+	for _, r := range results {
+		fmt.Fprintf(&b, `crucible_synthetic_vcenter_degraded{check=%q,title=%q,severity=%q} %d`+"\n",
+			r.Name, sanitizeLabel(r.Title), string(r.Severity), boolToInt(r.VCenterDegraded))
+	}
 	// Metric: crucible_synthetic_check_info — constant 1 carrying friendly
 	// metadata as labels. Standard `_info`-metric pattern: dashboards join
 	// against this on the `check` label to surface title/description.

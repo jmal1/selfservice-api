@@ -387,6 +387,41 @@ func main() {
 		Interval: l1ValidationInterval,
 	}
 
+	// Template health reconciler. Checks every student-visible template
+	// structurally (vCenter object exists) on every 12-hour cycle, and performs
+	// one full deep check (clone → power-on → wait-for-IP → destroy) per cycle
+	// rotating across templates. Anti-flap: 3 retries with exponential backoff,
+	// 2 consecutive-cycle confirmation before unhealthy. Immediate recovery.
+	//
+	// MUST be added to the leader-gated set when leader election lands
+	// (parallel lane). For now the enabled flag defaults to false so deployers
+	// opt in explicitly rather than hitting vCenter by surprise.
+	//
+	// Env knobs:
+	//   WORKER_TEMPLATE_HEALTH_ENABLED=true          — opt in
+	//   WORKER_TEMPLATE_HEALTH_INTERVAL              — default 12h
+	//   WORKER_TEMPLATE_HEALTH_DEEP_TIMEOUT          — default 10m
+	healthReconcilerEnabled := strings.EqualFold(os.Getenv("WORKER_TEMPLATE_HEALTH_ENABLED"), "true")
+	healthReconcilerInterval := envDuration(logger, "WORKER_TEMPLATE_HEALTH_INTERVAL", 12*time.Hour)
+	healthReconcilerDeepTimeout := envDuration(logger, "WORKER_TEMPLATE_HEALTH_DEEP_TIMEOUT", 10*time.Minute)
+	var healthReconcilerPusher *provisioner.TemplateHealthPusher
+	if pgURL := os.Getenv("WORKER_PUSHGATEWAY_URL"); pgURL != "" {
+		job := os.Getenv("WORKER_PUSHGATEWAY_JOB")
+		if job == "" {
+			job = "crucible_provision_worker"
+		}
+		healthReconcilerPusher = provisioner.NewTemplateHealthPusher(pgURL, job,
+			map[string]string{"layer": "api"})
+	}
+	healthReconcilerCfg := provisioner.TemplateHealthReconcilerConfig{
+		Interval:         healthReconcilerInterval,
+		DeepCheckTimeout: healthReconcilerDeepTimeout,
+		TemplateFolder:   cfg.VCenter.TemplatesFolder,
+		MaxRetries:       3,
+		RetryBaseDelay:   1 * time.Second,
+		Pusher:           healthReconcilerPusher,
+	}
+
 	// Worker ID for job claiming
 	workerID, err := os.Hostname()
 	if err != nil {
@@ -494,6 +529,23 @@ func main() {
 		}()
 	}
 
+	// Template health reconciler ticker (opt-in; nil-safe).
+	var healthReconcilerTickerC <-chan time.Time
+	if healthReconcilerEnabled {
+		t := time.NewTicker(healthReconcilerInterval)
+		defer t.Stop()
+		healthReconcilerTickerC = t.C
+		logger.Info("template health reconciler enabled",
+			"interval", healthReconcilerInterval,
+			"deep_timeout", healthReconcilerDeepTimeout)
+		// Sweep any orphaned health-check clones left by a previous crash.
+		go func() {
+			if _, err := vcClient.SweepHealthCheckOrphans(ctx, cfg.VCenter.TemplatesFolder); err != nil {
+				logger.Warn("health-check orphan sweep failed", "error", err)
+			}
+		}()
+	}
+
 	// Start expiration cron (checks for expired pods every 5 minutes)
 	go prov.StartExpirationCron(ctx)
 
@@ -540,6 +592,10 @@ func main() {
 				if _, err := prov.ReconcileL1TrustValidation(ctx, l1ValidationCfg); err != nil {
 					logger.Error("l1 trust validation reconcile failed", "error", err)
 				}
+				case <-healthReconcilerTickerC:
+					if _, err := prov.ReconcileTemplateHealth(ctx, healthReconcilerCfg); err != nil {
+						logger.Error("template health reconcile failed", "error", err)
+					}
 			}
 		}
 	}()
