@@ -149,7 +149,7 @@ func importImage(
 	objects imageObjectStore,
 	vc imageImportVCenter,
 	db imageImportDB,
-	metrics *PipelineMetrics,
+	metrics pipelineMetricsSink,
 	logger *slog.Logger,
 	cfg ImageImportConfig,
 	progress func(step, message string),

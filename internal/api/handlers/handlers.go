@@ -39,16 +39,21 @@ type Handler struct {
 
 	// Image upload fields (Epic A). Set via WithImageStore / WithVCenterISOs.
 	// nil means the feature is not configured; handlers return 503.
-	imageStore   ImageStore        // object-store surface for presign/complete/stat/delete
-	imgDB        imageDB           // image-specific DB queries (= h.db in production)
-	isoLister    VCenterISOLister  // vCenter ISO datastore browser
-	isoDatastore string            // which datastore to browse for ISOs
+	imageStore   ImageStore         // object-store surface for presign/complete/stat/delete
+	imgDB        imageDB            // image-specific DB queries (= h.db in production)
+	imageMetrics imageUploadMetrics // best-effort upload lifecycle metrics
+	isoLister    VCenterISOLister   // vCenter ISO datastore browser
+	isoDatastore string             // which datastore to browse for ISOs
 	isoCache     *isoDatastoreCache // 5-minute ISO listing cache
 
 	// templates is an optional override for database.Queries.ListTemplatesForUser.
 	// nil means the default h.db is used. For testing, this can be set to a fake
 	// implementation. See templateStore() accessor.
 	templates templateLister
+}
+
+type imageUploadMetrics interface {
+	RecordImageUpload(kind, result string)
 }
 
 // VCenterConsole is the interface for vCenter operations needed by the
@@ -108,6 +113,13 @@ func (h *Handler) WithVCenterFolders(vcf VCenterFolderEnumerator, templatesFolde
 func (h *Handler) WithImageStore(store ImageStore) *Handler {
 	h.imageStore = store
 	h.imgDB = h.db // *database.Queries satisfies imageDB structurally
+	return h
+}
+
+// WithPipelineMetrics wires the image-upload metric sink. The handler only
+// records lifecycle events; the caller is responsible for pushing the sink.
+func (h *Handler) WithPipelineMetrics(metrics imageUploadMetrics) *Handler {
+	h.imageMetrics = metrics
 	return h
 }
 

@@ -455,7 +455,7 @@ func TestProvisionTemplate_ISO_Manual(t *testing.T) {
 	payload.UnattendMode = models.UnattendModeManual
 	vc, db := newISOFakes(payload)
 
-	err := provisionTemplateFromISO(context.Background(), vc, db, discardLogger(), nil, payload)
+	err := provisionTemplateFromISO(context.Background(), vc, db, nil, discardLogger(), nil, payload)
 	if err != nil {
 		t.Fatalf("manual ISO provision returned error: %v", err)
 	}
@@ -505,7 +505,7 @@ func TestProvisionTemplate_ISO_Unattended(t *testing.T) {
 	vc, db := newISOFakes(payload)
 	vc.createRet = "vm-iso-7788"
 
-	err := provisionTemplateFromISO(context.Background(), vc, db, discardLogger(), nil, payload)
+	err := provisionTemplateFromISO(context.Background(), vc, db, nil, discardLogger(), nil, payload)
 	if err != nil {
 		t.Fatalf("unattended ISO provision returned error: %v", err)
 	}
@@ -573,7 +573,7 @@ func TestProvisionTemplate_ISO_Unattended_WaitsForPowerOffNotTools(t *testing.T)
 	payload.UnattendConfig = json.RawMessage(`{"Hostname":"ubuntu-lab","Password":"S3edP@ss-not-a-real-secret"}`) // pragma: allowlist-secret
 	vc, db := newISOFakes(payload)
 
-	if err := provisionTemplateFromISO(context.Background(), vc, db, discardLogger(), nil, payload); err != nil {
+	if err := provisionTemplateFromISO(context.Background(), vc, db, nil, discardLogger(), nil, payload); err != nil {
 		t.Fatalf("unattended ISO provision returned error: %v", err)
 	}
 
@@ -622,7 +622,7 @@ func TestProvisionTemplate_ISO_BadSourceRef(t *testing.T) {
 	payload.SourceRef = "NAS-BackupsAndISOS/ISOs/ubuntu.iso" // missing the [datastore] brackets
 	vc, db := newISOFakes(payload)
 
-	err := provisionTemplateFromISO(context.Background(), vc, db, discardLogger(), nil, payload)
+	err := provisionTemplateFromISO(context.Background(), vc, db, nil, discardLogger(), nil, payload)
 	if err == nil {
 		t.Fatal("expected an error for a malformed source_ref, got nil")
 	}
@@ -654,7 +654,7 @@ func TestProvisionTemplate_ISO_RemasterUnsupportedFailsLoudly(t *testing.T) {
 	payload.UnattendMode = models.UnattendModeDebianPreseed
 	vc, db := newISOFakes(payload)
 
-	err := provisionTemplateFromISO(context.Background(), vc, db, discardLogger(), nil, payload)
+	err := provisionTemplateFromISO(context.Background(), vc, db, nil, discardLogger(), nil, payload)
 	if err == nil {
 		t.Fatal("debian_preseed must fail loudly, got nil (silent downgrade to manual)")
 	}
@@ -674,6 +674,7 @@ func TestProvisionTemplate_ISO_RemasterUnsupportedFailsLoudly(t *testing.T) {
 		t.Errorf("final template state = %q, want %q", got, models.TemplateStateError)
 	}
 }
+
 // --- generalize completion sentinel -----------------------------------------
 //
 // Background: generalize's last act is to power the guest off, which kills the

@@ -103,12 +103,12 @@ type TemplateProvisionPayload struct {
 // default_password in templates rows; the threat model is "everyone with
 // jobs SELECT access already sees template credentials".
 type TemplateGeneralizePayload struct {
-	TemplateID     uuid.UUID `json:"template_id"`
-	OSType         string    `json:"os_type"`
-	GuestUsername  string    `json:"guest_username"`
-	GuestPassword  string    `json:"guest_password"`
-	VMMoref        string    `json:"vm_moref"`
-	SnapshotName   string    `json:"snapshot_name,omitempty"` // defaults to "base-image"
+	TemplateID    uuid.UUID `json:"template_id"`
+	OSType        string    `json:"os_type"`
+	GuestUsername string    `json:"guest_username"`
+	GuestPassword string    `json:"guest_password"`
+	VMMoref       string    `json:"vm_moref"`
+	SnapshotName  string    `json:"snapshot_name,omitempty"` // defaults to "base-image"
 }
 
 // ProvisionTemplate implements JobTypeTemplateProvision.
@@ -209,7 +209,7 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 		// wait on a *long* deadline), so they get their own dependency-injected
 		// core rather than falling through to the clone steps below. It does its
 		// own error-state marking, so we return its result verbatim.
-		return provisionTemplateFromISO(ctx, p.vc, p.db, p.logger,
+		return provisionTemplateFromISO(ctx, p.vc, p.db, p.pipeline, p.logger,
 			func(step, message string) { p.publishProgress(job.ID, step, message) }, payload)
 	default:
 		return p.markTemplateError(ctx, payload.TemplateID,
@@ -333,6 +333,7 @@ func provisionTemplateFromISO(
 	ctx context.Context,
 	vc isoProvisionVCenter,
 	db isoProvisionDB,
+	metrics pipelineMetricsSink,
 	logger *slog.Logger,
 	progress func(step, message string),
 	payload TemplateProvisionPayload,
@@ -346,7 +347,7 @@ func provisionTemplateFromISO(
 		}
 	}
 	markErr := func(cause error) error {
-		return markTemplateErrorViaDB(ctx, db, logger, payload.TemplateID, cause)
+		return markTemplateErrorViaDB(ctx, db, metrics, logger, payload.TemplateID, cause)
 	}
 
 	// Validate the installer reference up front. ParseDatastorePath is strict
@@ -478,7 +479,7 @@ func provisionTemplateFromISO(
 	}
 
 	prog("update_state", "Marking template as configuring")
-	if err := transitionTemplateViaDB(ctx, db, payload.TemplateID,
+	if err := transitionTemplateViaDB(ctx, db, metrics, payload.TemplateID,
 		models.TemplateStateProvisioning, models.TemplateStateConfiguring); err != nil {
 		return markErr(fmt.Errorf("advance to configuring: %w", err))
 	}
@@ -505,17 +506,23 @@ func unattendSpecFromPayload(payload TemplateProvisionPayload) (unattend.Spec, e
 // transitionTemplateViaDB is the db-interface twin of
 // (p *Provisioner).transitionTemplate: it gate-checks the move through the pure
 // state machine before touching the row, so an illegal transition fails fast.
-func transitionTemplateViaDB(ctx context.Context, db isoProvisionDB, id uuid.UUID, from, to string) error {
+func transitionTemplateViaDB(ctx context.Context, db isoProvisionDB, metrics pipelineMetricsSink, id uuid.UUID, from, to string) error {
 	if err := templates.CanTransition(from, to); err != nil {
 		return fmt.Errorf("state machine rejected %s→%s: %w", from, to, err)
 	}
-	return db.UpdateTemplateLifecycleState(ctx, id, from, to)
+	if err := db.UpdateTemplateLifecycleState(ctx, id, from, to); err != nil {
+		return err
+	}
+	if metrics != nil {
+		metrics.RecordTemplateTransition(from, to)
+	}
+	return nil
 }
 
 // markTemplateErrorViaDB is the db-interface twin of
 // (p *Provisioner).markTemplateError: best-effort move to 'error', returning the
 // original cause regardless so the job result surfaces the real problem.
-func markTemplateErrorViaDB(ctx context.Context, db isoProvisionDB, logger *slog.Logger, id uuid.UUID, cause error) error {
+func markTemplateErrorViaDB(ctx context.Context, db isoProvisionDB, metrics pipelineMetricsSink, logger *slog.Logger, id uuid.UUID, cause error) error {
 	tmpl, err := db.GetTemplateByID(ctx, id)
 	if err != nil || tmpl == nil {
 		logger.Warn("could not load template for error transition", "template_id", id, "load_err", err)
@@ -526,8 +533,13 @@ func markTemplateErrorViaDB(ctx context.Context, db isoProvisionDB, logger *slog
 			"current_state", tmpl.TemplateState, "err", err)
 		return cause
 	}
-	if err := db.UpdateTemplateLifecycleState(ctx, id, tmpl.TemplateState, models.TemplateStateError); err != nil {
+	from := tmpl.TemplateState
+	if err := db.UpdateTemplateLifecycleState(ctx, id, from, models.TemplateStateError); err != nil {
 		logger.Warn("error transition failed", "template_id", id, "err", err)
+		return cause
+	}
+	if metrics != nil {
+		metrics.RecordTemplateTransition(from, models.TemplateStateError)
 	}
 	return cause
 }
@@ -866,7 +878,16 @@ type TemplateVerifyPayload struct {
 //
 // This catches "bricked image" regressions (unbootable sysprep, no network,
 // BitLocker still on) BEFORE a student ever clones the template.
-func (p *Provisioner) VerifyTemplate(ctx context.Context, job *models.Job) error {
+func (p *Provisioner) VerifyTemplate(ctx context.Context, job *models.Job) (err error) {
+	if p.pipeline != nil {
+		defer func() {
+			result := "pass"
+			if err != nil {
+				result = "fail"
+			}
+			p.pipeline.RecordTemplateVerify(result)
+		}()
+	}
 	var payload TemplateVerifyPayload
 	if err := json.Unmarshal(job.Payload, &payload); err != nil {
 		return fmt.Errorf("parse template_verify payload: %w", err)
@@ -1019,6 +1040,8 @@ func (p *Provisioner) verifyFailedToReady(ctx context.Context, id uuid.UUID, cau
 		if uerr := p.db.UpdateTemplateLifecycleState(ctx, id, models.TemplateStateVerifying, models.TemplateStateReady); uerr != nil {
 			p.logger.Warn("verify: failed to move template back to ready after smoke failure",
 				"template_id", id, "error", uerr)
+		} else if p.pipeline != nil {
+			p.pipeline.RecordTemplateTransition(models.TemplateStateVerifying, models.TemplateStateReady)
 		}
 	}
 	return cause
@@ -1057,13 +1080,20 @@ func pollGuestCredentials(ctx context.Context, validate func(context.Context) er
 		}
 	}
 }
+
 // before calling UpdateTemplateLifecycleState, so an illegal transition
 // fails fast with a clear error instead of going through the DB.
 func (p *Provisioner) transitionTemplate(ctx context.Context, id uuid.UUID, from, to string) error {
 	if err := templates.CanTransition(from, to); err != nil {
 		return fmt.Errorf("state machine rejected %s→%s: %w", from, to, err)
 	}
-	return p.db.UpdateTemplateLifecycleState(ctx, id, from, to)
+	if err := p.db.UpdateTemplateLifecycleState(ctx, id, from, to); err != nil {
+		return err
+	}
+	if p.pipeline != nil {
+		p.pipeline.RecordTemplateTransition(from, to)
+	}
+	return nil
 }
 
 // markTemplateError moves the template to the error state and wraps the
@@ -1083,6 +1113,10 @@ func (p *Provisioner) markTemplateError(ctx context.Context, id uuid.UUID, cause
 	}
 	if err := p.db.UpdateTemplateLifecycleState(ctx, id, tmpl.TemplateState, models.TemplateStateError); err != nil {
 		p.logger.Warn("error transition failed", "template_id", id, "err", err)
+		return cause
+	}
+	if p.pipeline != nil {
+		p.pipeline.RecordTemplateTransition(tmpl.TemplateState, models.TemplateStateError)
 	}
 	return cause
 }

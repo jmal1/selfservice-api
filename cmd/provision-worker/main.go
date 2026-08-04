@@ -88,6 +88,18 @@ func main() {
 	// Create provisioner
 	prov := provisioner.New(queries, vcClient, opnClient, opnSSH, natsClient, logger)
 
+	var pipeline *provisioner.PipelineMetrics
+	if pgURL := os.Getenv("WORKER_PUSHGATEWAY_URL"); pgURL != "" {
+		job := os.Getenv("WORKER_PIPELINE_PUSHGATEWAY_JOB")
+		if job == "" {
+			job = "crucible_pipeline"
+		}
+		pipeline = provisioner.NewPipelineMetrics(pgURL, job, map[string]string{"layer": "api"})
+		prov.EnablePipelineMetrics(pipeline)
+		logger.Info("pipeline metrics enabled", "url", pgURL, "job", job)
+		go pipeline.RunPusher(ctx, 30*time.Second, logger)
+	}
+
 	// Optional: enable destroy_failed Pushgateway metric. When the
 	// WORKER_PUSHGATEWAY_URL env is set, the worker publishes
 	// crucible_pods_destroy_failed_count every 5 minutes so the
@@ -122,37 +134,33 @@ func main() {
 		if err != nil {
 			logger.Error("object store init failed; image_import disabled", "error", err)
 		} else {
-			var pipeline *provisioner.PipelineMetrics
-			if pgURL := os.Getenv("WORKER_PUSHGATEWAY_URL"); pgURL != "" {
-				job := os.Getenv("WORKER_PUSHGATEWAY_JOB")
-				if job == "" {
-					job = "crucible_provision_worker"
-				}
-				pipeline = provisioner.NewPipelineMetrics(pgURL, job, map[string]string{"layer": "api"})
-			}
 			// Imported OVAs land in the first configured Student-VMs pool;
 			// empty lets vCenter pick the datacenter default.
 			ovaPool := ""
 			if len(cfg.VCenter.ResourcePools) > 0 {
 				ovaPool = cfg.VCenter.ResourcePools[0]
 			}
-			prov.EnableImageImport(objects, pipeline, provisioner.ImageImportConfig{
-				ISODatastore:    cfg.VCenter.ISODatastore,
-				ISOFolder:       cfg.VCenter.ISOFolder,
-				OVAFolder:       cfg.VCenter.TemplatesFolder,
-				OVADatastore:    cfg.VCenter.Datastore,
-				OVAResourcePool: ovaPool,
-			})
+			if pipeline != nil {
+				prov.EnableImageImport(objects, pipeline, provisioner.ImageImportConfig{
+					ISODatastore:    cfg.VCenter.ISODatastore,
+					ISOFolder:       cfg.VCenter.ISOFolder,
+					OVAFolder:       cfg.VCenter.TemplatesFolder,
+					OVADatastore:    cfg.VCenter.Datastore,
+					OVAResourcePool: ovaPool,
+				})
+			} else {
+				prov.EnableImageImport(objects, nil, provisioner.ImageImportConfig{
+					ISODatastore:    cfg.VCenter.ISODatastore,
+					ISOFolder:       cfg.VCenter.ISOFolder,
+					OVAFolder:       cfg.VCenter.TemplatesFolder,
+					OVADatastore:    cfg.VCenter.Datastore,
+					OVAResourcePool: ovaPool,
+				})
+			}
 			logger.Info("image_import enabled",
 				"endpoint", cfg.ObjectStore.Endpoint,
 				"bucket", cfg.ObjectStore.Bucket,
 				"iso_datastore", cfg.VCenter.ISODatastore)
-
-			// Flush accumulated pipeline metrics. RecordImageImport and friends
-			// only mutate in-process counters; without this loop nothing ever
-			// reaches Prometheus and the pipeline dashboard stays empty, which
-			// is indistinguishable from "no imports have failed".
-			go pipeline.RunPusher(ctx, 30*time.Second, logger)
 
 			// Detect image_uploads rows abandoned in uploading/importing. Each
 			// one pins an object on a MinIO host with ~85 GB free on the same
@@ -163,6 +171,30 @@ func main() {
 				StaleThreshold: envDuration(logger, "WORKER_STUCK_UPLOAD_STALE_THRESHOLD", 30*time.Minute),
 			})
 		}
+	}
+
+	templateReconcilerEnabled := true
+	if v := os.Getenv("WORKER_PIPELINE_RECONCILER_ENABLED"); v != "" {
+		templateReconcilerEnabled = strings.EqualFold(v, "true")
+	}
+	templateReconcilerInterval := envDuration(logger, "WORKER_PIPELINE_RECONCILER_INTERVAL", 5*time.Minute)
+	templateReconcilerStaleThreshold := envDuration(logger, "WORKER_PIPELINE_RECONCILER_STALE_THRESHOLD", 2*time.Hour)
+	var templateReconcilerTickerC <-chan time.Time
+	if templateReconcilerEnabled {
+		t := time.NewTicker(templateReconcilerInterval)
+		defer t.Stop()
+		templateReconcilerTickerC = t.C
+		logger.Info("template reconciler enabled",
+			"interval", templateReconcilerInterval,
+			"stale_threshold", templateReconcilerStaleThreshold)
+		go func() {
+			if _, err := prov.ReconcileTemplateMetrics(ctx, provisioner.TemplateReconcilerConfig{
+				Interval:       templateReconcilerInterval,
+				StaleThreshold: templateReconcilerStaleThreshold,
+			}); err != nil {
+				logger.Error("initial template reconcile failed", "error", err)
+			}
+		}()
 	}
 
 	// Optional: vCenter orphan reconciler. Scans the configured Student-VMs
@@ -445,6 +477,13 @@ func main() {
 			case <-idleEvalTickerC:
 				if _, err := prov.EvaluateIdleVMs(ctx, idleEvalCfg); err != nil {
 					logger.Error("idle vm evaluation failed", "error", err)
+				}
+			case <-templateReconcilerTickerC:
+				if _, err := prov.ReconcileTemplateMetrics(ctx, provisioner.TemplateReconcilerConfig{
+					Interval:       templateReconcilerInterval,
+					StaleThreshold: templateReconcilerStaleThreshold,
+				}); err != nil {
+					logger.Error("template reconcile failed", "error", err)
 				}
 			}
 		}

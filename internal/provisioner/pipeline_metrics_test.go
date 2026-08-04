@@ -49,6 +49,30 @@ func TestPipelineMetrics_SerializeShape(t *testing.T) {
 	}
 }
 
+func TestPipelineMetrics_OmitsUncollectedStuckGauges(t *testing.T) {
+	m := NewPipelineMetrics("", "", nil)
+	out := string(m.serialize())
+
+	for _, name := range []string{"crucible_image_uploads_stuck", "crucible_template_stuck"} {
+		if strings.Contains(out, name) {
+			t.Fatalf("expected %s to be omitted before collection:\n%s", name, out)
+		}
+	}
+}
+
+func TestPipelineMetrics_EmitsZeroStuckGaugesAfterCollection(t *testing.T) {
+	m := NewPipelineMetrics("", "", nil)
+	m.SetImageUploadsStuck(0)
+	m.SetTemplatesStuck(0)
+	out := string(m.serialize())
+
+	for _, want := range []string{"crucible_image_uploads_stuck 0", "crucible_template_stuck 0"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected %q after collection:\n%s", want, out)
+		}
+	}
+}
+
 // Guards the label-escaping helper against the double-escaping bug that
 // %q would introduce (it would emit \"iso\" instead of "iso").
 func TestPipelineMetrics_LabelValuesNotDoubleEscaped(t *testing.T) {
