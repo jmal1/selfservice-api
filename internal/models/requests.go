@@ -52,6 +52,9 @@ type CreateTemplateRequest struct {
 	// for registered_existing_vm or for clone_no_customize templates whose
 	// guests manage their own networking.
 	AssignIP *bool `json:"assign_ip,omitempty"`
+	// Visibility controls whether students can see and use this template.
+	// Defaults to 'public' if omitted. Valid values: 'public', 'instructor_only'.
+	Visibility *string `json:"visibility,omitempty" validate:"omitempty,oneof=public instructor_only"`
 }
 
 // UpdateTemplateRequest is the admin API request to update a template.
@@ -67,6 +70,10 @@ type UpdateTemplateRequest struct {
 	DefaultPassword *string `json:"default_password,omitempty"`
 	Kind            *string `json:"kind,omitempty" validate:"omitempty,oneof=clone_with_customize clone_no_customize registered_existing_vm"`
 	AssignIP        *bool   `json:"assign_ip,omitempty"`
+	// Visibility controls whether students can see and use this template.
+	// Valid values: 'public', 'instructor_only'. If omitted, the current
+	// value is preserved.
+	Visibility *string `json:"visibility,omitempty" validate:"omitempty,oneof=public instructor_only"`
 	// ExpectedUpdatedAt enables optimistic concurrency control. When set
 	// the database UPDATE will only succeed if the row's current
 	// updated_at matches; otherwise UpdateTemplate returns
