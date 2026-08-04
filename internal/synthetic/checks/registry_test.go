@@ -226,6 +226,7 @@ func TestAll_StableNames(t *testing.T) {
 		"admin_run_detail_403":      true,
 		"admin_audit_403":           true,
 		"pod_testing_dashboard_404": true,
+		"blueprint_vm_playlists_contract": true,
 		"wiki_index_rbac":           true,
 		"image_upload_rbac":         true,
 	}

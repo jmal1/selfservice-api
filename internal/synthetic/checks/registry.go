@@ -191,7 +191,7 @@ var PodTestingDashboard404 = synthetic.CheckFunc{
 // nil-deref regression class: if blueprint existence checking is skipped, a nil
 // pointer dereference would return 500.
 var BlueprintVMPlaylistsContract404 = synthetic.CheckFunc{
-	NameVal:        "blueprint_vm_playlists_404",
+	NameVal:        "blueprint_vm_playlists_contract",
 	TitleVal:       "Missing Blueprint Playlists Returns 404 (not 500)",
 	DescriptionVal: "Probes /admin/blueprints/{phantom-uuid}/vm-playlists and requires 404. Watches for nil-deref bugs in blueprint resolution logic.",
 	SeverityVal:    synthetic.SeverityWarning,
