@@ -61,6 +61,7 @@ type imageObjectStore interface {
 type imageImportVCenter interface {
 	UploadToDatastore(ctx context.Context, datastore, remotePath string, r io.Reader, size int64, progress func(sent int64)) error
 	ImportOVA(ctx context.Context, p vcenter.OVAImportParams) (string, error)
+	GetDatastoreFreeBytes(ctx context.Context, datastore string) (int64, error)
 }
 
 // imageImportDB is the database subset the import job needs.
@@ -238,6 +239,21 @@ func importImage(
 		if cfg.ISODatastore == "" {
 			return fail(fmt.Errorf("iso import: ISO datastore is not configured"))
 		}
+
+		// Pre-flight: check that the ISO datastore has enough headroom.
+		// A failed check is treated as non-fatal (log + warn) so a transient
+		// govmomi hiccup doesn't block every in-flight import. A confirmed
+		// insufficient-space error IS fatal so we don't start streaming a
+		// multi-GB file that will fail at 95%.
+		freeBytes, fsErr := vc.GetDatastoreFreeBytes(ctx, cfg.ISODatastore)
+		if fsErr != nil {
+			log.Warn("could not determine datastore free space; proceeding without capacity check",
+				"datastore", cfg.ISODatastore, "error", fsErr)
+		} else if freeBytes < size {
+			return fail(fmt.Errorf("iso import: not enough free space on datastore %q: need %d bytes, have %d bytes",
+				cfg.ISODatastore, size, freeBytes))
+		}
+
 		remotePath := path.Join(isoFolder, filename)
 		if progress != nil {
 			progress("import", fmt.Sprintf("Streaming ISO to [%s] %s", cfg.ISODatastore, remotePath))

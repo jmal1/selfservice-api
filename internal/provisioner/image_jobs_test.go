@@ -88,6 +88,10 @@ type fakeImageVC struct {
 	importCalls int
 	lastDS      string
 	lastRemote  string
+
+	// For GetDatastoreFreeBytes
+	freeBytes    int64
+	freeBytesErr error
 }
 
 func (f *fakeImageVC) drain(r io.Reader) {
@@ -118,6 +122,18 @@ func (f *fakeImageVC) ImportOVA(_ context.Context, p vcenter.OVAImportParams) (s
 	}
 	f.drain(p.Reader)
 	return f.moref, nil
+}
+
+func (f *fakeImageVC) GetDatastoreFreeBytes(_ context.Context, _ string) (int64, error) {
+	if f.freeBytesErr != nil {
+		return 0, f.freeBytesErr
+	}
+	// Zero means "not configured in this test" — return a large default so
+	// existing tests that don't care about free-space don't fail the precheck.
+	if f.freeBytes == 0 {
+		return 100 << 30, nil // 100 GiB
+	}
+	return f.freeBytes, nil
 }
 
 type fakeImageDB struct {
