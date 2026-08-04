@@ -164,6 +164,9 @@ func TestReconcileL1_SelectsStaleAndIgnoresRecent(t *testing.T) {
 	if payload.TemplateID != staleID {
 		t.Errorf("payload.TemplateID = %v, want %v", payload.TemplateID, staleID)
 	}
+	if payload.VMMoref != staleTempl.VCenterVMID {
+		t.Errorf("payload.VMMoref = %q, want %q", payload.VMMoref, staleTempl.VCenterVMID)
+	}
 }
 
 // TestReconcileL1_NeverValidatedTemplateIncluded verifies that a template with
@@ -188,26 +191,75 @@ func TestReconcileL1_NeverValidatedTemplateIncluded(t *testing.T) {
 	}
 }
 
-// TestReconcileL1_SkipsTemplateWithNoVCenterVMID verifies that templates with
-// an empty VCenterVMID are skipped (no moref to clone from).
-func TestReconcileL1_SkipsTemplateWithNoVCenterVMID(t *testing.T) {
-	id := uuid.New()
-	tmpl := makeL1Template(id, nil)
-	tmpl.VCenterVMID = "" // no moref
-
-	db := &fakeL1DB{
-		allL1:  []models.Template{tmpl},
-		staleL1: []models.Template{tmpl},
+// TestReconcileL1_IdentifierSelection verifies that stale templates enqueue
+// when they have either identifier, and are skipped only when both are missing.
+func TestReconcileL1_IdentifierSelection(t *testing.T) {
+	tests := []struct {
+		name            string
+		vcenterVMID     string
+		vcenterTemplate string
+		wantEnqueued    int
+		wantVMMoref     string
+	}{
+		{
+			name:            "enqueues when only vcenter_template is set",
+			vcenterTemplate: "student-ubuntu-2404",
+			wantEnqueued:    1,
+			wantVMMoref:     "",
+		},
+		{
+			name:         "skips when neither identifier is set",
+			wantEnqueued: 0,
+		},
+		{
+			name:         "preserves existing vcenter_vm_id",
+			vcenterVMID:  "vm-1234",
+			wantEnqueued: 1,
+			wantVMMoref:  "vm-1234",
+		},
 	}
-	m := &fakeL1Metrics{}
 
-	counts, err := reconcileL1TrustValidation(context.Background(), db, m, discardLogger(),
-		L1TrustValidationReconcilerConfig{Interval: 7 * 24 * time.Hour})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if counts.Enqueued != 0 {
-		t.Errorf("enqueued %d jobs for template with no VCenterVMID, want 0", counts.Enqueued)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			id := uuid.New()
+			tmpl := makeL1Template(id, nil)
+			tmpl.VCenterVMID = tc.vcenterVMID
+			tmpl.VCenterTemplate = tc.vcenterTemplate
+
+			db := &fakeL1DB{
+				allL1:   []models.Template{tmpl},
+				staleL1: []models.Template{tmpl},
+			}
+			m := &fakeL1Metrics{}
+
+			counts, err := reconcileL1TrustValidation(context.Background(), db, m, discardLogger(),
+				L1TrustValidationReconcilerConfig{Interval: 7 * 24 * time.Hour})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if counts.Enqueued != tc.wantEnqueued {
+				t.Fatalf("enqueued %d jobs, want %d", counts.Enqueued, tc.wantEnqueued)
+			}
+			if tc.wantEnqueued == 0 {
+				if len(db.createdJobs) != 0 {
+					t.Fatalf("created %d jobs, want 0", len(db.createdJobs))
+				}
+				return
+			}
+			if len(db.createdJobs) != 1 {
+				t.Fatalf("created %d jobs, want 1", len(db.createdJobs))
+			}
+			var payload TemplateRevalidatePayload
+			if err := json.Unmarshal(db.createdJobs[0].Payload, &payload); err != nil {
+				t.Fatalf("unmarshal payload: %v", err)
+			}
+			if payload.TemplateID != id {
+				t.Errorf("payload.TemplateID = %v, want %v", payload.TemplateID, id)
+			}
+			if payload.VMMoref != tc.wantVMMoref {
+				t.Errorf("payload.VMMoref = %q, want %q", payload.VMMoref, tc.wantVMMoref)
+			}
+		})
 	}
 }
 
@@ -407,6 +459,7 @@ func TestRevalidateL1_SuccessRecordsPassResult(t *testing.T) {
 type fakeRevalidateDB struct {
 	tmpl             *models.Template
 	isActive         bool
+	getCalls         int
 	setActiveCalls   int
 	setActiveValue   *bool
 	validationResult string
@@ -414,6 +467,7 @@ type fakeRevalidateDB struct {
 }
 
 var _ revalidateL1CoreDB = (*fakeRevalidateDB)(nil)
+var _ revalidateL1TemplateDB = (*fakeRevalidateDB)(nil)
 
 func (f *fakeRevalidateDB) SetTemplateActive(_ context.Context, _ uuid.UUID, active bool) error {
 	f.setActiveCalls++
@@ -426,6 +480,14 @@ func (f *fakeRevalidateDB) SetTemplateValidationState(_ context.Context, _ uuid.
 	f.validationResult = result
 	f.validationAt = at
 	return nil
+}
+
+func (f *fakeRevalidateDB) GetTemplateByID(_ context.Context, id uuid.UUID) (*models.Template, error) {
+	f.getCalls++
+	if f.tmpl == nil || f.tmpl.ID != id {
+		return nil, nil
+	}
+	return f.tmpl, nil
 }
 
 type fakeRevalidateMetrics struct {
