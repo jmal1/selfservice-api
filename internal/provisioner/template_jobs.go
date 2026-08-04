@@ -1097,11 +1097,12 @@ func (p *Provisioner) VerifyTemplate(ctx context.Context, job *models.Job) (err 
 }
 
 // TemplateRevalidatePayload is the payload for a JobTypeTemplateRevalidate job.
-// Enqueued by the L1 trust-validation reconciler on a configurable interval.
+// Manual L1 templates may enqueue this without a VM moref; RevalidateL1Template
+// resolves template.VCenterTemplate by name at run time when needed.
 type TemplateRevalidatePayload struct {
 	TemplateID uuid.UUID `json:"template_id"`
-	// VMMoref is the MoRef of the template's base-image VM, sourced from
-	// template.VCenterVMID at enqueue time by the reconciler.
+	// VMMoref is the base-image VM's MoRef when already known. When empty,
+	// the job resolves the template's vcenter_template name at run time.
 	VMMoref string `json:"vm_moref"`
 }
 
@@ -1166,17 +1167,42 @@ func revalidateL1TemplateCore(
 	}
 }
 
-// RevalidateL1Template implements JobTypeTemplateRevalidate — the periodic
-// smoke-clone health check for already-published L1-tier templates.
-//
-// Unlike VerifyTemplate (which gates initial publish), this handler:
-//   - does NOT check or modify template_state
-//   - does NOT touch is_active — the template STAYS published on failure
-//
-// On failure it records the result in last_validation_result and emits the
-// crucible_template_validation_total counter so an alert fires. The job is
-// marked failed (for observability) but the template remains live.
-func (p *Provisioner) RevalidateL1Template(ctx context.Context, job *models.Job) error {
+type revalidateL1TemplateDB interface {
+	revalidateL1CoreDB
+	GetTemplateByID(ctx context.Context, id uuid.UUID) (*models.Template, error)
+}
+
+type revalidateL1TemplateVCenter interface {
+	ResolveVMByName(ctx context.Context, name string) (string, error)
+}
+
+type revalidateL1TemplateSmokeCheck func(ctx context.Context, tmpl *models.Template, vmMoref string, publish func(slug, msg string)) error
+
+var (
+	_ revalidateL1TemplateDB      = (*database.Queries)(nil)
+	_ revalidateL1TemplateVCenter = (*vcenter.Client)(nil)
+)
+
+// revalidateL1TemplateJob is the dependency-injected core for
+// JobTypeTemplateRevalidate. It loads the template first, then resolves the
+// source VM by name only when the payload did not already carry a MoRef.
+func revalidateL1TemplateJob(
+	ctx context.Context,
+	db revalidateL1TemplateDB,
+	vc revalidateL1TemplateVCenter,
+	pipeline revalidateL1CorePipeline,
+	logger *slog.Logger,
+	job *models.Job,
+	publish func(step, message string),
+	runSmokeCheck revalidateL1TemplateSmokeCheck,
+) error {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if publish == nil {
+		publish = func(string, string) {}
+	}
+
 	var payload TemplateRevalidatePayload
 	if err := json.Unmarshal(job.Payload, &payload); err != nil {
 		return fmt.Errorf("parse template_revalidate payload: %w", err)
@@ -1184,11 +1210,8 @@ func (p *Provisioner) RevalidateL1Template(ctx context.Context, job *models.Job)
 	if payload.TemplateID == uuid.Nil {
 		return fmt.Errorf("template_id is required")
 	}
-	if payload.VMMoref == "" {
-		return fmt.Errorf("vm_moref is required")
-	}
 
-	tmpl, err := p.db.GetTemplateByID(ctx, payload.TemplateID)
+	tmpl, err := db.GetTemplateByID(ctx, payload.TemplateID)
 	if err != nil {
 		return fmt.Errorf("load template: %w", err)
 	}
@@ -1196,19 +1219,49 @@ func (p *Provisioner) RevalidateL1Template(ctx context.Context, job *models.Job)
 		return fmt.Errorf("template %s not found", payload.TemplateID)
 	}
 
-	checkErr := p.runSmokeCheck(ctx, tmpl, payload.VMMoref, func(slug, msg string) {
-		p.publishProgress(job.ID, slug, msg)
-	})
+	vmMoref := payload.VMMoref
+	if vmMoref == "" {
+		sourceVM := tmpl.VCenterTemplate
+		if sourceVM == "" {
+			return fmt.Errorf("template %q (%s) has no vm_moref in the job payload and no vcenter_template to resolve; cannot revalidate L1", tmpl.Name, tmpl.ID)
+		}
+		resolved, rerr := vc.ResolveVMByName(ctx, sourceVM)
+		if rerr != nil {
+			return fmt.Errorf("resolve source VM %q for template %q (%s): %w; the source VM may have been renamed or deleted in vCenter", sourceVM, tmpl.Name, tmpl.ID, rerr)
+		}
+		if resolved == "" {
+			return fmt.Errorf("resolve source VM %q for template %q (%s) returned an empty moref; the source VM may have been renamed or deleted in vCenter", sourceVM, tmpl.Name, tmpl.ID)
+		}
+		vmMoref = resolved
+		logger.Info("resolved l1 template source VM by name",
+			"template_id", tmpl.ID, "name", tmpl.Name, "vcenter_template", sourceVM, "vm_moref", vmMoref)
+	}
 
-	// Delegate outcome recording to the injectable helper so the DB and
-	// metrics interactions can be verified in unit tests without a vCenter.
-	revalidateL1TemplateCore(ctx, p.db, p.pipeline, p.logger, tmpl, checkErr)
+	checkErr := runSmokeCheck(ctx, tmpl, vmMoref, publish)
 
-	// Return the check error so the job is marked 'failed' in the jobs table.
-	// The template is NOT unpublished; this is alerting-only. A failed job
-	// surfaces in the admin UI and prevents the reconciler from re-enqueuing
-	// a duplicate until the existing failed job is cleared or retried.
+	revalidateL1TemplateCore(ctx, db, pipeline, logger, tmpl, checkErr)
 	return checkErr
+}
+
+// RevalidateL1Template implements JobTypeTemplateRevalidate — the periodic
+// smoke-clone health check for already-published L1-tier templates.
+//
+// Unlike VerifyTemplate (which gates initial publish), this handler:
+//   - does NOT check or modify template_state
+//   - does NOT touch is_active — the template STAYS published on failure
+//
+// When the job payload does not already carry a moref, it resolves the source
+// VM by the template's vcenter_template name at run time so legacy/manual L1
+// templates can still be revalidated.
+//
+// On failure it records the result in last_validation_result and emits the
+// crucible_template_validation_total counter so an alert fires. The job is
+// marked failed (for observability) but the template remains live.
+func (p *Provisioner) RevalidateL1Template(ctx context.Context, job *models.Job) error {
+	return revalidateL1TemplateJob(ctx, p.db, p.vc, p.pipeline, p.logger, job,
+		func(slug, msg string) { p.publishProgress(job.ID, slug, msg) },
+		p.runSmokeCheck,
+	)
 }
 
 // verifyFailedToReady is the smoke-test failure path: it moves the template

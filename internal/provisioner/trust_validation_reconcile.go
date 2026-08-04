@@ -154,8 +154,8 @@ func reconcileL1TrustValidation(
 	}
 
 	for _, tmpl := range stale {
-		if tmpl.VCenterVMID == "" {
-			log.Warn("l1 template has no vcenter_vm_id; skipping revalidation",
+		if tmpl.VCenterVMID == "" && tmpl.VCenterTemplate == "" {
+			log.Warn("l1 template has no vcenter_vm_id and no vcenter_template; skipping revalidation",
 				"template_id", tmpl.ID, "name", tmpl.Name)
 			continue
 		}

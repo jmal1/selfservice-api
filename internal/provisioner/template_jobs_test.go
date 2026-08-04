@@ -267,6 +267,161 @@ func TestPollGuestCredentials_HonorsContextCancel(t *testing.T) {
 	}
 }
 
+// --------------------------------------------------------------------------
+// RevalidateL1Template: late moref resolution
+// --------------------------------------------------------------------------
+
+type fakeResolveVC struct {
+	db            *fakeRevalidateDB
+	resolveCalls  int
+	resolveName   string
+	resolveRet    string
+	resolveErr    error
+	sawTemplateLoad bool
+}
+
+var _ revalidateL1TemplateVCenter = (*fakeResolveVC)(nil)
+
+func (f *fakeResolveVC) ResolveVMByName(_ context.Context, name string) (string, error) {
+	f.resolveCalls++
+	f.resolveName = name
+	if f.db != nil {
+		f.sawTemplateLoad = f.db.getCalls > 0
+	}
+	if f.resolveErr != nil {
+		return "", f.resolveErr
+	}
+	return f.resolveRet, nil
+}
+
+func TestRevalidateL1Template_LateResolutionAndFastPath(t *testing.T) {
+	tests := []struct {
+		name            string
+		templateName    string
+		sourceName      string
+		payloadMoref    string
+		resolveRet      string
+		resolveErr      error
+		wantResolveCalls int
+		wantResolveName string
+		wantSmokeCalls  int
+		wantSmokeMoref  string
+		wantErrContains []string
+	}{
+		{
+			name:             "resolve by source VM name when payload omits moref",
+			templateName:     "Ubuntu 24.04 Server",
+			sourceName:       "student-ubuntu-2404",
+			resolveRet:       "vm-1111",
+			wantResolveCalls: 1,
+			wantResolveName:  "student-ubuntu-2404",
+			wantSmokeCalls:   1,
+			wantSmokeMoref:   "vm-1111",
+		},
+		{
+			name:             "resolve failure mentions template and source VM",
+			templateName:     "Windows 11",
+			sourceName:       "student-windows-11",
+			resolveErr:       errors.New("not found"),
+			wantResolveCalls: 1,
+			wantResolveName:  "student-windows-11",
+			wantSmokeCalls:   0,
+			wantErrContains:  []string{"Windows 11", "student-windows-11", "renamed or deleted"},
+		},
+		{
+			name:             "empty resolved moref is rejected",
+			templateName:     "Windows Server 2022",
+			sourceName:       "student-windows-server-2022",
+			resolveRet:       "",
+			wantResolveCalls: 1,
+			wantResolveName:  "student-windows-server-2022",
+			wantSmokeCalls:   0,
+			wantErrContains:  []string{"Windows Server 2022", "student-windows-server-2022", "empty moref"},
+		},
+		{
+			name:             "fast path preserves payload moref",
+			templateName:     "Windows Server 2025",
+			sourceName:       "student-windows-server-2025",
+			payloadMoref:     "vm-4242",
+			wantResolveCalls: 0,
+			wantSmokeCalls:   1,
+			wantSmokeMoref:   "vm-4242",
+		},
+		{
+			name:             "missing payload moref and source name errors",
+			templateName:     "synthetic-noop",
+			wantResolveCalls: 0,
+			wantSmokeCalls:   0,
+			wantErrContains:  []string{"synthetic-noop", "no vm_moref", "no vcenter_template"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			id := uuid.New()
+			tmpl := makeL1Template(id, nil)
+			tmpl.Name = tc.templateName
+			tmpl.VCenterVMID = ""
+			tmpl.VCenterTemplate = tc.sourceName
+
+			db := &fakeRevalidateDB{tmpl: &tmpl, isActive: true}
+			vc := &fakeResolveVC{db: db, resolveRet: tc.resolveRet, resolveErr: tc.resolveErr}
+			payload, err := json.Marshal(TemplateRevalidatePayload{TemplateID: id, VMMoref: tc.payloadMoref})
+			if err != nil {
+				t.Fatalf("marshal payload: %v", err)
+			}
+			job := &models.Job{ID: uuid.New(), Type: models.JobTypeTemplateRevalidate, Payload: payload}
+
+			var smokeCalls int
+			var smokeMoref string
+			err = revalidateL1TemplateJob(context.Background(), db, vc, nil, discardLogger(), job,
+				func(string, string) {},
+				func(_ context.Context, tmpl *models.Template, vmMoref string, _ func(string, string)) error {
+					smokeCalls++
+					if tmpl.ID != id {
+						t.Fatalf("smoke check template ID = %v, want %v", tmpl.ID, id)
+					}
+					smokeMoref = vmMoref
+					return nil
+				},
+			)
+
+			if db.getCalls != 1 {
+				t.Fatalf("GetTemplateByID called %d time(s), want 1", db.getCalls)
+			}
+			if vc.resolveCalls != tc.wantResolveCalls {
+				t.Fatalf("ResolveVMByName called %d time(s), want %d", vc.resolveCalls, tc.wantResolveCalls)
+			}
+			if tc.wantResolveCalls > 0 && !vc.sawTemplateLoad {
+				t.Fatal("ResolveVMByName ran before the template was loaded")
+			}
+			if tc.wantResolveName != "" && vc.resolveName != tc.wantResolveName {
+				t.Fatalf("ResolveVMByName name = %q, want %q", vc.resolveName, tc.wantResolveName)
+			}
+			if smokeCalls != tc.wantSmokeCalls {
+				t.Fatalf("smoke check called %d time(s), want %d", smokeCalls, tc.wantSmokeCalls)
+			}
+			if smokeCalls > 0 && smokeMoref != tc.wantSmokeMoref {
+				t.Fatalf("smoke check moref = %q, want %q", smokeMoref, tc.wantSmokeMoref)
+			}
+			if len(tc.wantErrContains) == 0 {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			for _, want := range tc.wantErrContains {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q does not contain %q", err.Error(), want)
+				}
+			}
+		})
+	}
+}
+
 // ── ISO template-provision fakes ───────────────────────────────────────────
 //
 // These target the pure provisionTemplateFromISO function with in-package
