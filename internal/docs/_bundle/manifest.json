@@ -141,13 +141,14 @@
     {
       "path": "docs/instructor/templates.md",
       "title": "Building a Template",
-      "size": 19606,
-      "sha256": "cb183319d585825f9cebe48e4942be1029ac6a939a2c41cda7387e29fa3c893c",
+      "size": 26372,
+      "sha256": "70dc03fcd4155e1eb66b9c603ba598d5e44eff28ece9fbdc63763e295d5464b7",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/glossary.md",
         "docs/instructor/overview.md",
         "docs/instructor/overview.md",
+        "docs/instructor/troubleshooting.md",
         "docs/instructor/troubleshooting.md",
         "docs/instructor/troubleshooting.md",
         "docs/instructor/troubleshooting.md"
@@ -194,8 +195,8 @@
     {
       "path": "internal/api/routes/routes.go",
       "title": "routes.go (Go)",
-      "size": 12395,
-      "sha256": "a56d0ba050cd292c53b6ea881e5b177adb1463c444708577eda4a6d9b89f9fd1",
+      "size": 13354,
+      "sha256": "ad8d66c0f4689e931281e661b9d319e8cc3bff6bbd8d95921b0ba11309c7816e",
       "is_markdown": false,
       "from_seed": false
     },
@@ -280,5 +281,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 221099
+  "total_bytes": 228824
 }

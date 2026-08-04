@@ -197,12 +197,12 @@ func main() {
 				})
 			}
 			logger.Info("image_import enabled",
-					"endpoint", cfg.ObjectStore.Endpoint,
-					"bucket", cfg.ObjectStore.Bucket,
-					"iso_datastore", cfg.VCenter.ISODatastore)
-				// Note: stuck-upload reconciler is integrated into the main select
-				// loop below (stuckUploadTickerC) so it can be gated by IsLeader().
-			}
+				"endpoint", cfg.ObjectStore.Endpoint,
+				"bucket", cfg.ObjectStore.Bucket,
+				"iso_datastore", cfg.VCenter.ISODatastore)
+			// Note: stuck-upload reconciler is integrated into the main select
+			// loop below (stuckUploadTickerC) so it can be gated by IsLeader().
+		}
 	}
 
 	// Capture stuck-upload config for use in the main select loop.
@@ -423,6 +423,41 @@ func main() {
 		Interval: l1ValidationInterval,
 	}
 
+	// Template health reconciler. Checks every student-visible template
+	// structurally (vCenter object exists) on every 12-hour cycle, and performs
+	// one full deep check (clone → power-on → wait-for-IP → destroy) per cycle
+	// rotating across templates. Anti-flap: 3 retries with exponential backoff,
+	// 2 consecutive-cycle confirmation before unhealthy. Immediate recovery.
+	//
+	// MUST be added to the leader-gated set when leader election lands
+	// (parallel lane). For now the enabled flag defaults to false so deployers
+	// opt in explicitly rather than hitting vCenter by surprise.
+	//
+	// Env knobs:
+	//   WORKER_TEMPLATE_HEALTH_ENABLED=true          — opt in
+	//   WORKER_TEMPLATE_HEALTH_INTERVAL              — default 12h
+	//   WORKER_TEMPLATE_HEALTH_DEEP_TIMEOUT          — default 10m
+	healthReconcilerEnabled := strings.EqualFold(os.Getenv("WORKER_TEMPLATE_HEALTH_ENABLED"), "true")
+	healthReconcilerInterval := envDuration(logger, "WORKER_TEMPLATE_HEALTH_INTERVAL", 12*time.Hour)
+	healthReconcilerDeepTimeout := envDuration(logger, "WORKER_TEMPLATE_HEALTH_DEEP_TIMEOUT", 10*time.Minute)
+	var healthReconcilerPusher *provisioner.TemplateHealthPusher
+	if pgURL := os.Getenv("WORKER_PUSHGATEWAY_URL"); pgURL != "" {
+		job := os.Getenv("WORKER_PUSHGATEWAY_JOB")
+		if job == "" {
+			job = "crucible_provision_worker"
+		}
+		healthReconcilerPusher = provisioner.NewTemplateHealthPusher(pgURL, job,
+			map[string]string{"layer": "api"})
+	}
+	healthReconcilerCfg := provisioner.TemplateHealthReconcilerConfig{
+		Interval:         healthReconcilerInterval,
+		DeepCheckTimeout: healthReconcilerDeepTimeout,
+		TemplateFolder:   cfg.VCenter.TemplatesFolder,
+		MaxRetries:       3,
+		RetryBaseDelay:   1 * time.Second,
+		Pusher:           healthReconcilerPusher,
+	}
+
 	// Worker ID for job claiming
 	workerID, err := os.Hostname()
 	if err != nil {
@@ -539,6 +574,16 @@ func main() {
 		logger.Info("stuck-upload reconciler enabled (leader-gated)",
 			"interval", stuckUploadInterval, "stale_threshold", stuckUploadStaleThreshold)
 	}
+	// Template health reconciler ticker (opt-in; nil-safe).
+	var healthReconcilerTickerC <-chan time.Time
+	if healthReconcilerEnabled {
+		t := time.NewTicker(healthReconcilerInterval)
+		defer t.Stop()
+		healthReconcilerTickerC = t.C
+		logger.Info("template health reconciler enabled",
+			"interval", healthReconcilerInterval,
+			"deep_timeout", healthReconcilerDeepTimeout)
+	}
 
 	// Immediately process any pending/recovered jobs
 	go processJobs(ctx, queries, prov, workerID, logger)
@@ -628,40 +673,58 @@ func main() {
 					logger.Error("l1 trust validation reconcile failed", "error", err)
 				}
 
-				// ── Leadership change notification ────────────────────────────────
-				// elec.Changes() fires true when this replica acquires the lock
-				// (startup or failover) and false when it loses it. On acquisition
-				// we run immediate passes for any reconcilers that need prompt
-				// startup behaviour — equivalent to the old "initial run" goroutines
-				// but racefree because leadership is confirmed before we reach here.
-				// The channel is buffered (size 1), so the event is safe even if the
-				// select loop is busy; it will be delivered on the next iteration.
-				case isLeader := <-elec.Changes():
-					if !isLeader {
-						continue
-					}
-					// Immediately expire any stale pods now that we are leader.
-					// This is fast (DB-only) so we run it inline.
-					prov.ExpireStale(ctx)
-					// Network reconcile touches the OPNsense API — run in a goroutine
-					// so it cannot stall the select loop on a slow firewall response.
-					if networkReconcilerEnabled {
-						go func() {
-							if _, err := prov.ReconcileNetwork(ctx, networkReconcilerCfg); err != nil {
-								logger.Error("network reconcile on leader acquisition failed", "error", err)
-							}
-						}()
-					}
-					// L1 trust validation runs a heavyweight DB query; goroutine for
-					// the same reason.
-					if l1ValidationEnabled {
-						go func() {
-							if _, err := prov.ReconcileL1TrustValidation(ctx, l1ValidationCfg); err != nil {
-								logger.Error("l1 trust validation on leader acquisition failed", "error", err)
-							}
-						}()
-					}
+			case <-healthReconcilerTickerC:
+				if !elec.IsLeader() {
+					continue
 				}
+				if _, err := prov.ReconcileTemplateHealth(ctx, healthReconcilerCfg); err != nil {
+					logger.Error("template health reconcile failed", "error", err)
+				}
+
+			// ── Leadership change notification ────────────────────────────────
+			// elec.Changes() fires true when this replica acquires the lock
+			// (startup or failover) and false when it loses it. On acquisition
+			// we run immediate passes for any reconcilers that need prompt
+			// startup behaviour — equivalent to the old "initial run" goroutines
+			// but racefree because leadership is confirmed before we reach here.
+			// The channel is buffered (size 1), so the event is safe even if the
+			// select loop is busy; it will be delivered on the next iteration.
+			case isLeader := <-elec.Changes():
+				if !isLeader {
+					continue
+				}
+				// Immediately expire any stale pods now that we are leader.
+				// This is fast (DB-only) so we run it inline.
+				prov.ExpireStale(ctx)
+				// Network reconcile touches the OPNsense API — run in a goroutine
+				// so it cannot stall the select loop on a slow firewall response.
+				if networkReconcilerEnabled {
+					go func() {
+						if _, err := prov.ReconcileNetwork(ctx, networkReconcilerCfg); err != nil {
+							logger.Error("network reconcile on leader acquisition failed", "error", err)
+						}
+					}()
+				}
+				// L1 trust validation runs a heavyweight DB query; goroutine for
+				// the same reason.
+				if l1ValidationEnabled {
+					go func() {
+						if _, err := prov.ReconcileL1TrustValidation(ctx, l1ValidationCfg); err != nil {
+							logger.Error("l1 trust validation on leader acquisition failed", "error", err)
+						}
+					}()
+				}
+				// Health-check clones from a crashed previous leader are swept
+				// here rather than at startup so exactly one replica does it.
+				if healthReconcilerEnabled {
+					go func() {
+						if _, err := vcClient.SweepHealthCheckOrphans(ctx, cfg.VCenter.TemplatesFolder); err != nil {
+							logger.Warn("health-check orphan sweep failed", "error", err)
+						}
+					}()
+				}
+
+			}
 		}
 	}()
 

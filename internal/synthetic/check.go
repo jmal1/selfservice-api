@@ -30,15 +30,29 @@ const (
 // reports the last HTTP response status observed by the Check (0 if the check
 // failed before any HTTP call completed). Err carries the failure reason for
 // log diagnostics; it MUST NOT contain credentials.
+//
+// Attempts is the total number of attempts the runner made before recording
+// this result. 1 means the check succeeded or failed on the first try with no
+// retry applied. Values >1 mean the check passed or exhausted retries on a
+// later attempt. Checks without a retry policy always have Attempts=1.
+//
+// VCenterDegraded is set when at least one attempt failed with an error
+// pattern that indicates vCenter slowness or unreachability (as opposed to a
+// Crucible defect). A check may be green (Success=true) AND have
+// VCenterDegraded=true when it passed on retry after an initial vCenter stall.
+// This is intentional: the stall is a meaningful signal even when the check
+// eventually passes.
 type Result struct {
-	Name        string
-	Title       string
-	Description string
-	Success     bool
-	Duration    time.Duration
-	HTTPStatus  int
-	Severity    Severity
-	Err         error
+	Name           string
+	Title          string
+	Description    string
+	Success        bool
+	Duration       time.Duration
+	HTTPStatus     int
+	Severity       Severity
+	Err            error
+	Attempts       int
+	VCenterDegraded bool
 }
 
 // Check is the contract every synthetic check must satisfy.

@@ -47,6 +47,7 @@ var requiredWiring = map[string][]struct {
 		{"RunPusher", "image-import metrics never reach Pushgateway without the flush loop"},
 		{"ReconcileStuckImageUploads", "without it crucible_image_uploads_stuck is never refreshed, so leaked uploads are never detected; the call site moved from RunStuckUploadReconciler (deleted) to the unified leader-gated select loop"},
 		{"TemplateFolder", "without it the vCenter client has no folder for source_type=iso template builds: CreateBlankVM resolves an empty path and every ISO template provision dies with `find folder \"\"` before creating anything -- the clone path hides this because it inherits the SOURCE VM's parent folder, and no ISO build had ever run"},
+		{"ReconcileTemplateHealth", "without it no template health checks run, crucible_template_health_* metrics are never pushed, and a silently-rotting template is invisible until students hit it live"},
 	},
 	"cmd/crucible-runner/main.go": {
 		{"MaterializeActionLibrary", "without it the engine-generated action library is never written to disk, so every library action (http_get, port_open, ssh_exec, …) fails with exit 127 — the original defect, in which workflows appeared to run, the Job exited 0, and no action could possibly pass"},
