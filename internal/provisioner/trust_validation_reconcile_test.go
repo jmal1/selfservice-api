@@ -22,12 +22,12 @@ import (
 // --------------------------------------------------------------------------
 
 type fakeL1DB struct {
-	allL1         []models.Template
-	allL1Err      error
-	staleL1       []models.Template
-	staleL1Err    error
-	createdJobs   []models.Job
-	createJobErr  error
+	allL1        []models.Template
+	allL1Err     error
+	staleL1      []models.Template
+	staleL1Err   error
+	createdJobs  []models.Job
+	createJobErr error
 	// For round-trip store tests
 	validationState map[uuid.UUID]struct {
 		result string
@@ -133,7 +133,7 @@ func TestReconcileL1_SelectsStaleAndIgnoresRecent(t *testing.T) {
 	recentTempl := makeL1Template(recentID, &recent)
 
 	db := &fakeL1DB{
-		allL1:  []models.Template{staleTempl, recentTempl},
+		allL1:   []models.Template{staleTempl, recentTempl},
 		staleL1: []models.Template{staleTempl}, // only stale one
 	}
 	m := &fakeL1Metrics{}
@@ -176,7 +176,7 @@ func TestReconcileL1_NeverValidatedTemplateIncluded(t *testing.T) {
 	tmpl := makeL1Template(id, nil) // nil = never validated
 
 	db := &fakeL1DB{
-		allL1:  []models.Template{tmpl},
+		allL1:   []models.Template{tmpl},
 		staleL1: []models.Template{tmpl},
 	}
 	m := &fakeL1Metrics{}
@@ -277,7 +277,7 @@ func TestReconcileL1_StalenessGaugeEmittedAfterRun(t *testing.T) {
 	t2 := makeL1Template(id2, nil) // never validated → expect 0
 
 	db := &fakeL1DB{
-		allL1:  []models.Template{t1, t2},
+		allL1:   []models.Template{t1, t2},
 		staleL1: []models.Template{},
 	}
 	m := &fakeL1Metrics{}
@@ -396,7 +396,7 @@ func TestRevalidateL1_FailureDoesNotUnpublish(t *testing.T) {
 	tmpl.VCenterVMID = "vm-9999"
 
 	db := &fakeRevalidateDB{
-		tmpl:    &tmpl,
+		tmpl:     &tmpl,
 		isActive: true,
 	}
 	metrics := &fakeRevalidateMetrics{}
@@ -491,7 +491,8 @@ func (f *fakeRevalidateDB) GetTemplateByID(_ context.Context, id uuid.UUID) (*mo
 }
 
 type fakeRevalidateMetrics struct {
-	validations map[string]int
+	validations   map[string]int
+	lastValidated map[string]float64
 }
 
 var _ revalidateL1CorePipeline = (*fakeRevalidateMetrics)(nil)
@@ -501,6 +502,13 @@ func (f *fakeRevalidateMetrics) RecordTemplateValidation(_, result string) {
 		f.validations = make(map[string]int)
 	}
 	f.validations[result]++
+}
+
+func (f *fakeRevalidateMetrics) SetTemplateLastValidated(templateID string, unixSec float64) {
+	if f.lastValidated == nil {
+		f.lastValidated = make(map[string]float64)
+	}
+	f.lastValidated[templateID] = unixSec
 }
 
 func contains(s, substr string) bool {
@@ -513,4 +521,59 @@ func contains(s, substr string) bool {
 			}
 			return false
 		}())
+}
+
+// TestRevalidateL1_PushesLastValidatedGauge is the regression test for a
+// production defect: the smoke check passed and templates.last_validated_at was
+// written, but crucible_template_last_validated_timestamp stayed at its
+// pre-validation value because ONLY the trust reconciler pushed that gauge --
+// and it runs weekly. The alert
+// `time() - crucible_template_last_validated_timestamp > 8d` therefore kept
+// firing for up to a full reconcile interval AFTER a successful validation.
+//
+// The gauge must advance on BOTH outcomes, mirroring SetTemplateValidationState
+// (which writes last_validated_at for pass and fail alike). Staleness means
+// "nobody checked recently"; a failing check is carried by the separate
+// RecordTemplateValidation result label, so advancing the gauge on failure
+// avoids double-alerting on a single fault.
+func TestRevalidateL1_PushesLastValidatedGauge(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		checkErr error
+	}{
+		{"pass", nil},
+		{"fail", errors.New("smoke check: CloneVM: connection refused")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmplID := uuid.New()
+			tmpl := makeL1Template(tmplID, nil)
+			db := &fakeRevalidateDB{isActive: true}
+			metrics := &fakeRevalidateMetrics{}
+
+			before := time.Now().Add(-time.Second)
+			revalidateL1TemplateCore(context.Background(), db, metrics, discardLogger(), &tmpl, tc.checkErr)
+			after := time.Now().Add(time.Second)
+
+			got, ok := metrics.lastValidated[tmplID.String()]
+			if !ok {
+				t.Fatalf("crucible_template_last_validated_timestamp was never pushed for %s; "+
+					"the staleness alert will keep firing until the next weekly reconcile "+
+					"even though this validation just ran (gauge map = %v)", tmplID, metrics.lastValidated)
+			}
+			if got < float64(before.Unix()) || got > float64(after.Unix()) {
+				t.Errorf("gauge = %v, want a current timestamp in [%d, %d]",
+					got, before.Unix(), after.Unix())
+			}
+
+			// The gauge must agree with what was written to the DB, otherwise
+			// the dashboard and the templates table tell different stories.
+			if db.validationAt.IsZero() {
+				t.Fatal("validationAt was not persisted; cannot compare gauge to DB")
+			}
+			if delta := got - float64(db.validationAt.Unix()); delta > 1 || delta < -1 {
+				t.Errorf("gauge (%v) and DB last_validated_at (%d) disagree by %vs; they must track together",
+					got, db.validationAt.Unix(), delta)
+			}
+		})
+	}
 }
