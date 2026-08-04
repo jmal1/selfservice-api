@@ -399,17 +399,21 @@ type BlueprintAccess struct {
 
 // Job represents a durable task in the job queue.
 type Job struct {
-	ID            uuid.UUID  `json:"id" db:"id"`
-	Type          string     `json:"type" db:"type"`
-	Payload       []byte     `json:"payload" db:"payload"`
-	Status        string     `json:"status" db:"status"`
-	ClaimedBy     *string    `json:"claimed_by,omitempty" db:"claimed_by"`
-	ClaimedAt     *time.Time `json:"claimed_at,omitempty" db:"claimed_at"`
-	StartedAt     *time.Time `json:"started_at,omitempty" db:"started_at"`
-	CompletedAt   *time.Time `json:"completed_at,omitempty" db:"completed_at"`
-	Result        []byte     `json:"result,omitempty" db:"result"`
-	RetryCount    int        `json:"retry_count" db:"retry_count"`
-	MaxRetries    int        `json:"max_retries" db:"max_retries"`
+	ID          uuid.UUID  `json:"id" db:"id"`
+	Type        string     `json:"type" db:"type"`
+	Payload     []byte     `json:"payload" db:"payload"`
+	Status      string     `json:"status" db:"status"`
+	ClaimedBy   *string    `json:"claimed_by,omitempty" db:"claimed_by"`
+	ClaimedAt   *time.Time `json:"claimed_at,omitempty" db:"claimed_at"`
+	StartedAt   *time.Time `json:"started_at,omitempty" db:"started_at"`
+	CompletedAt *time.Time `json:"completed_at,omitempty" db:"completed_at"`
+	Result      []byte     `json:"result,omitempty" db:"result"`
+	RetryCount  int        `json:"retry_count" db:"retry_count"`
+	MaxRetries  int        `json:"max_retries" db:"max_retries"`
+	// NextAttemptAt, when non-nil, is the earliest time ClaimJob will
+	// return this job.  Set by the worker when rescheduling a retryable
+	// failure with exponential backoff.  Migration 000027.
+	NextAttemptAt *time.Time `json:"next_attempt_at,omitempty" db:"next_attempt_at"`
 	RollbackSteps []byte     `json:"rollback_steps" db:"rollback_steps"`
 	CreatedAt     time.Time  `json:"created_at" db:"created_at"`
 }

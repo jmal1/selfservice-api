@@ -32,11 +32,19 @@ type pipelineMetricsSink interface {
 	RecordTemplateJob(jobType string, d time.Duration)
 	SetTemplateStates(counts map[string]int)
 	SetTemplatesStuck(n int)
+	// Retry metrics — added with migration 000026.
+	RecordJobRetry(jobType, reason string)
+	RecordJobRetryExhausted(jobType string)
+	SetJobRetryPending(n int)
 	Push(ctx context.Context) error
 }
 
+// jobStatusUpdater covers all job-row mutations that processJobLifecycle needs,
+// including the retry scheduling path. *database.Queries satisfies this;
+// tests inject a lightweight stub.
 type jobStatusUpdater interface {
 	UpdateJobStatus(ctx context.Context, id uuid.UUID, status string, result []byte) error
+	RetryJob(ctx context.Context, id uuid.UUID, nextAt time.Time) error
 }
 
 var _ pipelineMetricsSink = (*PipelineMetrics)(nil)
@@ -63,6 +71,13 @@ type Provisioner struct {
 	objects  imageObjectStore
 	pipeline pipelineMetricsSink
 	imageCfg ImageImportConfig
+
+	// cloneMu serialises concurrent clones from the same source VM moref.
+	// Key: source moref (string), value: chan struct{} (semaphore of size 1).
+	// See acquireCloneLock.  One provision-worker replica is confirmed in
+	// deploy/helm/selfservice/values.yaml (replicaCount.worker: 1), so an
+	// in-process mutex is sufficient.
+	cloneMu sync.Map
 }
 
 // EnablePipelineMetrics wires the shared pipeline metrics sink used by the
@@ -176,27 +191,88 @@ func processJobLifecycle(
 	}
 
 	err := dispatch(ctx, job)
-	if err != nil {
-		result, _ := json.Marshal(map[string]string{"error": err.Error()})
-		_ = db.UpdateJobStatus(ctx, job.ID, models.JobStatusFailed, result)
+	if err == nil {
+		result, _ := json.Marshal(map[string]string{"message": "completed successfully"})
+		_ = db.UpdateJobStatus(ctx, job.ID, models.JobStatusCompleted, result)
 		if publish != nil {
-			publish(job.ID, "failed", err.Error())
+			publish(job.ID, "completed", "Job completed successfully")
 		}
-		return err
+		return nil
 	}
 
-	result, _ := json.Marshal(map[string]string{"message": "completed successfully"})
-	_ = db.UpdateJobStatus(ctx, job.ID, models.JobStatusCompleted, result)
-	if publish != nil {
-		publish(job.ID, "completed", "Job completed successfully")
+	// Error path: retry if possible, otherwise fail terminally.
+	retryable, reason := ClassifyError(err, job.Type)
+	if retryable && job.RetryCount < job.MaxRetries {
+		nextAt := time.Now().Add(RetryBackoff(job.RetryCount))
+		if schedErr := db.RetryJob(ctx, job.ID, nextAt); schedErr == nil {
+			if pipeline != nil {
+				pipeline.RecordJobRetry(job.Type, reason)
+			}
+			if publish != nil {
+				publish(job.ID, "retry_scheduled", fmt.Sprintf(
+					"Retry %d/%d scheduled for %s (reason: %s)",
+					job.RetryCount+1, job.MaxRetries,
+					nextAt.Format(time.RFC3339), reason,
+				))
+			}
+			return nil // rescheduled; not a failure from the caller's perspective
+		}
+		// RetryJob itself failed (DB problem) — fall through to terminal failure.
 	}
-	return nil
+
+	// Terminal failure.
+	if retryable && job.RetryCount >= job.MaxRetries {
+		if pipeline != nil {
+			pipeline.RecordJobRetryExhausted(job.Type)
+		}
+	}
+
+	friendly := FriendlyError(err, job.RetryCount, job.MaxRetries)
+	type jobResult struct {
+		Error    string `json:"error"`
+		RawError string `json:"raw_error,omitempty"`
+		Attempts int    `json:"attempts"`
+	}
+	jr := jobResult{
+		Error:    friendly,
+		Attempts: job.RetryCount + 1,
+	}
+	if friendly != err.Error() {
+		jr.RawError = err.Error()
+	}
+	result, _ := json.Marshal(jr)
+	_ = db.UpdateJobStatus(ctx, job.ID, models.JobStatusFailed, result)
+	if publish != nil {
+		publish(job.ID, "failed", friendly)
+	}
+	return err
 }
 
 func (p *Provisioner) publishProgress(jobID uuid.UUID, step, message string) {
 	if p.nats != nil {
 		_ = p.nats.PublishJobStatus(jobID, step, message)
 	}
+}
+
+// acquireCloneLock serialises concurrent clones from the same source VM.
+//
+// Returns a release function that MUST be called (via defer) on every path.
+//
+// Pattern: a buffered channel of capacity 1 acts as a per-moref semaphore.
+// LoadOrStore guarantees all callers for a given moref see the same channel
+// regardless of order.  A send blocks until the token is available; the
+// release function reads it back.
+//
+// The map is never cleaned up (leaks one chan per unique moref over the
+// lifetime of the process), which is intentional: the number of source VMs
+// is bounded and bounded-small, and channel garbage-collection would add
+// complexity without benefit.
+func (p *Provisioner) acquireCloneLock(sourceMoref string) func() {
+	ch := make(chan struct{}, 1)
+	actual, _ := p.cloneMu.LoadOrStore(sourceMoref, ch)
+	token := actual.(chan struct{})
+	token <- struct{}{}       // acquire (blocks if another goroutine holds it)
+	return func() { <-token } // release
 }
 
 // newRollbackEngine creates a rollback engine for a job.

@@ -217,7 +217,15 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 	}
 
 	// Step 1: clone (idempotent — returns existing moref if name collision)
+	//
+	// Acquire a per-source-VM lock so two concurrent clones from the same
+	// source cannot overlap.  The most plausible trigger for the transient
+	// "virtual disk is either corrupted or not a supported format" fault is
+	// concurrent vSphere inventory operations against the same source VM.
+	// The lock is in-process because the provision-worker runs as a single
+	// replica (values.yaml replicaCount.worker: 1).
 	p.publishProgress(job.ID, "create_vm", fmt.Sprintf("Cloning source VM %s → %s", sourceMoref, payload.VMName))
+	releaseLock := p.acquireCloneLock(sourceMoref)
 	moref, err := p.vc.CloneTemplateSourceVM(ctx, vcenter.TemplateCloneParams{
 		SourceMoref: sourceMoref,
 		VMName:      payload.VMName,
@@ -226,6 +234,7 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 		VCPUs:       payload.VCPUs,
 		RAMmb:       payload.RAMmb,
 	})
+	releaseLock()
 	if err != nil {
 		return p.markTemplateError(ctx, payload.TemplateID, fmt.Errorf("clone source VM: %w", err))
 	}

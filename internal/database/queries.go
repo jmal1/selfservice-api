@@ -456,7 +456,6 @@ func (q *Queries) SetTemplateVCenterVM(ctx context.Context, id uuid.UUID, vcente
 	return err
 }
 
-
 // SetTemplateActive flips the templates.is_active flag. Called by the
 // template_verify worker on smoke-test success (active=true) so a template
 // only becomes visible to students AFTER an L3 clone was proven to boot.
@@ -792,6 +791,8 @@ func (q *Queries) CreateJob(ctx context.Context, jobType string, payload []byte)
 }
 
 // ClaimJob atomically claims the next pending job for a worker.
+// Jobs whose next_attempt_at is in the future are skipped (they are
+// sleeping between retry attempts).
 func (q *Queries) ClaimJob(ctx context.Context, workerID string) (*models.Job, error) {
 	var j models.Job
 	err := q.pool.QueryRow(ctx, `
@@ -802,15 +803,16 @@ func (q *Queries) ClaimJob(ctx context.Context, workerID string) (*models.Job, e
 		WHERE id = (
 			SELECT id FROM jobs
 			WHERE status = 'pending'
+			  AND (next_attempt_at IS NULL OR next_attempt_at <= now())
 			ORDER BY created_at ASC
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1
 		)
 		RETURNING id, type, payload, status, claimed_by, claimed_at,
-		          retry_count, max_retries, rollback_steps, created_at
+		          retry_count, max_retries, next_attempt_at, rollback_steps, created_at
 	`, workerID).Scan(
 		&j.ID, &j.Type, &j.Payload, &j.Status, &j.ClaimedBy, &j.ClaimedAt,
-		&j.RetryCount, &j.MaxRetries, &j.RollbackSteps, &j.CreatedAt,
+		&j.RetryCount, &j.MaxRetries, &j.NextAttemptAt, &j.RollbackSteps, &j.CreatedAt,
 	)
 	if err == pgx.ErrNoRows {
 		return nil, nil
@@ -833,6 +835,40 @@ func (q *Queries) UpdateJobStatus(ctx context.Context, id uuid.UUID, status stri
 func (q *Queries) UpdateJobRollbackSteps(ctx context.Context, id uuid.UUID, steps []byte) error {
 	_, err := q.pool.Exec(ctx, `UPDATE jobs SET rollback_steps = $2 WHERE id = $1`, id, steps)
 	return err
+}
+
+// RetryJob resets a failed job back to pending and schedules it for a
+// future attempt.  retry_count is incremented; claimed_by, claimed_at,
+// started_at, and completed_at are cleared; next_attempt_at is set to
+// nextAt so ClaimJob ignores the row until the delay expires.
+//
+// Called by the worker when ProcessJob returns a retryable error and
+// retry_count < max_retries.
+func (q *Queries) RetryJob(ctx context.Context, id uuid.UUID, nextAt time.Time) error {
+	_, err := q.pool.Exec(ctx, `
+		UPDATE jobs SET
+			status          = 'pending',
+			retry_count     = retry_count + 1,
+			claimed_by      = NULL,
+			claimed_at      = NULL,
+			started_at      = NULL,
+			completed_at    = NULL,
+			next_attempt_at = $2
+		WHERE id = $1
+	`, id, nextAt)
+	return err
+}
+
+// CountRetryPendingJobs returns the number of jobs currently sleeping
+// between retry attempts (pending with a future next_attempt_at). Used
+// to feed the crucible_job_retry_pending gauge.
+func (q *Queries) CountRetryPendingJobs(ctx context.Context) (int, error) {
+	var n int
+	err := q.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM jobs
+		WHERE status = 'pending' AND next_attempt_at > now()
+	`).Scan(&n)
+	return n, err
 }
 
 // RecoverStaleJobs resets in_progress/claimed jobs that were abandoned (e.g., worker restart).
@@ -1294,15 +1330,15 @@ func (q *Queries) DeactivateStaleSessions(ctx context.Context, staleMinutes int)
 
 // ActiveSession represents a session joined with user info for admin display.
 type ActiveSession struct {
-	ID           uuid.UUID  `json:"id"`
-	UserID       uuid.UUID  `json:"user_id"`
-	Username     string     `json:"username"`
-	DisplayName  *string    `json:"display_name,omitempty"`
-	Email        *string    `json:"email,omitempty"`
-	CreatedAt    time.Time  `json:"created_at"`
-	LastActivity time.Time  `json:"last_activity"`
-	IPAddress    *string    `json:"ip_address,omitempty"`
-	UserAgent    *string    `json:"user_agent,omitempty"`
+	ID           uuid.UUID `json:"id"`
+	UserID       uuid.UUID `json:"user_id"`
+	Username     string    `json:"username"`
+	DisplayName  *string   `json:"display_name,omitempty"`
+	Email        *string   `json:"email,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
+	LastActivity time.Time `json:"last_activity"`
+	IPAddress    *string   `json:"ip_address,omitempty"`
+	UserAgent    *string   `json:"user_agent,omitempty"`
 }
 
 // ListActiveSessions returns all active sessions with user info.
@@ -1338,7 +1374,7 @@ func (q *Queries) ListActiveSessions(ctx context.Context) ([]ActiveSession, erro
 type AuditLogFilter struct {
 	Page         int
 	PerPage      int
-	Action       string     // prefix match (e.g. "pod" matches "pod.create", "pod.delete")
+	Action       string // prefix match (e.g. "pod" matches "pod.create", "pod.delete")
 	UserID       *uuid.UUID
 	ResourceType string
 	ResourceID   *uuid.UUID

@@ -476,6 +476,41 @@ that unit, so it is a platform bug rather than something you did.
 
 ---
 
+## "Template provisioning failed, but then it succeeded / failed again after a delay"
+
+Template creation jobs (clone, generalise, etc.) are automatically retried up
+to **three times** when vSphere returns a transient error — for example, a
+storage-inventory rejection that resolves itself in under a minute. While
+retries are in flight the template shows `pending`, and each attempt is
+recorded in the platform job log.
+
+What this looks like in practice:
+
+- You request a template at 20:36 — vSphere rejects the clone in under a
+  second with a storage/inventory error.
+- The platform schedules a retry with exponential backoff (roughly 30 s, then
+  2 min, then 8 min).
+- By 20:37 the second attempt succeeds and the template continues to
+  `configuring`.
+
+If all three retries exhaust, the job moves to `error` and the status page
+shows a message like *"vSphere rejected the clone (transient storage/inventory
+error). Retried 3 times. If this persists, check datastore health."* The raw
+vCenter fault string is included for platform admins in the job detail view.
+
+**Errors that are never retried** (they indicate a configuration mistake, not
+a transient fault): invalid source ISO path, missing folder, ambiguous
+resource pool, guest-auth failure. These fail immediately so you see the real
+cause without waiting through three backoff cycles.
+
+> [!tip]
+> If a template stays in `pending` longer than expected after an error,
+> it is likely sitting in a retry backoff window. Check the Jobs page
+> — the next-attempt time is shown there. Only intervene (reset to `error`)
+> if the message is a deterministic configuration error, not a transient one.
+
+---
+
 ## See also
 
 - [Building Workflows](workflows.md) — the basics
