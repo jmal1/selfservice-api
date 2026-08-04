@@ -539,11 +539,22 @@ func runDeepCheck(
 	deepCtx, cancel := context.WithTimeout(ctx, cfg.DeepCheckTimeout)
 	defer cancel()
 
+	// The clone must land on the template's own staging port group. A clone
+	// inherits the template's NIC backing, and template VMs sit on a network
+	// with no DHCP -- so leaving this unset means WaitForIP can never succeed
+	// and the deep check fails by timeout on a perfectly healthy template.
+	// This is the same network the template-verify path uses (template_jobs.go),
+	// which is why verify has always worked and the deep check never has.
+	network := tmpl.StagingNetwork
+	if network == "" {
+		network = cfg.Network
+	}
+
 	params := vcenter.HealthCheckCloneParams{
 		SourceRef:  ref,
 		CloneName:  cloneName,
 		FolderPath: cfg.TemplateFolder,
-		Network:    cfg.Network,
+		Network:    network,
 		VCPUs:      int32(tmpl.DefaultVCPUs),
 		RAMmb:      int64(tmpl.DefaultRAMMB),
 	}
