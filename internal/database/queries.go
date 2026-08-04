@@ -46,12 +46,12 @@ var ErrImageUploadStale = errors.New("image upload is not in the expected state"
 // with scanTemplate so the order matches the Scan() argument list.
 // Migration 000018 added template_state, created_by, vcenter_vm_id,
 // source_type, source_ref, staging_network. Migration 000019 added
-// is_internal.
+// is_internal. Migration 000029 added visibility.
 const templateSelectCols = `id, name, vcenter_template, os_type, default_vcpus, default_ram_mb,
 		default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''),
 		default_username, default_password, kind, assign_ip, is_active,
 		template_state, created_by, vcenter_vm_id, source_type, source_ref, staging_network,
-		is_internal,
+		is_internal, visibility,
 		unattend_mode, unattend_config, guest_id,
 		created_at, updated_at,
 		trust_tier, last_validated_at, last_validation_result`
@@ -65,7 +65,7 @@ func scanTemplate(row pgx.Row, t *models.Template) error {
 		&t.DefaultDiskGB, &t.MinVCPUs, &t.MinRAMMB, &t.Description, &t.IconURL,
 		&t.DefaultUsername, &t.DefaultPassword, &t.Kind, &t.AssignIP, &t.IsActive,
 		&t.TemplateState, &t.CreatedBy, &t.VCenterVMID, &t.SourceType, &t.SourceRef, &t.StagingNetwork,
-		&t.IsInternal,
+		&t.IsInternal, &t.Visibility,
 		&t.UnattendMode, &t.UnattendConfig, &t.GuestID,
 		&t.CreatedAt, &t.UpdatedAt,
 		&t.TrustTier, &t.LastValidatedAt, &t.LastValidationResult,
@@ -191,37 +191,54 @@ func (q *Queries) CreateTemplate(ctx context.Context, req models.CreateTemplateR
 	if req.AssignIP != nil {
 		assignIP = *req.AssignIP
 	}
+	visibility := "public"
+	if req.Visibility != nil {
+		visibility = *req.Visibility
+	}
 	var t models.Template
 	err := scanTemplate(q.pool.QueryRow(ctx, `
 		INSERT INTO templates (name, vcenter_template, os_type, default_vcpus, default_ram_mb,
 		                       default_disk_gb, min_vcpus, min_ram_mb, description, icon_url,
-		                       default_username, default_password, kind, assign_ip)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		                       default_username, default_password, kind, assign_ip, visibility)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		RETURNING `+templateSelectCols+`
 	`, req.Name, req.VCenterTemplate, req.OSType, req.DefaultVCPUs, req.DefaultRAMMB,
 		req.DefaultDiskGB, req.MinVCPUs, req.MinRAMMB, req.Description, req.IconURL,
-		req.DefaultUsername, req.DefaultPassword, kind, assignIP,
+		req.DefaultUsername, req.DefaultPassword, kind, assignIP, visibility,
 	), &t)
 	return &t, err
 }
 
 // ListTemplatesForUser returns templates accessible to a user based on their
-// role. A template is visible if any of the following hold:
+// role and visibility. A template is visible if all of the following hold:
 //
-//   - it has no template_access rules (open to all)
-//   - the user's role appears in template_access.role
-//   - the user's id appears in template_access.user_id
+//   - it has no template_access rules (open to all) OR
+//   - the user's role appears in template_access.role OR
+//   - the user's id appears in template_access.user_id OR
 //   - 'admin' appears in template_access.role (admins see everything)
+//
+//   AND for students only:
+//   - visibility = 'public' (instructor_only templates hidden from students)
+//   - (unless is_internal is true AND user has explicit per-user access)
+//
+// Instructors and admins see all templates regardless of visibility.
 //
 // Uses EXISTS subqueries instead of a LEFT JOIN so the SELECT list (sharing
 // the unqualified `templateSelectCols` const) is unambiguous. The previous
 // LEFT JOIN form silently broke once a real template_access row existed
 // because `id` resolves to both templates.id and template_access.id.
 func (q *Queries) ListTemplatesForUser(ctx context.Context, userID uuid.UUID, role string) ([]models.Template, error) {
+	// Build visibility filter: students see only 'public', instructors/admins see all
+	visibilityFilter := ""
+	if role == "student" {
+		visibilityFilter = "AND t.visibility = 'public'"
+	}
+
 	rows, err := q.pool.Query(ctx, `
 		SELECT `+templateSelectCols+`
 		FROM templates t
 		WHERE t.is_active = true
+		  `+visibilityFilter+`
 		  AND (NOT EXISTS (SELECT 1 FROM template_access ta WHERE ta.template_id = t.id)
 		       OR EXISTS (SELECT 1 FROM template_access ta
 		                  WHERE ta.template_id = t.id
@@ -338,12 +355,13 @@ func (q *Queries) UpdateTemplate(ctx context.Context, id uuid.UUID, req models.U
 			default_username = COALESCE($9, default_username),
 			default_password = COALESCE($10, default_password),
 			kind = COALESCE($11, kind),
-			assign_ip = COALESCE($12, assign_ip)
+			assign_ip = COALESCE($12, assign_ip),
+			visibility = COALESCE($14, visibility)
 		WHERE id = $1
 		  AND ($13::timestamptz IS NULL OR updated_at = $13)
 		RETURNING `+templateSelectCols+`
 	`, id, req.Name, req.Description, req.IconURL, req.DefaultVCPUs, req.DefaultRAMMB, req.DefaultDiskGB, req.IsActive,
-		req.DefaultUsername, req.DefaultPassword, req.Kind, req.AssignIP, req.ExpectedUpdatedAt,
+		req.DefaultUsername, req.DefaultPassword, req.Kind, req.AssignIP, req.ExpectedUpdatedAt, req.Visibility,
 	), &t)
 	if err == pgx.ErrNoRows {
 		// Distinguish missing-row from version-mismatch. If the caller
