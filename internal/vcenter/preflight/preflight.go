@@ -42,11 +42,11 @@ import (
 // strings or building a parallel logging path. Never embed a raw vCenter
 // fault in Detail or Fix; rewrite it in terms the instructor can act on.
 type Result struct {
-	ID       string // canonical check ID, e.g. "PF-01"
-	Severity string // "block" or "warn"
-	OK       bool
-	Detail   string // what was actually observed, in plain language
-	Fix      string // what the instructor should do when OK is false (empty when OK is true)
+	ID       string `json:"id"`       // canonical check ID, e.g. "PF-01"
+	Severity string `json:"severity"` // "block" or "warn"
+	OK       bool   `json:"ok"`
+	Detail   string `json:"detail"` // what was actually observed, in plain language
+	Fix      string `json:"fix"`    // what the instructor should do when OK is false (empty when OK is true)
 }
 
 // Params carries the non-vCenter inputs that the 11 checks need. Populated
