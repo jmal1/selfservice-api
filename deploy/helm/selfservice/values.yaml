@@ -39,6 +39,16 @@ worker:
   # string to disable cleanly. Job label is the Pushgateway grouping key.
   pushgatewayURL: "http://pushgateway.observability:9091"
   pushgatewayJob: "crucible_provision_worker"
+  # Leader election: gate all periodic reconcilers behind a Postgres session-
+  # scoped advisory lock so exactly one of the N replicas runs them at a time.
+  # The job-claim loop (SELECT ... FOR UPDATE SKIP LOCKED) is NOT gated.
+  # Set enabled: false to disable (reverts to single-replica behaviour where
+  # every replica runs reconcilers — only safe with replicaCount.worker: 1).
+  leaderElection:
+    enabled: true
+    # How long followers wait between lock-acquisition attempts. 5s is a
+    # good balance between failover latency and Postgres connection churn.
+    retryInterval: "5s"
   # vCenter orphan reconciler (Phase 2.3 of the 2026-06-10 esxi2 NFS41 APD
   # recovery). When enabled, the worker scans `orphanReconciler.folder` on
   # `orphanReconciler.interval` and:

@@ -11,6 +11,7 @@ import (
 
 	"github.com/jmal1/selfservice-api/internal/config"
 	"github.com/jmal1/selfservice-api/internal/database"
+	"github.com/jmal1/selfservice-api/internal/leader"
 	events "github.com/jmal1/selfservice-api/internal/nats"
 	"github.com/jmal1/selfservice-api/internal/objectstore"
 	"github.com/jmal1/selfservice-api/internal/opnsense"
@@ -39,6 +40,26 @@ func main() {
 	}
 	defer pool.Close()
 	queries := database.NewQueries(pool)
+
+	// Leader election: gate all periodic reconcilers behind a session-scoped
+	// Postgres advisory lock so exactly one replica runs them at a time.
+	// The job-claim loop (processJobs) is intentionally NOT gated — all replicas
+	// must claim jobs via SELECT ... FOR UPDATE SKIP LOCKED.
+	//
+	// Set WORKER_LEADER_ELECTION_ENABLED=false to disable (single-replica mode).
+	leaderElectionEnabled := true
+	if v := os.Getenv("WORKER_LEADER_ELECTION_ENABLED"); v != "" {
+		leaderElectionEnabled = strings.EqualFold(v, "true")
+	}
+	leaderRetry := envDuration(logger, "WORKER_LEADER_RETRY_INTERVAL", 5*time.Second)
+
+	elec := leader.NewPostgresElector(cfg.Database.DSN(), leader.WorkerLockKey, leaderRetry, logger)
+	if !leaderElectionEnabled {
+		// When disabled, behave as a permanent leader (single-replica operation).
+		logger.Warn("leader election disabled; this replica will run all reconcilers unconditionally")
+		elec = leader.NewAlwaysLeader(logger)
+	}
+	go elec.Run(ctx)
 
 	// Connect to NATS
 	natsClient, err := events.NewClient(cfg.NATS, logger)
@@ -100,6 +121,24 @@ func main() {
 		go pipeline.RunPusher(ctx, 30*time.Second, logger)
 	}
 
+	// Leader metrics: push crucible_worker_is_leader and
+	// crucible_worker_leader_transitions_total to Pushgateway, labelled by pod.
+	// This feeds the CrucibleWorkerNoLeader alert (sum != 1 for 15m).
+	if pgURL := os.Getenv("WORKER_PUSHGATEWAY_URL"); pgURL != "" {
+		workerJob := os.Getenv("WORKER_PUSHGATEWAY_JOB")
+		if workerJob == "" {
+			workerJob = "crucible_provision_worker"
+		}
+		podName, _ := os.Hostname()
+		leaderPusher := &leader.Pusher{
+			BaseURL: pgURL,
+			Job:     workerJob,
+			Pod:     podName,
+		}
+		go leaderPusher.RunPusher(ctx, elec, 30*time.Second)
+		logger.Info("leader metrics pusher enabled", "pod", podName, "url", pgURL)
+	}
+
 	// Optional: enable destroy_failed Pushgateway metric. When the
 	// WORKER_PUSHGATEWAY_URL env is set, the worker publishes
 	// crucible_pods_destroy_failed_count every 5 minutes so the
@@ -158,20 +197,17 @@ func main() {
 				})
 			}
 			logger.Info("image_import enabled",
-				"endpoint", cfg.ObjectStore.Endpoint,
-				"bucket", cfg.ObjectStore.Bucket,
-				"iso_datastore", cfg.VCenter.ISODatastore)
-
-			// Detect image_uploads rows abandoned in uploading/importing. Each
-			// one pins an object on a MinIO host with ~85 GB free on the same
-			// filesystem apt-cacher-ng uses, so a silent leak here eventually
-			// breaks Linux template builds too.
-			go prov.RunStuckUploadReconciler(ctx, provisioner.StuckUploadReconcilerConfig{
-				Interval:       envDuration(logger, "WORKER_STUCK_UPLOAD_INTERVAL", 5*time.Minute),
-				StaleThreshold: envDuration(logger, "WORKER_STUCK_UPLOAD_STALE_THRESHOLD", 30*time.Minute),
-			})
-		}
+					"endpoint", cfg.ObjectStore.Endpoint,
+					"bucket", cfg.ObjectStore.Bucket,
+					"iso_datastore", cfg.VCenter.ISODatastore)
+				// Note: stuck-upload reconciler is integrated into the main select
+				// loop below (stuckUploadTickerC) so it can be gated by IsLeader().
+			}
 	}
+
+	// Capture stuck-upload config for use in the main select loop.
+	stuckUploadInterval := envDuration(logger, "WORKER_STUCK_UPLOAD_INTERVAL", 5*time.Minute)
+	stuckUploadStaleThreshold := envDuration(logger, "WORKER_STUCK_UPLOAD_STALE_THRESHOLD", 30*time.Minute)
 
 	templateReconcilerEnabled := true
 	if v := os.Getenv("WORKER_PIPELINE_RECONCILER_ENABLED"); v != "" {
@@ -454,8 +490,12 @@ func main() {
 		defer t.Stop()
 		networkReconcilerTickerC = t.C
 		logger.Info("opnsense network reconciler enabled", "interval", networkReconcilerInterval)
-		// Heal any existing network drift promptly on startup.
+		// Heal any existing network drift promptly on startup — only on the leader
+		// to prevent 4 replicas simultaneously hitting the OPNsense firewall API.
 		go func() {
+			if !elec.IsLeader() {
+				return
+			}
 			if _, err := prov.ReconcileNetwork(ctx, networkReconcilerCfg); err != nil {
 				logger.Error("initial network reconcile failed", "error", err)
 			}
@@ -485,17 +525,39 @@ func main() {
 		l1ValidationTickerC = t.C
 		logger.Info("l1 trust validation reconciler enabled",
 			"interval", l1ValidationInterval)
-		// Run once immediately on startup so the staleness gauge is populated
-		// before the first tick fires.
+		// Run once immediately on startup, but only when this replica is the
+		// elected leader so staleness gauge is populated without duplicates.
 		go func() {
+			if !elec.IsLeader() {
+				return
+			}
 			if _, err := prov.ReconcileL1TrustValidation(ctx, l1ValidationCfg); err != nil {
 				logger.Error("initial l1 trust validation reconcile failed", "error", err)
 			}
 		}()
 	}
 
-	// Start expiration cron (checks for expired pods every 5 minutes)
-	go prov.StartExpirationCron(ctx)
+	// Expiration cron ticker: gated by leader election (integrated into the main
+	// select loop below). The initial run of StartExpirationCron is replicated
+	// here as a leader-gated goroutine so the pattern is consistent.
+	expirationCronTicker := time.NewTicker(5 * time.Minute)
+	defer expirationCronTicker.Stop()
+	go func() {
+		if elec.IsLeader() {
+			prov.ExpireStale(ctx)
+		}
+	}()
+
+	// Stuck-upload reconciler ticker: gated by leader election (integrated into
+	// the main select loop below). Only active when an object store is configured.
+	var stuckUploadTickerC <-chan time.Time
+	if cfg.ObjectStore.Endpoint != "" {
+		t := time.NewTicker(stuckUploadInterval)
+		defer t.Stop()
+		stuckUploadTickerC = t.C
+		logger.Info("stuck-upload reconciler enabled (leader-gated)",
+			"interval", stuckUploadInterval, "stale_threshold", stuckUploadStaleThreshold)
+	}
 
 	// Immediately process any pending/recovered jobs
 	go processJobs(ctx, queries, prov, workerID, logger)
@@ -505,27 +567,65 @@ func main() {
 			select {
 			case <-ctx.Done():
 				return
+
+			// ── Job-claim loop: NOT gated by leader election ──────────────────
+			// All replicas claim jobs via SELECT ... FOR UPDATE SKIP LOCKED.
 			case <-ticker.C:
 				processJobs(ctx, queries, prov, workerID, logger)
+
+			// ── Periodic reconcilers: ALL gated by leader election ─────────────
+			// When not leader the tick fires but the body is a cheap no-op.
+			// This keeps the ticker alive so the leader can take over without
+			// needing a restart.
 			case <-retryTicker.C:
+				if !elec.IsLeader() {
+					continue
+				}
 				prov.RetryFailedDestroys(ctx)
+			case <-expirationCronTicker.C:
+				if !elec.IsLeader() {
+					continue
+				}
+				prov.ExpireStale(ctx)
+			case <-stuckUploadTickerC:
+				if !elec.IsLeader() {
+					continue
+				}
+				if _, err := prov.ReconcileStuckImageUploads(ctx, stuckUploadStaleThreshold); err != nil {
+					logger.Error("stuck-upload reconcile failed", "error", err)
+				}
 			case <-orphanTickerC:
+				if !elec.IsLeader() {
+					continue
+				}
 				if _, err := prov.ReconcileVCenterOrphans(ctx, orphanCfg); err != nil {
 					logger.Error("orphan reconcile failed", "error", err)
 				}
 			case <-ipReconcilerTickerC:
+				if !elec.IsLeader() {
+					continue
+				}
 				if _, err := prov.ReconcilePodVMIPs(ctx, ipReconcilerCfg); err != nil {
 					logger.Error("pod-vm ip reconcile failed", "error", err)
 				}
 			case <-networkReconcilerTickerC:
+				if !elec.IsLeader() {
+					continue
+				}
 				if _, err := prov.ReconcileNetwork(ctx, networkReconcilerCfg); err != nil {
 					logger.Error("network reconcile failed", "error", err)
 				}
 			case <-idleEvalTickerC:
+				if !elec.IsLeader() {
+					continue
+				}
 				if _, err := prov.EvaluateIdleVMs(ctx, idleEvalCfg); err != nil {
 					logger.Error("idle vm evaluation failed", "error", err)
 				}
 			case <-templateReconcilerTickerC:
+				if !elec.IsLeader() {
+					continue
+				}
 				if _, err := prov.ReconcileTemplateMetrics(ctx, provisioner.TemplateReconcilerConfig{
 					Interval:       templateReconcilerInterval,
 					StaleThreshold: templateReconcilerStaleThreshold,
@@ -533,10 +633,16 @@ func main() {
 					logger.Error("template reconcile failed", "error", err)
 				}
 			case <-retryPendingTickerC:
+				if !elec.IsLeader() {
+					continue
+				}
 				if err := prov.ReconcileRetryPending(ctx); err != nil {
 					logger.Error("retry-pending reconcile failed", "error", err)
 				}
 			case <-l1ValidationTickerC:
+				if !elec.IsLeader() {
+					continue
+				}
 				if _, err := prov.ReconcileL1TrustValidation(ctx, l1ValidationCfg); err != nil {
 					logger.Error("l1 trust validation reconcile failed", "error", err)
 				}

@@ -6,6 +6,14 @@ import (
 	"time"
 )
 
+// ExpireStale queues pod_destroy jobs for any pods whose expiry has passed.
+// It is the per-tick body of StartExpirationCron, exported so callers that
+// manage the tick schedule themselves (e.g. for leader-election gating) can
+// invoke a single reconcile pass without spinning up the internal goroutine.
+func (p *Provisioner) ExpireStale(ctx context.Context) {
+	p.expireStale(ctx)
+}
+
 // StartExpirationCron starts a background goroutine that checks for expired pods
 // every 5 minutes and queues pod_destroy jobs for them.
 func (p *Provisioner) StartExpirationCron(ctx context.Context) {
