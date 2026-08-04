@@ -56,12 +56,19 @@ const (
 	// vcenter_template). The synthetic-noop template (see plan §Phase 2) is
 	// the intended value in production.
 	envLifecycleTemplate = "SYNTHETIC_LIFECYCLE_TEMPLATE"
-	// envLifecycleReadyTimeout overrides the default 8m timeout for waiting
-	// on PodStatusActive. Increase if vCenter is slow; decrease for tests.
+	// envLifecycleReadyTimeout overrides the default 2m timeout for waiting
+	// on PodStatusActive. The default (2m = 3.2× the ~37s observed median)
+	// leaves room for a full retry within the 10-minute CronJob schedule.
 	envLifecycleReadyTimeout = "SYNTHETIC_LIFECYCLE_READY_TIMEOUT"
 	// envLifecycleDestroyTimeout overrides the default 90s timeout for
 	// waiting on PodStatusDestroyed.
 	envLifecycleDestroyTimeout = "SYNTHETIC_LIFECYCLE_DESTROY_TIMEOUT"
+	// envLifecycleMaxAttempts overrides the default 2 attempts for the
+	// pod_lifecycle check. Set to 1 to disable retry.
+	envLifecycleMaxAttempts = "SYNTHETIC_LIFECYCLE_MAX_ATTEMPTS"
+	// envLifecycleRetryBackoff overrides the default 30s pause between
+	// pod_lifecycle retry attempts.
+	envLifecycleRetryBackoff = "SYNTHETIC_LIFECYCLE_RETRY_BACKOFF"
 
 	// envJanitorMode, when truthy, replaces the entire check set with the
 	// single synthetic_janitor check. This is the standalone defense-in-depth
@@ -102,8 +109,9 @@ const (
 	// POST /testing/run returns 400 (bad playlist) and no runner is ever
 	// dispatched — the engine dispatch path is unmonitored until fixed.
 	envRunnerPlaylistID = "SYNTHETIC_RUNNER_PLAYLIST_ID"
-	// envRunnerReadyTimeout overrides the default 8m timeout for waiting
-	// on pod active. Increase if vCenter is slow; decrease for tests.
+	// envRunnerReadyTimeout overrides the default 2m timeout for waiting on
+	// pod active. The default (2m) leaves room for a full retry within the
+	// 30-minute runner CronJob schedule.
 	envRunnerReadyTimeout = "SYNTHETIC_RUNNER_READY_TIMEOUT"
 	// envRunnerRunTimeout overrides the default 10m timeout for waiting on
 	// a terminal run state. Increase if Kali runner provisioning or workflow
@@ -112,6 +120,12 @@ const (
 	// envRunnerDestroyTimeout overrides the default 90s timeout for waiting
 	// on pod destroyed.
 	envRunnerDestroyTimeout = "SYNTHETIC_RUNNER_DESTROY_TIMEOUT"
+	// envRunnerMaxAttempts overrides the default 2 attempts for runner_smoke.
+	// Set to 1 to disable retry.
+	envRunnerMaxAttempts = "SYNTHETIC_RUNNER_MAX_ATTEMPTS"
+	// envRunnerRetryBackoff overrides the default 30s pause between
+	// runner_smoke retry attempts.
+	envRunnerRetryBackoff = "SYNTHETIC_RUNNER_RETRY_BACKOFF"
 
 	// envInstructorUserID is the UUID of the dedicated instructor-role row
 	// (synthetic-instructor). When set, the monitor mints a SECOND session
@@ -306,9 +320,37 @@ func run(logger *slog.Logger) error {
 	}
 
 	runner := synthetic.NewRunner(client, pg, activeChecks, logger)
-	// pod_lifecycle needs its own timeout budget — it polls for minutes.
-	// Use the larger of (configured CheckTimeout) or (ready + destroy + 60s).
+	// pod_lifecycle and runner_smoke need their own timeout budget AND retry
+	// policies. lifecycleSafeTimeout picks the largest per-attempt envelope.
 	runner.CheckTimeout = lifecycleSafeTimeout(checkTimeout, activeChecks)
+
+	// Wire retry policies for the expensive, vCenter-dependent checks.
+	// Cheap contract checks (403, 404, healthz) are deliberately excluded:
+	// retrying them would mask real regressions instead of catching them.
+	if mode.kind == modeDefault {
+		if hasPodLifecycle(activeChecks) {
+			retryCfg, err := resolveRetryConfig(os.Getenv, envLifecycleMaxAttempts, envLifecycleRetryBackoff)
+			if err != nil {
+				return err
+			}
+			runner.SetRetry("pod_lifecycle", retryCfg)
+			logger.Info("pod_lifecycle retry policy",
+				"max_attempts", retryCfg.MaxAttempts,
+				"backoff", retryCfg.Backoff,
+			)
+		}
+	}
+	if mode.kind == modeRunner {
+		retryCfg, err := resolveRetryConfig(os.Getenv, envRunnerMaxAttempts, envRunnerRetryBackoff)
+		if err != nil {
+			return err
+		}
+		runner.SetRetry("runner_smoke", retryCfg)
+		logger.Info("runner_smoke retry policy",
+			"max_attempts", retryCfg.MaxAttempts,
+			"backoff", retryCfg.Backoff,
+		)
+	}
 
 	// Mint the session JWTs now that the real per-cycle budget is known. A
 	// fresh pair is minted each cycle so a token leaked from a single run
@@ -565,24 +607,52 @@ func resolvePushLayer(runnerMode bool, explicit string) (string, error) {
 	return layer, nil
 }
 
+// WorstCaseCycle computes the maximum wall-clock time a synthetic check can
+// consume in one CronJob pod when all retry attempts are exhausted.
+//
+// perAttempt is the sum of all per-attempt timeouts for the check being
+// measured. For pod_lifecycle that is readyTimeout + destroyTimeout. For
+// runner_smoke it is readyTimeout + runTimeout + destroyTimeout. overhead
+// (60 s) covers pre-clean HTTP round-trips, Pushgateway push, and logging;
+// it is fixed and intentionally not caller-configurable so the guard cannot
+// be silently weakened.
+//
+// The result must stay below the CronJob schedule. When concurrencyPolicy is
+// Forbid, a run that exceeds the schedule causes the NEXT cycle to be
+// silently skipped — during exactly the vCenter degradation that the retry
+// facility exists to absorb.
+func WorstCaseCycle(perAttempt, backoff time.Duration, attempts int) time.Duration {
+	if attempts < 1 {
+		attempts = 1
+	}
+	const overhead = 60 * time.Second
+	return time.Duration(attempts)*perAttempt +
+		time.Duration(attempts-1)*backoff + overhead
+}
+
 // lifecycleSafeTimeout returns a CheckTimeout that fits the most expensive
-// registered check. pod_lifecycle can legitimately run for ~10 minutes and
-// runner_smoke for ~20 minutes; the per-check timeout MUST exceed those sums
-// or the checks will always fail mid-run.
+// registered check per single attempt. pod_lifecycle can legitimately run for
+// up to ~3.5 minutes and runner_smoke for ~14.5 minutes per attempt (with
+// readyTimeout=150s for lifecycle, readyTimeout=2m + runTimeout=10m for
+// runner); the per-check timeout MUST exceed those per-attempt sums or checks
+// will always fail mid-run.
+//
+// The retry loop itself is NOT accounted for here — the runner's retry loop
+// in runOne calls execOnce repeatedly, each with this CheckTimeout as the
+// per-attempt ceiling.
 //
 // It takes the MAXIMUM envelope over every registered check rather than
 // returning on the first match. Returning early makes the result depend on
 // registration order, so a future change that registers pod_lifecycle and
-// runner_smoke together would hand runner_smoke an 11-minute budget for a
-// 21-minute job — and it would fail every single cycle with a timeout that
-// looks exactly like a genuinely broken Kali runner.
+// runner_smoke together would hand runner_smoke an inadequate budget.
 func lifecycleSafeTimeout(base time.Duration, all []synthetic.Check) time.Duration {
-	// Worst-case envelopes for the default configs:
-	//   pod_lifecycle: 8m ready + 90s destroy + ~90s pre-clean + HTTP overhead
-	//   runner_smoke:  8m ready + 10m run + 90s destroy + ~90s pre-clean + overhead
+	// Per-attempt envelopes (= readyTimeout + destroyTimeout + ~60s overhead,
+	// or readyTimeout + runTimeout + destroyTimeout + ~60s for runner_smoke).
+	// pod_lifecycle: 150s + 90s + 60s = 300s = 5 min
+	// runner_smoke:  120s + 600s + 90s + 60s = 870s ≈ 15 min
 	envelopes := map[string]time.Duration{
-		"pod_lifecycle": 11 * time.Minute,
-		"runner_smoke":  21 * time.Minute,
+		"pod_lifecycle": 5 * time.Minute,
+		"runner_smoke":  15 * time.Minute,
 	}
 
 	longest := base
@@ -592,6 +662,38 @@ func lifecycleSafeTimeout(base time.Duration, all []synthetic.Check) time.Durati
 		}
 	}
 	return longest
+}
+
+// hasPodLifecycle reports whether the active check list contains pod_lifecycle.
+func hasPodLifecycle(all []synthetic.Check) bool {
+	for _, c := range all {
+		if c.Name() == "pod_lifecycle" {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveRetryConfig reads max-attempts and backoff from the environment,
+// falling back to DefaultRetryConfig values. Returns an error only for
+// unparseable durations — missing values use the defaults.
+func resolveRetryConfig(getenv func(string) string, attemptsEnv, backoffEnv string) (synthetic.RetryConfig, error) {
+	cfg := synthetic.DefaultRetryConfig()
+	if v := getenv(attemptsEnv); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return cfg, fmt.Errorf("invalid %s=%q: must be a positive integer", attemptsEnv, v)
+		}
+		cfg.MaxAttempts = n
+	}
+	if v := getenv(backoffEnv); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("invalid %s=%q: %w", backoffEnv, v, err)
+		}
+		cfg.Backoff = d
+	}
+	return cfg, nil
 }
 
 // probeSyntheticUser hits /auth/me once at startup. A 404 means the
