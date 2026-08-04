@@ -100,6 +100,24 @@ func main() {
 		logger.Info("vCenter folder enumeration enabled", "folder", cfg.VCenter.TemplatesFolder)
 	}
 
+	// Preflight checks for the template wizard. Without this call the gate in
+	// AdminProvisionTemplate silently passes everything and
+	// AdminPreflightTemplate returns 503 — see TestPreflightIsWiredInMain.
+	if vc, ok := vcClient.(*vcenter.Client); ok && vc != nil {
+		handler.WithPreflightVCenter(vc, handlers.PreflightConfig{
+			DatastoreName:               cfg.VCenter.Datastore,
+			TemplateFolder:              cfg.VCenter.TemplatesFolder,
+			ConfiguredResourcePoolPaths: cfg.VCenter.ResourcePools,
+		})
+		logger.Info("template preflight checks enabled",
+			"datastore", cfg.VCenter.Datastore,
+			"folder", cfg.VCenter.TemplatesFolder,
+			"resource_pools", len(cfg.VCenter.ResourcePools))
+	} else {
+		logger.Warn("template preflight checks DISABLED — vCenter not connected; " +
+			"provisioning will not be gated by preflight")
+	}
+
 	var pipeline *provisioner.PipelineMetrics
 	if cfg.ObjectStore.Endpoint != "" {
 		if pgURL := os.Getenv("PIPELINE_PUSHGATEWAY_URL"); pgURL != "" {
