@@ -637,3 +637,54 @@ func TestParseDryRunEnv_UnrecognisedBranch(t *testing.T) {
 		}
 	}
 }
+
+// TestEvaluatorHandlesPartialToolsStatusResult is the caller-level regression
+// test for the idle-evaluator bulk-query bug (production: "skipping all VMs
+// this tick").
+//
+// Before the fix: QueryVMToolsStatusBulk returned an error when any moref was
+// deleted, causing the evaluator to skip every VM for the tick. After the fix:
+// the bulk query returns a partial map (deleted VMs absent), and the evaluator
+// evaluates the VMs that are present.
+//
+// This test injects the result that the FIXED QueryVMToolsStatusBulk produces:
+// the alive VM is in the tools map; the stale/deleted moref is absent. The
+// evaluator must process the alive VM and skip the absent one as ToolsMissing.
+func TestEvaluatorHandlesPartialToolsStatusResult(t *testing.T) {
+	const (
+		aliveMoref = "vm-alive"
+		deadMoref  = "vm-dead-stale" // stale row in DB, VM no longer in vCenter
+	)
+
+	aliveCandidate := makeCandidate(aliveMoref, pastTime(8*time.Hour))
+	deadCandidate := makeCandidate(deadMoref, pastTime(8*time.Hour))
+
+	db := newFakeDB()
+	db.candidates = []database.IdleSuspendCandidate{aliveCandidate, deadCandidate}
+
+	vc := newFakeVC()
+	// Simulate the result of the FIXED QueryVMToolsStatusBulk: returns Tools=true
+	// for the alive VM; the deleted VM is absent from the map (not an error).
+	vc.toolsRunning[aliveMoref] = true
+	// deadMoref intentionally absent — absent = Tools-not-running (guard 4)
+
+	vc.perfSamples[aliveMoref] = idleSample()
+	// No perf sample for deadMoref; it never passes guard 4 anyway.
+
+	counts, err := evaluateIdleVMs(context.Background(), vc, db, nil, IdleEvaluatorConfig{DryRun: false})
+	if err != nil {
+		t.Fatalf("evaluator must not fail when QueryVMToolsStatusBulk returns a partial result: %v", err)
+	}
+
+	// The tick must complete and evaluate the surviving VM.
+	if counts.Suspended != 1 {
+		t.Errorf("expected alive VM to be suspended (idle 8h, both signals met), got Suspended=%d", counts.Suspended)
+	}
+	// The stale-moref candidate must be counted as ToolsMissing (absent = guard 4).
+	if counts.ToolsMissing != 1 {
+		t.Errorf("expected stale-moref VM to be counted as ToolsMissing, got ToolsMissing=%d", counts.ToolsMissing)
+	}
+	if counts.Errors != 0 {
+		t.Errorf("expected 0 errors for a partial-tools-map tick, got %d", counts.Errors)
+	}
+}

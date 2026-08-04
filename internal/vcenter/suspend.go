@@ -7,6 +7,7 @@ package vcenter
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/vmware/govmomi/object"
@@ -152,12 +153,25 @@ func (c *Client) SamplePodVMPerf(ctx context.Context, morefs []string) (map[stri
 	return result, nil
 }
 
+// vmPropertyRetriever is the narrow interface used by QueryVMToolsStatusBulk
+// for both the bulk and per-moref fallback retrieval steps.
+// property.DefaultCollector satisfies it. Tests inject a fake to exercise the
+// deleted-VM fallback path without a full govmomi simulator.
+type vmPropertyRetriever interface {
+	Retrieve(ctx context.Context, objs []types.ManagedObjectReference, ps []string, dst interface{}) error
+}
+
 // QueryVMToolsStatusBulk fetches guest.toolsRunningStatus for all morefs in a
 // SINGLE PropertyCollector Retrieve call. Returns a map from MoRef value to
 // true (Tools running) or false (Tools not running or not installed).
 //
 // A moref absent from the result (e.g. VM deleted between the DB query and the
 // vCenter call) is treated by callers as Tools-not-running.
+//
+// If the bulk call fails because one or more VMs have already been deleted,
+// the function falls back to per-moref retrieval and omits the deleted refs
+// from the result rather than returning an error. Only genuine non-deleted
+// failures (auth errors, network problems, etc.) are propagated as errors.
 func (c *Client) QueryVMToolsStatusBulk(ctx context.Context, morefs []string) (map[string]bool, error) {
 	if len(morefs) == 0 {
 		return map[string]bool{}, nil
@@ -171,20 +185,82 @@ func (c *Client) QueryVMToolsStatusBulk(ctx context.Context, morefs []string) (m
 		refs[i] = types.ManagedObjectReference{Type: "VirtualMachine", Value: m}
 	}
 
-	var vms []mo.VirtualMachine
+	// withRetry handles session expiry (NotAuthenticated). Deleted-object
+	// errors are not retryable and pass through; retrieveVMToolsStatus handles
+	// them in the fallback path.
+	var result map[string]bool
 	retryErr := c.withRetry(ctx, "query VM tools status bulk", func() error {
 		pc := property.DefaultCollector(c.client.Client)
-		return pc.Retrieve(ctx, refs, []string{"guest.toolsRunningStatus"}, &vms)
+		var err error
+		result, err = retrieveVMToolsStatus(ctx, refs, pc, c.logger)
+		return err
 	})
-	if retryErr != nil {
-		return nil, fmt.Errorf("bulk tools status query: %w", retryErr)
+	return result, retryErr
+}
+
+// retrieveVMToolsStatus is the testable implementation behind QueryVMToolsStatusBulk.
+//
+// Fast path: issues a single bulk Retrieve over all refs (one PropertyCollector
+// round-trip). If that succeeds, returns immediately without a fallback.
+//
+// Degraded path: if the bulk call fails with a deleted-object fault (which real
+// vCenter returns when any moref in the batch refers to a destroyed VM), falls
+// back to per-moref retrieval. Refs that fail with a deleted-object error are
+// silently omitted from the result (absent = treated as Tools-not-running by
+// callers). Any non-deleted error is returned immediately as a hard failure so
+// genuine problems (auth, connectivity) still surface.
+func retrieveVMToolsStatus(
+	ctx context.Context,
+	refs []types.ManagedObjectReference,
+	retr vmPropertyRetriever,
+	logger *slog.Logger,
+) (map[string]bool, error) {
+	// Fast path: single bulk Retrieve (one PropertyCollector round-trip).
+	var vms []mo.VirtualMachine
+	err := retr.Retrieve(ctx, refs, []string{"guest.toolsRunningStatus"}, &vms)
+	if err == nil {
+		return vmToolsStatusMap(vms), nil
+	}
+	if !isAlreadyDeletedErr(err) {
+		// Hard failure — auth error, connection error, etc. Surface it.
+		return nil, fmt.Errorf("bulk tools status query: %w", err)
 	}
 
+	// Degraded path: at least one moref refers to a deleted VM. Retrieve
+	// per-moref so we return results for the VMs that still exist.
+	logger.Warn("bulk VM tools status query: encountered deleted VM reference, falling back to per-moref",
+		"total_refs", len(refs))
+
+	result := make(map[string]bool, len(refs))
+	skipped := 0
+	for _, ref := range refs {
+		var single []mo.VirtualMachine
+		if perErr := retr.Retrieve(ctx, []types.ManagedObjectReference{ref},
+			[]string{"guest.toolsRunningStatus"}, &single); perErr != nil {
+			if isAlreadyDeletedErr(perErr) {
+				skipped++
+				continue
+			}
+			return nil, fmt.Errorf("bulk tools status query: %w", perErr)
+		}
+		for i := range single {
+			running := single[i].Guest != nil &&
+				single[i].Guest.ToolsRunningStatus == string(types.VirtualMachineToolsRunningStatusGuestToolsRunning)
+			result[single[i].Self.Value] = running
+		}
+	}
+	logger.Warn("bulk VM tools status fallback complete",
+		"skipped_deleted", skipped, "total_refs", len(refs))
+	return result, nil
+}
+
+// vmToolsStatusMap builds a moref-value→running map from a []mo.VirtualMachine slice.
+func vmToolsStatusMap(vms []mo.VirtualMachine) map[string]bool {
 	result := make(map[string]bool, len(vms))
 	for i := range vms {
 		running := vms[i].Guest != nil &&
 			vms[i].Guest.ToolsRunningStatus == string(types.VirtualMachineToolsRunningStatusGuestToolsRunning)
 		result[vms[i].Self.Value] = running
 	}
-	return result, nil
+	return result
 }
