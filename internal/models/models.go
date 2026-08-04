@@ -25,22 +25,22 @@ type User struct {
 
 // Template represents a VM template available for provisioning.
 type Template struct {
-	ID              uuid.UUID  `json:"id" db:"id"`
-	Name            string     `json:"name" db:"name"`
-	VCenterTemplate string     `json:"vcenter_template" db:"vcenter_template"`
-	OSType          string     `json:"os_type" db:"os_type"`
-	DefaultVCPUs    int        `json:"default_vcpus" db:"default_vcpus"`
-	DefaultRAMMB    int        `json:"default_ram_mb" db:"default_ram_mb"`
-	DefaultDiskGB   int        `json:"default_disk_gb" db:"default_disk_gb"`
-	MinVCPUs        int        `json:"min_vcpus" db:"min_vcpus"`
-	MinRAMMB        int        `json:"min_ram_mb" db:"min_ram_mb"`
-	Description     string     `json:"description" db:"description"`
-	IconURL         string     `json:"icon_url" db:"icon_url"`
-	DefaultUsername string     `json:"default_username" db:"default_username"`
-	DefaultPassword string     `json:"default_password" db:"default_password"`
-	Kind            string     `json:"kind" db:"kind"`
-	AssignIP        bool       `json:"assign_ip" db:"assign_ip"`
-	IsActive        bool       `json:"is_active" db:"is_active"`
+	ID              uuid.UUID `json:"id" db:"id"`
+	Name            string    `json:"name" db:"name"`
+	VCenterTemplate string    `json:"vcenter_template" db:"vcenter_template"`
+	OSType          string    `json:"os_type" db:"os_type"`
+	DefaultVCPUs    int       `json:"default_vcpus" db:"default_vcpus"`
+	DefaultRAMMB    int       `json:"default_ram_mb" db:"default_ram_mb"`
+	DefaultDiskGB   int       `json:"default_disk_gb" db:"default_disk_gb"`
+	MinVCPUs        int       `json:"min_vcpus" db:"min_vcpus"`
+	MinRAMMB        int       `json:"min_ram_mb" db:"min_ram_mb"`
+	Description     string    `json:"description" db:"description"`
+	IconURL         string    `json:"icon_url" db:"icon_url"`
+	DefaultUsername string    `json:"default_username" db:"default_username"`
+	DefaultPassword string    `json:"default_password" db:"default_password"`
+	Kind            string    `json:"kind" db:"kind"`
+	AssignIP        bool      `json:"assign_ip" db:"assign_ip"`
+	IsActive        bool      `json:"is_active" db:"is_active"`
 	// IsInternal flags fixture / synthetic templates (e.g. synthetic-noop
 	// used by the lifecycle monitor) so they're hidden from the public
 	// /api/templates listing while still being resolvable by ID from
@@ -291,21 +291,21 @@ type TemplateAccess struct {
 
 // Pod represents a student's isolated environment (1 VLAN + N VMs).
 type Pod struct {
-	ID           uuid.UUID  `json:"id" db:"id"`
-	OwnerID      uuid.UUID  `json:"owner_id" db:"owner_id"`
-	Name         string     `json:"name" db:"name"`
-	Salt         string     `json:"salt" db:"salt"`
-	VLANID       int        `json:"vlan_id" db:"vlan_id"`
-	Subnet       string     `json:"subnet" db:"subnet"`
-	Status       string     `json:"status" db:"status"`
-	ErrorMessage *string    `json:"error_message,omitempty" db:"error_message"`
+	ID               uuid.UUID  `json:"id" db:"id"`
+	OwnerID          uuid.UUID  `json:"owner_id" db:"owner_id"`
+	Name             string     `json:"name" db:"name"`
+	Salt             string     `json:"salt" db:"salt"`
+	VLANID           int        `json:"vlan_id" db:"vlan_id"`
+	Subnet           string     `json:"subnet" db:"subnet"`
+	Status           string     `json:"status" db:"status"`
+	ErrorMessage     *string    `json:"error_message,omitempty" db:"error_message"`
 	ExpiresAt        *time.Time `json:"expires_at,omitempty" db:"expires_at"`
 	BlueprintID      *uuid.UUID `json:"blueprint_id,omitempty" db:"blueprint_id"`
 	AllowVMAdditions bool       `json:"allow_vm_additions" db:"allow_vm_additions"`
 	CreatedAt        time.Time  `json:"created_at" db:"created_at"`
-	UpdatedAt    time.Time  `json:"updated_at" db:"updated_at"`
-	VMs          []PodVM    `json:"vms,omitempty"`
-	Owner        *User      `json:"owner,omitempty"`
+	UpdatedAt        time.Time  `json:"updated_at" db:"updated_at"`
+	VMs              []PodVM    `json:"vms,omitempty"`
+	Owner            *User      `json:"owner,omitempty"`
 }
 
 // PodVM represents a virtual machine within a pod.
@@ -329,6 +329,11 @@ type PodVM struct {
 	CreatedAt         time.Time `json:"created_at" db:"created_at"`
 	TemplateName      string    `json:"template_name,omitempty"`
 	OSType            string    `json:"os_type,omitempty"`
+	// Activity tracking — set by migration 000025.
+	LastConsoleAt  *time.Time `json:"last_console_at,omitempty" db:"last_console_at"`
+	LastActivityAt *time.Time `json:"last_activity_at,omitempty" db:"last_activity_at"`
+	SuspendedAt    *time.Time `json:"suspended_at,omitempty" db:"suspended_at"`
+	SuspendReason  *string    `json:"suspend_reason,omitempty" db:"suspend_reason"`
 }
 
 // VMSnapshot represents a point-in-time snapshot of a VM.
@@ -435,13 +440,13 @@ type VLANPoolEntry struct {
 
 // Pod status constants.
 const (
-	PodStatusPending        = "pending"
-	PodStatusProvisioning   = "provisioning"
-	PodStatusActive         = "active"
-	PodStatusDestroying     = "destroying"
-	PodStatusDestroyFailed  = "destroy_failed"
-	PodStatusDestroyed      = "destroyed"
-	PodStatusError          = "error"
+	PodStatusPending       = "pending"
+	PodStatusProvisioning  = "provisioning"
+	PodStatusActive        = "active"
+	PodStatusDestroying    = "destroying"
+	PodStatusDestroyFailed = "destroy_failed"
+	PodStatusDestroyed     = "destroyed"
+	PodStatusError         = "error"
 )
 
 // VM status constants.
@@ -451,17 +456,18 @@ const (
 	VMStatusConfiguring = "configuring"
 	VMStatusRunning     = "running"
 	VMStatusStopped     = "stopped"
+	VMStatusSuspended   = "suspended" // saved-state checkpoint, resumable via vm_start
 	VMStatusError       = "error"
 	VMStatusDeleted     = "deleted"
 )
 
 // Job type constants.
 const (
-	JobTypePodCreate  = "pod_create"
-	JobTypePodDestroy = "pod_destroy"
-	JobTypeVMStart    = "vm_start"
-	JobTypeVMStop     = "vm_stop"
-	JobTypeVMRestart  = "vm_restart"
+	JobTypePodCreate        = "pod_create"
+	JobTypePodDestroy       = "pod_destroy"
+	JobTypeVMStart          = "vm_start"
+	JobTypeVMStop           = "vm_stop"
+	JobTypeVMRestart        = "vm_restart"
 	JobTypeVMDestroy        = "vm_destroy"
 	JobTypeVMAdd            = "vm_add"
 	JobTypeVMReset          = "vm_reset"
@@ -482,16 +488,21 @@ const (
 	// OVAs are deployed via OVF import into the Templates folder. Payload
 	// is provisioner.ImageImportPayload.
 	JobTypeImageImport = "image_import"
+
+	// JobTypeVMSuspend saves a VM's state to disk and parks it, freeing
+	// cluster resources. The VM can be resumed via a normal vm_start job
+	// (PowerOnVM resumes from suspend). Payload is provisioner.SuspendVMPayload.
+	JobTypeVMSuspend = "vm_suspend"
 )
 
 // Job status constants.
 const (
-	JobStatusPending   = "pending"
-	JobStatusClaimed   = "claimed"
+	JobStatusPending    = "pending"
+	JobStatusClaimed    = "claimed"
 	JobStatusInProgress = "in_progress"
-	JobStatusCompleted = "completed"
-	JobStatusFailed    = "failed"
-	JobStatusRollback  = "rollback"
+	JobStatusCompleted  = "completed"
+	JobStatusFailed     = "failed"
+	JobStatusRollback   = "rollback"
 )
 
 // User role constants.

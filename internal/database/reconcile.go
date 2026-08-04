@@ -108,3 +108,143 @@ func (q *Queries) ListPodVMLinksByVCenterID(ctx context.Context) (map[string]Pod
 	}
 	return out, rows.Err()
 }
+
+// ---------- Idle-suspend support (migration 000025) ----------
+
+// IdleSuspendCandidate is the minimal per-VM information the idle evaluator
+// needs. It avoids loading every PodVM column on every reconcile tick.
+type IdleSuspendCandidate struct {
+	PodVMID        uuid.UUID
+	PodID          uuid.UUID
+	PodStatus      string
+	VCenterVMID    string
+	DisplayName    string
+	LastActivityAt *time.Time // nil means no activity recorded since migration
+}
+
+// ListRunningPodVMsForIdleEval returns running pod_vms that belong to active
+// pods and have a vCenter reference. These are the candidates the idle
+// evaluator inspects on each tick.
+func (q *Queries) ListRunningPodVMsForIdleEval(ctx context.Context) ([]IdleSuspendCandidate, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT pv.id, pv.pod_id, p.status, pv.vcenter_vm_id,
+		       pv.display_name, pv.last_activity_at
+		FROM pod_vms pv
+		JOIN pods p ON pv.pod_id = p.id
+		WHERE pv.status = 'running'
+		  AND p.status = 'active'
+		  AND pv.vcenter_vm_id IS NOT NULL AND pv.vcenter_vm_id <> ''
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []IdleSuspendCandidate
+	for rows.Next() {
+		var c IdleSuspendCandidate
+		if err := rows.Scan(&c.PodVMID, &c.PodID, &c.PodStatus,
+			&c.VCenterVMID, &c.DisplayName, &c.LastActivityAt); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// TouchVMConsoleAt records a console-session activity timestamp. Called by the
+// WebMKS proxy on WS open, every heartbeat interval, and on WS close. Both
+// last_console_at and last_activity_at are set to t so the idle evaluator sees
+// the VM as recently active.
+func (q *Queries) TouchVMConsoleAt(ctx context.Context, id uuid.UUID, t time.Time) error {
+	_, err := q.pool.Exec(ctx, `
+		UPDATE pod_vms
+		SET last_console_at  = $2,
+		    last_activity_at = $2
+		WHERE id = $1
+	`, id, t)
+	return err
+}
+
+// TouchVMActivityAt updates only last_activity_at. Called by the idle evaluator
+// when it observes above-threshold CPU or network utilisation for a VM, keeping
+// the clock fresh without touching last_console_at.
+func (q *Queries) TouchVMActivityAt(ctx context.Context, id uuid.UUID, t time.Time) error {
+	_, err := q.pool.Exec(ctx, `
+		UPDATE pod_vms SET last_activity_at = $2 WHERE id = $1
+	`, id, t)
+	return err
+}
+
+// SetVMSuspended marks a VM as suspended, recording the timestamp and reason.
+func (q *Queries) SetVMSuspended(ctx context.Context, id uuid.UUID, t time.Time, reason string) error {
+	_, err := q.pool.Exec(ctx, `
+		UPDATE pod_vms
+		SET status         = 'suspended',
+		    suspended_at   = $2,
+		    suspend_reason = $3
+		WHERE id = $1
+	`, id, t, reason)
+	return err
+}
+
+// ClearVMSuspendedAt clears suspend metadata when a VM is powered on again.
+func (q *Queries) ClearVMSuspendedAt(ctx context.Context, id uuid.UUID) error {
+	_, err := q.pool.Exec(ctx, `
+		UPDATE pod_vms
+		SET suspended_at = NULL, suspend_reason = NULL
+		WHERE id = $1
+	`, id)
+	return err
+}
+
+// HasActiveJobForVM reports whether any non-terminal job is currently
+// targeting this VM (keyed by pod_vm_id in the JSON payload). Used as a
+// suspension guard: suspending a VM mid-job would leave the job in a
+// permanently broken state.
+func (q *Queries) HasActiveJobForVM(ctx context.Context, podVMID uuid.UUID) (bool, error) {
+	var exists bool
+	err := q.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM jobs
+			WHERE payload->>'pod_vm_id' = $1
+			  AND status NOT IN ('completed', 'failed')
+		)
+	`, podVMID.String()).Scan(&exists)
+	return exists, err
+}
+
+// HasInFlightRunForVM reports whether an assessment run is currently executing
+// against this VM as its target. Used as a suspension guard: suspending a VM
+// during a graded assessment run would corrupt the result.
+func (q *Queries) HasInFlightRunForVM(ctx context.Context, podVMID uuid.UUID) (bool, error) {
+	var exists bool
+	err := q.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM runs
+			WHERE target_pod_vm_id = $1
+			  AND status NOT IN ('completed', 'failed', 'cancelled', 'timeout')
+		)
+	`, podVMID).Scan(&exists)
+	return exists, err
+}
+
+// GetIdleTimeoutSeconds returns the effective idle timeout in seconds for the
+// given pod. It returns the per-pod override if one exists in suspend_settings,
+// the global default otherwise, and 21600 (6 hours) if no rows exist at all.
+func (q *Queries) GetIdleTimeoutSeconds(ctx context.Context, podID uuid.UUID) (int, error) {
+	var secs int
+	err := q.pool.QueryRow(ctx, `
+		SELECT COALESCE(
+			(SELECT idle_timeout_seconds FROM suspend_settings
+			 WHERE scope = 'pod' AND scope_id = $1),
+			(SELECT idle_timeout_seconds FROM suspend_settings
+			 WHERE scope = 'global'),
+			21600
+		)
+	`, podID).Scan(&secs)
+	if err != nil {
+		return 21600, err
+	}
+	return secs, nil
+}

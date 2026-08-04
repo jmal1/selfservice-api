@@ -23,12 +23,12 @@ import (
 
 // Provisioner orchestrates pod lifecycle operations.
 type Provisioner struct {
-	db       *database.Queries
-	vc       *vcenter.Client
-	opn      *opnsense.Client
-	opnSSH   *opnsense.SSHClient
-	nats     *events.Client
-	logger   *slog.Logger
+	db     *database.Queries
+	vc     *vcenter.Client
+	opn    *opnsense.Client
+	opnSSH *opnsense.SSHClient
+	nats   *events.Client
+	logger *slog.Logger
 
 	// DestroyFailedPusher is optional. When set, RetryFailedDestroys pushes
 	// the current count to Pushgateway so the
@@ -114,6 +114,8 @@ func (p *Provisioner) ProcessJob(ctx context.Context, job *models.Job) error {
 		err = p.VerifyTemplate(ctx, job)
 	case models.JobTypeImageImport:
 		err = p.ImportImage(ctx, job)
+	case models.JobTypeVMSuspend:
+		err = p.SuspendVM(ctx, job)
 	default:
 		err = fmt.Errorf("unknown job type: %s", job.Type)
 	}
@@ -553,9 +555,9 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 	p.publishProgress(job.ID, "vm_poweron", "Powering on VMs")
 
 	type vmPowerInfo struct {
-		index   int
-		vmSpec  VMSpec
-		moref   string
+		index  int
+		vmSpec VMSpec
+		moref  string
 	}
 
 	// Group cloned VMs by boot order
