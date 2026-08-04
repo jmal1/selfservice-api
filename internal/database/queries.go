@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -41,12 +42,28 @@ var ErrTemplateStale = errors.New("template was modified by another user")
 // already moved the row. Handlers should surface HTTP 409.
 var ErrImageUploadStale = errors.New("image upload is not in the expected state")
 
+var ErrTemplateNotFound = errors.New("template not found")
+var ErrBlueprintNotFound = errors.New("blueprint not found")
+
+// TemplatePinOrderClause is the canonical ordering for template lists (migration 000030).
+// Pinned items appear first (ordered by pin_order, then pinned_at), then unpinned items (by name).
+// The CASE expressions ensure unpinned rows sort by 0/NULL, preventing spurious ordering.
+const TemplatePinOrderClause = `ORDER BY t.pinned DESC, ` +
+	`CASE WHEN t.pinned THEN t.pin_order ELSE 0 END ASC, ` +
+	`CASE WHEN t.pinned THEN t.pinned_at ELSE NULL END DESC NULLS LAST, t.name ASC`
+
+// BlueprintPinOrderClause is the canonical ordering for blueprint lists (migration 000030).
+const BlueprintPinOrderClause = `ORDER BY b.pinned DESC, ` +
+	`CASE WHEN b.pinned THEN b.pin_order ELSE 0 END ASC, ` +
+	`CASE WHEN b.pinned THEN b.pinned_at ELSE NULL END DESC NULLS LAST, b.name ASC`
+
 // templateSelectCols is the canonical list of columns returned by every
 // Template SELECT / INSERT RETURNING / UPDATE RETURNING. Keep in lockstep
 // with scanTemplate so the order matches the Scan() argument list.
 // Migration 000018 added template_state, created_by, vcenter_vm_id,
 // source_type, source_ref, staging_network. Migration 000019 added
-// is_internal. Migration 000029 added visibility.
+// is_internal. Migration 000029 added visibility. Migration 000030 added
+// pinning support (pinned, pin_order, pinned_at, pinned_by).
 const templateSelectCols = `id, name, vcenter_template, os_type, default_vcpus, default_ram_mb,
 		default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''),
 		default_username, default_password, kind, assign_ip, is_active,
@@ -54,7 +71,8 @@ const templateSelectCols = `id, name, vcenter_template, os_type, default_vcpus, 
 		is_internal, visibility,
 		unattend_mode, unattend_config, guest_id,
 		created_at, updated_at,
-		trust_tier, last_validated_at, last_validation_result`
+		trust_tier, last_validated_at, last_validation_result,
+		pinned, pin_order, pinned_at, pinned_by`
 
 // scanTemplate populates t from a row whose columns are in templateSelectCols
 // order. Centralizes the column ordering so adding a column in the future
@@ -69,6 +87,7 @@ func scanTemplate(row pgx.Row, t *models.Template) error {
 		&t.UnattendMode, &t.UnattendConfig, &t.GuestID,
 		&t.CreatedAt, &t.UpdatedAt,
 		&t.TrustTier, &t.LastValidatedAt, &t.LastValidationResult,
+		&t.Pinned, &t.PinOrder, &t.PinnedAt, &t.PinnedBy,
 	)
 }
 
@@ -213,12 +232,17 @@ func (q *Queries) CreateTemplate(ctx context.Context, req models.CreateTemplateR
 // role and visibility. A template is visible if all of the following hold:
 //
 //   - it has no template_access rules (open to all) OR
+//
 //   - the user's role appears in template_access.role OR
+//
 //   - the user's id appears in template_access.user_id OR
+//
 //   - 'admin' appears in template_access.role (admins see everything)
 //
-//   AND for students only:
+//     AND for students only:
+//
 //   - visibility = 'public' (instructor_only templates hidden from students)
+//
 //   - (unless is_internal is true AND user has explicit per-user access)
 //
 // Instructors and admins see all templates regardless of visibility.
@@ -227,6 +251,9 @@ func (q *Queries) CreateTemplate(ctx context.Context, req models.CreateTemplateR
 // the unqualified `templateSelectCols` const) is unambiguous. The previous
 // LEFT JOIN form silently broke once a real template_access row existed
 // because `id` resolves to both templates.id and template_access.id.
+// The order clause implements the pinning sort order: pinned items first
+// (ordered by pin_order ASC, then pinned_at DESC), then unpinned items (by name).
+// This ensures a deterministic, stable sort that doesn't reshuffle between requests.
 func (q *Queries) ListTemplatesForUser(ctx context.Context, userID uuid.UUID, role string) ([]models.Template, error) {
 	// Build visibility filter: students see only 'public', instructors/admins see all
 	visibilityFilter := ""
@@ -243,7 +270,7 @@ func (q *Queries) ListTemplatesForUser(ctx context.Context, userID uuid.UUID, ro
 		       OR EXISTS (SELECT 1 FROM template_access ta
 		                  WHERE ta.template_id = t.id
 		                    AND (ta.role = $1 OR ta.user_id = $2 OR ta.role = 'admin')))
-		ORDER BY t.name
+		`+TemplatePinOrderClause+`
 	`, role, userID)
 	if err != nil {
 		return nil, err
@@ -287,11 +314,14 @@ func (q *Queries) ListExplicitTemplateAccessForUser(ctx context.Context, userID 
 	return out, nil
 }
 
-// ListAllTemplates returns all templates (admin).
+// ListAllTemplates returns all templates (admin). Uses the same pinning sort
+// order as ListTemplatesForUser: pinned items first (by pin_order, then pinned_at),
+// then unpinned items (by name).
 func (q *Queries) ListAllTemplates(ctx context.Context) ([]models.Template, error) {
 	rows, err := q.pool.Query(ctx, `
 		SELECT `+templateSelectCols+`
-		FROM templates ORDER BY name
+		FROM templates 
+		`+TemplatePinOrderClause+`
 	`)
 	if err != nil {
 		return nil, err
@@ -1689,17 +1719,26 @@ func (q *Queries) ListExpiredPods(ctx context.Context) ([]uuid.UUID, error) {
 
 // --- Blueprints ---
 
+const blueprintSelectCols = `id, name, description, created_by, allow_vm_additions,
+		is_active, created_at, updated_at, pinned, pin_order, pinned_at, pinned_by`
+
+func scanBlueprint(row pgx.Row, b *models.Blueprint) error {
+	return row.Scan(
+		&b.ID, &b.Name, &b.Description, &b.CreatedBy, &b.AllowVMAdditions,
+		&b.IsActive, &b.CreatedAt, &b.UpdatedAt, &b.Pinned, &b.PinOrder, &b.PinnedAt, &b.PinnedBy,
+	)
+}
+
 // ListBlueprintsForUser returns blueprints accessible to a user based on their role.
 func (q *Queries) ListBlueprintsForUser(ctx context.Context, userID uuid.UUID, role string) ([]models.Blueprint, error) {
 	rows, err := q.pool.Query(ctx, `
-		SELECT DISTINCT b.id, b.name, b.description, b.created_by, b.allow_vm_additions,
-		       b.is_active, b.created_at, b.updated_at
+		SELECT DISTINCT `+blueprintSelectCols+`
 		FROM blueprints b
 		LEFT JOIN blueprint_access ba ON b.id = ba.blueprint_id
 		WHERE b.is_active = true
 		  AND (ba.role = $1 OR ba.user_id = $2 OR $1 = 'admin'
 		       OR NOT EXISTS (SELECT 1 FROM blueprint_access WHERE blueprint_id = b.id))
-		ORDER BY b.name
+		`+BlueprintPinOrderClause+`
 	`, role, userID)
 	if err != nil {
 		return nil, err
@@ -1709,10 +1748,7 @@ func (q *Queries) ListBlueprintsForUser(ctx context.Context, userID uuid.UUID, r
 	var blueprints []models.Blueprint
 	for rows.Next() {
 		var bp models.Blueprint
-		if err := rows.Scan(
-			&bp.ID, &bp.Name, &bp.Description, &bp.CreatedBy, &bp.AllowVMAdditions,
-			&bp.IsActive, &bp.CreatedAt, &bp.UpdatedAt,
-		); err != nil {
+		if err := scanBlueprint(rows, &bp); err != nil {
 			return nil, err
 		}
 		blueprints = append(blueprints, bp)
@@ -1730,15 +1766,16 @@ func (q *Queries) ListBlueprintsForUser(ctx context.Context, userID uuid.UUID, r
 	return blueprints, nil
 }
 
-// ListAllBlueprints returns all blueprints (admin).
+// ListAllBlueprints returns all blueprints (admin). Uses the same pinning sort
+// order as ListBlueprintsForUser: pinned items first (by pin_order, then pinned_at),
+// then unpinned items (by name).
 func (q *Queries) ListAllBlueprints(ctx context.Context) ([]models.Blueprint, error) {
 	rows, err := q.pool.Query(ctx, `
-		SELECT b.id, b.name, b.description, b.created_by, b.allow_vm_additions,
-		       b.is_active, b.created_at, b.updated_at,
+		SELECT `+blueprintSelectCols+`,
 		       u.id, u.username, u.email, COALESCE(u.display_name, ''), u.role
 		FROM blueprints b
 		JOIN users u ON u.id = b.created_by
-		ORDER BY b.name
+		`+BlueprintPinOrderClause+`
 	`)
 	if err != nil {
 		return nil, err
@@ -1751,7 +1788,7 @@ func (q *Queries) ListAllBlueprints(ctx context.Context) ([]models.Blueprint, er
 		var creator models.User
 		if err := rows.Scan(
 			&bp.ID, &bp.Name, &bp.Description, &bp.CreatedBy, &bp.AllowVMAdditions,
-			&bp.IsActive, &bp.CreatedAt, &bp.UpdatedAt,
+			&bp.IsActive, &bp.CreatedAt, &bp.UpdatedAt, &bp.Pinned, &bp.PinOrder, &bp.PinnedAt, &bp.PinnedBy,
 			&creator.ID, &creator.Username, &creator.Email, &creator.DisplayName, &creator.Role,
 		); err != nil {
 			return nil, err
@@ -1774,14 +1811,10 @@ func (q *Queries) ListAllBlueprints(ctx context.Context) ([]models.Blueprint, er
 // GetBlueprintByID retrieves a blueprint with its VMs.
 func (q *Queries) GetBlueprintByID(ctx context.Context, id uuid.UUID) (*models.Blueprint, error) {
 	var bp models.Blueprint
-	err := q.pool.QueryRow(ctx, `
-		SELECT id, name, description, created_by, allow_vm_additions,
-		       is_active, created_at, updated_at
+	err := scanBlueprint(q.pool.QueryRow(ctx, `
+		SELECT `+blueprintSelectCols+`
 		FROM blueprints WHERE id = $1
-	`, id).Scan(
-		&bp.ID, &bp.Name, &bp.Description, &bp.CreatedBy, &bp.AllowVMAdditions,
-		&bp.IsActive, &bp.CreatedAt, &bp.UpdatedAt,
-	)
+	`, id), &bp)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -1937,4 +1970,174 @@ func (q *Queries) SetBlueprintAccess(ctx context.Context, blueprintID uuid.UUID,
 	}
 
 	return tx.Commit(ctx)
+}
+
+// --- Pinning Support (migration 000030) ---
+
+// PinState represents the pin configuration for a template or blueprint.
+type PinState struct {
+	Pinned   bool
+	PinOrder int
+}
+
+// ReorderTemplates atomically updates pin state and ordering for a set of templates.
+// The pins map contains template IDs to desired pin state.
+// Returns an error if any template ID does not exist. All updates are atomic.
+func (q *Queries) ReorderTemplates(ctx context.Context, pins map[uuid.UUID]PinState, pinnedBy uuid.UUID) error {
+	if len(pins) == 0 {
+		return nil
+	}
+
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	// Sort keys for deterministic error reporting
+	ids := make([]uuid.UUID, 0, len(pins))
+	for id := range pins {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i].String() < ids[j].String() })
+
+	for _, id := range ids {
+		state := pins[id]
+		// Check that the template exists
+		var exists bool
+		err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM templates WHERE id = $1)`, id).Scan(&exists)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("%w: %s", ErrTemplateNotFound, id)
+		}
+
+		// Update the template's pin state
+		_, err = tx.Exec(ctx, `
+			UPDATE templates
+			SET pinned = $1,
+			    pin_order = $2,
+			    pinned_at = CASE WHEN $1 AND NOT pinned THEN now()
+			                     WHEN $1 THEN pinned_at
+			                     ELSE NULL END,
+			    pinned_by = CASE WHEN $1 AND NOT pinned THEN $3
+			                     WHEN $1 THEN pinned_by
+			                     ELSE NULL END
+			WHERE id = $4
+		`, state.Pinned, state.PinOrder, pinnedBy, id)
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit(ctx)
+}
+
+// ReorderBlueprints atomically updates pin state and ordering for a set of blueprints.
+// The pins map contains blueprint IDs to desired pin state.
+// Returns an error if any blueprint ID does not exist. All updates are atomic.
+func (q *Queries) ReorderBlueprints(ctx context.Context, pins map[uuid.UUID]PinState, pinnedBy uuid.UUID) error {
+	if len(pins) == 0 {
+		return nil
+	}
+
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	// Sort keys for deterministic error reporting
+	ids := make([]uuid.UUID, 0, len(pins))
+	for id := range pins {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i].String() < ids[j].String() })
+
+	for _, id := range ids {
+		state := pins[id]
+		// Check that the blueprint exists
+		var exists bool
+		err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM blueprints WHERE id = $1)`, id).Scan(&exists)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("%w: %s", ErrBlueprintNotFound, id)
+		}
+
+		// Update the blueprint's pin state
+		_, err = tx.Exec(ctx, `
+			UPDATE blueprints
+			SET pinned = $1,
+			    pin_order = $2,
+			    pinned_at = CASE WHEN $1 AND NOT pinned THEN now()
+			                     WHEN $1 THEN pinned_at
+			                     ELSE NULL END,
+			    pinned_by = CASE WHEN $1 AND NOT pinned THEN $3
+			                     WHEN $1 THEN pinned_by
+			                     ELSE NULL END
+			WHERE id = $4
+		`, state.Pinned, state.PinOrder, pinnedBy, id)
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit(ctx)
+}
+
+// SetTemplatePin sets or clears the pinned state of a single template.
+// If pin is true, sets pinned_by to the caller. On unpin, clears pinned_by and pinned_at.
+func (q *Queries) SetTemplatePin(ctx context.Context, templateID uuid.UUID, pinned bool, pinOrder int, pinnedBy uuid.UUID) error {
+	var exists bool
+	err := q.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM templates WHERE id = $1)`, templateID).Scan(&exists)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("%w: %s", ErrTemplateNotFound, templateID)
+	}
+
+	_, err = q.pool.Exec(ctx, `
+		UPDATE templates
+		SET pinned = $1,
+		    pin_order = $2,
+		    pinned_at = CASE WHEN $1 AND NOT pinned THEN now()
+		                     WHEN $1 THEN pinned_at
+		                     ELSE NULL END,
+		    pinned_by = CASE WHEN $1 AND NOT pinned THEN $3
+		                     WHEN $1 THEN pinned_by
+		                     ELSE NULL END
+		WHERE id = $4
+	`, pinned, pinOrder, pinnedBy, templateID)
+	return err
+}
+
+// SetBlueprintPin sets or clears the pinned state of a single blueprint.
+// If pin is true, sets pinned_by to the caller. On unpin, clears pinned_by and pinned_at.
+func (q *Queries) SetBlueprintPin(ctx context.Context, blueprintID uuid.UUID, pinned bool, pinOrder int, pinnedBy uuid.UUID) error {
+	var exists bool
+	err := q.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM blueprints WHERE id = $1)`, blueprintID).Scan(&exists)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("%w: %s", ErrBlueprintNotFound, blueprintID)
+	}
+
+	_, err = q.pool.Exec(ctx, `
+		UPDATE blueprints
+		SET pinned = $1,
+		    pin_order = $2,
+		    pinned_at = CASE WHEN $1 AND NOT pinned THEN now()
+		                     WHEN $1 THEN pinned_at
+		                     ELSE NULL END,
+		    pinned_by = CASE WHEN $1 AND NOT pinned THEN $3
+		                     WHEN $1 THEN pinned_by
+		                     ELSE NULL END
+		WHERE id = $4
+	`, pinned, pinOrder, pinnedBy, blueprintID)
+	return err
 }

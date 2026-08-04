@@ -83,6 +83,12 @@ type Template struct {
 	TrustTier            string     `json:"trust_tier" db:"trust_tier"`
 	LastValidatedAt      *time.Time `json:"last_validated_at,omitempty" db:"last_validated_at"`
 	LastValidationResult *string    `json:"last_validation_result,omitempty" db:"last_validation_result"`
+	// Pinning (migration 000030): instructors can pin templates to emphasize them.
+	// Pinned items appear in a dedicated section above the normal list.
+	Pinned   bool        `json:"pinned" db:"pinned"`
+	PinOrder int         `json:"pin_order" db:"pin_order"`
+	PinnedAt *time.Time  `json:"pinned_at,omitempty" db:"pinned_at"`
+	PinnedBy *uuid.UUID  `json:"pinned_by,omitempty" db:"pinned_by"`
 }
 
 // VCenterRef returns the vCenter reference to clone FROM for this
@@ -402,6 +408,12 @@ type Blueprint struct {
 	UpdatedAt        time.Time     `json:"updated_at" db:"updated_at"`
 	VMs              []BlueprintVM `json:"vms,omitempty"`
 	Creator          *User         `json:"creator,omitempty"`
+	// Pinning (migration 000030): instructors can pin blueprints to emphasize them.
+	// Pinned items appear in a dedicated section above the normal list.
+	Pinned   bool        `json:"pinned" db:"pinned"`
+	PinOrder int         `json:"pin_order" db:"pin_order"`
+	PinnedAt *time.Time  `json:"pinned_at,omitempty" db:"pinned_at"`
+	PinnedBy *uuid.UUID  `json:"pinned_by,omitempty" db:"pinned_by"`
 }
 
 // BlueprintVM defines a VM within a blueprint.
