@@ -71,6 +71,27 @@ type CreateTemplateDraftRequest struct {
 	UnattendConfig json.RawMessage `json:"unattend_config,omitempty"`
 }
 
+// ResolvedCredentials is the wire type for
+// GET /admin/templates/{id}/resolved-credentials.
+//
+// SECURITY: the raw password is NEVER included. HasPassword tells the UI
+// whether a password exists without exposing its value.
+//
+// Source indicates which rung of the resolution ladder provided the
+// credentials so the UI can show a context-aware message:
+//   - "template"        — default_username / default_password on the row
+//   - "unattend_config" — credentials parsed from the ISO build's unattend_config
+//   - "none"            — no complete pair was found; wizard must prompt
+//
+// ("request" is also a valid source but is only returned by the shared
+// helper when an explicit override is passed — it never appears on the
+// GET endpoint response.)
+type ResolvedCredentials struct {
+	Username    string `json:"username"`
+	HasPassword bool   `json:"has_password"`
+	Source      string `json:"source"`
+}
+
 // WizardStateResponse is what GET /admin/templates/:id/wizard-state returns.
 // The UI uses AllowedNextStates to decide which action buttons to render.
 //
@@ -178,6 +199,43 @@ func (h *Handler) AdminCreateTemplateDraft(w http.ResponseWriter, r *http.Reques
 	stagingNetwork := req.StagingNetwork
 	if stagingNetwork == "" {
 		stagingNetwork = "PG-VM-Lab" // canonical VLAN 30 staging port group present on every host
+	}
+
+	// For clone_template: inherit missing credentials from the source
+	// template so that a template-from-template workflow never silently
+	// produces a draft with an empty username. An explicitly supplied
+	// value in the request always wins over the inherited one.
+	//
+	// This block runs before the auth check (it is pure request
+	// validation + a single optional DB read) so that the guard can be
+	// exercised in unit tests without an auth context. The h.db nil
+	// guard makes those tests safe when the handler is constructed
+	// without a database (test-only path).
+	if req.SourceType == models.TemplateSourceCloneTemplate {
+		if (req.DefaultUsername == "" || req.DefaultPassword == "") && h.db != nil {
+			if srcID, parseErr := uuid.Parse(req.SourceRef); parseErr == nil {
+				if srcTmpl, _ := h.db.GetTemplateByID(r.Context(), srcID); srcTmpl != nil {
+					inheritSourceTemplateCredentials(&req, srcTmpl)
+				}
+			}
+		}
+		// Guard: a clone_template draft that still has an empty
+		// default_username will produce a pod nobody can log into —
+		// the same silent defect ValidateLinuxTemplateContract catches
+		// at publish time, but caught here instead so it never reaches
+		// the publish gate. iso is exempt (credentials arrive via
+		// unattend_config during the configuring phase); clone_vcenter
+		// is exempt (the author sets them during configuring). Only
+		// clone_template can be checked eagerly because we have the
+		// source row.
+		if req.DefaultUsername == "" {
+			http.Error(w,
+				"clone_template draft requires default_username: the source template has no "+
+					"default_username, so the derived template would be unloggable. "+
+					"Set default_username in the request or update the source template first.",
+				http.StatusBadRequest)
+			return
+		}
 	}
 
 	userID := middleware.UserIDFromContext(r.Context())
@@ -298,30 +356,7 @@ func (h *Handler) AdminGeneralizeTemplate(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	guestUser := req.GuestUsername
-	if guestUser == "" {
-		guestUser = tmpl.DefaultUsername
-	}
-	guestPass := req.GuestPassword
-	if guestPass == "" {
-		guestPass = tmpl.DefaultPassword
-	}
-	// Last resort: an unattended ISO build baked its own credentials into the
-	// guest from unattend_config, and that is the authoritative record of what
-	// the account actually is. Demanding the operator re-enter credentials the
-	// platform generated itself is both pointless and error-prone -- they are
-	// not shown anywhere in the wizard, so the only way to satisfy the old
-	// check was to read them back out of the database by hand.
-	if guestUser == "" || guestPass == "" {
-		if u, p := unattendCredentials(tmpl); u != "" && p != "" {
-			if guestUser == "" {
-				guestUser = u
-			}
-			if guestPass == "" {
-				guestPass = p
-			}
-		}
-	}
+	guestUser, guestPass, _ := resolveGuestCredentials(tmpl, req.GuestUsername, req.GuestPassword)
 	if guestUser == "" || guestPass == "" {
 		http.Error(w,
 			"guest_username and guest_password are required (provide in body or set default_username/default_password on the template)",
@@ -373,6 +408,101 @@ func unattendCredentials(tmpl *models.Template) (string, string) {
 		return "", ""
 	}
 	return spec.Username, spec.Password
+}
+
+// resolveGuestCredentials implements the credential resolution ladder shared
+// by AdminGeneralizeTemplate and AdminGetResolvedCredentials. Priority:
+//
+//  1. reqUsername / reqPassword (explicit operator override) → source "request"
+//  2. tmpl.DefaultUsername / DefaultPassword → source "template"
+//  3. Credentials from tmpl.UnattendConfig → source "unattend_config"
+//
+// Returns source "none" when no complete username+password pair is available.
+// A partial pair (username without password or vice versa) is treated as
+// "none" — a half-authenticated session is as unusable as no credentials.
+func resolveGuestCredentials(tmpl *models.Template, reqUsername, reqPassword string) (username, password, source string) {
+	fromReq := reqUsername != "" || reqPassword != ""
+
+	username = reqUsername
+	password = reqPassword
+
+	// Rung 2: template row.
+	if username == "" {
+		username = tmpl.DefaultUsername
+	}
+	if password == "" {
+		password = tmpl.DefaultPassword
+	}
+
+	// Rung 3: unattend_config (ISO builds store the generated account here).
+	usedUnattend := false
+	if username == "" || password == "" {
+		if u, p := unattendCredentials(tmpl); u != "" && p != "" {
+			if username == "" {
+				username = u
+				usedUnattend = true
+			}
+			if password == "" {
+				password = p
+				usedUnattend = true
+			}
+		}
+	}
+
+	if username == "" || password == "" {
+		return "", "", "none"
+	}
+	switch {
+	case usedUnattend:
+		source = "unattend_config"
+	case fromReq:
+		source = "request"
+	default:
+		source = "template"
+	}
+	return
+}
+
+// inheritSourceTemplateCredentials copies default_username and default_password
+// from src into req when those fields were omitted in the wizard draft request.
+// An explicitly supplied value in req always wins. src == nil is a no-op.
+func inheritSourceTemplateCredentials(req *CreateTemplateDraftRequest, src *models.Template) {
+	if src == nil {
+		return
+	}
+	if req.DefaultUsername == "" {
+		req.DefaultUsername = src.DefaultUsername
+	}
+	if req.DefaultPassword == "" {
+		req.DefaultPassword = src.DefaultPassword
+	}
+}
+
+// AdminGetResolvedCredentials (GET /admin/templates/:id/resolved-credentials)
+// tells the wizard UI whether a complete credential pair can be resolved for
+// the generalize step — and from where — without exposing the password value.
+//
+// The resolution follows the same ladder as AdminGeneralizeTemplate so they
+// cannot drift apart. Source is one of "template", "unattend_config", or
+// "none" on this read-only endpoint (the "request" source only appears when
+// an explicit override is sent to the generalize endpoint itself).
+func (h *Handler) AdminGetResolvedCredentials(w http.ResponseWriter, r *http.Request) {
+	templateID, err := uuid.Parse(chi.URLParam(r, "templateID"))
+	if err != nil {
+		http.Error(w, "invalid template id", http.StatusBadRequest)
+		return
+	}
+	tmpl, err := h.db.GetTemplateByID(r.Context(), templateID)
+	if err != nil || tmpl == nil {
+		http.Error(w, "template not found", http.StatusNotFound)
+		return
+	}
+	resolvedUser, resolvedPass, source := resolveGuestCredentials(tmpl, "", "")
+	respondJSON(w, http.StatusOK, ResolvedCredentials{
+		Username:    resolvedUser,
+		HasPassword: resolvedPass != "",
+		Source:      source,
+	})
 }
 
 func linuxContractPublishError(tmpl *models.Template) (string, bool) {
