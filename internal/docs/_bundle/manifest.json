@@ -236,8 +236,8 @@
     {
       "path": "internal/models/workflow_models.go",
       "title": "workflow_models.go (Go)",
-      "size": 10496,
-      "sha256": "ea40b706c76fd2e700c82979e728c6b37585355357a442bd88884ada0c8e1fdb",
+      "size": 10755,
+      "sha256": "27341864c686408ff2dcf8569ca809301e3e3850e77e2fdde1baf0990af1542c",
       "is_markdown": false,
       "from_seed": false
     },
@@ -282,5 +282,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 231158
+  "total_bytes": 231417
 }
