@@ -149,6 +149,16 @@ spec:
               value: {{ .Values.worker.pipelineReconciler.interval | default "5m" | quote }}
             - name: WORKER_PIPELINE_RECONCILER_STALE_THRESHOLD
               value: {{ .Values.worker.pipelineReconciler.staleThreshold | default "2h" | quote }}
+            # Template health checks (roadmap J-2). Structural check on every
+            # student-visible template each cycle + one rotating deep check.
+            # Leader-gated, so only one replica runs it. Off by default so
+            # deployers opt in rather than hitting vCenter by surprise.
+            - name: WORKER_TEMPLATE_HEALTH_ENABLED
+              value: {{ .Values.worker.templateHealth.enabled | default false | quote }}
+            - name: WORKER_TEMPLATE_HEALTH_INTERVAL
+              value: {{ .Values.worker.templateHealth.interval | default "12h" | quote }}
+            - name: WORKER_TEMPLATE_HEALTH_DEEP_TIMEOUT
+              value: {{ .Values.worker.templateHealth.deepTimeout | default "10m" | quote }}
             # Idle-VM suspend evaluator. dryRun is the safety switch: when true
             # the evaluator logs what it WOULD suspend and makes no vCenter
             # mutations. Previously these were settable only via

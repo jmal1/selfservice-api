@@ -85,6 +85,25 @@ worker:
     enabled: true
     interval: "5m"
     staleThreshold: "2h"
+  # Template health checks (roadmap J-2). Every cycle runs a cheap structural
+  # check (vCenter object exists, powered off, has a base-image snapshot,
+  # datastore accessible) against every student-visible template, plus ONE deep
+  # check (clone -> power on -> wait for IP -> destroy) on the
+  # least-recently-deep-checked template. One deep check per cycle is
+  # deliberate: cloning every template every cycle would put recurring heavy
+  # clone load on the NFS 4.1 datastores that have known stale-handle clone
+  # failures, i.e. the check would cause the incidents it exists to detect.
+  #
+  # Anti-flap: each check retries up to 3 times with exponential backoff inside
+  # a cycle, and the alert additionally requires 2 consecutive failed cycles —
+  # so a real page needs 6 failed attempts across 24h. Recovery is immediate.
+  #
+  # Runs only on the elected leader (see leaderElection above); with 4 worker
+  # replicas an ungated reconciler would run this 4x against vCenter.
+  templateHealth:
+    enabled: false
+    interval: "12h"
+    deepTimeout: "10m"
   # Idle-VM suspend evaluator (Epic S). Suspends pod VMs that have been idle —
   # BOTH no Crucible console activity AND low vCenter CPU/net — for longer than
   # the per-pod idle timeout (global default 6h, in the suspend_settings table).
