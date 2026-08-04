@@ -1,0 +1,4 @@
+-- Placeholder: reserved for a parallel development lane.
+-- Delete this file when migration 000029 from that lane lands and replace with
+-- its real content. This stub exists solely so TestMigrationsContiguous passes
+-- on this branch while the parallel PRs (000029, 000030, 000031) are still open.
