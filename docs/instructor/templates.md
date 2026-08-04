@@ -482,6 +482,12 @@ Crucible runs automated health checks for every student-visible template every
 whose disk was moved, or whose base OS no longer boots — before students hit it
 during a lab session.
 
+"Student-visible" means active, not internal, in the `active` template state,
+**and** visibility `public`. A template you have marked **Instructor only** is
+deliberately *not* health-checked: it is staging content no student can reach,
+so alerting on it would be noise. It starts being checked as soon as you flip
+it to public — you do not have to wait for the next cycle, see below.
+
 ### What gets checked
 
 Each cycle has two layers:
@@ -562,8 +568,26 @@ on the next passing cycle (~12 hours). No manual reset is needed.
 
 The deep check names its clone `crucible-healthcheck-<template-uuid>`. If the
 worker crashes mid-check, the clone may be left behind on the datastore.
-Crucible sweeps for these orphaned clones at worker startup and destroys any it
-finds. The distinctive prefix ensures the sweep cannot match a student pod VM.
+Crucible sweeps for these orphaned clones whenever a worker becomes the elected
+leader and destroys any it finds. The distinctive prefix ensures the sweep
+cannot match a student pod VM.
+
+### When cycles actually run
+
+The 12-hour timer lives in the worker process, and Crucible is deployed several
+times a day, so relying on that timer alone would mean a cycle never completed.
+Instead, whenever a worker becomes the elected leader — at startup, after a
+deploy, or after a failover — it checks when the last cycle finished:
+
+- **More than 12 hours ago (or never):** it runs a cycle immediately. A freshly
+  deployed environment therefore has health data within minutes, not 12 hours.
+- **Less than 12 hours ago:** it skips. This is why a burst of deploys does not
+  produce a burst of deep checks — each deep check clones a real VM, and doing
+  that on every deploy would put avoidable load on the datastores.
+
+The practical consequence: after you publish a template or flip one to public,
+health data appears on the next cycle boundary, or immediately if a deploy or
+failover happens to land while a cycle is already due.
 
 ---
 
