@@ -904,6 +904,125 @@ type TemplateVerifyPayload struct {
 	VMMoref    string    `json:"vm_moref"` // source: the template's base-image VM
 }
 
+// runSmokeCheck is the shared smoke-test core reused by both VerifyTemplate
+// (publish gate) and RevalidateL1Template (periodic revalidation). It clones
+// vmMoref as a throwaway VM, boots it, waits for VMware Tools, optionally
+// waits for an IP, and for clone_with_customize templates validates that guest
+// customization applied the generated password. The throwaway clone is ALWAYS
+// destroyed on return, on every path. publish is called with (slug, message)
+// progress pairs; pass nil to suppress events. Returns nil on success or a
+// descriptive error identifying which check failed.
+func (p *Provisioner) runSmokeCheck(ctx context.Context, tmpl *models.Template, vmMoref string, publish func(slug, msg string)) error {
+	if publish == nil {
+		publish = func(_, _ string) {}
+	}
+	osType := strings.ToLower(tmpl.OSType)
+	network := tmpl.StagingNetwork
+	if network == "" {
+		network = "PG-VM-Lab"
+	}
+	vcpus := int32(tmpl.DefaultVCPUs)
+	if vcpus <= 0 {
+		vcpus = 2
+	}
+	ram := int64(tmpl.DefaultRAMMB)
+	if ram <= 0 {
+		ram = 4096
+	}
+	smokeName := fmt.Sprintf("smoke-%s-%d", tmpl.ID.String()[:8], time.Now().Unix())
+	smokePassword := generatePassword(12)
+
+	// The throwaway clone is ALWAYS destroyed, on every return path. Uses a
+	// background context so cleanup still runs if the job context is
+	// cancelled. DestroyVM treats an already-deleted VM as success, so a
+	// double-destroy (defer + explicit) is harmless.
+	var cloneMoref string
+	defer func() {
+		if cloneMoref == "" {
+			return
+		}
+		if derr := p.vc.DestroyVM(context.Background(), cloneMoref); derr != nil {
+			p.logger.Warn("smoke clone cleanup failed (manual cleanup may be needed)",
+				"template_id", tmpl.ID, "moref", cloneMoref, "name", smokeName, "error", derr)
+		}
+	}()
+
+	// Step 1: clone the base-image the same way a pod clone does.
+	publish("smoke_clone", fmt.Sprintf("Cloning base-image for smoke test (%s)", smokeName))
+	var err error
+	cloneMoref, err = p.vc.CloneVM(ctx, vcenter.CloneVMParams{
+		TemplateName: vmMoref,
+		VMName:       smokeName,
+		VCPUs:        vcpus,
+		RAMmb:        ram,
+		Network:      network,
+		OSType:       osType,
+		Password:     smokePassword,
+	})
+	if err != nil {
+		return fmt.Errorf("smoke clone failed (template may be unclonable): %w", err)
+	}
+
+	// Step 2: power on.
+	publish("smoke_power_on", "Powering on smoke-test clone")
+	if err := p.vc.PowerOnVM(ctx, cloneMoref); err != nil {
+		return fmt.Errorf("smoke clone power-on failed: %w", err)
+	}
+
+	// Step 3: wait for VMware Tools — proves the OS actually booted.
+	publish("smoke_wait_tools",
+		fmt.Sprintf("Waiting for the clone to boot (VMware Tools, up to %s)", cloneFirstBootToolsTimeout))
+	if err := p.vc.WaitForTools(ctx, cloneMoref, cloneFirstBootToolsTimeout); err != nil {
+		return fmt.Errorf("smoke clone did not boot: VMware Tools never reported within %s "+
+			"(image may be bricked — check generalize/sysprep and BitLocker): %w",
+			cloneFirstBootToolsTimeout, err)
+	}
+
+	// Step 4: wait for an IP (only if this template assigns one) — proves
+	// networking + OOBE customization completed, not just that it powered on.
+	if tmpl.AssignIP {
+		publish("smoke_wait_ip", "Waiting for the clone to get an IP (5 min)")
+		ip, err := p.vc.WaitForIP(ctx, cloneMoref, 5*time.Minute)
+		if err != nil {
+			return fmt.Errorf("smoke clone got no IP within 5m (DHCP/network or OOBE failure): %w", err)
+		}
+		p.logger.Info("smoke clone got IP", "template_id", tmpl.ID, "ip", ip)
+	}
+
+	// Step 4b: for clone_with_customize templates, prove that guest
+	// customization actually reset the account password. This is the check
+	// that catches the "cloudbase-init disabled in the golden image" class
+	// of bug (June-2026 template): the clone boots and even gets an IP, but
+	// the Student/student account is still on its bootstrap password because
+	// nothing inside the guest consumed the injected guestinfo. Without this
+	// gate a broken image sails through to `active` and only fails when a
+	// human logs in at L3.
+	//
+	// The clone was cloned with `smokePassword`, which the provisioner
+	// injects via guestinfo for cloudbase-init (Windows) / cloud-init (Linux)
+	// to apply. We poll ValidateGuestCredentials with that password: it fails
+	// while the account is still on the bootstrap password (and during the
+	// customization reboot), and succeeds once the agent has applied it. A
+	// timeout means customization never ran → fail the gate.
+	if shouldGenerateGuestPassword(tmpl.Kind, osType) {
+		guestUser, _ := resolvePodVMCredentials(tmpl.Kind, osType, smokePassword, tmpl)
+		publish("smoke_verify_customization",
+			"Verifying guest customization applied (account password reset)")
+		verr := pollGuestCredentials(ctx, func(c context.Context) error {
+			return p.vc.ValidateGuestCredentials(c, cloneMoref, guestUser, smokePassword)
+		}, 6*time.Minute, 15*time.Second)
+		if verr != nil {
+			return fmt.Errorf(
+				"guest customization did not apply: the clone booted but the %q account was never switched to its generated password within 6m — cloudbase-init/cloud-init likely isn't running on this image (verify the agent is installed + enabled and its config includes the VMware guestinfo metadata service and the user-data/local-scripts plugin): %w",
+				guestUser, verr)
+		}
+		p.logger.Info("smoke clone customization verified (password reset applied)",
+			"template_id", tmpl.ID, "guest_user", guestUser)
+	}
+
+	return nil
+}
+
 // VerifyTemplate implements JobTypeTemplateVerify — the automated smoke
 // test that hard-gates publish.
 //
@@ -954,114 +1073,15 @@ func (p *Provisioner) VerifyTemplate(ctx context.Context, job *models.Job) (err 
 			payload.TemplateID, tmpl.TemplateState, models.TemplateStateVerifying)
 	}
 
-	osType := strings.ToLower(tmpl.OSType)
-	network := tmpl.StagingNetwork
-	if network == "" {
-		network = "PG-VM-Lab"
-	}
-	vcpus := int32(tmpl.DefaultVCPUs)
-	if vcpus <= 0 {
-		vcpus = 2
-	}
-	ram := int64(tmpl.DefaultRAMMB)
-	if ram <= 0 {
-		ram = 4096
-	}
-	smokeName := fmt.Sprintf("smoke-%s-%d", tmpl.ID.String()[:8], time.Now().Unix())
-
-	// The throwaway clone is ALWAYS destroyed, on every return path. Uses a
-	// background context so cleanup still runs if the job context is
-	// cancelled. DestroyVM treats an already-deleted VM as success, so a
-	// double-destroy (defer + explicit) is harmless.
-	var cloneMoref string
-	defer func() {
-		if cloneMoref == "" {
-			return
-		}
-		if derr := p.vc.DestroyVM(context.Background(), cloneMoref); derr != nil {
-			p.logger.Warn("smoke clone cleanup failed (manual cleanup may be needed)",
-				"template_id", tmpl.ID, "moref", cloneMoref, "name", smokeName, "error", derr)
-		}
-	}()
-
-	// Step 1: clone the base-image the same way a pod clone does.
-	p.publishProgress(job.ID, "smoke_clone", fmt.Sprintf("Cloning base-image for smoke test (%s)", smokeName))
-	smokePassword := generatePassword(12)
-	cloneMoref, err = p.vc.CloneVM(ctx, vcenter.CloneVMParams{
-		TemplateName: payload.VMMoref,
-		VMName:       smokeName,
-		VCPUs:        vcpus,
-		RAMmb:        ram,
-		Network:      network,
-		OSType:       osType,
-		Password:     smokePassword,
-	})
-	if err != nil {
-		return p.verifyFailedToReady(ctx, tmpl.ID,
-			fmt.Errorf("smoke clone failed (template may be unclonable): %w", err))
+	// Run the smoke check. On failure, move the template back to 'ready' so
+	// the instructor can fix the image and re-publish.
+	if checkErr := p.runSmokeCheck(ctx, tmpl, payload.VMMoref, func(slug, msg string) {
+		p.publishProgress(job.ID, slug, msg)
+	}); checkErr != nil {
+		return p.verifyFailedToReady(ctx, tmpl.ID, checkErr)
 	}
 
-	// Step 2: power on.
-	p.publishProgress(job.ID, "smoke_power_on", "Powering on smoke-test clone")
-	if err := p.vc.PowerOnVM(ctx, cloneMoref); err != nil {
-		return p.verifyFailedToReady(ctx, tmpl.ID,
-			fmt.Errorf("smoke clone power-on failed: %w", err))
-	}
-
-	// Step 3: wait for VMware Tools — proves the OS actually booted.
-	p.publishProgress(job.ID, "smoke_wait_tools",
-		fmt.Sprintf("Waiting for the clone to boot (VMware Tools, up to %s)", cloneFirstBootToolsTimeout))
-	if err := p.vc.WaitForTools(ctx, cloneMoref, cloneFirstBootToolsTimeout); err != nil {
-		return p.verifyFailedToReady(ctx, tmpl.ID,
-			fmt.Errorf("smoke clone did not boot: VMware Tools never reported within %s "+
-				"(image may be bricked — check generalize/sysprep and BitLocker): %w",
-				cloneFirstBootToolsTimeout, err))
-	}
-
-	// Step 4: wait for an IP (only if this template assigns one) — proves
-	// networking + OOBE customization completed, not just that it powered on.
-	if tmpl.AssignIP {
-		p.publishProgress(job.ID, "smoke_wait_ip", "Waiting for the clone to get an IP (5 min)")
-		ip, err := p.vc.WaitForIP(ctx, cloneMoref, 5*time.Minute)
-		if err != nil {
-			return p.verifyFailedToReady(ctx, tmpl.ID,
-				fmt.Errorf("smoke clone got no IP within 5m (DHCP/network or OOBE failure): %w", err))
-		}
-		p.logger.Info("smoke clone got IP", "template_id", tmpl.ID, "ip", ip)
-	}
-
-	// Step 4b: for clone_with_customize templates, prove that guest
-	// customization actually reset the account password. This is the check
-	// that catches the "cloudbase-init disabled in the golden image" class
-	// of bug (June-2026 template): the clone boots and even gets an IP, but
-	// the Student/student account is still on its bootstrap password because
-	// nothing inside the guest consumed the injected guestinfo. Without this
-	// gate a broken image sails through to `active` and only fails when a
-	// human logs in at L3.
-	//
-	// The clone was cloned with `smokePassword`, which the provisioner
-	// injects via guestinfo for cloudbase-init (Windows) / cloud-init (Linux)
-	// to apply. We poll ValidateGuestCredentials with that password: it fails
-	// while the account is still on the bootstrap password (and during the
-	// customization reboot), and succeeds once the agent has applied it. A
-	// timeout means customization never ran → fail the gate.
-	if shouldGenerateGuestPassword(tmpl.Kind, osType) {
-		guestUser, _ := resolvePodVMCredentials(tmpl.Kind, osType, smokePassword, tmpl)
-		p.publishProgress(job.ID, "smoke_verify_customization",
-			"Verifying guest customization applied (account password reset)")
-		verr := pollGuestCredentials(ctx, func(c context.Context) error {
-			return p.vc.ValidateGuestCredentials(c, cloneMoref, guestUser, smokePassword)
-		}, 6*time.Minute, 15*time.Second)
-		if verr != nil {
-			return p.verifyFailedToReady(ctx, tmpl.ID, fmt.Errorf(
-				"guest customization did not apply: the clone booted but the %q account was never switched to its generated password within 6m — cloudbase-init/cloud-init likely isn't running on this image (verify the agent is installed + enabled and its config includes the VMware guestinfo metadata service and the user-data/local-scripts plugin): %w",
-				guestUser, verr))
-		}
-		p.logger.Info("smoke clone customization verified (password reset applied)",
-			"template_id", tmpl.ID, "guest_user", guestUser)
-	}
-
-	// Step 5: all checks passed — promote to active and make it visible.
+	// All checks passed — promote to active and make it visible.
 	p.publishProgress(job.ID, "publish", "Smoke test passed — publishing template")
 	if err := p.transitionTemplate(ctx, tmpl.ID, models.TemplateStateVerifying, models.TemplateStateActive); err != nil {
 		return p.markTemplateError(ctx, tmpl.ID, fmt.Errorf("promote verified template to active: %w", err))
@@ -1074,6 +1094,121 @@ func (p *Provisioner) VerifyTemplate(ctx context.Context, job *models.Job) (err 
 	}
 
 	return nil
+}
+
+// TemplateRevalidatePayload is the payload for a JobTypeTemplateRevalidate job.
+// Enqueued by the L1 trust-validation reconciler on a configurable interval.
+type TemplateRevalidatePayload struct {
+	TemplateID uuid.UUID `json:"template_id"`
+	// VMMoref is the MoRef of the template's base-image VM, sourced from
+	// template.VCenterVMID at enqueue time by the reconciler.
+	VMMoref string `json:"vm_moref"`
+}
+
+// revalidateL1CoreDB is the narrow DB surface used by revalidateL1TemplateCore.
+//
+// SetTemplateActive is listed explicitly so that tests can spy on it and
+// confirm it is NEVER called (alert-only policy: a failed revalidation must
+// not unpublish the template). Production code inside revalidateL1TemplateCore
+// deliberately never invokes SetTemplateActive.
+type revalidateL1CoreDB interface {
+	SetTemplateValidationState(ctx context.Context, id uuid.UUID, result string, at time.Time) error
+	SetTemplateActive(ctx context.Context, id uuid.UUID, active bool) error
+}
+
+// revalidateL1CorePipeline is the narrow metrics surface for revalidateL1TemplateCore.
+type revalidateL1CorePipeline interface {
+	RecordTemplateValidation(templateID, result string)
+}
+
+// revalidateL1TemplateCore records the outcome of a completed smoke check for
+// an L1 template. It is a pure function (no vCenter dependency) so tests can
+// inject fakes for both the DB and metrics and verify the alert-only policy.
+//
+// INVARIANT: this function NEVER calls db.SetTemplateActive — revalidation
+// failures must not change template visibility. Tests verify this by
+// injecting a spy that fails the test if SetTemplateActive is called.
+func revalidateL1TemplateCore(
+	ctx context.Context,
+	db revalidateL1CoreDB,
+	pipeline revalidateL1CorePipeline,
+	logger *slog.Logger,
+	tmpl *models.Template,
+	checkErr error,
+) {
+	now := time.Now()
+	result := "pass"
+	if checkErr != nil {
+		raw := checkErr.Error()
+		const maxLen = 512
+		if len(raw) > maxLen {
+			raw = raw[:maxLen]
+		}
+		result = "fail: " + raw
+		if logger != nil {
+			logger.Error("l1 revalidation failed (alert only — template remains published)",
+				"template_id", tmpl.ID, "name", tmpl.Name, "error", checkErr)
+		}
+	}
+
+	if dbErr := db.SetTemplateValidationState(ctx, tmpl.ID, result, now); dbErr != nil {
+		if logger != nil {
+			logger.Warn("revalidation: failed to persist validation state",
+				"template_id", tmpl.ID, "error", dbErr)
+		}
+	}
+	if pipeline != nil {
+		metricResult := "pass"
+		if checkErr != nil {
+			metricResult = "fail"
+		}
+		pipeline.RecordTemplateValidation(tmpl.ID.String(), metricResult)
+	}
+}
+
+// RevalidateL1Template implements JobTypeTemplateRevalidate — the periodic
+// smoke-clone health check for already-published L1-tier templates.
+//
+// Unlike VerifyTemplate (which gates initial publish), this handler:
+//   - does NOT check or modify template_state
+//   - does NOT touch is_active — the template STAYS published on failure
+//
+// On failure it records the result in last_validation_result and emits the
+// crucible_template_validation_total counter so an alert fires. The job is
+// marked failed (for observability) but the template remains live.
+func (p *Provisioner) RevalidateL1Template(ctx context.Context, job *models.Job) error {
+	var payload TemplateRevalidatePayload
+	if err := json.Unmarshal(job.Payload, &payload); err != nil {
+		return fmt.Errorf("parse template_revalidate payload: %w", err)
+	}
+	if payload.TemplateID == uuid.Nil {
+		return fmt.Errorf("template_id is required")
+	}
+	if payload.VMMoref == "" {
+		return fmt.Errorf("vm_moref is required")
+	}
+
+	tmpl, err := p.db.GetTemplateByID(ctx, payload.TemplateID)
+	if err != nil {
+		return fmt.Errorf("load template: %w", err)
+	}
+	if tmpl == nil {
+		return fmt.Errorf("template %s not found", payload.TemplateID)
+	}
+
+	checkErr := p.runSmokeCheck(ctx, tmpl, payload.VMMoref, func(slug, msg string) {
+		p.publishProgress(job.ID, slug, msg)
+	})
+
+	// Delegate outcome recording to the injectable helper so the DB and
+	// metrics interactions can be verified in unit tests without a vCenter.
+	revalidateL1TemplateCore(ctx, p.db, p.pipeline, p.logger, tmpl, checkErr)
+
+	// Return the check error so the job is marked 'failed' in the jobs table.
+	// The template is NOT unpublished; this is alerting-only. A failed job
+	// surfaces in the admin UI and prevents the reconciler from re-enqueuing
+	// a duplicate until the existing failed job is cleared or retried.
+	return checkErr
 }
 
 // verifyFailedToReady is the smoke-test failure path: it moves the template
