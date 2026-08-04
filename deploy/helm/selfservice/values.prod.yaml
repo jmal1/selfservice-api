@@ -16,9 +16,13 @@ synthetic:
   lifecycle:
     enabled: true
     template: synthetic-noop
-    # Tightened from chart default 8m — the synthetic-noop template reliably
-    # reaches active in under 90s on this cluster. Alerts fire faster on regressions.
-    readyTimeout: 3m
+    # Pinned to the production-calibrated value. Must agree with
+    # values.yaml and DefaultPodLifecycleConfig in lifecycle.go.
+    # Worst case: 2×(150s+90s)+30s+60s = 570s = 9m30s < 10min ✓
+    readyTimeout: 150s
+    destroyTimeout: 90s
+    maxAttempts: 2
+    retryBackoff: 30s
   janitor:
     enabled: true
   # Hourly end-to-end proof of the Kali runner path (Multus NAD, CNI dhcp lease,

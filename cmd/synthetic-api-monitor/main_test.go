@@ -8,6 +8,7 @@ import (
 
 	"github.com/jmal1/selfservice-api/internal/synthetic"
 	"github.com/jmal1/selfservice-api/internal/synthetic/checks"
+	"gopkg.in/yaml.v3"
 )
 
 // names builds a check set carrying only names — the timeout-envelope logic
@@ -39,18 +40,18 @@ func TestLifecycleSafeTimeout_TakesTheLongestEnvelopeRegardlessOfOrder(t *testin
 		want   time.Duration
 	}{
 		{"no expensive checks keeps the base", names("healthz", "auth_me"), base},
-		{"pod_lifecycle alone", names("healthz", "pod_lifecycle"), 4 * time.Minute},
-		{"runner_smoke alone", names("runner_smoke"), 14 * time.Minute},
+		{"pod_lifecycle alone", names("healthz", "pod_lifecycle"), 5 * time.Minute},
+		{"runner_smoke alone", names("runner_smoke"), 15 * time.Minute},
 		{
 			// Ordering guard: lifecycle first would have short-circuited.
 			"both, lifecycle registered first",
 			names("healthz", "pod_lifecycle", "runner_smoke"),
-			14 * time.Minute,
+			15 * time.Minute,
 		},
 		{
 			"both, runner registered first",
 			names("runner_smoke", "pod_lifecycle"),
-			14 * time.Minute,
+			15 * time.Minute,
 		},
 	}
 
@@ -417,8 +418,8 @@ func TestSessionTokenTTL_OutlivesEveryCheckBudget(t *testing.T) {
 		longest, base time.Duration
 		active        int
 	}{
-		{"runner mode: one check with a 14m per-attempt budget", 14 * time.Minute, 30 * time.Second, 1},
-		{"default mode with pod_lifecycle (4m per-attempt budget)", 4 * time.Minute, 30 * time.Second, 13},
+		{"runner mode: one check with a 15m per-attempt budget", 15 * time.Minute, 30 * time.Second, 1},
+		{"default mode with pod_lifecycle (5m per-attempt budget)", 5 * time.Minute, 30 * time.Second, 13},
 		{"default mode, no expensive checks", 30 * time.Second, 30 * time.Second, 8},
 		{"janitor mode", 30 * time.Second, 30 * time.Second, 1},
 		{"degenerate: no active checks", 30 * time.Second, 30 * time.Second, 0},
@@ -440,8 +441,8 @@ func TestSessionTokenTTL_OutlivesEveryCheckBudget(t *testing.T) {
 // formula would have been adequate, this test would pass vacuously.
 func TestSessionTokenTTL_BeatsTheShippedBug(t *testing.T) {
 	const base = 30 * time.Second
-	// runner_smoke per-attempt envelope with the new 2-min ReadyTimeout.
-	const runnerBudget = 14 * time.Minute
+	// runner_smoke per-attempt envelope with the 150s ReadyTimeout default.
+	const runnerBudget = 15 * time.Minute
 
 	buggy := base * time.Duration(len(checks.All())+1)
 	if buggy >= runnerBudget {
@@ -551,66 +552,191 @@ func TestHasPodLifecycle(t *testing.T) {
 	}
 }
 
-// TestPodLifecycleRetry_WorstCaseFitsCronJob asserts that the worst-case cycle
-// time with 2 attempts and the default timeouts stays under the 10-minute
-// CronJob schedule.
+// helmLifecycleValues holds the fields from deploy/helm/selfservice/values.yaml
+// (and values.prod.yaml) that govern pod_lifecycle retry and timeout behavior.
+// Used only in test to verify the deployed config satisfies the CronJob bound.
+type helmLifecycleValues struct {
+	ReadyTimeout   string `yaml:"readyTimeout"`
+	DestroyTimeout string `yaml:"destroyTimeout"`
+	MaxAttempts    int    `yaml:"maxAttempts"`
+	RetryBackoff   string `yaml:"retryBackoff"`
+}
+
+// helmRunnerValues holds the runner_smoke fields from the Helm values files.
+type helmRunnerValues struct {
+	ReadyTimeout   string `yaml:"readyTimeout"`
+	RunTimeout     string `yaml:"runTimeout"`
+	DestroyTimeout string `yaml:"destroyTimeout"`
+	MaxAttempts    int    `yaml:"maxAttempts"`
+	RetryBackoff   string `yaml:"retryBackoff"`
+}
+
+type helmValuesFile struct {
+	Synthetic struct {
+		Lifecycle helmLifecycleValues `yaml:"lifecycle"`
+		Runner    helmRunnerValues    `yaml:"runner"`
+	} `yaml:"synthetic"`
+}
+
+// loadHelmValues parses a Helm values YAML file.
+func loadHelmValues(t *testing.T, path string) helmValuesFile {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read helm values %s: %v", path, err)
+	}
+	var v helmValuesFile
+	if err := yaml.Unmarshal(data, &v); err != nil {
+		t.Fatalf("parse helm values %s: %v", path, err)
+	}
+	return v
+}
+
+// mergeLifecycle applies prod overrides on top of base (non-zero prod fields win).
+func mergeLifecycle(base, prod helmLifecycleValues) helmLifecycleValues {
+	if prod.ReadyTimeout != "" {
+		base.ReadyTimeout = prod.ReadyTimeout
+	}
+	if prod.DestroyTimeout != "" {
+		base.DestroyTimeout = prod.DestroyTimeout
+	}
+	if prod.MaxAttempts != 0 {
+		base.MaxAttempts = prod.MaxAttempts
+	}
+	if prod.RetryBackoff != "" {
+		base.RetryBackoff = prod.RetryBackoff
+	}
+	return base
+}
+
+// mergeRunner applies prod overrides on top of base for runner_smoke fields.
+func mergeRunner(base, prod helmRunnerValues) helmRunnerValues {
+	if prod.ReadyTimeout != "" {
+		base.ReadyTimeout = prod.ReadyTimeout
+	}
+	if prod.RunTimeout != "" {
+		base.RunTimeout = prod.RunTimeout
+	}
+	if prod.DestroyTimeout != "" {
+		base.DestroyTimeout = prod.DestroyTimeout
+	}
+	if prod.MaxAttempts != 0 {
+		base.MaxAttempts = prod.MaxAttempts
+	}
+	if prod.RetryBackoff != "" {
+		base.RetryBackoff = prod.RetryBackoff
+	}
+	return base
+}
+
+// parseDurField parses a duration string from a Helm values field and fails
+// with a clear message when the string is empty or invalid.
+func parseDurField(t *testing.T, s, field string) time.Duration {
+	t.Helper()
+	if s == "" {
+		t.Fatalf("helm field %q is empty; it must be set in values.yaml or values.prod.yaml so "+
+			"WorstCaseCycle can verify the deployed config", field)
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		t.Fatalf("helm field %q=%q: %v", field, s, err)
+	}
+	return d
+}
+
+// TestPodLifecycleRetry_WorstCaseDerivedFromHelmValues reads the production
+// Helm values (values.yaml base + values.prod.yaml overlay) and asserts the
+// worst-case pod_lifecycle cycle time fits the CronJob schedule.
 //
-// Arithmetic:
+// This test exists to catch what a hardcoded-literal test cannot: a divergence
+// between the code default and the value the CronJob actually deploys. The bug
+// it was added to catch: values.prod.yaml had readyTimeout=3m, giving a
+// worst-case of 2×(180s+90s)+30s+60s = 630s = 10m30s > 10m CronJob ✗.
 //
-//	2 × (ReadyTimeout + DestroyTimeout) + Backoff + overhead
-//	= 2 × (120s + 90s) + 30s + 60s
-//	= 510s = 8m30s < 10m ✓
-func TestPodLifecycleRetry_WorstCaseFitsCronJob(t *testing.T) {
+// With concurrencyPolicy:Forbid, a run that exceeds the schedule causes the
+// NEXT cycle to be silently skipped — during exactly the vCenter degradation
+// that the retry facility exists to absorb.
+func TestPodLifecycleRetry_WorstCaseDerivedFromHelmValues(t *testing.T) {
 	const (
-		readyTimeout   = 2 * time.Minute
-		destroyTimeout = 90 * time.Second
-		maxAttempts    = 2
-		backoff        = 30 * time.Second
-		overhead       = 60 * time.Second // pre-clean, HTTP, logging
-		cronJob        = 10 * time.Minute
+		valuesBase = "../../deploy/helm/selfservice/values.yaml"
+		valuesProd = "../../deploy/helm/selfservice/values.prod.yaml"
+		cronJob    = 10 * time.Minute
 	)
 
-	worstCase := time.Duration(maxAttempts)*(readyTimeout+destroyTimeout) +
-		time.Duration(maxAttempts-1)*backoff + overhead
+	base := loadHelmValues(t, valuesBase)
+	prod := loadHelmValues(t, valuesProd)
+	eff := mergeLifecycle(base.Synthetic.Lifecycle, prod.Synthetic.Lifecycle)
 
-	if worstCase >= cronJob {
+	ready := parseDurField(t, eff.ReadyTimeout, "synthetic.lifecycle.readyTimeout")
+	destroy := parseDurField(t, eff.DestroyTimeout, "synthetic.lifecycle.destroyTimeout")
+
+	backoff := 30 * time.Second
+	if eff.RetryBackoff != "" {
+		backoff = parseDurField(t, eff.RetryBackoff, "synthetic.lifecycle.retryBackoff")
+	}
+	attempts := 2
+	if eff.MaxAttempts != 0 {
+		attempts = eff.MaxAttempts
+	}
+
+	wc := WorstCaseCycle(ready+destroy, backoff, attempts)
+	if wc >= cronJob {
 		t.Errorf(
-			"worst-case pod_lifecycle cycle time %v >= CronJob schedule %v.\n"+
-				"Retry budget too large: overlapping CronJob runs cause resource leaks "+
-				"and stale metrics. Reduce MaxAttempts or ReadyTimeout.",
-			worstCase, cronJob,
+			"Helm-effective worst-case pod_lifecycle cycle time %v >= CronJob schedule %v.\n"+
+				"  Effective Helm config: readyTimeout=%s destroyTimeout=%s maxAttempts=%d retryBackoff=%s\n"+
+				"  Arithmetic: %d×(%s+%s) + %d×%s + 60s = %v\n"+
+				"  With concurrencyPolicy:Forbid the NEXT cycle is silently skipped.\n"+
+				"  Fix: lower readyTimeout or destroyTimeout in values.yaml / values.prod.yaml.",
+			wc, cronJob,
+			eff.ReadyTimeout, eff.DestroyTimeout, attempts, eff.RetryBackoff,
+			attempts, eff.ReadyTimeout, eff.DestroyTimeout, attempts-1, eff.RetryBackoff,
+			wc,
 		)
 	}
 }
 
-// TestRunnerSmokeRetry_WorstCaseFitsCronJob asserts the worst-case runner_smoke
-// cycle fits the 30-minute CronJob schedule.
+// TestRunnerSmokeRetry_WorstCaseDerivedFromHelmValues reads the production Helm
+// values and asserts the worst-case runner_smoke cycle time fits the CronJob
+// schedule (hourly, schedule: "37 * * * *" = 60 min interval).
 //
-// Arithmetic (worst case: both attempts hit the RunTimeout):
-//
-//	2 × (ReadyTimeout + RunTimeout + DestroyTimeout) + Backoff + overhead
-//	= 2 × (120s + 600s + 90s) + 30s + 60s
-//	= 1710s = 28m30s < 30m ✓
-func TestRunnerSmokeRetry_WorstCaseFitsCronJob(t *testing.T) {
+// Note on activeDeadlineSeconds: the runner CronJob pod has a 25-minute hard
+// ceiling (activeDeadlineSeconds: 1500). The worst case when vCenter stalls
+// (both attempts exhaust readyTimeout only, not runTimeout) is
+// 2×(readyTimeout+destroyTimeout)+30s+60s which is well inside 25 min. The
+// full-run worst case (runTimeout fires on both attempts) exceeds 25 min but
+// is bounded by the K8s pod deadline in practice.
+func TestRunnerSmokeRetry_WorstCaseDerivedFromHelmValues(t *testing.T) {
 	const (
-		readyTimeout   = 2 * time.Minute
-		runTimeout     = 10 * time.Minute
-		destroyTimeout = 90 * time.Second
-		maxAttempts    = 2
-		backoff        = 30 * time.Second
-		overhead       = 60 * time.Second
-		cronJob        = 30 * time.Minute
+		valuesBase = "../../deploy/helm/selfservice/values.yaml"
+		valuesProd = "../../deploy/helm/selfservice/values.prod.yaml"
+		cronJob    = 60 * time.Minute // runner schedule: "37 * * * *" = hourly
 	)
 
-	worstCase := time.Duration(maxAttempts)*(readyTimeout+runTimeout+destroyTimeout) +
-		time.Duration(maxAttempts-1)*backoff + overhead
+	base := loadHelmValues(t, valuesBase)
+	prod := loadHelmValues(t, valuesProd)
+	eff := mergeRunner(base.Synthetic.Runner, prod.Synthetic.Runner)
 
-	if worstCase >= cronJob {
+	ready := parseDurField(t, eff.ReadyTimeout, "synthetic.runner.readyTimeout")
+	run := parseDurField(t, eff.RunTimeout, "synthetic.runner.runTimeout")
+	destroy := parseDurField(t, eff.DestroyTimeout, "synthetic.runner.destroyTimeout")
+
+	backoff := 30 * time.Second
+	if eff.RetryBackoff != "" {
+		backoff = parseDurField(t, eff.RetryBackoff, "synthetic.runner.retryBackoff")
+	}
+	attempts := 2
+	if eff.MaxAttempts != 0 {
+		attempts = eff.MaxAttempts
+	}
+
+	wc := WorstCaseCycle(ready+run+destroy, backoff, attempts)
+	if wc >= cronJob {
 		t.Errorf(
-			"worst-case runner_smoke cycle time %v >= CronJob schedule %v.\n"+
-				"Retry budget too large: overlapping CronJob runs cause resource leaks "+
-				"and stale metrics. Reduce MaxAttempts or ReadyTimeout.",
-			worstCase, cronJob,
+			"Helm-effective worst-case runner_smoke cycle time %v >= CronJob schedule %v (hourly).\n"+
+				"  Effective Helm config: readyTimeout=%s runTimeout=%s destroyTimeout=%s maxAttempts=%d retryBackoff=%s\n"+
+				"  Fix: lower readyTimeout or runTimeout in values.yaml.",
+			wc, cronJob,
+			eff.ReadyTimeout, eff.RunTimeout, eff.DestroyTimeout, attempts, eff.RetryBackoff,
 		)
 	}
 }

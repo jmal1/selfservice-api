@@ -607,11 +607,35 @@ func resolvePushLayer(runnerMode bool, explicit string) (string, error) {
 	return layer, nil
 }
 
+// WorstCaseCycle computes the maximum wall-clock time a synthetic check can
+// consume in one CronJob pod when all retry attempts are exhausted.
+//
+// perAttempt is the sum of all per-attempt timeouts for the check being
+// measured. For pod_lifecycle that is readyTimeout + destroyTimeout. For
+// runner_smoke it is readyTimeout + runTimeout + destroyTimeout. overhead
+// (60 s) covers pre-clean HTTP round-trips, Pushgateway push, and logging;
+// it is fixed and intentionally not caller-configurable so the guard cannot
+// be silently weakened.
+//
+// The result must stay below the CronJob schedule. When concurrencyPolicy is
+// Forbid, a run that exceeds the schedule causes the NEXT cycle to be
+// silently skipped — during exactly the vCenter degradation that the retry
+// facility exists to absorb.
+func WorstCaseCycle(perAttempt, backoff time.Duration, attempts int) time.Duration {
+	if attempts < 1 {
+		attempts = 1
+	}
+	const overhead = 60 * time.Second
+	return time.Duration(attempts)*perAttempt +
+		time.Duration(attempts-1)*backoff + overhead
+}
+
 // lifecycleSafeTimeout returns a CheckTimeout that fits the most expensive
 // registered check per single attempt. pod_lifecycle can legitimately run for
-// ~3 minutes and runner_smoke for ~13 minutes per attempt (with the new 2-min
-// ReadyTimeout defaults); the per-check timeout MUST exceed those per-attempt
-// sums or checks will always fail mid-run.
+// up to ~3.5 minutes and runner_smoke for ~14.5 minutes per attempt (with
+// readyTimeout=150s for lifecycle, readyTimeout=2m + runTimeout=10m for
+// runner); the per-check timeout MUST exceed those per-attempt sums or checks
+// will always fail mid-run.
 //
 // The retry loop itself is NOT accounted for here — the runner's retry loop
 // in runOne calls execOnce repeatedly, each with this CheckTimeout as the
@@ -622,12 +646,13 @@ func resolvePushLayer(runnerMode bool, explicit string) (string, error) {
 // registration order, so a future change that registers pod_lifecycle and
 // runner_smoke together would hand runner_smoke an inadequate budget.
 func lifecycleSafeTimeout(base time.Duration, all []synthetic.Check) time.Duration {
-	// Per-attempt envelopes for the new default configs (ReadyTimeout=2m):
-	//   pod_lifecycle: 2m ready + 90s destroy + ~60s pre-clean + HTTP overhead
-	//   runner_smoke:  2m ready + 10m run + 90s destroy + ~60s pre-clean
+	// Per-attempt envelopes (= readyTimeout + destroyTimeout + ~60s overhead,
+	// or readyTimeout + runTimeout + destroyTimeout + ~60s for runner_smoke).
+	// pod_lifecycle: 150s + 90s + 60s = 300s = 5 min
+	// runner_smoke:  120s + 600s + 90s + 60s = 870s ≈ 15 min
 	envelopes := map[string]time.Duration{
-		"pod_lifecycle": 4 * time.Minute,
-		"runner_smoke":  14 * time.Minute,
+		"pod_lifecycle": 5 * time.Minute,
+		"runner_smoke":  15 * time.Minute,
 	}
 
 	longest := base

@@ -270,11 +270,22 @@ synthetic:
   lifecycle:
     enabled: false
     template: "synthetic-noop"
-    readyTimeout: "8m"
+    # readyTimeout: upper bound for waiting on PodStatusActive.
+    # 150 s is calibrated to 24h production telemetry: longest successful
+    # pod_lifecycle run was 125.2 s; 150 s adds a 20% margin. Worst-case
+    # cycle time with 2 attempts and 30 s backoff:
+    #   2 × (150 s + 90 s) + 30 s + 60 s = 570 s = 9 m 30 s < 10 min ✓
+    # TestPodLifecycleRetry_WorstCaseDerivedFromHelmValues enforces this.
+    readyTimeout: "150s"
     destroyTimeout: "90s"
+    # Retry configuration. maxAttempts=2 means one retry on failure.
+    # Retry is applied ONLY to pod_lifecycle and runner_smoke — cheap
+    # contract checks (healthz, *_403, *_404) remain single-shot.
+    maxAttempts: 2
+    retryBackoff: "30s"
     # activeDeadlineSeconds for the CronJob pod when lifecycle is enabled.
-    # Must exceed readyTimeout + destroyTimeout + per-check overhead. 900s
-    # (15 min) gives ~3 min headroom on top of the default 11m envelope.
+    # Must exceed WorstCaseCycle(readyTimeout+destroyTimeout, retryBackoff, maxAttempts)
+    # = 570 s. 900 s (15 min) gives 5.5 min headroom.
     activeDeadlineSeconds: 900
   # Standalone orphan-pod janitor (defense-in-depth for synthetic monitoring).
   # Runs independently of the */10 monitor so synthetic pods don't accumulate
@@ -328,6 +339,9 @@ synthetic:
     # pull slower than this surfaces as a runner timeout, not a check hang.
     runTimeout: "10m"
     destroyTimeout: "90s"
+    # Retry configuration. Mirrors lifecycle retry semantics.
+    maxAttempts: 2
+    retryBackoff: "30s"
     # Must exceed readyTimeout + runTimeout + destroyTimeout + overhead
     # (8m + 10m + 90s = 19.5m). 1500s (25 min) leaves ~5 min headroom.
     # lifecycleSafeTimeout() independently widens the per-check budget; this

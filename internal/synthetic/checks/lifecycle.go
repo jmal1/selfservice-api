@@ -50,21 +50,26 @@ type PodLifecycleConfig struct {
 
 // DefaultPodLifecycleConfig returns the production-tuned defaults.
 //
-// ReadyTimeout rationale: the synthetic-noop template completes in ~37 s on
-// a healthy vCenter. 120 s (2 min) is 3.2× the observed median — generous
-// enough to tolerate normal variance but tight enough to leave room for a
-// full retry within the 10-minute CronJob schedule. The previous default of
-// 8 minutes was sized for a worst-case cold clone of a full Ubuntu template;
-// the noop template is intentionally lightweight, so that headroom is gone.
+// ReadyTimeout rationale: 24-hour production telemetry shows the longest
+// SUCCESSFUL pod_lifecycle run took 125.2 s (at the 100th percentile over
+// that window). The median is ~37 s. 150 s (2 m 30 s) gives a 25 s / 20%
+// margin above the observed peak — enough for normal variance — while
+// keeping the per-attempt budget well below what two retries need to fit
+// inside the 10-minute CronJob window.
+//
+// The Helm chart (deploy/helm/selfservice/values.yaml, lifecycle.readyTimeout)
+// pins this to the same 150 s in the deployed CronJob. Code default and chart
+// default MUST agree; WorstCaseCycle in the test suite enforces the arithmetic
+// against the chart values directly.
 //
 // Worst-case pod_lifecycle cycle time with 2 attempts and 30 s backoff:
 //
 //	2 × (ReadyTimeout + DestroyTimeout) + Backoff + overhead
-//	= 2 × (120 s + 90 s) + 30 s + 60 s = 510 s ≈ 8.5 min < 10 min ✓
+//	= 2 × (150 s + 90 s) + 30 s + 60 s = 570 s = 9 m 30 s < 10 min ✓
 func DefaultPodLifecycleConfig(templateName string) PodLifecycleConfig {
 	return PodLifecycleConfig{
 		TemplateName:   templateName,
-		ReadyTimeout:   2 * time.Minute,
+		ReadyTimeout:   150 * time.Second,
 		DestroyTimeout: 90 * time.Second,
 		PreCleanMaxAge: 5 * time.Minute,
 	}
