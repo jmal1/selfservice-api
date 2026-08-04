@@ -121,6 +121,10 @@ type fakeHealthVC struct {
 	// assert the deep check actually retried rather than merely succeeded.
 	cloneCalls int
 
+	// lastCloneParams records the params of the most recent clone call so a
+	// test can assert what the deep check actually asked vCenter for.
+	lastCloneParams vcenter.HealthCheckCloneParams
+
 	// powerOnErr controls PowerOnVM.
 	powerOnErr error
 
@@ -172,6 +176,7 @@ func (f *fakeHealthVC) VMExists(_ context.Context, ref string) (bool, error) {
 func (f *fakeHealthVC) CloneForHealthCheck(_ context.Context, params vcenter.HealthCheckCloneParams) (*vcenter.HealthCheckCloneResult, error) {
 	f.mu.Lock()
 	f.cloneCalls++
+	f.lastCloneParams = params
 	// Consume one queued transient clone failure, if any. Lets a test model
 	// the documented "fails now, succeeds 68s later" environmental fault.
 	if len(f.cloneTransient) > 0 {
@@ -262,14 +267,15 @@ var _ templateHealthMetrics = (*fakeHealthMetrics)(nil)
 func makeTemplate(id, ref string) models.Template {
 	uid, _ := uuid.Parse(id)
 	return models.Template{
-		ID:            uid,
-		Name:          "tpl-" + id[:8],
-		VCenterVMID:   ref,
-		TemplateState: models.TemplateStateActive,
-		IsActive:      true,
-		IsInternal:    false,
-		DefaultVCPUs:  2,
-		DefaultRAMMB:  1024,
+		ID:             uid,
+		Name:           "tpl-" + id[:8],
+		VCenterVMID:    ref,
+		TemplateState:  models.TemplateStateActive,
+		IsActive:       true,
+		IsInternal:     false,
+		DefaultVCPUs:   2,
+		DefaultRAMMB:   1024,
+		StagingNetwork: testStagingNetwork,
 	}
 }
 
