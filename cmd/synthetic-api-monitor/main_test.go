@@ -554,21 +554,24 @@ func TestHasPodLifecycle(t *testing.T) {
 
 // helmLifecycleValues holds the fields from deploy/helm/selfservice/values.yaml
 // (and values.prod.yaml) that govern pod_lifecycle retry and timeout behavior.
-// Used only in test to verify the deployed config satisfies the CronJob bound.
+// Used only in test to verify the deployed config satisfies both the
+// activeDeadlineSeconds (hard pod kill) and schedule interval (Forbid skip).
 type helmLifecycleValues struct {
-	ReadyTimeout   string `yaml:"readyTimeout"`
-	DestroyTimeout string `yaml:"destroyTimeout"`
-	MaxAttempts    int    `yaml:"maxAttempts"`
-	RetryBackoff   string `yaml:"retryBackoff"`
+	ReadyTimeout          string `yaml:"readyTimeout"`
+	DestroyTimeout        string `yaml:"destroyTimeout"`
+	MaxAttempts           int    `yaml:"maxAttempts"`
+	RetryBackoff          string `yaml:"retryBackoff"`
+	ActiveDeadlineSeconds int    `yaml:"activeDeadlineSeconds"`
 }
 
 // helmRunnerValues holds the runner_smoke fields from the Helm values files.
 type helmRunnerValues struct {
-	ReadyTimeout   string `yaml:"readyTimeout"`
-	RunTimeout     string `yaml:"runTimeout"`
-	DestroyTimeout string `yaml:"destroyTimeout"`
-	MaxAttempts    int    `yaml:"maxAttempts"`
-	RetryBackoff   string `yaml:"retryBackoff"`
+	ReadyTimeout          string `yaml:"readyTimeout"`
+	RunTimeout            string `yaml:"runTimeout"`
+	DestroyTimeout        string `yaml:"destroyTimeout"`
+	MaxAttempts           int    `yaml:"maxAttempts"`
+	RetryBackoff          string `yaml:"retryBackoff"`
+	ActiveDeadlineSeconds int    `yaml:"activeDeadlineSeconds"`
 }
 
 type helmValuesFile struct {
@@ -606,6 +609,9 @@ func mergeLifecycle(base, prod helmLifecycleValues) helmLifecycleValues {
 	if prod.RetryBackoff != "" {
 		base.RetryBackoff = prod.RetryBackoff
 	}
+	if prod.ActiveDeadlineSeconds != 0 {
+		base.ActiveDeadlineSeconds = prod.ActiveDeadlineSeconds
+	}
 	return base
 }
 
@@ -625,6 +631,9 @@ func mergeRunner(base, prod helmRunnerValues) helmRunnerValues {
 	}
 	if prod.RetryBackoff != "" {
 		base.RetryBackoff = prod.RetryBackoff
+	}
+	if prod.ActiveDeadlineSeconds != 0 {
+		base.ActiveDeadlineSeconds = prod.ActiveDeadlineSeconds
 	}
 	return base
 }
@@ -646,21 +655,23 @@ func parseDurField(t *testing.T, s, field string) time.Duration {
 
 // TestPodLifecycleRetry_WorstCaseDerivedFromHelmValues reads the production
 // Helm values (values.yaml base + values.prod.yaml overlay) and asserts the
-// worst-case pod_lifecycle cycle time fits the CronJob schedule.
+// worst-case pod_lifecycle cycle time satisfies BOTH constraints:
 //
-// This test exists to catch what a hardcoded-literal test cannot: a divergence
-// between the code default and the value the CronJob actually deploys. The bug
-// it was added to catch: values.prod.yaml had readyTimeout=3m, giving a
-// worst-case of 2×(180s+90s)+30s+60s = 630s = 10m30s > 10m CronJob ✗.
+//  1. < activeDeadlineSeconds (K8s hard kill of the CronJob pod — the more
+//     dangerous bound: an exceeded deadline means the pod is SIGKILLed
+//     mid-run and pushes NO metric, giving a stale series instead of a clean 0)
 //
-// With concurrencyPolicy:Forbid, a run that exceeds the schedule causes the
-// NEXT cycle to be silently skipped — during exactly the vCenter degradation
-// that the retry facility exists to absorb.
+//  2. < CronJob schedule interval (concurrencyPolicy:Forbid — exceeded schedule
+//     silently skips the next cycle)
+//
+// The bug this test was added to catch: values.prod.yaml had readyTimeout=3m,
+// giving 2×(180s+90s)+30s+60s = 630s = 10m30s > 10m schedule ✗.
 func TestPodLifecycleRetry_WorstCaseDerivedFromHelmValues(t *testing.T) {
 	const (
-		valuesBase = "../../deploy/helm/selfservice/values.yaml"
-		valuesProd = "../../deploy/helm/selfservice/values.prod.yaml"
-		cronJob    = 10 * time.Minute
+		valuesBase           = "../../deploy/helm/selfservice/values.yaml"
+		valuesProd           = "../../deploy/helm/selfservice/values.prod.yaml"
+		cronJob              = 10 * time.Minute
+		defaultDeadlineHard  = 900 * time.Second // template default when not set
 	)
 
 	base := loadHelmValues(t, valuesBase)
@@ -678,38 +689,50 @@ func TestPodLifecycleRetry_WorstCaseDerivedFromHelmValues(t *testing.T) {
 	if eff.MaxAttempts != 0 {
 		attempts = eff.MaxAttempts
 	}
+	deadline := defaultDeadlineHard
+	if eff.ActiveDeadlineSeconds != 0 {
+		deadline = time.Duration(eff.ActiveDeadlineSeconds) * time.Second
+	}
 
 	wc := WorstCaseCycle(ready+destroy, backoff, attempts)
+
+	if wc >= deadline {
+		t.Errorf(
+			"Helm-effective worst-case pod_lifecycle cycle time %v >= activeDeadlineSeconds %v.\n"+
+				"  Effective Helm config: readyTimeout=%s destroyTimeout=%s maxAttempts=%d retryBackoff=%s activeDeadlineSeconds=%d\n"+
+				"  K8s SIGKILL mid-run pushes NO metric → stale series instead of clean 0.\n"+
+				"  Fix: raise activeDeadlineSeconds or lower readyTimeout/destroyTimeout in values.yaml/values.prod.yaml.",
+			wc, deadline,
+			eff.ReadyTimeout, eff.DestroyTimeout, attempts, eff.RetryBackoff, eff.ActiveDeadlineSeconds,
+		)
+	}
 	if wc >= cronJob {
 		t.Errorf(
 			"Helm-effective worst-case pod_lifecycle cycle time %v >= CronJob schedule %v.\n"+
 				"  Effective Helm config: readyTimeout=%s destroyTimeout=%s maxAttempts=%d retryBackoff=%s\n"+
-				"  Arithmetic: %d×(%s+%s) + %d×%s + 60s = %v\n"+
 				"  With concurrencyPolicy:Forbid the NEXT cycle is silently skipped.\n"+
 				"  Fix: lower readyTimeout or destroyTimeout in values.yaml / values.prod.yaml.",
 			wc, cronJob,
 			eff.ReadyTimeout, eff.DestroyTimeout, attempts, eff.RetryBackoff,
-			attempts, eff.ReadyTimeout, eff.DestroyTimeout, attempts-1, eff.RetryBackoff,
-			wc,
 		)
 	}
 }
 
 // TestRunnerSmokeRetry_WorstCaseDerivedFromHelmValues reads the production Helm
-// values and asserts the worst-case runner_smoke cycle time fits the CronJob
-// schedule (hourly, schedule: "37 * * * *" = 60 min interval).
+// values and asserts the worst-case runner_smoke cycle time satisfies BOTH:
 //
-// Note on activeDeadlineSeconds: the runner CronJob pod has a 25-minute hard
-// ceiling (activeDeadlineSeconds: 1500). The worst case when vCenter stalls
-// (both attempts exhaust readyTimeout only, not runTimeout) is
-// 2×(readyTimeout+destroyTimeout)+30s+60s which is well inside 25 min. The
-// full-run worst case (runTimeout fires on both attempts) exceeds 25 min but
-// is bounded by the K8s pod deadline in practice.
+//  1. < activeDeadlineSeconds (K8s hard kill — the binding constraint). When
+//     exceeded, the pod is SIGKILLed mid-attempt and pushes NO metric. The
+//     stale CrucibleSyntheticStale alert fires instead of the accurate
+//     CrucibleSyntheticCheckFailed. That is a worse signal than a clean failure.
+//
+//  2. < CronJob schedule interval (hourly, "37 * * * *"; concurrencyPolicy:Forbid)
 func TestRunnerSmokeRetry_WorstCaseDerivedFromHelmValues(t *testing.T) {
 	const (
-		valuesBase = "../../deploy/helm/selfservice/values.yaml"
-		valuesProd = "../../deploy/helm/selfservice/values.prod.yaml"
-		cronJob    = 60 * time.Minute // runner schedule: "37 * * * *" = hourly
+		valuesBase          = "../../deploy/helm/selfservice/values.yaml"
+		valuesProd          = "../../deploy/helm/selfservice/values.prod.yaml"
+		cronJob             = 60 * time.Minute // runner schedule: "37 * * * *" = hourly
+		defaultDeadlineHard = 1500 * time.Second
 	)
 
 	base := loadHelmValues(t, valuesBase)
@@ -728,8 +751,23 @@ func TestRunnerSmokeRetry_WorstCaseDerivedFromHelmValues(t *testing.T) {
 	if eff.MaxAttempts != 0 {
 		attempts = eff.MaxAttempts
 	}
+	deadline := defaultDeadlineHard
+	if eff.ActiveDeadlineSeconds != 0 {
+		deadline = time.Duration(eff.ActiveDeadlineSeconds) * time.Second
+	}
 
 	wc := WorstCaseCycle(ready+run+destroy, backoff, attempts)
+
+	if wc >= deadline {
+		t.Errorf(
+			"Helm-effective worst-case runner_smoke cycle time %v >= activeDeadlineSeconds %v.\n"+
+				"  Effective Helm config: readyTimeout=%s runTimeout=%s destroyTimeout=%s maxAttempts=%d retryBackoff=%s activeDeadlineSeconds=%d\n"+
+				"  K8s SIGKILL mid-run pushes NO metric → stale series (CrucibleSyntheticStale) instead of clean failure (CrucibleSyntheticCheckFailed).\n"+
+				"  Fix: raise synthetic.runner.activeDeadlineSeconds in values.yaml and values.prod.yaml.",
+			wc, deadline,
+			eff.ReadyTimeout, eff.RunTimeout, eff.DestroyTimeout, attempts, eff.RetryBackoff, eff.ActiveDeadlineSeconds,
+		)
+	}
 	if wc >= cronJob {
 		t.Errorf(
 			"Helm-effective worst-case runner_smoke cycle time %v >= CronJob schedule %v (hourly).\n"+
