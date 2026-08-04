@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -43,6 +44,18 @@ var ErrImageUploadStale = errors.New("image upload is not in the expected state"
 
 var ErrTemplateNotFound = errors.New("template not found")
 var ErrBlueprintNotFound = errors.New("blueprint not found")
+
+// TemplatePinOrderClause is the canonical ordering for template lists (migration 000030).
+// Pinned items appear first (ordered by pin_order, then pinned_at), then unpinned items (by name).
+// The CASE expressions ensure unpinned rows sort by 0/NULL, preventing spurious ordering.
+const TemplatePinOrderClause = `ORDER BY t.pinned DESC, ` +
+	`CASE WHEN t.pinned THEN t.pin_order ELSE 0 END ASC, ` +
+	`CASE WHEN t.pinned THEN t.pinned_at ELSE NULL END DESC NULLS LAST, t.name ASC`
+
+// BlueprintPinOrderClause is the canonical ordering for blueprint lists (migration 000030).
+const BlueprintPinOrderClause = `ORDER BY b.pinned DESC, ` +
+	`CASE WHEN b.pinned THEN b.pin_order ELSE 0 END ASC, ` +
+	`CASE WHEN b.pinned THEN b.pinned_at ELSE NULL END DESC NULLS LAST, b.name ASC`
 
 // templateSelectCols is the canonical list of columns returned by every
 // Template SELECT / INSERT RETURNING / UPDATE RETURNING. Keep in lockstep
@@ -234,8 +247,7 @@ func (q *Queries) ListTemplatesForUser(ctx context.Context, userID uuid.UUID, ro
 		       OR EXISTS (SELECT 1 FROM template_access ta
 		                  WHERE ta.template_id = t.id
 		                    AND (ta.role = $1 OR ta.user_id = $2 OR ta.role = 'admin')))
-		ORDER BY t.pinned DESC, CASE WHEN t.pinned THEN t.pin_order ELSE 0 END ASC, 
-		         CASE WHEN t.pinned THEN t.pinned_at ELSE NULL END DESC NULLS LAST, t.name ASC
+		`+TemplatePinOrderClause+`
 	`, role, userID)
 	if err != nil {
 		return nil, err
@@ -286,8 +298,7 @@ func (q *Queries) ListAllTemplates(ctx context.Context) ([]models.Template, erro
 	rows, err := q.pool.Query(ctx, `
 		SELECT `+templateSelectCols+`
 		FROM templates 
-		ORDER BY pinned DESC, CASE WHEN pinned THEN pin_order ELSE 0 END ASC,
-		         CASE WHEN pinned THEN pinned_at ELSE NULL END DESC NULLS LAST, name ASC
+		`+TemplatePinOrderClause+`
 	`)
 	if err != nil {
 		return nil, err
@@ -1961,7 +1972,15 @@ func (q *Queries) ReorderTemplates(ctx context.Context, pins map[uuid.UUID]PinSt
 	}
 	defer tx.Rollback(ctx)
 
-	for id, state := range pins {
+	// Sort keys for deterministic error reporting
+	ids := make([]uuid.UUID, 0, len(pins))
+	for id := range pins {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i].String() < ids[j].String() })
+
+	for _, id := range ids {
+		state := pins[id]
 		// Check that the template exists
 		var exists bool
 		err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM templates WHERE id = $1)`, id).Scan(&exists)
@@ -2007,7 +2026,15 @@ func (q *Queries) ReorderBlueprints(ctx context.Context, pins map[uuid.UUID]PinS
 	}
 	defer tx.Rollback(ctx)
 
-	for id, state := range pins {
+	// Sort keys for deterministic error reporting
+	ids := make([]uuid.UUID, 0, len(pins))
+	for id := range pins {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i].String() < ids[j].String() })
+
+	for _, id := range ids {
+		state := pins[id]
 		// Check that the blueprint exists
 		var exists bool
 		err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM blueprints WHERE id = $1)`, id).Scan(&exists)

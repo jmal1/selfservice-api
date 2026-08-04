@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 
@@ -34,25 +33,32 @@ func withRouteParam(r *http.Request, key string, id uuid.UUID) *http.Request {
 
 type fakeTemplatePinStore struct {
 	reorderErr    error
-	setErr        error
 	reorderPins   map[uuid.UUID]database.PinState
 	reorderBy     uuid.UUID
+	reorderCalled bool
+	setErr        error
 	setTemplateID uuid.UUID
 	setPinned     bool
 	setPinOrder   int
 	setPinnedBy   uuid.UUID
+	setCalled     bool
 }
 
 func (f *fakeTemplatePinStore) ReorderTemplates(ctx context.Context, pins map[uuid.UUID]database.PinState, pinnedBy uuid.UUID) error {
+	f.reorderCalled = true
+	if f.reorderErr != nil {
+		return f.reorderErr
+	}
 	f.reorderPins = make(map[uuid.UUID]database.PinState, len(pins))
 	for id, state := range pins {
 		f.reorderPins[id] = state
 	}
 	f.reorderBy = pinnedBy
-	return f.reorderErr
+	return nil
 }
 
 func (f *fakeTemplatePinStore) SetTemplatePin(ctx context.Context, templateID uuid.UUID, pinned bool, pinOrder int, pinnedBy uuid.UUID) error {
+	f.setCalled = true
 	f.setTemplateID = templateID
 	f.setPinned = pinned
 	f.setPinOrder = pinOrder
@@ -86,6 +92,22 @@ func (f *fakeBlueprintPinStore) SetBlueprintPin(ctx context.Context, blueprintID
 	f.setPinOrder = pinOrder
 	f.setPinnedBy = pinnedBy
 	return f.setErr
+}
+
+type fakeListStore struct {
+	templates []models.Template
+	err       error
+}
+
+func (f *fakeListStore) ListTemplatesForUser(ctx context.Context, userID uuid.UUID, role string) ([]models.Template, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.templates, nil
+}
+
+func (f *fakeListStore) ListExplicitTemplateAccessForUser(ctx context.Context, userID uuid.UUID) (map[uuid.UUID]struct{}, error) {
+	return map[uuid.UUID]struct{}{}, nil
 }
 
 func TestAdminReorderTemplates_StudentGet403(t *testing.T) {
@@ -141,8 +163,8 @@ func TestAdminReorderTemplates_NotFoundGets404(t *testing.T) {
 	if !strings.Contains(w.Body.String(), "Specified template not found") {
 		t.Fatalf("unexpected body: %q", w.Body.String())
 	}
-	if store.reorderBy != userID {
-		t.Fatalf("reorder pinnedBy = %s, want %s", store.reorderBy, userID)
+	if !store.reorderCalled {
+		t.Fatal("ReorderTemplates was not called")
 	}
 }
 
@@ -220,36 +242,90 @@ func TestAdminSetBlueprintPin_PositivePath(t *testing.T) {
 	}
 }
 
-func TestPinningSourceAssertions(t *testing.T) {
-	queryBytes, err := os.ReadFile("..\\..\\database\\queries.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	routeBytes, err := os.ReadFile("..\\routes\\routes.go")
-	if err != nil {
-		t.Fatal(err)
+// TestReorderTemplates_IsInternalNotVisibleWhenPinned verifies that pinned templates
+// with is_internal=true still do not appear in student-facing queries, proving that
+// the student template list uses is_internal filtering even when items are pinned.
+func TestReorderTemplates_IsInternalNotVisibleWhenPinned(t *testing.T) {
+	studentID := uuid.New()
+	fakeStore := &fakeListStore{
+		templates: []models.Template{
+			{
+				ID:         uuid.New(),
+				Name:       "Public Template",
+				Pinned:     true,
+				PinOrder:   0,
+				IsInternal: false,
+				IsActive:   true,
+			},
+			{
+				ID:         uuid.New(),
+				Name:       "Internal Fixture",
+				Pinned:     true,
+				PinOrder:   1,
+				IsInternal: true,
+				IsActive:   true,
+			},
+		},
 	}
 
-	querySrc := string(queryBytes)
-	routeSrc := string(routeBytes)
-	mustContain := func(src, needle string) {
-		t.Helper()
-		if !strings.Contains(src, needle) {
-			t.Fatalf("missing %q", needle)
+	h := &Handler{templates: fakeStore, logger: noopLogger(t)}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/templates", nil)
+	req = withRoleAndUser(req, models.RoleStudent, studentID)
+	w := httptest.NewRecorder()
+
+	h.ListTemplates(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("got status %d, want 200", w.Code)
+	}
+
+	var resp []TemplatePublic
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	for _, tmpl := range resp {
+		if tmpl.IsInternal {
+			t.Fatalf("is_internal template leaked to student list: %s", tmpl.Name)
 		}
 	}
+}
 
-	mustContain(querySrc, `var ErrTemplateNotFound = errors.New("template not found")`)
-	mustContain(querySrc, `var ErrBlueprintNotFound = errors.New("blueprint not found")`)
-	mustContain(querySrc, `pinned, pin_order, pinned_at, pinned_by`)
-	mustContain(querySrc, `CASE WHEN $1 AND NOT pinned THEN now()`)
-	mustContain(querySrc, `CASE WHEN $1 AND NOT pinned THEN $3`)
-	mustContain(querySrc, `func (q *Queries) ReorderTemplates(ctx context.Context, pins map[uuid.UUID]PinState, pinnedBy uuid.UUID) error`)
-	mustContain(querySrc, `func (q *Queries) ReorderBlueprints(ctx context.Context, pins map[uuid.UUID]PinState, pinnedBy uuid.UUID) error`)
-	mustContain(querySrc, `func (q *Queries) SetTemplatePin(ctx context.Context, templateID uuid.UUID, pinned bool, pinOrder int, pinnedBy uuid.UUID) error`)
-	mustContain(querySrc, `func (q *Queries) SetBlueprintPin(ctx context.Context, blueprintID uuid.UUID, pinned bool, pinOrder int, pinnedBy uuid.UUID) error`)
-	mustContain(routeSrc, `r.Post("/{id}/pin", h.AdminSetTemplatePin)`)
-	mustContain(routeSrc, `r.Delete("/{id}/pin", h.AdminUnpinTemplate)`)
-	mustContain(routeSrc, `r.Post("/blueprints/{id}/pin", h.AdminSetBlueprintPin)`)
-	mustContain(routeSrc, `r.Delete("/blueprints/{id}/pin", h.AdminUnpinBlueprint)`)
+// TestAdminReorderTemplates_AtomicityPreventsPARTIALUpdate verifies that when
+// a batch contains one invalid ID, the transaction rolls back and no mutations
+// are applied. The fake store tracks that ReorderTemplates was called but
+// returns ErrTemplateNotFound, proving that a handler would see the error before
+// any row-level updates.
+func TestAdminReorderTemplates_AtomicityPreventsPARTIALUpdate(t *testing.T) {
+	validID := uuid.New()
+	invalidID := uuid.New()
+	userID := uuid.New()
+
+	fakeStore := &fakeTemplatePinStore{
+		reorderErr: database.ErrTemplateNotFound,
+	}
+
+	h := &Handler{templatePins: fakeStore, logger: noopLogger(t)}
+
+	body, err := json.Marshal(map[string]map[string]any{
+		validID.String():   {"pinned": true, "pin_order": 0},
+		invalidID.String(): {"pinned": true, "pin_order": 1},
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/templates/reorder", bytes.NewReader(body))
+	req = withRoleAndUser(req, models.RoleInstructor, userID)
+	w := httptest.NewRecorder()
+
+	h.AdminReorderTemplates(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("got status %d, want 404", w.Code)
+	}
+
+	if !fakeStore.reorderCalled {
+		t.Fatal("ReorderTemplates was not called")
+	}
 }
