@@ -3,12 +3,16 @@ package provisioner
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/jmal1/selfservice-api/internal/database"
+	"github.com/jmal1/selfservice-api/internal/models"
 )
 
 // The template health reconciler's only in-process trigger is a 12h
@@ -124,5 +128,87 @@ func TestCycleDueZeroIntervalFallsBackTo12h(t *testing.T) {
 	}
 	if due {
 		t.Fatal("zero interval treated as 0 rather than the 12h default; every call would be due")
+	}
+}
+
+// -- panic containment -----------------------------------------------------
+
+// panicVC panics on the first vCenter call, reproducing the shape of the
+// production incident: a govmomi property-destination bug made VMExists panic
+// the moment the reconciler first ran for real.
+type panicVC struct{ fakeHealthVC }
+
+func (p *panicVC) VMExists(_ context.Context, _ string) (bool, error) {
+	panic("simulated govmomi panic inside VMExists")
+}
+
+// TestReconcileTemplateHealthContainsPanics is the guard for the incident this
+// feature caused the first time it ever executed. Template health runs in a
+// goroutine inside the provision worker, so an escaping panic does not merely
+// break health checks — it kills the process. And because the crash releases
+// the leader lock, the next replica acquires it, runs the same cycle, and dies
+// too. That walked the fault through all four workers and took provisioning
+// down cluster-wide.
+//
+// Degrading to "health checks are broken" must always beat "provisioning is
+// down".
+func TestReconcileTemplateHealthContainsPanics(t *testing.T) {
+	tmpl := models.Template{
+		ID:              uuid.New(),
+		Name:            "panic-template",
+		VCenterTemplate: "vm-panic",
+		IsActive:        true,
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// The assertion is simply that this call returns. Without the recover the
+	// panic unwinds past it and the test binary dies — exactly as the worker
+	// process did.
+	_, err := reconcileTemplateHealth(
+		context.Background(),
+		newFakeHealthDB([]models.Template{tmpl}),
+		&panicVC{},
+		nil,
+		logger,
+		TemplateHealthReconcilerConfig{Interval: 12 * time.Hour},
+	)
+	if err == nil {
+		t.Fatal("a panic inside the cycle must surface as an error, not be silently swallowed")
+	}
+	if !strings.Contains(err.Error(), "panicked") {
+		t.Errorf("the error should identify itself as a contained panic so it is not mistaken for a vCenter fault; got: %v", err)
+	}
+}
+
+// A panic must not be reported as a partially-healthy cycle. The named return
+// used to implement the recover will otherwise surface whatever counts the
+// aborted cycle had already accumulated -- the first version of this guard
+// returned "Templates: 1, CheckerUp: true" for a cycle that died on its first
+// vCenter call, and the worker logs those counts on the catch-up path.
+func TestContainedPanicIsNotReportedAsSuccess(t *testing.T) {
+	tmpl := models.Template{
+		ID:              uuid.New(),
+		Name:            "panic-template",
+		VCenterTemplate: "vm-panic",
+		IsActive:        true,
+	}
+	db := newFakeHealthDB([]models.Template{tmpl})
+
+	counts, err := reconcileTemplateHealth(
+		context.Background(),
+		db,
+		&panicVC{},
+		nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		TemplateHealthReconcilerConfig{Interval: 12 * time.Hour},
+	)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if counts.Templates != 0 || counts.Healthy != 0 {
+		t.Errorf("a panicking cycle must not report progress; got %+v", counts)
+	}
+	if counts.CheckerUp {
+		t.Error("CheckerUp must be false after a panic: the checker demonstrably did not work")
 	}
 }

@@ -45,9 +45,14 @@ func (c *Client) vmExistsInner(ctx context.Context, ref string) (bool, error) {
 	// that the reference object was constructed. resolveSourceVM with a moref
 	// builds the object locally without a round-trip; Properties confirms the
 	// VM actually exists in the inventory.
-	var props struct {
-		Name string `mo:"name"`
-	}
+	//
+	// The destination MUST be a mo.VirtualMachine. govmomi's
+	// mo.LoadObjectContent assigns the whole managed object into the
+	// destination by reflection, so an ad-hoc struct -- even one carrying the
+	// right `mo:"name"` tags -- panics at runtime with
+	// "reflect.Set: value of type mo.VirtualMachine is not assignable".
+	// The property list still limits what is fetched over the wire.
+	var props mo.VirtualMachine
 	if err := vm.Properties(ctx, vm.Reference(), []string{"name"}, &props); err != nil {
 		if isAlreadyDeletedErr(err) || isNotFoundErr(err) {
 			return false, nil
