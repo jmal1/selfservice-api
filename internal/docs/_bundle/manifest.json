@@ -113,8 +113,8 @@
     {
       "path": "docs/instructor/playlists.md",
       "title": "Building Playlists",
-      "size": 5720,
-      "sha256": "ba071708e99e64e957826525b5407d08e1d179e3fe13d19a379771b0cdbd5969",
+      "size": 7855,
+      "sha256": "b90899b357f6c721c27576aeb533ae23d5a0aaf609c15da50ee55d9a009a40f4",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/overview.md",
@@ -194,8 +194,8 @@
     {
       "path": "internal/api/routes/routes.go",
       "title": "routes.go (Go)",
-      "size": 12395,
-      "sha256": "a56d0ba050cd292c53b6ea881e5b177adb1463c444708577eda4a6d9b89f9fd1",
+      "size": 12486,
+      "sha256": "a2d67b7fda63b443c4eb9068c9c07b76772ded2957baa8397a3cc2aac360a0af",
       "is_markdown": false,
       "from_seed": false
     },
@@ -280,5 +280,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 221099
+  "total_bytes": 223325
 }
