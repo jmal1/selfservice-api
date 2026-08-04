@@ -13,6 +13,7 @@ COMPOSE       ?= docker compose -f docker-compose.dev.yaml
 WIKI_SEEDS    := \
 	docs/instructor/overview.md \
 	docs/instructor/templates.md \
+	docs/instructor/playlists.md \
 	AGENTS.md \
 	docs/ai-prompts/build-workflow.md \
 	docs/ai/build-workflow-prompt.md

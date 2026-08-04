@@ -159,6 +159,56 @@ get clearer per-topic pass rates.
 
 ---
 
+## Assigning playlists to blueprints
+
+Playlists are assigned at the **template** level, not the blueprint level.
+When you create or edit a template, you specify which playlists should run
+on each VM in that template. This is called the **template default**.
+
+### Template defaults
+
+A template can have one or more playlists. When a blueprint uses that template,
+all VMs from that template inherit its default playlists automatically.
+
+**Example**: If you create a template called "Ubuntu-22.04-target" and assign
+the playlist "SSH Hardening" to it, then every blueprint that includes an
+"Ubuntu-22.04-target" VM will run "SSH Hardening" on that slot.
+
+### Blueprint-level overrides
+
+Sometimes you want a specific VM slot in a blueprint to run *different*
+playlists than the template default. You can override the template's defaults
+at the blueprint level.
+
+**Example**: You have a blueprint called "ubuntu-duo" with two VMs, both from
+the "Ubuntu-22.04-target" template. Normally both would run "SSH Hardening".
+But you want the second VM (the "victim") to run a different playlist called
+"SSH Misconfiguration". You can override the second VM slot to run
+"SSH Misconfiguration" instead, while the first VM still runs "SSH Hardening".
+
+### Seeing which playlists will actually run
+
+When editing or reviewing a blueprint, you can view the **resolved** playlists
+for each VM slot — the list that accounts for both template defaults and
+any blueprint-level overrides.
+
+In the blueprint editor, click the **Playlists** button on any VM slot to see:
+- The name of each assigned playlist
+- Whether it came from the template default (green badge) or a blueprint override (blue badge)
+
+This prevents the silent surprise where you edit a template's default playlists
+but don't realize certain blueprints won't pick up your change (because they
+have overrides).
+
+### Reverting an override
+
+If you've overridden a VM slot's playlists but want it to go back to the
+template defaults, click **Revert to Template** in the playlists view.
+This removes the override and the VM will immediately start inheriting
+the template's defaults again.
+
+---
+
 ## See also
 
 - [Building Workflows](workflows.md) — what playlists are composed of

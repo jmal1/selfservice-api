@@ -90,6 +90,21 @@ func TestExistingAdminRoutesStillRegistered(t *testing.T) {
 	}
 }
 
+// Test that blueprint VM playlists routes are registered.
+func TestBlueprintVMPlaylistsRoutesRegistered(t *testing.T) {
+	found := walkRoutes(t)
+
+	want := []string{
+		"GET /api/v1/admin/blueprints/{blueprintID}/vm-playlists",
+		"DELETE /api/v1/admin/blueprints/{blueprintID}/vm-playlists/{vmSlot}",
+	}
+	for _, w := range want {
+		if !found[w] {
+			t.Errorf("route not registered: %s", w)
+		}
+	}
+}
+
 // TestAdminRunsRouteRegistered verifies that the admin runs endpoint is registered.
 func TestAdminRunsRouteRegistered(t *testing.T) {
 	found := walkRoutes(t)

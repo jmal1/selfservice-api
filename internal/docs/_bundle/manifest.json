@@ -2,6 +2,7 @@
   "seeds": [
     "docs/instructor/overview.md",
     "docs/instructor/templates.md",
+    "docs/instructor/playlists.md",
     "AGENTS.md",
     "docs/ai-prompts/build-workflow.md",
     "docs/ai/build-workflow-prompt.md"
@@ -113,8 +114,8 @@
     {
       "path": "docs/instructor/playlists.md",
       "title": "Building Playlists",
-      "size": 5720,
-      "sha256": "ba071708e99e64e957826525b5407d08e1d179e3fe13d19a379771b0cdbd5969",
+      "size": 7855,
+      "sha256": "b90899b357f6c721c27576aeb533ae23d5a0aaf609c15da50ee55d9a009a40f4",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/overview.md",
@@ -122,7 +123,7 @@
         "docs/instructor/workflows.md",
         "docs/instructor/workflows.md"
       ],
-      "from_seed": false
+      "from_seed": true
     },
     {
       "path": "docs/instructor/runner-environment.md",
@@ -195,8 +196,8 @@
     {
       "path": "internal/api/routes/routes.go",
       "title": "routes.go (Go)",
-      "size": 13354,
-      "sha256": "ad8d66c0f4689e931281e661b9d319e8cc3bff6bbd8d95921b0ba11309c7816e",
+      "size": 13553,
+      "sha256": "0798084c1975497e77b1321ffd0988f4247365c6e99b9defaad5f4a924c52ae8",
       "is_markdown": false,
       "from_seed": false
     },
@@ -281,5 +282,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 234016
+  "total_bytes": 236350
 }

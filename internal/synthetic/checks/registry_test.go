@@ -239,19 +239,20 @@ func TestAll_StableNames(t *testing.T) {
 	// changes. If you intentionally rename a check, update the alert YAML in
 	// the Grafana provisioning then update this test.
 	wantNames := map[string]bool{
-		"healthz":                      true,
-		"auth_me":                      true,
-		"pods_list":                    true,
-		"admin_list_users_403":         true,
-		"admin_run_detail_403":         true,
-		"admin_audit_403":              true,
-		"admin_runs_filter_contract":   true,
-		"pod_testing_dashboard_404":    true,
-		"wiki_index_rbac":              true,
-		"image_upload_rbac":            true,
-		"template_health_status_rbac":  true,
-		"template_pin_rbac":            true,
-		"template_visibility_enforced": true,
+		"healthz":                         true,
+		"auth_me":                         true,
+		"pods_list":                       true,
+		"admin_list_users_403":            true,
+		"admin_run_detail_403":            true,
+		"admin_audit_403":                 true,
+		"blueprint_vm_playlists_contract": true,
+		"pod_testing_dashboard_404":       true,
+		"wiki_index_rbac":                 true,
+		"image_upload_rbac":               true,
+		"template_health_status_rbac":     true,
+		"template_pin_rbac":               true,
+		"template_visibility_enforced":    true,
+		"admin_runs_filter_contract":      true,
 	}
 	for _, c := range All() {
 		if !wantNames[c.Name()] {
