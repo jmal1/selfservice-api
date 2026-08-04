@@ -1,4 +1,4 @@
--- Migration 000027: add next_attempt_at to jobs for retry scheduling.
+-- Migration 000026: add next_attempt_at to jobs for retry scheduling.
 --
 -- When a job fails with a retryable error (e.g. vCenter's intermittent
 -- "virtual disk is either corrupted or not a supported format" clone
