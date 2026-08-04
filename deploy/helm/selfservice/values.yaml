@@ -69,6 +69,22 @@ worker:
     enabled: true
     interval: "5m"
     staleThreshold: "2h"
+  # Idle-VM suspend evaluator (Epic S). Suspends pod VMs that have been idle —
+  # BOTH no Crucible console activity AND low vCenter CPU/net — for longer than
+  # the per-pod idle timeout (global default 6h, in the suspend_settings table).
+  #
+  # dryRun is the safety switch, and it defaults to TRUE: the evaluator logs the
+  # VMs it would suspend and makes zero vCenter mutations. Only set it to false
+  # after watching a dry-run cycle report suspended=0 against live data.
+  #
+  # Requires the vCenter role to hold VirtualMachine.Interact.Suspend. Without
+  # it every attempt fails with "Permission to perform this operation was
+  # denied" — and the dry-run cannot detect that, because it never calls
+  # vCenter. CrucibleVMSuspendFailing alerts on exactly that condition.
+  idleEvaluator:
+    enabled: true
+    dryRun: false
+    interval: "15m"
   # Pushgateway job for the template/image pipeline metric families
   # (crucible_image_*, crucible_template_*). Separate job label from
   # pushgatewayJob above so the two metric sets can be scoped

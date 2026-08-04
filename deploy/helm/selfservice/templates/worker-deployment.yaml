@@ -149,6 +149,25 @@ spec:
               value: {{ .Values.worker.pipelineReconciler.interval | default "5m" | quote }}
             - name: WORKER_PIPELINE_RECONCILER_STALE_THRESHOLD
               value: {{ .Values.worker.pipelineReconciler.staleThreshold | default "2h" | quote }}
+            # Idle-VM suspend evaluator. dryRun is the safety switch: when true
+            # the evaluator logs what it WOULD suspend and makes no vCenter
+            # mutations. Previously these were settable only via
+            # `kubectl set env`, which a helm upgrade silently reverts — so an
+            # armed evaluator would quietly disarm itself on the next deploy.
+            #
+            # NOTE: deliberately no `| default` filter here. Helm's `default`
+            # treats boolean false as empty, so `dryRun | default true` would
+            # render "true" even when dryRun is explicitly false — silently
+            # making it impossible to arm. An empty value is safe anyway: the
+            # worker defaults to dry-run ON when WORKER_IDLE_EVALUATOR_DRY_RUN
+            # is unset, enabled when *_ENABLED is unset, and 15m when *_INTERVAL
+            # is unset.
+            - name: WORKER_IDLE_EVALUATOR_ENABLED
+              value: {{ .Values.worker.idleEvaluator.enabled | quote }}
+            - name: WORKER_IDLE_EVALUATOR_DRY_RUN
+              value: {{ .Values.worker.idleEvaluator.dryRun | quote }}
+            - name: WORKER_IDLE_EVALUATOR_INTERVAL
+              value: {{ .Values.worker.idleEvaluator.interval | quote }}
             # Pushgateway job label for the template/image pipeline metric
             # families. Keep distinct from WORKER_PUSHGATEWAY_JOB so the
             # destroy_failed pusher and the pipeline collector don't overwrite
