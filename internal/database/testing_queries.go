@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -808,4 +809,74 @@ func (q *Queries) SetBlueprintVMPlaylists(ctx context.Context, blueprintID uuid.
 		}
 	}
 	return nil
+}
+
+// BlueprintVMPlaylistsResolvedRow represents a row in the GetBlueprintVMPlaylistsResolved result.
+type BlueprintVMPlaylistsResolvedRow struct {
+	VMSlot       int       `json:"vm_slot"`
+	PlaylistID   uuid.UUID `json:"playlist_id"`
+	PlaylistName string    `json:"name"`
+	PlaylistSlug string    `json:"slug"`
+	Source       string    `json:"source"` // "blueprint_override" or "template_default"
+	ExecutionOrder int     `json:"execution_order"`
+}
+
+// GetBlueprintVMPlaylistsResolved returns the resolved playlists for each VM slot on a blueprint,
+// with explicit source labeling ("blueprint_override" or "template_default").
+// Returns sql.ErrNoRows if the blueprint does not exist.
+func (q *Queries) GetBlueprintVMPlaylistsResolved(ctx context.Context, blueprintID uuid.UUID) ([]BlueprintVMPlaylistsResolvedRow, error) {
+	// First, verify the blueprint exists
+	var exists bool
+	err := q.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM blueprints WHERE id = $1)`, blueprintID).Scan(&exists)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, sql.ErrNoRows
+	}
+
+	// Get all VM slots and their playlists with override+default resolution
+	// Union of:
+	// 1. Blueprint overrides (source = 'blueprint_override')
+	// 2. Template defaults that have no blueprint override (source = 'template_default')
+	rows, err := q.pool.Query(ctx, `
+		-- Get blueprint overrides
+		SELECT bvp.vm_slot, p.id, p.name, p.slug, 'blueprint_override' as source, bvp.execution_order
+		FROM blueprint_vm_playlists bvp
+		JOIN playlists p ON p.id = bvp.playlist_id
+		WHERE bvp.blueprint_id = $1
+		  AND p.is_active = true
+
+		UNION ALL
+
+		-- Get template defaults where no override exists
+		SELECT DISTINCT bv.boot_order, p.id, p.name, p.slug, 'template_default', tp.execution_order
+		FROM blueprint_vms bv
+		JOIN blueprint_templates bt ON bt.id = bv.template_id
+		JOIN template_playlists tp ON tp.template_id = bt.id
+		JOIN playlists p ON p.id = tp.playlist_id
+		WHERE bv.blueprint_id = $1
+		  AND p.is_active = true
+		  AND NOT EXISTS (
+			SELECT 1 FROM blueprint_vm_playlists bvp
+			WHERE bvp.blueprint_id = $1
+			  AND bvp.vm_slot = bv.boot_order
+		  )
+
+		ORDER BY vm_slot, execution_order
+	`, blueprintID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []BlueprintVMPlaylistsResolvedRow
+	for rows.Next() {
+		var row BlueprintVMPlaylistsResolvedRow
+		if err := rows.Scan(&row.VMSlot, &row.PlaylistID, &row.PlaylistName, &row.PlaylistSlug, &row.Source, &row.ExecutionOrder); err != nil {
+			return nil, err
+		}
+		result = append(result, row)
+	}
+	return result, rows.Err()
 }

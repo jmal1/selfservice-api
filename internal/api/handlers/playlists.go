@@ -192,6 +192,73 @@ func (h *Handler) AdminSetBlueprintVMPlaylists(w http.ResponseWriter, r *http.Re
 	respondJSON(w, http.StatusOK, map[string]string{"status": "updated"})
 }
 
+// AdminGetBlueprintVMPlaylistsResolved returns the resolved playlists for each VM slot on a blueprint,
+// with source labeling ("blueprint_override" or "template_default").
+func (h *Handler) AdminGetBlueprintVMPlaylistsResolved(w http.ResponseWriter, r *http.Request) {
+	blueprintID, err := uuid.Parse(chi.URLParam(r, "blueprintID"))
+	if err != nil {
+		http.Error(w, "invalid blueprint ID", http.StatusBadRequest)
+		return
+	}
+
+	rows, err := h.db.GetBlueprintVMPlaylistsResolved(r.Context(), blueprintID)
+	if err != nil {
+		if err.Error() == "sql: no rows in result set" {
+			http.Error(w, "blueprint not found", http.StatusNotFound)
+			return
+		}
+		h.logger.Error("failed to get blueprint VM playlists", "error", err)
+		http.Error(w, "failed to get playlists", http.StatusInternalServerError)
+		return
+	}
+
+	// Transform flat rows into a grouped response: vm_slot -> playlists array
+	type PlaylistInfo struct {
+		PlaylistID   uuid.UUID `json:"playlist_id"`
+		Name         string    `json:"name"`
+		Slug         string    `json:"slug"`
+		Source       string    `json:"source"` // "blueprint_override" or "template_default"
+		ExecutionOrder int     `json:"execution_order"`
+	}
+
+	type VMPlaylistSlot struct {
+		VMSlot    int              `json:"vm_slot"`
+		Playlists []PlaylistInfo   `json:"playlists"`
+	}
+
+	// Group by VM slot
+	vmMap := make(map[int][]PlaylistInfo)
+	for _, row := range rows {
+		vmMap[row.VMSlot] = append(vmMap[row.VMSlot], PlaylistInfo{
+			PlaylistID:    row.PlaylistID,
+			Name:          row.PlaylistName,
+			Slug:          row.PlaylistSlug,
+			Source:        row.Source,
+			ExecutionOrder: row.ExecutionOrder,
+		})
+	}
+
+	// Convert to sorted list
+	var vmPlaylists []VMPlaylistSlot
+	for vmSlot, playlists := range vmMap {
+		vmPlaylists = append(vmPlaylists, VMPlaylistSlot{
+			VMSlot:    vmSlot,
+			Playlists: playlists,
+		})
+	}
+
+	// Sort by VM slot for consistent ordering
+	for i := 0; i < len(vmPlaylists)-1; i++ {
+		for j := i + 1; j < len(vmPlaylists); j++ {
+			if vmPlaylists[j].VMSlot < vmPlaylists[i].VMSlot {
+				vmPlaylists[i], vmPlaylists[j] = vmPlaylists[j], vmPlaylists[i]
+			}
+		}
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{"vm_playlists": vmPlaylists})
+}
+
 // AdminListRuns returns all runs across all pods (admin view).
 func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 	runs, err := h.db.ListAllRuns(r.Context())

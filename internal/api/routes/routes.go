@@ -308,6 +308,7 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 
 			// Blueprint VM playlist overrides
 			r.Post("/blueprints/{blueprintID}/vm-playlists", h.AdminSetBlueprintVMPlaylists)
+			r.Get("/blueprints/{blueprintID}/vm-playlists", h.AdminGetBlueprintVMPlaylistsResolved)
 
 			// Testing runs (admin view)
 			r.Get("/runs", h.AdminListRuns)

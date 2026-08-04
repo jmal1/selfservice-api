@@ -186,6 +186,33 @@ var PodTestingDashboard404 = synthetic.CheckFunc{
 	},
 }
 
+// BlueprintVMPlaylistsContract404 asserts that a nonexistent blueprint returns 404
+// (not 500) from the blueprint VM playlists resolution endpoint. This catches the
+// nil-deref regression class: if blueprint existence checking is skipped, a nil
+// pointer dereference would return 500.
+var BlueprintVMPlaylistsContract404 = synthetic.CheckFunc{
+	NameVal:        "blueprint_vm_playlists_404",
+	TitleVal:       "Missing Blueprint Playlists Returns 404 (not 500)",
+	DescriptionVal: "Probes /admin/blueprints/{phantom-uuid}/vm-playlists and requires 404. Watches for nil-deref bugs in blueprint resolution logic.",
+	SeverityVal:    synthetic.SeverityWarning,
+	RunFn: func(ctx context.Context, c *synthetic.Client) (int, error) {
+		const phantom = "00000000-0000-0000-0000-000000000000"
+		resp, err := c.Do(ctx, http.MethodGet, "/api/v1/admin/blueprints/"+phantom+"/vm-playlists", nil)
+		if err != nil {
+			return 0, err
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		if resp.StatusCode == http.StatusInternalServerError {
+			return resp.StatusCode, fmt.Errorf("phantom blueprint vm-playlists endpoint returned 500 (nil-deref bug)")
+		}
+		if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusForbidden {
+			return resp.StatusCode, fmt.Errorf("phantom blueprint vm-playlists endpoint returned %d, want 404 or 403", resp.StatusCode)
+		}
+		return resp.StatusCode, nil
+	},
+}
+
 // WikiIndexRBAC asserts that a non-instructor synthetic user is rejected from
 // the wiki index with 403. The wiki contains internal authoring docs scoped
 // to instructors and admins; a permission regression would surface here.
@@ -250,6 +277,7 @@ func All() []synthetic.Check {
 		AdminRunDetail403,
 		AdminAudit403,
 		PodTestingDashboard404,
+		BlueprintVMPlaylistsContract404,
 		WikiIndexRBAC,
 		ImageUploadRBAC,
 	}
