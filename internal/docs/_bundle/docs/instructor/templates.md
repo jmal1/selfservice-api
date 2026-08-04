@@ -165,6 +165,35 @@ smoke test fails, the template drops back to `ready` with the failure
 recorded — fix the image and Publish again. **Unpublish** an active
 template at any time to hide it without losing the generalized image.
 
+## Step 5.1 — Template Visibility (Instructor-Only Staging)
+
+When you publish a template, you can mark it as **"Instructor only"** to
+hide it from the student template picker while you stage or test it. This
+is useful when:
+
+- A template is nearly ready but still needs final tweaks or testing
+- You want instructors to test a new template before students access it
+- You're preparing a template for use in a future course
+
+**In the template edit dialog:**
+
+1. Look for the **Visibility** toggle (appears when editing or creating)
+2. Choose:
+   - **Public** (default) — template appears in the student template catalog
+   - **Instructor only** — template is hidden from students and only
+     visible to instructors and admins in the template picker
+
+> [!note]
+> **Visibility vs. Publish state are independent.** An active (published)
+> instructor-only template is fully functional — it just doesn't appear in the
+> student-facing catalog. An instructor can still click "Deploy" and use it
+> to create a pod for testing. Students **cannot** see instructor-only
+> templates in the list *or* reach them through any other path; attempting
+> to use one (if they knew its ID) results in a permission error.
+
+Once you're satisfied with the template, change it back to **Public** so
+students can access it.
+
 ---
 
 ## Linux template contract
@@ -517,6 +546,28 @@ finds. The distinctive prefix ensures the sweep cannot match a student pod VM.
 ---
 
 See [troubleshooting.md](troubleshooting.md) for more general help.
+## Pinning templates and blueprints
+
+Templates and blueprints can be **pinned** to emphasize them. Pinned items appear in a dedicated **Pinned** section at the top of the template and blueprint picker, making them immediately visible to students without scrolling through a long list.
+
+### How pinning works
+
+- **Multiple pins allowed** — Pin as many templates or blueprints as you like.
+- **Ordered** — Pinned items appear in the order you set; drag them to reorder (or use up/down buttons on mobile).
+- **Still in main list** — Pinned items also stay in the normal alphabetical list below the Pinned section. Pinning is emphasis, not filtering.
+- **Instructor/admin only** — Only instructors (role ≥ instructor) can pin or unpin. Students see the Pinned section read-only.
+
+### When to pin
+
+Pin this week's material so students land on it immediately:
+
+- The lab template for the current module
+- The starter blueprint for an active project
+- A frequently-used tool or reference template
+
+### Viewing and managing pins
+
+In **Admin → Templates** or **Admin → Blueprints**, you'll see a **Pin** icon (📌) next to each item. Click it to pin; click again to unpin. Pinned items show a special **Pinned** badge, and you can drag them to reorder (or use ↑/↓ buttons). The order you set here is what students see in the Pinned section at the top of their picker.
 
 ---
 
