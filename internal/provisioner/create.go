@@ -21,6 +21,27 @@ import (
 	"github.com/jmal1/selfservice-api/internal/vcenter"
 )
 
+// pipelineMetricsSink is the metrics surface the provisioner uses for the
+// template + image pipeline. It is intentionally narrow so tests can inject a
+// fake without pulling in the full PipelineMetrics implementation.
+type pipelineMetricsSink interface {
+	RecordImageImport(kind, result string, d time.Duration, bytesMoved int64)
+	SetImageUploadsStuck(n int)
+	RecordTemplateTransition(from, to string)
+	RecordTemplateVerify(result string)
+	RecordTemplateJob(jobType string, d time.Duration)
+	SetTemplateStates(counts map[string]int)
+	SetTemplatesStuck(n int)
+	Push(ctx context.Context) error
+}
+
+type jobStatusUpdater interface {
+	UpdateJobStatus(ctx context.Context, id uuid.UUID, status string, result []byte) error
+}
+
+var _ pipelineMetricsSink = (*PipelineMetrics)(nil)
+var _ jobStatusUpdater = (*database.Queries)(nil)
+
 // Provisioner orchestrates pod lifecycle operations.
 type Provisioner struct {
 	db     *database.Queries
@@ -40,16 +61,24 @@ type Provisioner struct {
 	// every other job type; image_import jobs then fail loudly with a clear
 	// message rather than nil-panicking mid-upload.
 	objects  imageObjectStore
-	pipeline *PipelineMetrics
+	pipeline pipelineMetricsSink
 	imageCfg ImageImportConfig
+}
+
+// EnablePipelineMetrics wires the shared pipeline metrics sink used by the
+// template reconciler, template jobs, and image import jobs.
+func (p *Provisioner) EnablePipelineMetrics(metrics pipelineMetricsSink) {
+	p.pipeline = metrics
 }
 
 // EnableImageImport wires the dependencies needed to process image_import jobs.
 // Called by the worker at startup once an object store is configured; when it
-// is not called, ImportImage returns an explanatory error instead of panicking.
-func (p *Provisioner) EnableImageImport(objects *objectstore.Client, metrics *PipelineMetrics, cfg ImageImportConfig) {
+// is not called, ImportImage returns an explanatory message instead of panicking.
+func (p *Provisioner) EnableImageImport(objects *objectstore.Client, metrics pipelineMetricsSink, cfg ImageImportConfig) {
 	p.objects = objects
-	p.pipeline = metrics
+	if metrics != nil {
+		p.pipeline = metrics
+	}
 	p.imageCfg = cfg
 }
 
@@ -75,61 +104,92 @@ func New(
 // ProcessJob dispatches a job to the correct workflow.
 func (p *Provisioner) ProcessJob(ctx context.Context, job *models.Job) error {
 	p.logger.Info("processing job", "id", job.ID, "type", job.Type)
+	return processJobLifecycle(ctx, p.db, p.pipeline, job, p.publishProgress, func(ctx context.Context, job *models.Job) error {
+		switch job.Type {
+		case models.JobTypePodCreate:
+			return p.CreatePod(ctx, job)
+		case models.JobTypePodDestroy:
+			return p.DestroyPod(ctx, job)
+		case models.JobTypeVMStart:
+			return p.PowerVM(ctx, job, "start")
+		case models.JobTypeVMStop:
+			return p.PowerVM(ctx, job, "stop")
+		case models.JobTypeVMRestart:
+			return p.PowerVM(ctx, job, "restart")
+		case models.JobTypeVMReset:
+			return p.PowerVM(ctx, job, "reset")
+		case models.JobTypeVMDestroy:
+			return p.DestroyVM(ctx, job)
+		case models.JobTypeVMAdd:
+			return p.AddVM(ctx, job)
+		case models.JobTypeVMSnapshot:
+			return p.SnapshotVM(ctx, job)
+		case models.JobTypeVMRevert:
+			return p.RevertVM(ctx, job)
+		case models.JobTypeVMSnapshotDelete:
+			return p.DeleteSnapshot(ctx, job)
+		case models.JobTypeTemplateProvision:
+			return p.ProvisionTemplate(ctx, job)
+		case models.JobTypeTemplateGeneralize:
+			return p.GeneralizeTemplate(ctx, job)
+		case models.JobTypeTemplateVerify:
+			return p.VerifyTemplate(ctx, job)
+		case models.JobTypeImageImport:
+			return p.ImportImage(ctx, job)
+		case models.JobTypeVMSuspend:
+			return p.SuspendVM(ctx, job)
+		default:
+			return fmt.Errorf("unknown job type: %s", job.Type)
+		}
+	})
+}
 
-	// Mark in_progress
-	if err := p.db.UpdateJobStatus(ctx, job.ID, models.JobStatusInProgress, nil); err != nil {
+func isTemplateJobType(jobType string) bool {
+	switch jobType {
+	case models.JobTypeTemplateProvision, models.JobTypeTemplateGeneralize, models.JobTypeTemplateVerify:
+		return true
+	default:
+		return false
+	}
+}
+
+func processJobLifecycle(
+	ctx context.Context,
+	db jobStatusUpdater,
+	pipeline pipelineMetricsSink,
+	job *models.Job,
+	publish func(uuid.UUID, string, string),
+	dispatch func(context.Context, *models.Job) error,
+) error {
+	// Mark in_progress before dispatching the job body.
+	if err := db.UpdateJobStatus(ctx, job.ID, models.JobStatusInProgress, nil); err != nil {
 		return fmt.Errorf("update job status: %w", err)
 	}
-	p.publishProgress(job.ID, "started", "Job processing started")
-
-	var err error
-	switch job.Type {
-	case models.JobTypePodCreate:
-		err = p.CreatePod(ctx, job)
-	case models.JobTypePodDestroy:
-		err = p.DestroyPod(ctx, job)
-	case models.JobTypeVMStart:
-		err = p.PowerVM(ctx, job, "start")
-	case models.JobTypeVMStop:
-		err = p.PowerVM(ctx, job, "stop")
-	case models.JobTypeVMRestart:
-		err = p.PowerVM(ctx, job, "restart")
-	case models.JobTypeVMReset:
-		err = p.PowerVM(ctx, job, "reset")
-	case models.JobTypeVMDestroy:
-		err = p.DestroyVM(ctx, job)
-	case models.JobTypeVMAdd:
-		err = p.AddVM(ctx, job)
-	case models.JobTypeVMSnapshot:
-		err = p.SnapshotVM(ctx, job)
-	case models.JobTypeVMRevert:
-		err = p.RevertVM(ctx, job)
-	case models.JobTypeVMSnapshotDelete:
-		err = p.DeleteSnapshot(ctx, job)
-	case models.JobTypeTemplateProvision:
-		err = p.ProvisionTemplate(ctx, job)
-	case models.JobTypeTemplateGeneralize:
-		err = p.GeneralizeTemplate(ctx, job)
-	case models.JobTypeTemplateVerify:
-		err = p.VerifyTemplate(ctx, job)
-	case models.JobTypeImageImport:
-		err = p.ImportImage(ctx, job)
-	case models.JobTypeVMSuspend:
-		err = p.SuspendVM(ctx, job)
-	default:
-		err = fmt.Errorf("unknown job type: %s", job.Type)
+	if pipeline != nil && isTemplateJobType(job.Type) {
+		started := time.Now()
+		defer func() {
+			pipeline.RecordTemplateJob(job.Type, time.Since(started))
+		}()
+	}
+	if publish != nil {
+		publish(job.ID, "started", "Job processing started")
 	}
 
+	err := dispatch(ctx, job)
 	if err != nil {
 		result, _ := json.Marshal(map[string]string{"error": err.Error()})
-		_ = p.db.UpdateJobStatus(ctx, job.ID, models.JobStatusFailed, result)
-		p.publishProgress(job.ID, "failed", err.Error())
+		_ = db.UpdateJobStatus(ctx, job.ID, models.JobStatusFailed, result)
+		if publish != nil {
+			publish(job.ID, "failed", err.Error())
+		}
 		return err
 	}
 
 	result, _ := json.Marshal(map[string]string{"message": "completed successfully"})
-	_ = p.db.UpdateJobStatus(ctx, job.ID, models.JobStatusCompleted, result)
-	p.publishProgress(job.ID, "completed", "Job completed successfully")
+	_ = db.UpdateJobStatus(ctx, job.ID, models.JobStatusCompleted, result)
+	if publish != nil {
+		publish(job.ID, "completed", "Job completed successfully")
+	}
 	return nil
 }
 

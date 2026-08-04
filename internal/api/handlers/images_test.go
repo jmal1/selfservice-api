@@ -398,6 +398,14 @@ func (f *fakeImageStore) UsedBytes(_ context.Context) (int64, error) {
 	return f.usedBytes, f.usedBytesErr
 }
 
+type fakeImageMetrics struct {
+	records []string
+}
+
+func (f *fakeImageMetrics) RecordImageUpload(kind, result string) {
+	f.records = append(f.records, kind+"|"+result)
+}
+
 // newImageHandler builds a *Handler wired with the given fakes.
 func newImageHandler(db *fakeImageDB, store *fakeImageStore) *Handler {
 	return &Handler{
@@ -564,7 +572,7 @@ func TestAdminCompleteImageUpload_StatMismatch(t *testing.T) {
 
 	// Response must NOT be 200 OK — a truncated upload is not "uploaded".
 	if w.Code == http.StatusOK {
-		t.Errorf("status = 200; want non-200 on size mismatch — "+
+		t.Errorf("status = 200; want non-200 on size mismatch — " +
 			"a truncated upload must not transition to 'uploaded'")
 	}
 
@@ -659,5 +667,72 @@ func TestAdminCreateImageUpload_AllowsWhenUsageUnknown(t *testing.T) {
 	}
 	if store.presignCalls != 1 {
 		t.Errorf("presignCalls = %d, want 1 — upload should proceed when usage is unknown", store.presignCalls)
+	}
+}
+
+// TestAdminImageUploadLifecycle_RecordsMetrics proves the upload lifecycle
+// events are wired to the pipeline metrics sink from production handler code.
+// The created/completed/failed samples are all driven by handler paths so the
+// test fails if any call site is removed.
+func TestAdminImageUploadLifecycle_RecordsMetrics(t *testing.T) {
+	db := &fakeImageDB{}
+	store := &fakeImageStore{}
+	metrics := &fakeImageMetrics{}
+	h := newImageHandler(db, store).WithPipelineMetrics(metrics)
+
+	createBody := `{"filename":"kali.iso","size_bytes":1024}`
+	createReq := httptest.NewRequest(http.MethodPost, "/admin/images", strings.NewReader(createBody))
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	h.AdminCreateImageUpload(createW, createReq)
+
+	if createW.Code != http.StatusCreated {
+		t.Fatalf("create status = %d; want 201", createW.Code)
+	}
+	if db.createdImg == nil {
+		t.Fatal("CreateImageUpload did not create a row")
+	}
+	if len(metrics.records) != 1 || metrics.records[0] != models.ImageKindISO+"|created" {
+		t.Fatalf("created metric = %v, want [%s|created]", metrics.records, models.ImageKindISO)
+	}
+
+	store.statSize = db.createdImg.SizeBytes
+	db.getImg = db.createdImg
+	completeBody := `{"parts":[{"part_number":1,"etag":"etag-abc"}]}`
+	completeReq := httptest.NewRequest(http.MethodPost, "/admin/images/"+db.createdImg.ID.String()+"/complete", strings.NewReader(completeBody))
+	completeReq.Header.Set("Content-Type", "application/json")
+	completeReq = withImageIDParam(completeReq, db.createdImg.ID)
+	completeW := httptest.NewRecorder()
+	h.AdminCompleteImageUpload(completeW, completeReq)
+
+	if completeW.Code != http.StatusOK {
+		t.Fatalf("complete status = %d; want 200", completeW.Code)
+	}
+	if len(metrics.records) != 2 || metrics.records[1] != models.ImageKindISO+"|completed" {
+		t.Fatalf("completed metric = %v, want second record %s|completed", metrics.records, models.ImageKindISO)
+	}
+
+	badID := uuid.New()
+	db.getImg = &models.ImageUpload{
+		ID:        badID,
+		Filename:  "broken.iso",
+		Kind:      models.ImageKindISO,
+		Status:    models.ImageUploadPending,
+		ObjectKey: "crucible/" + badID.String() + "/broken.iso",
+		UploadID:  "upload-2",
+		SizeBytes: 2048,
+	}
+	store.statSize = 1024
+	failedReq := httptest.NewRequest(http.MethodPost, "/admin/images/"+badID.String()+"/complete", strings.NewReader(completeBody))
+	failedReq.Header.Set("Content-Type", "application/json")
+	failedReq = withImageIDParam(failedReq, badID)
+	failedW := httptest.NewRecorder()
+	h.AdminCompleteImageUpload(failedW, failedReq)
+
+	if failedW.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("failed status = %d; want 422", failedW.Code)
+	}
+	if len(metrics.records) != 3 || metrics.records[2] != models.ImageKindISO+"|failed" {
+		t.Fatalf("failed metric = %v, want third record %s|failed", metrics.records, models.ImageKindISO)
 	}
 }

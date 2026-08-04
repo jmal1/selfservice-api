@@ -5,8 +5,9 @@
 // environments without observability wired up.
 //
 // Namespaces:
-//   crucible_image_*     — browser -> MinIO -> vCenter image staging
-//   crucible_template_*  — the wizard lifecycle state machine
+//
+//	crucible_image_*     — browser -> MinIO -> vCenter image staging
+//	crucible_template_*  — the wizard lifecycle state machine
 //
 // Counter semantics note: this process keeps counters in memory and
 // pushes their absolute value. A worker restart resets them to 0, which
@@ -58,19 +59,21 @@ type PipelineMetrics struct {
 
 	mu sync.Mutex
 
-	imageUploadTotal    map[string]float64 // kind|result
-	imageImportTotal    map[string]float64 // kind|result
-	imageImportDurSum   map[string]float64 // kind
-	imageImportDurCount map[string]float64 // kind
-	imageImportBytes    map[string]float64 // kind
-	imageUploadsStuck   float64
+	imageUploadTotal           map[string]float64 // kind|result
+	imageImportTotal           map[string]float64 // kind|result
+	imageImportDurSum          map[string]float64 // kind
+	imageImportDurCount        map[string]float64 // kind
+	imageImportBytes           map[string]float64 // kind
+	imageUploadsStuck          float64
+	imageUploadsStuckCollected bool
 
-	templateTransitions map[string]float64 // from|to
-	templateVerify      map[string]float64 // result
-	templateJobDurSum   map[string]float64 // job_type
-	templateJobDurCount map[string]float64 // job_type
-	templateStates      map[string]float64 // state
-	templateStuck       float64
+	templateTransitions    map[string]float64 // from|to
+	templateVerify         map[string]float64 // result
+	templateJobDurSum      map[string]float64 // job_type
+	templateJobDurCount    map[string]float64 // job_type
+	templateStates         map[string]float64 // state
+	templateStuck          float64
+	templateStuckCollected bool
 }
 
 // NewPipelineMetrics returns an initialized collector. baseURL may be
@@ -124,6 +127,7 @@ func (m *PipelineMetrics) SetImageUploadsStuck(n int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.imageUploadsStuck = float64(n)
+	m.imageUploadsStuckCollected = true
 }
 
 // RecordTemplateTransition counts a lifecycle state change. `to="error"`
@@ -168,6 +172,7 @@ func (m *PipelineMetrics) SetTemplatesStuck(n int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.templateStuck = float64(n)
+	m.templateStuckCollected = true
 }
 
 // Push serializes the current values and POSTs them. No-op when BaseURL
@@ -224,9 +229,11 @@ func (m *PipelineMetrics) serialize() []byte {
 		"Cumulative bytes streamed from object storage into vCenter, by kind.",
 		"kind", m.imageImportBytes)
 
-	b.WriteString("# HELP crucible_image_uploads_stuck Staged image uploads wedged in a non-terminal state past the staleness threshold.\n")
-	b.WriteString("# TYPE crucible_image_uploads_stuck gauge\n")
-	fmt.Fprintf(&b, "crucible_image_uploads_stuck %g\n", m.imageUploadsStuck)
+	if m.imageUploadsStuckCollected {
+		b.WriteString("# HELP crucible_image_uploads_stuck Staged image uploads wedged in a non-terminal state past the staleness threshold.\n")
+		b.WriteString("# TYPE crucible_image_uploads_stuck gauge\n")
+		fmt.Fprintf(&b, "crucible_image_uploads_stuck %g\n", m.imageUploadsStuck)
+	}
 
 	writeCounter2(&b, "crucible_template_transition_total",
 		"Template lifecycle state transitions.",
@@ -247,9 +254,11 @@ func (m *PipelineMetrics) serialize() []byte {
 		"Number of templates currently in each lifecycle state.",
 		"state", m.templateStates)
 
-	b.WriteString("# HELP crucible_template_stuck Templates sitting in a non-terminal lifecycle state past the staleness threshold.\n")
-	b.WriteString("# TYPE crucible_template_stuck gauge\n")
-	fmt.Fprintf(&b, "crucible_template_stuck %g\n", m.templateStuck)
+	if m.templateStuckCollected {
+		b.WriteString("# HELP crucible_template_stuck Templates sitting in a non-terminal lifecycle state past the staleness threshold.\n")
+		b.WriteString("# TYPE crucible_template_stuck gauge\n")
+		fmt.Fprintf(&b, "crucible_template_stuck %g\n", m.templateStuck)
+	}
 
 	b.WriteString("# HELP crucible_pipeline_run_timestamp_seconds Unix time of the latest pipeline metrics push.\n")
 	b.WriteString("# TYPE crucible_pipeline_run_timestamp_seconds gauge\n")

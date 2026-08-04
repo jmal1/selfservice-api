@@ -139,6 +139,11 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.secrets.objectstore }}
                   key: secret-key
+            # API-side pipeline metrics for image upload lifecycle events.
+            - name: PIPELINE_PUSHGATEWAY_URL
+              value: {{ .Values.api.pipelinePushgatewayURL | default "" | quote }}
+            - name: PIPELINE_PUSHGATEWAY_JOB
+              value: {{ .Values.api.pipelinePushgatewayJob | default "crucible_pipeline_api" | quote }}
             {{- end }}
           livenessProbe:
             httpGet:

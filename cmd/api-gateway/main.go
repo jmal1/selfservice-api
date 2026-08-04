@@ -17,6 +17,7 @@ import (
 	"github.com/jmal1/selfservice-api/internal/database"
 	events "github.com/jmal1/selfservice-api/internal/nats"
 	"github.com/jmal1/selfservice-api/internal/objectstore"
+	"github.com/jmal1/selfservice-api/internal/provisioner"
 	"github.com/jmal1/selfservice-api/internal/vcenter"
 	vsphereHealth "github.com/jmal1/selfservice-api/internal/vsphere/health"
 )
@@ -99,6 +100,17 @@ func main() {
 		logger.Info("vCenter folder enumeration enabled", "folder", cfg.VCenter.TemplatesFolder)
 	}
 
+	var pipeline *provisioner.PipelineMetrics
+	if cfg.ObjectStore.Endpoint != "" {
+		if pgURL := os.Getenv("PIPELINE_PUSHGATEWAY_URL"); pgURL != "" {
+			job := os.Getenv("PIPELINE_PUSHGATEWAY_JOB")
+			if job == "" {
+				job = "crucible_pipeline_api"
+			}
+			pipeline = provisioner.NewPipelineMetrics(pgURL, job, map[string]string{"layer": "api"})
+		}
+	}
+
 	// Image upload (Epic A). Optional: without an object store every
 	// /admin/images endpoint answers 503 "image upload not configured"
 	// rather than nil-panicking, so the gateway still serves everything else.
@@ -115,6 +127,10 @@ func main() {
 			logger.Error("object store init failed — image upload disabled", "error", err)
 		} else {
 			handler.WithImageStore(objects)
+			if pipeline != nil {
+				handler.WithPipelineMetrics(pipeline)
+				go pipeline.RunPusher(ctx, 30*time.Second, logger)
+			}
 			logger.Info("image upload enabled",
 				"endpoint", cfg.ObjectStore.Endpoint, "bucket", cfg.ObjectStore.Bucket)
 		}
@@ -141,13 +157,13 @@ func main() {
 	// SSO password — the exact failure mode we hit on 2026-06-07.
 	if cfg.VCenter.URL != "" && cfg.VCenter.User != "" && cfg.VCenter.Password != "" {
 		probe, err := vsphereHealth.New(vsphereHealth.Config{
-			VCenterURL:           cfg.VCenter.URL,
-			User:                 cfg.VCenter.User,
-			Password:             cfg.VCenter.Password,
-			Insecure:             cfg.VCenter.Insecure,
-			PushgatewayURL:       cfg.VCenter.HealthPushgatewayURL,
-			Job:                  "crucible_vsphere_health",
-			GroupingLabels:       map[string]string{"layer": "vsphere"},
+			VCenterURL:     cfg.VCenter.URL,
+			User:           cfg.VCenter.User,
+			Password:       cfg.VCenter.Password,
+			Insecure:       cfg.VCenter.Insecure,
+			PushgatewayURL: cfg.VCenter.HealthPushgatewayURL,
+			Job:            "crucible_vsphere_health",
+			GroupingLabels: map[string]string{"layer": "vsphere"},
 		}, logger)
 		if err != nil {
 			logger.Warn("vsphere health probe disabled", "error", err)

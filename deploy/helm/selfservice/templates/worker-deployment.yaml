@@ -141,6 +141,20 @@ spec:
               value: {{ .Values.worker.networkReconciler.enabled | default false | quote }}
             - name: WORKER_NETWORK_RECONCILER_INTERVAL
               value: {{ .Values.worker.networkReconciler.interval | default "5m" | quote }}
+            # Template pipeline reconciler: refreshes crucible_template_state
+            # and crucible_template_stuck from the live templates table.
+            - name: WORKER_PIPELINE_RECONCILER_ENABLED
+              value: {{ .Values.worker.pipelineReconciler.enabled | default false | quote }}
+            - name: WORKER_PIPELINE_RECONCILER_INTERVAL
+              value: {{ .Values.worker.pipelineReconciler.interval | default "5m" | quote }}
+            - name: WORKER_PIPELINE_RECONCILER_STALE_THRESHOLD
+              value: {{ .Values.worker.pipelineReconciler.staleThreshold | default "2h" | quote }}
+            # Pushgateway job label for the template/image pipeline metric
+            # families. Keep distinct from WORKER_PUSHGATEWAY_JOB so the
+            # destroy_failed pusher and the pipeline collector don't overwrite
+            # each other's series.
+            - name: WORKER_PIPELINE_PUSHGATEWAY_JOB
+              value: {{ .Values.worker.pipelinePushgatewayJob | default "crucible_pipeline" | quote }}
             {{- if .Values.objectstore.enabled }}
             # The image_import job streams the staged object out of MinIO and
             # into vCenter, so the worker needs the same credentials the API

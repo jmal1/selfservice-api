@@ -20,6 +20,11 @@ imagePullSecrets:
 api:
   port: 8080
   allowedOrigins: "https://crucible.jmal.io"
+  # Pushgateway destination for the API gateway's image-upload lifecycle
+  # metrics. Kept separate from the worker's pipeline job label so the two
+  # processes do not overwrite each other's Pushgateway group.
+  pipelinePushgatewayURL: "http://pushgateway.observability:9091"
+  pipelinePushgatewayJob: "crucible_pipeline_api"
   resources:
     requests:
       cpu: 100m

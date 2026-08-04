@@ -262,6 +262,7 @@ func (h *Handler) AdminCreateImageUpload(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	h.recordImageUpload(kind, "created")
 
 	if h.db != nil {
 		audit.Log(r.Context(), h.db, "image.upload.create",
@@ -323,6 +324,7 @@ func (h *Handler) AdminCompleteImageUpload(w http.ResponseWriter, r *http.Reques
 
 	if err := h.imageStore.CompleteMultipart(r.Context(), img.ObjectKey, img.UploadID, mp); err != nil {
 		h.logger.Error("complete multipart failed", "error", err, "id", imageID)
+		h.recordImageUpload(img.Kind, "failed")
 		http.Error(w, "failed to complete upload: "+err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -334,6 +336,7 @@ func (h *Handler) AdminCompleteImageUpload(w http.ResponseWriter, r *http.Reques
 	if err != nil {
 		h.logger.Error("stat object failed after complete", "error", err, "id", imageID)
 		_ = h.imgDB.SetImageUploadError(r.Context(), imageID, "stat after complete failed: "+err.Error())
+		h.recordImageUpload(img.Kind, "failed")
 		http.Error(w, "failed to verify upload size", http.StatusBadGateway)
 		return
 	}
@@ -341,6 +344,7 @@ func (h *Handler) AdminCompleteImageUpload(w http.ResponseWriter, r *http.Reques
 	if info.Size != img.SizeBytes {
 		msg := fmt.Sprintf("size mismatch: declared %d bytes, got %d bytes; upload rejected", img.SizeBytes, info.Size)
 		_ = h.imgDB.SetImageUploadError(r.Context(), imageID, msg)
+		h.recordImageUpload(img.Kind, "failed")
 		respondJSON(w, http.StatusUnprocessableEntity, map[string]any{
 			"error":         "size_mismatch",
 			"declared_size": img.SizeBytes,
@@ -352,13 +356,16 @@ func (h *Handler) AdminCompleteImageUpload(w http.ResponseWriter, r *http.Reques
 
 	if err := h.imgDB.SetImageUploadUploaded(r.Context(), imageID, info.Size); err != nil {
 		if errors.Is(err, database.ErrImageUploadStale) {
+			h.recordImageUpload(img.Kind, "failed")
 			http.Error(w, "upload is in unexpected state", http.StatusConflict)
 			return
 		}
 		h.logger.Error("set uploaded status failed", "error", err, "id", imageID)
+		h.recordImageUpload(img.Kind, "failed")
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	h.recordImageUpload(img.Kind, "completed")
 
 	fresh, _ := h.imgDB.GetImageUploadByID(r.Context(), imageID)
 	if fresh == nil {
@@ -395,10 +402,10 @@ func (h *Handler) AdminImportImage(w http.ResponseWriter, r *http.Request) {
 
 	if img.Status != models.ImageUploadUploaded {
 		respondJSON(w, http.StatusConflict, map[string]any{
-			"error":          "invalid_status",
-			"current_status": img.Status,
+			"error":           "invalid_status",
+			"current_status":  img.Status,
 			"required_status": models.ImageUploadUploaded,
-			"message":        "image must be in 'uploaded' status to import",
+			"message":         "image must be in 'uploaded' status to import",
 		})
 		return
 	}
@@ -510,9 +517,9 @@ func (h *Handler) AdminDeleteImage(w http.ResponseWriter, r *http.Request) {
 	}
 	if refCount > 0 {
 		respondJSON(w, http.StatusConflict, map[string]any{
-			"error":           "image_referenced",
-			"template_count":  refCount,
-			"message":         fmt.Sprintf("image is referenced by %d template(s); remove those references first", refCount),
+			"error":          "image_referenced",
+			"template_count": refCount,
+			"message":        fmt.Sprintf("image is referenced by %d template(s); remove those references first", refCount),
 		})
 		return
 	}
@@ -543,6 +550,12 @@ func (h *Handler) AdminDeleteImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) recordImageUpload(kind, result string) {
+	if h != nil && h.imageMetrics != nil {
+		h.imageMetrics.RecordImageUpload(kind, result)
+	}
 }
 
 // AdminListVCenterISOs browses the ISO datastore so the wizard can offer
@@ -579,9 +592,9 @@ func (h *Handler) AdminListVCenterISOs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respondJSON(w, http.StatusOK, map[string]any{
-		"files":            files,
-		"datastore":        h.isoDatastore,
-		"cached":           cached,
+		"files":             files,
+		"datastore":         h.isoDatastore,
+		"cached":            cached,
 		"cache_age_seconds": age,
 	})
 }
