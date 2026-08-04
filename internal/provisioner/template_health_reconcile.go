@@ -27,17 +27,18 @@
 //
 // # Deep-check cleanup
 //
-//   The deep check names its clone "crucible-healthcheck-<templateID>" and
-//   places it in the Templates folder (not the Student-VMs folder, which the
-//   orphan reconciler scans). A deferred destroy runs even when the power-on
-//   or wait-for-IP step fails. A sweep at worker startup catches any clones
-//   left behind by a crash.
+//	The deep check names its clone "crucible-healthcheck-<templateID>" and
+//	places it in the Templates folder (not the Student-VMs folder, which the
+//	orphan reconciler scans). A deferred destroy runs even when the power-on
+//	or wait-for-IP step fails. A sweep at worker startup catches any clones
+//	left behind by a crash.
 package provisioner
 
 import (
 	"context"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -188,7 +189,20 @@ func templateHealthCycleDue(ctx context.Context, db templateHealthDB, interval t
 }
 
 // ReconcileTemplateHealth is the Provisioner-bound entry point. The provision
-// worker calls this from its select loop.
+// worker calls this from its select loop and on leader acquisition.
+//
+// A panic anywhere in the cycle is converted into an error rather than allowed
+// to escape. This is not defensive decoration: template health is a
+// non-essential background health probe, but it runs in a goroutine inside the
+// provision worker, so an escaping panic kills the whole process — including
+// job claiming and every other reconciler. Worse, it does not stop at one
+// replica: the crash releases the leader lock, the next replica acquires it,
+// runs the same cycle, and dies too, walking the fault through all four.
+//
+// That is exactly what happened the first time this code ever executed: a
+// govmomi property-destination bug in VMExists panicked, and provisioning was
+// down across the cluster until template health was disabled. Degrading to
+// "health checks are broken" is always preferable to "provisioning is down".
 func (p *Provisioner) ReconcileTemplateHealth(ctx context.Context, cfg TemplateHealthReconcilerConfig) (TemplateHealthCounts, error) {
 	// Guard the nil-pointer-in-interface trap: a nil *TemplateHealthPusher
 	// would satisfy metrics != nil, then panic on the first method call.
@@ -201,6 +215,13 @@ func (p *Provisioner) ReconcileTemplateHealth(ctx context.Context, cfg TemplateH
 
 // reconcileTemplateHealth is the pure implementation. Factored out so tests
 // can inject fakes for every dependency.
+//
+// The recover lives here rather than on the Provisioner method for two
+// reasons: it is the single choke point both trigger paths (the 12h ticker and
+// the leader-acquisition catch-up) pass through, and Provisioner holds
+// concrete *database.Queries / *vcenter.Client fields, so a guard at that
+// boundary could never be tested with fakes. An untestable safety net is not a
+// safety net.
 func reconcileTemplateHealth(
 	ctx context.Context,
 	db templateHealthDB,
@@ -208,7 +229,25 @@ func reconcileTemplateHealth(
 	metrics templateHealthMetrics,
 	logger *slog.Logger,
 	cfg TemplateHealthReconcilerConfig,
-) (TemplateHealthCounts, error) {
+) (counts TemplateHealthCounts, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			stack := debug.Stack()
+			// Discard whatever partial counts the aborted cycle had
+			// accumulated. A named return would otherwise surface
+			// "Templates: 8, CheckerUp: true" for a cycle that died,
+			// and the caller logs those counts.
+			counts = TemplateHealthCounts{CheckerUp: false}
+			err = fmt.Errorf("template health reconcile panicked (contained; provisioning unaffected): %v", r)
+			if logger != nil {
+				logger.Error("template health reconcile panicked",
+					"component", "template_health_reconciler",
+					"panic", fmt.Sprint(r),
+					"stack", string(stack))
+			}
+		}
+	}()
+
 	if cfg.Interval <= 0 {
 		cfg.Interval = 12 * time.Hour
 	}
@@ -238,7 +277,7 @@ func reconcileTemplateHealth(
 		return TemplateHealthCounts{CheckerUp: false}, fmt.Errorf("list student-visible templates: %w", err)
 	}
 
-	counts := TemplateHealthCounts{
+	counts = TemplateHealthCounts{
 		Templates: len(templates),
 		CheckerUp: true,
 	}
@@ -458,12 +497,12 @@ func runDeepCheck(
 	defer cancel()
 
 	params := vcenter.HealthCheckCloneParams{
-		SourceRef:    ref,
-		CloneName:    cloneName,
-		FolderPath:   cfg.TemplateFolder,
-		Network:      cfg.Network,
-		VCPUs:        int32(tmpl.DefaultVCPUs),
-		RAMmb:        int64(tmpl.DefaultRAMMB),
+		SourceRef:  ref,
+		CloneName:  cloneName,
+		FolderPath: cfg.TemplateFolder,
+		Network:    cfg.Network,
+		VCPUs:      int32(tmpl.DefaultVCPUs),
+		RAMmb:      int64(tmpl.DefaultRAMMB),
 	}
 	if params.VCPUs == 0 {
 		params.VCPUs = 1
