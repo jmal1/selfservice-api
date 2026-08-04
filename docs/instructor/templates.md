@@ -179,9 +179,11 @@ template at any time to hide it without losing the generalized image.
 
 Crucible clones your template per student and injects a **unique per-pod
 password** over VMware guestinfo. That injection only works if the guest
-image satisfies the contract below. The publish gate validates the parts
-it can see from the template row (e.g. a blank `default_username`), but
-the guest-internal pieces are yours to get right inside the build console.
+image satisfies the contract below. The publish gate validates the row-level
+parts it can see: blank `default_username` / `default_password` on any
+non-customized template, and blank or non-`student` `default_username` on
+a customized Linux template. The guest-internal pieces are still yours to
+get right inside the build console.
 
 ### The five requirements
 
@@ -373,10 +375,11 @@ sudo -n true && echo "sudo OK"                       # must print sudo OK (req 5
 > SSH host keys — which means every clone shares them.
 
 Also confirm the template row's **default_username is `student`** (for a
-customized template) or holds real static credentials (for a
-non-customized one). The wizard's publish gate blocks a blank or
-non-`student` username on a customized Linux template for exactly this
-reason.
+customized Linux template) or holds real static credentials (for a
+non-customized template on any OS). The wizard's publish gate blocks blank
+`default_username` / `default_password` on non-customized templates, and
+blank or non-`student` `default_username` on customized Linux templates,
+for exactly this reason.
 
 ---
 

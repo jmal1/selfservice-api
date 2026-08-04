@@ -523,8 +523,8 @@ func (h *Handler) AdminGetResolvedCredentials(w http.ResponseWriter, r *http.Req
 	})
 }
 
-func linuxContractPublishError(tmpl *models.Template) (string, bool) {
-	violations := templates.ValidateLinuxTemplateContract(tmpl)
+func credentialContractPublishError(tmpl *models.Template) (string, bool) {
+	violations := templates.ValidateTemplateCredentialContract(tmpl)
 	if len(violations) == 0 {
 		return "", false
 	}
@@ -532,7 +532,7 @@ func linuxContractPublishError(tmpl *models.Template) (string, bool) {
 	for _, v := range violations {
 		parts = append(parts, fmt.Sprintf("%s: %s (fix: %s)", v.Field, v.Problem, v.Fix))
 	}
-	return "template violates the Linux guest-image contract, so students would be unable to log in — " +
+	return "template would publish unusable student credentials, so the student would be unable to log in — " +
 		strings.Join(parts, "; "), true
 }
 
@@ -540,8 +540,8 @@ func linuxContractPublishError(tmpl *models.Template) (string, bool) {
 //
 // Two gates run here, and they catch different failures:
 //
-//   - The Linux guest-image contract (synchronous, below) catches a template
-//     that boots fine but that no student can log into.
+//   - The publish credential contract (synchronous, below) catches a template
+//     that boots fine but would hand the student unusable credentials.
 //   - The hard smoke gate (asynchronous) means this no longer flips the
 //     template live directly. It transitions ready → verifying and enqueues a
 //     template_verify job that clones the base-image, boots it, and only
@@ -559,14 +559,14 @@ func (h *Handler) AdminPublishTemplate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "template has no vCenter VM / base-image to verify (generalize never completed)", http.StatusConflict)
 		return
 	}
-	// Linux guest-image contract gate. The smoke test below proves the VM
-	// boots; it does NOT prove a student can log in. Per-clone credentials
-	// are injected via cloud-init's default user, so a Linux template whose
-	// default_username is empty or is not "student" yields a VM that boots
-	// perfectly and then refuses every password the UI shows the student.
-	// That failure is invisible until a student hits it, so block it here
-	// rather than after publish.
-	if msg, blocked := linuxContractPublishError(tmpl); blocked {
+	// Publish credential contract gate. The smoke test below proves the VM
+	// boots; it does NOT prove the credentials Crucible surfaces are usable.
+	// For clone_no_customize / registered_existing_vm, blank static template
+	// credentials on any OS yield a VM that boots but hands the student no
+	// usable login. For customized Linux templates, the cloud-init default
+	// user must still line up with the injected "student" account. Catch
+	// those latent lockouts here rather than after publish.
+	if msg, blocked := credentialContractPublishError(tmpl); blocked {
 		http.Error(w, msg, http.StatusConflict)
 		return
 	}
