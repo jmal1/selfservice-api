@@ -161,6 +161,7 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 			r.Post("/draft", h.AdminCreateTemplateDraft)
 			r.Get("/{templateID}/wizard-state", h.AdminGetWizardState)
 			r.Post("/{templateID}/provision", h.AdminProvisionTemplate)
+			r.Post("/{templateID}/preflight", h.AdminPreflightTemplate)
 			r.Post("/{templateID}/generalize", h.AdminGeneralizeTemplate)
 			r.Post("/{templateID}/publish", h.AdminPublishTemplate)
 			r.Post("/{templateID}/unpublish", h.AdminUnpublishTemplate)

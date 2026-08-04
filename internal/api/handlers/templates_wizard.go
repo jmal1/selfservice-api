@@ -318,15 +318,33 @@ func (h *Handler) AdminCreateTemplateDraft(w http.ResponseWriter, r *http.Reques
 // Transitions draft → provisioning and enqueues a template_provision
 // job. Returns 202 Accepted with the new job ID and updated wizard
 // state.
+//
+// Preflight gate: before enqueuing, runs all 11 preflight checks. If any
+// block-severity check fails, returns 409 with the full result list.
+// Warnings never block. An admin may set override_preflight_blocks=true in
+// the request body to bypass a blocking failure (logged + audited).
 func (h *Handler) AdminProvisionTemplate(w http.ResponseWriter, r *http.Request) {
 	tmpl, ok := h.requireTemplateInState(w, r, models.TemplateStateDraft)
 	if !ok {
 		return
 	}
 
-	// Build payload from the template row. The instructor doesn't
-	// override hardware here — they pick it during draft creation.
+	// Parse optional body for the admin override flag.
+	var req ProvisionWithPreflightRequest
+	if r.Body != nil && r.Body != http.NoBody {
+		_ = json.NewDecoder(r.Body).Decode(&req) // body is optional; ignore decode errors
+	}
+
+	// Build the target VM name up front so PF-09 (name-free check) can
+	// verify it before the job is enqueued.
 	vmName := buildTemplateVMName(tmpl.Name)
+
+	// Preflight gate. If vcPreflight is nil (not configured), the gate is a
+	// no-op and provisioning proceeds unchanged.
+	if _, blocked := h.runPreflightGate(w, r, tmpl, vmName, req.OverridePreflightBlocks); blocked {
+		return
+	}
+
 	payload := buildProvisionPayload(tmpl, vmName)
 	if !h.advanceTemplateAndEnqueue(w, r, tmpl, models.TemplateStateDraft, models.TemplateStateProvisioning,
 		models.JobTypeTemplateProvision, payload, "template.provision") {
@@ -665,7 +683,7 @@ func (h *Handler) requireTemplateInState(w http.ResponseWriter, r *http.Request,
 		http.Error(w, "invalid template id", http.StatusBadRequest)
 		return nil, false
 	}
-	tmpl, err := h.db.GetTemplateByID(r.Context(), templateID)
+	tmpl, err := h.provisionStore().GetTemplateByID(r.Context(), templateID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			http.Error(w, "template not found", http.StatusNotFound)
@@ -692,6 +710,7 @@ func (h *Handler) requireTemplateInState(w http.ResponseWriter, r *http.Request,
 // response) on any failure.
 func (h *Handler) advanceTemplateAndEnqueue(w http.ResponseWriter, r *http.Request, tmpl *models.Template,
 	from, to, jobType string, payload map[string]any, auditAction string) bool {
+	pdb := h.provisionStore()
 	if err := templates.CanTransition(from, to); err != nil {
 		h.writeStateConflict(w, tmpl, err.Error())
 		return false
@@ -702,16 +721,16 @@ func (h *Handler) advanceTemplateAndEnqueue(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return false
 	}
-	if err := h.db.UpdateTemplateLifecycleState(r.Context(), tmpl.ID, from, to); err != nil {
+	if err := pdb.UpdateTemplateLifecycleState(r.Context(), tmpl.ID, from, to); err != nil {
 		h.handleLifecycleUpdateErr(w, tmpl, err)
 		return false
 	}
-	job, err := h.db.CreateJob(r.Context(), jobType, body)
+	job, err := pdb.CreateJob(r.Context(), jobType, body)
 	if err != nil {
 		// Best-effort rollback: try to move state back. If that fails
 		// we're in an inconsistent state — surface it loud so the
 		// operator hits /retry rather than retry-stuck.
-		_ = h.db.UpdateTemplateLifecycleState(r.Context(), tmpl.ID, to, from)
+		_ = pdb.UpdateTemplateLifecycleState(r.Context(), tmpl.ID, to, from)
 		h.logger.Error("enqueue job failed", "error", err, "job_type", jobType)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return false
@@ -721,14 +740,18 @@ func (h *Handler) advanceTemplateAndEnqueue(w http.ResponseWriter, r *http.Reque
 			h.logger.Warn("failed to publish job created event", "error", err, "job_id", job.ID)
 		}
 	}
-	audit.Log(r.Context(), h.db, auditAction,
-		audit.Resource("template", tmpl.ID),
-		audit.IP(r.RemoteAddr),
-		audit.Detail("job_id", job.ID.String()),
-		audit.Detail("from_state", from),
-		audit.Detail("to_state", to),
-	)
-	fresh, _ := h.db.GetTemplateByID(r.Context(), tmpl.ID)
+	// Audit is best-effort; skip when h.db is nil (test environments that
+	// inject a fake provDB but omit the real *database.Queries).
+	if h.db != nil {
+		audit.Log(r.Context(), h.db, auditAction,
+			audit.Resource("template", tmpl.ID),
+			audit.IP(r.RemoteAddr),
+			audit.Detail("job_id", job.ID.String()),
+			audit.Detail("from_state", from),
+			audit.Detail("to_state", to),
+		)
+	}
+	fresh, _ := pdb.GetTemplateByID(r.Context(), tmpl.ID)
 	respondJSON(w, http.StatusAccepted, map[string]any{
 		"job_id": job.ID,
 		"state":  h.wizardState(r.Context(), fresh),
