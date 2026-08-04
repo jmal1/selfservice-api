@@ -11,7 +11,7 @@ import (
 )
 
 // TemplateHealthState is the per-template health state row from
-// template_health_state (migration 000032).
+// template_health_state (migration 000031).
 type TemplateHealthState struct {
 	TemplateID             uuid.UUID  `json:"template_id"`
 	TemplateName           string     `json:"template_name"`
