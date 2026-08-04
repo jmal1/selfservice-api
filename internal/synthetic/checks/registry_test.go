@@ -214,6 +214,26 @@ func TestWikiIndexRBAC_FailsOn200(t *testing.T) {
 	}
 }
 
+func TestTemplatePinRBAC_PassesOn403(t *testing.T) {
+	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
+		"/api/v1/admin/templates/reorder": func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(403) },
+	})
+	status, err := TemplatePinRBAC.Run(context.Background(), synthetic.NewClient(srv.URL, ""))
+	if err != nil || status != 403 {
+		t.Fatalf("403 should pass: status=%d err=%v", status, err)
+	}
+}
+
+func TestTemplatePinRBAC_FailsOn200(t *testing.T) {
+	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
+		"/api/v1/admin/templates/reorder": func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) },
+	})
+	_, err := TemplatePinRBAC.Run(context.Background(), synthetic.NewClient(srv.URL, ""))
+	if err == nil {
+		t.Fatal("a 200 from a reorder endpoint as a student MUST fail — that is the entire point of this check")
+	}
+}
+
 func TestAll_StableNames(t *testing.T) {
 	// Alert rules reference check names; renames are monitoring breaking
 	// changes. If you intentionally rename a check, update the alert YAML in
@@ -228,6 +248,7 @@ func TestAll_StableNames(t *testing.T) {
 		"pod_testing_dashboard_404": true,
 		"wiki_index_rbac":           true,
 		"image_upload_rbac":         true,
+		"template_pin_rbac":         true,
 	}
 	for _, c := range All() {
 		if !wantNames[c.Name()] {

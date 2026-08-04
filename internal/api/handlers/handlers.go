@@ -1037,6 +1037,57 @@ func (h *Handler) ListTemplates(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, newTemplatePublicList(visible))
 }
 
+// --- Template Pinning (migration 000030) ---
+
+// AdminReorderTemplates updates the pin state and ordering for templates.
+// Instructor/admin only. Request body is a map of template IDs to {pinned, pin_order}.
+// All updates are atomic; either all succeed or none do. Returns 403 if role < instructor.
+func (h *Handler) AdminReorderTemplates(w http.ResponseWriter, r *http.Request) {
+	role := middleware.RoleFromContext(r.Context())
+	if role != models.RoleInstructor && role != models.RoleAdmin {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	var reqBody map[string]struct {
+		Pinned   bool `json:"pinned"`
+		PinOrder int  `json:"pin_order"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Convert string keys to UUIDs
+	req := make(map[uuid.UUID]database.PinState)
+	for k, v := range reqBody {
+		id, err := uuid.Parse(k)
+		if err != nil {
+			http.Error(w, "invalid template id: "+k, http.StatusBadRequest)
+			return
+		}
+		req[id] = database.PinState{Pinned: v.Pinned, PinOrder: v.PinOrder}
+	}
+
+	err := h.db.ReorderTemplates(r.Context(), req)
+	if err != nil {
+		if err.Error() == "template not found" || (err != nil && len(err.Error()) > 8 && err.Error()[:8] == "template") {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		h.logger.Error("reorder templates failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	audit.Log(r.Context(), h.db, "templates.reorder",
+		audit.IP(r.RemoteAddr),
+		audit.Detail("count", fmt.Sprintf("%d", len(req))),
+	)
+
+	respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
 // --- Job Handlers ---
 
 // GetJobStatus returns the current status of a job.

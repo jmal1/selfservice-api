@@ -424,6 +424,31 @@ See [troubleshooting.md](troubleshooting.md) for more general help.
 
 ---
 
+## Pinning templates and blueprints
+
+Templates and blueprints can be **pinned** to emphasize them. Pinned items appear in a dedicated **Pinned** section at the top of the template and blueprint picker, making them immediately visible to students without scrolling through a long list.
+
+### How pinning works
+
+- **Multiple pins allowed** — Pin as many templates or blueprints as you like.
+- **Ordered** — Pinned items appear in the order you set; drag them to reorder (or use up/down buttons on mobile).
+- **Still in main list** — Pinned items also stay in the normal alphabetical list below the Pinned section. Pinning is emphasis, not filtering.
+- **Instructor/admin only** — Only instructors (role ≥ instructor) can pin or unpin. Students see the Pinned section read-only.
+
+### When to pin
+
+Pin this week's material so students land on it immediately:
+
+- The lab template for the current module
+- The starter blueprint for an active project
+- A frequently-used tool or reference template
+
+### Viewing and managing pins
+
+In **Admin → Templates** or **Admin → Blueprints**, you'll see a **Pin** icon (📌) next to each item. Click it to pin; click again to unpin. Pinned items show a special **Pinned** badge, and you can drag them to reorder (or use ↑/↓ buttons). The order you set here is what students see in the Pinned section at the top of their picker.
+
+---
+
 ## Related pages
 
 - [overview.md](overview.md) — How templates fit into pods, blueprints, playlists

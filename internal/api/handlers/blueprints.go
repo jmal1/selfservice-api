@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/jmal1/selfservice-api/internal/audit"
+	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/middleware"
 	"github.com/jmal1/selfservice-api/internal/models"
 )
@@ -479,6 +480,57 @@ func (h *Handler) AdminUpdateBlueprint(w http.ResponseWriter, r *http.Request) {
 	// Re-fetch with VMs
 	updated, _ := h.db.GetBlueprintByID(r.Context(), bpID)
 	respondJSON(w, http.StatusOK, updated)
+}
+
+// --- Blueprint Pinning (migration 000030) ---
+
+// AdminReorderBlueprints updates the pin state and ordering for blueprints.
+// Instructor/admin only. Request body is a map of blueprint IDs to {pinned, pin_order}.
+// All updates are atomic; either all succeed or none do. Returns 403 if role < instructor.
+func (h *Handler) AdminReorderBlueprints(w http.ResponseWriter, r *http.Request) {
+	role := middleware.RoleFromContext(r.Context())
+	if role != models.RoleInstructor && role != models.RoleAdmin {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	var reqBody map[string]struct {
+		Pinned   bool `json:"pinned"`
+		PinOrder int  `json:"pin_order"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Convert string keys to UUIDs
+	req := make(map[uuid.UUID]database.PinState)
+	for k, v := range reqBody {
+		id, err := uuid.Parse(k)
+		if err != nil {
+			http.Error(w, "invalid blueprint id: "+k, http.StatusBadRequest)
+			return
+		}
+		req[id] = database.PinState{Pinned: v.Pinned, PinOrder: v.PinOrder}
+	}
+
+	err := h.db.ReorderBlueprints(r.Context(), req)
+	if err != nil {
+		if err.Error() == "blueprint not found" || (err != nil && len(err.Error()) > 9 && err.Error()[:9] == "blueprint") {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		h.logger.Error("reorder blueprints failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	audit.Log(r.Context(), h.db, "blueprints.reorder",
+		audit.IP(r.RemoteAddr),
+		audit.Detail("count", fmt.Sprintf("%d", len(req))),
+	)
+
+	respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 // AdminDeleteBlueprint soft-deletes a blueprint.

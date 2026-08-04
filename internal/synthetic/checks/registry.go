@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/jmal1/selfservice-api/internal/synthetic"
 )
@@ -238,6 +239,29 @@ var AdminAudit403 = synthetic.CheckFunc{
 	},
 }
 
+// TemplatePinRBAC asserts that a non-instructor synthetic user is rejected from
+// the template reorder endpoint with 403. Pinning is an instructor-only operation;
+// this check catches any RBAC regression that would allow students to reorder templates.
+var TemplatePinRBAC = synthetic.CheckFunc{
+	NameVal:        "template_pin_rbac",
+	TitleVal:       "RBAC: Student Cannot Pin Templates",
+	DescriptionVal: "Calls POST /api/v1/admin/templates/reorder as a student-role user and requires a 403. Catches any RBAC regression that would allow students to modify template pinning.",
+	SeverityVal:    synthetic.SeverityCritical,
+	RunFn: func(ctx context.Context, c *synthetic.Client) (int, error) {
+		// Empty reorder request (no templates to reorder) — we just care about the RBAC gate
+		resp, err := c.Do(ctx, http.MethodPost, "/api/v1/admin/templates/reorder", io.NopCloser(strings.NewReader("{}")))
+		if err != nil {
+			return 0, err
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		if resp.StatusCode != http.StatusForbidden {
+			return resp.StatusCode, fmt.Errorf("template reorder returned %d, want 403", resp.StatusCode)
+		}
+		return resp.StatusCode, nil
+	},
+}
+
 // All returns the canonical list of synthetic checks the monitor runs each
 // cycle. Ordering does not matter — checks run sequentially and results are
 // pushed atomically. Add new checks here.
@@ -252,6 +276,7 @@ func All() []synthetic.Check {
 		PodTestingDashboard404,
 		WikiIndexRBAC,
 		ImageUploadRBAC,
+		TemplatePinRBAC,
 	}
 }
 

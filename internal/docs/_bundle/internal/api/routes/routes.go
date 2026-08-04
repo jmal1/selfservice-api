@@ -186,6 +186,7 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 			r.Get("/{templateID}/dependents", h.AdminListTemplateDependents)
 			r.Get("/{templateID}/playlists", h.AdminGetTemplatePlaylists)
 			r.Post("/{templateID}/playlists", h.AdminSetTemplatePlaylists)
+			r.Post("/reorder", h.AdminReorderTemplates)
 		})
 
 		// Admin routes.
@@ -261,6 +262,7 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 			r.Put("/blueprints/{blueprintID}", h.AdminUpdateBlueprint)
 			r.Delete("/blueprints/{blueprintID}", h.AdminDeleteBlueprint)
 			r.Post("/blueprints/{blueprintID}/access", h.AdminSetBlueprintAccess)
+			r.Post("/blueprints/reorder", h.AdminReorderBlueprints)
 
 			// Admin pod management
 			r.Post("/pods/{podID}/extend", h.AdminExtendPod)
