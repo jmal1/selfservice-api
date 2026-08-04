@@ -52,6 +52,12 @@ type Handler struct {
 	// implementation. See templateStore() accessor.
 	templates templateLister
 
+	// provDB is an optional override for the narrow DB surface used by the
+	// template provision path (requireTemplateInState + advanceTemplateAndEnqueue).
+	// nil means h.db is used. Tests inject a fake via WithProvisionDB to drive
+	// AdminProvisionTemplate end-to-end without a real pgxpool. See provisionStore().
+	provDB provisionDB
+
 	// Preflight checks. Set via WithPreflightVCenter. nil = not configured;
 	// AdminPreflightTemplate returns 503 and the provision gate is skipped.
 	vcPreflight  PreflightVCenter
@@ -146,6 +152,31 @@ func (h *Handler) templateStore() templateLister {
 		return h.templates
 	}
 	return h.db
+}
+
+// provisionDB is the narrow slice of *database.Queries that the template
+// provision path needs. Declaring it as an interface lets tests inject a fake
+// without a live pgxpool — see Handler.provisionStore() and WithProvisionDB.
+type provisionDB interface {
+	GetTemplateByID(ctx context.Context, id uuid.UUID) (*models.Template, error)
+	UpdateTemplateLifecycleState(ctx context.Context, id uuid.UUID, from, to string) error
+	CreateJob(ctx context.Context, jobType string, payload []byte) (*models.Job, error)
+}
+
+// provisionStore returns the provisionDB in use. h.provDB is non-nil only in
+// tests; production code always falls through to h.db.
+func (h *Handler) provisionStore() provisionDB {
+	if h.provDB != nil {
+		return h.provDB
+	}
+	return h.db
+}
+
+// WithProvisionDB injects a fake provisionDB for testing AdminProvisionTemplate
+// end-to-end without a real database connection. Do not call from production code.
+func (h *Handler) WithProvisionDB(db provisionDB) *Handler {
+	h.provDB = db
+	return h
 }
 
 // PreflightVCenter is a type alias so the handlers package can name the

@@ -118,6 +118,13 @@ func SessionIDFromContext(ctx context.Context) uuid.UUID {
 	return uuid.Nil
 }
 
+// WithRole returns a copy of ctx with the given role injected under the same
+// key used by the Auth middleware. Use this in tests and internal service calls
+// that need to establish a role without going through full JWT validation.
+func WithRole(ctx context.Context, role string) context.Context {
+	return context.WithValue(ctx, roleKey, role)
+}
+
 // hasMinRole checks if the actual role meets or exceeds the minimum required role.
 func hasMinRole(actual, minimum string) bool {
 	roleLevel := map[string]int{

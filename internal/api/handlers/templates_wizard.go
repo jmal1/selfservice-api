@@ -683,7 +683,7 @@ func (h *Handler) requireTemplateInState(w http.ResponseWriter, r *http.Request,
 		http.Error(w, "invalid template id", http.StatusBadRequest)
 		return nil, false
 	}
-	tmpl, err := h.db.GetTemplateByID(r.Context(), templateID)
+	tmpl, err := h.provisionStore().GetTemplateByID(r.Context(), templateID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			http.Error(w, "template not found", http.StatusNotFound)
@@ -710,6 +710,7 @@ func (h *Handler) requireTemplateInState(w http.ResponseWriter, r *http.Request,
 // response) on any failure.
 func (h *Handler) advanceTemplateAndEnqueue(w http.ResponseWriter, r *http.Request, tmpl *models.Template,
 	from, to, jobType string, payload map[string]any, auditAction string) bool {
+	pdb := h.provisionStore()
 	if err := templates.CanTransition(from, to); err != nil {
 		h.writeStateConflict(w, tmpl, err.Error())
 		return false
@@ -720,16 +721,16 @@ func (h *Handler) advanceTemplateAndEnqueue(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return false
 	}
-	if err := h.db.UpdateTemplateLifecycleState(r.Context(), tmpl.ID, from, to); err != nil {
+	if err := pdb.UpdateTemplateLifecycleState(r.Context(), tmpl.ID, from, to); err != nil {
 		h.handleLifecycleUpdateErr(w, tmpl, err)
 		return false
 	}
-	job, err := h.db.CreateJob(r.Context(), jobType, body)
+	job, err := pdb.CreateJob(r.Context(), jobType, body)
 	if err != nil {
 		// Best-effort rollback: try to move state back. If that fails
 		// we're in an inconsistent state — surface it loud so the
 		// operator hits /retry rather than retry-stuck.
-		_ = h.db.UpdateTemplateLifecycleState(r.Context(), tmpl.ID, to, from)
+		_ = pdb.UpdateTemplateLifecycleState(r.Context(), tmpl.ID, to, from)
 		h.logger.Error("enqueue job failed", "error", err, "job_type", jobType)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return false
@@ -739,14 +740,18 @@ func (h *Handler) advanceTemplateAndEnqueue(w http.ResponseWriter, r *http.Reque
 			h.logger.Warn("failed to publish job created event", "error", err, "job_id", job.ID)
 		}
 	}
-	audit.Log(r.Context(), h.db, auditAction,
-		audit.Resource("template", tmpl.ID),
-		audit.IP(r.RemoteAddr),
-		audit.Detail("job_id", job.ID.String()),
-		audit.Detail("from_state", from),
-		audit.Detail("to_state", to),
-	)
-	fresh, _ := h.db.GetTemplateByID(r.Context(), tmpl.ID)
+	// Audit is best-effort; skip when h.db is nil (test environments that
+	// inject a fake provDB but omit the real *database.Queries).
+	if h.db != nil {
+		audit.Log(r.Context(), h.db, auditAction,
+			audit.Resource("template", tmpl.ID),
+			audit.IP(r.RemoteAddr),
+			audit.Detail("job_id", job.ID.String()),
+			audit.Detail("from_state", from),
+			audit.Detail("to_state", to),
+		)
+	}
+	fresh, _ := pdb.GetTemplateByID(r.Context(), tmpl.ID)
 	respondJSON(w, http.StatusAccepted, map[string]any{
 		"job_id": job.ID,
 		"state":  h.wizardState(r.Context(), fresh),

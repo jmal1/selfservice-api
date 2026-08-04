@@ -1,12 +1,11 @@
 package handlers
 
-// templates_preflight_test.go -- Handler-level tests for the preflight gate.
+// templates_preflight_test.go — handler-level tests for the preflight gate
+// (runPreflightGate, exercised directly).
 //
-// Tests:
-//  1. Blocking failure -> 409 with results list in body.
-//  2. Warnings alone -> 202 (provisioning proceeds).
-//  3. Admin override bypasses a blocking failure -> 202.
-//  4. Non-admin instructor cannot use the override -> 403.
+// For end-to-end tests that drive AdminProvisionTemplate and assert that
+// the gate is actually load-bearing (a job is NOT enqueued on a block),
+// see templates_provision_test.go.
 
 import (
 	"bytes"
@@ -128,6 +127,11 @@ func buildTestPreflightHandler(vc PreflightVCenter) *Handler {
 	}
 }
 
+// withRole is a test-local helper that injects a role into a request's context.
+func withRole(r *http.Request, role string) *http.Request {
+	return r.WithContext(middleware.WithRole(r.Context(), role))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -141,10 +145,7 @@ func TestPreflightGate_BlockFailures(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	req := middleware.WithRoleForTest(
-		httptest.NewRequest(http.MethodPost, "/provision", nil),
-		models.RoleInstructor,
-	)
+	req := withRole(httptest.NewRequest(http.MethodPost, "/provision", nil), models.RoleInstructor)
 
 	_, blocked := h.runPreflightGate(rec, req, tmpl, "tpl-test", false)
 	if !blocked {
@@ -196,10 +197,7 @@ func TestPreflightGate_WarningsAllow(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	req := middleware.WithRoleForTest(
-		httptest.NewRequest(http.MethodPost, "/provision", nil),
-		models.RoleInstructor,
-	)
+	req := withRole(httptest.NewRequest(http.MethodPost, "/provision", nil), models.RoleInstructor)
 
 	_, blocked := h.runPreflightGate(rec, req, tmpl, "tpl-test", false)
 	if blocked {
@@ -217,7 +215,7 @@ func TestPreflightGate_AdminOverride(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	req := middleware.WithRoleForTest(
+	req := withRole(
 		httptest.NewRequest(http.MethodPost, "/provision",
 			bytes.NewBufferString(`{"override_preflight_blocks":true}`)),
 		models.RoleAdmin,
@@ -239,7 +237,7 @@ func TestPreflightGate_InstructorCannotOverride(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	req := middleware.WithRoleForTest(
+	req := withRole(
 		httptest.NewRequest(http.MethodPost, "/provision",
 			bytes.NewBufferString(`{"override_preflight_blocks":true}`)),
 		models.RoleInstructor,
