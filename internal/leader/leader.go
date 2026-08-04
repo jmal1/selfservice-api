@@ -112,15 +112,21 @@ func (e *Elector) Changes() <-chan bool { return e.changeCh }
 
 // Run is the election loop. It blocks until ctx is cancelled.
 //
-// When created via NewAlwaysLeader, Run simply blocks until ctx is cancelled
-// without modifying any state.
+// When created via NewAlwaysLeader, Run signals the Changes channel once
+// (so callers that watch Changes() for initial-run triggers still fire) and
+// then blocks until ctx is cancelled without further state changes.
 //
 // Typical usage:
 //
 //	go elec.Run(ctx)
 func (e *Elector) Run(ctx context.Context) {
-	// AlwaysLeader mode: no-op until shutdown.
+	// AlwaysLeader mode: signal the Changes channel so the select loop in
+	// main performs its initial-run passes, then wait for shutdown.
 	if e.newBackend == nil {
+		select {
+		case e.changeCh <- true:
+		default:
+		}
 		<-ctx.Done()
 		return
 	}

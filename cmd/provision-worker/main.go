@@ -490,16 +490,9 @@ func main() {
 		defer t.Stop()
 		networkReconcilerTickerC = t.C
 		logger.Info("opnsense network reconciler enabled", "interval", networkReconcilerInterval)
-		// Heal any existing network drift promptly on startup — only on the leader
-		// to prevent 4 replicas simultaneously hitting the OPNsense firewall API.
-		go func() {
-			if !elec.IsLeader() {
-				return
-			}
-			if _, err := prov.ReconcileNetwork(ctx, networkReconcilerCfg); err != nil {
-				logger.Error("initial network reconcile failed", "error", err)
-			}
-		}()
+		// Initial run: handled via elec.Changes() in the main select loop below
+		// so the first pass fires as soon as leadership is elected, not speculatively
+		// before the lock is acquired.
 	}
 
 	// Idle VM suspend evaluator ticker (disabled by default via dry-run; nil-safe).
@@ -525,28 +518,17 @@ func main() {
 		l1ValidationTickerC = t.C
 		logger.Info("l1 trust validation reconciler enabled",
 			"interval", l1ValidationInterval)
-		// Run once immediately on startup, but only when this replica is the
-		// elected leader so staleness gauge is populated without duplicates.
-		go func() {
-			if !elec.IsLeader() {
-				return
-			}
-			if _, err := prov.ReconcileL1TrustValidation(ctx, l1ValidationCfg); err != nil {
-				logger.Error("initial l1 trust validation reconcile failed", "error", err)
-			}
-		}()
+		// Initial run: handled via elec.Changes() in the main select loop below
+		// so the first pass fires as soon as leadership is elected, not speculatively
+		// before the lock is acquired.
 	}
 
 	// Expiration cron ticker: gated by leader election (integrated into the main
-	// select loop below). The initial run of StartExpirationCron is replicated
-	// here as a leader-gated goroutine so the pattern is consistent.
+	// select loop below). The initial-run behaviour of StartExpirationCron is
+	// preserved via the elec.Changes() case below — fires immediately on first
+	// leadership acquisition rather than waiting a full 5-minute tick.
 	expirationCronTicker := time.NewTicker(5 * time.Minute)
 	defer expirationCronTicker.Stop()
-	go func() {
-		if elec.IsLeader() {
-			prov.ExpireStale(ctx)
-		}
-	}()
 
 	// Stuck-upload reconciler ticker: gated by leader election (integrated into
 	// the main select loop below). Only active when an object store is configured.
@@ -646,7 +628,41 @@ func main() {
 				if _, err := prov.ReconcileL1TrustValidation(ctx, l1ValidationCfg); err != nil {
 					logger.Error("l1 trust validation reconcile failed", "error", err)
 				}
-			}
+
+				// ── Leadership change notification ────────────────────────────────
+				// elec.Changes() fires true when this replica acquires the lock
+				// (startup or failover) and false when it loses it. On acquisition
+				// we run immediate passes for any reconcilers that need prompt
+				// startup behaviour — equivalent to the old "initial run" goroutines
+				// but racefree because leadership is confirmed before we reach here.
+				// The channel is buffered (size 1), so the event is safe even if the
+				// select loop is busy; it will be delivered on the next iteration.
+				case isLeader := <-elec.Changes():
+					if !isLeader {
+						continue
+					}
+					// Immediately expire any stale pods now that we are leader.
+					// This is fast (DB-only) so we run it inline.
+					prov.ExpireStale(ctx)
+					// Network reconcile touches the OPNsense API — run in a goroutine
+					// so it cannot stall the select loop on a slow firewall response.
+					if networkReconcilerEnabled {
+						go func() {
+							if _, err := prov.ReconcileNetwork(ctx, networkReconcilerCfg); err != nil {
+								logger.Error("network reconcile on leader acquisition failed", "error", err)
+							}
+						}()
+					}
+					// L1 trust validation runs a heavyweight DB query; goroutine for
+					// the same reason.
+					if l1ValidationEnabled {
+						go func() {
+							if _, err := prov.ReconcileL1TrustValidation(ctx, l1ValidationCfg); err != nil {
+								logger.Error("l1 trust validation on leader acquisition failed", "error", err)
+							}
+						}()
+					}
+				}
 		}
 	}()
 

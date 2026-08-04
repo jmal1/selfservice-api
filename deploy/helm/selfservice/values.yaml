@@ -49,6 +49,12 @@ worker:
     # How long followers wait between lock-acquisition attempts. 5s is a
     # good balance between failover latency and Postgres connection churn.
     retryInterval: "5s"
+  # DB connection pool cap for the worker's pgxpool.
+  # Workers are nearly single-threaded (sequential job claims + one reconciler
+  # at a time), so the default 20-connection pool wastes connections.
+  # Each replica also holds 1 dedicated leader-election connection outside the
+  # pool. Platform budget at 4 workers: api(20) + engine(20) + 4×(5+1) = 64/100.
+  dbMaxConns: 5
   # vCenter orphan reconciler (Phase 2.3 of the 2026-06-10 esxi2 NFS41 APD
   # recovery). When enabled, the worker scans `orphanReconciler.folder` on
   # `orphanReconciler.interval` and:

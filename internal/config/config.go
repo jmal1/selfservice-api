@@ -47,6 +47,13 @@ type DatabaseConfig struct {
 	Password string
 	DBName   string
 	SSLMode  string
+	// MaxConns caps the pgxpool connection pool for this process.
+	// 0 means "use the database package default (20)". Tune this per
+	// deployment: the platform-wide ceiling against max_connections = 100 is
+	// roughly (api-gateway × 20) + (engine × 20) + (workers × (MaxConns + 1 leader))
+	// = 20 + 20 + 4 × 6 = 64 at the current worker setting of 5.
+	// Set DB_MAX_CONNS to override.
+	MaxConns int
 }
 
 func (d DatabaseConfig) DSN() string {
@@ -134,6 +141,7 @@ func Load() (*Config, error) {
 			Password: getEnv("DB_PASSWORD", ""),
 			DBName:   getEnv("DB_NAME", "selfservice"),
 			SSLMode:  getEnv("DB_SSLMODE", "disable"),
+			MaxConns: getEnvInt("DB_MAX_CONNS", 0), // 0 → database package default (20)
 		},
 		OIDC: OIDCConfig{
 			IssuerURL:             getEnv("OIDC_ISSUER_URL", ""),
