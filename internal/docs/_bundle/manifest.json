@@ -194,8 +194,8 @@
     {
       "path": "internal/api/routes/routes.go",
       "title": "routes.go (Go)",
-      "size": 12253,
-      "sha256": "22a5f1f440090f5f4af41544ef6ba383d333a7d94926462b70872f01c012af7f",
+      "size": 12332,
+      "sha256": "47303b3f7a64770a73ae209c180e4024fec02187aa5b25c58f5ee31389e14d73",
       "is_markdown": false,
       "from_seed": false
     },
@@ -280,5 +280,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 216942
+  "total_bytes": 217021
 }
