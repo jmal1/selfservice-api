@@ -252,6 +252,7 @@ func All() []synthetic.Check {
 		PodTestingDashboard404,
 		WikiIndexRBAC,
 		ImageUploadRBAC,
+		TemplateHealthStatusRBAC,
 	}
 }
 

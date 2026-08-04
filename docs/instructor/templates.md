@@ -424,6 +424,102 @@ See [troubleshooting.md](troubleshooting.md) for more general help.
 
 ---
 
+## Template Health Checks
+
+Crucible runs automated health checks for every student-visible template every
+**12 hours** to catch silent rot — a template whose vCenter object was deleted,
+whose disk was moved, or whose base OS no longer boots — before students hit it
+during a lab session.
+
+### What gets checked
+
+Each cycle has two layers:
+
+| Layer | Frequency | What it does |
+|-------|-----------|--------------|
+| **Structural** | Every template, every 12h cycle | Verifies the vCenter VM/template object still exists in inventory. Cheap: one API call per template, no VM created. |
+| **Deep** | One template per 12h cycle, rotating | Clones the template → powers it on → waits for a guest IP → destroys the clone. Proves the full boot path works end-to-end. |
+
+Every template is deep-checked in turn, so the full rotation period is
+`12h × number_of_templates`. For a lab with 10 templates, each template gets a
+full deep check roughly every 5 days.
+
+### Anti-flap: when does "unhealthy" alert?
+
+A single bad 12-hour window never triggers an alert. Crucible requires
+**2 consecutive failing cycles** before marking a template unhealthy.
+
+- Within each cycle, each failing check is retried **3 times with exponential
+  backoff** (1 s, 2 s, 4 s) to absorb transient vCenter blips.
+- One passing cycle **immediately** clears the unhealthy state — recovery is
+  not delayed by the same confirmation window.
+
+This means the earliest an alert fires after a real breakage is approximately
+24 hours (two 12h cycles).
+
+### Checker-vs-template failures
+
+Crucible distinguishes between "this template is broken" and "the checker
+itself cannot reach vCenter." A vCenter outage sets a single
+`crucible_template_health_checker_up=0` metric — it does **not** mark every
+template unhealthy. Look for the `CrucibleTemplateHealthCheckerDown` alert
+first; if it's firing, the per-template status should be ignored until
+connectivity is restored.
+
+### Viewing health status
+
+Instructors can see per-template health at:
+
+```
+GET /api/v1/admin/templates/health
+```
+
+Each row includes:
+- `health_status` — `"healthy"`, `"unhealthy"`, or `"unknown"` (not yet checked)
+- `consecutive_failures` — how many back-to-back cycles have failed
+- `last_structural_check_at` — when the last structural check ran
+- `last_deep_check_at` — when the last full deep check ran
+- `last_error` — the most recent error message (truncated to 256 chars)
+
+Templates appear in this list as soon as they are active, with
+`health_status="unknown"` until the first check cycle completes.
+
+### Interpreting an unhealthy template
+
+`health_status = "unhealthy"` means the template failed **both** the last two
+12-hour cycles. The `last_error` field says what went wrong.
+
+**Common causes:**
+
+| `last_error` pattern | Likely cause |
+|----------------------|--------------|
+| `vCenter object "vm-XXXX" does not exist` | The template VM was deleted from vCenter inventory |
+| `clone failed: source VM "…" not found` | Same as above (deep check also detected it) |
+| `power-on failed: …` | Disk/config issue — the template VM exists but won't start |
+| `wait-for-IP failed: no IP within 10m` | OS boot hangs or guest tools not installed |
+
+**What to do:**
+1. Check the last error message at `GET /api/v1/admin/templates/health`.
+2. Open vCenter and verify the template VM exists at the expected path.
+3. If the VM is missing, re-publish the template through the wizard.
+4. If the VM exists but won't boot, attach a console and investigate the OS.
+
+Once the underlying issue is fixed, the health check will clear automatically
+on the next passing cycle (~12 hours). No manual reset is needed.
+
+### Orphan cleanup
+
+The deep check names its clone `crucible-healthcheck-<template-uuid>`. If the
+worker crashes mid-check, the clone may be left behind on the datastore.
+Crucible sweeps for these orphaned clones at worker startup and destroys any it
+finds. The distinctive prefix ensures the sweep cannot match a student pod VM.
+
+---
+
+See [troubleshooting.md](troubleshooting.md) for more general help.
+
+---
+
 ## Related pages
 
 - [overview.md](overview.md) — How templates fit into pods, blueprints, playlists
