@@ -256,13 +256,15 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 		return p.markTemplateError(ctx, payload.TemplateID, fmt.Errorf("power on: %w", err))
 	}
 
-	// Step 5: wait for VMware Tools to come up (5 min). If the source VM
-	// doesn't have open-vm-tools / VMware Tools installed, this will time
-	// out and surface a clear error to the instructor.
-	p.publishProgress(job.ID, "wait_tools", "Waiting for VMware Tools (5 min)")
-	if err := p.vc.WaitForTools(ctx, moref, 5*time.Minute); err != nil {
+	// Step 5: wait for VMware Tools to come up. This is an ordinary first boot;
+	// see cloneFirstBootToolsTimeout for why the deadline is what it is.
+	p.publishProgress(job.ID, "wait_tools",
+		fmt.Sprintf("Waiting for VMware Tools (up to %s)", cloneFirstBootToolsTimeout))
+	if err := p.vc.WaitForTools(ctx, moref, cloneFirstBootToolsTimeout); err != nil {
 		return p.markTemplateError(ctx, payload.TemplateID,
-			fmt.Errorf("wait for VMware Tools: %w (install open-vm-tools on the source VM before publishing)", err))
+			fmt.Errorf("wait for VMware Tools: %w — the VM powered on but never reported tools. "+
+				"Either the guest is still booting (rare at this deadline), or open-vm-tools/VMware Tools "+
+				"is not installed and enabled on the source VM", err))
 	}
 
 	// Step 6: advance to 'configuring' so the instructor can start setup
@@ -286,6 +288,38 @@ const isoInstallToolsTimeout = 60 * time.Minute
 // for that system's VMware Tools. This is an ordinary first boot, so it gets an
 // ordinary deadline rather than the install-length one.
 const isoInstalledBootTimeout = 15 * time.Minute
+
+// runningVMToolsCheckTimeout bounds the tools *sanity check* at the start of
+// generalize. Unlike the first-boot waits, this VM has been powered on and
+// actively configured by the instructor for some time, so tools are either
+// already running or something is genuinely wrong. A short deadline is correct
+// here: it fails fast instead of stalling a job for a quarter of an hour on a
+// VM that will never report. Do not raise this to match the first-boot
+// deadlines — they answer a different question.
+const runningVMToolsCheckTimeout = 30 * time.Second
+
+// cloneFirstBootToolsTimeout bounds how long we wait for VMware Tools after
+// powering on a freshly cloned VM — both when provisioning a template and when
+// smoke-testing one during verify.
+//
+// This is the *same class of wait* as isoInstalledBootTimeout (an ordinary
+// first boot), so it gets the same deadline for the same reason. It was five
+// minutes until 2026-08-04, when provisioning a clone of `Ubuntu 24.04 Server`
+// (tpl-ubuntu-aacc6a, vm-13702) failed with
+//
+//	timed out after 5m0s waiting for VMware Tools ... (current status: "guestToolsNotRunning")
+//
+// and the VM was found reporting guestToolsRunning shortly afterwards. The
+// template was healthy; the deadline was wrong, and the error told the
+// instructor to install open-vm-tools on a VM that already had it.
+//
+// Five minutes is not a safe first-boot budget here: guest customization
+// reboots the VM, so tools legitimately come up, disappear and come back within
+// this window, and the clone sources sit on NFS-backed storage where that
+// sequence routinely exceeds five minutes. Waiting longer costs nothing on the
+// happy path — WaitForTools returns as soon as tools report — while a short
+// deadline turns a working template into a hard failure.
+const cloneFirstBootToolsTimeout = 15 * time.Minute
 
 // isoProvisionVCenter is the vCenter subset the iso template-provision path
 // needs. The real *vcenter.Client satisfies it (asserted below), so production
@@ -629,7 +663,7 @@ func (p *Provisioner) GeneralizeTemplate(ctx context.Context, job *models.Job) e
 
 	// Step 1: tools sanity check
 	p.publishProgress(job.ID, "verify_tools", "Verifying VMware Tools is running")
-	if err := p.vc.WaitForTools(ctx, payload.VMMoref, 30*time.Second); err != nil {
+	if err := p.vc.WaitForTools(ctx, payload.VMMoref, runningVMToolsCheckTimeout); err != nil {
 		return p.markTemplateError(ctx, payload.TemplateID,
 			fmt.Errorf("VMware Tools not running: %w", err))
 	}
@@ -975,10 +1009,13 @@ func (p *Provisioner) VerifyTemplate(ctx context.Context, job *models.Job) (err 
 	}
 
 	// Step 3: wait for VMware Tools — proves the OS actually booted.
-	p.publishProgress(job.ID, "smoke_wait_tools", "Waiting for the clone to boot (VMware Tools, 5 min)")
-	if err := p.vc.WaitForTools(ctx, cloneMoref, 5*time.Minute); err != nil {
+	p.publishProgress(job.ID, "smoke_wait_tools",
+		fmt.Sprintf("Waiting for the clone to boot (VMware Tools, up to %s)", cloneFirstBootToolsTimeout))
+	if err := p.vc.WaitForTools(ctx, cloneMoref, cloneFirstBootToolsTimeout); err != nil {
 		return p.verifyFailedToReady(ctx, tmpl.ID,
-			fmt.Errorf("smoke clone did not boot: VMware Tools never reported within 5m (image may be bricked — check generalize/sysprep and BitLocker): %w", err))
+			fmt.Errorf("smoke clone did not boot: VMware Tools never reported within %s "+
+				"(image may be bricked — check generalize/sysprep and BitLocker): %w",
+				cloneFirstBootToolsTimeout, err))
 	}
 
 	// Step 4: wait for an IP (only if this template assigns one) — proves
