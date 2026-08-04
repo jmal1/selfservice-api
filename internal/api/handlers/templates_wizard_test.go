@@ -579,45 +579,102 @@ func TestInvalidUnattendConfigRejected(t *testing.T) {
 	}
 }
 
-// TestLinuxContractPublishError_BlocksLiveUbuntuDefect guards the publish
-// gate. The shapes below are not hypothetical: the live "Ubuntu 24.04 Server"
-// template is active in production with an empty default_username, which is
-// exactly case 1. Without this gate that template boots green through the
-// smoke test and then rejects every password the UI shows a student.
-func TestLinuxContractPublishError_BlocksLiveUbuntuDefect(t *testing.T) {
+// TestCredentialContractPublishError_BlocksUnusableLogins guards the publish
+// gate. The cases below cover both the live Linux defect and the latent
+// Windows clone_no_customize hole: both shapes boot fine, but without usable
+// credentials the student only discovers the breakage after the template is
+// live.
+func TestCredentialContractPublishError_BlocksUnusableLogins(t *testing.T) {
 	tests := []struct {
 		name        string
 		tmpl        models.Template
 		wantBlocked bool
-		wantInMsg   string
+		wantInMsg   []string
 	}{
 		{
-			name:        "linux with empty default_username is blocked",
-			tmpl:        models.Template{OSType: "linux", DefaultUsername: "", DefaultPassword: "pw"},
+			name: "linux clone_with_customize with empty default_username is blocked",
+			tmpl: models.Template{
+				OSType:          "linux",
+				Kind:            models.TemplateKindCloneWithCustomize,
+				DefaultUsername: "",
+				DefaultPassword: "pw",
+			},
 			wantBlocked: true,
-			wantInMsg:   "default_username",
+			wantInMsg:   []string{"default_username", "student"},
 		},
 		{
-			name:        "linux with non-student default_username is blocked",
-			tmpl:        models.Template{OSType: "linux", DefaultUsername: "ubuntu", DefaultPassword: "pw"},
+			name: "linux clone_with_customize with non-student default_username is blocked",
+			tmpl: models.Template{
+				OSType:          "linux",
+				Kind:            models.TemplateKindCloneWithCustomize,
+				DefaultUsername: "ubuntu",
+				DefaultPassword: "pw",
+			},
 			wantBlocked: true,
-			wantInMsg:   "student",
+			wantInMsg:   []string{"student"},
 		},
 		{
-			name:        "compliant linux template publishes",
-			tmpl:        models.Template{OSType: "linux", DefaultUsername: "student", DefaultPassword: "pw"},
-			wantBlocked: false,
+			name: "windows clone_no_customize with empty default_username is blocked",
+			tmpl: models.Template{
+				OSType:          "windows",
+				Kind:            models.TemplateKindCloneNoCustomize,
+				DefaultUsername: "",
+				DefaultPassword: "pw",
+			},
+			wantBlocked: true,
+			wantInMsg:   []string{"default_username", models.TemplateKindCloneNoCustomize},
 		},
 		{
-			name:        "windows is never subject to the linux contract",
-			tmpl:        models.Template{OSType: "windows", DefaultUsername: ""},
-			wantBlocked: false,
+			name: "linux clone_no_customize with empty default_username is blocked",
+			tmpl: models.Template{
+				OSType:          "linux",
+				Kind:            models.TemplateKindCloneNoCustomize,
+				DefaultUsername: "",
+				DefaultPassword: "pw",
+			},
+			wantBlocked: true,
+			wantInMsg:   []string{"default_username", models.TemplateKindCloneNoCustomize},
+		},
+		{
+			name: "windows clone_no_customize with static credentials is accepted",
+			tmpl: models.Template{
+				OSType:          "windows",
+				Kind:            models.TemplateKindCloneNoCustomize,
+				DefaultUsername: "Administrator",
+				DefaultPassword: "pw",
+			},
+		},
+		{
+			name: "linux clone_no_customize with static credentials is accepted",
+			tmpl: models.Template{
+				OSType:          "linux",
+				Kind:            models.TemplateKindCloneNoCustomize,
+				DefaultUsername: "student",
+				DefaultPassword: "pw",
+			},
+		},
+		{
+			name: "windows clone_with_customize with empty default_username is accepted",
+			tmpl: models.Template{
+				OSType:          "windows",
+				Kind:            models.TemplateKindCloneWithCustomize,
+				DefaultUsername: "",
+			},
+		},
+		{
+			name: "manual windows template matching production shape stays accepted",
+			tmpl: models.Template{
+				SourceType:      models.TemplateSourceManual,
+				OSType:          "windows",
+				Kind:            models.TemplateKindCloneWithCustomize,
+				DefaultUsername: "",
+			},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			msg, blocked := linuxContractPublishError(&tc.tmpl)
+			msg, blocked := credentialContractPublishError(&tc.tmpl)
 
 			if blocked != tc.wantBlocked {
 				t.Fatalf("blocked = %v, want %v (msg=%q)", blocked, tc.wantBlocked, msg)
@@ -629,10 +686,12 @@ func TestLinuxContractPublishError_BlocksLiveUbuntuDefect(t *testing.T) {
 				return
 			}
 			// A 409 body an instructor cannot act on is nearly as bad as no
-			// gate at all, so assert the message actually names the field
-			// and carries a fix rather than merely being non-empty.
-			if !strings.Contains(msg, tc.wantInMsg) {
-				t.Errorf("msg = %q, want it to mention %q", msg, tc.wantInMsg)
+			// gate at all, so assert the message actually names the field,
+			// names the mode-specific reason, and carries a fix.
+			for _, want := range tc.wantInMsg {
+				if !strings.Contains(msg, want) {
+					t.Errorf("msg = %q; want it to mention %q", msg, want)
+				}
 			}
 			if !strings.Contains(msg, "fix:") {
 				t.Errorf("msg = %q, want it to include a remediation hint", msg)
