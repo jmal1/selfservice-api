@@ -524,9 +524,8 @@ func main() {
 	}
 
 	// Expiration cron ticker: gated by leader election (integrated into the main
-	// select loop below). The initial-run behaviour of StartExpirationCron is
-	// preserved via the elec.Changes() case below — fires immediately on first
-	// leadership acquisition rather than waiting a full 5-minute tick.
+	// select loop below). ExpireStale is called immediately on leadership
+	// acquisition via elec.Changes(), then on each 5-minute tick.
 	expirationCronTicker := time.NewTicker(5 * time.Minute)
 	defer expirationCronTicker.Stop()
 
