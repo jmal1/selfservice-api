@@ -142,6 +142,12 @@ func (h *Handler) DeployBlueprint(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Defense in depth: ensure students cannot use instructor_only templates
+		if role == models.RoleStudent && tmpl.Visibility == "instructor_only" {
+			http.Error(w, fmt.Sprintf("template %s not accessible", bv.TemplateID), http.StatusForbidden)
+			return
+		}
+
 		vcpus := tmpl.DefaultVCPUs
 		if bv.VCPUs != nil {
 			vcpus = *bv.VCPUs

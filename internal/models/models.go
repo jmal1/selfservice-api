@@ -48,6 +48,12 @@ type Template struct {
 	// Admin-only /admin/templates still shows internal rows.
 	// Migration 000019.
 	IsInternal bool `json:"is_internal" db:"is_internal"`
+	// Visibility controls whether instructors can stage a template without
+	// students seeing it. Valid values: 'public' (students see it) or
+	// 'instructor_only' (hidden from student list and pod-create).
+	// Instructors and admins see all regardless of visibility.
+	// Migration 000029.
+	Visibility string `json:"visibility" db:"visibility"`
 	// TemplateState drives the wizard lifecycle (migration 000018).
 	// See models.TemplateState* constants and internal/templates/lifecycle.go
 	// for allowed transitions. Defaults to 'active' for legacy rows.

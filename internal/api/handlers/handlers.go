@@ -363,6 +363,12 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Defense in depth: ensure students cannot use instructor_only templates
+		if role == models.RoleStudent && found.Visibility == "instructor_only" {
+			http.Error(w, "template not found or not accessible: "+vm.TemplateID.String(), http.StatusForbidden)
+			return
+		}
+
 		vcpus := found.DefaultVCPUs
 		if vm.VCPUs != nil {
 			vcpus = *vm.VCPUs

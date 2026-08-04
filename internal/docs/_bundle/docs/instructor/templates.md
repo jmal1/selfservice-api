@@ -165,6 +165,35 @@ smoke test fails, the template drops back to `ready` with the failure
 recorded — fix the image and Publish again. **Unpublish** an active
 template at any time to hide it without losing the generalized image.
 
+## Step 5.1 — Template Visibility (Instructor-Only Staging)
+
+When you publish a template, you can mark it as **"Instructor only"** to
+hide it from the student template picker while you stage or test it. This
+is useful when:
+
+- A template is nearly ready but still needs final tweaks or testing
+- You want instructors to test a new template before students access it
+- You're preparing a template for use in a future course
+
+**In the template edit dialog:**
+
+1. Look for the **Visibility** toggle (appears when editing or creating)
+2. Choose:
+   - **Public** (default) — template appears in the student template catalog
+   - **Instructor only** — template is hidden from students and only
+     visible to instructors and admins in the template picker
+
+> [!note]
+> **Visibility vs. Publish state are independent.** An active (published)
+> instructor-only template is fully functional — it just doesn't appear in the
+> student-facing catalog. An instructor can still click "Deploy" and use it
+> to create a pod for testing. Students **cannot** see instructor-only
+> templates in the list *or* reach them through any other path; attempting
+> to use one (if they knew its ID) results in a permission error.
+
+Once you're satisfied with the template, change it back to **Public** so
+students can access it.
+
 ---
 
 ## Linux template contract
