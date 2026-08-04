@@ -248,7 +248,7 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	runs, err := h.db.ListAllRunsFiltered(r.Context(), filter)
+	runs, err := h.runsStore().ListAllRunsFiltered(r.Context(), filter)
 	if err != nil {
 		h.logger.Error("admin list runs failed", "error", err)
 		http.Error(w, "failed to list runs", http.StatusInternalServerError)
