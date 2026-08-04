@@ -94,6 +94,10 @@ spec:
                   value: {{ .Values.synthetic.runner.runTimeout | default "10m" | quote }}
                 - name: SYNTHETIC_RUNNER_DESTROY_TIMEOUT
                   value: {{ .Values.synthetic.runner.destroyTimeout | default "90s" | quote }}
+                - name: SYNTHETIC_RUNNER_MAX_ATTEMPTS
+                  value: {{ .Values.synthetic.runner.maxAttempts | default 2 | quote }}
+                - name: SYNTHETIC_RUNNER_RETRY_BACKOFF
+                  value: {{ .Values.synthetic.runner.retryBackoff | default "30s" | quote }}
               resources:
                 {{- toYaml .Values.synthetic.resources | nindent 16 }}
               securityContext:

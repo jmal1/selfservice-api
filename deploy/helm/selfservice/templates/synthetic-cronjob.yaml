@@ -87,6 +87,10 @@ spec:
                   value: {{ .Values.synthetic.lifecycle.readyTimeout | quote }}
                 - name: SYNTHETIC_LIFECYCLE_DESTROY_TIMEOUT
                   value: {{ .Values.synthetic.lifecycle.destroyTimeout | quote }}
+                - name: SYNTHETIC_LIFECYCLE_MAX_ATTEMPTS
+                  value: {{ .Values.synthetic.lifecycle.maxAttempts | default 2 | quote }}
+                - name: SYNTHETIC_LIFECYCLE_RETRY_BACKOFF
+                  value: {{ .Values.synthetic.lifecycle.retryBackoff | default "30s" | quote }}
                 {{- end }}
               resources:
                 {{- toYaml .Values.synthetic.resources | nindent 16 }}

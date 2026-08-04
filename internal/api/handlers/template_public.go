@@ -40,6 +40,7 @@ type TemplatePublic struct {
 	AssignIP        bool            `json:"assign_ip"`
 	IsActive        bool            `json:"is_active"`
 	IsInternal      bool            `json:"is_internal"`
+	Visibility      string          `json:"visibility"`
 	TemplateState   string          `json:"template_state"`
 	CreatedBy       *uuid.UUID      `json:"created_by,omitempty"`
 	VCenterVMID     string          `json:"vcenter_vm_id"`
@@ -73,6 +74,7 @@ func newTemplatePublic(t models.Template) TemplatePublic {
 		AssignIP:        t.AssignIP,
 		IsActive:        t.IsActive,
 		IsInternal:      t.IsInternal,
+		Visibility:      t.Visibility,
 		TemplateState:   t.TemplateState,
 		CreatedBy:       t.CreatedBy,
 		VCenterVMID:     t.VCenterVMID,

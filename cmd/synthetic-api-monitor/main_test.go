@@ -8,6 +8,7 @@ import (
 
 	"github.com/jmal1/selfservice-api/internal/synthetic"
 	"github.com/jmal1/selfservice-api/internal/synthetic/checks"
+	"gopkg.in/yaml.v3"
 )
 
 // names builds a check set carrying only names — the timeout-envelope logic
@@ -39,18 +40,18 @@ func TestLifecycleSafeTimeout_TakesTheLongestEnvelopeRegardlessOfOrder(t *testin
 		want   time.Duration
 	}{
 		{"no expensive checks keeps the base", names("healthz", "auth_me"), base},
-		{"pod_lifecycle alone", names("healthz", "pod_lifecycle"), 11 * time.Minute},
-		{"runner_smoke alone", names("runner_smoke"), 21 * time.Minute},
+		{"pod_lifecycle alone", names("healthz", "pod_lifecycle"), 5 * time.Minute},
+		{"runner_smoke alone", names("runner_smoke"), 15 * time.Minute},
 		{
 			// Ordering guard: lifecycle first would have short-circuited.
 			"both, lifecycle registered first",
 			names("healthz", "pod_lifecycle", "runner_smoke"),
-			21 * time.Minute,
+			15 * time.Minute,
 		},
 		{
 			"both, runner registered first",
 			names("runner_smoke", "pod_lifecycle"),
-			21 * time.Minute,
+			15 * time.Minute,
 		},
 	}
 
@@ -417,8 +418,8 @@ func TestSessionTokenTTL_OutlivesEveryCheckBudget(t *testing.T) {
 		longest, base time.Duration
 		active        int
 	}{
-		{"runner mode: one check with a 21m budget", 21 * time.Minute, 30 * time.Second, 1},
-		{"default mode with pod_lifecycle (11m budget)", 11 * time.Minute, 30 * time.Second, 13},
+		{"runner mode: one check with a 15m per-attempt budget", 15 * time.Minute, 30 * time.Second, 1},
+		{"default mode with pod_lifecycle (5m per-attempt budget)", 5 * time.Minute, 30 * time.Second, 13},
 		{"default mode, no expensive checks", 30 * time.Second, 30 * time.Second, 8},
 		{"janitor mode", 30 * time.Second, 30 * time.Second, 1},
 		{"degenerate: no active checks", 30 * time.Second, 30 * time.Second, 0},
@@ -440,7 +441,8 @@ func TestSessionTokenTTL_OutlivesEveryCheckBudget(t *testing.T) {
 // formula would have been adequate, this test would pass vacuously.
 func TestSessionTokenTTL_BeatsTheShippedBug(t *testing.T) {
 	const base = 30 * time.Second
-	const runnerBudget = 21 * time.Minute
+	// runner_smoke per-attempt envelope with the 150s ReadyTimeout default.
+	const runnerBudget = 15 * time.Minute
 
 	buggy := base * time.Duration(len(checks.All())+1)
 	if buggy >= runnerBudget {
@@ -470,5 +472,309 @@ func TestSessionTokenTTL_IsDerivedFromTheRunnerBudgetNotAllChecks(t *testing.T) 
 	if strings.Contains(body, "len(checks.All())+1") {
 		t.Error("a session token is being minted from checks.All() again: in runner or janitor mode " +
 			"that is the wrong check set, and it reintroduces the 4m30s-token-vs-21m-budget bug")
+	}
+}
+
+// TestResolveRetryConfig_Defaults guards the default retry configuration.
+func TestResolveRetryConfig_Defaults(t *testing.T) {
+	cfg, err := resolveRetryConfig(func(string) string { return "" }, "ENV_ATTEMPTS", "ENV_BACKOFF")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.MaxAttempts != 2 {
+		t.Errorf("MaxAttempts = %d, want 2", cfg.MaxAttempts)
+	}
+	if cfg.Backoff != 30*time.Second {
+		t.Errorf("Backoff = %v, want 30s", cfg.Backoff)
+	}
+}
+
+// TestResolveRetryConfig_Overrides confirms that env vars are applied.
+func TestResolveRetryConfig_Overrides(t *testing.T) {
+	env := map[string]string{
+		"ENV_ATTEMPTS": "3",
+		"ENV_BACKOFF":  "45s",
+	}
+	cfg, err := resolveRetryConfig(func(k string) string { return env[k] }, "ENV_ATTEMPTS", "ENV_BACKOFF")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.MaxAttempts != 3 {
+		t.Errorf("MaxAttempts = %d, want 3", cfg.MaxAttempts)
+	}
+	if cfg.Backoff != 45*time.Second {
+		t.Errorf("Backoff = %v, want 45s", cfg.Backoff)
+	}
+}
+
+// TestResolveRetryConfig_RejectsInvalid covers error paths for bad inputs.
+func TestResolveRetryConfig_RejectsInvalid(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		env     map[string]string
+		wantErr string
+	}{
+		{
+			"zero attempts",
+			map[string]string{"ENV_ATTEMPTS": "0"},
+			"ENV_ATTEMPTS",
+		},
+		{
+			"non-integer attempts",
+			map[string]string{"ENV_ATTEMPTS": "two"},
+			"ENV_ATTEMPTS",
+		},
+		{
+			"invalid backoff",
+			map[string]string{"ENV_BACKOFF": "10"},
+			"ENV_BACKOFF",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := resolveRetryConfig(func(k string) string { return tc.env[k] }, "ENV_ATTEMPTS", "ENV_BACKOFF")
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error %q should mention %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestHasPodLifecycle confirms the helper finds pod_lifecycle by name.
+func TestHasPodLifecycle(t *testing.T) {
+	if hasPodLifecycle(names("healthz", "auth_me")) {
+		t.Error("hasPodLifecycle returned true for a set with no pod_lifecycle")
+	}
+	if !hasPodLifecycle(names("healthz", "pod_lifecycle", "auth_me")) {
+		t.Error("hasPodLifecycle returned false for a set containing pod_lifecycle")
+	}
+}
+
+// helmLifecycleValues holds the fields from deploy/helm/selfservice/values.yaml
+// (and values.prod.yaml) that govern pod_lifecycle retry and timeout behavior.
+// Used only in test to verify the deployed config satisfies both the
+// activeDeadlineSeconds (hard pod kill) and schedule interval (Forbid skip).
+type helmLifecycleValues struct {
+	ReadyTimeout          string `yaml:"readyTimeout"`
+	DestroyTimeout        string `yaml:"destroyTimeout"`
+	MaxAttempts           int    `yaml:"maxAttempts"`
+	RetryBackoff          string `yaml:"retryBackoff"`
+	ActiveDeadlineSeconds int    `yaml:"activeDeadlineSeconds"`
+}
+
+// helmRunnerValues holds the runner_smoke fields from the Helm values files.
+type helmRunnerValues struct {
+	ReadyTimeout          string `yaml:"readyTimeout"`
+	RunTimeout            string `yaml:"runTimeout"`
+	DestroyTimeout        string `yaml:"destroyTimeout"`
+	MaxAttempts           int    `yaml:"maxAttempts"`
+	RetryBackoff          string `yaml:"retryBackoff"`
+	ActiveDeadlineSeconds int    `yaml:"activeDeadlineSeconds"`
+}
+
+type helmValuesFile struct {
+	Synthetic struct {
+		Lifecycle helmLifecycleValues `yaml:"lifecycle"`
+		Runner    helmRunnerValues    `yaml:"runner"`
+	} `yaml:"synthetic"`
+}
+
+// loadHelmValues parses a Helm values YAML file.
+func loadHelmValues(t *testing.T, path string) helmValuesFile {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read helm values %s: %v", path, err)
+	}
+	var v helmValuesFile
+	if err := yaml.Unmarshal(data, &v); err != nil {
+		t.Fatalf("parse helm values %s: %v", path, err)
+	}
+	return v
+}
+
+// mergeLifecycle applies prod overrides on top of base (non-zero prod fields win).
+func mergeLifecycle(base, prod helmLifecycleValues) helmLifecycleValues {
+	if prod.ReadyTimeout != "" {
+		base.ReadyTimeout = prod.ReadyTimeout
+	}
+	if prod.DestroyTimeout != "" {
+		base.DestroyTimeout = prod.DestroyTimeout
+	}
+	if prod.MaxAttempts != 0 {
+		base.MaxAttempts = prod.MaxAttempts
+	}
+	if prod.RetryBackoff != "" {
+		base.RetryBackoff = prod.RetryBackoff
+	}
+	if prod.ActiveDeadlineSeconds != 0 {
+		base.ActiveDeadlineSeconds = prod.ActiveDeadlineSeconds
+	}
+	return base
+}
+
+// mergeRunner applies prod overrides on top of base for runner_smoke fields.
+func mergeRunner(base, prod helmRunnerValues) helmRunnerValues {
+	if prod.ReadyTimeout != "" {
+		base.ReadyTimeout = prod.ReadyTimeout
+	}
+	if prod.RunTimeout != "" {
+		base.RunTimeout = prod.RunTimeout
+	}
+	if prod.DestroyTimeout != "" {
+		base.DestroyTimeout = prod.DestroyTimeout
+	}
+	if prod.MaxAttempts != 0 {
+		base.MaxAttempts = prod.MaxAttempts
+	}
+	if prod.RetryBackoff != "" {
+		base.RetryBackoff = prod.RetryBackoff
+	}
+	if prod.ActiveDeadlineSeconds != 0 {
+		base.ActiveDeadlineSeconds = prod.ActiveDeadlineSeconds
+	}
+	return base
+}
+
+// parseDurField parses a duration string from a Helm values field and fails
+// with a clear message when the string is empty or invalid.
+func parseDurField(t *testing.T, s, field string) time.Duration {
+	t.Helper()
+	if s == "" {
+		t.Fatalf("helm field %q is empty; it must be set in values.yaml or values.prod.yaml so "+
+			"WorstCaseCycle can verify the deployed config", field)
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		t.Fatalf("helm field %q=%q: %v", field, s, err)
+	}
+	return d
+}
+
+// TestPodLifecycleRetry_WorstCaseDerivedFromHelmValues reads the production
+// Helm values (values.yaml base + values.prod.yaml overlay) and asserts the
+// worst-case pod_lifecycle cycle time satisfies BOTH constraints:
+//
+//  1. < activeDeadlineSeconds (K8s hard kill of the CronJob pod — the more
+//     dangerous bound: an exceeded deadline means the pod is SIGKILLed
+//     mid-run and pushes NO metric, giving a stale series instead of a clean 0)
+//
+//  2. < CronJob schedule interval (concurrencyPolicy:Forbid — exceeded schedule
+//     silently skips the next cycle)
+//
+// The bug this test was added to catch: values.prod.yaml had readyTimeout=3m,
+// giving 2×(180s+90s)+30s+60s = 630s = 10m30s > 10m schedule ✗.
+func TestPodLifecycleRetry_WorstCaseDerivedFromHelmValues(t *testing.T) {
+	const (
+		valuesBase           = "../../deploy/helm/selfservice/values.yaml"
+		valuesProd           = "../../deploy/helm/selfservice/values.prod.yaml"
+		cronJob              = 10 * time.Minute
+		defaultDeadlineHard  = 900 * time.Second // template default when not set
+	)
+
+	base := loadHelmValues(t, valuesBase)
+	prod := loadHelmValues(t, valuesProd)
+	eff := mergeLifecycle(base.Synthetic.Lifecycle, prod.Synthetic.Lifecycle)
+
+	ready := parseDurField(t, eff.ReadyTimeout, "synthetic.lifecycle.readyTimeout")
+	destroy := parseDurField(t, eff.DestroyTimeout, "synthetic.lifecycle.destroyTimeout")
+
+	backoff := 30 * time.Second
+	if eff.RetryBackoff != "" {
+		backoff = parseDurField(t, eff.RetryBackoff, "synthetic.lifecycle.retryBackoff")
+	}
+	attempts := 2
+	if eff.MaxAttempts != 0 {
+		attempts = eff.MaxAttempts
+	}
+	deadline := defaultDeadlineHard
+	if eff.ActiveDeadlineSeconds != 0 {
+		deadline = time.Duration(eff.ActiveDeadlineSeconds) * time.Second
+	}
+
+	wc := WorstCaseCycle(ready+destroy, backoff, attempts)
+
+	if wc >= deadline {
+		t.Errorf(
+			"Helm-effective worst-case pod_lifecycle cycle time %v >= activeDeadlineSeconds %v.\n"+
+				"  Effective Helm config: readyTimeout=%s destroyTimeout=%s maxAttempts=%d retryBackoff=%s activeDeadlineSeconds=%d\n"+
+				"  K8s SIGKILL mid-run pushes NO metric → stale series instead of clean 0.\n"+
+				"  Fix: raise activeDeadlineSeconds or lower readyTimeout/destroyTimeout in values.yaml/values.prod.yaml.",
+			wc, deadline,
+			eff.ReadyTimeout, eff.DestroyTimeout, attempts, eff.RetryBackoff, eff.ActiveDeadlineSeconds,
+		)
+	}
+	if wc >= cronJob {
+		t.Errorf(
+			"Helm-effective worst-case pod_lifecycle cycle time %v >= CronJob schedule %v.\n"+
+				"  Effective Helm config: readyTimeout=%s destroyTimeout=%s maxAttempts=%d retryBackoff=%s\n"+
+				"  With concurrencyPolicy:Forbid the NEXT cycle is silently skipped.\n"+
+				"  Fix: lower readyTimeout or destroyTimeout in values.yaml / values.prod.yaml.",
+			wc, cronJob,
+			eff.ReadyTimeout, eff.DestroyTimeout, attempts, eff.RetryBackoff,
+		)
+	}
+}
+
+// TestRunnerSmokeRetry_WorstCaseDerivedFromHelmValues reads the production Helm
+// values and asserts the worst-case runner_smoke cycle time satisfies BOTH:
+//
+//  1. < activeDeadlineSeconds (K8s hard kill — the binding constraint). When
+//     exceeded, the pod is SIGKILLed mid-attempt and pushes NO metric. The
+//     stale CrucibleSyntheticStale alert fires instead of the accurate
+//     CrucibleSyntheticCheckFailed. That is a worse signal than a clean failure.
+//
+//  2. < CronJob schedule interval (hourly, "37 * * * *"; concurrencyPolicy:Forbid)
+func TestRunnerSmokeRetry_WorstCaseDerivedFromHelmValues(t *testing.T) {
+	const (
+		valuesBase          = "../../deploy/helm/selfservice/values.yaml"
+		valuesProd          = "../../deploy/helm/selfservice/values.prod.yaml"
+		cronJob             = 60 * time.Minute // runner schedule: "37 * * * *" = hourly
+		defaultDeadlineHard = 1500 * time.Second
+	)
+
+	base := loadHelmValues(t, valuesBase)
+	prod := loadHelmValues(t, valuesProd)
+	eff := mergeRunner(base.Synthetic.Runner, prod.Synthetic.Runner)
+
+	ready := parseDurField(t, eff.ReadyTimeout, "synthetic.runner.readyTimeout")
+	run := parseDurField(t, eff.RunTimeout, "synthetic.runner.runTimeout")
+	destroy := parseDurField(t, eff.DestroyTimeout, "synthetic.runner.destroyTimeout")
+
+	backoff := 30 * time.Second
+	if eff.RetryBackoff != "" {
+		backoff = parseDurField(t, eff.RetryBackoff, "synthetic.runner.retryBackoff")
+	}
+	attempts := 2
+	if eff.MaxAttempts != 0 {
+		attempts = eff.MaxAttempts
+	}
+	deadline := defaultDeadlineHard
+	if eff.ActiveDeadlineSeconds != 0 {
+		deadline = time.Duration(eff.ActiveDeadlineSeconds) * time.Second
+	}
+
+	wc := WorstCaseCycle(ready+run+destroy, backoff, attempts)
+
+	if wc >= deadline {
+		t.Errorf(
+			"Helm-effective worst-case runner_smoke cycle time %v >= activeDeadlineSeconds %v.\n"+
+				"  Effective Helm config: readyTimeout=%s runTimeout=%s destroyTimeout=%s maxAttempts=%d retryBackoff=%s activeDeadlineSeconds=%d\n"+
+				"  K8s SIGKILL mid-run pushes NO metric → stale series (CrucibleSyntheticStale) instead of clean failure (CrucibleSyntheticCheckFailed).\n"+
+				"  Fix: raise synthetic.runner.activeDeadlineSeconds in values.yaml and values.prod.yaml.",
+			wc, deadline,
+			eff.ReadyTimeout, eff.RunTimeout, eff.DestroyTimeout, attempts, eff.RetryBackoff, eff.ActiveDeadlineSeconds,
+		)
+	}
+	if wc >= cronJob {
+		t.Errorf(
+			"Helm-effective worst-case runner_smoke cycle time %v >= CronJob schedule %v (hourly).\n"+
+				"  Effective Helm config: readyTimeout=%s runTimeout=%s destroyTimeout=%s maxAttempts=%d retryBackoff=%s\n"+
+				"  Fix: lower readyTimeout or runTimeout in values.yaml.",
+			wc, cronJob,
+			eff.ReadyTimeout, eff.RunTimeout, eff.DestroyTimeout, attempts, eff.RetryBackoff,
+		)
 	}
 }

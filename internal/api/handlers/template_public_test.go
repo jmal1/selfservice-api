@@ -43,6 +43,7 @@ func TestTemplatePublicMarshalDoesNotLeakPassword(t *testing.T) {
 		AssignIP:        true,
 		IsActive:        true,
 		IsInternal:      false,
+		Visibility:      "public",
 		TemplateState:   "active",
 		CreatedBy:       nil,
 		VCenterVMID:     "vm-123",
@@ -98,6 +99,7 @@ func TestTemplatePublicMarshalIncludesAllRequiredFields(t *testing.T) {
 		AssignIP:        true,
 		IsActive:        true,
 		IsInternal:      false,
+		Visibility:      "public",
 		TemplateState:   "active",
 		CreatedBy:       nil,
 		VCenterVMID:     "vm-123",
@@ -139,6 +141,7 @@ func TestTemplatePublicMarshalIncludesAllRequiredFields(t *testing.T) {
 		"assign_ip",
 		"is_active",
 		"is_internal",
+		"visibility",
 		"template_state",
 		"vcenter_vm_id",
 		"source_type",
@@ -180,6 +183,7 @@ func TestTemplatePublicFieldPreservation(t *testing.T) {
 		AssignIP:        false,
 		IsActive:        false,
 		IsInternal:      true,
+		Visibility:      "instructor_only",
 		TemplateState:   "draft",
 		CreatedBy:       &createdBy,
 		VCenterVMID:     "vm-999",
@@ -243,6 +247,9 @@ func TestTemplatePublicFieldPreservation(t *testing.T) {
 	}
 	if public.IsInternal != tmpl.IsInternal {
 		t.Errorf("IsInternal mismatch")
+	}
+	if public.Visibility != tmpl.Visibility {
+		t.Errorf("Visibility mismatch: %s != %s", public.Visibility, tmpl.Visibility)
 	}
 	if public.TemplateState != tmpl.TemplateState {
 		t.Errorf("TemplateState mismatch")
@@ -323,6 +330,7 @@ func TestPositiveControl_RawTemplateContainsPassword(t *testing.T) {
 		AssignIP:        true,
 		IsActive:        true,
 		IsInternal:      false,
+		Visibility:      "public",
 		TemplateState:   "active",
 		CreatedBy:       nil,
 		VCenterVMID:     "vm-123",
@@ -401,6 +409,7 @@ func TestListTemplatesHandlerDoesNotLeakPassword(t *testing.T) {
 		AssignIP:        true,
 		IsActive:        true,
 		IsInternal:      false,
+		Visibility:      "public",
 		TemplateState:   "active",
 		CreatedBy:       nil,
 		VCenterVMID:     "vm-prod-123",
