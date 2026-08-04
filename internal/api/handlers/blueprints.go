@@ -514,10 +514,12 @@ func (h *Handler) AdminReorderBlueprints(w http.ResponseWriter, r *http.Request)
 		req[id] = database.PinState{Pinned: v.Pinned, PinOrder: v.PinOrder}
 	}
 
-	err := h.db.ReorderBlueprints(r.Context(), req)
+	userID := middleware.UserIDFromContext(r.Context())
+	err := h.blueprintPinStore().ReorderBlueprints(r.Context(), req, userID)
 	if err != nil {
-		if err.Error() == "blueprint not found" || (err != nil && len(err.Error()) > 9 && err.Error()[:9] == "blueprint") {
-			http.Error(w, err.Error(), http.StatusNotFound)
+		if errors.Is(err, database.ErrBlueprintNotFound) {
+			h.logger.Warn("reorder blueprints target not found", "error", err, "user_id", userID)
+			http.Error(w, "Specified blueprint not found", http.StatusNotFound)
 			return
 		}
 		h.logger.Error("reorder blueprints failed", "error", err)
@@ -525,9 +527,86 @@ func (h *Handler) AdminReorderBlueprints(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	audit.Log(r.Context(), h.db, "blueprints.reorder",
+	h.auditLog(r.Context(), "blueprints.reorder",
 		audit.IP(r.RemoteAddr),
 		audit.Detail("count", fmt.Sprintf("%d", len(req))),
+	)
+
+	respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// AdminSetBlueprintPin pins a single blueprint at the requested position.
+func (h *Handler) AdminSetBlueprintPin(w http.ResponseWriter, r *http.Request) {
+	role := middleware.RoleFromContext(r.Context())
+	if role != models.RoleInstructor && role != models.RoleAdmin {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	blueprintID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		http.Error(w, "invalid blueprint id", http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		PinOrder int `json:"pin_order"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	userID := middleware.UserIDFromContext(r.Context())
+	if err := h.blueprintPinStore().SetBlueprintPin(r.Context(), blueprintID, true, req.PinOrder, userID); err != nil {
+		if errors.Is(err, database.ErrBlueprintNotFound) {
+			h.logger.Warn("set blueprint pin target not found", "error", err, "user_id", userID)
+			http.Error(w, "Specified blueprint not found", http.StatusNotFound)
+			return
+		}
+		h.logger.Error("set blueprint pin failed", "error", err, "blueprint_id", blueprintID, "user_id", userID)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	h.auditLog(r.Context(), "blueprint.pin",
+		audit.Resource("blueprint", blueprintID),
+		audit.IP(r.RemoteAddr),
+		audit.Detail("pin_order", fmt.Sprintf("%d", req.PinOrder)),
+	)
+
+	respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// AdminUnpinBlueprint clears the pinned state for a single blueprint.
+func (h *Handler) AdminUnpinBlueprint(w http.ResponseWriter, r *http.Request) {
+	role := middleware.RoleFromContext(r.Context())
+	if role != models.RoleInstructor && role != models.RoleAdmin {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	blueprintID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		http.Error(w, "invalid blueprint id", http.StatusBadRequest)
+		return
+	}
+
+	userID := middleware.UserIDFromContext(r.Context())
+	if err := h.blueprintPinStore().SetBlueprintPin(r.Context(), blueprintID, false, 0, userID); err != nil {
+		if errors.Is(err, database.ErrBlueprintNotFound) {
+			h.logger.Warn("unpin blueprint target not found", "error", err, "user_id", userID)
+			http.Error(w, "Specified blueprint not found", http.StatusNotFound)
+			return
+		}
+		h.logger.Error("unpin blueprint failed", "error", err, "blueprint_id", blueprintID, "user_id", userID)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	h.auditLog(r.Context(), "blueprint.unpin",
+		audit.Resource("blueprint", blueprintID),
+		audit.IP(r.RemoteAddr),
 	)
 
 	respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})

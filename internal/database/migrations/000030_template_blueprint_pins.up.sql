@@ -14,10 +14,12 @@
 ALTER TABLE templates ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE templates ADD COLUMN pin_order INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE templates ADD COLUMN pinned_at TIMESTAMPTZ;
+ALTER TABLE templates ADD COLUMN pinned_by UUID REFERENCES users(id) ON DELETE SET NULL;
 
 ALTER TABLE blueprints ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE blueprints ADD COLUMN pin_order INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE blueprints ADD COLUMN pinned_at TIMESTAMPTZ;
+ALTER TABLE blueprints ADD COLUMN pinned_by UUID REFERENCES users(id) ON DELETE SET NULL;
 
 -- Partial indexes for queries that list pinned items
 CREATE INDEX idx_templates_pinned_order ON templates (pinned, pin_order) WHERE pinned;

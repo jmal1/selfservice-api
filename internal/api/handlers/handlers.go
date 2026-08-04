@@ -52,6 +52,11 @@ type Handler struct {
 	// implementation. See templateStore() accessor.
 	templates templateLister
 
+	// templatePins and blueprintPins optionally override the pinning DB surface
+	// so pin/reorder handlers can be tested without a live pgxpool.
+	templatePins  templatePinStore
+	blueprintPins blueprintPinStore
+
 	// provDB is an optional override for the narrow DB surface used by the
 	// template provision path (requireTemplateInState + advanceTemplateAndEnqueue).
 	// nil means h.db is used. Tests inject a fake via WithProvisionDB to drive
@@ -154,6 +159,30 @@ func (h *Handler) templateStore() templateLister {
 	return h.db
 }
 
+type templatePinStore interface {
+	ReorderTemplates(ctx context.Context, pins map[uuid.UUID]database.PinState, pinnedBy uuid.UUID) error
+	SetTemplatePin(ctx context.Context, templateID uuid.UUID, pinned bool, pinOrder int, pinnedBy uuid.UUID) error
+}
+
+type blueprintPinStore interface {
+	ReorderBlueprints(ctx context.Context, pins map[uuid.UUID]database.PinState, pinnedBy uuid.UUID) error
+	SetBlueprintPin(ctx context.Context, blueprintID uuid.UUID, pinned bool, pinOrder int, pinnedBy uuid.UUID) error
+}
+
+func (h *Handler) templatePinStore() templatePinStore {
+	if h.templatePins != nil {
+		return h.templatePins
+	}
+	return h.db
+}
+
+func (h *Handler) blueprintPinStore() blueprintPinStore {
+	if h.blueprintPins != nil {
+		return h.blueprintPins
+	}
+	return h.db
+}
+
 // provisionDB is the narrow slice of *database.Queries that the template
 // provision path needs. Declaring it as an interface lets tests inject a fake
 // without a live pgxpool — see Handler.provisionStore() and WithProvisionDB.
@@ -212,6 +241,13 @@ func (h *Handler) invalidateTemplatesFolderCache() {
 	if h.templatesFolder != nil {
 		h.templatesFolder.cache.Invalidate()
 	}
+}
+
+func (h *Handler) auditLog(ctx context.Context, action string, opts ...audit.Option) {
+	if h.db == nil {
+		return
+	}
+	audit.Log(ctx, h.db, action, opts...)
 }
 
 // --- Pod Handlers ---
@@ -1069,10 +1105,12 @@ func (h *Handler) AdminReorderTemplates(w http.ResponseWriter, r *http.Request) 
 		req[id] = database.PinState{Pinned: v.Pinned, PinOrder: v.PinOrder}
 	}
 
-	err := h.db.ReorderTemplates(r.Context(), req)
+	userID := middleware.UserIDFromContext(r.Context())
+	err := h.templatePinStore().ReorderTemplates(r.Context(), req, userID)
 	if err != nil {
-		if err.Error() == "template not found" || (err != nil && len(err.Error()) > 8 && err.Error()[:8] == "template") {
-			http.Error(w, err.Error(), http.StatusNotFound)
+		if errors.Is(err, database.ErrTemplateNotFound) {
+			h.logger.Warn("reorder templates target not found", "error", err, "user_id", userID)
+			http.Error(w, "Specified template not found", http.StatusNotFound)
 			return
 		}
 		h.logger.Error("reorder templates failed", "error", err)
@@ -1080,9 +1118,86 @@ func (h *Handler) AdminReorderTemplates(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	audit.Log(r.Context(), h.db, "templates.reorder",
+	h.auditLog(r.Context(), "templates.reorder",
 		audit.IP(r.RemoteAddr),
 		audit.Detail("count", fmt.Sprintf("%d", len(req))),
+	)
+
+	respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// AdminSetTemplatePin pins a single template at the requested position.
+func (h *Handler) AdminSetTemplatePin(w http.ResponseWriter, r *http.Request) {
+	role := middleware.RoleFromContext(r.Context())
+	if role != models.RoleInstructor && role != models.RoleAdmin {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	templateID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		http.Error(w, "invalid template id", http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		PinOrder int `json:"pin_order"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	userID := middleware.UserIDFromContext(r.Context())
+	if err := h.templatePinStore().SetTemplatePin(r.Context(), templateID, true, req.PinOrder, userID); err != nil {
+		if errors.Is(err, database.ErrTemplateNotFound) {
+			h.logger.Warn("set template pin target not found", "error", err, "user_id", userID)
+			http.Error(w, "Specified template not found", http.StatusNotFound)
+			return
+		}
+		h.logger.Error("set template pin failed", "error", err, "template_id", templateID, "user_id", userID)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	h.auditLog(r.Context(), "template.pin",
+		audit.Resource("template", templateID),
+		audit.IP(r.RemoteAddr),
+		audit.Detail("pin_order", fmt.Sprintf("%d", req.PinOrder)),
+	)
+
+	respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// AdminUnpinTemplate clears the pinned state for a single template.
+func (h *Handler) AdminUnpinTemplate(w http.ResponseWriter, r *http.Request) {
+	role := middleware.RoleFromContext(r.Context())
+	if role != models.RoleInstructor && role != models.RoleAdmin {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	templateID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		http.Error(w, "invalid template id", http.StatusBadRequest)
+		return
+	}
+
+	userID := middleware.UserIDFromContext(r.Context())
+	if err := h.templatePinStore().SetTemplatePin(r.Context(), templateID, false, 0, userID); err != nil {
+		if errors.Is(err, database.ErrTemplateNotFound) {
+			h.logger.Warn("unpin template target not found", "error", err, "user_id", userID)
+			http.Error(w, "Specified template not found", http.StatusNotFound)
+			return
+		}
+		h.logger.Error("unpin template failed", "error", err, "template_id", templateID, "user_id", userID)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	h.auditLog(r.Context(), "template.unpin",
+		audit.Resource("template", templateID),
+		audit.IP(r.RemoteAddr),
 	)
 
 	respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})

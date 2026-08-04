@@ -3,196 +3,253 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"testing"
-	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+
+	"github.com/jmal1/selfservice-api/internal/database"
+	"github.com/jmal1/selfservice-api/internal/middleware"
 	"github.com/jmal1/selfservice-api/internal/models"
 )
 
-// setCtxUser is a test helper to inject a user into request context.
-func setCtxUser(r *http.Request, user *models.User) *http.Request {
-	return r.WithContext(context.WithValue(r.Context(), contextKey("user"), user))
+func withRoleAndUser(r *http.Request, role string, userID uuid.UUID) *http.Request {
+	ctx := middleware.WithRole(r.Context(), role)
+	ctx = middleware.WithUserID(ctx, userID)
+	return r.WithContext(ctx)
 }
 
-// TestAdminReorderTemplates_StudentGet403 verifies that students cannot
-// mutate the pin state of templates.
+func withRouteParam(r *http.Request, key string, id uuid.UUID) *http.Request {
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add(key, id.String())
+	return r.WithContext(context.WithValue(r.Context(), chi.RouteCtxKey, rctx))
+}
+
+type fakeTemplatePinStore struct {
+	reorderErr    error
+	setErr        error
+	reorderPins   map[uuid.UUID]database.PinState
+	reorderBy     uuid.UUID
+	setTemplateID uuid.UUID
+	setPinned     bool
+	setPinOrder   int
+	setPinnedBy   uuid.UUID
+}
+
+func (f *fakeTemplatePinStore) ReorderTemplates(ctx context.Context, pins map[uuid.UUID]database.PinState, pinnedBy uuid.UUID) error {
+	f.reorderPins = make(map[uuid.UUID]database.PinState, len(pins))
+	for id, state := range pins {
+		f.reorderPins[id] = state
+	}
+	f.reorderBy = pinnedBy
+	return f.reorderErr
+}
+
+func (f *fakeTemplatePinStore) SetTemplatePin(ctx context.Context, templateID uuid.UUID, pinned bool, pinOrder int, pinnedBy uuid.UUID) error {
+	f.setTemplateID = templateID
+	f.setPinned = pinned
+	f.setPinOrder = pinOrder
+	f.setPinnedBy = pinnedBy
+	return f.setErr
+}
+
+type fakeBlueprintPinStore struct {
+	reorderErr     error
+	setErr         error
+	reorderPins    map[uuid.UUID]database.PinState
+	reorderBy      uuid.UUID
+	setBlueprintID uuid.UUID
+	setPinned      bool
+	setPinOrder    int
+	setPinnedBy    uuid.UUID
+}
+
+func (f *fakeBlueprintPinStore) ReorderBlueprints(ctx context.Context, pins map[uuid.UUID]database.PinState, pinnedBy uuid.UUID) error {
+	f.reorderPins = make(map[uuid.UUID]database.PinState, len(pins))
+	for id, state := range pins {
+		f.reorderPins[id] = state
+	}
+	f.reorderBy = pinnedBy
+	return f.reorderErr
+}
+
+func (f *fakeBlueprintPinStore) SetBlueprintPin(ctx context.Context, blueprintID uuid.UUID, pinned bool, pinOrder int, pinnedBy uuid.UUID) error {
+	f.setBlueprintID = blueprintID
+	f.setPinned = pinned
+	f.setPinOrder = pinOrder
+	f.setPinnedBy = pinnedBy
+	return f.setErr
+}
+
 func TestAdminReorderTemplates_StudentGet403(t *testing.T) {
-	h := &Handler{
-		db:     nil, // Not needed for auth gate
-		logger: slog.Default(),
-	}
-
-	// Set up a student (role=1)
-	student := &models.User{
-		ID:   uuid.New(),
-		Role: models.RoleStudent,
-	}
-
-	// Prepare a request with empty body (we just care about the auth gate)
-	body := bytes.NewReader([]byte("{}"))
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/templates/reorder", body)
-	req = setCtxUser(req, student)
+	h := &Handler{logger: slog.Default()}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/templates/reorder", bytes.NewReader([]byte("{}")))
+	req = withRoleAndUser(req, models.RoleStudent, uuid.New())
 
 	w := httptest.NewRecorder()
 	h.AdminReorderTemplates(w, req)
 
 	if w.Code != http.StatusForbidden {
-		t.Errorf("student reorder: got %d, want 403", w.Code)
+		t.Fatalf("got %d, want 403", w.Code)
 	}
 }
 
-// TestAdminReorderBlueprints_StudentGet403 verifies that students cannot
-// mutate the pin state of blueprints.
 func TestAdminReorderBlueprints_StudentGet403(t *testing.T) {
-	h := &Handler{
-		db:     nil,
-		logger: slog.Default(),
-	}
-
-	student := &models.User{
-		ID:   uuid.New(),
-		Role: models.RoleStudent,
-	}
-
-	body := bytes.NewReader([]byte("{}"))
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/blueprints/reorder", body)
-	req = setCtxUser(req, student)
+	h := &Handler{logger: slog.Default()}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/blueprints/reorder", bytes.NewReader([]byte("{}")))
+	req = withRoleAndUser(req, models.RoleStudent, uuid.New())
 
 	w := httptest.NewRecorder()
 	h.AdminReorderBlueprints(w, req)
 
 	if w.Code != http.StatusForbidden {
-		t.Errorf("student reorder blueprints: got %d, want 403", w.Code)
+		t.Fatalf("got %d, want 403", w.Code)
 	}
 }
 
-// TestListTemplatesSortOrder verifies that templates are returned in the correct
-// order: pinned first (by pin_order), then unpinned (by name).
-// This is a unit test that demonstrates the expected behavior.
-func TestListTemplatesSortOrder(t *testing.T) {
-	tests := []struct {
-		name      string
-		templates []models.Template
-		want      []string
-	}{
-		{
-			name: "all_unpinned_sorted_by_name",
-			templates: []models.Template{
-				{ID: uuid.New(), Name: "Zebra"},
-				{ID: uuid.New(), Name: "Alpha"},
-				{ID: uuid.New(), Name: "Beta"},
-			},
-			want: []string{"Alpha", "Beta", "Zebra"},
-		},
-		{
-			name: "pinned_first_then_unpinned",
-			templates: []models.Template{
-				{ID: uuid.New(), Name: "Zebra", Pinned: false},
-				{ID: uuid.New(), Name: "Pinned-Alpha", Pinned: true, PinOrder: 1},
-				{ID: uuid.New(), Name: "Alpha", Pinned: false},
-				{ID: uuid.New(), Name: "Pinned-Beta", Pinned: true, PinOrder: 0},
-			},
-			want: []string{"Pinned-Beta", "Pinned-Alpha", "Alpha", "Zebra"},
-		},
-		{
-			name: "pinned_same_order_sorted_by_pinned_at_desc",
-			templates: []models.Template{
-				{ID: uuid.New(), Name: "First", Pinned: true, PinOrder: 0, PinnedAt: timePtr(time.Unix(100, 0))},
-				{ID: uuid.New(), Name: "Second", Pinned: true, PinOrder: 0, PinnedAt: timePtr(time.Unix(200, 0))},
-				{ID: uuid.New(), Name: "Third", Pinned: true, PinOrder: 1},
-			},
-			want: []string{"Second", "First", "Third"},
-		},
+func TestAdminReorderTemplates_NotFoundGets404(t *testing.T) {
+	targetID := uuid.New()
+	store := &fakeTemplatePinStore{
+		reorderErr: fmt.Errorf("%w: %s", database.ErrTemplateNotFound, targetID),
+	}
+	h := &Handler{logger: slog.Default(), templatePins: store}
+
+	body, err := json.Marshal(map[string]map[string]any{
+		targetID.String(): {"pinned": true, "pin_order": 1},
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			// Sort templates according to the specification
-			sorted := sortTemplatesByPin(tc.templates)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/templates/reorder", bytes.NewReader(body))
+	userID := uuid.New()
+	req = withRoleAndUser(req, models.RoleInstructor, userID)
 
-			// Verify order
-			for i, want := range tc.want {
-				if i >= len(sorted) {
-					t.Errorf("sorted has fewer items than expected (got %d, want %d)", len(sorted), len(tc.want))
-					return
-				}
-				if sorted[i].Name != want {
-					t.Errorf("position %d: got %q, want %q", i, sorted[i].Name, want)
-				}
-			}
-		})
+	w := httptest.NewRecorder()
+	h.AdminReorderTemplates(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("got %d, want 404", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "Specified template not found") {
+		t.Fatalf("unexpected body: %q", w.Body.String())
+	}
+	if store.reorderBy != userID {
+		t.Fatalf("reorder pinnedBy = %s, want %s", store.reorderBy, userID)
 	}
 }
 
-// sortTemplatesByPin mirrors the database sort logic for testing.
-func sortTemplatesByPin(templates []models.Template) []models.Template {
-	sorted := make([]models.Template, len(templates))
-	copy(sorted, templates)
+func TestAdminReorderBlueprints_NotFoundGets404(t *testing.T) {
+	targetID := uuid.New()
+	store := &fakeBlueprintPinStore{
+		reorderErr: fmt.Errorf("%w: %s", database.ErrBlueprintNotFound, targetID),
+	}
+	h := &Handler{logger: slog.Default(), blueprintPins: store}
 
-	// Bubble sort implementation that correctly implements the multi-level sort
-	for i := 0; i < len(sorted); i++ {
-		for j := i + 1; j < len(sorted); j++ {
-			if shouldSwap(sorted[i], sorted[j]) {
-				sorted[i], sorted[j] = sorted[j], sorted[i]
-			}
+	body, err := json.Marshal(map[string]map[string]any{
+		targetID.String(): {"pinned": true, "pin_order": 2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/blueprints/reorder", bytes.NewReader(body))
+	userID := uuid.New()
+	req = withRoleAndUser(req, models.RoleInstructor, userID)
+
+	w := httptest.NewRecorder()
+	h.AdminReorderBlueprints(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("got %d, want 404", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "Specified blueprint not found") {
+		t.Fatalf("unexpected body: %q", w.Body.String())
+	}
+	if store.reorderBy != userID {
+		t.Fatalf("reorder pinnedBy = %s, want %s", store.reorderBy, userID)
+	}
+}
+
+func TestAdminSetTemplatePin_PositivePath(t *testing.T) {
+	templateID := uuid.New()
+	userID := uuid.New()
+	store := &fakeTemplatePinStore{}
+	h := &Handler{logger: slog.Default(), templatePins: store}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/templates/"+templateID.String()+"/pin", bytes.NewReader([]byte(`{"pin_order":7}`)))
+	req = withRoleAndUser(req, models.RoleInstructor, userID)
+	req = withRouteParam(req, "id", templateID)
+
+	w := httptest.NewRecorder()
+	h.AdminSetTemplatePin(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200", w.Code)
+	}
+	if store.setTemplateID != templateID || !store.setPinned || store.setPinOrder != 7 || store.setPinnedBy != userID {
+		t.Fatalf("unexpected SetTemplatePin call: %+v", store)
+	}
+}
+
+func TestAdminSetBlueprintPin_PositivePath(t *testing.T) {
+	blueprintID := uuid.New()
+	userID := uuid.New()
+	store := &fakeBlueprintPinStore{}
+	h := &Handler{logger: slog.Default(), blueprintPins: store}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/blueprints/"+blueprintID.String()+"/pin", bytes.NewReader([]byte(`{"pin_order":3}`)))
+	req = withRoleAndUser(req, models.RoleInstructor, userID)
+	req = withRouteParam(req, "id", blueprintID)
+
+	w := httptest.NewRecorder()
+	h.AdminSetBlueprintPin(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200", w.Code)
+	}
+	if store.setBlueprintID != blueprintID || !store.setPinned || store.setPinOrder != 3 || store.setPinnedBy != userID {
+		t.Fatalf("unexpected SetBlueprintPin call: %+v", store)
+	}
+}
+
+func TestPinningSourceAssertions(t *testing.T) {
+	queryBytes, err := os.ReadFile("..\\..\\database\\queries.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	routeBytes, err := os.ReadFile("..\\routes\\routes.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	querySrc := string(queryBytes)
+	routeSrc := string(routeBytes)
+	mustContain := func(src, needle string) {
+		t.Helper()
+		if !strings.Contains(src, needle) {
+			t.Fatalf("missing %q", needle)
 		}
 	}
-	return sorted
-}
 
-// shouldSwap returns true if template a should come after template b in the sort order.
-// Sort order: pinned DESC (true first), then pin_order ASC, then pinned_at DESC (NULL last), then name ASC.
-func shouldSwap(a, b models.Template) bool {
-	// Pinned items first
-	if a.Pinned && !b.Pinned {
-		return false // a is pinned, b is not → don't swap (a goes first)
-	}
-	if !a.Pinned && b.Pinned {
-		return true // a is not pinned, b is → swap (b should go first)
-	}
-
-	// Both pinned or both unpinned: compare by pin_order if both are pinned
-	if a.Pinned && b.Pinned {
-		if a.PinOrder != b.PinOrder {
-			return a.PinOrder > b.PinOrder // Lower pin_order goes first (ASC)
-		}
-		// Same pin_order: compare by pinned_at (DESC, NULL last)
-		cmp := compareTime(a.PinnedAt, b.PinnedAt)
-		if cmp != 0 {
-			return cmp > 0 // compareTime returns -1 if a should go before b in DESC order
-		}
-	}
-
-	// Unpinned or same pin state and pin_order: compare by name (ASC)
-	return a.Name > b.Name
-}
-
-// compareTime compares two time pointers (DESC for pinned_at, NULL LAST).
-func compareTime(a, b *time.Time) int {
-	if a == nil && b == nil {
-		return 0
-	}
-	if a == nil {
-		return 1 // NULL sorts last (descending)
-	}
-	if b == nil {
-		return -1
-	}
-	// Both non-nil: DESC order
-	if a.After(*b) {
-		return -1
-	}
-	if a.Before(*b) {
-		return 1
-	}
-	return 0
-}
-
-// timePtr returns a pointer to a time.Time.
-func timePtr(t time.Time) *time.Time {
-	return &t
+	mustContain(querySrc, `var ErrTemplateNotFound = errors.New("template not found")`)
+	mustContain(querySrc, `var ErrBlueprintNotFound = errors.New("blueprint not found")`)
+	mustContain(querySrc, `pinned, pin_order, pinned_at, pinned_by`)
+	mustContain(querySrc, `CASE WHEN $1 AND NOT pinned THEN now()`)
+	mustContain(querySrc, `CASE WHEN $1 AND NOT pinned THEN $3`)
+	mustContain(querySrc, `func (q *Queries) ReorderTemplates(ctx context.Context, pins map[uuid.UUID]PinState, pinnedBy uuid.UUID) error`)
+	mustContain(querySrc, `func (q *Queries) ReorderBlueprints(ctx context.Context, pins map[uuid.UUID]PinState, pinnedBy uuid.UUID) error`)
+	mustContain(querySrc, `func (q *Queries) SetTemplatePin(ctx context.Context, templateID uuid.UUID, pinned bool, pinOrder int, pinnedBy uuid.UUID) error`)
+	mustContain(querySrc, `func (q *Queries) SetBlueprintPin(ctx context.Context, blueprintID uuid.UUID, pinned bool, pinOrder int, pinnedBy uuid.UUID) error`)
+	mustContain(routeSrc, `r.Post("/{id}/pin", h.AdminSetTemplatePin)`)
+	mustContain(routeSrc, `r.Delete("/{id}/pin", h.AdminUnpinTemplate)`)
+	mustContain(routeSrc, `r.Post("/blueprints/{id}/pin", h.AdminSetBlueprintPin)`)
+	mustContain(routeSrc, `r.Delete("/blueprints/{id}/pin", h.AdminUnpinBlueprint)`)
 }
