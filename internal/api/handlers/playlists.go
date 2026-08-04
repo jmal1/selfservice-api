@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -257,6 +258,33 @@ func (h *Handler) AdminGetBlueprintVMPlaylistsResolved(w http.ResponseWriter, r 
 	}
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{"vm_playlists": vmPlaylists})
+}
+
+// AdminDeleteBlueprintVMPlaylistsOverride removes playlist overrides for a blueprint VM slot,
+// reverting it to inherit the template's default playlists.
+func (h *Handler) AdminDeleteBlueprintVMPlaylistsOverride(w http.ResponseWriter, r *http.Request) {
+	blueprintID, err := uuid.Parse(chi.URLParam(r, "blueprintID"))
+	if err != nil {
+		http.Error(w, "invalid blueprint ID", http.StatusBadRequest)
+		return
+	}
+
+	vmSlotStr := chi.URLParam(r, "vmSlot")
+	vmSlot := 0
+	_, err = fmt.Sscanf(vmSlotStr, "%d", &vmSlot)
+	if err != nil {
+		http.Error(w, "invalid vm slot", http.StatusBadRequest)
+		return
+	}
+
+	// Delete override by setting empty playlist list
+	if err := h.db.SetBlueprintVMPlaylists(r.Context(), blueprintID, vmSlot, []uuid.UUID{}); err != nil {
+		h.logger.Error("failed to delete blueprint VM playlists override", "error", err)
+		http.Error(w, "failed to delete override", http.StatusInternalServerError)
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]string{"status": "override removed"})
 }
 
 // AdminListRuns returns all runs across all pods (admin view).
