@@ -281,6 +281,55 @@ cause usually falls out in minutes.
 
 ---
 
+## "Provision is disabled — the wizard says preflight checks failed"
+
+Before a clone job is enqueued, the wizard runs a set of **preflight checks**
+that verify the environment is ready. If any *blocking* check fails, the
+Provision button is disabled and each failing row shows a **Fix** hint.
+
+Common causes:
+
+**Source VM moref does not resolve (PF-01)**
+: The source VM was deleted or moved in vCenter after the draft was created.
+  Re-run the draft step and pick a valid source.
+
+**Target datastore not mounted on all cluster hosts (PF-03)**
+: The configured datastore isn't accessible from the full cluster. Either
+  mount it on the missing hosts, or contact the platform admin to update
+  the target datastore in the Crucible config.
+
+**Not enough datastore free space (PF-04)**
+: Free space < source provisioned size × 1.2. Delete stale staging VMs or
+  snapshots to recover space, then re-run the checks.
+
+**In-flight tasks on source VM (PF-06)**
+: Another clone or consolidation is already running against the same source.
+  Wait for it to finish (check vCenter Tasks), then try again. This check
+  exists because concurrent operations against the same source VM are the
+  leading theory for certain intermittent clone failures.
+
+**VMware Tools not running (PF-07)**
+: The source VM must be powered on with Tools running before a
+  clone-with-customize succeeds. Power it on, wait for Tools to start, then
+  re-run the checks.
+
+**Target VM name already taken (PF-09)**
+: A VM with the generated name already exists in the Templates folder — likely
+  a leftover from a previous failed provision. Delete the stale VM in vCenter,
+  then re-run.
+
+**Warning rows (amber ⚠)** do not block the Provision button; they flag
+potential issues (missing guest credentials, staging port group not found on
+standard vSwitch) that you may want to investigate but are not fatal.
+
+> [!note]
+> If all checks are green but provisioning still fails immediately, an
+> *intermittent* vCenter fault may be in play. Those are not detectable
+> by static checks — the platform has automatic retry-with-backoff for
+> that class of error.
+
+---
+
 ## "My ISO template sat in `provisioning` for an hour, then errored"
 
 An unattended ISO install that never finishes almost always means the

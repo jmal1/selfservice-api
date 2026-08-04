@@ -157,8 +157,8 @@
     {
       "path": "docs/instructor/troubleshooting.md",
       "title": "Troubleshooting",
-      "size": 20713,
-      "sha256": "10f3a61848635cc2d39c8797dc262adcc4a93982174c517c48e4e822ea6fe207",
+      "size": 22845,
+      "sha256": "f0514ad0a09bcb72e9430d5d11f12411427f119f31fb03bad2cee027cb5aeae9",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/actions.md",
@@ -194,8 +194,8 @@
     {
       "path": "internal/api/routes/routes.go",
       "title": "routes.go (Go)",
-      "size": 12332,
-      "sha256": "47303b3f7a64770a73ae209c180e4024fec02187aa5b25c58f5ee31389e14d73",
+      "size": 12395,
+      "sha256": "a56d0ba050cd292c53b6ea881e5b177adb1463c444708577eda4a6d9b89f9fd1",
       "is_markdown": false,
       "from_seed": false
     },
@@ -280,5 +280,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 218684
+  "total_bytes": 220879
 }
