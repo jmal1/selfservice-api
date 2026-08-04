@@ -26,16 +26,6 @@ import (
 	"github.com/jmal1/selfservice-api/internal/database"
 )
 
-// StuckUploadReconcilerConfig configures RunStuckUploadReconciler.
-type StuckUploadReconcilerConfig struct {
-	// Interval is how often the reconciler fires. Zero falls back to 5 minutes.
-	Interval time.Duration
-
-	// StaleThreshold is how long a row must sit in uploading/importing before
-	// it is counted as stuck. Zero falls back to 30 minutes.
-	StaleThreshold time.Duration
-}
-
 // imageUploadsDB is the narrow database interface the stuck-upload reconciler
 // needs. *database.Queries satisfies it structurally via CountStuckImageUploads.
 type imageUploadsDB interface {
@@ -60,41 +50,6 @@ type imageUploadsMetrics interface {
 // compatible with the narrow interfaces without importing them in tests.
 var _ imageUploadsDB = (*database.Queries)(nil)
 var _ imageUploadsMetrics = (*PipelineMetrics)(nil)
-
-// RunStuckUploadReconciler runs the stuck-upload gauge loop. It fires once per
-// cfg.Interval, calling ReconcileStuckImageUploads each tick. The loop returns
-// when ctx is cancelled. Call from the provision-worker as:
-//
-//	go prov.RunStuckUploadReconciler(ctx, cfg)
-func (p *Provisioner) RunStuckUploadReconciler(ctx context.Context, cfg StuckUploadReconcilerConfig) {
-	if cfg.Interval <= 0 {
-		cfg.Interval = 5 * time.Minute
-	}
-	if cfg.StaleThreshold <= 0 {
-		cfg.StaleThreshold = 30 * time.Minute
-	}
-	logger := p.logger
-	if logger == nil {
-		logger = slog.Default()
-	}
-	logger.Info("stuck-upload reconciler started",
-		"interval", cfg.Interval, "stale_threshold", cfg.StaleThreshold)
-
-	ticker := time.NewTicker(cfg.Interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			logger.Info("stuck-upload reconciler stopped")
-			return
-		case <-ticker.C:
-			if _, err := p.ReconcileStuckImageUploads(ctx, cfg.StaleThreshold); err != nil {
-				logger.Error("stuck-upload reconcile failed", "error", err)
-			}
-		}
-	}
-}
 
 // ReconcileStuckImageUploads runs a single pass: counts image_uploads rows
 // stuck in a non-terminal state older than staleThreshold and publishes the

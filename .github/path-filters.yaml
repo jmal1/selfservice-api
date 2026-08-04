@@ -51,6 +51,7 @@ api-gateway:
 
 provision-worker:
   - 'cmd/provision-worker/**'
+  - 'internal/leader/**'
   - 'internal/objectstore/**'
   - 'internal/opnsense/**'
   - 'internal/provisioner/**'
