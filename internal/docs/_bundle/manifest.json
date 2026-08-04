@@ -10,8 +10,8 @@
     {
       "path": "AGENTS.md",
       "title": "AGENTS.md — Crucible AI Authoring Reference",
-      "size": 31959,
-      "sha256": "2ad83fb6c8724e6f2e771ded92ce425adece1858bbdd628fe7de7acf9a41fe7c",
+      "size": 31429,
+      "sha256": "21c3414c1c2a905526d38057772637394eeab89f9a801baa7c2a88f748ebbfbe",
       "is_markdown": true,
       "links_out": [
         "deploy/runner/actions.sh",
@@ -35,32 +35,32 @@
     {
       "path": "deploy/runner/actions.sh",
       "title": "actions.sh (Bash)",
-      "size": 12055,
-      "sha256": "d23f6b2160c261b244c1f978aba9df523dabe496f4d07ab00b8d188b8e4f6135",
+      "size": 11803,
+      "sha256": "1e874ae18995a716354689c553fb47eda3c431ce57564baff56046a41ea2058c",
       "is_markdown": false,
       "from_seed": false
     },
     {
       "path": "docs/ai-prompts/build-workflow.md",
       "title": "Prompt: \"Build me a Crucible workflow\"",
-      "size": 5222,
-      "sha256": "8841c6b85bff2bd178097b4c5c110710882e8b6792b6ea2090f57d370e940f4e",
+      "size": 5153,
+      "sha256": "97e1c0b77f26c97de31ef9f1983c9f9b42447f0d229fe9b7edcd8e331a40b0f0",
       "is_markdown": true,
       "from_seed": true
     },
     {
       "path": "docs/ai/build-workflow-prompt.md",
       "title": "Build-a-Workflow Prompt Template",
-      "size": 3549,
-      "sha256": "f89ae79e48f086dd8153231ed6b8f3d12b35b20926161fce2c5f23456f7e3a09",
+      "size": 3497,
+      "sha256": "60dce876251c3ca2ad41e68610be668b7595109123285408bdfb121563a6639d",
       "is_markdown": true,
       "from_seed": true
     },
     {
       "path": "docs/instructor/actions.md",
       "title": "Building Library Actions",
-      "size": 7090,
-      "sha256": "8e0bcfd5f82788d16a7aac3898c66f8d08c023dbfead9c1cbd7e2c616ce2bc48",
+      "size": 6896,
+      "sha256": "b60b83f10ca4094f12a752cffadd1aa5c10b65d57aea18695990619d21bfefab",
       "is_markdown": true,
       "links_out": [
         "AGENTS.md",
@@ -78,8 +78,8 @@
     {
       "path": "docs/instructor/glossary.md",
       "title": "Glossary",
-      "size": 4928,
-      "sha256": "75fcac64a6c3a6ed3628525da91b7bc2828e887a229a2dfb9ceda7e835ab9b7e",
+      "size": 4885,
+      "sha256": "6e232ee82e02785099f3f16acb97c2bde151b06356058052490ff5c6f3501aae",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/actions.md",
@@ -91,8 +91,8 @@
     {
       "path": "docs/instructor/overview.md",
       "title": "Crucible for Instructors — Overview",
-      "size": 8390,
-      "sha256": "3a6746b3f134946e62dbc328d3488a4fbd789036d9e7d8bd5c0d2d878a91e253",
+      "size": 8212,
+      "sha256": "ccfced2490f4b58bfe4f4dd270fb774c9977d13c1cc3301f740f2a16b0689419",
       "is_markdown": true,
       "links_out": [
         "AGENTS.md",
@@ -113,8 +113,8 @@
     {
       "path": "docs/instructor/playlists.md",
       "title": "Building Playlists",
-      "size": 5886,
-      "sha256": "15ccdae95e1d3aacb3c4fcb4e723618160c31122a2585e8082d2245e940dc0a8",
+      "size": 5720,
+      "sha256": "ba071708e99e64e957826525b5407d08e1d179e3fe13d19a379771b0cdbd5969",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/overview.md",
@@ -127,8 +127,8 @@
     {
       "path": "docs/instructor/runner-environment.md",
       "title": "Runner Environment",
-      "size": 9072,
-      "sha256": "513b977292f5c56cd53cc0ed37f02e0bcd587dccab0a06ba91d44ecb01992909",
+      "size": 8854,
+      "sha256": "a6a689d3e4abc5c9639c0c13512af24d0d057f5c0368b9424d34c0421435e46b",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/overview.md",
@@ -141,8 +141,8 @@
     {
       "path": "docs/instructor/templates.md",
       "title": "Building a Template",
-      "size": 21375,
-      "sha256": "d4c687324bc8777fcdba5ca62c7af81a8cac326acd65a038303c32f714d84b6f",
+      "size": 20915,
+      "sha256": "a7771f2341c1665a3b10d774dcb700d41a09a039e468b227761154c2536991f1",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/glossary.md",
@@ -157,8 +157,8 @@
     {
       "path": "docs/instructor/troubleshooting.md",
       "title": "Troubleshooting",
-      "size": 23412,
-      "sha256": "ac2fc45a9eb33f0b40a39475e9e7eca4b1cb5fd287896630fa9825b6820db76b",
+      "size": 22845,
+      "sha256": "f0514ad0a09bcb72e9430d5d11f12411427f119f31fb03bad2cee027cb5aeae9",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/actions.md",
@@ -175,8 +175,8 @@
     {
       "path": "docs/instructor/workflows.md",
       "title": "Building Workflows",
-      "size": 7981,
-      "sha256": "c6344a5a9146db39682eed32f4ad97e33671c8383f429ffb652a46469106adef",
+      "size": 7771,
+      "sha256": "6db8cf5dedab6687262f6abfc15e3a8f3e0cd6b35ff52a0bab9db7ee43f59863",
       "is_markdown": true,
       "links_out": [
         "AGENTS.md",
@@ -194,91 +194,91 @@
     {
       "path": "internal/api/routes/routes.go",
       "title": "routes.go (Go)",
-      "size": 12715,
-      "sha256": "9ca46abe41416a6104f21b8a85b576d262053ec020936aea1011aad32297dbfd",
+      "size": 12395,
+      "sha256": "a56d0ba050cd292c53b6ea881e5b177adb1463c444708577eda4a6d9b89f9fd1",
       "is_markdown": false,
       "from_seed": false
     },
     {
       "path": "internal/database/migrations/000012_assessment_engine.up.sql",
       "title": "000012_assessment_engine.up.sql (SQL)",
-      "size": 8449,
-      "sha256": "fc10753a38a91dcc41abd61d3f79e77bc353c92e9dc71008305df7d21b467d3b",
+      "size": 8269,
+      "sha256": "2a1b61060bf622e073e870525a8adf3f39be92de115bd728a90614fc08e868fb",
       "is_markdown": false,
       "from_seed": false
     },
     {
       "path": "internal/database/migrations/000014_action_library.up.sql",
       "title": "000014_action_library.up.sql (SQL)",
-      "size": 882,
-      "sha256": "b335fef2f121315da13a9b2d44f31ff173a0b3f4256a6de17466870ff3b04387",
+      "size": 867,
+      "sha256": "84dff0e666e05acaba5ef52d8a3932d0297d5879a0631dbb8f117258e4c6e0a7",
       "is_markdown": false,
       "from_seed": false
     },
     {
       "path": "internal/database/migrations/000015_action_platforms.up.sql",
       "title": "000015_action_platforms.up.sql (SQL)",
-      "size": 995,
-      "sha256": "cfa990e1fdeb358f281e5e4480c26c4c7375f878891382aa3d60c666de5bee60",
+      "size": 985,
+      "sha256": "9d1e9d703cef0a2bf3063f42edba30c67f3b91d39848f1462dac4f9cea239e49",
       "is_markdown": false,
       "from_seed": false
     },
     {
       "path": "internal/engine/engine.go",
       "title": "engine.go (Go)",
-      "size": 18079,
-      "sha256": "4b62e2f27743e4d88098035e012b2e92229d258b3cb514014db1d75a04331f45",
+      "size": 17572,
+      "sha256": "04c6ed3a41ccee3aeda5608c415a9079d2f3ea8f22b98465ee1288bae75ba889",
       "is_markdown": false,
       "from_seed": false
     },
     {
       "path": "internal/models/workflow_models.go",
       "title": "workflow_models.go (Go)",
-      "size": 10715,
-      "sha256": "dc6f3614bd2e4a51e3abf796b111e7472ef03bbc61398819118ffdae482a07c2",
+      "size": 10496,
+      "sha256": "ea40b706c76fd2e700c82979e728c6b37585355357a442bd88884ada0c8e1fdb",
       "is_markdown": false,
       "from_seed": false
     },
     {
       "path": "internal/runner/executor.go",
       "title": "executor.go (Go)",
-      "size": 8828,
-      "sha256": "ea1df1404ccb81bb96c1d166c6693c6161d2b53ac9b47fa45de0c6a74ecf6825",
+      "size": 8524,
+      "sha256": "05481a0197e2171dcb64e5195a6d11b0908c6db3ccc67285052cb5078426497d",
       "is_markdown": false,
       "from_seed": false
     },
     {
       "path": "internal/runnertools/tools.txt",
       "title": "tools.txt (Text)",
-      "size": 3160,
-      "sha256": "ef32e78f982d3894872c5f759709aec6012b3412c24ae5912ebbc1e4398444b9",
+      "size": 3082,
+      "sha256": "523d6c7149865569c46c7e81391091a55627c1e4740096d88c6f3d998c8ccf78",
       "is_markdown": false,
       "from_seed": false
     },
     {
       "path": "internal/scriptvalidator/detect.go",
       "title": "detect.go (Go)",
-      "size": 3156,
-      "sha256": "8312d922c79423931aab825f283f98e0dcb2a7b81b60f6462e696cbf0155bc88",
+      "size": 3077,
+      "sha256": "0cfbe6f95665139499635b7c987e04f7283f4a32f3e6749de8f935c1dacc3ccc",
       "is_markdown": false,
       "from_seed": false
     },
     {
       "path": "internal/scriptvalidator/validator.go",
       "title": "validator.go (Go)",
-      "size": 11939,
-      "sha256": "b7aa8259cd074c4ad74ed360336f58789ff1f3281cf088f31556bb818eec6141",
+      "size": 11603,
+      "sha256": "a4d4b1e7d4092032c13c53ccf2dd56ab507473e9213a31d65f778e01a9668ed0",
       "is_markdown": false,
       "from_seed": false
     },
     {
       "path": "internal/scriptvalidator/wrap.go",
       "title": "wrap.go (Go)",
-      "size": 7768,
-      "sha256": "057b2ae97dd170b0abaa54111c0b7efb7d7809ecc3b62ecce6d72318535070f6",
+      "size": 7558,
+      "sha256": "1fd46cebe8b10a3edcf02d637d0dc20b4c0a10f9dff892d3f7e26afa8c42b867",
       "is_markdown": false,
       "from_seed": false
     }
   ],
-  "total_bytes": 227605
+  "total_bytes": 222408
 }
