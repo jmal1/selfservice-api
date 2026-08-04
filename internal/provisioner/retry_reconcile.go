@@ -8,13 +8,12 @@
 //
 // Design mirrors image_reconcile.go exactly: narrow interfaces, a pure
 // reconcileRetryPending function that tests can call without a real DB or
-// Pushgateway, and a RunRetryPendingReconciler loop that the worker starts.
+// Pushgateway, and ReconcileRetryPending that the worker calls from its select loop.
 package provisioner
 
 import (
 	"context"
 	"log/slog"
-	"time"
 
 	"github.com/jmal1/selfservice-api/internal/database"
 )
@@ -59,27 +58,4 @@ func (p *Provisioner) ReconcileRetryPending(ctx context.Context) error {
 		return nil
 	}
 	return reconcileRetryPending(ctx, p.db, p.pipeline, p.logger)
-}
-
-// RunRetryPendingReconciler runs ReconcileRetryPending on a ticker until ctx
-// is cancelled.  It is started as a goroutine by the worker when a
-// Pushgateway URL is configured.
-func (p *Provisioner) RunRetryPendingReconciler(ctx context.Context, interval time.Duration) {
-	if interval <= 0 {
-		interval = 30 * time.Second
-	}
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			if err := p.ReconcileRetryPending(ctx); err != nil {
-				if p.logger != nil {
-					p.logger.Warn("retry-pending reconcile failed", "error", err)
-				}
-			}
-		}
-	}
 }

@@ -18,14 +18,31 @@ import (
 var migrationsFS embed.FS
 
 // Connect creates a connection pool to PostgreSQL.
+//
+// Pool sizing: the default MaxConns (20) is intentionally conservative so that
+// a single process does not exhaust the server. Tune it per deployment via
+// DB_MAX_CONNS. The platform-wide ceiling with the current configuration is:
+//   api-gateway (20) + crucible-engine (20) + 4 × workers (5 + 1 leader conn) = 64
+// against max_connections = 100, leaving ~36 headroom for admin tools and
+// migrations. Adjust this comment when the fleet composition changes.
 func Connect(ctx context.Context, cfg config.DatabaseConfig) (*pgxpool.Pool, error) {
 	poolCfg, err := pgxpool.ParseConfig(cfg.DSN())
 	if err != nil {
 		return nil, fmt.Errorf("parse database config: %w", err)
 	}
 
-	poolCfg.MaxConns = 20
+	// Default pool size. Override per-process via DB_MAX_CONNS (cfg.MaxConns).
+	const defaultMaxConns = 20
+	maxConns := int32(defaultMaxConns)
+	if cfg.MaxConns > 0 {
+		maxConns = int32(cfg.MaxConns)
+	}
+	poolCfg.MaxConns = maxConns
 	poolCfg.MinConns = 2
+	if maxConns < 4 {
+		// Avoid keeping more idle connections than the pool can hold.
+		poolCfg.MinConns = 1
+	}
 	poolCfg.MaxConnLifetime = 30 * time.Minute
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)

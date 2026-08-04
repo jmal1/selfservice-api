@@ -56,7 +56,7 @@ func poisonClient(t *testing.T) *synthetic.Client {
 func TestElevated_UsesConfiguredClientNotRunners(t *testing.T) {
 	good := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
 		"/api/v1/admin/images":       func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`[]`)) },
-		"/api/v1/admin/vcenter/isos": func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`[]`)) },
+		"/api/v1/admin/vcenter/isos": func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{"isos":[]}`)) },
 		"/api/v1/admin/templates/00000000-0000-0000-0000-000000000000/wizard-state": func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNotFound)
 		},
@@ -142,11 +142,18 @@ func TestImageListContract_FailsOn403(t *testing.T) {
 }
 
 func TestISOCatalogReachable_Happy(t *testing.T) {
-	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
-		"/api/v1/admin/vcenter/isos": func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{"files":[]}`)) },
-	})
-	if _, err := elevatedFor(t, srv.URL, "iso_catalog_reachable").Run(context.Background(), nil); err != nil {
-		t.Fatalf("err: %v", err)
+	// Empty isos list: no entries to validate source field on, so this passes.
+	for _, body := range []string{
+		`{"isos":[]}`,
+		`{"isos":null}`,
+		`{"isos":[{"source":"datastore","name":"kali.iso","path":"[NAS] ISOs/kali.iso"}]}`,
+	} {
+		srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
+			"/api/v1/admin/vcenter/isos": func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(body)) },
+		})
+		if _, err := elevatedFor(t, srv.URL, "iso_catalog_reachable").Run(context.Background(), nil); err != nil {
+			t.Errorf("body %s: %v", body, err)
+		}
 	}
 }
 
@@ -172,6 +179,25 @@ func TestISOCatalogReachable_DistinguishesFailureModes(t *testing.T) {
 		if !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("status %d: error %q should contain %q", tc.code, err, tc.want)
 		}
+	}
+}
+
+// TestISOCatalogReachable_FailsWhenSourceFieldMissing verifies that the check
+// catches a regression where the merged ISO list drops the 'source' field from
+// an entry. Without 'source', the wizard cannot distinguish uploaded from
+// datastore ISOs.
+func TestISOCatalogReachable_FailsWhenSourceFieldMissing(t *testing.T) {
+	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
+		"/api/v1/admin/vcenter/isos": func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`{"isos":[{"name":"kali.iso","path":"[NAS] ISOs/kali.iso"}]}`))
+		},
+	})
+	_, err := elevatedFor(t, srv.URL, "iso_catalog_reachable").Run(context.Background(), nil)
+	if err == nil {
+		t.Fatal("expected failure when 'source' field is absent from an ISO entry")
+	}
+	if !strings.Contains(err.Error(), "source") {
+		t.Errorf("error %q should mention the missing 'source' field", err)
 	}
 }
 

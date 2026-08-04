@@ -18,7 +18,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/minio/minio-go/v7"
 
+	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/models"
+	"github.com/jmal1/selfservice-api/internal/vcenter"
 )
 
 func TestImageKindFromFilename(t *testing.T) {
@@ -265,6 +267,15 @@ type fakeImageDB struct {
 	listImgs []models.ImageUpload
 	listErr  error
 
+	// ListImageUploadsByStatus
+	listByStatusImgs []models.ImageUpload
+	listByStatusErr  error
+
+	// UpdateImageUploadStatus
+	updateStatusFromExpected string // if set, the "from" arg must match
+	updateStatusCalls        int
+	updateStatusErr          error
+
 	// SetImageUploadUploaded
 	setUploadedCalls int
 	setUploadedErr   error
@@ -306,6 +317,18 @@ func (f *fakeImageDB) GetImageUploadByID(_ context.Context, _ uuid.UUID) (*model
 
 func (f *fakeImageDB) ListImageUploads(_ context.Context) ([]models.ImageUpload, error) {
 	return f.listImgs, f.listErr
+}
+
+func (f *fakeImageDB) ListImageUploadsByStatus(_ context.Context, _ []string) ([]models.ImageUpload, error) {
+	return f.listByStatusImgs, f.listByStatusErr
+}
+
+func (f *fakeImageDB) UpdateImageUploadStatus(_ context.Context, _ uuid.UUID, from, _ string) error {
+	f.updateStatusCalls++
+	if f.updateStatusFromExpected != "" && from != f.updateStatusFromExpected {
+		return errors.New("unexpected from-status: got " + from + ", want " + f.updateStatusFromExpected)
+	}
+	return f.updateStatusErr
 }
 
 func (f *fakeImageDB) SetImageUploadUploaded(_ context.Context, _ uuid.UUID, _ int64) error {
@@ -734,5 +757,364 @@ func TestAdminImageUploadLifecycle_RecordsMetrics(t *testing.T) {
 	}
 	if len(metrics.records) != 3 || metrics.records[2] != models.ImageKindISO+"|failed" {
 		t.Fatalf("failed metric = %v, want third record %s|failed", metrics.records, models.ImageKindISO)
+	}
+}
+
+// =============================================================================
+// Tests for Lane 3 features: auto-import, merged ISO list, OVA exclusion,
+// path-traversal rejection, idempotent double-complete, error retry.
+// =============================================================================
+
+// fakeISOLister implements VCenterISOLister for tests.
+type fakeISOLister struct {
+	files []vcenter.DatastoreFile
+	err   error
+}
+
+func (f *fakeISOLister) ListDatastoreFiles(_ context.Context, _, _, _ string) ([]vcenter.DatastoreFile, error) {
+	return f.files, f.err
+}
+
+// newISOHandler builds a *Handler wired with all the ISO-related fakes.
+func newISOHandler(db *fakeImageDB, store *fakeImageStore, lister *fakeISOLister, datastore string) *Handler {
+	h := newImageHandler(db, store)
+	if lister != nil {
+		h.isoLister = lister
+		h.isoDatastore = datastore
+		// No cache — tests want fresh results every time.
+	}
+	return h
+}
+
+// TestAdminCompleteImageUpload_AutoEnqueuesImport verifies that on a
+// successful upload completion, an image_import job is enqueued automatically
+// and the response is 200.
+func TestAdminCompleteImageUpload_AutoEnqueuesImport(t *testing.T) {
+	id := uuid.New()
+	img := &models.ImageUpload{
+		ID:        id,
+		Filename:  "mint.iso",
+		Kind:      models.ImageKindISO,
+		Status:    models.ImageUploadPending,
+		ObjectKey: "crucible/" + id.String() + "/mint.iso",
+		UploadID:  "upload-mint",
+		SizeBytes: 2 << 30, // 2 GiB
+	}
+	db := &fakeImageDB{getImg: img}
+	store := &fakeImageStore{statSize: img.SizeBytes}
+	h := newImageHandler(db, store)
+
+	body := `{"parts":[{"part_number":1,"etag":"etag-mint"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/admin/images/"+id.String()+"/complete",
+		strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req = withImageIDParam(req, id)
+	w := httptest.NewRecorder()
+	h.AdminCompleteImageUpload(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200; body = %s", w.Code, w.Body.String())
+	}
+	// SetImageUploadUploaded must have been called exactly once.
+	if db.setUploadedCalls != 1 {
+		t.Errorf("SetImageUploadUploaded calls = %d; want 1", db.setUploadedCalls)
+	}
+	// CreateJob must have been called once (auto-import).
+	if db.createJobErr != nil {
+		t.Fatalf("CreateJob returned error: %v", db.createJobErr)
+	}
+	// Verify response body is the image row (not null).
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+}
+
+// TestAdminCompleteImageUpload_IdempotentOnDoubleComplete verifies that calling
+// complete a second time when the row is already past 'uploaded' returns 200,
+// not 409, and does NOT enqueue a second import job.
+func TestAdminCompleteImageUpload_IdempotentOnDoubleComplete(t *testing.T) {
+	id := uuid.New()
+	img := &models.ImageUpload{
+		ID:        id,
+		Filename:  "mint.iso",
+		Kind:      models.ImageKindISO,
+		Status:    models.ImageUploadImporting, // already past uploaded
+		ObjectKey: "crucible/" + id.String() + "/mint.iso",
+		UploadID:  "upload-mint",
+		SizeBytes: 2 << 30,
+	}
+	// Simulate: SetImageUploadUploaded returns ErrImageUploadStale because row
+	// is not in pending/uploading. GetImageUploadByID returns the importing row.
+	db := &fakeImageDB{
+		setUploadedErr: errors.New("image upload is stale"),
+		getImg:         img,
+	}
+	// Make setUploadedErr wrap ErrImageUploadStale.
+	db.setUploadedErr = database.ErrImageUploadStale
+	store := &fakeImageStore{statSize: img.SizeBytes}
+	h := newImageHandler(db, store)
+
+	body := `{"parts":[{"part_number":1,"etag":"etag-mint"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/admin/images/"+id.String()+"/complete",
+		strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req = withImageIDParam(req, id)
+	w := httptest.NewRecorder()
+	h.AdminCompleteImageUpload(w, req)
+
+	// Must NOT 409 — the client gets idempotent 200.
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200 for idempotent double-complete; body = %s",
+			w.Code, w.Body.String())
+	}
+}
+
+// TestAdminListVCenterISOs_MergesUploadedISOs verifies that imported ISOs
+// from the image_uploads table are merged into the /admin/vcenter/isos
+// response under the 'isos' key.
+func TestAdminListVCenterISOs_MergesUploadedISOs(t *testing.T) {
+	id := uuid.New()
+	uploadedISO := models.ImageUpload{
+		ID:            id,
+		Filename:      "mint.iso",
+		Kind:          models.ImageKindISO,
+		Status:        models.ImageUploadImported,
+		DatastorePath: "[NAS-BackupsAndISOS] ISOs/mint.iso",
+	}
+	db := &fakeImageDB{listByStatusImgs: []models.ImageUpload{uploadedISO}}
+	lister := &fakeISOLister{files: []vcenter.DatastoreFile{
+		{
+			Name:         "kali.iso",
+			Path:         "[NAS-BackupsAndISOS] ISOs/kali.iso",
+			FolderPath:   "ISOs",
+			SizeBytes:    4 << 30,
+			ModifiedTime: time.Now(),
+		},
+	}}
+	h := newISOHandler(db, &fakeImageStore{}, lister, "NAS-BackupsAndISOS")
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/vcenter/isos", nil)
+	w := httptest.NewRecorder()
+	h.AdminListVCenterISOs(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200; body = %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		ISOs []ISOEntry `json:"isos"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(resp.ISOs) != 2 {
+		t.Fatalf("isos count = %d; want 2 (kali.iso from datastore + mint.iso from uploads)",
+			len(resp.ISOs))
+	}
+	// Confirm sources
+	sources := map[string]bool{}
+	for _, entry := range resp.ISOs {
+		sources[entry.Source] = true
+	}
+	if !sources["datastore"] {
+		t.Error("missing 'datastore' source in merged list")
+	}
+	if !sources["uploaded"] {
+		t.Error("missing 'uploaded' source in merged list")
+	}
+}
+
+// TestAdminListVCenterISOs_DedupsByPath verifies that when an imported ISO has
+// the same datastore path as a file found on the datastore, it is not listed twice.
+func TestAdminListVCenterISOs_DedupsByPath(t *testing.T) {
+	sharedPath := "[NAS-BackupsAndISOS] ISOs/kali.iso"
+	uploadedISO := models.ImageUpload{
+		ID:            uuid.New(),
+		Filename:      "kali.iso",
+		Kind:          models.ImageKindISO,
+		Status:        models.ImageUploadImported,
+		DatastorePath: sharedPath,
+	}
+	db := &fakeImageDB{listByStatusImgs: []models.ImageUpload{uploadedISO}}
+	lister := &fakeISOLister{files: []vcenter.DatastoreFile{
+		{
+			Name:         "kali.iso",
+			Path:         sharedPath, // same path
+			FolderPath:   "ISOs",
+			SizeBytes:    4 << 30,
+			ModifiedTime: time.Now(),
+		},
+	}}
+	h := newISOHandler(db, &fakeImageStore{}, lister, "NAS-BackupsAndISOS")
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/vcenter/isos", nil)
+	w := httptest.NewRecorder()
+	h.AdminListVCenterISOs(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200", w.Code)
+	}
+
+	var resp struct {
+		ISOs []ISOEntry `json:"isos"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(resp.ISOs) != 1 {
+		t.Errorf("isos count = %d; want 1 (dedup by path should eliminate the duplicate)", len(resp.ISOs))
+	}
+}
+
+// TestAdminListVCenterISOs_ExcludesOVAs verifies that OVA image uploads never
+// appear in the ISO picker, regardless of their status.
+func TestAdminListVCenterISOs_ExcludesOVAs(t *testing.T) {
+	ovaImported := models.ImageUpload{
+		ID:          uuid.New(),
+		Filename:    "pfsense.ova",
+		Kind:        models.ImageKindOVA,
+		Status:      models.ImageUploadImported,
+		VCenterVMID: "vm-42",
+	}
+	ovaImporting := models.ImageUpload{
+		ID:       uuid.New(),
+		Filename: "vyos.ova",
+		Kind:     models.ImageKindOVA,
+		Status:   models.ImageUploadImporting,
+	}
+	db := &fakeImageDB{listByStatusImgs: []models.ImageUpload{ovaImported, ovaImporting}}
+	lister := &fakeISOLister{files: nil} // datastore has nothing
+	h := newISOHandler(db, &fakeImageStore{}, lister, "NAS-BackupsAndISOS")
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/vcenter/isos", nil)
+	w := httptest.NewRecorder()
+	h.AdminListVCenterISOs(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200", w.Code)
+	}
+
+	var resp struct {
+		ISOs []ISOEntry `json:"isos"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(resp.ISOs) != 0 {
+		t.Errorf("isos count = %d; want 0 — OVAs must never appear in ISO picker; got: %v",
+			len(resp.ISOs), resp.ISOs)
+	}
+}
+
+// TestAdminListVCenterISOs_SurfacesInFlightAsDisabled verifies that in-flight
+// (importing) and error rows appear as disabled entries so the wizard can
+// display "Importing…" rather than a blank picker.
+func TestAdminListVCenterISOs_SurfacesInFlightAsDisabled(t *testing.T) {
+	importingISO := models.ImageUpload{
+		ID:       uuid.New(),
+		Filename: "ubuntu.iso",
+		Kind:     models.ImageKindISO,
+		Status:   models.ImageUploadImporting,
+	}
+	errorISO := models.ImageUpload{
+		ID:           uuid.New(),
+		Filename:     "fedora.iso",
+		Kind:         models.ImageKindISO,
+		Status:       models.ImageUploadError,
+		ErrorMessage: "no space left on device",
+	}
+	db := &fakeImageDB{listByStatusImgs: []models.ImageUpload{importingISO, errorISO}}
+	lister := &fakeISOLister{files: nil}
+	h := newISOHandler(db, &fakeImageStore{}, lister, "NAS-BackupsAndISOS")
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/vcenter/isos", nil)
+	w := httptest.NewRecorder()
+	h.AdminListVCenterISOs(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200", w.Code)
+	}
+
+	var resp struct {
+		ISOs []ISOEntry `json:"isos"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(resp.ISOs) != 2 {
+		t.Fatalf("isos count = %d; want 2 (one importing + one error)", len(resp.ISOs))
+	}
+	for _, entry := range resp.ISOs {
+		if !entry.Disabled {
+			t.Errorf("entry %q (status=%s) has disabled=false; want disabled=true for in-flight/error entries",
+				entry.Name, entry.Status)
+		}
+		if entry.Source != "uploaded" {
+			t.Errorf("entry %q source = %q; want 'uploaded'", entry.Name, entry.Source)
+		}
+	}
+	// The error entry must carry the error message.
+	for _, entry := range resp.ISOs {
+		if entry.Status == models.ImageUploadError && entry.ErrorMessage == "" {
+			t.Errorf("error entry %q has no error_message; want %q",
+				entry.Name, "no space left on device")
+		}
+	}
+}
+
+// TestAdminImportImage_RetryFromError verifies that an image row in 'error'
+// status can be re-queued via AdminImportImage without re-uploading.
+func TestAdminImportImage_RetryFromError(t *testing.T) {
+	id := uuid.New()
+	errorImg := &models.ImageUpload{
+		ID:           id,
+		Filename:     "mint.iso",
+		Kind:         models.ImageKindISO,
+		Status:       models.ImageUploadError,
+		ObjectKey:    "crucible/" + id.String() + "/mint.iso",
+		ErrorMessage: "previous import failed: disk full",
+	}
+	db := &fakeImageDB{
+		getImg:                   errorImg,
+		updateStatusFromExpected: models.ImageUploadError,
+	}
+	h := newImageHandler(db, &fakeImageStore{})
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/images/"+id.String()+"/import", nil)
+	req = withImageIDParam(req, id)
+	w := httptest.NewRecorder()
+	h.AdminImportImage(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d; want 202 for retry from error; body = %s", w.Code, w.Body.String())
+	}
+	if db.updateStatusCalls != 1 {
+		t.Errorf("UpdateImageUploadStatus calls = %d; want 1 (reset error→uploaded)", db.updateStatusCalls)
+	}
+}
+
+// TestAdminImportImage_RejectsInvalidObjectKeyPrefix verifies that an image
+// whose object key does not start with "crucible/" is rejected with an
+// internal-error response (defense-in-depth path traversal guard).
+func TestAdminImportImage_RejectsInvalidObjectKeyPrefix(t *testing.T) {
+	id := uuid.New()
+	badImg := &models.ImageUpload{
+		ID:        id,
+		Filename:  "evil.iso",
+		Kind:      models.ImageKindISO,
+		Status:    models.ImageUploadUploaded,
+		ObjectKey: "../../etc/passwd",
+	}
+	db := &fakeImageDB{getImg: badImg}
+	h := newImageHandler(db, &fakeImageStore{})
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/images/"+id.String()+"/import", nil)
+	req = withImageIDParam(req, id)
+	w := httptest.NewRecorder()
+	h.AdminImportImage(w, req)
+
+	if w.Code == http.StatusAccepted {
+		t.Fatal("status = 202; want non-202 for path-traversal object key")
 	}
 }

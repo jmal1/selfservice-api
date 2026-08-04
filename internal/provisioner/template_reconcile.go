@@ -35,36 +35,6 @@ type templateReconcileMetrics interface {
 var _ templateReconcileDB = (*database.Queries)(nil)
 var _ templateReconcileMetrics = (*PipelineMetrics)(nil)
 
-// RunTemplateReconciler runs the template metrics loop until ctx is cancelled.
-func (p *Provisioner) RunTemplateReconciler(ctx context.Context, cfg TemplateReconcilerConfig) {
-	if cfg.Interval <= 0 {
-		cfg.Interval = 5 * time.Minute
-	}
-	if cfg.StaleThreshold <= 0 {
-		cfg.StaleThreshold = 30 * time.Minute
-	}
-	logger := p.logger
-	if logger == nil {
-		logger = slog.Default()
-	}
-	logger.Info("template reconciler started", "interval", cfg.Interval, "stale_threshold", cfg.StaleThreshold)
-
-	ticker := time.NewTicker(cfg.Interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			logger.Info("template reconciler stopped")
-			return
-		case <-ticker.C:
-			if _, err := p.ReconcileTemplateMetrics(ctx, cfg); err != nil {
-				logger.Error("template reconcile failed", "error", err)
-			}
-		}
-	}
-}
-
 // ReconcileTemplateMetrics performs one count + publish pass.
 func (p *Provisioner) ReconcileTemplateMetrics(ctx context.Context, cfg TemplateReconcilerConfig) (TemplateReconcileCounts, error) {
 	var m templateReconcileMetrics

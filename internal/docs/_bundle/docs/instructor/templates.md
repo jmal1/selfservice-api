@@ -78,6 +78,28 @@ on the template's **unattended install mode**:
 | `cloudinit_cidata` (Ubuntu Server) | Attaches a generated cloud-init seed CD and runs a **hands-off** autoinstall. No console input required. | 20–45 min |
 | `windows_autounattend` | Attaches a generated `autounattend.xml` seed CD and runs Windows Setup unattended. | 30–60 min |
 
+#### Getting an ISO into the picker
+
+Before you can select an ISO in the wizard, it must be **uploaded** through
+**Admin → Images → Upload**. After the upload completes, an import job is
+enqueued automatically — you do not need to take any further action. The ISO
+will appear in the wizard picker with the status `Importing…` until the import
+finishes, then it will become selectable.
+
+If the import fails (shown in the image list as an error with a message), click
+**Retry import** to re-run the import without re-uploading the file.
+
+> [!note]
+> OVAs are handled differently — they are imported into vCenter's Templates
+> folder as a ready-to-clone VM and are **not** available as ISO install media.
+> Use the `clone_vcenter` template source type to build from an OVA-derived VM.
+
+> [!warning]
+> The "ISO install" picker may show previously-uploaded ISOs that are still
+> importing (`Importing…`, greyed-out). These are not yet usable; wait for the
+> import to finish or check the image list for errors. If the picker is empty,
+> link: **Admin → Images** to upload an ISO first.
+
 > [!note]
 > **An unattended install finishes when the VM powers itself off.**
 > The generated config ends with `shutdown: poweroff`, and the worker waits
