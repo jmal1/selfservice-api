@@ -63,35 +63,6 @@ type l1TrustValidationMetrics interface {
 var _ l1TrustValidationDB = (*database.Queries)(nil)
 var _ l1TrustValidationMetrics = (*PipelineMetrics)(nil)
 
-// RunL1TrustValidationReconciler runs ReconcileL1TrustValidation on a ticker
-// until ctx is cancelled. Started as a goroutine by the worker when L1
-// validation is enabled (WORKER_L1_VALIDATION_ENABLED=true).
-func (p *Provisioner) RunL1TrustValidationReconciler(ctx context.Context, cfg L1TrustValidationReconcilerConfig) {
-	if cfg.Interval <= 0 {
-		cfg.Interval = 168 * time.Hour // weekly
-	}
-	logger := p.logger
-	if logger == nil {
-		logger = slog.Default()
-	}
-	logger.Info("l1 trust validation reconciler started", "interval", cfg.Interval)
-
-	ticker := time.NewTicker(cfg.Interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			logger.Info("l1 trust validation reconciler stopped")
-			return
-		case <-ticker.C:
-			if _, err := p.ReconcileL1TrustValidation(ctx, cfg); err != nil {
-				logger.Error("l1 trust validation reconcile failed", "error", err)
-			}
-		}
-	}
-}
-
 // ReconcileL1TrustValidation is the Provisioner-bound entry point. Production
 // callers (cmd/provision-worker) invoke this from their select loop.
 func (p *Provisioner) ReconcileL1TrustValidation(ctx context.Context, cfg L1TrustValidationReconcilerConfig) (L1TrustValidationCounts, error) {
