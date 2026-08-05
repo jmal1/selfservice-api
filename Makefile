@@ -16,6 +16,7 @@ WIKI_SEEDS    := \
 	docs/instructor/playlists.md \
 	AGENTS.md \
 	docs/ai-prompts/build-workflow.md \
+	docs/ai-prompts/create-a-template.md \
 	docs/ai/build-workflow-prompt.md
 WIKI_OUT      := internal/docs/_bundle
 

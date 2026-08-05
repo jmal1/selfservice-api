@@ -48,12 +48,169 @@ the page.
 
 ## Step 1 — Draft
 
-Go to **Admin → Templates → New**. Fill in:
+> [!tip] New here? Read this whole section before you touch the form.
+> It tells you **exactly what to type in every box**. You do not need to
+> understand VMware to build a template — just follow the recipe for your OS.
 
-- **Name** — human-friendly, will be shown to students
-- **OS type** — `ubuntu`, `windows`, `kali`, etc. (drives the generalize behavior)
-- **Source** — clone from an existing Crucible template, or paste a vCenter VM moref
-- **Staging network** — defaults to `PG-VM-Lab` (the VLAN 30 port group on every host); only change if you know why
+Go to **Admin → Templates → New**. The form has four boxes-worth of fields:
+**Identity**, **Source**, **Hardware**, and **Guest credentials**. The tables
+below say what to put in each. When in doubt, copy the recipe.
+
+### Words you'll see (quick glossary)
+
+- **Template** — a finished, frozen VM image. Every student pod is a fresh copy
+  ("clone") of a template.
+- **ISO** — the installer disc file for an operating system (what you'd burn to
+  a USB stick to install Windows or Ubuntu). Ends in `.iso`.
+- **Provision** — the wizard builds the working VM you'll set up.
+- **Generalize** — the wizard cleans the VM so every student copy is unique.
+- **Unattended install** — the OS installs itself with no clicking, using
+  answers you fill in here.
+
+### Quick-start recipes (copy these)
+
+Pick the row that matches what you're building and use exactly those values.
+Anything not listed, **leave blank** — the wizard fills in sensible defaults.
+
+| I want to build… | Source type | ISO install mode | Username | Password | Everything else |
+|------------------|-------------|------------------|----------|----------|-----------------|
+| A copy of an existing lab template (most common) | **Clone an existing Crucible template** | — | leave blank | leave blank | leave blank |
+| Ubuntu Server from scratch | **ISO install** | `cloudinit_cidata` | `student` | `Changeme123!` | leave blank |
+| Kali or Debian from scratch | **ISO install** | `debian_preseed` | `student` | `Changeme123!` | leave blank |
+| Windows from scratch | **ISO install** | `windows_autounattend` | `Student` | `Changeme123!` | leave blank |
+| A desktop OS I want to click through myself | **ISO install** | `manual` | leave blank | leave blank | leave blank |
+
+> [!important] The **standard build password** for this lab is `Changeme123!`.
+> Use it everywhere the wizard asks you to make up a password, unless your
+> teacher tells you otherwise. See
+> [The standard build login](#the-standard-build-login-studentchangeme123) below
+> for what this password is and is *not*.
+
+### Field reference — Identity
+
+| Field | What to type | Default | Why it matters |
+|-------|--------------|---------|----------------|
+| **Template name** *(required)* | A friendly name students will see, e.g. `Ubuntu 24.04 — Web Security` | — | This is the label in the catalog. Make it clear. |
+| **OS family** *(required)* | `Linux` or `Windows` | `Linux` | Controls how the wizard cleans the image (cloud-init vs. sysprep). Pick the one that matches your ISO/source. |
+| **Staging network** | Leave as `PG-VM-Lab` | `PG-VM-Lab` | The temporary network the build VM uses. Only change it if a teacher tells you to. |
+| **Description** | One or two sentences on what's inside | — | Shown to students. Optional but kind. |
+| **Icon URL** | A link to a logo image, or leave blank | — | Cosmetic only. |
+
+### Field reference — Source
+
+**Source type** tells the wizard where the VM comes from. Pick one:
+
+| Source type | Choose this when… | What goes in the box below |
+|-------------|-------------------|----------------------------|
+| **Clone an existing Crucible template** | You want to start from a template that already works (fastest, safest) | Pick a template from the dropdown |
+| **Clone an existing vCenter VM** | A teacher/admin points you at a specific VM or an imported OVA | Pick the VM from the dropdown |
+| **ISO install** | You're installing an OS from scratch off an installer disc | Pick your `.iso` from the dropdown |
+
+> [!note] Don't see your ISO in the list?
+> Upload it on the **Images** page and wait for it to finish importing, then
+> come back — it'll appear under "Uploaded & imported ISOs". ISOs already on the
+> server appear under "ISOs already on vCenter datastore". The value looks like
+> `[NAS-BackupsAndISOS] ISOs/ubuntu-24.04.iso` — you don't type that, you just
+> pick it.
+
+### Field reference — Hardware
+
+Starting size for the build VM. Students can bump CPU/RAM later within their quota.
+
+| Field | Safe starting value | Notes |
+|-------|--------------------|-------|
+| **vCPUs** | `2` | Range 1–16. |
+| **RAM (MB)** | `4096` (= 4 GB) | Minimum 512. Windows wants at least `4096`. |
+| **Disk (GB)** | `40` | Minimum 10. Give Windows `60`+. A clone keeps this size. |
+
+### Field reference — Guest credentials (bottom of the form)
+
+These are the **username and password the wizard uses to log in and clean the
+VM** during Generalize.
+
+| Field | What to type | If you leave it blank |
+|-------|--------------|-----------------------|
+| **Default username** | The account you'll log in as. For a **Linux** template this **must be** `student`. For Windows, `Student`. | For "Clone an existing Crucible template", it's copied from the source template. For an ISO build, the account you created during install is used. |
+| **Default password** | The standard build password `Changeme123!` | Same fallback as above. |
+
+> [!warning] For **Linux** templates the username has to be exactly `student`.
+> Crucible gives every student pod its own password by setting it on the account
+> named `student`. If your account is called `ubuntu` or `admin`, students get a
+> password on an account they're never told about and **can't log in**. The
+> publish step blocks this, but save yourself the round-trip: use `student`.
+
+---
+
+### ISO install — the "Unattended install" fields
+
+*(Only appears when Source type = **ISO install**.)*
+
+An unattended install means the OS installs itself using answers you provide,
+with no clicking. Choose an **Install mode** that matches your ISO:
+
+| Install mode | Use it for | Hands-off? | Roughly how long |
+|--------------|-----------|------------|------------------|
+| `manual` | Any OS you'd rather click through yourself in the console (desktop Linux, odd distros) | No — you drive the installer | Up to you |
+| `cloudinit_cidata` | **Ubuntu Server** ISOs | Yes | 20–45 min |
+| `debian_preseed` | **Debian** and **Kali** ISOs | Yes | 20–45 min |
+| `windows_autounattend` | **Windows** ISOs | Yes | 30–60 min |
+
+If you pick anything other than `manual`, a few more boxes appear. Here's what
+each one wants — **most can be left blank**:
+
+| Field | What to type | Leave blank to get… |
+|-------|--------------|---------------------|
+| **Hostname** | A computer name like `ubuntu-lab` (letters, numbers, dashes) | A generic name — fine for most labs |
+| **Username** | `student` for Linux, `Student` for Windows | `student` |
+| **Password** | `Changeme123!` (the standard build password) | *Don't leave blank* — always set a password here |
+| **Locale** | Leave blank | `en_US.UTF-8` |
+| **Time zone** | Leave blank | `America/New_York` |
+| **APT proxy** *(Linux only)* | `http://10.10.30.20:3142` to speed up package downloads | No proxy (installs still work, just slower) |
+| **Extra packages** | Comma-separated tools you want pre-installed, e.g. `curl, git, vim` | Nothing extra |
+
+> [!note] You type the password in plain text here.
+> Crucible stores it safely for you (encrypted on Windows, hashed on Linux) — you
+> never deal with that. This is the password you'll use to log into the build VM
+> in the next step.
+
+> [!tip] A `cloudinit_cidata` Ubuntu build sets up everything Crucible needs
+> automatically (VMware Tools, the `student` account, passwordless sudo, SSH host
+> keys, the apt proxy). That's why it's the easiest path for Linux. See
+> [Linux template contract](#linux-template-contract) for the details it handles.
+
+For the full play-by-play of what happens after you click Provision on an ISO,
+see [Provisioning from an ISO](#provisioning-from-an-iso).
+
+---
+
+### The standard build login (`Student`/`Changeme123!`)
+
+> [!important]
+> Whenever the wizard asks you to make up a username/password for the VM you're
+> building, use:
+> - **Username:** `student` (Linux) or `Student` (Windows)
+> - **Password:** `Changeme123!`
+
+This is the **build login** — the account *you* use to log into the VM in the
+console while you set it up. It is a shared, well-known convention so anyone on
+the team can pick up a half-built template.
+
+> [!danger] This is **not** the password students get.
+> When a student launches a pod, Crucible generates a **brand-new random
+> password just for them** and shows it on their pod page. `Changeme123!` only
+> ever lives on the build VM and is replaced on every student copy. So it is safe
+> to write it in docs — but it also means you must never tell a student "the
+> password is `Changeme123!`"; theirs is different.
+
+When do you type it vs. leave things blank?
+
+- **Cloning an existing Crucible template:** leave the credential boxes blank.
+  The template you cloned already has working credentials and they carry over.
+- **Building from an ISO:** type `Student`/`Changeme123!` in the **Unattended
+  install** boxes so the installer creates that account.
+- **Any template where you're unsure what the login is:** set the **Default
+  username / Default password** at the bottom to `Student`/`Changeme123!` so the
+  wizard has something real to log in with during Generalize.
 
 Click **Create draft**. You'll land on the wizard page for the new template.
 
