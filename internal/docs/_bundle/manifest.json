@@ -5,6 +5,7 @@
     "docs/instructor/playlists.md",
     "AGENTS.md",
     "docs/ai-prompts/build-workflow.md",
+    "docs/ai-prompts/create-a-template.md",
     "docs/ai/build-workflow-prompt.md"
   ],
   "files": [
@@ -46,6 +47,14 @@
       "title": "Prompt: \"Build me a Crucible workflow\"",
       "size": 5153,
       "sha256": "97e1c0b77f26c97de31ef9f1983c9f9b42447f0d229fe9b7edcd8e331a40b0f0",
+      "is_markdown": true,
+      "from_seed": true
+    },
+    {
+      "path": "docs/ai-prompts/create-a-template.md",
+      "title": "Prompt: \"Help me create a Crucible template\"",
+      "size": 7196,
+      "sha256": "902e5f97e97759a3f941a7bddc52382b36962574aaef82c52109b7f046f6c3d0",
       "is_markdown": true,
       "from_seed": true
     },
@@ -142,8 +151,8 @@
     {
       "path": "docs/instructor/templates.md",
       "title": "Building a Template",
-      "size": 28824,
-      "sha256": "14d9e35f2922a5afb9876a97805bc63d06c0ba9ed031217fb46c2006aeb71208",
+      "size": 37739,
+      "sha256": "0c618ce22d00891ada2209240411cc0c713236cc78cf812c660b87a00e9dbf8a",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/glossary.md",
@@ -282,5 +291,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 237706
+  "total_bytes": 253817
 }
