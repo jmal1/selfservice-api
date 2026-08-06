@@ -435,9 +435,12 @@ Linux.
 
 - Don't retype the password into a plaintext field anywhere — the wizard stores
   the sysprep-safe encoded form for you.
-- If Setup stops with **no disks listed**, that's the pvscsi driver issue that
-  affects every Windows installer — see
-  [the Windows storage-driver note](#windows-storage-driver-pvscsi) above.
+- Windows Setup has **no built-in pvscsi driver**, so it may stop at a
+  disk-selection screen showing no drives. If it does, either (a) click
+  **Load driver**, browse the mounted VMware Tools CD to the `pvscsi` folder and
+  select it, or (b) have an admin switch the VM's disk controller to **LSI Logic
+  SAS** (in-box driver). Full detail:
+  [the Windows storage-driver note](#windows-storage-driver-pvscsi) and Gap B.
 
 **You're done when…** the template reaches `active` and a test deploy logs in as
 `Student` with the *per-pod* password from the pod page. See the shared
@@ -547,7 +550,9 @@ commands before setup partitions the disk):
    block above (see the note — this may need admin help until the generator adds
    it).
 3. Click **Provision**. With the bypass in place, Setup installs unattended. If
-   Setup shows **no disks**, that's the pvscsi issue — see
+   Setup shows **no disks**, that's the pvscsi issue — either (a) click
+   **Load driver** and browse the VMware Tools CD to the `pvscsi` folder, or
+   (b) have an admin switch the disk controller to **LSI Logic SAS**; see
    [the Windows storage-driver note](#windows-storage-driver-pvscsi).
 4. When state reaches `configuring`, **fully patch the image first** if this is a
    24H2 (build 26100) media: install the Nov 2024+ cumulative update to reach
@@ -561,6 +566,21 @@ gray screen) and logs in with its per-pod password. See the shared
 [health-check checklist](#health-check-checklist-every-recipe).
 
 ---
+
+> [!warning]
+> **⚠️ Guest OS ID naming trap (Windows Server).** The vSphere API's Server IDs
+> do **not** line up with the year on the box — the `-Next` IDs are shifted one
+> release forward, and WS2016 has no `2016` id at all. Copy these exactly:
+>
+> | Windows Server version | Guest OS ID |
+> |------------------------|-------------|
+> | Server 2016 | `windows9Server64Guest` (shares the Win10 kernel) |
+> | Server 2019 | `windows2019srv_64Guest` |
+> | Server 2022 | `windows2019srvNext_64Guest` ("2019**Next**") |
+> | Server 2025 | `windows2022srvNext_64Guest` ("2022**Next**") |
+>
+> Future editors: don't "correct" these to match the year — the mismatch is
+> intentional and verified against the govmomi `vim25/types/enum.go` enum.
 
 ### 7. Windows Server 2016
 
@@ -581,7 +601,7 @@ gray screen) and logs in with its per-pod password. See the shared
 | **Source type** | `ISO install` |
 | **ISO** | Pick the Windows Server 2016 x64 ISO (e.g. `WinServer2016_x64.iso`) |
 | **Install mode** | `windows_autounattend` |
-| **Guest OS ID** | `windows9Server64Guest` ⚠️ (there is no `windows2016srv` id — WS2016 shares the Win10 kernel) |
+| **Guest OS ID** | `windows9Server64Guest` (Windows Server 2016; shares the Windows 10 kernel, so the ID says "windows9Server") |
 | **vCPUs** | `2` |
 | **RAM (MB)** | `4096` |
 | **Disk (GB)** | `70` (60–80 is fine) |
@@ -594,6 +614,11 @@ gray screen) and logs in with its per-pod password. See the shared
 **Steps** — same as Windows 10 (Provision → configure → Generalize → Publish),
 but if Setup can't see the disk, stop and arrange the LSI SAS controller fix
 from Gap B before retrying.
+
+> [!note]
+> If your vCenter's **Guest OS ID** dropdown doesn't list `windows9Server64Guest`,
+> `windows2019srv_64Guest` (Server 2019's ID) is the nearest alternative — the
+> install still works; only optimization hints differ.
 
 **You're done when…** Setup finds the disk, completes unattended, and the
 template reaches `active`. See the shared
@@ -695,6 +720,9 @@ driver for WS2022 is `…\pvscsi\Win10\amd64`).
 - Storage: if Setup can't see the disk, apply the Gap B controller fix from
   [the Windows storage-driver note](#windows-storage-driver-pvscsi) (Tools pvscsi
   driver for WS2025 is `…\pvscsi\Win10\amd64`).
+- **Guest OS ID fallback:** if your ESXi 8.0 build's dropdown doesn't offer
+  `windows2022srvNext_64Guest` yet, fall back to `windows2019srvNext_64Guest`
+  (Server 2022's ID) — the install still works; only optimization hints differ.
 
 **You're done when…** the template reaches `active`; a test clone boots to a
 desktop (no gray screen) and the generalize log skipping BitLocker is expected,
