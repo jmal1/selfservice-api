@@ -320,6 +320,101 @@ func TestDetachCDROMs_vcsim(t *testing.T) {
 	})
 }
 
+// --- SCSI controller selection by guest OS (Gap B: Windows Server ISO builds) ---
+//
+// A pvscsi system disk is invisible to the Windows in-box installer (no pvscsi
+// driver ships in the Windows ISO — VMware KB 1010398), so Windows Server shells
+// must use an LSI Logic SAS controller, whose driver is in-box. blankVMDevices
+// branches the controller on isWindowsServerGuestID; these tests read the
+// created VM back from the simulator and assert the real controller type plus
+// that the single system disk is attached to whichever controller was built.
+
+// assertDiskOnController fails unless the VM has exactly one system disk and it
+// is attached to the controller with the given device key.
+func assertDiskOnController(t *testing.T, devices object.VirtualDeviceList, ctrlKey int32) {
+	t.Helper()
+	disks := devices.SelectByType((*types.VirtualDisk)(nil))
+	if len(disks) != 1 {
+		t.Fatalf("disk count = %d, want 1", len(disks))
+	}
+	if got := disks[0].(*types.VirtualDisk).ControllerKey; got != ctrlKey {
+		t.Errorf("disk ControllerKey = %d, want %d (disk must attach to the SCSI controller)", got, ctrlKey)
+	}
+}
+
+func TestCreateBlankVM_WindowsServerUsesLSISAS(t *testing.T) {
+	// Every 64-bit Windows Server guest identifier must produce an LSI SAS
+	// controller (and no pvscsi controller) with the disk attached to it.
+	serverGuestIDs := []string{
+		"windows9Server64Guest",      // Windows Server 2016
+		"windows2019srv_64Guest",     // Windows Server 2019
+		"windows2019srvNext_64Guest", // Windows Server 2022
+		"windows2022srvNext_64Guest", // Windows Server 2025
+	}
+	for _, guestID := range serverGuestIDs {
+		t.Run(guestID, func(t *testing.T) {
+			withSimulator(t, func(ctx context.Context, c *Client, vimc *vim25.Client) {
+				p := baseBlankVMParams("blank-" + guestID)
+				p.GuestID = guestID
+
+				moref, err := c.CreateBlankVM(ctx, p)
+				if err != nil {
+					t.Fatalf("CreateBlankVM: %v", err)
+				}
+
+				cfg := readVMConfig(t, ctx, vimc, moref)
+				devices := object.VirtualDeviceList(cfg.Hardware.Device)
+
+				sas := devices.SelectByType((*types.VirtualLsiLogicSASController)(nil))
+				if len(sas) != 1 {
+					t.Fatalf("LSI Logic SAS controller count = %d, want 1 for %s", len(sas), guestID)
+				}
+				if n := len(devices.SelectByType((*types.ParaVirtualSCSIController)(nil))); n != 0 {
+					t.Errorf("ParaVirtual SCSI controller count = %d, want 0 for Windows Server guest %s", n, guestID)
+				}
+				ctrlKey := sas[0].(*types.VirtualLsiLogicSASController).Key
+				assertDiskOnController(t, devices, ctrlKey)
+			})
+		})
+	}
+}
+
+func TestCreateBlankVM_NonServerUsesPvscsi(t *testing.T) {
+	// Linux and Windows client guests must stay on pvscsi (the higher-perf
+	// controller); only Windows Server needs the LSI SAS fallback.
+	nonServerGuestIDs := []string{
+		"ubuntu64Guest",     // Linux
+		"windows9_64Guest",  // Windows 10 client
+		"windows11_64Guest", // Windows 11 client
+	}
+	for _, guestID := range nonServerGuestIDs {
+		t.Run(guestID, func(t *testing.T) {
+			withSimulator(t, func(ctx context.Context, c *Client, vimc *vim25.Client) {
+				p := baseBlankVMParams("blank-" + guestID)
+				p.GuestID = guestID
+
+				moref, err := c.CreateBlankVM(ctx, p)
+				if err != nil {
+					t.Fatalf("CreateBlankVM: %v", err)
+				}
+
+				cfg := readVMConfig(t, ctx, vimc, moref)
+				devices := object.VirtualDeviceList(cfg.Hardware.Device)
+
+				pvscsi := devices.SelectByType((*types.ParaVirtualSCSIController)(nil))
+				if len(pvscsi) != 1 {
+					t.Fatalf("ParaVirtual SCSI controller count = %d, want 1 for %s", len(pvscsi), guestID)
+				}
+				if n := len(devices.SelectByType((*types.VirtualLsiLogicSASController)(nil))); n != 0 {
+					t.Errorf("LSI Logic SAS controller count = %d, want 0 for non-Server guest %s", n, guestID)
+				}
+				ctrlKey := pvscsi[0].(*types.ParaVirtualSCSIController).Key
+				assertDiskOnController(t, devices, ctrlKey)
+			})
+		})
+	}
+}
+
 // --- Placement defaults (the bug that broke the first real ISO template build) ---
 //
 // Every test above hands CreateBlankVM an explicit FolderPath and Datastore.

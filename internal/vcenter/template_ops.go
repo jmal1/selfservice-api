@@ -495,10 +495,16 @@ type BlankVMParams struct {
 }
 
 // CreateBlankVM creates an empty VM configured to boot an OS installer ISO and
-// returns the new VM's moref. The shell has a pvscsi controller with a single
+// returns the new VM's moref. The shell has a SCSI controller with a single
 // thin system disk, a VMXNET3 NIC on the requested port group, and one or two
 // IDE CD-ROMs (ISOPath, and SeedISOPath when provided) with the CD-ROM ahead of
 // the disk in the boot order so the installer runs on first power-on.
+//
+// The SCSI controller type depends on the guest: Windows Server guests get an
+// LSI Logic SAS controller (the Windows in-box installer has no pvscsi driver,
+// so a pvscsi disk is invisible to Setup — see isWindowsServerGuestID and
+// docs/architecture/iso-build-hardware-gaps.md Gap B); everything else keeps the
+// higher-performance pvscsi controller.
 //
 // All validation happens before any vCenter round-trip, so a rejected request
 // never leaves an orphaned VM behind.
@@ -640,17 +646,28 @@ func (c *Client) createBlankVMInner(ctx context.Context, p BlankVMParams) (strin
 	return newRef.Value, nil
 }
 
-// blankVMDevices assembles the device list for a blank installer VM: a pvscsi
+// blankVMDevices assembles the device list for a blank installer VM: a SCSI
 // controller with a thin system disk, an IDE controller carrying the CD-ROM(s),
 // and a VMXNET3 NIC. It uses govmomi's VirtualDeviceList builders (the same
 // idiom as `govc vm.create`) so controller keys and unit numbers are assigned
 // consistently.
+//
+// The SCSI controller kind is chosen from the guest OS: Windows Server guests
+// get "lsilogic-sas" because the Windows in-box installer ships no pvscsi driver
+// (VMware KB 1010398), so a pvscsi system disk is invisible to Setup ("We
+// couldn't find any drives."). The LSI SAS driver is in-box on every supported
+// Windows Server release, so Setup sees the disk with no manual Load-driver
+// step. Linux and Windows client guests keep the faster "pvscsi" controller.
 func blankVMDevices(dsRef types.ManagedObjectReference, p BlankVMParams) (object.VirtualDeviceList, error) {
 	var devices object.VirtualDeviceList
 
-	scsi, err := devices.CreateSCSIController("pvscsi")
+	scsiType := "pvscsi"
+	if isWindowsServerGuestID(p.GuestID) {
+		scsiType = "lsilogic-sas"
+	}
+	scsi, err := devices.CreateSCSIController(scsiType)
 	if err != nil {
-		return nil, fmt.Errorf("create pvscsi controller: %w", err)
+		return nil, fmt.Errorf("create %s controller: %w", scsiType, err)
 	}
 	devices = append(devices, scsi)
 
@@ -707,6 +724,34 @@ func blankVMDevices(dsRef types.ManagedObjectReference, p BlankVMParams) (object
 	}
 
 	return devices, nil
+}
+
+// isWindowsServerGuestID reports whether guestID is a Windows Server vSphere
+// guest identifier. Windows Server ISO builds need an LSI Logic SAS controller
+// rather than pvscsi so the in-box installer can see the system disk (see
+// blankVMDevices and docs/architecture/iso-build-hardware-gaps.md Gap B).
+//
+// The identifiers below are the 64-bit Windows Server values from govmomi's
+// vim25/types enum (VirtualMachineGuestOsIdentifier):
+//
+//	windows9Server64Guest      Windows Server 2016
+//	windows2019srv_64Guest     Windows Server 2019
+//	windows2019srvNext_64Guest Windows Server 2022
+//	windows2022srvNext_64Guest Windows Server 2025
+//
+// Windows client guests (windows9_64Guest = Win10, windows11_64Guest = Win11)
+// and every non-Windows guest are deliberately excluded: they stay on pvscsi and
+// rely on the manual Load-driver fallback until Option 1 (driver staging) lands.
+func isWindowsServerGuestID(guestID string) bool {
+	switch guestID {
+	case "windows9Server64Guest", // Windows Server 2016
+		"windows2019srv_64Guest",     // Windows Server 2019
+		"windows2019srvNext_64Guest", // Windows Server 2022
+		"windows2022srvNext_64Guest": // Windows Server 2025
+		return true
+	default:
+		return false
+	}
 }
 
 // DetachCDROMs removes every CD-ROM device from the VM identified by moref.
