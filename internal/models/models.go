@@ -205,6 +205,16 @@ const (
 	TemplateSourceISO = "iso"
 )
 
+// CanonicalStagingNetwork is the ONLY network a template build VM is ever
+// attached to. It is the isolated VLAN 30 staging port group (present on
+// every ESXi host) and is a deliberate network-segmentation control: build
+// VMs run untrusted, half-configured OS images and must never touch the
+// management or production networks. This is NOT operator-configurable — the
+// wizard does not accept a staging_network override and the value is forced
+// server-side on every draft. It matches the `staging_network` column DEFAULT
+// in migration 000021_staging_network_pg_vm_lab.up.sql; keep the two in sync.
+const CanonicalStagingNetwork = "PG-VM-Lab"
+
 // Unattended-install mode constants — keep in sync with the CHECK
 // constraint templates_unattend_mode_check in migration
 // 000023_image_uploads.up.sql and the generators in internal/unattend.

@@ -540,7 +540,13 @@ func main() {
 			"interval", idleEvalInterval,
 			"dry_run", dryRunResult.DryRun)
 		if idleEvalPusher != nil {
-			go idleEvalPusher.RunSuspendMetricsPusher(ctx, 30*time.Second, logger)
+			// Leader-gate the push: only the replica that runs the evaluator
+			// (and thus advances the last-run timestamp) may write the shared
+			// Pushgateway grouping key. See RunSuspendMetricsPusher for why a
+			// non-leader push pins crucible_idle_evaluator_last_run_timestamp
+			// to a stale start-time seed and makes CrucibleIdleEvaluatorStale
+			// fire forever.
+			go idleEvalPusher.RunSuspendMetricsPusher(ctx, 30*time.Second, elec.IsLeader, logger)
 		}
 	}
 
@@ -744,6 +750,22 @@ func main() {
 						} else {
 							logger.Info("template health catch-up skipped; a cycle ran within the interval",
 								"interval", healthReconcilerCfg.Interval)
+						}
+					}()
+				}
+				// Idle-VM evaluator: run one pass immediately on leadership
+				// acquisition. The 15m ticker is created at process start and is
+				// not reset by failover, so a newly-elected leader would wait up
+				// to a full interval before its first pass. During that window it
+				// keeps pushing its stale process-start seed for
+				// crucible_idle_evaluator_last_run_timestamp, which can trip
+				// CrucibleIdleEvaluatorStale on a mid-life failover. Running a
+				// pass now refreshes the heartbeat immediately. Goroutine because
+				// it touches vCenter and must not stall the select loop.
+				if idleEvalEnabled {
+					go func() {
+						if _, err := prov.EvaluateIdleVMs(ctx, idleEvalCfg); err != nil {
+							logger.Error("idle vm evaluation on leader acquisition failed", "error", err)
 						}
 					}()
 				}

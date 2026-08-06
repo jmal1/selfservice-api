@@ -919,7 +919,7 @@ func (p *Provisioner) runSmokeCheck(ctx context.Context, tmpl *models.Template, 
 	osType := strings.ToLower(tmpl.OSType)
 	network := tmpl.StagingNetwork
 	if network == "" {
-		network = "PG-VM-Lab"
+		network = models.CanonicalStagingNetwork
 	}
 	vcpus := int32(tmpl.DefaultVCPUs)
 	if vcpus <= 0 {

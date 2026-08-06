@@ -98,7 +98,7 @@ Anything not listed, **leave blank** — the wizard fills in sensible defaults.
 |-------|--------------|---------|----------------|
 | **Template name** *(required)* | A friendly name students will see, e.g. `Ubuntu 24.04 — Web Security` | — | This is the label in the catalog. Make it clear. |
 | **OS family** *(required)* | `Linux` or `Windows` | `Linux` | Controls how the wizard cleans the image (cloud-init vs. sysprep). Pick the one that matches your ISO/source. |
-| **Staging network** | Leave as `PG-VM-Lab` | `PG-VM-Lab` | The temporary network the build VM uses. Only change it if a teacher tells you to. |
+| **Staging network** | *(nothing — it's fixed)* | `PG-VM-Lab` | Not editable. Every build VM is forced onto the isolated `PG-VM-Lab` (VLAN 30) network so a half-built image can never touch the real lab network. This is a security control baked into every template — the wizard just shows it read-only. |
 | **Description** | One or two sentences on what's inside | — | Shown to students. Optional but kind. |
 | **Icon URL** | A link to a logo image, or leave blank | — | Cosmetic only. |
 

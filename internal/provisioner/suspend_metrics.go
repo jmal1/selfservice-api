@@ -168,7 +168,23 @@ func (m *SuspendMetrics) serialize() []byte {
 // visible in Prometheus. Without it the series are silently absent, which is
 // indistinguishable from zero and makes "the evaluator has never run" look
 // identical to "no suspensions have occurred."
-func (m *SuspendMetrics) RunSuspendMetricsPusher(ctx context.Context, interval time.Duration, logger *slog.Logger) {
+//
+// isLeader gates pushing so that only the elected leader publishes these
+// series. A nil isLeader means "always push" (single-replica or test use).
+//
+// Leader-gating is mandatory in multi-replica deployments. Every replica shares
+// the SAME Pushgateway grouping key ({job, layer=api}, no per-pod label), but
+// only the leader runs the idle evaluator — the sole call site of
+// SetLastRunTimestamp. A non-leader replica never advances its lastRunUnix past
+// the process-start seed set in NewSuspendMetrics, so if it pushed, it would
+// overwrite the leader's fresh heartbeat with its own frozen start time on the
+// next tick. With N replicas the stale writers win N-1 of every N pushes, so
+// crucible_idle_evaluator_last_run_timestamp stays pinned near a non-leader's
+// start time forever and CrucibleIdleEvaluatorStale (time() - max(gauge) > 1h)
+// fires permanently even while the evaluator is healthy and suspending VMs.
+// The sibling leader.Pusher avoids this by carrying a per-pod grouping key;
+// here we instead ensure exactly one writer (the leader) touches the shared key.
+func (m *SuspendMetrics) RunSuspendMetricsPusher(ctx context.Context, interval time.Duration, isLeader func() bool, logger *slog.Logger) {
 	if m == nil || m.BaseURL == "" {
 		return
 	}
@@ -178,8 +194,11 @@ func (m *SuspendMetrics) RunSuspendMetricsPusher(ctx context.Context, interval t
 	if logger == nil {
 		logger = slog.Default()
 	}
+	// leading reports whether this replica should push right now.
+	leading := func() bool { return isLeader == nil || isLeader() }
+
 	log := logger.With("component", "suspend_metrics_pusher")
-	log.Info("suspend metrics pusher started", "interval", interval, "job", m.Job)
+	log.Info("suspend metrics pusher started", "interval", interval, "job", m.Job, "leader_gated", isLeader != nil)
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -187,6 +206,12 @@ func (m *SuspendMetrics) RunSuspendMetricsPusher(ctx context.Context, interval t
 	for {
 		select {
 		case <-ctx.Done():
+			// Only the leader flushes on shutdown; a departing non-leader must
+			// not clobber the shared grouping key with its stale seed.
+			if !leading() {
+				log.Info("suspend metrics pusher stopped (not leader; skipped final flush)")
+				return
+			}
 			flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			if err := m.Push(flushCtx); err != nil {
 				log.Warn("final suspend metrics push failed", "error", err)
@@ -195,6 +220,9 @@ func (m *SuspendMetrics) RunSuspendMetricsPusher(ctx context.Context, interval t
 			log.Info("suspend metrics pusher stopped")
 			return
 		case <-ticker.C:
+			if !leading() {
+				continue
+			}
 			if err := m.Push(ctx); err != nil {
 				log.Warn("suspend metrics push failed", "error", err)
 			}
