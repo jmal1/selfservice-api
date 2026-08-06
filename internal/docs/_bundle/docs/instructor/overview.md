@@ -169,6 +169,7 @@ Submit via the admin UI Workflows page, or via the lifecycle endpoints
 | You want to… | Read… |
 |---|---|
 | Build a new VM template from scratch | [Building Templates](templates.md) |
+| Follow a copy-me recipe for a specific OS | [Per-OS Template Build Recipes](os-recipes.md) |
 | Author your first workflow | [Building Workflows](workflows.md) |
 | Understand what's available to your script at runtime | [Runner Environment](runner-environment.md) |
 | Add a reusable check to the library | [Building Actions](actions.md) |

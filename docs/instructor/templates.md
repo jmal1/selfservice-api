@@ -69,6 +69,12 @@ below say what to put in each. When in doubt, copy the recipe.
 
 ### Quick-start recipes (copy these)
 
+> [!tip] Want a full click-by-click recipe for **one specific OS**?
+> See [Per-OS Template Build Recipes](os-recipes.md) — it has a copy-me table and
+> numbered steps for Ubuntu Server/Desktop, Debian, Linux Mint, Windows 10/11,
+> and Windows Server 2016/2019/2025, including the exact Guest OS ID and the
+> Windows 11 TPM/Secure-Boot bypass. The table below is the one-line summary.
+
 Pick the row that matches what you're building and use exactly those values.
 Anything not listed, **leave blank** — the wizard fills in sensible defaults.
 
