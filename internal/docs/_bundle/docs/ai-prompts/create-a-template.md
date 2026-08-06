@@ -92,8 +92,8 @@ Respond conversationally, but structure the core answer as a numbered checklist
 they can literally follow top-to-bottom:
 
 1. Which **Source type** to pick, and what to choose in the box that appears.
-2. **Identity**: Template name (help them write a clear one), OS family, leave
-   Staging network as `PG-VM-Lab`.
+2. **Identity**: Template name (help them write a clear one), OS family. (The
+   staging network is fixed at `PG-VM-Lab` and shown read-only — nothing to set.)
 3. **Hardware**: the three numbers.
 4. If ISO: the **Install mode** and each unattended field (say "leave blank" for
    defaults, spell out the ones that matter).
@@ -113,7 +113,7 @@ Ask clarifying questions **only if** you can't pick a recipe from their answer
 > 1. **Source type:** *ISO install*, then pick the Ubuntu Server `.iso` from the
 >    list (upload it on the Images page first if it's not there).
 > 2. **Template name:** something like `Ubuntu 24.04 — Web Lab`. **OS family:**
->    Linux. **Staging network:** leave `PG-VM-Lab`.
+>    Linux. (Staging network is fixed at `PG-VM-Lab` — nothing to change.)
 > 3. **Hardware:** 2 vCPU, 4096 MB RAM, 40 GB disk.
 > 4. **Install mode:** `cloudinit_cidata`. **Username:** `student`.
 >    **Password:** `Changeme123!`. Leave hostname, locale, time zone, APT proxy,

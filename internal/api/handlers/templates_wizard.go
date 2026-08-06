@@ -44,8 +44,9 @@ import (
 //   - source_type=clone_vcenter, source_ref=<vCenter VM moref>
 //   - source_type=iso, source_ref=<datastore path> (Phase 2 stub)
 //
-// StagingNetwork defaults to "LabVMs-VLAN30" if omitted (configurable per
-// site; see current/01-Network-Configuration.md). VCPUs / RAMmb / DiskGB
+// The staging network is NOT part of this payload: every build VM is forced
+// onto models.CanonicalStagingNetwork server-side as a non-negotiable network
+// isolation control (see AdminCreateTemplateDraft). VCPUs / RAMmb / DiskGB
 // override the source's hardware; zero = inherit.
 type CreateTemplateDraftRequest struct {
 	Name            string `json:"name"`
@@ -55,9 +56,8 @@ type CreateTemplateDraftRequest struct {
 	DefaultUsername string `json:"default_username,omitempty"`
 	DefaultPassword string `json:"default_password,omitempty"`
 
-	SourceType     string `json:"source_type"`
-	SourceRef      string `json:"source_ref"`
-	StagingNetwork string `json:"staging_network,omitempty"`
+	SourceType string `json:"source_type"`
+	SourceRef  string `json:"source_ref"`
 
 	VCPUs  int `json:"vcpus,omitempty"`
 	RAMMB  int `json:"ram_mb,omitempty"`
@@ -196,10 +196,11 @@ func (h *Handler) AdminCreateTemplateDraft(w http.ResponseWriter, r *http.Reques
 		unattendMode = models.UnattendModeManual
 	}
 
-	stagingNetwork := req.StagingNetwork
-	if stagingNetwork == "" {
-		stagingNetwork = "PG-VM-Lab" // canonical VLAN 30 staging port group present on every host
-	}
+	// Network isolation control: build VMs ALWAYS land on the canonical
+	// VLAN 30 staging port group, never on an operator-supplied network.
+	// The request has no staging_network field; there is nothing to honor
+	// or fall back from.
+	stagingNetwork := models.CanonicalStagingNetwork
 
 	// For clone_template: inherit missing credentials from the source
 	// template so that a template-from-template workflow never silently
