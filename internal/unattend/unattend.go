@@ -88,6 +88,21 @@ type Spec struct {
 	TimeZone  string   `json:"time_zone"` // defaults "America/New_York"
 	AptProxy  string   `json:"apt_proxy"` // e.g. "http://10.10.30.20:3142"
 	ExtraPkgs []string `json:"extra_pkgs"`
+
+	// BypassWin11HardwareChecks makes the windows_autounattend generator emit
+	// an extra windowsPE pass that writes the HKLM\SYSTEM\Setup\LabConfig
+	// Bypass* registry values before the disk-selection screen, so Windows 11
+	// Setup skips its TPM 2.0 / Secure Boot / RAM / storage / CPU checks. This
+	// is required because Crucible's blank ISO-install VM shells ship with no
+	// vTPM and no Secure Boot (see internal/vcenter template_ops.go
+	// blankVMDevices), which Win11 Setup otherwise hard-rejects.
+	//
+	// Like Mode, it is json:"-": it is derived from the template's guest OS ID
+	// by the caller (only windows11_64Guest), not authored in unattend_config,
+	// so accepting it from JSON would create a second source of truth. When
+	// false the generator emits no windowsPE block, keeping Win10/Server answer
+	// files byte-identical to before this field existed.
+	BypassWin11HardwareChecks bool `json:"-"`
 }
 
 // withDefaults returns a copy of s with empty defaultable fields populated.
