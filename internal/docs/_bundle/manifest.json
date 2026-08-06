@@ -53,8 +53,8 @@
     {
       "path": "docs/ai-prompts/create-a-template.md",
       "title": "Prompt: \"Help me create a Crucible template\"",
-      "size": 7196,
-      "sha256": "902e5f97e97759a3f941a7bddc52382b36962574aaef82c52109b7f046f6c3d0",
+      "size": 7137,
+      "sha256": "98bd58aa6b2058d85a3a5d0b915dd7f5c4c9048e96ca1dcd2a596870c6fa5d2e",
       "is_markdown": true,
       "from_seed": true
     },
@@ -151,8 +151,8 @@
     {
       "path": "docs/instructor/templates.md",
       "title": "Building a Template",
-      "size": 37739,
-      "sha256": "0c618ce22d00891ada2209240411cc0c713236cc78cf812c660b87a00e9dbf8a",
+      "size": 37902,
+      "sha256": "c065ca400d59eca80c237c42787d8ce53b8c623544f510e13f005a50a7ac88f5",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/glossary.md",
@@ -291,5 +291,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 253817
+  "total_bytes": 253921
 }
