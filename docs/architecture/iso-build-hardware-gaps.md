@@ -50,9 +50,13 @@ the `HKLM\SYSTEM\Setup\LabConfig` bypass values before Setup touches the disk:
 - `BypassTPMCheck = 1`
 - `BypassSecureBootCheck = 1`
 - `BypassRAMCheck = 1`
-- `BypassStorageCheck = 1` (harmless; skips the 64 GB floor)
+- `BypassStorageCheck = 1` (skips the 64 GB floor)
+- `BypassCPUCheck = 1` (skips the supported-CPU allow-list)
 - `HKLM\SYSTEM\Setup\BypassNRO = 1` (lets OOBE finish with a local account, no
   network / Microsoft account)
+
+These five `Bypass*Check` values are the authoritative set (verified on 23H2 and
+24H2); `BypassNRO` is an additional local-account convenience.
 
 The full XML snippet is in the Windows 11 recipe
 ([`docs/instructor/os-recipes.md`](../instructor/os-recipes.md), recipe 6).
@@ -83,8 +87,10 @@ and absent otherwise.
 
 Give `CreateBlankVM` the ability to attach a `VirtualTPM` device and set
 `bootOptions`/firmware for **Secure Boot** when the guest is
-`windows9_64Guest` (which covers both Win10 and Win11) or when a new
-`needs_vtpm` template flag is set.
+`windows11_64Guest` or when a new `needs_vtpm` template flag is set. (Note the
+Guest OS ID trap: Win10 is `windows9_64Guest`, but **Win11 is
+`windows11_64Guest`** — they are distinct, so a vTPM gate keyed on the guest ID
+must target `windows11_64Guest`.)
 
 - **Requires:** a vSphere **Key Provider** (native key provider or a KMS) so the
   vTPM has somewhere to seal keys, and the service account needs
@@ -107,49 +113,74 @@ provisioned and we're ready to require it. Cite: `blankVMDevices` /
 
 ---
 
-## Gap B — Windows Server installers may not see the pvscsi disk
+## Gap B — Windows Setup may not see the pvscsi disk (all Windows SKUs)
 
 ### Problem
 
-The shell's system disk hangs off a **pvscsi** controller. pvscsi has no in-box
-Windows driver on older media; Windows Server 2016 (and sometimes 2019) Setup
-then shows *"We couldn't find any drives. To get a storage driver, click Load
-driver."* and cannot proceed. Client Windows 10/11 media generally ships the
-pvscsi driver, so this bites **Server** builds most.
+The shell's system disk hangs off a **pvscsi** controller. **No** Windows Setup
+media — Windows 10, Windows 11, or Server 2016/2019/2022/2025 — ships an in-box
+pvscsi driver (VMware KB 1010398), so any Windows ISO build can stop at
+*"We couldn't find any drives. To get a storage driver, click Load driver."* and
+be unable to proceed. In this lab's field history the failure has been reported
+most on Server builds, but the root cause is common to every Windows installer,
+so every Windows recipe must account for it.
 
-### Option 1 — slipstream the VMware pvscsi driver into the answer file
+**Constraint that shapes the fix:** `blankVMDevices` builds a **single IDE
+controller with at most two CD-ROMs** — CD-ROM 0 = installer ISO, CD-ROM 1 =
+the seed ISO (`SeedISOPath`, set in `internal/provisioner/template_jobs.go`). The
+seed ISO the pipeline generates (`internal/unattend/windows.go` →
+`buildAutounattendISO`) contains **only** `autounattend.xml`; there is no third
+slot and no VMware Tools media mounted. So neither a `windowsPE` driver-injection
+that reads the Tools ISO **nor** the manual **Load driver** fallback has anything
+to point at today without a pipeline change. This is why LSI SAS (Option 2) is
+the pragmatic recommendation.
 
-Add the pvscsi driver to Setup via `autounattend.xml`
-`Microsoft-Windows-PnpCustomizationsWinPE` (`DriverPaths`) pointing at the
-VMware Tools `pvscsi` driver staged on the seed media, so WinPE loads it before
-disk selection.
+### Option 1 — slipstream the VMware pvscsi driver into the seed media
+
+Stage the correct VMware Tools `pvscsi` driver onto the **seed ISO** alongside
+`autounattend.xml`, then reference it from a `windowsPE`-pass
+`Microsoft-Windows-PnpCustomizationsWinPE` component (`<DriverPaths>` →
+`<PathAndCredentials>`) so WinPE loads it before disk selection. Driver folder by
+OS (on the VMware Tools installer ISO layout):
+
+- **Win11 / Server 2022 / Server 2025** (Tools ≥ 12): `…\pvscsi\Win10\amd64`
+- **Win10 / Server 2016 / Server 2019** (Tools ≥ 11.2): `…\pvscsi\Win8\amd64`
 
 - **Pros:** keeps the high-performance pvscsi controller for every guest;
-  uniform shell across OSes.
-- **Cons:** we must stage the correct signed pvscsi driver for each Windows
-  version on the seed ISO and reference it in the answer file — more moving
-  parts in the seed-build path, and driver/OS version drift to maintain.
+  uniform shell across OSes; fixes client Windows too.
+- **Cons:** the seed-build path must copy the correct signed pvscsi driver onto
+  the seed ISO **and** the generator must emit a `windowsPE`
+  `PnpCustomizationsWinPE` block — neither exists today (the generator emits only
+  `specialize` + `oobeSystem`). More moving parts and driver/OS-version drift to
+  maintain. The manual **Load driver** fallback also only works once some Tools
+  media is mounted, which likewise needs a pipeline change.
 
 ### Option 2 — use LSI SAS for Server guest IDs *(recommended)*
 
 For Server guest IDs, build the shell with an **LSI SAS** controller instead of
 pvscsi. LSI SAS has an in-box Windows driver, so Setup sees the disk with no
-slipstreaming.
+slipstreaming and no extra mounted media.
 
 - **Field history:** LSI SAS is the controller that has historically worked for
   WS2022/WS2025 ISO builds in this lab; pvscsi is where the "no drives" reports
   came from. That real-world signal favors LSI SAS for Server.
-- **Pros:** no driver staging, no per-version driver maintenance, matches what
-  already works. The performance delta is irrelevant for a teaching template.
+- **Pros:** no driver staging, no per-version driver maintenance, no need for a
+  third CD slot, matches what already works. The performance delta is irrelevant
+  for a teaching template.
 - **Cons:** a second controller code path in `blankVMDevices` (branch on guest
-  ID family), and mildly lower theoretical throughput than pvscsi.
+  ID family), and mildly lower theoretical throughput than pvscsi. Client Windows
+  10/11 on pvscsi still needs Option 1 (or an LSI SAS shell of its own) to be
+  fully hands-off.
 
-**Recommendation:** implement **Option 2** — branch `blankVMDevices` to use
-`CreateSCSIController("lsilogic-sas")` when `p.GuestID` is a Windows **Server**
-identifier (`windows2019srv_64Guest`, `windows2019srvNext_64Guest`, and older
-`windows*srv*` IDs), keeping pvscsi for Linux and Windows client guests. Client
-Windows keeps pvscsi because its media carries the driver and we lose nothing.
-This is a contained change in `blankVMDevices`
+**Recommendation:** implement **Option 2** for Server now — branch
+`blankVMDevices` to use `CreateSCSIController("lsilogic-sas")` when `p.GuestID` is
+a Windows **Server** identifier (`windows9Server64Guest` for WS2016,
+`windows2019srv_64Guest` for WS2019, `windows2019srvNext_64Guest` for WS2022,
+`windows2022srvNext_64Guest` for WS2025, and older `windows*srv*` /
+`windows*Server*` IDs), keeping pvscsi for Linux. For **client** Windows
+(`windows9_64Guest`, `windows11_64Guest`) either extend the LSI SAS branch or
+land Option 1's driver-staging — pick one before publishing a Win10/Win11 ISO
+template. This is a contained change in `blankVMDevices`
 (`internal/vcenter/template_ops.go`) with a unit test asserting the controller
 type per guest-ID family.
 
@@ -167,7 +198,7 @@ focused change with its own test:
 | Gap | Works-now mitigation | Durable fix | Recommended path |
 |-----|----------------------|-------------|------------------|
 | **A** — no vTPM / Secure Boot (blocks Win11) | LabConfig registry bypass in `autounattend.xml` `windowsPE` pass (doc-only today; gated generator change is the low-risk follow-up) | Optional vTPM + Secure Boot on the blank shell via a Key Provider + Cryptographer perms | **(i)** now, **(ii)** later |
-| **B** — pvscsi disk invisible to Server Setup | Use LSI SAS controller for Server guest IDs, or slipstream pvscsi driver | LSI SAS for Server guest IDs in `blankVMDevices` | **Option 2 (LSI SAS)** |
+| **B** — pvscsi disk invisible to Windows Setup (all SKUs; Server hit hardest in field) | Use LSI SAS controller for Server guest IDs, or stage the pvscsi driver on the seed ISO + a `windowsPE` `PnpCustomizationsWinPE` block | LSI SAS for Server guest IDs in `blankVMDevices` (client Windows needs LSI SAS too, or Option 1 driver-staging) | **Option 2 (LSI SAS)** |
 
 Both fixes touch `internal/vcenter/template_ops.go` (`CreateBlankVM` /
 `blankVMDevices`); Gap A option (i) additionally touches the Windows answer-file
