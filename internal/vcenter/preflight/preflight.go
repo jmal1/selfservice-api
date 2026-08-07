@@ -54,7 +54,17 @@ type Result struct {
 type Params struct {
 	// SourceMoref is the vCenter managed-object reference of the source VM,
 	// e.g. "vm-1234". Required for clone-based checks (PF-01 … PF-07, PF-11).
+	// For clone_template drafts this is the moref the source template's
+	// Crucible UUID was resolved to — see templates.ResolveCloneSourceMoref —
+	// NOT the raw source_ref (which is a Crucible templates.id UUID).
 	SourceMoref string
+
+	// SourceResolveError, when non-empty, means the handler could not resolve
+	// the draft's source to a live vCenter moref before running the checks
+	// (e.g. a clone_template whose source template row has no vcenter linkage,
+	// or a source VM that was deleted). PF-01 reports it as a blocking failure
+	// so the instructor sees why the source could not be located.
+	SourceResolveError string
 
 	// TargetVMName is the intended name for the staging VM (PF-09).
 	TargetVMName string
@@ -191,6 +201,23 @@ func AnyBlockFailed(results []Result) bool {
 
 // --- individual check functions ---
 
+// cascadeIfSourceUnresolved returns a deterministic "Fix PF-01 first" failure
+// when a clone-based check has no resolved source moref. The moref-dependent
+// checks (PF-02 … PF-07, PF-11) must not depend on the vCenter call happening
+// to error on an empty moref: the real API does (NoPermission/NotFound), but a
+// fake — or a future client — may return an empty result instead, which would
+// let a check show a misleading green when the source could not be resolved.
+// Callers invoke this AFTER their ISO skip guard, so p.SourceMoref == "" here
+// only ever means "clone source failed to resolve" (see PF-01 for the reason).
+func cascadeIfSourceUnresolved(id, sev string, p Params) (Result, bool) {
+	if p.SourceMoref == "" {
+		return Result{ID: id, Severity: sev, OK: false,
+			Detail: "source VM moref is not resolved",
+			Fix:    "Fix PF-01 first."}, true
+	}
+	return Result{}, false
+}
+
 // pf01SourceResolves verifies the source VM moref resolves to a live
 // managed-object reference in vCenter.
 //
@@ -198,6 +225,18 @@ func AnyBlockFailed(results []Result) bool {
 // Does NOT catch disk corruption or transient clone failures.
 func pf01SourceResolves(ctx context.Context, vc PreflightVCenter, p Params) Result {
 	id, sev := "PF-01", "block"
+	if p.SourceType == models.TemplateSourceISO {
+		// ISO installs have no source VM to resolve; PF-10 validates the ISO
+		// file instead. Without this guard an ISO draft fails PF-01 forever
+		// ("source moref is empty").
+		return Result{ID: id, Severity: sev, OK: true,
+			Detail: "skipped: no source VM to resolve (ISO source); PF-10 validates the ISO file"}
+	}
+	if p.SourceResolveError != "" {
+		return Result{ID: id, Severity: sev, OK: false,
+			Detail: fmt.Sprintf("source VM reference could not be resolved: %s", p.SourceResolveError),
+			Fix:    "Verify the source template still points at a live VM in vCenter, or re-pick the source in the wizard draft step."}
+	}
 	if p.SourceMoref == "" {
 		return Result{ID: id, Severity: sev, OK: false,
 			Detail: "source moref is empty",
@@ -222,8 +261,11 @@ func pf01SourceResolves(ctx context.Context, vc PreflightVCenter, p Params) Resu
 // Does NOT catch: intermittent clone faults.
 func pf02ClusterHasResourcePool(ctx context.Context, vc PreflightVCenter, p Params) Result {
 	id, sev := "PF-02", "block"
-	if p.SourceMoref == "" {
+	if p.SourceType == models.TemplateSourceISO {
 		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: no source moref (ISO source)"}
+	}
+	if r, cascade := cascadeIfSourceUnresolved(id, sev, p); cascade {
+		return r
 	}
 	vm, err := vc.FetchVMProps(ctx, p.SourceMoref)
 	if err != nil {
@@ -276,8 +318,14 @@ func pf02ClusterHasResourcePool(ctx context.Context, vc PreflightVCenter, p Para
 // Catches: NFS mount dropped from one cluster, datastore name wrong.
 func pf03DatastoreMountedOnCluster(ctx context.Context, vc PreflightVCenter, p Params) Result {
 	id, sev := "PF-03", "block"
-	if p.SourceMoref == "" || p.DatastoreName == "" {
-		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: insufficient params"}
+	if p.SourceType == models.TemplateSourceISO {
+		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: no source moref (ISO source)"}
+	}
+	if p.DatastoreName == "" {
+		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: target datastore not configured"}
+	}
+	if r, cascade := cascadeIfSourceUnresolved(id, sev, p); cascade {
+		return r
 	}
 	vm, err := vc.FetchVMProps(ctx, p.SourceMoref)
 	if err != nil {
@@ -329,8 +377,14 @@ func pf03DatastoreMountedOnCluster(ctx context.Context, vc PreflightVCenter, p P
 // and the actual clone operation.
 func pf04DatastoreFreeSpace(ctx context.Context, vc PreflightVCenter, p Params) Result {
 	id, sev := "PF-04", "block"
-	if p.DatastoreName == "" || p.SourceMoref == "" {
-		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: insufficient params"}
+	if p.SourceType == models.TemplateSourceISO {
+		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: no source moref (ISO source)"}
+	}
+	if p.DatastoreName == "" {
+		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: target datastore not configured"}
+	}
+	if r, cascade := cascadeIfSourceUnresolved(id, sev, p); cascade {
+		return r
 	}
 	vm, err := vc.FetchVMProps(ctx, p.SourceMoref)
 	if err != nil {
@@ -370,8 +424,11 @@ func pf04DatastoreFreeSpace(ctx context.Context, vc PreflightVCenter, p Params) 
 // is impractical pre-clone and outside the scope of a synchronous check.
 func pf05DiskChainIntact(ctx context.Context, vc PreflightVCenter, p Params) Result {
 	id, sev := "PF-05", "block"
-	if p.SourceMoref == "" {
+	if p.SourceType == models.TemplateSourceISO {
 		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: no source moref (ISO source)"}
+	}
+	if r, cascade := cascadeIfSourceUnresolved(id, sev, p); cascade {
+		return r
 	}
 	vm, err := vc.FetchVMProps(ctx, p.SourceMoref)
 	if err != nil {
@@ -427,8 +484,11 @@ func pf05DiskChainIntact(ctx context.Context, vc PreflightVCenter, p Params) Res
 // clone actually starting. The retry-with-backoff lane handles the residual.
 func pf06NoInFlightTasks(ctx context.Context, vc PreflightVCenter, p Params) Result {
 	id, sev := "PF-06", "block"
-	if p.SourceMoref == "" {
+	if p.SourceType == models.TemplateSourceISO {
 		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: no source moref (ISO source)"}
+	}
+	if r, cascade := cascadeIfSourceUnresolved(id, sev, p); cascade {
+		return r
 	}
 	tasks, err := vc.InFlightTasksForVM(ctx, p.SourceMoref)
 	if err != nil {
@@ -468,8 +528,11 @@ func pf06NoInFlightTasks(ctx context.Context, vc PreflightVCenter, p Params) Res
 // service is stopped.
 func pf07ToolsPresent(ctx context.Context, vc PreflightVCenter, p Params) Result {
 	id, sev := "PF-07", "block"
-	if p.SourceMoref == "" {
+	if p.SourceType == models.TemplateSourceISO {
 		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: no source moref"}
+	}
+	if r, cascade := cascadeIfSourceUnresolved(id, sev, p); cascade {
+		return r
 	}
 	vm, err := vc.FetchVMProps(ctx, p.SourceMoref)
 	if err != nil {
@@ -595,8 +658,14 @@ func pf10ISOExists(ctx context.Context, vc PreflightVCenter, p Params) Result {
 // false positive for DVS environments.
 func pf11PortGroupOnAllHosts(ctx context.Context, vc PreflightVCenter, p Params) Result {
 	id, sev := "PF-11", "warn"
-	if p.StagingPortGroup == "" || p.SourceMoref == "" {
-		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: insufficient params"}
+	if p.SourceType == models.TemplateSourceISO {
+		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: no source moref (ISO source)"}
+	}
+	if p.StagingPortGroup == "" {
+		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: no staging port group configured"}
+	}
+	if r, cascade := cascadeIfSourceUnresolved(id, sev, p); cascade {
+		return r
 	}
 	vm, err := vc.FetchVMProps(ctx, p.SourceMoref)
 	if err != nil {
