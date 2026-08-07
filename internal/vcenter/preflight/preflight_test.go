@@ -163,7 +163,8 @@ func vmWithHost(hostMoref string) *mo.VirtualMachine {
 	return &mo.VirtualMachine{
 		ManagedEntity: mo.ManagedEntity{},
 		Runtime: types.VirtualMachineRuntimeInfo{
-			Host: hostRef(hostMoref),
+			Host:       hostRef(hostMoref),
+			PowerState: types.VirtualMachinePowerStatePoweredOn,
 		},
 		Guest: &types.GuestInfo{
 			ToolsRunningStatus: string(types.VirtualMachineToolsRunningStatusGuestToolsRunning),
@@ -437,6 +438,30 @@ func TestPF06_Fail_CloneTaskInFlight(t *testing.T) {
 	}
 }
 
+// PF-06 degrades to a non-blocking warning when the task list cannot be read
+// (e.g. NoPermission from a service account that can read VM props but not the
+// task manager). It must NOT hard-block: the provision worker does not gate on
+// this check.
+func TestPF06_Warn_WhenTaskListUnreadable(t *testing.T) {
+	f := newFake()
+	f.vmProps["vm-1"] = vmWithHost("host-1")
+	f.taskErrors = map[string]error{
+		"vm-1": errors.New("read task infos: NoPermission"),
+	}
+	p := preflight.Params{SourceMoref: "vm-1", SourceType: models.TemplateSourceCloneVCenter}
+	r := preflight.RunAll(context.Background(), f, p)
+	pf06 := findResult(t, r, "PF-06")
+	if pf06.OK {
+		t.Fatal("PF-06 should report not-OK when the task list cannot be read")
+	}
+	if pf06.Severity != "warn" {
+		t.Fatalf("PF-06 should degrade to a non-blocking warn on read error; got severity %q", pf06.Severity)
+	}
+	if preflight.AnyBlockFailed(r) {
+		t.Fatal("an unreadable task list must not block provisioning (AnyBlockFailed should be false)")
+	}
+}
+
 // PF-07: VMware Tools present and running (clone-based only)
 
 func TestPF07_Pass(t *testing.T) {
@@ -450,17 +475,60 @@ func TestPF07_Pass(t *testing.T) {
 	}
 }
 
-// Negative control: tools status is "guestToolsNotRunning".
+// Negative control: powered-on source with tools not running still blocks.
 func TestPF07_Fail_ToolsNotRunning(t *testing.T) {
 	f := newFake()
-	vm := vmWithHost("host-1")
+	vm := vmWithHost("host-1") // powered on
 	vm.Guest.ToolsRunningStatus = string(types.VirtualMachineToolsRunningStatusGuestToolsNotRunning)
 	f.vmProps["vm-no-tools"] = vm
 	p := preflight.Params{SourceMoref: "vm-no-tools", SourceType: models.TemplateSourceCloneVCenter}
 	r := preflight.RunAll(context.Background(), f, p)
 	pf07 := findResult(t, r, "PF-07")
 	if pf07.OK {
-		t.Fatal("PF-07 should fail when VMware Tools is not running")
+		t.Fatal("PF-07 should fail when a powered-on source has VMware Tools not running")
+	}
+	if pf07.Severity != "block" {
+		t.Fatalf("a powered-on source with dead tools should block; got severity %q", pf07.Severity)
+	}
+}
+
+// A powered-off source (the normal template state) with tools installed passes
+// without requiring the tools daemon to be running.
+func TestPF07_PoweredOff_ToolsInstalled_Pass(t *testing.T) {
+	f := newFake()
+	vm := vmWithHost("host-1")
+	vm.Runtime.PowerState = types.VirtualMachinePowerStatePoweredOff
+	vm.Guest.ToolsRunningStatus = string(types.VirtualMachineToolsRunningStatusGuestToolsNotRunning)
+	vm.Guest.ToolsVersionStatus2 = string(types.VirtualMachineToolsVersionStatusGuestToolsCurrent)
+	f.vmProps["vm-off"] = vm
+	p := preflight.Params{SourceMoref: "vm-off", SourceType: models.TemplateSourceCloneVCenter}
+	r := preflight.RunAll(context.Background(), f, p)
+	pf07 := findResult(t, r, "PF-07")
+	if !pf07.OK {
+		t.Fatalf("PF-07 should pass for a powered-off source with tools installed; got Detail=%q", pf07.Detail)
+	}
+}
+
+// A powered-off source with no reported tools version degrades to a
+// non-blocking warning — it must never block provisioning.
+func TestPF07_PoweredOff_NotInstalled_Warn(t *testing.T) {
+	f := newFake()
+	vm := vmWithHost("host-1")
+	vm.Runtime.PowerState = types.VirtualMachinePowerStatePoweredOff
+	vm.Guest.ToolsRunningStatus = string(types.VirtualMachineToolsRunningStatusGuestToolsNotRunning)
+	vm.Guest.ToolsVersionStatus2 = "" // never reported
+	f.vmProps["vm-off-notools"] = vm
+	p := preflight.Params{SourceMoref: "vm-off-notools", SourceType: models.TemplateSourceCloneVCenter}
+	r := preflight.RunAll(context.Background(), f, p)
+	pf07 := findResult(t, r, "PF-07")
+	if pf07.OK {
+		t.Fatal("PF-07 should report not-OK when a powered-off source has no tools installed")
+	}
+	if pf07.Severity != "warn" {
+		t.Fatalf("a powered-off source without tools should warn, not block; got severity %q", pf07.Severity)
+	}
+	if preflight.AnyBlockFailed(r) {
+		t.Fatal("a powered-off source without tools must not block provisioning")
 	}
 }
 
