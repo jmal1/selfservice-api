@@ -54,7 +54,17 @@ type Result struct {
 type Params struct {
 	// SourceMoref is the vCenter managed-object reference of the source VM,
 	// e.g. "vm-1234". Required for clone-based checks (PF-01 … PF-07, PF-11).
+	// For clone_template drafts this is the moref the source template's
+	// Crucible UUID was resolved to — see templates.ResolveCloneSourceMoref —
+	// NOT the raw source_ref (which is a Crucible templates.id UUID).
 	SourceMoref string
+
+	// SourceResolveError, when non-empty, means the handler could not resolve
+	// the draft's source to a live vCenter moref before running the checks
+	// (e.g. a clone_template whose source template row has no vcenter linkage,
+	// or a source VM that was deleted). PF-01 reports it as a blocking failure
+	// so the instructor sees why the source could not be located.
+	SourceResolveError string
 
 	// TargetVMName is the intended name for the staging VM (PF-09).
 	TargetVMName string
@@ -191,6 +201,23 @@ func AnyBlockFailed(results []Result) bool {
 
 // --- individual check functions ---
 
+// cascadeIfSourceUnresolved returns a deterministic "Fix PF-01 first" failure
+// when a clone-based check has no resolved source moref. The moref-dependent
+// checks (PF-02 … PF-07, PF-11) must not depend on the vCenter call happening
+// to error on an empty moref: the real API does (NoPermission/NotFound), but a
+// fake — or a future client — may return an empty result instead, which would
+// let a check show a misleading green when the source could not be resolved.
+// Callers invoke this AFTER their ISO skip guard, so p.SourceMoref == "" here
+// only ever means "clone source failed to resolve" (see PF-01 for the reason).
+func cascadeIfSourceUnresolved(id, sev string, p Params) (Result, bool) {
+	if p.SourceMoref == "" {
+		return Result{ID: id, Severity: sev, OK: false,
+			Detail: "source VM moref is not resolved",
+			Fix:    "Fix PF-01 first."}, true
+	}
+	return Result{}, false
+}
+
 // pf01SourceResolves verifies the source VM moref resolves to a live
 // managed-object reference in vCenter.
 //
@@ -198,6 +225,18 @@ func AnyBlockFailed(results []Result) bool {
 // Does NOT catch disk corruption or transient clone failures.
 func pf01SourceResolves(ctx context.Context, vc PreflightVCenter, p Params) Result {
 	id, sev := "PF-01", "block"
+	if p.SourceType == models.TemplateSourceISO {
+		// ISO installs have no source VM to resolve; PF-10 validates the ISO
+		// file instead. Without this guard an ISO draft fails PF-01 forever
+		// ("source moref is empty").
+		return Result{ID: id, Severity: sev, OK: true,
+			Detail: "skipped: no source VM to resolve (ISO source); PF-10 validates the ISO file"}
+	}
+	if p.SourceResolveError != "" {
+		return Result{ID: id, Severity: sev, OK: false,
+			Detail: fmt.Sprintf("source VM reference could not be resolved: %s", p.SourceResolveError),
+			Fix:    "Verify the source template still points at a live VM in vCenter, or re-pick the source in the wizard draft step."}
+	}
 	if p.SourceMoref == "" {
 		return Result{ID: id, Severity: sev, OK: false,
 			Detail: "source moref is empty",
@@ -222,8 +261,11 @@ func pf01SourceResolves(ctx context.Context, vc PreflightVCenter, p Params) Resu
 // Does NOT catch: intermittent clone faults.
 func pf02ClusterHasResourcePool(ctx context.Context, vc PreflightVCenter, p Params) Result {
 	id, sev := "PF-02", "block"
-	if p.SourceMoref == "" {
+	if p.SourceType == models.TemplateSourceISO {
 		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: no source moref (ISO source)"}
+	}
+	if r, cascade := cascadeIfSourceUnresolved(id, sev, p); cascade {
+		return r
 	}
 	vm, err := vc.FetchVMProps(ctx, p.SourceMoref)
 	if err != nil {
@@ -276,8 +318,14 @@ func pf02ClusterHasResourcePool(ctx context.Context, vc PreflightVCenter, p Para
 // Catches: NFS mount dropped from one cluster, datastore name wrong.
 func pf03DatastoreMountedOnCluster(ctx context.Context, vc PreflightVCenter, p Params) Result {
 	id, sev := "PF-03", "block"
-	if p.SourceMoref == "" || p.DatastoreName == "" {
-		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: insufficient params"}
+	if p.SourceType == models.TemplateSourceISO {
+		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: no source moref (ISO source)"}
+	}
+	if p.DatastoreName == "" {
+		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: target datastore not configured"}
+	}
+	if r, cascade := cascadeIfSourceUnresolved(id, sev, p); cascade {
+		return r
 	}
 	vm, err := vc.FetchVMProps(ctx, p.SourceMoref)
 	if err != nil {
@@ -329,8 +377,14 @@ func pf03DatastoreMountedOnCluster(ctx context.Context, vc PreflightVCenter, p P
 // and the actual clone operation.
 func pf04DatastoreFreeSpace(ctx context.Context, vc PreflightVCenter, p Params) Result {
 	id, sev := "PF-04", "block"
-	if p.DatastoreName == "" || p.SourceMoref == "" {
-		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: insufficient params"}
+	if p.SourceType == models.TemplateSourceISO {
+		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: no source moref (ISO source)"}
+	}
+	if p.DatastoreName == "" {
+		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: target datastore not configured"}
+	}
+	if r, cascade := cascadeIfSourceUnresolved(id, sev, p); cascade {
+		return r
 	}
 	vm, err := vc.FetchVMProps(ctx, p.SourceMoref)
 	if err != nil {
@@ -370,8 +424,11 @@ func pf04DatastoreFreeSpace(ctx context.Context, vc PreflightVCenter, p Params) 
 // is impractical pre-clone and outside the scope of a synchronous check.
 func pf05DiskChainIntact(ctx context.Context, vc PreflightVCenter, p Params) Result {
 	id, sev := "PF-05", "block"
-	if p.SourceMoref == "" {
+	if p.SourceType == models.TemplateSourceISO {
 		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: no source moref (ISO source)"}
+	}
+	if r, cascade := cascadeIfSourceUnresolved(id, sev, p); cascade {
+		return r
 	}
 	vm, err := vc.FetchVMProps(ctx, p.SourceMoref)
 	if err != nil {
@@ -425,16 +482,38 @@ func pf05DiskChainIntact(ctx context.Context, vc PreflightVCenter, p Params) Res
 // source is already busy. It is a mitigation with UNKNOWN effectiveness —
 // it does not eliminate the race window between this check passing and the
 // clone actually starting. The retry-with-backoff lane handles the residual.
+//
+// Severity policy: PF-06 hard-blocks ONLY when it positively identifies an
+// interfering in-flight task (clone/consolidate/relocate) on the source VM.
+// If the task list cannot be read at all (e.g. the service account lacks the
+// privilege to enumerate tasks → NoPermission), PF-06 degrades to a
+// non-blocking warning: the provision worker does not gate on this check, so
+// an unreadable task list must not block a provision the system can perform.
 func pf06NoInFlightTasks(ctx context.Context, vc PreflightVCenter, p Params) Result {
 	id, sev := "PF-06", "block"
-	if p.SourceMoref == "" {
+	if p.SourceType == models.TemplateSourceISO {
 		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: no source moref (ISO source)"}
+	}
+	if r, cascade := cascadeIfSourceUnresolved(id, sev, p); cascade {
+		return r
 	}
 	tasks, err := vc.InFlightTasksForVM(ctx, p.SourceMoref)
 	if err != nil {
-		return Result{ID: id, Severity: sev, OK: false,
-			Detail: fmt.Sprintf("cannot read in-flight task list for VM %q: %v", p.SourceMoref, err),
-			Fix:    "Check vCenter connectivity."}
+		// Reading the task list is a best-effort mitigation, not a proven
+		// precondition (see the doc comment above). The most common failure
+		// here is a NoPermission fault: the vCenter service account can read
+		// VM/datastore/cluster properties (PF-01…PF-05 passed) but lacks the
+		// privilege to enumerate the TaskManager's tasks. When we cannot read
+		// the task list we cannot determine whether an interfering task is
+		// running — but the provision worker does not gate on this check and
+		// clones successfully regardless. Blocking here would prevent a
+		// provision the system can actually perform, so degrade to a
+		// non-blocking warning rather than a hard block.
+		return Result{ID: id, Severity: "warn", OK: false,
+			Detail: fmt.Sprintf("could not verify in-flight tasks for VM %q: %v", p.SourceMoref, err),
+			Fix: "Non-blocking — provisioning is not gated on this check. If this is a NoPermission " +
+				"error, grant the vCenter service account read access to tasks (a role with System.Read " +
+				"on the source VM and its parents) so PF-06 can detect concurrent clone/consolidate operations."}
 	}
 	// Filter to operations known to interfere with a concurrent clone.
 	var blocking []string
@@ -461,32 +540,73 @@ func pf06NoInFlightTasks(ctx context.Context, vc PreflightVCenter, p Params) Res
 		Detail: fmt.Sprintf("no interfering in-flight tasks for VM %q", p.SourceMoref)}
 }
 
-// pf07ToolsPresent checks that VMware Tools is installed and running on the
-// source VM. Applies to clone-based sources only; RunAll skips it for ISO.
+// pf07ToolsPresent checks VMware Tools on the source VM. Applies to clone-based
+// sources only; RunAll skips it for ISO.
 //
-// Catches: source VM missing open-vm-tools / VMware Tools, or the tools
-// service is stopped.
+// Template source VMs are normally powered OFF — they are not left running
+// idly — and a running tools daemon is neither observable on a powered-off VM
+// nor required for cloning. PF-07 is therefore power-state aware:
+//
+//   - Source powered OFF (the expected template state): verify tools are
+//     *installed* via the guest tools version status, which vCenter retains
+//     across power cycles. Installed → pass. Not installed / never reported →
+//     a NON-BLOCKING warning. It never hard-blocks a provision the worker can
+//     perform (the clone path does not require the source's tools to be running).
+//   - Source powered ON: require tools to be *running*; a powered-on source
+//     with a dead tools service is a genuine, blockable signal.
+//
+// Catches (powered on): source VM missing open-vm-tools / VMware Tools, or the
+// tools service is stopped.
 func pf07ToolsPresent(ctx context.Context, vc PreflightVCenter, p Params) Result {
 	id, sev := "PF-07", "block"
-	if p.SourceMoref == "" {
+	if p.SourceType == models.TemplateSourceISO {
 		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: no source moref"}
+	}
+	if r, cascade := cascadeIfSourceUnresolved(id, sev, p); cascade {
+		return r
 	}
 	vm, err := vc.FetchVMProps(ctx, p.SourceMoref)
 	if err != nil {
 		return Result{ID: id, Severity: sev, OK: false,
 			Detail: fmt.Sprintf("cannot read source VM properties: %v", err), Fix: "Fix PF-01 first."}
 	}
+
+	poweredOn := vm.Runtime.PowerState == types.VirtualMachinePowerStatePoweredOn
+
+	// Installed status derives from the tools version status, which vCenter
+	// retains even while the VM is powered off. Empty means vCenter has never
+	// received a guest report (e.g. the VM has never been powered on).
+	var versionStatus string
+	if vm.Guest != nil {
+		versionStatus = vm.Guest.ToolsVersionStatus2
+	}
+	installed := versionStatus != "" &&
+		versionStatus != string(types.VirtualMachineToolsVersionStatusGuestToolsNotInstalled)
+
+	if !poweredOn {
+		// Powered-off is the expected state for a template source. Never block:
+		// running-tools state is not observable and provisioning does not need it.
+		if installed {
+			return Result{ID: id, Severity: sev, OK: true,
+				Detail: fmt.Sprintf("VMware Tools is installed (version status: %q); source VM is powered off (expected for template sources), so running status is not checked", versionStatus)}
+		}
+		return Result{ID: id, Severity: "warn", OK: false,
+			Detail: "source VM is powered off and VMware Tools does not appear installed (no guest tools version reported); clones may lack guest tools",
+			Fix:    "Non-blocking. If clones need guest tools, power the source on once with open-vm-tools / VMware Tools installed so vCenter records the tools version, then power off."}
+	}
+
+	// Powered on: a live source should have tools running.
 	if vm.Guest == nil {
 		return Result{ID: id, Severity: sev, OK: false,
-			Detail: "vCenter returned no guest info (VM may be powered off)",
-			Fix:    "Power on the source VM and wait for VMware Tools to report running, or confirm tools are installed."}
+			Detail: "source VM is powered on but vCenter returned no guest info",
+			Fix:    "Ensure open-vm-tools or VMware Tools is installed and running on the source VM."}
 	}
 	const running = string(types.VirtualMachineToolsRunningStatusGuestToolsRunning)
 	if vm.Guest.ToolsRunningStatus != running {
 		return Result{ID: id, Severity: sev, OK: false,
-			Detail: fmt.Sprintf("VMware Tools running status is %q (want %q)",
+			Detail: fmt.Sprintf("source VM is powered on but VMware Tools running status is %q (want %q)",
 				vm.Guest.ToolsRunningStatus, running),
-			Fix: `Start the source VM, ensure open-vm-tools or VMware Tools is installed and enabled, and wait for status to reach "guestToolsRunning".`}
+			Fix: `Ensure open-vm-tools or VMware Tools is installed and enabled, and wait for status to reach "guestToolsRunning".`}
 	}
 	return Result{ID: id, Severity: sev, OK: true,
 		Detail: fmt.Sprintf("VMware Tools is running (version status: %q)", vm.Guest.ToolsVersionStatus2)}
@@ -595,8 +715,14 @@ func pf10ISOExists(ctx context.Context, vc PreflightVCenter, p Params) Result {
 // false positive for DVS environments.
 func pf11PortGroupOnAllHosts(ctx context.Context, vc PreflightVCenter, p Params) Result {
 	id, sev := "PF-11", "warn"
-	if p.StagingPortGroup == "" || p.SourceMoref == "" {
-		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: insufficient params"}
+	if p.SourceType == models.TemplateSourceISO {
+		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: no source moref (ISO source)"}
+	}
+	if p.StagingPortGroup == "" {
+		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: no staging port group configured"}
+	}
+	if r, cascade := cascadeIfSourceUnresolved(id, sev, p); cascade {
+		return r
 	}
 	vm, err := vc.FetchVMProps(ctx, p.SourceMoref)
 	if err != nil {

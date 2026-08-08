@@ -149,72 +149,48 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 		return fmt.Errorf("template %s not found", payload.TemplateID)
 	}
 	if tmpl.TemplateState != models.TemplateStateProvisioning {
+		// Idempotency guard. A prior or duplicate provision job for this
+		// template may have already advanced it past 'provisioning' (e.g. a
+		// retry cycle, or the worker re-running a job). Re-cloning would just
+		// churn vCenter and the losing job would then corrupt the healthy
+		// template — so treat "already provisioned" as success instead of
+		// surfacing a spurious "Provision failed" to the operator.
+		if templateProvisionedBeyond(tmpl.TemplateState) {
+			p.logger.Info("template already past provisioning; treating duplicate provision job as no-op",
+				"template_id", payload.TemplateID, "state", tmpl.TemplateState)
+			return nil
+		}
 		return fmt.Errorf("template %s is in state %q, expected %q",
 			payload.TemplateID, tmpl.TemplateState, models.TemplateStateProvisioning)
 	}
 
 	// Source dispatch.
 	//
-	// IMPORTANT: source_ref semantics depend on source_type. Historically
-	// this branch treated both as a raw moref, which silently broke the
-	// clone_template flow because the UI submits the *Crucible templates.id
-	// UUID* — not a vCenter moref. We now resolve clone_template's UUID
-	// to a real moref by looking up the source template row and using
-	// its vCenter VM ID (preferred, set by a prior wizard run) or its
-	// vcenter_template name (fallback for legacy/static templates).
-	var sourceMoref string
-	switch payload.SourceType {
-	case models.TemplateSourceCloneTemplate:
-		if payload.SourceRef == "" {
-			return p.markTemplateError(ctx, payload.TemplateID, fmt.Errorf("source_ref required for source_type=%s", payload.SourceType))
-		}
-		sourceTemplateID, parseErr := uuid.Parse(payload.SourceRef)
-		if parseErr != nil {
-			return p.markTemplateError(ctx, payload.TemplateID,
-				fmt.Errorf("source_ref %q is not a valid Crucible template UUID for source_type=clone_template: %w", payload.SourceRef, parseErr))
-		}
-		srcTmpl, srcErr := p.db.GetTemplateByID(ctx, sourceTemplateID)
-		if srcErr != nil {
-			return p.markTemplateError(ctx, payload.TemplateID, fmt.Errorf("load source template %s: %w", sourceTemplateID, srcErr))
-		}
-		if srcTmpl == nil {
-			return p.markTemplateError(ctx, payload.TemplateID, fmt.Errorf("source template %s not found", sourceTemplateID))
-		}
-		switch {
-		case srcTmpl.VCenterVMID != "":
-			sourceMoref = srcTmpl.VCenterVMID
-			p.logger.Info("resolved clone_template source via VCenterVMID",
-				"source_template_id", sourceTemplateID, "moref", sourceMoref)
-		case srcTmpl.VCenterTemplate != "":
-			resolved, rerr := p.vc.ResolveVMByName(ctx, srcTmpl.VCenterTemplate)
-			if rerr != nil {
-				return p.markTemplateError(ctx, payload.TemplateID,
-					fmt.Errorf("resolve source template %q to vCenter moref: %w", srcTmpl.VCenterTemplate, rerr))
-			}
-			sourceMoref = resolved
-			p.logger.Info("resolved clone_template source via vCenterTemplate name",
-				"source_template_id", sourceTemplateID, "vcenter_template", srcTmpl.VCenterTemplate, "moref", sourceMoref)
-		default:
-			return p.markTemplateError(ctx, payload.TemplateID,
-				fmt.Errorf("source template %s has neither vcenter_vm_id nor vcenter_template set; cannot resolve to a vCenter VM", sourceTemplateID))
-		}
-	case models.TemplateSourceCloneVCenter:
-		if payload.SourceRef == "" {
-			return p.markTemplateError(ctx, payload.TemplateID, fmt.Errorf("source_ref required for source_type=%s", payload.SourceType))
-		}
-		sourceMoref = payload.SourceRef
-	case models.TemplateSourceISO:
-		// ISO installs diverge completely from the clone flow (create a blank
-		// VM, optionally attach a generated seed ISO, run the installer, then
-		// wait on a *long* deadline), so they get their own dependency-injected
-		// core rather than falling through to the clone steps below. It does its
-		// own error-state marking, so we return its result verbatim.
+	// ISO installs diverge completely from the clone flow (create a blank
+	// VM, optionally attach a generated seed ISO, run the installer, then
+	// wait on a *long* deadline), so they get their own dependency-injected
+	// core rather than falling through to the clone steps below. It does its
+	// own error-state marking, so we return its result verbatim.
+	if payload.SourceType == models.TemplateSourceISO {
 		return provisionTemplateFromISO(ctx, p.vc, p.db, p.pipeline, p.logger,
 			func(step, message string) { p.publishProgress(job.ID, step, message) }, payload)
-	default:
-		return p.markTemplateError(ctx, payload.TemplateID,
-			fmt.Errorf("unknown source_type %q (must be one of clone_template, clone_vcenter, iso)", payload.SourceType))
 	}
+
+	// clone_template / clone_vcenter: resolve the source to a live vCenter
+	// moref via the SAME helper preflight uses, so the two can never diverge.
+	//
+	// source_ref semantics depend on source_type. clone_vcenter's source_ref
+	// is already a moref; clone_template's is a *Crucible templates.id UUID*
+	// (not a moref) — the resolver loads that row and uses its vcenter_vm_id
+	// (preferred, set by a prior wizard run) or vcenter_template name
+	// (fallback). Treating the UUID as a moref is the bug this shares-a-helper
+	// design exists to prevent — see internal/templates/source_resolve.go.
+	sourceMoref, resolveErr := templates.ResolveCloneSourceMoref(ctx, p.db, p.vc, payload.SourceType, payload.SourceRef)
+	if resolveErr != nil {
+		return p.markTemplateError(ctx, payload.TemplateID, resolveErr)
+	}
+	p.logger.Info("resolved template clone source",
+		"source_type", payload.SourceType, "source_ref", payload.SourceRef, "moref", sourceMoref)
 
 	// Step 1: clone (idempotent — returns existing moref if name collision)
 	//
@@ -226,6 +202,12 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 	// replica (values.yaml replicaCount.worker: 1).
 	p.publishProgress(job.ID, "create_vm", fmt.Sprintf("Cloning source VM %s → %s", sourceMoref, payload.VMName))
 	releaseLock := p.acquireCloneLock(sourceMoref)
+	// For clone_with_customize sources, inject the draft's default_password
+	// as first-boot guest customization so the staging VM's student / Student
+	// account comes up with the credentials the wizard tells the instructor
+	// to use. Non-customized sources carry real credentials in the image, so
+	// we leave these empty and clone the source contents verbatim.
+	cloneOSType, clonePassword := stagingCloneCredentials(tmpl)
 	moref, err := p.vc.CloneTemplateSourceVM(ctx, vcenter.TemplateCloneParams{
 		SourceMoref: sourceMoref,
 		VMName:      payload.VMName,
@@ -233,6 +215,8 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 		Network:     payload.StagingNetwork,
 		VCPUs:       payload.VCPUs,
 		RAMmb:       payload.RAMmb,
+		OSType:      cloneOSType,
+		Password:    clonePassword,
 	})
 	releaseLock()
 	if err != nil {
@@ -270,10 +254,42 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 	// Step 6: advance to 'configuring' so the instructor can start setup
 	p.publishProgress(job.ID, "update_state", "Marking template as configuring")
 	if err := p.transitionTemplate(ctx, payload.TemplateID, models.TemplateStateProvisioning, models.TemplateStateConfiguring); err != nil {
+		// If a duplicate/concurrent job already advanced this template out of
+		// 'provisioning', our clone is redundant but harmless — do NOT flip the
+		// now-healthy template to 'error'. Report success so the losing job is
+		// marked completed rather than turning a working provision into a
+		// visible failure.
+		if errors.Is(err, database.ErrTemplateStale) {
+			if fresh, gerr := p.db.GetTemplateByID(ctx, payload.TemplateID); gerr == nil && fresh != nil &&
+				templateProvisionedBeyond(fresh.TemplateState) {
+				p.logger.Info("provisioning→configuring lost the race to a concurrent job; template already advanced",
+					"template_id", payload.TemplateID, "state", fresh.TemplateState)
+				return nil
+			}
+		}
 		return p.markTemplateError(ctx, payload.TemplateID, fmt.Errorf("advance to configuring: %w", err))
 	}
 
 	return nil
+}
+
+// templateProvisionedBeyond reports whether a template state is at or past the
+// point a successful provision reaches (i.e. the staging clone exists and the
+// template is in or beyond 'configuring'). Used to make ProvisionTemplate
+// idempotent: a duplicate/late provision job for such a template is a no-op
+// success, not a failure. 'error' and the pre-provision states are excluded so
+// a genuinely failed or not-yet-provisioned template still fails loudly.
+func templateProvisionedBeyond(state string) bool {
+	switch state {
+	case models.TemplateStateConfiguring,
+		models.TemplateStateGeneralizing,
+		models.TemplateStateReady,
+		models.TemplateStateVerifying,
+		models.TemplateStateActive:
+		return true
+	default:
+		return false
+	}
 }
 
 // isoInstallToolsTimeout bounds how long the unattended-install path waits for
