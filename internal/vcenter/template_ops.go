@@ -50,12 +50,30 @@ type TemplateCloneParams struct {
 	// source's values are preserved.
 	VCPUs int32
 	RAMmb int64
+
+	// OSType ("linux" / "windows") and Password drive first-boot guest
+	// customization. When Password is non-empty and OSType is a known OS,
+	// the clone injects guestinfo.userdata / guestinfo.metadata (via
+	// guestinfoCustomization) so the staging VM's default account
+	// (student / Student) comes up with this password set.
+	//
+	// This is what makes the wizard's "log into the staging VM with the
+	// supplied credentials" step actually work for clone_with_customize
+	// sources, whose cloud-init `student` account has NO baked-in password
+	// (it is set per-clone). Leave Password empty for non-customized
+	// sources, which carry real credentials in the image already.
+	OSType   string
+	Password string
 }
 
 // CloneTemplateSourceVM clones a source VM into the templates folder.
-// Unlike CloneVM, this does NOT inject cloud-init data — the resulting
-// VM is exactly the source contents with the requested hardware
-// adjustments and a NIC on the staging network. Returns the new VM's
+//
+// For clone_with_customize sources the caller passes OSType + Password so the
+// clone injects first-boot guest customization (guestinfoCustomization) — the
+// source image's cloud-init `student` account has no baked-in password, so
+// without this the staging VM would boot with no usable login. When Password
+// is empty the resulting VM is exactly the source contents with the requested
+// hardware adjustments and a NIC on the staging network. Returns the new VM's
 // moref.
 //
 // If a VM with the requested name already exists in the target folder
@@ -215,6 +233,17 @@ func (c *Client) cloneTemplateSourceVMInner(ctx context.Context, params Template
 		if params.RAMmb > 0 {
 			cloneSpec.Config.MemoryMB = params.RAMmb
 		}
+	}
+
+	// Inject first-boot guest customization (password + hostname) for
+	// customized clones. guestinfoCustomization returns nil when Password is
+	// empty or OSType is unknown, so non-customized clones are untouched.
+	// Shared with the per-pod clone path so the two cannot drift.
+	if extra := guestinfoCustomization(params.OSType, params.Password, params.VMName); len(extra) > 0 {
+		if cloneSpec.Config == nil {
+			cloneSpec.Config = &types.VirtualMachineConfigSpec{}
+		}
+		cloneSpec.Config.ExtraConfig = append(cloneSpec.Config.ExtraConfig, extra...)
 	}
 
 	task, err := source.Clone(ctx, folder, params.VMName, cloneSpec)

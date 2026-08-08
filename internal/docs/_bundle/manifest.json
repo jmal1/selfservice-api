@@ -2,6 +2,7 @@
   "seeds": [
     "docs/instructor/overview.md",
     "docs/instructor/templates.md",
+    "docs/instructor/os-recipes.md",
     "docs/instructor/playlists.md",
     "AGENTS.md",
     "docs/ai-prompts/build-workflow.md",
@@ -99,10 +100,40 @@
       "from_seed": false
     },
     {
+      "path": "docs/instructor/os-recipes.md",
+      "title": "Per-OS Template Build Recipes",
+      "size": 38144,
+      "sha256": "7558b6574a601862b6b680203aae01ded6cf6fca7ac49d17ff5e9ce4fceddbfe",
+      "is_markdown": true,
+      "links_out": [
+        "docs/instructor/glossary.md",
+        "docs/instructor/overview.md",
+        "docs/instructor/templates.md",
+        "docs/instructor/templates.md",
+        "docs/instructor/templates.md",
+        "docs/instructor/templates.md",
+        "docs/instructor/templates.md",
+        "docs/instructor/templates.md",
+        "docs/instructor/templates.md",
+        "docs/instructor/templates.md",
+        "docs/instructor/templates.md",
+        "docs/instructor/templates.md",
+        "docs/instructor/templates.md",
+        "docs/instructor/templates.md",
+        "docs/instructor/templates.md",
+        "docs/instructor/templates.md",
+        "docs/instructor/templates.md",
+        "docs/instructor/templates.md",
+        "docs/instructor/templates.md",
+        "docs/instructor/templates.md"
+      ],
+      "from_seed": true
+    },
+    {
       "path": "docs/instructor/overview.md",
       "title": "Crucible for Instructors — Overview",
-      "size": 8212,
-      "sha256": "ccfced2490f4b58bfe4f4dd270fb774c9977d13c1cc3301f740f2a16b0689419",
+      "size": 8307,
+      "sha256": "d13e8283bdcbdd56632628da54d4e81715ec7aceccd12ea8b323e340893b0434",
       "is_markdown": true,
       "links_out": [
         "AGENTS.md",
@@ -110,6 +141,7 @@
         "AGENTS.md",
         "docs/instructor/actions.md",
         "docs/instructor/glossary.md",
+        "docs/instructor/os-recipes.md",
         "docs/instructor/playlists.md",
         "docs/instructor/runner-environment.md",
         "docs/instructor/runner-environment.md",
@@ -151,11 +183,12 @@
     {
       "path": "docs/instructor/templates.md",
       "title": "Building a Template",
-      "size": 37902,
-      "sha256": "c065ca400d59eca80c237c42787d8ce53b8c623544f510e13f005a50a7ac88f5",
+      "size": 38289,
+      "sha256": "e34a79cea188207489f82a0cf02b88b7f9bf7bb9fe4bfdffe4e3aedca7b9317b",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/glossary.md",
+        "docs/instructor/os-recipes.md",
         "docs/instructor/overview.md",
         "docs/instructor/overview.md",
         "docs/instructor/troubleshooting.md",
@@ -291,5 +324,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 253921
+  "total_bytes": 292547
 }

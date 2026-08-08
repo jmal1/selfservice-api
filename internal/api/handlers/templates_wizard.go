@@ -16,8 +16,6 @@ package handlers
 import (
 	"bytes"
 	stdcontext "context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -338,7 +336,7 @@ func (h *Handler) AdminProvisionTemplate(w http.ResponseWriter, r *http.Request)
 
 	// Build the target VM name up front so PF-09 (name-free check) can
 	// verify it before the job is enqueued.
-	vmName := buildTemplateVMName(tmpl.Name)
+	vmName := buildTemplateVMName(tmpl.Name, tmpl.ID)
 
 	// Preflight gate. If vcPreflight is nil (not configured), the gate is a
 	// no-op and provisioning proceeds unchanged.
@@ -935,8 +933,17 @@ func isBuildState(state string) bool {
 
 // buildTemplateVMName produces a vCenter-safe VM name from the template's
 // human-readable name: lower-case, alphanumeric-or-dash, with a 6-char
-// random suffix for uniqueness within the Templates folder.
-func buildTemplateVMName(humanName string) string {
+// suffix DERIVED FROM THE TEMPLATE ID.
+//
+// The suffix is deterministic (first 6 hex of the template UUID) on purpose.
+// It used to be random, which meant every Provision/Retry cycle produced a
+// *new* staging VM name; the idempotent clone therefore cloned a fresh VM on
+// each retry and orphaned the previous one in the Templates folder. With a
+// stable name, a retry reuses the same staging VM (CloneTemplateSourceVM
+// returns the existing moref on a name collision), so a template can only ever
+// have one staging VM — no orphans, and no two concurrent jobs racing to clone
+// different VMs from the same source.
+func buildTemplateVMName(humanName string, templateID uuid.UUID) string {
 	slug := strings.ToLower(humanName)
 	slug = vmNameSlugRe.ReplaceAllString(slug, "-")
 	slug = strings.Trim(slug, "-")
@@ -946,9 +953,11 @@ func buildTemplateVMName(humanName string) string {
 	if len(slug) > 40 {
 		slug = slug[:40]
 	}
-	suffix := make([]byte, 3)
-	_, _ = rand.Read(suffix)
-	return fmt.Sprintf("tpl-%s-%s", slug, hex.EncodeToString(suffix))
+	suffix := strings.ReplaceAll(templateID.String(), "-", "")
+	if len(suffix) > 6 {
+		suffix = suffix[:6]
+	}
+	return fmt.Sprintf("tpl-%s-%s", slug, suffix)
 }
 
 func ifNonEmpty(s, msg string) string {
