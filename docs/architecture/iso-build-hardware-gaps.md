@@ -135,7 +135,7 @@ seed ISO the pipeline generates (`internal/unattend/windows.go` →
 slot and no VMware Tools media mounted. So neither a `windowsPE` driver-injection
 that reads the Tools ISO **nor** the manual **Load driver** fallback has anything
 to point at today without a pipeline change. This is why LSI SAS (Option 2) is
-the pragmatic recommendation.
+the pragmatic fix — now shipped in #122 for Server guest IDs.
 
 ### Option 1 — slipstream the VMware pvscsi driver into the seed media
 
@@ -157,7 +157,7 @@ OS (on the VMware Tools installer ISO layout):
   maintain. The manual **Load driver** fallback also only works once some Tools
   media is mounted, which likewise needs a pipeline change.
 
-### Option 2 — use LSI SAS for Server guest IDs *(recommended)*
+### Option 2 — use LSI SAS for Server guest IDs *(recommended — **DONE**, shipped in #122)*
 
 For Server guest IDs, build the shell with an **LSI SAS** controller instead of
 pvscsi. LSI SAS has an in-box Windows driver, so Setup sees the disk with no
@@ -174,24 +174,23 @@ slipstreaming and no extra mounted media.
   10/11 on pvscsi still needs Option 1 (or an LSI SAS shell of its own) to be
   fully hands-off.
 
-**Recommendation:** implement **Option 2** for Server now — branch
-`blankVMDevices` to use `CreateSCSIController("lsilogic-sas")` when `p.GuestID` is
-a Windows **Server** identifier (`windows9Server64Guest` for WS2016,
-`windows2019srv_64Guest` for WS2019, `windows2019srvNext_64Guest` for WS2022,
-`windows2022srvNext_64Guest` for WS2025, and older `windows*srv*` /
-`windows*Server*` IDs), keeping pvscsi for Linux. For **client** Windows
-(`windows9_64Guest`, `windows11_64Guest`) either extend the LSI SAS branch or
-land Option 1's driver-staging — pick one before publishing a Win10/Win11 ISO
-template. This is a contained change in `blankVMDevices`
-(`internal/vcenter/template_ops.go`) with a unit test asserting the controller
-type per guest-ID family.
+**DONE (shipped in #122):** `blankVMDevices` now branches to
+`CreateSCSIController("lsilogic-sas")` when `p.GuestID` is a Windows **Server**
+identifier — the `isWindowsServerGuestID` helper matches `windows9Server64Guest`
+(WS2016), `windows2019srv_64Guest` (WS2019), `windows2019srvNext_64Guest`
+(WS2022), and `windows2022srvNext_64Guest` (WS2025) — keeping pvscsi for Linux
+and for **client** Windows (`windows9_64Guest`, `windows11_64Guest`). A vcsim
+unit test asserts Server IDs → one LSI SAS controller with the disk attached and
+non-Server IDs → pvscsi. **Client** Windows 10/11 therefore still build on pvscsi
+and keep the manual **Load driver** fallback until a future **Option 1**
+(seed-staged pvscsi driver) lands. Cite: `blankVMDevices` in
+`internal/vcenter/template_ops.go`.
 
-**TODO (follow-up):** the controller-selection branch is small and safe, but it
-changes VM-shape assertions that existing `template_ops` / provisioner tests may
-encode, so it's specced here rather than bundled into this docs PR. Land it as a
-focused change with its own test:
-`internal/vcenter/template_ops.go` → `blankVMDevices` guest-ID branch +
-`internal/vcenter` test for the controller type.
+**Status:** landed in #122 as a focused, separately-tested change —
+`internal/vcenter/template_ops.go` `blankVMDevices` guest-ID branch +
+`isWindowsServerGuestID` helper + a vcsim test asserting the controller type per
+guest-ID family. A future **Option 1** would extend hands-off disk visibility to
+client Windows (Win10/Win11), which stay on pvscsi today.
 
 ---
 
@@ -200,7 +199,7 @@ focused change with its own test:
 | Gap | Works-now mitigation | Durable fix | Recommended path |
 |-----|----------------------|-------------|------------------|
 | **A** — no vTPM / Secure Boot (blocks Win11) | LabConfig registry bypass in `autounattend.xml` `windowsPE` pass — **DONE (#121):** the generator now emits it automatically, gated to `windows11_64Guest` | Optional vTPM + Secure Boot on the blank shell via a Key Provider + Cryptographer perms | **(i) shipped (#121)**, **(ii)** later |
-| **B** — pvscsi disk invisible to Windows Setup (all SKUs; Server hit hardest in field) | Use LSI SAS controller for Server guest IDs, or stage the pvscsi driver on the seed ISO + a `windowsPE` `PnpCustomizationsWinPE` block | LSI SAS for Server guest IDs in `blankVMDevices` (client Windows needs LSI SAS too, or Option 1 driver-staging) | **Option 2 (LSI SAS)** |
+| **B** — pvscsi disk invisible to Windows Setup (all SKUs; Server hit hardest in field) | LSI SAS controller for Server guest IDs — **DONE (#122):** `blankVMDevices` builds Server shells on LSI SAS automatically; client Win10/11 keep the manual Load-driver fallback | Option 1 (seed-staged pvscsi driver) to make client Windows hands-off too | **Option 2 shipped (#122)**; Option 1 later |
 
 Both fixes touch `internal/vcenter/template_ops.go` (`CreateBlankVM` /
 `blankVMDevices`); Gap A option (i) additionally touches the Windows answer-file
