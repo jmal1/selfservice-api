@@ -65,6 +65,11 @@ type autounattendData struct {
 	TimeZone        string
 	Username        string
 	EncodedPassword string
+
+	// BypassWin11HardwareChecks, when true, emits a windowsPE pass that writes
+	// the HKLM\SYSTEM\Setup\LabConfig Bypass* values before disk selection so
+	// Windows 11 Setup skips its TPM/Secure Boot/RAM/storage/CPU gates.
+	BypassWin11HardwareChecks bool
 }
 
 // buildAutounattendXML renders the autounattend.xml document for s.
@@ -75,10 +80,11 @@ func buildAutounattendXML(s Spec) (string, error) {
 	}
 
 	data := autounattendData{
-		ComputerName:    html.EscapeString(computerName),
-		TimeZone:        html.EscapeString(windowsTimeZone(s.TimeZone)),
-		Username:        html.EscapeString(s.Username),
-		EncodedPassword: encodeWindowsPassword(s.Password, "Password"),
+		ComputerName:              html.EscapeString(computerName),
+		TimeZone:                  html.EscapeString(windowsTimeZone(s.TimeZone)),
+		Username:                  html.EscapeString(s.Username),
+		EncodedPassword:           encodeWindowsPassword(s.Password, "Password"),
+		BypassWin11HardwareChecks: s.BypassWin11HardwareChecks,
 	}
 
 	var buf bytes.Buffer
@@ -110,7 +116,46 @@ func buildAutounattendISO(s Spec) (name string, data []byte, err error) {
 // not scrub them.
 var autounattendTemplate = template.Must(template.New("autounattend").Parse(`<?xml version="1.0" encoding="utf-8"?>
 <unattend xmlns="urn:schemas-microsoft-com:unattend">
-
+{{if .BypassWin11HardwareChecks}}
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-Deployment" processorArchitecture="amd64"
+      publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+      xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>cmd /c reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassTPMCheck /t REG_DWORD /d 1 /f</Path>
+          <Description>Win11 setup bypass: TPM check</Description>
+          <WillReboot>Never</WillReboot>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Path>cmd /c reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassSecureBootCheck /t REG_DWORD /d 1 /f</Path>
+          <Description>Win11 setup bypass: Secure Boot check</Description>
+          <WillReboot>Never</WillReboot>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Path>cmd /c reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassRAMCheck /t REG_DWORD /d 1 /f</Path>
+          <Description>Win11 setup bypass: RAM check</Description>
+          <WillReboot>Never</WillReboot>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>4</Order>
+          <Path>cmd /c reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassStorageCheck /t REG_DWORD /d 1 /f</Path>
+          <Description>Win11 setup bypass: storage check</Description>
+          <WillReboot>Never</WillReboot>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>5</Order>
+          <Path>cmd /c reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassCPUCheck /t REG_DWORD /d 1 /f</Path>
+          <Description>Win11 setup bypass: CPU check</Description>
+          <WillReboot>Never</WillReboot>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+  </settings>
+{{end}}
   <settings pass="specialize">
     <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64"
       publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"

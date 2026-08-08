@@ -42,7 +42,7 @@ neither, an unmodified Windows 11 `windows_autounattend` build stops at
 all Server SKUs covered in the recipes are unaffected — they install fine on the
 vTPM-less EFI shell.
 
-### Option (i) — autounattend LabConfig bypass *(recommended, works now, doc-only)*
+### Option (i) — autounattend LabConfig bypass *(recommended — **DONE**, shipped in #121)*
 
 Add a `windowsPE`-pass `RunSynchronous` block to `autounattend.xml` that writes
 the `HKLM\SYSTEM\Setup\LabConfig` bypass values before Setup touches the disk:
@@ -63,25 +63,27 @@ The full XML snippet is in the Windows 11 recipe
 
 - **Pros:** zero infrastructure change; no Key Provider, no host crypto config,
   no new template field. Works on the exact shell we build today.
-- **Cons:** the generated answer file must carry the block. Crucible's generator
+- **Status — handled automatically (ref #121).** Crucible's generator
   (`internal/unattend/windows.go` + `internal/provisioner/assets/windows-unattend.xml`)
-  currently emits only the `specialize` and `oobeSystem` passes — **not**
-  `windowsPE` — so today a Win11 build needs the block added to the generated
-  `autounattend.xml` out of band (admin-assisted). It's a functional
+  now emits the `windowsPE` LabConfig block **automatically** whenever the build
+  targets Windows 11, so a Win11 build no longer needs the block added out of
+  band. Win10 and Server answer files are unchanged. It remains a functional
   install-time bypass, not a security posture we'd ship to production Windows;
   for a throwaway lab image that's acceptable.
 
-**TODO (follow-up, low-risk):** teach the Windows answer-file generator to append
-the `windowsPE` LabConfig block **only** when the target is Windows 11. Gating is
-important: the block is unnecessary on Win10/Server and adding a `windowsPE`
+**DONE (shipped in #121):** the Windows answer-file generator now appends the
+`windowsPE` LabConfig block **only** when the target is Windows 11. Gating
+matters: the block is unnecessary on Win10/Server and adding a `windowsPE`
 `Microsoft-Windows-Setup` component unconditionally would change every Windows
 build's answer file (and its golden test vector in
-`internal/unattend/unattend_test.go`). A clean gate needs a per-build signal that
-the generator doesn't have today — the `Spec` carries no OS/version — so this is
-left as a spec rather than implemented here. Cheapest wiring: pass the template's
-Guest OS ID / an `is_win11` bool into the unattend `Spec`, branch on it in
-`buildAutounattendXML`, and add a test asserting the block is present for Win11
-and absent otherwise.
+`internal/unattend/unattend_test.go`). The implemented wiring: the caller
+(`internal/provisioner/template_jobs.go`) sets a `BypassWin11HardwareChecks`
+bool on the unattend `Spec` when `payload.GuestID == "windows11_64Guest"`, and
+`internal/unattend/windows.go` branches on it in the answer-file template. The
+`{{if}}` whitespace is crafted so the flag-off answer file is byte-identical to
+today, so only Win11 vectors change. Tests assert the five ordered LabConfig
+keys appear before `specialize` for Win11 and are absent (identical header)
+otherwise.
 
 ### Option (ii) — add optional vTPM + Secure Boot to the blank shell *(cleaner, follow-up)*
 
@@ -106,8 +108,8 @@ must target `windows11_64Guest`.)
   the generalize/clone paths must tolerate. Higher blast radius than a doc-only
   answer-file tweak.
 
-**Recommendation:** ship **(i)** now (doc + a gated generator change when
-convenient); pursue **(ii)** as the durable fix once a Key Provider is
+**Recommendation:** **(i) is shipped** (#121 — the gated generator change is
+live, plus this doc); pursue **(ii)** as the durable fix once a Key Provider is
 provisioned and we're ready to require it. Cite: `blankVMDevices` /
 `CreateBlankVM` in `internal/vcenter/template_ops.go`.
 
@@ -197,7 +199,7 @@ focused change with its own test:
 
 | Gap | Works-now mitigation | Durable fix | Recommended path |
 |-----|----------------------|-------------|------------------|
-| **A** — no vTPM / Secure Boot (blocks Win11) | LabConfig registry bypass in `autounattend.xml` `windowsPE` pass (doc-only today; gated generator change is the low-risk follow-up) | Optional vTPM + Secure Boot on the blank shell via a Key Provider + Cryptographer perms | **(i)** now, **(ii)** later |
+| **A** — no vTPM / Secure Boot (blocks Win11) | LabConfig registry bypass in `autounattend.xml` `windowsPE` pass — **DONE (#121):** the generator now emits it automatically, gated to `windows11_64Guest` | Optional vTPM + Secure Boot on the blank shell via a Key Provider + Cryptographer perms | **(i) shipped (#121)**, **(ii)** later |
 | **B** — pvscsi disk invisible to Windows Setup (all SKUs; Server hit hardest in field) | Use LSI SAS controller for Server guest IDs, or stage the pvscsi driver on the seed ISO + a `windowsPE` `PnpCustomizationsWinPE` block | LSI SAS for Server guest IDs in `blankVMDevices` (client Windows needs LSI SAS too, or Option 1 driver-staging) | **Option 2 (LSI SAS)** |
 
 Both fixes touch `internal/vcenter/template_ops.go` (`CreateBlankVM` /

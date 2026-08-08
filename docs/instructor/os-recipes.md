@@ -532,23 +532,29 @@ commands before setup partitions the disk):
 ```
 
 > [!note]
-> **Where this snippet lives.** Crucible generates the Windows answer file for
-> you today, and it does **not** yet include this `windowsPE` block (the
-> generator only writes the `specialize` and `oobeSystem` passes). Until it does,
-> a Windows 11 ISO build needs this block added to the generated
-> `autounattend.xml`, and the file must sit at the **root** of the removable/seed
-> volume. This is tracked as **Gap A** in the engineering note
-> `docs/architecture/iso-build-hardware-gaps.md` — read it before attempting a
-> Win11 template, and coordinate with an admin so the seed disc carries the
-> bypass. The alternative long-term fix (give the shell a real vTPM + Secure
-> Boot) is **Gap A option (ii)** in that note.
+> **Where this snippet lives — now automatic.** As of **PR #121**, Crucible's
+> Windows answer-file generator emits this `windowsPE` LabConfig block **for you
+> automatically** whenever the template's Guest OS ID is `windows11_64Guest`, so
+> you no longer hand-add it. Win10 (`windows9_64Guest`) and every Windows Server
+> answer file stay byte-identical — the block is gated strictly on the Win11
+> guest ID, and the existing `specialize` + `oobeSystem` passes (and the encoded
+> password) are untouched. The generated `autounattend.xml` still sits at the
+> **root** of the removable/seed volume.
+> _Fallback:_ if you are building on an **older api image that predates #121**,
+> the generator will not include the block — add it to the generated
+> `autounattend.xml` by hand and coordinate with an admin so the seed disc
+> carries it. This is **Gap A** in the engineering note
+> `docs/architecture/iso-build-hardware-gaps.md` (option (i), now **DONE** —
+> ref #121); the durable long-term fix (give the shell a real vTPM + Secure
+> Boot) is **Gap A option (ii)** there.
 
 **Steps**
 
 1. Fill the form per the table and click **Create draft**.
-2. Ensure the generated `autounattend.xml` includes the `windowsPE` LabConfig
-   block above (see the note — this may need admin help until the generator adds
-   it).
+2. On a current api image the generator already includes the `windowsPE`
+   LabConfig block for `windows11_64Guest` (see the note), so no manual step is
+   needed; on an older image predating #121, add the block by hand
+   (admin-assisted).
 3. Click **Provision**. With the bypass in place, Setup installs unattended. If
    Setup shows **no disks**, that's the pvscsi issue — either (a) click
    **Load driver** and browse the VMware Tools CD to the `pvscsi` folder, or

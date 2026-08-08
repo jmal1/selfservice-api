@@ -559,6 +559,11 @@ func unattendSpecFromPayload(payload TemplateProvisionPayload) (unattend.Spec, e
 		}
 	}
 	spec.Mode = payload.UnattendMode
+	// Windows 11 Setup hard-stops without TPM 2.0 + Secure Boot, but Crucible's
+	// blank ISO-install shells carry neither. Gate the LabConfig bypass strictly
+	// on the Win11 guest ID so Windows 10 (windows9_64Guest) and every Server
+	// guest ID keep producing byte-identical answer files.
+	spec.BypassWin11HardwareChecks = payload.GuestID == "windows11_64Guest"
 	return spec, nil
 }
 
