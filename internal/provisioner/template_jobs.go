@@ -191,6 +191,12 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 	// replica (values.yaml replicaCount.worker: 1).
 	p.publishProgress(job.ID, "create_vm", fmt.Sprintf("Cloning source VM %s → %s", sourceMoref, payload.VMName))
 	releaseLock := p.acquireCloneLock(sourceMoref)
+	// For clone_with_customize sources, inject the draft's default_password
+	// as first-boot guest customization so the staging VM's student / Student
+	// account comes up with the credentials the wizard tells the instructor
+	// to use. Non-customized sources carry real credentials in the image, so
+	// we leave these empty and clone the source contents verbatim.
+	cloneOSType, clonePassword := stagingCloneCredentials(tmpl)
 	moref, err := p.vc.CloneTemplateSourceVM(ctx, vcenter.TemplateCloneParams{
 		SourceMoref: sourceMoref,
 		VMName:      payload.VMName,
@@ -198,6 +204,8 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 		Network:     payload.StagingNetwork,
 		VCPUs:       payload.VCPUs,
 		RAMmb:       payload.RAMmb,
+		OSType:      cloneOSType,
+		Password:    clonePassword,
 	})
 	releaseLock()
 	if err != nil {
