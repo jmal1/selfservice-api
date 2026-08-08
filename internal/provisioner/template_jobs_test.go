@@ -125,6 +125,38 @@ func TestIsExpectedShutdownErr(t *testing.T) {
 	}
 }
 
+// TestTemplateProvisionedBeyond guards the idempotency gate that keeps a
+// duplicate/late provision job from (a) failing loudly when the template has
+// already been provisioned, or (b) flipping a healthy configuring template to
+// error when it loses the provisioning→configuring race. Only the pre-clone
+// states and 'error' must be treated as "not yet provisioned".
+func TestTemplateProvisionedBeyond(t *testing.T) {
+	beyond := []string{
+		models.TemplateStateConfiguring,
+		models.TemplateStateGeneralizing,
+		models.TemplateStateReady,
+		models.TemplateStateVerifying,
+		models.TemplateStateActive,
+	}
+	for _, s := range beyond {
+		if !templateProvisionedBeyond(s) {
+			t.Errorf("state %q should count as provisioned-beyond", s)
+		}
+	}
+	notBeyond := []string{
+		models.TemplateStateDraft,
+		models.TemplateStateProvisioning,
+		models.TemplateStateError,
+		"",
+		"bogus",
+	}
+	for _, s := range notBeyond {
+		if templateProvisionedBeyond(s) {
+			t.Errorf("state %q must NOT count as provisioned-beyond", s)
+		}
+	}
+}
+
 // TestTemplateProvisionPayload_JSONRoundTrip locks in the wire shape of
 // the job payload. Changes here cascade to the API handlers that build
 // the payload AND to any in-flight jobs at the time of deploy, so this

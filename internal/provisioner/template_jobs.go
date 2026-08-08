@@ -149,6 +149,17 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 		return fmt.Errorf("template %s not found", payload.TemplateID)
 	}
 	if tmpl.TemplateState != models.TemplateStateProvisioning {
+		// Idempotency guard. A prior or duplicate provision job for this
+		// template may have already advanced it past 'provisioning' (e.g. a
+		// retry cycle, or the worker re-running a job). Re-cloning would just
+		// churn vCenter and the losing job would then corrupt the healthy
+		// template — so treat "already provisioned" as success instead of
+		// surfacing a spurious "Provision failed" to the operator.
+		if templateProvisionedBeyond(tmpl.TemplateState) {
+			p.logger.Info("template already past provisioning; treating duplicate provision job as no-op",
+				"template_id", payload.TemplateID, "state", tmpl.TemplateState)
+			return nil
+		}
 		return fmt.Errorf("template %s is in state %q, expected %q",
 			payload.TemplateID, tmpl.TemplateState, models.TemplateStateProvisioning)
 	}
@@ -243,10 +254,42 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 	// Step 6: advance to 'configuring' so the instructor can start setup
 	p.publishProgress(job.ID, "update_state", "Marking template as configuring")
 	if err := p.transitionTemplate(ctx, payload.TemplateID, models.TemplateStateProvisioning, models.TemplateStateConfiguring); err != nil {
+		// If a duplicate/concurrent job already advanced this template out of
+		// 'provisioning', our clone is redundant but harmless — do NOT flip the
+		// now-healthy template to 'error'. Report success so the losing job is
+		// marked completed rather than turning a working provision into a
+		// visible failure.
+		if errors.Is(err, database.ErrTemplateStale) {
+			if fresh, gerr := p.db.GetTemplateByID(ctx, payload.TemplateID); gerr == nil && fresh != nil &&
+				templateProvisionedBeyond(fresh.TemplateState) {
+				p.logger.Info("provisioning→configuring lost the race to a concurrent job; template already advanced",
+					"template_id", payload.TemplateID, "state", fresh.TemplateState)
+				return nil
+			}
+		}
 		return p.markTemplateError(ctx, payload.TemplateID, fmt.Errorf("advance to configuring: %w", err))
 	}
 
 	return nil
+}
+
+// templateProvisionedBeyond reports whether a template state is at or past the
+// point a successful provision reaches (i.e. the staging clone exists and the
+// template is in or beyond 'configuring'). Used to make ProvisionTemplate
+// idempotent: a duplicate/late provision job for such a template is a no-op
+// success, not a failure. 'error' and the pre-provision states are excluded so
+// a genuinely failed or not-yet-provisioned template still fails loudly.
+func templateProvisionedBeyond(state string) bool {
+	switch state {
+	case models.TemplateStateConfiguring,
+		models.TemplateStateGeneralizing,
+		models.TemplateStateReady,
+		models.TemplateStateVerifying,
+		models.TemplateStateActive:
+		return true
+	default:
+		return false
+	}
 }
 
 // isoInstallToolsTimeout bounds how long the unattended-install path waits for
