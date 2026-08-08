@@ -24,6 +24,7 @@ import (
 // the integration suite.
 
 func TestBuildTemplateVMName(t *testing.T) {
+	tid := uuid.MustParse("61684ed3-d083-4095-aefe-fd4cfcf188ae")
 	tests := []struct {
 		name     string
 		input    string
@@ -38,7 +39,7 @@ func TestBuildTemplateVMName(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := buildTemplateVMName(tt.input)
+			got := buildTemplateVMName(tt.input, tid)
 			if !strings.HasPrefix(got, tt.wantStem) {
 				t.Errorf("buildTemplateVMName(%q) = %q; want prefix %q",
 					tt.input, got, tt.wantStem)
@@ -61,14 +62,25 @@ func TestBuildTemplateVMName(t *testing.T) {
 	}
 }
 
-func TestBuildTemplateVMNameUnique(t *testing.T) {
-	seen := map[string]bool{}
+// The suffix is derived from the template ID, so repeated calls for the SAME
+// template must yield the SAME name (this is what lets a retry reuse the
+// existing staging VM instead of orphaning it), while different templates get
+// different suffixes.
+func TestBuildTemplateVMNameDeterministic(t *testing.T) {
+	tid := uuid.MustParse("61684ed3-d083-4095-aefe-fd4cfcf188ae")
+	first := buildTemplateVMName("collision-test", tid)
 	for i := 0; i < 100; i++ {
-		name := buildTemplateVMName("collision-test")
-		if seen[name] {
-			t.Fatalf("buildTemplateVMName produced duplicate %q on iter %d", name, i)
+		if got := buildTemplateVMName("collision-test", tid); got != first {
+			t.Fatalf("buildTemplateVMName not stable for same template: %q vs %q on iter %d", got, first, i)
 		}
-		seen[name] = true
+	}
+	if want := "tpl-collision-test-61684e"; first != want {
+		t.Errorf("buildTemplateVMName = %q; want %q (first 6 hex of template ID)", first, want)
+	}
+
+	other := buildTemplateVMName("collision-test", uuid.MustParse("00000000-1111-2222-3333-444444444444"))
+	if other == first {
+		t.Errorf("different templates produced the same VM name %q", first)
 	}
 }
 

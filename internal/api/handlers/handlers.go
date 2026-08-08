@@ -20,6 +20,7 @@ import (
 	"github.com/jmal1/selfservice-api/internal/middleware"
 	"github.com/jmal1/selfservice-api/internal/models"
 	events "github.com/jmal1/selfservice-api/internal/nats"
+	"github.com/jmal1/selfservice-api/internal/templates"
 	"github.com/jmal1/selfservice-api/internal/vcenter"
 	"github.com/jmal1/selfservice-api/internal/vcenter/preflight"
 )
@@ -72,6 +73,12 @@ type Handler struct {
 	// AdminPreflightTemplate returns 503 and the provision gate is skipped.
 	vcPreflight  PreflightVCenter
 	preflightCfg PreflightConfig
+
+	// vcResolver resolves a clone_template source (a Crucible templates.id
+	// UUID) to a live vCenter moref, mirroring the provision worker. Set from
+	// the vCenter client in WithPreflightVCenter when it supports name
+	// resolution; nil in tests that inject a resolver-less fake.
+	vcResolver templates.VMNameResolver
 }
 
 type imageUploadMetrics interface {
@@ -248,6 +255,12 @@ type PreflightVCenter = preflight.PreflightVCenter
 func (h *Handler) WithPreflightVCenter(vc PreflightVCenter, cfg PreflightConfig) *Handler {
 	h.vcPreflight = vc
 	h.preflightCfg = cfg
+	// The production vCenter client can resolve a source template's inventory
+	// name to a moref; a resolver-less test fake cannot. Capture it when
+	// present so clone_template preflight resolves exactly like the worker.
+	if r, ok := vc.(templates.VMNameResolver); ok {
+		h.vcResolver = r
+	}
 	return h
 }
 

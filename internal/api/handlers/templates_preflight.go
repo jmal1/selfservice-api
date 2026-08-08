@@ -25,6 +25,7 @@ package handlers
 // RoleInstructor, but the handler explicitly checks for RoleAdmin.
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -35,6 +36,7 @@ import (
 	"github.com/jmal1/selfservice-api/internal/audit"
 	"github.com/jmal1/selfservice-api/internal/middleware"
 	"github.com/jmal1/selfservice-api/internal/models"
+	"github.com/jmal1/selfservice-api/internal/templates"
 	"github.com/jmal1/selfservice-api/internal/vcenter/preflight"
 )
 
@@ -66,7 +68,7 @@ func (h *Handler) AdminPreflightTemplate(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "template not found", http.StatusNotFound)
 		return
 	}
-	params := h.buildPreflightParams(tmpl, "")
+	params := h.buildPreflightParams(r.Context(), tmpl, "")
 	results := preflight.RunAll(r.Context(), h.vcPreflight, params)
 	respondJSON(w, http.StatusOK, map[string]any{
 		"template_id":      tmpl.ID,
@@ -102,7 +104,7 @@ func (h *Handler) runPreflightGate(w http.ResponseWriter, r *http.Request, tmpl 
 		return nil, false
 	}
 
-	params := h.buildPreflightParams(tmpl, vmName)
+	params := h.buildPreflightParams(r.Context(), tmpl, vmName)
 	results = preflight.RunAll(r.Context(), h.vcPreflight, params)
 
 	if !preflight.AnyBlockFailed(results) {
@@ -160,30 +162,43 @@ func (h *Handler) runPreflightGate(w http.ResponseWriter, r *http.Request, tmpl 
 
 // buildPreflightParams assembles a preflight.Params from the template row and
 // the handler's configured preflight config.
-func (h *Handler) buildPreflightParams(tmpl *models.Template, vmName string) preflight.Params {
+//
+// The source reference is resolved to a live vCenter moref via the SAME helper
+// the provision worker uses (templates.ResolveCloneSourceMoref). This matters
+// most for clone_template drafts, whose source_ref is a Crucible templates.id
+// UUID — NOT a vCenter moref. Feeding that UUID straight to vCenter as a moref
+// was the original bug that failed preflight on sources the worker could clone.
+// If resolution fails, the reason is threaded into Params.SourceResolveError so
+// PF-01 reports it as a blocking failure instead of a raw vCenter fault.
+func (h *Handler) buildPreflightParams(ctx context.Context, tmpl *models.Template, vmName string) preflight.Params {
 	p := preflight.Params{
-		TargetVMName:  vmName,
-		DatastoreName: h.preflightCfg.DatastoreName,
-		StagingPortGroup: tmpl.StagingNetwork,
-		SourceType:    tmpl.SourceType,
-		GuestUsername: tmpl.DefaultUsername,
-		GuestPassword: tmpl.DefaultPassword,
+		TargetVMName:                vmName,
+		DatastoreName:               h.preflightCfg.DatastoreName,
+		StagingPortGroup:            tmpl.StagingNetwork,
+		SourceType:                  tmpl.SourceType,
+		GuestUsername:               tmpl.DefaultUsername,
+		GuestPassword:               tmpl.DefaultPassword,
 		ConfiguredResourcePoolPaths: h.preflightCfg.ConfiguredResourcePoolPaths,
-		TargetFolderPath: h.preflightCfg.TemplateFolder,
+		TargetFolderPath:            h.preflightCfg.TemplateFolder,
 	}
 
-	switch tmpl.SourceType {
-	case models.TemplateSourceCloneVCenter:
-		p.SourceMoref = tmpl.SourceRef
-	case models.TemplateSourceCloneTemplate:
-		// source_ref holds the Crucible template UUID; the vcenter_vm_id
-		// of that template row is the actual moref. At draft time the wizard
-		// stores the source template's vcenter_vm_id in source_ref when the
-		// source is clone_template. We use it directly here.
-		p.SourceMoref = tmpl.SourceRef
-	case models.TemplateSourceISO:
+	if tmpl.SourceType == models.TemplateSourceISO {
 		p.ISORef = tmpl.SourceRef
+		return p
 	}
 
+	// clone_template / clone_vcenter: resolve source_ref to a live moref.
+	// Use a genuine nil interface (not a typed-nil *database.Queries) when the
+	// DB is not wired, so the resolver can detect it rather than panic.
+	var getter templates.TemplateByIDGetter
+	if h.db != nil {
+		getter = h.db
+	}
+	moref, err := templates.ResolveCloneSourceMoref(ctx, getter, h.vcResolver, tmpl.SourceType, tmpl.SourceRef)
+	if err != nil {
+		p.SourceResolveError = err.Error()
+	} else {
+		p.SourceMoref = moref
+	}
 	return p
 }

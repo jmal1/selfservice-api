@@ -30,7 +30,28 @@ func shouldGenerateGuestPassword(kind, osType string) bool {
 	return osType == "linux" || osType == "windows"
 }
 
-// resolvePodVMCredentials returns the (username, password) tuple that
+// stagingCloneCredentials returns the (osType, password) that the template
+// wizard's staging clone should inject as first-boot guest customization.
+//
+// Only clone_with_customize sources on a known OS get an injected password:
+// their cloud-init / cloudbase-init `student` account has NO baked-in password
+// (it is set per-clone via guestinfo), so without injection the staging VM
+// boots with no usable login and the instructor cannot log in with the
+// credentials the wizard surfaces. Non-customized sources carry real
+// credentials in the image already, so both return values are empty and the
+// clone copies the source verbatim.
+//
+// Pure so it can be unit-tested without a database or vCenter.
+func stagingCloneCredentials(tmpl *models.Template) (osType, password string) {
+	if tmpl == nil {
+		return "", ""
+	}
+	if !shouldGenerateGuestPassword(tmpl.Kind, tmpl.OSType) {
+		return "", ""
+	}
+	return tmpl.OSType, tmpl.DefaultPassword
+}
+
 // should be persisted on the pod_vms row after a successful clone.
 //
 //   - clone_with_customize: the generated password is authoritative; the
