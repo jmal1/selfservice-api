@@ -52,6 +52,91 @@ func TestShouldGenerateGuestPassword(t *testing.T) {
 	}
 }
 
+func TestStagingCloneCredentials(t *testing.T) {
+	tests := []struct {
+		name     string
+		tmpl     *models.Template
+		wantOS   string
+		wantPass string
+	}{
+		{
+			name: "clone_with_customize linux injects default_password",
+			tmpl: &models.Template{
+				Kind:            models.TemplateKindCloneWithCustomize,
+				OSType:          "linux",
+				DefaultPassword: "Changeme123!",
+			},
+			wantOS:   "linux",
+			wantPass: "Changeme123!",
+		},
+		{
+			name: "clone_with_customize windows injects default_password",
+			tmpl: &models.Template{
+				Kind:            models.TemplateKindCloneWithCustomize,
+				OSType:          "windows",
+				DefaultPassword: "Changeme123!",
+			},
+			wantOS:   "windows",
+			wantPass: "Changeme123!",
+		},
+		{
+			name: "empty kind defaults to customized and injects",
+			tmpl: &models.Template{
+				Kind:            "",
+				OSType:          "linux",
+				DefaultPassword: "Changeme123!",
+			},
+			wantOS:   "linux",
+			wantPass: "Changeme123!",
+		},
+		{
+			name: "clone_no_customize does not inject (source carries real creds)",
+			tmpl: &models.Template{
+				Kind:            models.TemplateKindCloneNoCustomize,
+				OSType:          "linux",
+				DefaultPassword: "Changeme123!",
+			},
+			wantOS:   "",
+			wantPass: "",
+		},
+		{
+			name: "registered_existing_vm does not inject",
+			tmpl: &models.Template{
+				Kind:            models.TemplateKindRegisteredExistingVM,
+				OSType:          "windows",
+				DefaultPassword: "Changeme123!",
+			},
+			wantOS:   "",
+			wantPass: "",
+		},
+		{
+			name: "unknown OS does not inject",
+			tmpl: &models.Template{
+				Kind:            models.TemplateKindCloneWithCustomize,
+				OSType:          "freebsd",
+				DefaultPassword: "Changeme123!",
+			},
+			wantOS:   "",
+			wantPass: "",
+		},
+		{
+			name:     "nil template is safe",
+			tmpl:     nil,
+			wantOS:   "",
+			wantPass: "",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotOS, gotPass := stagingCloneCredentials(tc.tmpl)
+			if gotOS != tc.wantOS || gotPass != tc.wantPass {
+				t.Fatalf("stagingCloneCredentials() = (%q,%q), want (%q,%q)",
+					gotOS, gotPass, tc.wantOS, tc.wantPass)
+			}
+		})
+	}
+}
+
 func TestResolvePodVMCredentials(t *testing.T) {
 	tmplWithDefaults := &models.Template{
 		DefaultUsername: "admin",
@@ -60,13 +145,13 @@ func TestResolvePodVMCredentials(t *testing.T) {
 	tmplBlank := &models.Template{}
 
 	tests := []struct {
-		name        string
-		kind        string
-		osType      string
-		generated   string
-		tmpl        *models.Template
-		wantUser    string
-		wantPass    string
+		name      string
+		kind      string
+		osType    string
+		generated string
+		tmpl      *models.Template
+		wantUser  string
+		wantPass  string
 	}{
 		{
 			name:      "clone_with_customize linux uses generated",
