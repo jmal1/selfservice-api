@@ -387,12 +387,16 @@ Linux.
 > IDE CD-ROMs — the installer ISO and the autounattend **seed** ISO — and the
 > seed ISO the pipeline builds carries *only* `autounattend.xml` (no driver
 > files). So there is currently **no mounted VMware Tools CD** for either the
-> `windowsPE` injection or the **Load driver** fallback to point at. Until the
-> pipeline stages the pvscsi driver (see **Gap B** in
-> `docs/architecture/iso-build-hardware-gaps.md`), the reliable fix for a Server
-> build that can't see its disk is to give the shell an **LSI SAS** controller
-> (which *does* have an in-box Windows driver). Coordinate that with an admin —
-> it is a code/shell change, not a wizard field.
+> `windowsPE` injection or the **Load driver** fallback to point at.
+>
+> **Windows Server builds are handled automatically (as of #122).** Crucible now
+> builds **Server** shells on an **LSI SAS** controller (which *does* have an
+> in-box Windows driver), so Server Setup sees the disk with no action from you —
+> no Load-driver step, no admin involvement. **Client** Windows 10 / 11 still
+> build on pvscsi, so they can still hit "no drives"; use the manual **Load
+> driver** fallback above for those until the pipeline stages the pvscsi driver
+> (Option 1) — see **Gap B** in
+> `docs/architecture/iso-build-hardware-gaps.md`.
 
 <a id="fully-patch-before-sysprep"></a>
 > [!warning]
@@ -590,16 +594,14 @@ gray screen) and logs in with its per-pod password. See the shared
 
 ### 7. Windows Server 2016
 
-> [!warning]
-> **Storage-driver caveat.** Server 2016 Setup has no in-box pvscsi driver, so it
-> may show *"We couldn't find any drives"* on Crucible's pvscsi shell — this is
-> the same universal issue described in
-> [the Windows storage-driver note](#windows-storage-driver-pvscsi). Because the
-> pipeline mounts no VMware Tools CD, the practical fix for a Server build is the
-> **LSI SAS** controller (**Gap B** in
-> `docs/architecture/iso-build-hardware-gaps.md`), which is an admin/code step,
-> not a wizard field. If a Tools CD *is* mounted, its pvscsi driver for this OS is
-> in `…\pvscsi\Win8\amd64`.
+> [!note]
+> **Storage driver — handled automatically (as of #122).** Server 2016 Setup has
+> no in-box pvscsi driver, so on a plain pvscsi shell it would show *"We couldn't
+> find any drives"*. Crucible now builds **Server** shells on an **LSI SAS**
+> controller (in-box Windows driver), so `windows9Server64Guest` Setup sees the
+> disk with no action — see **Gap B** (Option 2, **DONE**) in
+> `docs/architecture/iso-build-hardware-gaps.md`. No Load-driver step or wizard
+> field is needed.
 
 | Wizard field | Value |
 |--------------|-------|
@@ -617,9 +619,9 @@ gray screen) and logs in with its per-pod password. See the shared
 | **Unattended → Password** | `Changeme123!` |
 | **Generalize method** | sysprep /generalize (automatic) |
 
-**Steps** — same as Windows 10 (Provision → configure → Generalize → Publish),
-but if Setup can't see the disk, stop and arrange the LSI SAS controller fix
-from Gap B before retrying.
+**Steps** — same as Windows 10 (Provision → configure → Generalize → Publish).
+Setup sees the disk automatically because Server shells build on LSI SAS (Gap B,
+Option 2, #122) — no Load-driver step needed.
 
 > [!note]
 > If your vCenter's **Guest OS ID** dropdown doesn't list `windows9Server64Guest`,
@@ -651,9 +653,8 @@ template reaches `active`. See the shared
 | **Generalize method** | sysprep /generalize (automatic) |
 
 **Steps** — identical to Windows 10: Provision → (optional) configure →
-Generalize → Publish. If Setup shows no disk, apply the Gap B controller fix from
-[the Windows storage-driver note](#windows-storage-driver-pvscsi) (Tools pvscsi
-driver for WS2019 is `…\pvscsi\Win8\amd64`).
+Generalize → Publish. Setup sees the disk automatically — Server shells build on
+LSI SAS (Gap B, Option 2, #122), so no Load-driver step is needed.
 
 **You're done when…** the template reaches `active` and a test deploy logs in as
 `Student` with the per-pod password. See the shared
@@ -680,9 +681,8 @@ driver for WS2019 is `…\pvscsi\Win8\amd64`).
 | **Generalize method** | sysprep /generalize (automatic) |
 
 **Steps** — identical to Windows 10: Provision → (optional) configure →
-Generalize → Publish. If Setup shows no disk, apply the Gap B controller fix from
-[the Windows storage-driver note](#windows-storage-driver-pvscsi) (Tools pvscsi
-driver for WS2022 is `…\pvscsi\Win10\amd64`).
+Generalize → Publish. Setup sees the disk automatically — Server shells build on
+LSI SAS (Gap B, Option 2, #122), so no Load-driver step is needed.
 
 **You're done when…** the template reaches `active` and a test deploy logs in as
 `Student` with the per-pod password. See the shared
@@ -723,9 +723,8 @@ driver for WS2022 is `…\pvscsi\Win10\amd64`).
   errors out when scripted, drive it from **Settings → Windows Update** (or
   `UsoClient StartInstall`) rather than a scripted COM call, which can fail on
   WS2025.
-- Storage: if Setup can't see the disk, apply the Gap B controller fix from
-  [the Windows storage-driver note](#windows-storage-driver-pvscsi) (Tools pvscsi
-  driver for WS2025 is `…\pvscsi\Win10\amd64`).
+- Storage: no action needed — Server shells build on LSI SAS automatically
+  (Gap B, Option 2, #122), so Setup sees the disk without a Load-driver step.
 - **Guest OS ID fallback:** if your ESXi 8.0 build's dropdown doesn't offer
   `windows2022srvNext_64Guest` yet, fall back to `windows2019srvNext_64Guest`
   (Server 2022's ID) — the install still works; only optimization hints differ.
