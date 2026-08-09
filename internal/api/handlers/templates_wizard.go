@@ -184,6 +184,28 @@ func (h *Handler) AdminCreateTemplateDraft(w http.ResponseWriter, r *http.Reques
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// Guest OS ID is only meaningful for an ISO build (the clone paths inherit
+	// the source VM's guest OS). Requiring and shape-checking it here turns the
+	// opaque provision-time "guest ID required" vCenter fault into a clear,
+	// early 400 — the failure an instructor hit following the Mint recipe when
+	// the wizard shipped no way to set it. Validation is deliberately wide (see
+	// models.ValidGuestID): any catalog OS or any "<name>Guest"-shaped custom
+	// identifier is accepted, so uncommon or future OSes still work.
+	if req.SourceType == models.TemplateSourceISO {
+		req.GuestID = strings.TrimSpace(req.GuestID)
+		if req.GuestID == "" {
+			http.Error(w,
+				`guest_id is required for an ISO build — pick a Guest OS in the wizard (e.g. "ubuntu64Guest" for Ubuntu/Mint, "debian12_64Guest" for Debian, "windows11_64Guest" for Windows 11). See GET /admin/templates/guest-os-catalog for the full list.`,
+				http.StatusBadRequest)
+			return
+		}
+		if !models.ValidGuestID(req.GuestID) {
+			http.Error(w,
+				fmt.Sprintf(`guest_id %q is not a valid vSphere guest OS identifier; it must look like "<name>Guest" (e.g. "ubuntu64Guest", "debian12_64Guest", "windows11_64Guest"). See GET /admin/templates/guest-os-catalog for the full list.`, req.GuestID),
+				http.StatusBadRequest)
+			return
+		}
+	}
 	unattendConfig, err := normalizeUnattendConfig(req.UnattendConfig)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)

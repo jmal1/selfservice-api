@@ -27,8 +27,13 @@ with **"You're done when…"** so you know it worked.
   **Install mode**; the four choices are `manual`, `cloudinit_cidata`,
   `debian_preseed`, `windows_autounattend`.
 - **Guest OS ID** — a short code (like `ubuntu64Guest`) that tells VMware which
-  operating system it's building. The wizard field is **Guest OS ID**. Copy the
-  exact code from the recipe; a wrong one can make the installer misbehave.
+  operating system it's building. In the wizard this is the **Guest OS**
+  dropdown: pick the entry whose name matches your OS and Crucible fills in the
+  code for you. Each recipe below lists the exact code so you can confirm the
+  right dropdown entry. If your OS isn't in the list, choose **Other
+  (advanced)** at the bottom of the dropdown and type the code from the recipe
+  by hand — any valid `…Guest` code is accepted, so uncommon or brand-new OSes
+  still work.
 - **Generalize** — the wizard button that cleans the finished VM so every
   student gets a unique copy. What "clean" means differs per OS; each recipe
   says which method applies.
