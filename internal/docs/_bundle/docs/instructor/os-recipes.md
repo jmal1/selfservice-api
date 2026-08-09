@@ -109,7 +109,7 @@ over-allocate.
 |--------------|-------|
 | **OS family** | `Linux` |
 | **Source type** | `ISO install` |
-| **ISO** | Pick the Ubuntu **Server** 24.04 LTS ISO (e.g. `ubuntu-24.04-live-server-amd64.iso`) |
+| **ISO** | Pick the Ubuntu **Server** 24.04 LTS ISO — in this lab it is `ubuntu-24.04.3-live-server-amd64.iso` |
 | **Install mode** | `cloudinit_cidata` |
 | **Guest OS ID** | `ubuntu64Guest` |
 | **vCPUs** | `2` |
@@ -158,7 +158,7 @@ line should look right without you touching anything.
 |--------------|-------|
 | **OS family** | `Linux` |
 | **Source type** | `ISO install` |
-| **ISO** | Pick the Ubuntu **Desktop** 24.04 LTS ISO (e.g. `ubuntu-24.04-desktop-amd64.iso`) |
+| **ISO** | Pick the Ubuntu **Desktop** 24.04 LTS ISO — in this lab it is `ubuntu-24.04.3-desktop-amd64.iso` |
 | **Install mode** | `cloudinit_cidata` |
 | **Guest OS ID** | `ubuntu64Guest` |
 | **vCPUs** | `2` |
@@ -225,7 +225,7 @@ deploy logs in with the *per-pod* password from the pod page. See the shared
 |--------------|-------|
 | **OS family** | `Linux` |
 | **Source type** | `ISO install` |
-| **ISO** | Pick the Debian 12 (or 13) netinst/DVD ISO (e.g. `debian-12.x.0-amd64-netinst.iso`) |
+| **ISO** | Pick the Debian 12 (or 13) netinst/DVD ISO (e.g. `debian-12.x.0-amd64-netinst.iso`). **Not yet in this lab's ISO library — ask an admin to upload it first** (see *Missing ISOs* at the bottom). |
 | **Install mode** | `manual` |
 | **Guest OS ID** | `debian12_64Guest` for Debian 12 · `debian13_64Guest` for Debian 13 |
 | **vCPUs** | `2` |
@@ -292,7 +292,7 @@ reaches `active`. See the shared
 |--------------|-------|
 | **OS family** | `Linux` |
 | **Source type** | `ISO install` |
-| **ISO** | Pick the Linux Mint 22.x **MATE** ISO (e.g. `linuxmint-22-mate-64bit.iso`) |
+| **ISO** | Pick the Linux Mint 22.x **MATE** ISO — in this lab it is `linuxmint-22.3-mate-64bit.iso` |
 | **Install mode** | `manual` |
 | **Guest OS ID** | `ubuntu64Guest` (Mint 22 is built on Ubuntu 24.04) |
 | **vCPUs** | `2` |
@@ -420,7 +420,7 @@ Linux.
 |--------------|-------|
 | **OS family** | `Windows` |
 | **Source type** | `ISO install` |
-| **ISO** | Pick the Windows 10 Pro x64 ISO (e.g. `Win10_22H2_x64.iso`) |
+| **ISO** | Pick the Windows 10 Pro x64 ISO — in this lab it is `Windows10.iso` |
 | **Install mode** | `windows_autounattend` |
 | **Guest OS ID** | `windows9_64Guest` |
 | **vCPUs** | `2` |
@@ -470,7 +470,7 @@ Linux.
 |--------------|-------|
 | **OS family** | `Windows` |
 | **Source type** | `ISO install` |
-| **ISO** | Pick the Windows 11 Pro x64 ISO (e.g. `Win11_23H2_x64.iso`) |
+| **ISO** | Pick the Windows 11 Pro x64 ISO — in this lab it is `Win11_25H2_English_x64.iso` |
 | **Install mode** | `windows_autounattend` |
 | **Guest OS ID** | `windows11_64Guest` |
 | **vCPUs** | `2` |
@@ -612,7 +612,7 @@ gray screen) and logs in with its per-pod password. See the shared
 |--------------|-------|
 | **OS family** | `Windows` |
 | **Source type** | `ISO install` |
-| **ISO** | Pick the Windows Server 2016 x64 ISO (e.g. `WinServer2016_x64.iso`) |
+| **ISO** | Pick the Windows Server 2016 x64 ISO (e.g. `WinServer2016_x64.iso`). **Not yet in this lab's ISO library — ask an admin to upload it first** (see *Missing ISOs* at the bottom). |
 | **Install mode** | `windows_autounattend` |
 | **Guest OS ID** | `windows9Server64Guest` (Windows Server 2016; shares the Windows 10 kernel, so the ID says "windows9Server") |
 | **vCPUs** | `2` |
@@ -645,7 +645,7 @@ template reaches `active`. See the shared
 |--------------|-------|
 | **OS family** | `Windows` |
 | **Source type** | `ISO install` |
-| **ISO** | Pick the Windows Server 2019 x64 ISO (e.g. `WinServer2019_x64.iso`) |
+| **ISO** | Pick the Windows Server 2019 x64 ISO (e.g. `WinServer2019_x64.iso`). **Not yet in this lab's ISO library — ask an admin to upload it first** (see *Missing ISOs* at the bottom). |
 | **Install mode** | `windows_autounattend` |
 | **Guest OS ID** | `windows2019srv_64Guest` |
 | **vCPUs** | `2` |
@@ -673,7 +673,7 @@ LSI SAS (Gap B, Option 2, #122), so no Load-driver step is needed.
 |--------------|-------|
 | **OS family** | `Windows` |
 | **Source type** | `ISO install` |
-| **ISO** | Pick the Windows Server 2022 x64 ISO (e.g. `WinServer2022_x64.iso`) |
+| **ISO** | Pick the Windows Server 2022 x64 ISO — in this lab it is `WindowsServer2022.iso` |
 | **Install mode** | `windows_autounattend` |
 | **Guest OS ID** | `windows2019srvNext_64Guest` ⚠️ ("2019**Next**" = Server 2022, **not** 2019) |
 | **vCPUs** | `2` |
@@ -701,7 +701,7 @@ LSI SAS (Gap B, Option 2, #122), so no Load-driver step is needed.
 |--------------|-------|
 | **OS family** | `Windows` |
 | **Source type** | `ISO install` |
-| **ISO** | Pick the Windows Server 2025 x64 ISO (e.g. `WinServer2025_x64.iso`) |
+| **ISO** | Pick the Windows Server 2025 x64 ISO — in this lab it is `WindowsServer2025.iso` |
 | **Install mode** | `windows_autounattend` |
 | **Guest OS ID** | `windows2022srvNext_64Guest` ⚠️ ("2022**Next**" = Server 2025, **not** 2022) |
 | **vCPUs** | `2` |
@@ -786,6 +786,25 @@ where their password comes from:
 > different password. If you chose Mint **Option B** (static login), that's the
 > one exception: those students share the `student` / `Changeme123!` you set on
 > the template row, because that template opts out of per-student customization.
+
+---
+
+## Missing ISOs (upload these before using those recipes)
+
+Three recipes above point here because their installer ISO is **not yet in this
+lab's ISO library**, so the wizard's **ISO source** dropdown won't list them until
+an admin uploads them to the `NAS-BackupsAndISOS` datastore (`ISOs/…`):
+
+| OS | Recipe | Get the ISO from |
+|----|--------|------------------|
+| Debian 12 / 13 | Recipe 3 (Debian) | debian.org → the amd64 netinst/DVD image |
+| Windows Server 2016 | Server recipes | Microsoft Evaluation Center / VLSC |
+| Windows Server 2019 | Server recipes | Microsoft Evaluation Center / VLSC |
+
+Everything else in this guide (Ubuntu Server/Desktop 24.04.3, Linux Mint 22.3,
+Windows 10, Windows 11 25H2, Windows Server 2022, Windows Server 2025) **is
+already uploaded** and will appear in the picker with the exact filename shown in
+each recipe's **ISO** row.
 
 ---
 

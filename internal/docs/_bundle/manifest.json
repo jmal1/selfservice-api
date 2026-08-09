@@ -102,8 +102,8 @@
     {
       "path": "docs/instructor/os-recipes.md",
       "title": "Per-OS Template Build Recipes",
-      "size": 38407,
-      "sha256": "b84c85a6517ac5b0350947765351343c2e34c18d9cd8e7f5e673616efc579026",
+      "size": 39732,
+      "sha256": "b79ee1f83097aa6cf8e8401a50aaa1eee8181a2b2fb5bf4dca1849be5950f7e3",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/glossary.md",
@@ -324,5 +324,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 292868
+  "total_bytes": 294193
 }
