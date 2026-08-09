@@ -102,8 +102,8 @@
     {
       "path": "docs/instructor/os-recipes.md",
       "title": "Per-OS Template Build Recipes",
-      "size": 38087,
-      "sha256": "4bd21cff75d073a8a3dd332349260798ea470b9046a862604d8b147c852814ec",
+      "size": 38407,
+      "sha256": "b84c85a6517ac5b0350947765351343c2e34c18d9cd8e7f5e673616efc579026",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/glossary.md",
@@ -238,8 +238,8 @@
     {
       "path": "internal/api/routes/routes.go",
       "title": "routes.go (Go)",
-      "size": 13553,
-      "sha256": "0798084c1975497e77b1321ffd0988f4247365c6e99b9defaad5f4a924c52ae8",
+      "size": 13611,
+      "sha256": "4629f3e26031856d3e7a48feaee8623223f9c6746ad28b3eddcb7aa51403c690",
       "is_markdown": false,
       "from_seed": false
     },
@@ -324,5 +324,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 292490
+  "total_bytes": 292868
 }

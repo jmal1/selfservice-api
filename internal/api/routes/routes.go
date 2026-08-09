@@ -167,6 +167,7 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 
 				// Wizard (T4) — instructor-accessible.
 				r.Post("/draft", h.AdminCreateTemplateDraft)
+				r.Get("/guest-os-catalog", h.AdminListGuestOSCatalog)
 				r.Get("/{templateID}/wizard-state", h.AdminGetWizardState)
 				r.Post("/{templateID}/provision", h.AdminProvisionTemplate)
 				r.Post("/{templateID}/preflight", h.AdminPreflightTemplate)

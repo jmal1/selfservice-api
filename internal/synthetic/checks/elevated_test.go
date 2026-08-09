@@ -57,6 +57,9 @@ func TestElevated_UsesConfiguredClientNotRunners(t *testing.T) {
 	good := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
 		"/api/v1/admin/images":       func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`[]`)) },
 		"/api/v1/admin/vcenter/isos": func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{"isos":[]}`)) },
+		"/api/v1/admin/templates/guest-os-catalog": func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`{"options":[{"guest_id":"ubuntu64Guest"}]}`))
+		},
 		"/api/v1/admin/templates/00000000-0000-0000-0000-000000000000/wizard-state": func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNotFound)
 		},
@@ -66,8 +69,8 @@ func TestElevated_UsesConfiguredClientNotRunners(t *testing.T) {
 		},
 	})
 	all := Elevated(ElevatedConfig{Client: synthetic.NewClient(good.URL, "instructor-cookie")})
-	if len(all) != 5 {
-		t.Fatalf("Elevated() returned %d checks, want 5", len(all))
+	if len(all) != 6 {
+		t.Fatalf("Elevated() returned %d checks, want 6", len(all))
 	}
 	for _, c := range all {
 		if _, err := c.Run(context.Background(), poisonClient(t)); err != nil {
@@ -205,6 +208,63 @@ func TestISOCatalogReachable_FailsWhenSourceFieldMissing(t *testing.T) {
 	}
 }
 
+func TestGuestOSCatalogReachable_Happy(t *testing.T) {
+	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
+		"/api/v1/admin/templates/guest-os-catalog": func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`{"options":[{"label":"Ubuntu / Mint","guest_id":"ubuntu64Guest","os_type":"linux","group":"Ubuntu family"},{"label":"Windows 11","guest_id":"windows11_64Guest","os_type":"windows","group":"Windows client"}]}`))
+		},
+	})
+	if _, err := elevatedFor(t, srv.URL, "guest_os_catalog_reachable").Run(context.Background(), nil); err != nil {
+		t.Errorf("happy path: %v", err)
+	}
+}
+
+func TestGuestOSCatalogReachable_FailsOnEmptyCatalog(t *testing.T) {
+	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
+		"/api/v1/admin/templates/guest-os-catalog": func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`{"options":[]}`))
+		},
+	})
+	_, err := elevatedFor(t, srv.URL, "guest_os_catalog_reachable").Run(context.Background(), nil)
+	if err == nil {
+		t.Fatal("expected failure on an empty catalog")
+	}
+	if !strings.Contains(err.Error(), "empty") {
+		t.Errorf("error %q should mention the empty catalog", err)
+	}
+}
+
+func TestGuestOSCatalogReachable_FailsWhenBaselineMissing(t *testing.T) {
+	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
+		"/api/v1/admin/templates/guest-os-catalog": func(w http.ResponseWriter, r *http.Request) {
+			// Non-empty, but ubuntu64Guest dropped -> shape/content drift.
+			w.Write([]byte(`{"options":[{"guest_id":"windows11_64Guest"}]}`))
+		},
+	})
+	_, err := elevatedFor(t, srv.URL, "guest_os_catalog_reachable").Run(context.Background(), nil)
+	if err == nil {
+		t.Fatal("expected failure when ubuntu64Guest is absent")
+	}
+	if !strings.Contains(err.Error(), "ubuntu64Guest") {
+		t.Errorf("error %q should mention the missing baseline id", err)
+	}
+}
+
+func TestGuestOSCatalogReachable_FailsOn403(t *testing.T) {
+	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
+		"/api/v1/admin/templates/guest-os-catalog": func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+		},
+	})
+	_, err := elevatedFor(t, srv.URL, "guest_os_catalog_reachable").Run(context.Background(), nil)
+	if err == nil {
+		t.Fatal("expected failure on 403")
+	}
+	if !strings.Contains(err.Error(), "instructor identity") {
+		t.Errorf("error %q should hint at the instructor identity", err)
+	}
+}
+
 func TestTemplateWizardState404_PassesOn404(t *testing.T) {
 	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
 		"/api/v1/admin/templates/00000000-0000-0000-0000-000000000000/wizard-state": func(w http.ResponseWriter, r *http.Request) {
@@ -279,6 +339,7 @@ func TestElevated_StableNames(t *testing.T) {
 	want := map[string]bool{
 		"image_list_contract":             true,
 		"iso_catalog_reachable":           true,
+		"guest_os_catalog_reachable":      true,
 		"template_wizard_state_404":       true,
 		"admin_runs_filter_contract":      true,
 		"blueprint_vm_playlists_contract": true,

@@ -964,3 +964,87 @@ func TestResolveGuestCredentials_SourcePerRung(t *testing.T) {
 		})
 	}
 }
+
+// --- Guest OS ID validation on the ISO draft path (regression: the wizard
+// shipped no way to set guest_id, so ISO templates were created with
+// guest_id="" and every provision failed with vCenter's opaque
+// "guest ID required" fault). These 400s are returned before any DB access,
+// so a Handler{} with nil deps is sufficient. ---
+
+func postDraft(t *testing.T, body CreateTemplateDraftRequest) *httptest.ResponseRecorder {
+	t.Helper()
+	h := &Handler{}
+	buf, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/admin/templates/draft", bytes.NewReader(buf))
+	rec := httptest.NewRecorder()
+	h.AdminCreateTemplateDraft(rec, req)
+	return rec
+}
+
+func TestAdminCreateTemplateDraft_ISORequiresGuestID(t *testing.T) {
+	rec := postDraft(t, CreateTemplateDraftRequest{
+		Name:       "Mint 22",
+		OSType:     models.OSTypeLinux,
+		SourceType: models.TemplateSourceISO,
+		SourceRef:  "[NAS-BackupsAndISOS] ISOs/mint.iso",
+		// GuestID deliberately omitted.
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d; want 400", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "guest_id is required") {
+		t.Errorf("body = %q; want a 'guest_id is required' message", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "guest-os-catalog") {
+		t.Errorf("body = %q; want a pointer to the guest-os-catalog endpoint", rec.Body.String())
+	}
+}
+
+func TestAdminCreateTemplateDraft_ISORejectsJunkGuestID(t *testing.T) {
+	rec := postDraft(t, CreateTemplateDraftRequest{
+		Name:       "Mint 22",
+		OSType:     models.OSTypeLinux,
+		SourceType: models.TemplateSourceISO,
+		SourceRef:  "[NAS-BackupsAndISOS] ISOs/mint.iso",
+		GuestID:    "not a real guest",
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d; want 400", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "not a valid vSphere guest OS identifier") {
+		t.Errorf("body = %q; want an invalid-guest-id message", rec.Body.String())
+	}
+}
+
+func TestAdminListGuestOSCatalog(t *testing.T) {
+	h := &Handler{}
+	req := httptest.NewRequest(http.MethodGet, "/admin/templates/guest-os-catalog", nil)
+	rec := httptest.NewRecorder()
+	h.AdminListGuestOSCatalog(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200", rec.Code)
+	}
+	var body struct {
+		Options []models.GuestOSOption `json:"options"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(body.Options) == 0 {
+		t.Fatal("options is empty; want the full guest OS catalog")
+	}
+	// Spot-check that the Mint/Ubuntu entry a student needs is present.
+	var sawUbuntu bool
+	for _, o := range body.Options {
+		if o.GuestID == "ubuntu64Guest" {
+			sawUbuntu = true
+		}
+	}
+	if !sawUbuntu {
+		t.Error("catalog response missing ubuntu64Guest")
+	}
+}

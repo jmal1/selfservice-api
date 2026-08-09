@@ -54,6 +54,7 @@ func Elevated(cfg ElevatedConfig) []synthetic.Check {
 	return []synthetic.Check{
 		imageListContract(cfg),
 		isoCatalogReachable(cfg),
+		guestOSCatalogReachable(cfg),
 		templateWizardState404(cfg),
 		adminRunsFilterContract(cfg),
 		blueprintVMPlaylistsContract(cfg),
@@ -324,6 +325,69 @@ func isoCatalogReachable(cfg ElevatedConfig) synthetic.Check {
 				return resp.StatusCode, fmt.Errorf(
 					"ISO catalog returned %d, want 200: %s", resp.StatusCode, snippet(body))
 			}
+		},
+	}
+}
+
+// guestOSCatalogReachable proves the template wizard's Guest OS dropdown can
+// still load its options.
+//
+// This is the check for the exact regression that made ISO templates
+// unprovisionable: the wizard shipped no way to set guest_id and the catalog
+// endpoint did not exist, so every ISO build failed at provision time with an
+// opaque vCenter "guest ID required" fault. The endpoint is instructor-gated
+// (a student sees 403 before the handler runs) so it must use the elevated
+// identity to reach the handler at all. Asserting the list is non-empty and
+// still contains the baseline ubuntu64Guest id catches both an empty catalog
+// and a response-shape drift that would silently break the dropdown while the
+// deploy looked healthy.
+func guestOSCatalogReachable(cfg ElevatedConfig) synthetic.Check {
+	return synthetic.CheckFunc{
+		NameVal:        "guest_os_catalog_reachable",
+		TitleVal:       "Guest OS Catalog (Wizard Dropdown)",
+		DescriptionVal: "Fetches /admin/templates/guest-os-catalog as an instructor and requires 200 with a non-empty options array that still includes ubuntu64Guest. Guards the wizard Guest OS dropdown data source -- an empty or failing catalog is the regression that made ISO templates unprovisionable.",
+		SeverityVal:    synthetic.SeverityWarning,
+		RunFn: func(ctx context.Context, _ *synthetic.Client) (int, error) {
+			c, err := cfg.client()
+			if err != nil {
+				return 0, err
+			}
+			resp, err := c.Do(ctx, http.MethodGet, "/api/v1/admin/templates/guest-os-catalog", nil)
+			if err != nil {
+				return 0, err
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+
+			if resp.StatusCode == http.StatusForbidden {
+				return resp.StatusCode, fmt.Errorf(
+					"guest-os-catalog returned 403 to the instructor identity -- this check is running with the wrong client or the instructor role lost access")
+			}
+			if resp.StatusCode != http.StatusOK {
+				return resp.StatusCode, fmt.Errorf("guest-os-catalog returned %d, want 200: %s", resp.StatusCode, snippet(body))
+			}
+			var parsed struct {
+				Options []struct {
+					GuestID string `json:"guest_id"`
+				} `json:"options"`
+			}
+			if err := json.Unmarshal(body, &parsed); err != nil {
+				return resp.StatusCode, fmt.Errorf("guest-os-catalog body is not the expected shape: %w (body=%s)", err, snippet(body))
+			}
+			if len(parsed.Options) == 0 {
+				return resp.StatusCode, fmt.Errorf("guest-os-catalog returned an empty options array -- the wizard Guest OS dropdown would be unusable")
+			}
+			var sawUbuntu bool
+			for _, o := range parsed.Options {
+				if o.GuestID == "ubuntu64Guest" {
+					sawUbuntu = true
+					break
+				}
+			}
+			if !sawUbuntu {
+				return resp.StatusCode, fmt.Errorf("guest-os-catalog is missing the baseline ubuntu64Guest entry -- the catalog may have drifted")
+			}
+			return resp.StatusCode, nil
 		},
 	}
 }
