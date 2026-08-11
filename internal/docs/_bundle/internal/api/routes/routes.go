@@ -19,7 +19,9 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 	// Global middleware
 	r.Use(chimiddleware.RequestID)
 	r.Use(chimiddleware.RealIP)
-	r.Use(chimiddleware.Recoverer)
+	// Recover is our JSON-emitting panic handler; it replaces chi's built-in
+	// Recoverer (which writes a bodyless text/plain 500 the UI can't parse).
+	r.Use(middleware.Recover(nil))
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   allowedOrigins,
 		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
