@@ -423,12 +423,6 @@ func (h *Handler) AdminUpdateBlueprint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	existing, err := h.db.GetBlueprintByID(r.Context(), bpID)
-	if err != nil || existing == nil {
-		http.Error(w, "blueprint not found", http.StatusNotFound)
-		return
-	}
-
 	var req struct {
 		Name             string `json:"name"`
 		Description      string `json:"description"`
@@ -445,6 +439,20 @@ func (h *Handler) AdminUpdateBlueprint(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	// Same invariant the create path enforces: a blueprint must always keep a
+	// name and at least one VM. Without this an update could persist an empty
+	// blueprint, which the API then serializes with the `vms` key omitted
+	// (json:"vms,omitempty") and crashes the admin UI's blueprints page.
+	if req.Name == "" || len(req.VMs) == 0 {
+		http.Error(w, "name and at least one VM are required", http.StatusBadRequest)
+		return
+	}
+
+	existing, err := h.db.GetBlueprintByID(r.Context(), bpID)
+	if err != nil || existing == nil {
+		http.Error(w, "blueprint not found", http.StatusNotFound)
 		return
 	}
 
