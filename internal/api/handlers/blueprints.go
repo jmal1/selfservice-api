@@ -37,7 +37,7 @@ func (h *Handler) ListBlueprints(w http.ResponseWriter, r *http.Request) {
 	blueprints, err := h.db.ListBlueprintsForUser(r.Context(), userID, role)
 	if err != nil {
 		h.logger.Error("list blueprints failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	respondJSON(w, http.StatusOK, blueprints)
@@ -47,13 +47,13 @@ func (h *Handler) ListBlueprints(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) GetBlueprint(w http.ResponseWriter, r *http.Request) {
 	bpID, err := uuid.Parse(chi.URLParam(r, "blueprintID"))
 	if err != nil {
-		http.Error(w, "invalid blueprint id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid blueprint id")
 		return
 	}
 
 	bp, err := h.db.GetBlueprintByID(r.Context(), bpID)
 	if err != nil || bp == nil {
-		http.Error(w, "blueprint not found", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "blueprint not found")
 		return
 	}
 
@@ -64,7 +64,7 @@ func (h *Handler) GetBlueprint(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) DeployBlueprint(w http.ResponseWriter, r *http.Request) {
 	bpID, err := uuid.Parse(chi.URLParam(r, "blueprintID"))
 	if err != nil {
-		http.Error(w, "invalid blueprint id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid blueprint id")
 		return
 	}
 
@@ -72,7 +72,7 @@ func (h *Handler) DeployBlueprint(w http.ResponseWriter, r *http.Request) {
 		Name string `json:"name"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
-		http.Error(w, "name is required", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "name is required")
 		return
 	}
 
@@ -82,7 +82,7 @@ func (h *Handler) DeployBlueprint(w http.ResponseWriter, r *http.Request) {
 	// Verify blueprint access
 	bp, err := h.db.GetBlueprintByID(r.Context(), bpID)
 	if err != nil || bp == nil || !bp.IsActive {
-		http.Error(w, "blueprint not found", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "blueprint not found")
 		return
 	}
 
@@ -90,7 +90,7 @@ func (h *Handler) DeployBlueprint(w http.ResponseWriter, r *http.Request) {
 	accessible, err := h.db.ListBlueprintsForUser(r.Context(), userID, role)
 	if err != nil {
 		h.logger.Error("list blueprints failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	found := false
@@ -101,21 +101,21 @@ func (h *Handler) DeployBlueprint(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !found {
-		http.Error(w, "blueprint not accessible", http.StatusForbidden)
+		respondError(w, r, http.StatusForbidden, "blueprint not accessible")
 		return
 	}
 
 	// Get user for quota checks
 	user, err := h.db.GetUserByID(r.Context(), userID)
 	if err != nil || user == nil {
-		http.Error(w, "user not found", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "user not found")
 		return
 	}
 
 	// Resolve templates for all blueprint VMs and calculate total resources
 	templates, err := h.db.ListTemplatesForUser(r.Context(), userID, role)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	templateMap := make(map[uuid.UUID]*models.Template)
@@ -138,13 +138,13 @@ func (h *Handler) DeployBlueprint(w http.ResponseWriter, r *http.Request) {
 	for _, bv := range bp.VMs {
 		tmpl, ok := templateMap[bv.TemplateID]
 		if !ok {
-			http.Error(w, fmt.Sprintf("template %s not accessible", bv.TemplateID), http.StatusBadRequest)
+			respondError(w, r, http.StatusBadRequest, fmt.Sprintf("template %s not accessible", bv.TemplateID))
 			return
 		}
 
 		// Defense in depth: ensure students cannot use instructor_only templates
 		if role == models.RoleStudent && tmpl.Visibility == "instructor_only" {
-			http.Error(w, fmt.Sprintf("template %s not accessible", bv.TemplateID), http.StatusForbidden)
+			respondError(w, r, http.StatusForbidden, fmt.Sprintf("template %s not accessible", bv.TemplateID))
 			return
 		}
 
@@ -183,16 +183,16 @@ func (h *Handler) DeployBlueprint(w http.ResponseWriter, r *http.Request) {
 	// Check quotas
 	usage, err := h.db.GetResourceUsage(r.Context(), userID)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	if err := ValidateQuotas(usage, user, 1, totalVCPUs, totalRAM); err != nil {
 		var qe *QuotaError
 		if errors.As(err, &qe) {
-			http.Error(w, qe.Error(), http.StatusConflict)
+			respondError(w, r, http.StatusConflict, qe.Error())
 		} else {
 			h.logger.Error("quota validation failed", "error", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			respondError(w, r, http.StatusInternalServerError, "internal error")
 		}
 		return
 	}
@@ -201,7 +201,7 @@ func (h *Handler) DeployBlueprint(w http.ResponseWriter, r *http.Request) {
 	podID := uuid.New()
 	salt, err := generateSalt()
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -219,7 +219,7 @@ func (h *Handler) DeployBlueprint(w http.ResponseWriter, r *http.Request) {
 	tx, err := h.db.Pool().Begin(r.Context())
 	if err != nil {
 		h.logger.Error("begin tx failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	defer tx.Rollback(r.Context())
@@ -231,7 +231,7 @@ func (h *Handler) DeployBlueprint(w http.ResponseWriter, r *http.Request) {
 	`, podID, userID, req.Name, salt, expiresAt, bpID, bp.AllowVMAdditions)
 	if err != nil {
 		h.logger.Error("insert pod failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -239,14 +239,14 @@ func (h *Handler) DeployBlueprint(w http.ResponseWriter, r *http.Request) {
 	vlanTag, subnet, err := h.db.CheckoutVLAN(r.Context(), tx, podID, "all")
 	if err != nil {
 		h.logger.Error("checkout vlan failed", "error", err)
-		http.Error(w, "no VLANs available", http.StatusConflict)
+		respondError(w, r, http.StatusConflict, "no VLANs available")
 		return
 	}
 
 	_, err = tx.Exec(r.Context(), `UPDATE pods SET vlan_id = $1, subnet = $2 WHERE id = $3`, vlanTag, subnet, podID)
 	if err != nil {
 		h.logger.Error("update pod vlan failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -274,7 +274,7 @@ func (h *Handler) DeployBlueprint(w http.ResponseWriter, r *http.Request) {
 		`, vmID, podID, rv.TemplateID, rv.DisplayName, rv.VCPUs, rv.RAMMB, rv.DiskGB, rv.BootOrder)
 		if err != nil {
 			h.logger.Error("insert pod_vm failed", "error", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			respondError(w, r, http.StatusInternalServerError, "internal error")
 			return
 		}
 
@@ -300,7 +300,7 @@ func (h *Handler) DeployBlueprint(w http.ResponseWriter, r *http.Request) {
 
 	if err := tx.Commit(r.Context()); err != nil {
 		h.logger.Error("commit failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -314,7 +314,7 @@ func (h *Handler) DeployBlueprint(w http.ResponseWriter, r *http.Request) {
 	job, err := h.db.CreateJob(r.Context(), models.JobTypePodCreate, payload)
 	if err != nil {
 		h.logger.Error("create job failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -344,7 +344,7 @@ func (h *Handler) AdminListBlueprints(w http.ResponseWriter, r *http.Request) {
 	blueprints, err := h.db.ListAllBlueprints(r.Context())
 	if err != nil {
 		h.logger.Error("list all blueprints failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	respondJSON(w, http.StatusOK, blueprints)
@@ -367,11 +367,11 @@ func (h *Handler) AdminCreateBlueprint(w http.ResponseWriter, r *http.Request) {
 		} `json:"vms"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if req.Name == "" || len(req.VMs) == 0 {
-		http.Error(w, "name and at least one VM are required", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "name and at least one VM are required")
 		return
 	}
 
@@ -402,7 +402,7 @@ func (h *Handler) AdminCreateBlueprint(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.db.CreateBlueprint(r.Context(), bp); err != nil {
 		h.logger.Error("create blueprint failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -419,7 +419,7 @@ func (h *Handler) AdminCreateBlueprint(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminUpdateBlueprint(w http.ResponseWriter, r *http.Request) {
 	bpID, err := uuid.Parse(chi.URLParam(r, "blueprintID"))
 	if err != nil {
-		http.Error(w, "invalid blueprint id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid blueprint id")
 		return
 	}
 
@@ -438,7 +438,7 @@ func (h *Handler) AdminUpdateBlueprint(w http.ResponseWriter, r *http.Request) {
 		} `json:"vms"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	// Same invariant the create path enforces: a blueprint must always keep a
@@ -446,13 +446,13 @@ func (h *Handler) AdminUpdateBlueprint(w http.ResponseWriter, r *http.Request) {
 	// blueprint, which the API then serializes with the `vms` key omitted
 	// (json:"vms,omitempty") and crashes the admin UI's blueprints page.
 	if req.Name == "" || len(req.VMs) == 0 {
-		http.Error(w, "name and at least one VM are required", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "name and at least one VM are required")
 		return
 	}
 
 	existing, err := h.db.GetBlueprintByID(r.Context(), bpID)
 	if err != nil || existing == nil {
-		http.Error(w, "blueprint not found", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "blueprint not found")
 		return
 	}
 
@@ -482,7 +482,7 @@ func (h *Handler) AdminUpdateBlueprint(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.db.UpdateBlueprint(r.Context(), bp); err != nil {
 		h.logger.Error("update blueprint failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -504,7 +504,7 @@ func (h *Handler) AdminUpdateBlueprint(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminReorderBlueprints(w http.ResponseWriter, r *http.Request) {
 	role := middleware.RoleFromContext(r.Context())
 	if role != models.RoleInstructor && role != models.RoleAdmin {
-		http.Error(w, "forbidden", http.StatusForbidden)
+		respondError(w, r, http.StatusForbidden, "forbidden")
 		return
 	}
 
@@ -513,7 +513,7 @@ func (h *Handler) AdminReorderBlueprints(w http.ResponseWriter, r *http.Request)
 		PinOrder int  `json:"pin_order"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
@@ -522,7 +522,7 @@ func (h *Handler) AdminReorderBlueprints(w http.ResponseWriter, r *http.Request)
 	for k, v := range reqBody {
 		id, err := uuid.Parse(k)
 		if err != nil {
-			http.Error(w, "invalid blueprint id: "+k, http.StatusBadRequest)
+			respondError(w, r, http.StatusBadRequest, "invalid blueprint id: "+k)
 			return
 		}
 		req[id] = database.PinState{Pinned: v.Pinned, PinOrder: v.PinOrder}
@@ -533,11 +533,11 @@ func (h *Handler) AdminReorderBlueprints(w http.ResponseWriter, r *http.Request)
 	if err != nil {
 		if errors.Is(err, database.ErrBlueprintNotFound) {
 			h.logger.Warn("reorder blueprints target not found", "error", err, "user_id", userID)
-			http.Error(w, "Specified blueprint not found", http.StatusNotFound)
+			respondError(w, r, http.StatusNotFound, "Specified blueprint not found")
 			return
 		}
 		h.logger.Error("reorder blueprints failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -553,13 +553,13 @@ func (h *Handler) AdminReorderBlueprints(w http.ResponseWriter, r *http.Request)
 func (h *Handler) AdminSetBlueprintPin(w http.ResponseWriter, r *http.Request) {
 	role := middleware.RoleFromContext(r.Context())
 	if role != models.RoleInstructor && role != models.RoleAdmin {
-		http.Error(w, "forbidden", http.StatusForbidden)
+		respondError(w, r, http.StatusForbidden, "forbidden")
 		return
 	}
 
 	blueprintID, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
-		http.Error(w, "invalid blueprint id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid blueprint id")
 		return
 	}
 
@@ -567,7 +567,7 @@ func (h *Handler) AdminSetBlueprintPin(w http.ResponseWriter, r *http.Request) {
 		PinOrder int `json:"pin_order"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
@@ -575,11 +575,11 @@ func (h *Handler) AdminSetBlueprintPin(w http.ResponseWriter, r *http.Request) {
 	if err := h.blueprintPinStore().SetBlueprintPin(r.Context(), blueprintID, true, req.PinOrder, userID); err != nil {
 		if errors.Is(err, database.ErrBlueprintNotFound) {
 			h.logger.Warn("set blueprint pin target not found", "error", err, "user_id", userID)
-			http.Error(w, "Specified blueprint not found", http.StatusNotFound)
+			respondError(w, r, http.StatusNotFound, "Specified blueprint not found")
 			return
 		}
 		h.logger.Error("set blueprint pin failed", "error", err, "blueprint_id", blueprintID, "user_id", userID)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -596,13 +596,13 @@ func (h *Handler) AdminSetBlueprintPin(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminUnpinBlueprint(w http.ResponseWriter, r *http.Request) {
 	role := middleware.RoleFromContext(r.Context())
 	if role != models.RoleInstructor && role != models.RoleAdmin {
-		http.Error(w, "forbidden", http.StatusForbidden)
+		respondError(w, r, http.StatusForbidden, "forbidden")
 		return
 	}
 
 	blueprintID, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
-		http.Error(w, "invalid blueprint id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid blueprint id")
 		return
 	}
 
@@ -610,11 +610,11 @@ func (h *Handler) AdminUnpinBlueprint(w http.ResponseWriter, r *http.Request) {
 	if err := h.blueprintPinStore().SetBlueprintPin(r.Context(), blueprintID, false, 0, userID); err != nil {
 		if errors.Is(err, database.ErrBlueprintNotFound) {
 			h.logger.Warn("unpin blueprint target not found", "error", err, "user_id", userID)
-			http.Error(w, "Specified blueprint not found", http.StatusNotFound)
+			respondError(w, r, http.StatusNotFound, "Specified blueprint not found")
 			return
 		}
 		h.logger.Error("unpin blueprint failed", "error", err, "blueprint_id", blueprintID, "user_id", userID)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -630,13 +630,13 @@ func (h *Handler) AdminUnpinBlueprint(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminDeleteBlueprint(w http.ResponseWriter, r *http.Request) {
 	bpID, err := uuid.Parse(chi.URLParam(r, "blueprintID"))
 	if err != nil {
-		http.Error(w, "invalid blueprint id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid blueprint id")
 		return
 	}
 
 	if err := h.db.DeleteBlueprint(r.Context(), bpID); err != nil {
 		h.logger.Error("delete blueprint failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -652,7 +652,7 @@ func (h *Handler) AdminDeleteBlueprint(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminSetBlueprintAccess(w http.ResponseWriter, r *http.Request) {
 	bpID, err := uuid.Parse(chi.URLParam(r, "blueprintID"))
 	if err != nil {
-		http.Error(w, "invalid blueprint id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid blueprint id")
 		return
 	}
 
@@ -663,7 +663,7 @@ func (h *Handler) AdminSetBlueprintAccess(w http.ResponseWriter, r *http.Request
 		} `json:"rules"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
@@ -678,7 +678,7 @@ func (h *Handler) AdminSetBlueprintAccess(w http.ResponseWriter, r *http.Request
 
 	if err := h.db.SetBlueprintAccess(r.Context(), bpID, rules); err != nil {
 		h.logger.Error("set blueprint access failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 

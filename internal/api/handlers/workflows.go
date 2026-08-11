@@ -53,7 +53,7 @@ func normalizeActionScripts(actions []models.Action) []models.Action {
 func (h *Handler) AdminListWorkflows(w http.ResponseWriter, r *http.Request) {
 	workflows, err := h.db.ListWorkflows(r.Context())
 	if err != nil {
-		http.Error(w, "failed to list workflows", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "failed to list workflows")
 		return
 	}
 	respondJSON(w, http.StatusOK, workflows)
@@ -63,13 +63,13 @@ func (h *Handler) AdminListWorkflows(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminGetWorkflow(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "workflowID"))
 	if err != nil {
-		http.Error(w, "invalid workflow ID", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid workflow ID")
 		return
 	}
 
 	wf, err := h.db.GetWorkflowWithActions(r.Context(), id)
 	if err != nil {
-		http.Error(w, "workflow not found", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "workflow not found")
 		return
 	}
 	respondJSON(w, http.StatusOK, wf)
@@ -92,12 +92,12 @@ func (h *Handler) AdminCreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		Actions        []models.Action `json:"actions"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
 	if req.Name == "" || req.Slug == "" {
-		http.Error(w, "name and slug are required", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "name and slug are required")
 		return
 	}
 	if req.TimeoutSeconds <= 0 {
@@ -128,7 +128,7 @@ func (h *Handler) AdminCreateWorkflow(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.db.CreateWorkflow(r.Context(), wf); err != nil {
 		h.logger.Error("failed to create workflow", "error", err)
-		http.Error(w, "failed to create workflow", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "failed to create workflow")
 		return
 	}
 
@@ -139,7 +139,7 @@ func (h *Handler) AdminCreateWorkflow(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminUpdateWorkflow(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "workflowID"))
 	if err != nil {
-		http.Error(w, "invalid workflow ID", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid workflow ID")
 		return
 	}
 
@@ -154,7 +154,7 @@ func (h *Handler) AdminUpdateWorkflow(w http.ResponseWriter, r *http.Request) {
 		Actions        []models.Action `json:"actions"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
@@ -162,7 +162,7 @@ func (h *Handler) AdminUpdateWorkflow(w http.ResponseWriter, r *http.Request) {
 		normalizeScriptPtr(req.Script), normalizeScriptPtr(req.SetupScript),
 		req.TimeoutSeconds, req.CreationMode, normalizeActionScripts(req.Actions)); err != nil {
 		h.logger.Error("failed to update workflow", "error", err)
-		http.Error(w, "failed to update workflow", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "failed to update workflow")
 		return
 	}
 
@@ -173,13 +173,13 @@ func (h *Handler) AdminUpdateWorkflow(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminDeleteWorkflow(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "workflowID"))
 	if err != nil {
-		http.Error(w, "invalid workflow ID", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid workflow ID")
 		return
 	}
 
 	if err := h.db.DeleteWorkflow(r.Context(), id); err != nil {
 		h.logger.Error("failed to delete workflow", "error", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -190,13 +190,13 @@ func (h *Handler) AdminDeleteWorkflow(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminSubmitWorkflow(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "workflowID"))
 	if err != nil {
-		http.Error(w, "invalid workflow ID", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid workflow ID")
 		return
 	}
 
 	if err := h.db.TransitionWorkflowStatus(r.Context(), id,
 		models.WorkflowStatusDraft, models.WorkflowStatusPendingReview); err != nil {
-		http.Error(w, "workflow is not in draft status", http.StatusConflict)
+		respondError(w, r, http.StatusConflict, "workflow is not in draft status")
 		return
 	}
 
@@ -207,7 +207,7 @@ func (h *Handler) AdminSubmitWorkflow(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminApproveWorkflow(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "workflowID"))
 	if err != nil {
-		http.Error(w, "invalid workflow ID", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid workflow ID")
 		return
 	}
 
@@ -216,18 +216,18 @@ func (h *Handler) AdminApproveWorkflow(w http.ResponseWriter, r *http.Request) {
 
 	wf, err := h.db.GetWorkflow(r.Context(), id)
 	if err != nil {
-		http.Error(w, "workflow not found", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "workflow not found")
 		return
 	}
 
 	// Approver must be different from creator (unless admin)
 	if wf.CreatedBy == userID && role != models.RoleAdmin {
-		http.Error(w, "cannot approve your own workflow — another instructor must review", http.StatusForbidden)
+		respondError(w, r, http.StatusForbidden, "cannot approve your own workflow — another instructor must review")
 		return
 	}
 
 	if err := h.db.ApproveWorkflow(r.Context(), id, userID); err != nil {
-		http.Error(w, "workflow is not in pending_review status", http.StatusConflict)
+		respondError(w, r, http.StatusConflict, "workflow is not in pending_review status")
 		return
 	}
 
@@ -238,13 +238,13 @@ func (h *Handler) AdminApproveWorkflow(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminActivateWorkflow(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "workflowID"))
 	if err != nil {
-		http.Error(w, "invalid workflow ID", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid workflow ID")
 		return
 	}
 
 	if err := h.db.TransitionWorkflowStatus(r.Context(), id,
 		models.WorkflowStatusApproved, models.WorkflowStatusActive); err != nil {
-		http.Error(w, "workflow is not in approved status", http.StatusConflict)
+		respondError(w, r, http.StatusConflict, "workflow is not in approved status")
 		return
 	}
 
@@ -257,7 +257,7 @@ func (h *Handler) AdminImportWorkflows(w http.ResponseWriter, r *http.Request) {
 
 	var workflows []models.Workflow
 	if err := json.NewDecoder(r.Body).Decode(&workflows); err != nil {
-		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid JSON")
 		return
 	}
 
@@ -283,7 +283,7 @@ func (h *Handler) AdminImportWorkflows(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminExportWorkflows(w http.ResponseWriter, r *http.Request) {
 	workflows, err := h.db.ListWorkflowsWithActions(r.Context())
 	if err != nil {
-		http.Error(w, "failed to export", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "failed to export")
 		return
 	}
 
@@ -297,7 +297,7 @@ func (h *Handler) AdminExportWorkflows(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminListActions(w http.ResponseWriter, r *http.Request) {
 	actions, err := h.db.ListLibraryActions(r.Context())
 	if err != nil {
-		http.Error(w, "failed to list actions", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "failed to list actions")
 		return
 	}
 	respondJSON(w, http.StatusOK, actions)
@@ -306,12 +306,12 @@ func (h *Handler) AdminListActions(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminGetAction(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "actionID"))
 	if err != nil {
-		http.Error(w, "invalid action ID", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid action ID")
 		return
 	}
 	action, err := h.db.GetLibraryAction(r.Context(), id)
 	if err != nil {
-		http.Error(w, "action not found", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "action not found")
 		return
 	}
 	respondJSON(w, http.StatusOK, action)
@@ -335,11 +335,11 @@ func (h *Handler) AdminCreateAction(w http.ResponseWriter, r *http.Request) {
 		SupportedPlatforms json.RawMessage `json:"supported_platforms"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if req.Name == "" || req.Slug == "" {
-		http.Error(w, "name and slug are required", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "name and slug are required")
 		return
 	}
 	if req.ActionType == "" {
@@ -384,7 +384,7 @@ func (h *Handler) AdminCreateAction(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.db.CreateLibraryAction(r.Context(), action); err != nil {
 		h.logger.Error("failed to create action", "error", err)
-		http.Error(w, "failed to create action", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "failed to create action")
 		return
 	}
 	respondJSON(w, http.StatusCreated, action)
@@ -393,7 +393,7 @@ func (h *Handler) AdminCreateAction(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminUpdateAction(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "actionID"))
 	if err != nil {
-		http.Error(w, "invalid action ID", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid action ID")
 		return
 	}
 
@@ -414,7 +414,7 @@ func (h *Handler) AdminUpdateAction(w http.ResponseWriter, r *http.Request) {
 		SupportedPlatforms *json.RawMessage `json:"supported_platforms"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
@@ -430,7 +430,7 @@ func (h *Handler) AdminUpdateAction(w http.ResponseWriter, r *http.Request) {
 		req.InputContext, req.OutputContext, req.TimeoutSeconds, req.StudentFailHint,
 		req.Points, req.Penalty, req.SupportedPlatforms); err != nil {
 		h.logger.Error("failed to update action", "error", err)
-		http.Error(w, "failed to update action", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "failed to update action")
 		return
 	}
 	respondJSON(w, http.StatusOK, map[string]string{"status": "updated"})
@@ -439,11 +439,11 @@ func (h *Handler) AdminUpdateAction(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminDeleteAction(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "actionID"))
 	if err != nil {
-		http.Error(w, "invalid action ID", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid action ID")
 		return
 	}
 	if err := h.db.DeleteLibraryAction(r.Context(), id); err != nil {
-		http.Error(w, "action not found or not a library action", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "action not found or not a library action")
 		return
 	}
 	respondJSON(w, http.StatusOK, map[string]string{"status": "deleted"})

@@ -22,7 +22,7 @@ import (
 func (h *Handler) GetTestingDashboard(w http.ResponseWriter, r *http.Request) {
 	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
 	if err != nil {
-		http.Error(w, "invalid pod ID", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid pod ID")
 		return
 	}
 
@@ -33,15 +33,15 @@ func (h *Handler) GetTestingDashboard(w http.ResponseWriter, r *http.Request) {
 	pod, err := h.db.GetPodByID(r.Context(), podID)
 	if err != nil {
 		h.logger.Error("get pod failed", "pod_id", podID, "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	if pod == nil {
-		http.Error(w, "pod not found", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "pod not found")
 		return
 	}
 	if pod.OwnerID != userID && role != models.RoleAdmin {
-		http.Error(w, "not your pod", http.StatusForbidden)
+		respondError(w, r, http.StatusForbidden, "not your pod")
 		return
 	}
 
@@ -49,7 +49,7 @@ func (h *Handler) GetTestingDashboard(w http.ResponseWriter, r *http.Request) {
 	playlists, err := h.db.GetPlaylistsForPod(r.Context(), podID)
 	if err != nil {
 		h.logger.Error("failed to get playlists for pod", "pod_id", podID, "error", err)
-		http.Error(w, "failed to load playlists", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "failed to load playlists")
 		return
 	}
 
@@ -70,7 +70,7 @@ func (h *Handler) GetTestingDashboard(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) CreateTestingRun(w http.ResponseWriter, r *http.Request) {
 	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
 	if err != nil {
-		http.Error(w, "invalid pod ID", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid pod ID")
 		return
 	}
 
@@ -81,15 +81,15 @@ func (h *Handler) CreateTestingRun(w http.ResponseWriter, r *http.Request) {
 	pod, err := h.db.GetPodByID(r.Context(), podID)
 	if err != nil {
 		h.logger.Error("get pod failed", "pod_id", podID, "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	if pod == nil {
-		http.Error(w, "pod not found", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "pod not found")
 		return
 	}
 	if pod.OwnerID != userID && role != models.RoleAdmin {
-		http.Error(w, "not your pod", http.StatusForbidden)
+		respondError(w, r, http.StatusForbidden, "not your pod")
 		return
 	}
 
@@ -99,11 +99,11 @@ func (h *Handler) CreateTestingRun(w http.ResponseWriter, r *http.Request) {
 		WorkflowIDs []uuid.UUID `json:"workflow_ids"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if req.PlaylistID == nil && len(req.WorkflowIDs) == 0 {
-		http.Error(w, "playlist_id or workflow_ids required", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "playlist_id or workflow_ids required")
 		return
 	}
 	// The engine resolves a run's workflows solely from its playlist
@@ -115,30 +115,30 @@ func (h *Handler) CreateTestingRun(w http.ResponseWriter, r *http.Request) {
 	// ad-hoc selection. No caller relies on this: the UI only ever sends
 	// playlist_id.
 	if req.PlaylistID == nil {
-		http.Error(w, "ad-hoc workflow_ids are not supported yet; supply playlist_id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "ad-hoc workflow_ids are not supported yet; supply playlist_id")
 		return
 	}
 
 	// Check for active run on this pod
 	hasActive, err := h.db.HasActiveRun(r.Context(), podID)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	if hasActive {
-		http.Error(w, "an assessment is already running on this pod", http.StatusConflict)
+		respondError(w, r, http.StatusConflict, "an assessment is already running on this pod")
 		return
 	}
 
 	// Rate limit: 3 runs per hour
 	recentCount, err := h.db.CountRecentRuns(r.Context(), podID, userID, 1*time.Hour)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	if recentCount >= 3 {
 		w.Header().Set("Retry-After", "3600")
-		http.Error(w, "maximum 3 runs per hour", http.StatusTooManyRequests)
+		respondError(w, r, http.StatusTooManyRequests, "maximum 3 runs per hour")
 		return
 	}
 
@@ -158,7 +158,7 @@ func (h *Handler) CreateTestingRun(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.db.CreateRun(r.Context(), run); err != nil {
 		h.logger.Error("failed to create run", "error", err)
-		http.Error(w, "failed to create run", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "failed to create run")
 		return
 	}
 
@@ -180,7 +180,7 @@ func (h *Handler) CreateTestingRun(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ListTestingRuns(w http.ResponseWriter, r *http.Request) {
 	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
 	if err != nil {
-		http.Error(w, "invalid pod ID", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid pod ID")
 		return
 	}
 
@@ -190,21 +190,21 @@ func (h *Handler) ListTestingRuns(w http.ResponseWriter, r *http.Request) {
 	pod, err := h.db.GetPodByID(r.Context(), podID)
 	if err != nil {
 		h.logger.Error("get pod failed", "pod_id", podID, "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	if pod == nil {
-		http.Error(w, "pod not found", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "pod not found")
 		return
 	}
 	if pod.OwnerID != userID && role != models.RoleAdmin {
-		http.Error(w, "not your pod", http.StatusForbidden)
+		respondError(w, r, http.StatusForbidden, "not your pod")
 		return
 	}
 
 	runs, err := h.db.GetRunsForPod(r.Context(), podID)
 	if err != nil {
-		http.Error(w, "failed to load runs", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "failed to load runs")
 		return
 	}
 
@@ -225,12 +225,12 @@ func validateTestingRunAccess(podOwnerID, userID uuid.UUID, role string) int {
 func (h *Handler) GetTestingRun(w http.ResponseWriter, r *http.Request) {
 	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
 	if err != nil {
-		http.Error(w, "invalid pod ID", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid pod ID")
 		return
 	}
 	runID, err := uuid.Parse(chi.URLParam(r, "runID"))
 	if err != nil {
-		http.Error(w, "invalid run ID", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid run ID")
 		return
 	}
 
@@ -240,25 +240,25 @@ func (h *Handler) GetTestingRun(w http.ResponseWriter, r *http.Request) {
 	pod, err := h.db.GetPodByID(r.Context(), podID)
 	if err != nil {
 		h.logger.Error("get pod failed", "pod_id", podID, "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	if pod == nil {
-		http.Error(w, "pod not found", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "pod not found")
 		return
 	}
 	if status := validateTestingRunAccess(pod.OwnerID, userID, role); status != 0 {
-		http.Error(w, "not your pod", http.StatusForbidden)
+		respondError(w, r, http.StatusForbidden, "not your pod")
 		return
 	}
 
 	run, err := h.db.GetRunWithResults(r.Context(), runID)
 	if err != nil {
-		http.Error(w, "run not found", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "run not found")
 		return
 	}
 	if run.PodID != podID {
-		http.Error(w, "run not found", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "run not found")
 		return
 	}
 
@@ -277,12 +277,12 @@ func (h *Handler) GetTestingRun(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) CancelTestingRun(w http.ResponseWriter, r *http.Request) {
 	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
 	if err != nil {
-		http.Error(w, "invalid pod ID", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid pod ID")
 		return
 	}
 	runID, err := uuid.Parse(chi.URLParam(r, "runID"))
 	if err != nil {
-		http.Error(w, "invalid run ID", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid run ID")
 		return
 	}
 
@@ -292,21 +292,21 @@ func (h *Handler) CancelTestingRun(w http.ResponseWriter, r *http.Request) {
 	pod, err := h.db.GetPodByID(r.Context(), podID)
 	if err != nil {
 		h.logger.Error("get pod failed", "pod_id", podID, "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	if pod == nil {
-		http.Error(w, "pod not found", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "pod not found")
 		return
 	}
 	if pod.OwnerID != userID && role != models.RoleAdmin {
-		http.Error(w, "not your pod", http.StatusForbidden)
+		respondError(w, r, http.StatusForbidden, "not your pod")
 		return
 	}
 
 	run, err := h.db.GetRun(r.Context(), runID)
 	if err != nil {
-		http.Error(w, "run not found", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "run not found")
 		return
 	}
 
@@ -315,11 +315,11 @@ func (h *Handler) CancelTestingRun(w http.ResponseWriter, r *http.Request) {
 	case models.RunStatusPending, models.RunStatusProvisioning, models.RunStatusRunning:
 		errMsg := fmt.Sprintf("Cancelled by %s", middleware.UsernameFromContext(r.Context()))
 		if err := h.db.UpdateRunStatus(r.Context(), runID, models.RunStatusCancelled, &errMsg); err != nil {
-			http.Error(w, "failed to cancel", http.StatusInternalServerError)
+			respondError(w, r, http.StatusInternalServerError, "failed to cancel")
 			return
 		}
 		respondJSON(w, http.StatusOK, map[string]string{"status": "cancelled"})
 	default:
-		http.Error(w, "run has already finished", http.StatusConflict)
+		respondError(w, r, http.StatusConflict, "run has already finished")
 	}
 }
