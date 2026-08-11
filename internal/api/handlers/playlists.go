@@ -21,7 +21,7 @@ import (
 func (h *Handler) AdminListPlaylists(w http.ResponseWriter, r *http.Request) {
 	playlists, err := h.db.ListPlaylists(r.Context())
 	if err != nil {
-		http.Error(w, "failed to list playlists", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "failed to list playlists")
 		return
 	}
 	respondJSON(w, http.StatusOK, playlists)
@@ -31,13 +31,13 @@ func (h *Handler) AdminListPlaylists(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminGetPlaylist(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "playlistID"))
 	if err != nil {
-		http.Error(w, "invalid playlist ID", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid playlist ID")
 		return
 	}
 
 	pl, err := h.db.GetPlaylistWithWorkflows(r.Context(), id)
 	if err != nil {
-		http.Error(w, "playlist not found", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "playlist not found")
 		return
 	}
 	respondJSON(w, http.StatusOK, pl)
@@ -54,11 +54,11 @@ func (h *Handler) AdminCreatePlaylist(w http.ResponseWriter, r *http.Request) {
 		WorkflowIDs []uuid.UUID `json:"workflow_ids"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if req.Name == "" || req.Slug == "" {
-		http.Error(w, "name and slug are required", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "name and slug are required")
 		return
 	}
 
@@ -73,7 +73,7 @@ func (h *Handler) AdminCreatePlaylist(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.db.CreatePlaylist(r.Context(), pl, req.WorkflowIDs); err != nil {
 		h.logger.Error("failed to create playlist", "error", err)
-		http.Error(w, "failed to create playlist", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "failed to create playlist")
 		return
 	}
 
@@ -84,7 +84,7 @@ func (h *Handler) AdminCreatePlaylist(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminUpdatePlaylist(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "playlistID"))
 	if err != nil {
-		http.Error(w, "invalid playlist ID", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid playlist ID")
 		return
 	}
 
@@ -95,13 +95,13 @@ func (h *Handler) AdminUpdatePlaylist(w http.ResponseWriter, r *http.Request) {
 		IsActive    *bool       `json:"is_active"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
 	if err := h.db.UpdatePlaylist(r.Context(), id, req.Name, req.Description, req.IsActive, req.WorkflowIDs); err != nil {
 		h.logger.Error("failed to update playlist", "error", err)
-		http.Error(w, "failed to update playlist", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "failed to update playlist")
 		return
 	}
 
@@ -112,12 +112,12 @@ func (h *Handler) AdminUpdatePlaylist(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminDeletePlaylist(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "playlistID"))
 	if err != nil {
-		http.Error(w, "invalid playlist ID", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid playlist ID")
 		return
 	}
 
 	if err := h.db.DeactivatePlaylist(r.Context(), id); err != nil {
-		http.Error(w, "failed to delete playlist", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "failed to delete playlist")
 		return
 	}
 
@@ -128,7 +128,7 @@ func (h *Handler) AdminDeletePlaylist(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminSetTemplatePlaylists(w http.ResponseWriter, r *http.Request) {
 	templateID, err := uuid.Parse(chi.URLParam(r, "templateID"))
 	if err != nil {
-		http.Error(w, "invalid template ID", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid template ID")
 		return
 	}
 
@@ -136,13 +136,13 @@ func (h *Handler) AdminSetTemplatePlaylists(w http.ResponseWriter, r *http.Reque
 		PlaylistIDs []uuid.UUID `json:"playlist_ids"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
 	if err := h.db.SetTemplatePlaylists(r.Context(), templateID, req.PlaylistIDs); err != nil {
 		h.logger.Error("failed to set template playlists", "error", err)
-		http.Error(w, "failed to set playlists", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "failed to set playlists")
 		return
 	}
 
@@ -153,14 +153,14 @@ func (h *Handler) AdminSetTemplatePlaylists(w http.ResponseWriter, r *http.Reque
 func (h *Handler) AdminGetTemplatePlaylists(w http.ResponseWriter, r *http.Request) {
 	templateID, err := uuid.Parse(chi.URLParam(r, "templateID"))
 	if err != nil {
-		http.Error(w, "invalid template ID", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid template ID")
 		return
 	}
 
 	ids, err := h.db.GetTemplatePlaylists(r.Context(), templateID)
 	if err != nil {
 		h.logger.Error("failed to get template playlists", "error", err)
-		http.Error(w, "failed to get playlists", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "failed to get playlists")
 		return
 	}
 	if ids == nil {
@@ -174,7 +174,7 @@ func (h *Handler) AdminGetTemplatePlaylists(w http.ResponseWriter, r *http.Reque
 func (h *Handler) AdminSetBlueprintVMPlaylists(w http.ResponseWriter, r *http.Request) {
 	blueprintID, err := uuid.Parse(chi.URLParam(r, "blueprintID"))
 	if err != nil {
-		http.Error(w, "invalid blueprint ID", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid blueprint ID")
 		return
 	}
 
@@ -183,13 +183,13 @@ func (h *Handler) AdminSetBlueprintVMPlaylists(w http.ResponseWriter, r *http.Re
 		PlaylistIDs []uuid.UUID `json:"playlist_ids"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
 	if err := h.db.SetBlueprintVMPlaylists(r.Context(), blueprintID, req.VMSlot, req.PlaylistIDs); err != nil {
 		h.logger.Error("failed to set blueprint VM playlists", "error", err)
-		http.Error(w, "failed to set playlists", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "failed to set playlists")
 		return
 	}
 
@@ -201,18 +201,18 @@ func (h *Handler) AdminSetBlueprintVMPlaylists(w http.ResponseWriter, r *http.Re
 func (h *Handler) AdminGetBlueprintVMPlaylistsResolved(w http.ResponseWriter, r *http.Request) {
 	blueprintID, err := uuid.Parse(chi.URLParam(r, "blueprintID"))
 	if err != nil {
-		http.Error(w, "invalid blueprint ID", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid blueprint ID")
 		return
 	}
 
 	rows, err := h.db.GetBlueprintVMPlaylistsResolved(r.Context(), blueprintID)
 	if err != nil {
 		if err.Error() == "sql: no rows in result set" {
-			http.Error(w, "blueprint not found", http.StatusNotFound)
+			respondError(w, r, http.StatusNotFound, "blueprint not found")
 			return
 		}
 		h.logger.Error("failed to get blueprint VM playlists", "error", err)
-		http.Error(w, "failed to get playlists", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "failed to get playlists")
 		return
 	}
 
@@ -268,7 +268,7 @@ func (h *Handler) AdminGetBlueprintVMPlaylistsResolved(w http.ResponseWriter, r 
 func (h *Handler) AdminDeleteBlueprintVMPlaylistsOverride(w http.ResponseWriter, r *http.Request) {
 	blueprintID, err := uuid.Parse(chi.URLParam(r, "blueprintID"))
 	if err != nil {
-		http.Error(w, "invalid blueprint ID", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid blueprint ID")
 		return
 	}
 
@@ -276,14 +276,14 @@ func (h *Handler) AdminDeleteBlueprintVMPlaylistsOverride(w http.ResponseWriter,
 	vmSlot := 0
 	_, err = fmt.Sscanf(vmSlotStr, "%d", &vmSlot)
 	if err != nil {
-		http.Error(w, "invalid vm slot", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid vm slot")
 		return
 	}
 
 	// Delete override by setting empty playlist list
 	if err := h.db.SetBlueprintVMPlaylists(r.Context(), blueprintID, vmSlot, []uuid.UUID{}); err != nil {
 		h.logger.Error("failed to delete blueprint VM playlists override", "error", err)
-		http.Error(w, "failed to delete override", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "failed to delete override")
 		return
 	}
 
@@ -346,7 +346,7 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 	runs, err := h.runsStore().ListAllRunsFiltered(r.Context(), filter)
 	if err != nil {
 		h.logger.Error("admin list runs failed", "error", err)
-		http.Error(w, "failed to list runs", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "failed to list runs")
 		return
 	}
 
@@ -362,13 +362,13 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminGetRun(w http.ResponseWriter, r *http.Request) {
 	runID, err := uuid.Parse(chi.URLParam(r, "runID"))
 	if err != nil {
-		http.Error(w, "invalid run ID", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid run ID")
 		return
 	}
 
 	run, err := h.db.GetRunWithResults(r.Context(), runID)
 	if err != nil {
-		http.Error(w, "run not found", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "run not found")
 		return
 	}
 

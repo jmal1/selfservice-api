@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
 
 	"github.com/jmal1/selfservice-api/internal/audit"
@@ -269,7 +270,7 @@ func (h *Handler) WithPreflightVCenter(vc PreflightVCenter, cfg PreflightConfig)
 // minutes; pass ?refresh=true to bypass. Returns 503 if vCenter is not wired.
 func (h *Handler) AdminListVCenterTemplatesFolder(w http.ResponseWriter, r *http.Request) {
 	if h.templatesFolder == nil {
-		http.Error(w, "vCenter folder enumeration not configured", http.StatusServiceUnavailable)
+		respondError(w, r, http.StatusServiceUnavailable, "vCenter folder enumeration not configured")
 		return
 	}
 	h.templatesFolder.ServeHTTP(w, r)
@@ -307,7 +308,7 @@ func (h *Handler) ListPods(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		h.logger.Error("list pods failed", "error", err, "user_id", userID)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	respondJSON(w, http.StatusOK, pods)
@@ -317,18 +318,18 @@ func (h *Handler) ListPods(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) GetPod(w http.ResponseWriter, r *http.Request) {
 	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
 	if err != nil {
-		http.Error(w, "invalid pod id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid pod id")
 		return
 	}
 
 	pod, err := h.db.GetPodByID(r.Context(), podID)
 	if err != nil {
 		h.logger.Error("get pod failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	if pod == nil {
-		http.Error(w, "pod not found", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "pod not found")
 		return
 	}
 
@@ -336,7 +337,7 @@ func (h *Handler) GetPod(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.UserIDFromContext(r.Context())
 	role := middleware.RoleFromContext(r.Context())
 	if pod.OwnerID != userID && role != models.RoleAdmin {
-		http.Error(w, "forbidden", http.StatusForbidden)
+		respondError(w, r, http.StatusForbidden, "forbidden")
 		return
 	}
 
@@ -347,12 +348,12 @@ func (h *Handler) GetPod(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 	var req models.CreatePodRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
 	if req.Name == "" || len(req.VMs) == 0 {
-		http.Error(w, "name and at least one VM are required", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "name and at least one VM are required")
 		return
 	}
 
@@ -362,7 +363,7 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 	// Fetch user for quota check
 	user, err := h.db.GetUserByID(r.Context(), userID)
 	if err != nil || user == nil {
-		http.Error(w, "user not found", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "user not found")
 		return
 	}
 
@@ -370,7 +371,7 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 	usage, err := h.db.GetResourceUsage(r.Context(), userID)
 	if err != nil {
 		h.logger.Error("get resource usage failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -387,7 +388,7 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 
 	templates, err := h.db.ListTemplatesForUser(r.Context(), userID, role)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -400,13 +401,13 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if found == nil {
-			http.Error(w, "template not found or not accessible: "+vm.TemplateID.String(), http.StatusBadRequest)
+			respondError(w, r, http.StatusBadRequest, "template not found or not accessible: "+vm.TemplateID.String())
 			return
 		}
 
 		// Defense in depth: ensure students cannot use instructor_only templates
 		if role == models.RoleStudent && found.Visibility == "instructor_only" {
-			http.Error(w, "template not found or not accessible: "+vm.TemplateID.String(), http.StatusForbidden)
+			respondError(w, r, http.StatusForbidden, "template not found or not accessible: "+vm.TemplateID.String())
 			return
 		}
 
@@ -430,10 +431,10 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 	if err := ValidateQuotas(usage, user, 1, totalVCPUs, totalRAM); err != nil {
 		var qe *QuotaError
 		if errors.As(err, &qe) {
-			http.Error(w, qe.Error(), http.StatusConflict)
+			respondError(w, r, http.StatusConflict, qe.Error())
 		} else {
 			h.logger.Error("quota validation failed", "error", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			respondError(w, r, http.StatusInternalServerError, "internal error")
 		}
 		return
 	}
@@ -452,7 +453,7 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 	// Generate a short random salt for VM naming
 	saltBytes := make([]byte, 3)
 	if _, err := rand.Read(saltBytes); err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	salt := hex.EncodeToString(saltBytes)
@@ -463,7 +464,7 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 	tx, err := h.db.Pool().Begin(ctx)
 	if err != nil {
 		h.logger.Error("begin tx failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	defer tx.Rollback(ctx)
@@ -481,7 +482,7 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 	)
 	if err != nil {
 		h.logger.Error("create pod failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -489,7 +490,7 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 	vlanTag, subnet, err := h.db.CheckoutVLAN(ctx, tx, podID, "all")
 	if err != nil {
 		h.logger.Error("checkout VLAN failed", "error", err)
-		http.Error(w, "no available VLAN slots", http.StatusConflict)
+		respondError(w, r, http.StatusConflict, "no available VLAN slots")
 		return
 	}
 
@@ -499,7 +500,7 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 	`, vlanTag, subnet, podID)
 	if err != nil {
 		h.logger.Error("create pod failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -533,7 +534,7 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 		`, podID, rv.template.ID, rv.req.DisplayName, rv.vcpus, rv.ramMB, rv.diskGB).Scan(&vmID, &vmCreatedAt)
 		if err != nil {
 			h.logger.Error("create pod_vm failed", "error", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			respondError(w, r, http.StatusInternalServerError, "internal error")
 			return
 		}
 
@@ -557,7 +558,7 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 
 	if err := tx.Commit(ctx); err != nil {
 		h.logger.Error("commit tx failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -579,7 +580,7 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 	job, err := h.db.CreateJob(ctx, models.JobTypePodCreate, payload)
 	if err != nil {
 		h.logger.Error("create job failed", "error", err)
-		http.Error(w, "failed to queue provisioning job", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "failed to queue provisioning job")
 		return
 	}
 
@@ -606,25 +607,25 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) DeletePod(w http.ResponseWriter, r *http.Request) {
 	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
 	if err != nil {
-		http.Error(w, "invalid pod id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid pod id")
 		return
 	}
 
 	pod, err := h.db.GetPodByID(r.Context(), podID)
 	if err != nil || pod == nil {
-		http.Error(w, "pod not found", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "pod not found")
 		return
 	}
 
 	userID := middleware.UserIDFromContext(r.Context())
 	role := middleware.RoleFromContext(r.Context())
 	if pod.OwnerID != userID && role != models.RoleAdmin {
-		http.Error(w, "forbidden", http.StatusForbidden)
+		respondError(w, r, http.StatusForbidden, "forbidden")
 		return
 	}
 
 	if pod.Status == models.PodStatusDestroying || pod.Status == models.PodStatusDestroyed {
-		http.Error(w, "pod is already being destroyed", http.StatusConflict)
+		respondError(w, r, http.StatusConflict, "pod is already being destroyed")
 		return
 	}
 
@@ -632,7 +633,7 @@ func (h *Handler) DeletePod(w http.ResponseWriter, r *http.Request) {
 	job, err := h.db.CreateJob(r.Context(), models.JobTypePodDestroy, payload)
 	if err != nil {
 		h.logger.Error("create destroy job failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -657,25 +658,25 @@ func (h *Handler) DeletePod(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ExtendPod(w http.ResponseWriter, r *http.Request) {
 	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
 	if err != nil {
-		http.Error(w, "invalid pod id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid pod id")
 		return
 	}
 
 	pod, err := h.db.GetPodByID(r.Context(), podID)
 	if err != nil || pod == nil {
-		http.Error(w, "pod not found", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "pod not found")
 		return
 	}
 
 	userID := middleware.UserIDFromContext(r.Context())
 	role := middleware.RoleFromContext(r.Context())
 	if pod.OwnerID != userID && role != models.RoleAdmin {
-		http.Error(w, "forbidden", http.StatusForbidden)
+		respondError(w, r, http.StatusForbidden, "forbidden")
 		return
 	}
 
 	if pod.Status != models.PodStatusActive {
-		http.Error(w, "pod must be active to extend", http.StatusConflict)
+		respondError(w, r, http.StatusConflict, "pod must be active to extend")
 		return
 	}
 
@@ -698,14 +699,14 @@ func (h *Handler) ExtendPod(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.db.CreatePodAttestation(r.Context(), attestation); err != nil {
 		h.logger.Error("create attestation failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
 	// Update pod expiry
 	if err := h.db.UpdatePodExpiry(r.Context(), podID, newExpiry); err != nil {
 		h.logger.Error("update pod expiry failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -727,18 +728,18 @@ func (h *Handler) ExtendPod(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminExtendPod(w http.ResponseWriter, r *http.Request) {
 	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
 	if err != nil {
-		http.Error(w, "invalid pod id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid pod id")
 		return
 	}
 
 	pod, err := h.db.GetPodByID(r.Context(), podID)
 	if err != nil || pod == nil {
-		http.Error(w, "pod not found", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "pod not found")
 		return
 	}
 
 	if pod.Status != models.PodStatusActive {
-		http.Error(w, "pod must be active to extend", http.StatusConflict)
+		respondError(w, r, http.StatusConflict, "pod must be active to extend")
 		return
 	}
 
@@ -753,13 +754,13 @@ func (h *Handler) AdminExtendPod(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.db.CreatePodAttestation(r.Context(), attestation); err != nil {
 		h.logger.Error("create attestation failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
 	if err := h.db.UpdatePodExpiry(r.Context(), podID, newExpiry); err != nil {
 		h.logger.Error("update pod expiry failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -780,36 +781,36 @@ func (h *Handler) AdminExtendPod(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) DeleteVM(w http.ResponseWriter, r *http.Request) {
 	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
 	if err != nil {
-		http.Error(w, "invalid pod id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid pod id")
 		return
 	}
 	vmID, err := uuid.Parse(chi.URLParam(r, "vmID"))
 	if err != nil {
-		http.Error(w, "invalid vm id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid vm id")
 		return
 	}
 
 	pod, err := h.db.GetPodByID(r.Context(), podID)
 	if err != nil || pod == nil {
-		http.Error(w, "pod not found", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "pod not found")
 		return
 	}
 
 	userID := middleware.UserIDFromContext(r.Context())
 	role := middleware.RoleFromContext(r.Context())
 	if pod.OwnerID != userID && role != models.RoleAdmin {
-		http.Error(w, "forbidden", http.StatusForbidden)
+		respondError(w, r, http.StatusForbidden, "forbidden")
 		return
 	}
 
 	// Verify VM belongs to this pod
 	vm, err := h.db.GetPodVM(r.Context(), vmID)
 	if err != nil || vm.PodID != podID {
-		http.Error(w, "vm not found in this pod", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "vm not found in this pod")
 		return
 	}
 	if vm.Status == models.VMStatusDeleted {
-		http.Error(w, "vm is already deleted", http.StatusConflict)
+		respondError(w, r, http.StatusConflict, "vm is already deleted")
 		return
 	}
 
@@ -827,7 +828,7 @@ func (h *Handler) DeleteVM(w http.ResponseWriter, r *http.Request) {
 	job, err := h.db.CreateJob(r.Context(), models.JobTypeVMDestroy, payload)
 	if err != nil {
 		h.logger.Error("create vm destroy job failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -851,47 +852,47 @@ func (h *Handler) DeleteVM(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AddVM(w http.ResponseWriter, r *http.Request) {
 	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
 	if err != nil {
-		http.Error(w, "invalid pod id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid pod id")
 		return
 	}
 
 	var req models.AddVMRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if req.DisplayName == "" {
-		http.Error(w, "display_name is required", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "display_name is required")
 		return
 	}
 
 	pod, err := h.db.GetPodByID(r.Context(), podID)
 	if err != nil || pod == nil {
-		http.Error(w, "pod not found", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "pod not found")
 		return
 	}
 
 	userID := middleware.UserIDFromContext(r.Context())
 	role := middleware.RoleFromContext(r.Context())
 	if pod.OwnerID != userID && role != models.RoleAdmin {
-		http.Error(w, "forbidden", http.StatusForbidden)
+		respondError(w, r, http.StatusForbidden, "forbidden")
 		return
 	}
 
 	if pod.Status != models.PodStatusActive {
-		http.Error(w, "pod must be active to add VMs", http.StatusConflict)
+		respondError(w, r, http.StatusConflict, "pod must be active to add VMs")
 		return
 	}
 
 	if !pod.AllowVMAdditions && role != models.RoleAdmin {
-		http.Error(w, "this environment does not allow adding VMs", http.StatusForbidden)
+		respondError(w, r, http.StatusForbidden, "this environment does not allow adding VMs")
 		return
 	}
 
 	// Resolve template
 	templates, err := h.db.ListTemplatesForUser(r.Context(), userID, role)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	var found *models.Template
@@ -902,19 +903,19 @@ func (h *Handler) AddVM(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if found == nil {
-		http.Error(w, "template not found or not accessible", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "template not found or not accessible")
 		return
 	}
 
 	// Check quotas
 	user, err := h.db.GetUserByID(r.Context(), userID)
 	if err != nil || user == nil {
-		http.Error(w, "user not found", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "user not found")
 		return
 	}
 	usage, err := h.db.GetResourceUsage(r.Context(), userID)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -934,10 +935,10 @@ func (h *Handler) AddVM(w http.ResponseWriter, r *http.Request) {
 	if err := ValidateQuotas(usage, user, 0, vcpus, ram); err != nil {
 		var qe *QuotaError
 		if errors.As(err, &qe) {
-			http.Error(w, qe.Error(), http.StatusConflict)
+			respondError(w, r, http.StatusConflict, qe.Error())
 		} else {
 			h.logger.Error("quota validation failed", "error", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			respondError(w, r, http.StatusInternalServerError, "internal error")
 		}
 		return
 	}
@@ -954,7 +955,7 @@ func (h *Handler) AddVM(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.db.CreatePodVM(r.Context(), vm); err != nil {
 		h.logger.Error("create pod vm failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -970,7 +971,7 @@ func (h *Handler) AddVM(w http.ResponseWriter, r *http.Request) {
 	job, err := h.db.CreateJob(r.Context(), models.JobTypeVMAdd, payload)
 	if err != nil {
 		h.logger.Error("create vm add job failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -995,12 +996,12 @@ func (h *Handler) AddVM(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) VMPowerAction(w http.ResponseWriter, r *http.Request) {
 	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
 	if err != nil {
-		http.Error(w, "invalid pod id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid pod id")
 		return
 	}
 	vmID, err := uuid.Parse(chi.URLParam(r, "vmID"))
 	if err != nil {
-		http.Error(w, "invalid vm id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid vm id")
 		return
 	}
 
@@ -1017,31 +1018,31 @@ func (h *Handler) VMPowerAction(w http.ResponseWriter, r *http.Request) {
 	case "reset":
 		jobType = models.JobTypeVMReset
 	default:
-		http.Error(w, "unknown power action", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "unknown power action")
 		return
 	}
 
 	pod, err := h.db.GetPodByID(r.Context(), podID)
 	if err != nil || pod == nil {
-		http.Error(w, "pod not found", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "pod not found")
 		return
 	}
 
 	userID := middleware.UserIDFromContext(r.Context())
 	role := middleware.RoleFromContext(r.Context())
 	if pod.OwnerID != userID && role != models.RoleAdmin {
-		http.Error(w, "forbidden", http.StatusForbidden)
+		respondError(w, r, http.StatusForbidden, "forbidden")
 		return
 	}
 
 	// Verify VM belongs to this pod
 	vm, err := h.db.GetPodVM(r.Context(), vmID)
 	if err != nil || vm.PodID != podID {
-		http.Error(w, "vm not found in this pod", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "vm not found in this pod")
 		return
 	}
 	if vm.Status == models.VMStatusDeleted {
-		http.Error(w, "vm is deleted", http.StatusConflict)
+		respondError(w, r, http.StatusConflict, "vm is deleted")
 		return
 	}
 
@@ -1055,7 +1056,7 @@ func (h *Handler) VMPowerAction(w http.ResponseWriter, r *http.Request) {
 	job, err := h.db.CreateJob(r.Context(), jobType, payload)
 	if err != nil {
 		h.logger.Error("create vm power job failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -1099,13 +1100,13 @@ func (h *Handler) ListTemplates(w http.ResponseWriter, r *http.Request) {
 	templates, err := h.templateStore().ListTemplatesForUser(r.Context(), userID, role)
 	if err != nil {
 		h.logger.Error("list templates failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	explicit, err := h.templateStore().ListExplicitTemplateAccessForUser(r.Context(), userID)
 	if err != nil {
 		h.logger.Error("list explicit template access failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	visible := templates[:0]
@@ -1128,7 +1129,7 @@ func (h *Handler) ListTemplates(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminReorderTemplates(w http.ResponseWriter, r *http.Request) {
 	role := middleware.RoleFromContext(r.Context())
 	if role != models.RoleInstructor && role != models.RoleAdmin {
-		http.Error(w, "forbidden", http.StatusForbidden)
+		respondError(w, r, http.StatusForbidden, "forbidden")
 		return
 	}
 
@@ -1137,7 +1138,7 @@ func (h *Handler) AdminReorderTemplates(w http.ResponseWriter, r *http.Request) 
 		PinOrder int  `json:"pin_order"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
@@ -1146,7 +1147,7 @@ func (h *Handler) AdminReorderTemplates(w http.ResponseWriter, r *http.Request) 
 	for k, v := range reqBody {
 		id, err := uuid.Parse(k)
 		if err != nil {
-			http.Error(w, "invalid template id: "+k, http.StatusBadRequest)
+			respondError(w, r, http.StatusBadRequest, "invalid template id: "+k)
 			return
 		}
 		req[id] = database.PinState{Pinned: v.Pinned, PinOrder: v.PinOrder}
@@ -1157,11 +1158,11 @@ func (h *Handler) AdminReorderTemplates(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		if errors.Is(err, database.ErrTemplateNotFound) {
 			h.logger.Warn("reorder templates target not found", "error", err, "user_id", userID)
-			http.Error(w, "Specified template not found", http.StatusNotFound)
+			respondError(w, r, http.StatusNotFound, "Specified template not found")
 			return
 		}
 		h.logger.Error("reorder templates failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -1177,13 +1178,13 @@ func (h *Handler) AdminReorderTemplates(w http.ResponseWriter, r *http.Request) 
 func (h *Handler) AdminSetTemplatePin(w http.ResponseWriter, r *http.Request) {
 	role := middleware.RoleFromContext(r.Context())
 	if role != models.RoleInstructor && role != models.RoleAdmin {
-		http.Error(w, "forbidden", http.StatusForbidden)
+		respondError(w, r, http.StatusForbidden, "forbidden")
 		return
 	}
 
 	templateID, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
-		http.Error(w, "invalid template id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid template id")
 		return
 	}
 
@@ -1191,7 +1192,7 @@ func (h *Handler) AdminSetTemplatePin(w http.ResponseWriter, r *http.Request) {
 		PinOrder int `json:"pin_order"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
@@ -1199,11 +1200,11 @@ func (h *Handler) AdminSetTemplatePin(w http.ResponseWriter, r *http.Request) {
 	if err := h.templatePinStore().SetTemplatePin(r.Context(), templateID, true, req.PinOrder, userID); err != nil {
 		if errors.Is(err, database.ErrTemplateNotFound) {
 			h.logger.Warn("set template pin target not found", "error", err, "user_id", userID)
-			http.Error(w, "Specified template not found", http.StatusNotFound)
+			respondError(w, r, http.StatusNotFound, "Specified template not found")
 			return
 		}
 		h.logger.Error("set template pin failed", "error", err, "template_id", templateID, "user_id", userID)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -1220,13 +1221,13 @@ func (h *Handler) AdminSetTemplatePin(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminUnpinTemplate(w http.ResponseWriter, r *http.Request) {
 	role := middleware.RoleFromContext(r.Context())
 	if role != models.RoleInstructor && role != models.RoleAdmin {
-		http.Error(w, "forbidden", http.StatusForbidden)
+		respondError(w, r, http.StatusForbidden, "forbidden")
 		return
 	}
 
 	templateID, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
-		http.Error(w, "invalid template id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid template id")
 		return
 	}
 
@@ -1234,11 +1235,11 @@ func (h *Handler) AdminUnpinTemplate(w http.ResponseWriter, r *http.Request) {
 	if err := h.templatePinStore().SetTemplatePin(r.Context(), templateID, false, 0, userID); err != nil {
 		if errors.Is(err, database.ErrTemplateNotFound) {
 			h.logger.Warn("unpin template target not found", "error", err, "user_id", userID)
-			http.Error(w, "Specified template not found", http.StatusNotFound)
+			respondError(w, r, http.StatusNotFound, "Specified template not found")
 			return
 		}
 		h.logger.Error("unpin template failed", "error", err, "template_id", templateID, "user_id", userID)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -1256,13 +1257,13 @@ func (h *Handler) AdminUnpinTemplate(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) GetJobStatus(w http.ResponseWriter, r *http.Request) {
 	jobID, err := uuid.Parse(chi.URLParam(r, "jobID"))
 	if err != nil {
-		http.Error(w, "invalid job id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid job id")
 		return
 	}
 
 	job, err := h.db.GetJob(r.Context(), jobID)
 	if err != nil || job == nil {
-		http.Error(w, "job not found", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "job not found")
 		return
 	}
 
@@ -1281,7 +1282,7 @@ func (h *Handler) ListMyJobs(w http.ResponseWriter, r *http.Request) {
 	jobs, err := h.db.ListJobsByUser(r.Context(), userID)
 	if err != nil {
 		h.logger.Error("list user jobs failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	if jobs == nil {
@@ -1298,14 +1299,14 @@ func (h *Handler) GetMe(w http.ResponseWriter, r *http.Request) {
 
 	user, err := h.db.GetUserByID(r.Context(), userID)
 	if err != nil || user == nil {
-		http.Error(w, "user not found", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "user not found")
 		return
 	}
 
 	usage, err := h.db.GetResourceUsage(r.Context(), userID)
 	if err != nil {
 		h.logger.Error("get resource usage failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -1326,7 +1327,7 @@ func (h *Handler) AdminListUsers(w http.ResponseWriter, r *http.Request) {
 	users, err := h.db.ListUsers(r.Context())
 	if err != nil {
 		h.logger.Error("admin list users failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	respondJSON(w, http.StatusOK, users)
@@ -1336,19 +1337,19 @@ func (h *Handler) AdminListUsers(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminUpdateQuotas(w http.ResponseWriter, r *http.Request) {
 	userID, err := uuid.Parse(chi.URLParam(r, "userID"))
 	if err != nil {
-		http.Error(w, "invalid user id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid user id")
 		return
 	}
 
 	var req models.UpdateQuotaRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
 	if err := h.db.UpdateUserQuotas(r.Context(), userID, req); err != nil {
 		h.logger.Error("update quotas failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -1360,7 +1361,7 @@ func (h *Handler) AdminListTemplates(w http.ResponseWriter, r *http.Request) {
 	templates, err := h.db.ListAllTemplates(r.Context())
 	if err != nil {
 		h.logger.Error("admin list templates failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	respondJSON(w, http.StatusOK, templates)
@@ -1370,19 +1371,19 @@ func (h *Handler) AdminListTemplates(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminCreateTemplate(w http.ResponseWriter, r *http.Request) {
 	var req models.CreateTemplateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
 	if req.Name == "" || req.VCenterTemplate == "" || req.OSType == "" {
-		http.Error(w, "name, vcenter_template, and os_type are required", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "name, vcenter_template, and os_type are required")
 		return
 	}
 
 	tmpl, err := h.db.CreateTemplate(r.Context(), req)
 	if err != nil {
 		h.logger.Error("create template failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -1394,19 +1395,19 @@ func (h *Handler) AdminCreateTemplate(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminSetTemplateAccess(w http.ResponseWriter, r *http.Request) {
 	templateID, err := uuid.Parse(chi.URLParam(r, "templateID"))
 	if err != nil {
-		http.Error(w, "invalid template id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid template id")
 		return
 	}
 
 	var req models.SetTemplateAccessRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
 	if err := h.db.SetTemplateAccess(r.Context(), templateID, req.Rules); err != nil {
 		h.logger.Error("set template access failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -1417,28 +1418,28 @@ func (h *Handler) AdminSetTemplateAccess(w http.ResponseWriter, r *http.Request)
 func (h *Handler) AdminUpdateTemplate(w http.ResponseWriter, r *http.Request) {
 	templateID, err := uuid.Parse(chi.URLParam(r, "templateID"))
 	if err != nil {
-		http.Error(w, "invalid template id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid template id")
 		return
 	}
 
 	var req models.UpdateTemplateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
 	tmpl, err := h.db.UpdateTemplate(r.Context(), templateID, req)
 	if err != nil {
 		if errors.Is(err, database.ErrTemplateStale) {
-			http.Error(w, "template was modified by another user; refresh and try again", http.StatusConflict)
+			respondError(w, r, http.StatusConflict, "template was modified by another user; refresh and try again")
 			return
 		}
 		h.logger.Error("update template failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	if tmpl == nil {
-		http.Error(w, "template not found", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "template not found")
 		return
 	}
 
@@ -1463,14 +1464,14 @@ func (h *Handler) AdminUpdateTemplate(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminDeleteTemplate(w http.ResponseWriter, r *http.Request) {
 	templateID, err := uuid.Parse(chi.URLParam(r, "templateID"))
 	if err != nil {
-		http.Error(w, "invalid template id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid template id")
 		return
 	}
 
 	tmpl, err := h.db.GetTemplateByID(r.Context(), templateID)
 	if err != nil {
 		h.logger.Error("load template for delete failed", "error", err, "template_id", templateID)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	if tmpl == nil {
@@ -1490,11 +1491,10 @@ func (h *Handler) AdminDeleteTemplate(w http.ResponseWriter, r *http.Request) {
 	// (destroyed-pod) rows are fine — DeleteTemplateWithHistory mops those up.
 	if _, deps, derr := h.db.ListTemplateDependents(r.Context(), templateID); derr != nil {
 		h.logger.Error("delete template: list dependents failed", "error", derr, "template_id", templateID)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	} else if len(deps) > 0 {
-		http.Error(w, fmt.Sprintf("template is in use by %d active pod VM(s); destroy those pods before deleting the template", len(deps)),
-			http.StatusConflict)
+		respondError(w, r, http.StatusConflict, fmt.Sprintf("template is in use by %d active pod VM(s); destroy those pods before deleting the template", len(deps)))
 		return
 	}
 
@@ -1503,11 +1503,10 @@ func (h *Handler) AdminDeleteTemplate(w http.ResponseWriter, r *http.Request) {
 	// delete otherwise; the operator must detach it from the blueprint first.
 	if n, berr := h.db.CountTemplateBlueprintRefs(r.Context(), templateID); berr != nil {
 		h.logger.Error("delete template: count blueprint refs failed", "error", berr, "template_id", templateID)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	} else if n > 0 {
-		http.Error(w, fmt.Sprintf("template is used by %d blueprint VM definition(s); remove it from those blueprints before deleting", n),
-			http.StatusConflict)
+		respondError(w, r, http.StatusConflict, fmt.Sprintf("template is used by %d blueprint VM definition(s); remove it from those blueprints before deleting", n))
 		return
 	}
 
@@ -1529,8 +1528,7 @@ func (h *Handler) AdminDeleteTemplate(w http.ResponseWriter, r *http.Request) {
 				)
 				// 502: an upstream system (vCenter) failed. The DB row
 				// is preserved so the operator can retry.
-				http.Error(w, "failed to destroy staging VM in vCenter: "+err.Error(),
-					http.StatusBadGateway)
+				respondError(w, r, http.StatusBadGateway, "failed to destroy staging VM in vCenter: "+err.Error())
 				return
 			}
 			h.logger.Info("template delete: destroyed staging VM",
@@ -1540,7 +1538,7 @@ func (h *Handler) AdminDeleteTemplate(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.db.DeleteTemplateWithHistory(r.Context(), templateID); err != nil {
 		h.logger.Error("delete template failed", "error", err, "template_id", templateID)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -1583,14 +1581,14 @@ func templateDeleteStateRefusal(state string) (bool, string) {
 func (h *Handler) AdminListTemplateDependents(w http.ResponseWriter, r *http.Request) {
 	templateID, err := uuid.Parse(chi.URLParam(r, "templateID"))
 	if err != nil {
-		http.Error(w, "invalid template id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid template id")
 		return
 	}
 
 	templateName, vms, err := h.db.ListTemplateDependents(r.Context(), templateID)
 	if err != nil {
 		h.logger.Error("list template dependents failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	if vms == nil {
@@ -1613,7 +1611,7 @@ func (h *Handler) AdminListJobs(w http.ResponseWriter, r *http.Request) {
 	jobs, err := h.db.ListAllJobs(r.Context())
 	if err != nil {
 		h.logger.Error("admin list jobs failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	if jobs == nil {
@@ -1627,7 +1625,7 @@ func (h *Handler) AdminListAuditLog(w http.ResponseWriter, r *http.Request) {
 	entries, err := h.db.ListAuditLog(r.Context())
 	if err != nil {
 		h.logger.Error("admin list audit log failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	if entries == nil {
@@ -1643,7 +1641,7 @@ func (h *Handler) AdminListVLANPool(w http.ResponseWriter, r *http.Request) {
 	entries, err := h.db.ListVLANPool(r.Context())
 	if err != nil {
 		h.logger.Error("admin list vlan pool failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	if entries == nil {
@@ -1656,18 +1654,18 @@ func (h *Handler) AdminListVLANPool(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminAddVLAN(w http.ResponseWriter, r *http.Request) {
 	var req models.AddVLANRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if req.VLANTag < 1 || req.VLANTag > 4094 || req.Subnet == "" || req.HostScope == "" {
-		http.Error(w, "vlan_tag (1-4094), subnet, and host_scope are required", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "vlan_tag (1-4094), subnet, and host_scope are required")
 		return
 	}
 
 	entry, err := h.db.AddVLAN(r.Context(), req)
 	if err != nil {
 		h.logger.Error("add VLAN failed", "error", err)
-		http.Error(w, "failed to add VLAN (may already exist)", http.StatusConflict)
+		respondError(w, r, http.StatusConflict, "failed to add VLAN (may already exist)")
 		return
 	}
 
@@ -1679,24 +1677,24 @@ func (h *Handler) AdminUpdateVLAN(w http.ResponseWriter, r *http.Request) {
 	idStr := chi.URLParam(r, "vlanID")
 	var id int
 	if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
-		http.Error(w, "invalid vlan id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid vlan id")
 		return
 	}
 
 	var req models.UpdateVLANRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
 	entry, err := h.db.UpdateVLAN(r.Context(), id, req)
 	if err != nil {
 		h.logger.Error("update VLAN failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	if entry == nil {
-		http.Error(w, "VLAN not found", http.StatusNotFound)
+		respondError(w, r, http.StatusNotFound, "VLAN not found")
 		return
 	}
 
@@ -1708,13 +1706,13 @@ func (h *Handler) AdminRemoveVLAN(w http.ResponseWriter, r *http.Request) {
 	idStr := chi.URLParam(r, "vlanID")
 	var id int
 	if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
-		http.Error(w, "invalid vlan id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid vlan id")
 		return
 	}
 
 	if err := h.db.RemoveVLAN(r.Context(), id); err != nil {
 		h.logger.Error("remove VLAN failed", "error", err)
-		http.Error(w, err.Error(), http.StatusConflict)
+		respondError(w, r, http.StatusConflict, err.Error())
 		return
 	}
 
@@ -1732,6 +1730,26 @@ func respondJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(data)
+}
+
+// respondError writes a structured JSON error body:
+//
+//	{"error": "<message>", "request_id": "<chi request id>"}
+//
+// It is the JSON counterpart of the plain-text http.Error used historically.
+// The UI's apiFetch parses the response body as JSON, so http.Error (which
+// emits text/plain) left ApiError.body null and the real reason ("name is
+// required", etc.) never reached the user. Handlers on the user-facing form
+// surface should use respondError so the client can surface the actual reason.
+//
+// request_id is best-effort: it echoes the chi RequestID middleware value when
+// present so a support request can be correlated with server logs.
+func respondError(w http.ResponseWriter, r *http.Request, status int, message string) {
+	body := map[string]string{"error": message}
+	if reqID := chimiddleware.GetReqID(r.Context()); reqID != "" {
+		body["request_id"] = reqID
+	}
+	respondJSON(w, status, body)
 }
 
 // sanitizeName converts a display name to a DNS-safe slug.
@@ -1796,7 +1814,7 @@ func (h *Handler) AdminSearchAuditLog(w http.ResponseWriter, r *http.Request) {
 	page, err := h.db.ListAuditLogPaginated(r.Context(), filter)
 	if err != nil {
 		h.logger.Error("admin search audit log failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	if page.Entries == nil {
@@ -1812,7 +1830,7 @@ func (h *Handler) AdminListSessions(w http.ResponseWriter, r *http.Request) {
 	sessions, err := h.db.ListActiveSessions(r.Context())
 	if err != nil {
 		h.logger.Error("admin list sessions failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	if sessions == nil {

@@ -215,17 +215,17 @@ func (c *isoDatastoreCache) set(files []vcenter.DatastoreFile) {
 // image_uploads row, and returns presigned PUT URLs.
 func (h *Handler) AdminCreateImageUpload(w http.ResponseWriter, r *http.Request) {
 	if h.imageStore == nil || h.imgDB == nil {
-		http.Error(w, "image upload not configured", http.StatusServiceUnavailable)
+		respondError(w, r, http.StatusServiceUnavailable, "image upload not configured")
 		return
 	}
 
 	var req CreateImageUploadRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if req.Filename == "" {
-		http.Error(w, "filename is required", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "filename is required")
 		return
 	}
 
@@ -234,14 +234,14 @@ func (h *Handler) AdminCreateImageUpload(w http.ResponseWriter, r *http.Request)
 	// cannot be supplied at all.
 	kind, err := ImageKindFromFilename(req.Filename)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	// Size cap checked BEFORE touching the object store or the database so
 	// a rejected request never leaves dangling state.
 	if status, verr := ValidateImageUploadSize(req.SizeBytes); verr != nil {
-		http.Error(w, verr.Error(), status)
+		respondError(w, r, status, verr.Error())
 		return
 	}
 
@@ -252,10 +252,10 @@ func (h *Handler) AdminCreateImageUpload(w http.ResponseWriter, r *http.Request)
 	if used, uerr := h.imageStore.UsedBytes(r.Context()); uerr != nil {
 		h.logger.Warn("staging usage check failed; allowing upload", "error", uerr)
 	} else if used+req.SizeBytes > ImageStagingBudgetBytes {
-		http.Error(w, fmt.Sprintf(
+		respondError(w, r, http.StatusInsufficientStorage, fmt.Sprintf(
 			"insufficient staging space: %d bytes already staged plus %d requested exceeds the %d byte budget; import or delete a pending image first",
 			used, req.SizeBytes, ImageStagingBudgetBytes,
-		), http.StatusInsufficientStorage)
+		))
 		return
 	}
 
@@ -272,7 +272,7 @@ func (h *Handler) AdminCreateImageUpload(w http.ResponseWriter, r *http.Request)
 	)
 	if err != nil {
 		h.logger.Error("presign multipart failed", "error", err)
-		http.Error(w, "failed to create upload session", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "failed to create upload session")
 		return
 	}
 
@@ -288,7 +288,7 @@ func (h *Handler) AdminCreateImageUpload(w http.ResponseWriter, r *http.Request)
 	}
 	if err := h.imgDB.CreateImageUpload(r.Context(), img); err != nil {
 		h.logger.Error("create image upload row failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	h.recordImageUpload(kind, "created")
@@ -318,30 +318,30 @@ func (h *Handler) AdminCreateImageUpload(w http.ResponseWriter, r *http.Request)
 // object to confirm the real size, and moves the row to `uploaded`.
 func (h *Handler) AdminCompleteImageUpload(w http.ResponseWriter, r *http.Request) {
 	if h.imageStore == nil || h.imgDB == nil {
-		http.Error(w, "image upload not configured", http.StatusServiceUnavailable)
+		respondError(w, r, http.StatusServiceUnavailable, "image upload not configured")
 		return
 	}
 
 	imageID, err := uuid.Parse(chi.URLParam(r, "imageID"))
 	if err != nil {
-		http.Error(w, "invalid image id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid image id")
 		return
 	}
 
 	img, err := h.imgDB.GetImageUploadByID(r.Context(), imageID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			http.Error(w, "image upload not found", http.StatusNotFound)
+			respondError(w, r, http.StatusNotFound, "image upload not found")
 			return
 		}
 		h.logger.Error("get image upload failed", "error", err, "id", imageID)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
 	var req CompleteImageUploadRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
@@ -354,7 +354,7 @@ func (h *Handler) AdminCompleteImageUpload(w http.ResponseWriter, r *http.Reques
 	if err := h.imageStore.CompleteMultipart(r.Context(), img.ObjectKey, img.UploadID, mp); err != nil {
 		h.logger.Error("complete multipart failed", "error", err, "id", imageID)
 		h.recordImageUpload(img.Kind, "failed")
-		http.Error(w, "failed to complete upload: "+err.Error(), http.StatusBadGateway)
+		respondError(w, r, http.StatusBadGateway, "failed to complete upload: "+err.Error())
 		return
 	}
 
@@ -366,7 +366,7 @@ func (h *Handler) AdminCompleteImageUpload(w http.ResponseWriter, r *http.Reques
 		h.logger.Error("stat object failed after complete", "error", err, "id", imageID)
 		_ = h.imgDB.SetImageUploadError(r.Context(), imageID, "stat after complete failed: "+err.Error())
 		h.recordImageUpload(img.Kind, "failed")
-		http.Error(w, "failed to verify upload size", http.StatusBadGateway)
+		respondError(w, r, http.StatusBadGateway, "failed to verify upload size")
 		return
 	}
 
@@ -403,12 +403,12 @@ func (h *Handler) AdminCompleteImageUpload(w http.ResponseWriter, r *http.Reques
 				}
 			}
 			h.recordImageUpload(img.Kind, "failed")
-			http.Error(w, "upload is in unexpected state", http.StatusConflict)
+			respondError(w, r, http.StatusConflict, "upload is in unexpected state")
 			return
 		}
 		h.logger.Error("set uploaded status failed", "error", err, "id", imageID)
 		h.recordImageUpload(img.Kind, "failed")
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	h.recordImageUpload(img.Kind, "completed")
@@ -457,24 +457,24 @@ func (h *Handler) AdminCompleteImageUpload(w http.ResponseWriter, r *http.Reques
 // from MinIO into vCenter.
 func (h *Handler) AdminImportImage(w http.ResponseWriter, r *http.Request) {
 	if h.imgDB == nil {
-		http.Error(w, "image upload not configured", http.StatusServiceUnavailable)
+		respondError(w, r, http.StatusServiceUnavailable, "image upload not configured")
 		return
 	}
 
 	imageID, err := uuid.Parse(chi.URLParam(r, "imageID"))
 	if err != nil {
-		http.Error(w, "invalid image id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid image id")
 		return
 	}
 
 	img, err := h.imgDB.GetImageUploadByID(r.Context(), imageID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			http.Error(w, "image upload not found", http.StatusNotFound)
+			respondError(w, r, http.StatusNotFound, "image upload not found")
 			return
 		}
 		h.logger.Error("get image upload failed", "error", err, "id", imageID)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -493,7 +493,7 @@ func (h *Handler) AdminImportImage(w http.ResponseWriter, r *http.Request) {
 	if !strings.HasPrefix(img.ObjectKey, "crucible/") {
 		h.logger.Error("image object key does not start with crucible/ prefix; refusing import",
 			"id", imageID, "object_key", img.ObjectKey)
-		http.Error(w, "invalid object key: key does not match expected prefix", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "invalid object key: key does not match expected prefix")
 		return
 	}
 
@@ -511,7 +511,7 @@ func (h *Handler) AdminImportImage(w http.ResponseWriter, r *http.Request) {
 		if err := h.imgDB.UpdateImageUploadStatus(r.Context(), imageID,
 			models.ImageUploadError, models.ImageUploadUploaded); err != nil {
 			h.logger.Error("reset error row to uploaded failed", "error", err, "id", imageID)
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			respondError(w, r, http.StatusInternalServerError, "internal error")
 			return
 		}
 	}
@@ -520,7 +520,7 @@ func (h *Handler) AdminImportImage(w http.ResponseWriter, r *http.Request) {
 	job, err := h.imgDB.CreateJob(r.Context(), models.JobTypeImageImport, payload)
 	if err != nil {
 		h.logger.Error("create image import job failed", "error", err, "id", imageID)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -548,14 +548,14 @@ func (h *Handler) AdminImportImage(w http.ResponseWriter, r *http.Request) {
 // AdminListImages lists staged images and their status.
 func (h *Handler) AdminListImages(w http.ResponseWriter, r *http.Request) {
 	if h.imgDB == nil {
-		http.Error(w, "image upload not configured", http.StatusServiceUnavailable)
+		respondError(w, r, http.StatusServiceUnavailable, "image upload not configured")
 		return
 	}
 
 	images, err := h.imgDB.ListImageUploads(r.Context())
 	if err != nil {
 		h.logger.Error("list image uploads failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	respondJSON(w, http.StatusOK, images)
@@ -564,24 +564,24 @@ func (h *Handler) AdminListImages(w http.ResponseWriter, r *http.Request) {
 // AdminGetImage returns a single staged image.
 func (h *Handler) AdminGetImage(w http.ResponseWriter, r *http.Request) {
 	if h.imgDB == nil {
-		http.Error(w, "image upload not configured", http.StatusServiceUnavailable)
+		respondError(w, r, http.StatusServiceUnavailable, "image upload not configured")
 		return
 	}
 
 	imageID, err := uuid.Parse(chi.URLParam(r, "imageID"))
 	if err != nil {
-		http.Error(w, "invalid image id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid image id")
 		return
 	}
 
 	img, err := h.imgDB.GetImageUploadByID(r.Context(), imageID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			http.Error(w, "image upload not found", http.StatusNotFound)
+			respondError(w, r, http.StatusNotFound, "image upload not found")
 			return
 		}
 		h.logger.Error("get image upload failed", "error", err, "id", imageID)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	respondJSON(w, http.StatusOK, img)
@@ -591,24 +591,24 @@ func (h *Handler) AdminGetImage(w http.ResponseWriter, r *http.Request) {
 // if a template still references the image.
 func (h *Handler) AdminDeleteImage(w http.ResponseWriter, r *http.Request) {
 	if h.imageStore == nil || h.imgDB == nil {
-		http.Error(w, "image upload not configured", http.StatusServiceUnavailable)
+		respondError(w, r, http.StatusServiceUnavailable, "image upload not configured")
 		return
 	}
 
 	imageID, err := uuid.Parse(chi.URLParam(r, "imageID"))
 	if err != nil {
-		http.Error(w, "invalid image id", http.StatusBadRequest)
+		respondError(w, r, http.StatusBadRequest, "invalid image id")
 		return
 	}
 
 	img, err := h.imgDB.GetImageUploadByID(r.Context(), imageID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			http.Error(w, "image upload not found", http.StatusNotFound)
+			respondError(w, r, http.StatusNotFound, "image upload not found")
 			return
 		}
 		h.logger.Error("get image upload failed", "error", err, "id", imageID)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -618,7 +618,7 @@ func (h *Handler) AdminDeleteImage(w http.ResponseWriter, r *http.Request) {
 	refCount, err := h.imgDB.CountTemplatesReferencingImage(r.Context(), img.DatastorePath, img.VCenterVMID)
 	if err != nil {
 		h.logger.Error("count template references failed", "error", err, "id", imageID)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	if refCount > 0 {
@@ -635,14 +635,14 @@ func (h *Handler) AdminDeleteImage(w http.ResponseWriter, r *http.Request) {
 	if img.ObjectKey != "" {
 		if err := h.imageStore.Remove(r.Context(), img.ObjectKey); err != nil {
 			h.logger.Error("remove object failed", "error", err, "key", img.ObjectKey)
-			http.Error(w, "failed to remove image object: "+err.Error(), http.StatusInternalServerError)
+			respondError(w, r, http.StatusInternalServerError, "failed to remove image object: "+err.Error())
 			return
 		}
 	}
 
 	if err := h.imgDB.DeleteImageUpload(r.Context(), imageID); err != nil {
 		h.logger.Error("delete image upload row failed", "error", err, "id", imageID)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -675,7 +675,7 @@ func (h *Handler) recordImageUpload(kind, result string) {
 // and must be deployed via OVF import, which is a separate flow.
 func (h *Handler) AdminListVCenterISOs(w http.ResponseWriter, r *http.Request) {
 	if h.isoLister == nil {
-		http.Error(w, "vCenter ISO browsing not configured", http.StatusServiceUnavailable)
+		respondError(w, r, http.StatusServiceUnavailable, "vCenter ISO browsing not configured")
 		return
 	}
 
@@ -694,7 +694,7 @@ func (h *Handler) AdminListVCenterISOs(w http.ResponseWriter, r *http.Request) {
 	if files == nil {
 		fresh, err := h.isoLister.ListDatastoreFiles(r.Context(), h.isoDatastore, "", ".iso")
 		if err != nil {
-			http.Error(w, "failed to list ISO datastore: "+err.Error(), http.StatusBadGateway)
+			respondError(w, r, http.StatusBadGateway, "failed to list ISO datastore: "+err.Error())
 			return
 		}
 		if h.isoCache != nil {
