@@ -344,6 +344,14 @@ const cloneFirstBootToolsTimeout = 15 * time.Minute
 type isoProvisionVCenter interface {
 	UploadToDatastore(ctx context.Context, datastore, remotePath string, r io.Reader, size int64, progress func(sent int64)) error
 	CreateBlankVM(ctx context.Context, p vcenter.BlankVMParams) (string, error)
+	// ProbeSystemDiskReadable opens the staging VM's system disk without
+	// powering it on, so a broken (0-byte flat) disk is caught — and repaired —
+	// before power-on rather than surfacing as a "Module 'Disk' power on failed"
+	// storm in vCenter.
+	ProbeSystemDiskReadable(ctx context.Context, moref string) error
+	// RecreateSystemDisk repairs a broken system disk by destroying it and
+	// adding a fresh one at the requested capacity.
+	RecreateSystemDisk(ctx context.Context, moref string, diskGB int) error
 	PowerOnVM(ctx context.Context, moref string) error
 	// WaitForPowerOff, not WaitForTools, is the unattended install's completion
 	// signal — see the long comment at the call site.
@@ -484,6 +492,35 @@ func provisionTemplateFromISO(
 	// generalize / cancel / resume can find the VM.
 	if err := db.SetTemplateVCenterVM(ctx, payload.TemplateID, moref); err != nil {
 		return markErr(fmt.Errorf("record vCenter VM ID: %w", err))
+	}
+
+	// GET before power-on: open the system disk to confirm the datastore
+	// actually materialized its flat extent. A blank shell on the NFS datastore
+	// intermittently comes back with a full-size descriptor over a 0-byte flat;
+	// powering that on emits "Module 'Disk' power on failed" and a pile of
+	// vmware-NN.log files before failing. Probing first catches the broken disk
+	// with no power-on and no log spew, and lets us repair it in place. The
+	// probe rides out a legitimately-slow allocation on its own bounded budget,
+	// so a fault that survives it is a genuinely broken disk, not a transient.
+	prog("verify_disk", "Verifying the system disk allocated on the datastore")
+	if err := vc.ProbeSystemDiskReadable(ctx, moref); err != nil {
+		if !vcenter.IsDiskNotReadyErr(err) {
+			return markErr(fmt.Errorf("verify system disk: %w", err))
+		}
+		// Genuinely broken flat: recreate the disk once, then re-probe to
+		// confirm the fresh flat is readable before we ever power on.
+		logger.Warn("staging VM system disk did not allocate on the datastore; recreating it once",
+			"vm", moref, "template_id", payload.TemplateID, "disk_gb", payload.DiskGB, "cause", err)
+		prog("repair_disk", "System disk did not allocate on the datastore; recreating it")
+		if rerr := vc.RecreateSystemDisk(ctx, moref, payload.DiskGB); rerr != nil {
+			return markErr(fmt.Errorf("recreate broken system disk (original probe failed: %v): %w", err, rerr))
+		}
+		prog("verify_disk", "Re-verifying the recreated system disk")
+		if rerr := vc.ProbeSystemDiskReadable(ctx, moref); rerr != nil {
+			return markErr(fmt.Errorf("system disk still unreadable after recreate: %w", rerr))
+		}
+		logger.Info("staging VM system disk recreated and verified readable",
+			"vm", moref, "template_id", payload.TemplateID)
 	}
 
 	prog("power_on", "Powering on VM to begin install")

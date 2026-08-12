@@ -47,6 +47,13 @@ func TestIsDiskNotReadyErr(t *testing.T) {
 			if got := isDiskNotReadyErr(tc.err); got != tc.want {
 				t.Fatalf("isDiskNotReadyErr(%v) = %v, want %v", tc.err, got, tc.want)
 			}
+			// The exported wrapper the provisioner calls must agree with the
+			// internal matcher for every case; if they ever drift, the pre-power-on
+			// probe would classify a broken disk differently from the power-on
+			// retry and the two would fight.
+			if got := IsDiskNotReadyErr(tc.err); got != tc.want {
+				t.Fatalf("IsDiskNotReadyErr(%v) = %v, want %v (exported wrapper must match internal)", tc.err, got, tc.want)
+			}
 		})
 	}
 }

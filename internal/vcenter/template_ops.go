@@ -828,3 +828,163 @@ func (c *Client) detachCDROMsInner(ctx context.Context, moref string) error {
 	c.logger.Info("detached CD-ROMs", "moref", moref, "count", len(cdroms))
 	return nil
 }
+
+// firstSystemDisk returns the VM's system disk: the first VirtualDisk in device
+// order (unit 0 on the primary controller for the shells CreateBlankVM builds).
+// It is the disk the ISO installer writes to and the one whose flat extent the
+// NFS datastore occasionally fails to materialize.
+func firstSystemDisk(devices object.VirtualDeviceList) (*types.VirtualDisk, error) {
+	disks := devices.SelectByType((*types.VirtualDisk)(nil))
+	if len(disks) == 0 {
+		return nil, fmt.Errorf("VM has no virtual disk")
+	}
+	disk, ok := disks[0].(*types.VirtualDisk)
+	if !ok {
+		return nil, fmt.Errorf("unexpected disk device type %T", disks[0])
+	}
+	return disk, nil
+}
+
+// ProbeSystemDiskReadable opens the VM's system disk WITHOUT powering the VM on
+// and returns nil if it is readable. This is the "GET before power on": a blank
+// shell built on the NFS datastore intermittently comes back with a full-size
+// disk descriptor but a 0-byte -flat.vmdk, and powering such a VM on emits
+// "Module 'Disk' power on failed" plus a pile of vmware-NN.log files before it
+// fails. QueryVirtualDiskUuid opens the descriptor AND the flat extent exactly
+// like the hypervisor's disk-open, so a broken flat returns the same
+// "is not a virtual disk" / "larger than real size" fault — but with no
+// power-on and none of that log spew.
+//
+// The open is wrapped in retryWhileDiskNotReady so the legitimately-slow-NFS
+// case (the flat is still being allocated) is ridden out on the same bounded
+// budget the power-on retry uses, rather than being misread as broken. A fault
+// that survives the whole budget is a genuinely broken disk the caller should
+// repair; IsDiskNotReadyErr classifies it.
+func (c *Client) ProbeSystemDiskReadable(ctx context.Context, moref string) error {
+	if moref == "" {
+		return fmt.Errorf("moref required")
+	}
+	if err := c.ensureConnected(ctx); err != nil {
+		return err
+	}
+	return c.withRetry(ctx, "probe system disk", func() error {
+		vm := object.NewVirtualMachine(c.client.Client,
+			types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
+		devices, err := vm.Device(ctx)
+		if err != nil {
+			return fmt.Errorf("list devices on %s: %w", moref, err)
+		}
+		disk, err := firstSystemDisk(devices)
+		if err != nil {
+			return fmt.Errorf("locate system disk on %s: %w", moref, err)
+		}
+		backing, ok := disk.Backing.(*types.VirtualDiskFlatVer2BackingInfo)
+		if !ok {
+			return fmt.Errorf("system disk on %s has unexpected backing %T", moref, disk.Backing)
+		}
+		if backing.FileName == "" {
+			return fmt.Errorf("system disk on %s has no backing file name", moref)
+		}
+		vdm := object.NewVirtualDiskManager(c.client.Client)
+		return retryWhileDiskNotReady(ctx, c.logger, moref, powerOnDiskReadyAttempts, powerOnDiskReadyDelay, func() error {
+			// QueryVirtualDiskUuid opens the disk to read its UUID; the return
+			// value is irrelevant here — a nil error means the extent opened.
+			if _, qerr := vdm.QueryVirtualDiskUuid(ctx, backing.FileName, c.datacenter); qerr != nil {
+				return fmt.Errorf("open system disk %s on %s: %w", backing.FileName, moref, qerr)
+			}
+			return nil
+		})
+	})
+}
+
+// RecreateSystemDisk repairs a VM whose system disk failed to materialize on
+// the datastore (a 0-byte flat behind a full-size descriptor). It removes the
+// existing system disk AND its backing files (FileOperation=destroy) and adds a
+// fresh thin disk of diskGB on the same controller and unit, in a single
+// Reconfigure. Passing an empty backing name to CreateDisk lets vSphere
+// auto-name a new flat, so the recreate does not collide with the just-removed
+// file. The VM's controllers, NIC and CD-ROMs are untouched.
+//
+// This is the one-shot repair the ISO provision path runs when
+// ProbeSystemDiskReadable reports the disk broken; a re-probe afterwards
+// confirms the new flat is readable before power-on.
+func (c *Client) RecreateSystemDisk(ctx context.Context, moref string, diskGB int) error {
+	if moref == "" {
+		return fmt.Errorf("moref required")
+	}
+	if diskGB <= 0 {
+		return fmt.Errorf("disk size must be greater than 0 GB (got %d)", diskGB)
+	}
+	if err := c.ensureConnected(ctx); err != nil {
+		return err
+	}
+	return c.withRetry(ctx, "recreate system disk", func() error {
+		return c.recreateSystemDiskInner(ctx, moref, diskGB)
+	})
+}
+
+func (c *Client) recreateSystemDiskInner(ctx context.Context, moref string, diskGB int) error {
+	vm := object.NewVirtualMachine(c.client.Client,
+		types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
+	devices, err := vm.Device(ctx)
+	if err != nil {
+		return fmt.Errorf("list devices on %s: %w", moref, err)
+	}
+	oldDisk, err := firstSystemDisk(devices)
+	if err != nil {
+		return fmt.Errorf("locate system disk on %s: %w", moref, err)
+	}
+	backing, ok := oldDisk.Backing.(*types.VirtualDiskFlatVer2BackingInfo)
+	if !ok {
+		return fmt.Errorf("system disk on %s has unexpected backing %T", moref, oldDisk.Backing)
+	}
+	if backing.Datastore == nil {
+		return fmt.Errorf("system disk on %s has no datastore reference", moref)
+	}
+	controller := devices.FindByKey(oldDisk.ControllerKey)
+	if controller == nil {
+		return fmt.Errorf("system disk on %s references missing controller key %d", moref, oldDisk.ControllerKey)
+	}
+	baseController, ok := controller.(types.BaseVirtualController)
+	if !ok {
+		return fmt.Errorf("device %d on %s is not a controller (%T)", oldDisk.ControllerKey, moref, controller)
+	}
+
+	// Build the replacement on a throwaway list so CreateDisk does not see the
+	// disk we are about to remove; pin it to the same controller and unit as
+	// the original so the boot order and guest device naming are unchanged.
+	var fresh object.VirtualDeviceList
+	newDisk := fresh.CreateDisk(baseController, *backing.Datastore, "")
+	newDisk.CapacityInKB = int64(diskGB) * 1024 * 1024
+	newDisk.ControllerKey = oldDisk.ControllerKey
+	newDisk.UnitNumber = oldDisk.UnitNumber
+	if nb, ok := newDisk.Backing.(*types.VirtualDiskFlatVer2BackingInfo); ok {
+		nb.ThinProvisioned = types.NewBool(true)
+	}
+
+	changes := []types.BaseVirtualDeviceConfigSpec{
+		&types.VirtualDeviceConfigSpec{
+			Operation:     types.VirtualDeviceConfigSpecOperationRemove,
+			FileOperation: types.VirtualDeviceConfigSpecFileOperationDestroy,
+			Device:        oldDisk,
+		},
+		&types.VirtualDeviceConfigSpec{
+			Operation:     types.VirtualDeviceConfigSpecOperationAdd,
+			FileOperation: types.VirtualDeviceConfigSpecFileOperationCreate,
+			Device:        newDisk,
+		},
+	}
+
+	c.logger.Warn("recreating broken system disk",
+		"moref", moref, "old_backing", backing.FileName, "disk_gb", diskGB)
+
+	task, err := vm.Reconfigure(ctx, types.VirtualMachineConfigSpec{DeviceChange: changes})
+	if err != nil {
+		return fmt.Errorf("reconfigure to recreate system disk on %s: %w", moref, err)
+	}
+	if err := task.Wait(ctx); err != nil {
+		return fmt.Errorf("wait recreate system disk on %s: %w", moref, err)
+	}
+	c.logger.Info("recreated system disk", "moref", moref, "disk_gb", diskGB)
+	return nil
+}

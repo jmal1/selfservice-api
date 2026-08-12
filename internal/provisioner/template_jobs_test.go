@@ -473,6 +473,12 @@ type fakeISOVC struct {
 	detachErr   error
 	powerErr    error
 
+	// probeErrs is consumed one-per-call by ProbeSystemDiskReadable so a test
+	// can model "broken on the first probe, readable after the recreate". A
+	// call past the end of the slice returns nil (readable).
+	probeErrs   []error
+	recreateErr error
+
 	// seq records the order of vCenter calls so a test can assert the ISO
 	// install sequence, not just that each call happened. Ordering is the
 	// whole contract here: detaching the installer media before the install
@@ -488,6 +494,12 @@ type fakeISOVC struct {
 
 	powerOnCalls int
 	powerOnMoref string
+
+	probeCalls    int
+	probeMoref    string
+	recreateCalls int
+	recreateMoref string
+	recreateGB    int
 
 	waitCalls   int
 	waitMoref   string
@@ -525,6 +537,29 @@ func (f *fakeISOVC) CreateBlankVM(_ context.Context, p vcenter.BlankVMParams) (s
 		return "vm-iso-0001", nil
 	}
 	return f.createRet, nil
+}
+
+// ProbeSystemDiskReadable models the pre-power-on disk GET. It records the call
+// and returns the next queued probe error (nil once the slice is exhausted), so
+// a test can drive "broken on first probe, readable after recreate".
+func (f *fakeISOVC) ProbeSystemDiskReadable(_ context.Context, moref string) error {
+	f.probeCalls++
+	f.seq = append(f.seq, "probe")
+	f.probeMoref = moref
+	if len(f.probeErrs) > 0 {
+		err := f.probeErrs[0]
+		f.probeErrs = f.probeErrs[1:]
+		return err
+	}
+	return nil
+}
+
+func (f *fakeISOVC) RecreateSystemDisk(_ context.Context, moref string, diskGB int) error {
+	f.recreateCalls++
+	f.seq = append(f.seq, "recreate")
+	f.recreateMoref = moref
+	f.recreateGB = diskGB
+	return f.recreateErr
 }
 
 func (f *fakeISOVC) PowerOnVM(_ context.Context, moref string) error {
@@ -764,7 +799,7 @@ func TestProvisionTemplate_ISO_Unattended_WaitsForPowerOffNotTools(t *testing.T)
 		t.Fatalf("unattended ISO provision returned error: %v", err)
 	}
 
-	want := []string{"upload", "create", "power_on", "wait_power_off", "detach", "power_on", "wait_tools"}
+	want := []string{"upload", "create", "probe", "power_on", "wait_power_off", "detach", "power_on", "wait_tools"}
 	if len(vc.seq) != len(want) {
 		t.Fatalf("vCenter call sequence = %v, want %v", vc.seq, want)
 	}
