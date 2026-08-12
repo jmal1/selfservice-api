@@ -485,9 +485,9 @@ session.
 > starts without keys.
 
 On **Ubuntu 24.04** the SSH daemon unit is `ssh.service`, not `sshd.service`,
-and it is socket-activated. Order host-key regeneration
-`Before=ssh.service ssh.socket`; ordering before `ssh.service` alone is not
-enough when the socket accepts the connection first.
+and it is socket-activated. Order host-key regeneration only
+`Before=ssh.service`; this is sufficient even when the socket accepts the
+connection first.
 
 **4. apt proxy pointed at the staging cache.** So package installs during
 build go through the lab's apt-cacher-ng. Create
