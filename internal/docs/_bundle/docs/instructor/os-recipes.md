@@ -42,11 +42,10 @@ with **"You're done when…"** so you know it worked.
   [Linux template contract](templates.md#linux-template-contract). Some recipes
   satisfy it for you; some make you do it by hand.
 
-> [!important] The standard build login is `Student` / `Changeme123!`.
-> Use it every time a recipe or the wizard asks you to make up a password. This
-> is **not** the password students get — Crucible generates a fresh random one
-> per student. See
-> [The standard build login](templates.md#the-standard-build-login-studentchangeme123).
+The standard build login is `Student` / `Changeme123!`. Use it whenever a
+recipe or the wizard asks you to make up a password. This is **not** the
+password students get: Crucible generates a fresh random password per student.
+See [The standard build login](templates.md#the-standard-build-login-studentchangeme123).
 
 ---
 
@@ -68,11 +67,9 @@ install-mode list (`manual`, `cloudinit_cidata`, `debian_preseed`,
 `windows_autounattend`). Anything not on this page hasn't been given a tested
 recipe yet; pick the closest match and expect to do more by hand.
 
-> [!note]
-> **What's live in your lab right now** is a separate question from "what can be
-> built." To see the templates students can currently deploy, go to
-> **Admin → Templates** and look for ones in the **active** state. This page is
-> about *building new* templates, not listing existing ones.
+**What is live in your lab** is separate from what can be built. To see the
+templates students can deploy, go to **Admin → Templates** and look for ones in
+the **active** state. This page is about building new templates.
 
 ---
 
@@ -97,13 +94,10 @@ over-allocate.
 
 ### 1. Ubuntu Server 24.04 LTS — the easy path
 
-> [!tip]
-> This is the recommended Linux build. `cloudinit_cidata` installs itself
-> hands-off **and** satisfies all five points of the
-> [Linux template contract](templates.md#linux-template-contract) for you:
-> open-vm-tools, cloud-init with the VMware datasource, the `student` default
-> user, SSH host-key regeneration, the apt proxy, and passwordless sudo. You
-> mostly wait.
+This is the recommended Linux build. `cloudinit_cidata` installs hands-off and
+satisfies the [Linux template contract](templates.md#linux-template-contract):
+open-vm-tools, cloud-init with the VMware datasource, the `student` default
+user, SSH host-key regeneration, the apt proxy, and passwordless sudo.
 
 | Wizard field | Value |
 |--------------|-------|
@@ -147,12 +141,10 @@ line should look right without you touching anything.
 
 ### 2. Ubuntu Desktop 24.04 LTS — same easy path as Server
 
-> [!tip]
-> Ubuntu **Desktop** 23.04 and later (so 24.04 too) ship the same **subiquity**
-> autoinstaller as Server, so it uses `cloudinit_cidata` and installs hands-off
-> just like recipe 1. The only extra thing you want on a Desktop image is the
-> **desktop** flavour of the VMware tools so the console resizes and the
-> clipboard works.
+Ubuntu **Desktop** 23.04 and later (including 24.04) use the same **subiquity**
+autoinstaller as Server, so `cloudinit_cidata` installs hands-off just as in
+recipe 1. For a Desktop image, also install the **desktop** VMware tools for
+console resizing and clipboard support.
 
 | Wizard field | Value |
 |--------------|-------|
@@ -211,7 +203,7 @@ deploy logs in with the *per-pod* password from the pod page. See the shared
 
 ### 3. Debian 12 / 13 — build it by hand today
 
-> [!danger]
+> [!caution]
 > **Read this before you pick an Install mode.** Debian's automated mode
 > (`debian_preseed`) is **defined but not enabled in this build.** The
 > debian-installer refuses to read a preseed from a second CD, so the seed would
@@ -282,7 +274,7 @@ reaches `active`. See the shared
 
 ### 4. Linux Mint 22.x (MATE) — read the tradeoff first
 
-> [!danger]
+> [!caution]
 > **Mint ships no cloud-init.** Crucible delivers each student's unique password
 > through cloud-init's VMware datasource. On a stock Mint image that channel does
 > not exist, so **every student clone would silently reject the password**. You
@@ -332,13 +324,6 @@ Choose this if you don't need unique passwords and want the simplest path.
    Every student then shares that login.
 3. Generalize and Publish.
 
-> [!warning]
-> Do **not** ship a *customizable* Mint template with no cloud-init. That is the
-> guaranteed silent lockout described in the
-> [contract's Mint warning](templates.md#the-five-requirements): the pod looks
-> healthy and green, but the student's password is refused. Pick Option A or B
-> explicitly.
-
 **You're done when…**
 - **Option A:** the verify block passes and a test deploy logs in with the
   *per-pod* password shown on the pod page.
@@ -356,19 +341,16 @@ an `autounattend.xml` seed disc that installs Windows unattended, creates the
 runs **sysprep /generalize** automatically. Give Windows more disk and RAM than
 Linux.
 
-> [!important]
-> **The per-clone password just works — do not set it by hand.** The answer file
-> stores the build password in Windows' encoded form
-> (`base64(UTF-16LE(cleartext + "Password"))`) in the `oobeSystem` pass, which
-> survives sysprep, and cloudbase-init re-applies a **fresh random password per
-> student** on first clone boot. Never type a password into a plaintext field or
-> edit it in the XML — the pipeline substitutes the per-clone value for you.
+**The per-clone password just works — do not set it by hand.** The answer file
+stores the build password in Windows' encoded form
+(`base64(UTF-16LE(cleartext + "Password"))`) in the `oobeSystem` pass, which
+survives sysprep, and cloudbase-init re-applies a **fresh random password per
+student** on first clone boot. Do not type a password into a plaintext field or
+edit it in the XML; the pipeline substitutes the per-clone value.
 
-> [!important] The blank Windows VM Crucible builds has **no vTPM and no Secure
-> Boot** (it's a pvscsi + EFI shell). That's fine for Windows 10 and Server, but
-> Windows 11 refuses to install without them — see recipe 6 and the engineering
-> note `docs/architecture/iso-build-hardware-gaps.md` for the supported
-> workaround.
+The blank Windows VM Crucible builds has **no vTPM and no Secure Boot** (it is a
+pvscsi + EFI shell). That is fine for Windows 10 and Server, but Windows 11
+needs the supported workaround in recipe 6.
 
 <a id="windows-storage-driver-pvscsi"></a>
 > [!warning]
@@ -459,7 +441,7 @@ Linux.
 
 ### 6. Windows 11 Pro — needs the TPM/Secure-Boot bypass
 
-> [!danger]
+> [!caution]
 > **This is the one Windows recipe with an extra required step.** The blank VM
 > has no vTPM and no Secure Boot, but Windows 11 Setup hard-blocks on both. To
 > install unattended on Crucible's shell you must add the documented
@@ -540,22 +522,14 @@ commands before setup partitions the disk):
 </settings>
 ```
 
-> [!note]
-> **Where this snippet lives — now automatic.** As of **PR #121**, Crucible's
-> Windows answer-file generator emits this `windowsPE` LabConfig block **for you
-> automatically** whenever the template's Guest OS ID is `windows11_64Guest`, so
-> you no longer hand-add it. Win10 (`windows9_64Guest`) and every Windows Server
-> answer file stay byte-identical — the block is gated strictly on the Win11
-> guest ID, and the existing `specialize` + `oobeSystem` passes (and the encoded
-> password) are untouched. The generated `autounattend.xml` still sits at the
-> **root** of the removable/seed volume.
-> _Fallback:_ if you are building on an **older api image that predates #121**,
-> the generator will not include the block — add it to the generated
-> `autounattend.xml` by hand and coordinate with an admin so the seed disc
-> carries it. This is **Gap A** in the engineering note
-> `docs/architecture/iso-build-hardware-gaps.md` (option (i), now **DONE** —
-> ref #121); the durable long-term fix (give the shell a real vTPM + Secure
-> Boot) is **Gap A option (ii)** there.
+**The snippet is now automatic.** As of **PR #121**, Crucible's Windows
+answer-file generator emits this `windowsPE` LabConfig block whenever the
+template's Guest OS ID is `windows11_64Guest`, so you no longer add it by hand.
+Win10 (`windows9_64Guest`) and every Windows Server answer file stay
+byte-identical. The generated `autounattend.xml` still sits at the **root** of
+the removable/seed volume. On an **older API image that predates #121**, add the
+block to the generated `autounattend.xml` by hand and coordinate with an admin
+so the seed disc carries it.
 
 **Steps**
 
@@ -599,14 +573,10 @@ gray screen) and logs in with its per-pod password. See the shared
 
 ### 7. Windows Server 2016
 
-> [!note]
-> **Storage driver — handled automatically (as of #122).** Server 2016 Setup has
-> no in-box pvscsi driver, so on a plain pvscsi shell it would show *"We couldn't
-> find any drives"*. Crucible now builds **Server** shells on an **LSI SAS**
-> controller (in-box Windows driver), so `windows9Server64Guest` Setup sees the
-> disk with no action — see **Gap B** (Option 2, **DONE**) in
-> `docs/architecture/iso-build-hardware-gaps.md`. No Load-driver step or wizard
-> field is needed.
+**Storage driver is handled automatically (as of #122).** Server 2016 Setup has
+no in-box pvscsi driver, so Crucible builds **Server** shells on an **LSI SAS**
+controller with an in-box Windows driver. `windows9Server64Guest` Setup sees the
+disk with no Load-driver step or wizard field.
 
 | Wizard field | Value |
 |--------------|-------|
@@ -628,10 +598,9 @@ gray screen) and logs in with its per-pod password. See the shared
 Setup sees the disk automatically because Server shells build on LSI SAS (Gap B,
 Option 2, #122) — no Load-driver step needed.
 
-> [!note]
-> If your vCenter's **Guest OS ID** dropdown doesn't list `windows9Server64Guest`,
-> `windows2019srv_64Guest` (Server 2019's ID) is the nearest alternative — the
-> install still works; only optimization hints differ.
+If your vCenter's **Guest OS ID** dropdown does not list
+`windows9Server64Guest`, use `windows2019srv_64Guest` (Server 2019's ID) as the
+nearest alternative. The install still works; only optimization hints differ.
 
 **You're done when…** Setup finds the disk, completes unattended, and the
 template reaches `active`. See the shared
@@ -781,11 +750,10 @@ where their password comes from:
    `student` (Linux) or `Student` (Windows) with the password from their pod
    page — **never** `Changeme123!`.
 
-> [!important]
-> `Changeme123!` only ever lives on the template you build. Each student gets a
-> different password. If you chose Mint **Option B** (static login), that's the
-> one exception: those students share the `student` / `Changeme123!` you set on
-> the template row, because that template opts out of per-student customization.
+`Changeme123!` only lives on the template you build. Each student gets a
+different password, except with Mint **Option B** (static login): those students
+share the `student` / `Changeme123!` set on the template row because that
+template opts out of per-student customization.
 
 ---
 

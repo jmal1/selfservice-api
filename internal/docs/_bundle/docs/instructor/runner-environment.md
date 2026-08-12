@@ -6,9 +6,8 @@ your script there. This page documents what's available inside that
 runner so you can write scripts that "just work" without hunting
 through engine source.
 
-> [!note]
-> Everything described here applies to `execution_mode: kali_runner`.
-> The `vmware_tools` mode is different — see the bottom of this page.
+Everything described here applies to `execution_mode: kali_runner`.
+The `vmware_tools` mode is different; see the bottom of this page.
 
 ---
 
@@ -88,10 +87,9 @@ ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
     'whoami'
 ```
 
-> [!tip]
-> Always pass `-o ConnectTimeout=5` (or similar). Without it, a hung
-> target can stall your script up to the workflow `timeout_seconds`
-> (default 300s) before the engine kills it.
+Always pass `-o ConnectTimeout=5` (or similar). Without it, a hung target can
+stall your script until the engine kills it at the workflow `timeout_seconds`
+(default 300s).
 
 For Windows targets, WinRM is configured with the equivalent of an
 auto-login NTLM cred:
@@ -134,22 +132,17 @@ what you see here is what is actually in the image.
 > exits **127** and the action is reported as an `error` naming the missing
 > command.
 
-> [!important]
-> If you need a tool that isn't in the runner image, **don't `apt install` it
-> from your script** (there is no internet egress from the runner anyway, and
-> you'd be mutating a shared image). Ask an admin to add one line to
-> `tools.txt` and rebuild.
->
-> The workflow editor warns you at save time (**CRU0002**) when a script calls
-> a command the runner image does not provide, so you normally find out while
-> authoring rather than at grading time.
->
-> CRU0002 looks only at **command position**, so ordinary shell plumbing is not
-> flagged: variable assignments (`TARGET=example.com`), bash array appends
-> (`curl_args+=(-b "$jar")`), comments, and single-quoted text are all ignored.
-> If you do see a CRU0002 warning naming something that clearly isn't a command,
-> that's a bug in the linter — report it rather than working around it. A linter
-> that cries wolf is one you'd rightly start ignoring.
+If you need a tool that is not in the runner image, **do not `apt install` it
+from your script**: the runner has no internet egress, and you would be mutating
+a shared image. Ask an admin to add it to `tools.txt` and rebuild.
+
+The workflow editor warns at save time (**CRU0002**) when a script calls a
+command the runner image does not provide, so you normally find out while
+authoring rather than at grading time. CRU0002 looks only at **command
+position**, so ordinary shell plumbing is not flagged: variable assignments
+(`TARGET=example.com`), bash array appends (`curl_args+=(-b "$jar")`), comments,
+and single-quoted text are all ignored. If it names something that clearly is
+not a command, report the linter bug rather than working around it.
 
 Crucible's own shipped library actions are held to a stronger version of the
 same rule: their tool dependencies are checked **at build time**, and a library
@@ -183,11 +176,9 @@ for forensic exercises.
 | `script` timeout (`timeout_seconds`) | 300s | 1800s |
 | Single `run_action` timeout (engine-imposed) | 60s | 300s |
 
-> [!warning]
-> Use the **smallest reasonable timeout** for each `run_action`. A long
-> per-action timeout makes the run feel slow to students and masks real
-> hangs. If a check needs more than 30 seconds, ask whether you're
-> doing too much in one step.
+Use the **smallest reasonable timeout** for each `run_action`. A long
+per-action timeout makes the run feel slow and masks real hangs. If a check
+needs more than 30 seconds, consider whether it does too much in one step.
 
 ---
 

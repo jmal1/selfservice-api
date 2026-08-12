@@ -4,9 +4,8 @@ An **action** is a reusable, parameterised grading step. If you find
 yourself copying the same `run_action "..." bash -c '...'` block into
 three workflows, it's time to promote it to the library.
 
-> [!note]
-> If you haven't already, read [Building Workflows](workflows.md) first.
-> Actions only make sense once you've felt the pain of repeating yourself.
+Read [Building Workflows](workflows.md) first if you have not already. Actions
+make sense once you have felt the cost of repeating yourself.
 
 ---
 
@@ -19,9 +18,8 @@ three workflows, it's time to promote it to the library.
 | Logic depends on context built up by earlier steps (e.g. "did the student install package X") | **Inline** — actions are stateless |
 | You want students to see consistent error messages across labs | **Library action** with a `student_fail_hint` template |
 
-> [!tip]
-> Wait for the third copy-paste before extracting. Premature library
-> growth becomes the next person's discovery problem.
+Wait for the third copy-paste before extracting. Premature library growth becomes
+the next person's discovery problem.
 
 ---
 
@@ -123,10 +121,9 @@ Tags follow the pattern `<os>:<distro>` or `<os>:*`:
 Defined in
 [`internal/database/migrations/000015_action_platforms.up.sql`](../../internal/database/migrations/000015_action_platforms.up.sql).
 
-> [!tip]
-> Start narrow (`linux:ubuntu`) and widen only when you've confirmed
-> the action works on the broader set. A `linux:*` claim that breaks
-> on Alpine is worse than a missing claim.
+Start narrow (`linux:ubuntu`) and widen only after confirming the action works
+on the broader set. A `linux:*` claim that breaks on Alpine is worse than a
+missing claim.
 
 ---
 
@@ -147,10 +144,8 @@ Later actions can then `$CTX_INTERFACES_BODY`. See the engine source
 in [`internal/engine/engine.go`](../../internal/engine/engine.go) for
 the exact format.
 
-> [!important]
-> Output context is **per-workflow**, not global. Two different
-> playlist runs see independent context; one workflow can't poison
-> another's view.
+Output context is **per-workflow**, not global. Two different playlist runs see
+independent context; one workflow cannot poison another's view.
 
 ---
 
@@ -166,10 +161,9 @@ and every workflow that calls it gets the same helpful error message.
 Mustache-style `{{ params.foo }}` substitutions resolve at run time
 using the actual param values.
 
-> [!tip]
-> Make the hint actionable. "Failed" → "Open port 23. Run: `sudo ufw
-> deny 23/tcp`". Students learn faster when the error tells them the
-> next move.
+Make the hint actionable. Instead of "Failed", say "Open port 23. Run:
+`sudo ufw deny 23/tcp`". Students learn faster when the error tells them the
+next move.
 
 ---
 

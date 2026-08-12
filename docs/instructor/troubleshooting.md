@@ -80,10 +80,8 @@ Common hangs:
 | `apt update` on the runner | Won't work anyway — no internet |
 | Waiting on `read` because of an interactive prompt | `< /dev/null` or use `-y` / `--yes` flags |
 
-> [!tip]
-> If a workflow genuinely needs more than 60 seconds, **split it**
-> into two workflows in the playlist. Smaller scripts = faster
-> feedback for the student.
+If a workflow genuinely needs more than 60 seconds, **split it** into two
+workflows in the playlist. Smaller scripts provide faster student feedback.
 
 ---
 
@@ -109,10 +107,9 @@ A tool your workflow script calls is not installed in the assessment runner.
 
 The runner classifies exit 127 as `error` rather than `fail` to distinguish an infrastructure defect from a student mistake. The student's result panel says the problem is not their fault and asks them to report it.
 
-> [!warning]
-> The **workflow editor catches this at authoring time** (warning **CRU0002**) when you save a
-> script that calls a command not in the runner image. If you saw CRU0002 and dismissed it, that
-> is the same root cause surfacing at runtime.
+The **workflow editor catches this at authoring time** (warning **CRU0002**)
+when you save a script that calls a command not in the runner image. If you saw
+CRU0002 and dismissed it, that is the same root cause surfacing at runtime.
 
 **Immediate fix:**
 
@@ -322,11 +319,9 @@ Common causes:
 potential issues (missing guest credentials, staging port group not found on
 standard vSwitch) that you may want to investigate but are not fatal.
 
-> [!note]
-> If all checks are green but provisioning still fails immediately, an
-> *intermittent* vCenter fault may be in play. Those are not detectable
-> by static checks — the platform has automatic retry-with-backoff for
-> that class of error.
+If all checks are green but provisioning still fails immediately, an
+*intermittent* vCenter fault may be in play. Static checks cannot detect those
+faults; the platform automatically retries them with backoff.
 
 ---
 
@@ -354,13 +349,12 @@ console tells you *which* prompt.
 : The VM booted from the wrong device. Re-run Provision; if it recurs,
   the ISO itself may be corrupt — re-upload it.
 
-> [!note]
-> **VMware Tools showing "running" during an ISO install means nothing.**
-> The Ubuntu Server installer runs Tools inside its own live environment
-> about 40 seconds after power-on, with a completely empty disk. Crucible
-> deliberately ignores it and waits for the VM to **power itself off**,
-> which the generated config does when the install genuinely completes.
-> Don't use Tools status to judge whether an install is progressing.
+**VMware Tools showing "running" during an ISO install does not signal
+completion.** The Ubuntu Server installer runs Tools inside its own live
+environment about 40 seconds after power-on, with a completely empty disk.
+Crucible deliberately waits for the VM to **power itself off**, which the
+generated config does when the install genuinely completes. Do not use Tools
+status to judge installation progress.
 
 ## "My ISO template reached `configuring` but the disk is empty"
 
@@ -444,11 +438,9 @@ What that means for you:
 | `error`, *"generalize script failed"* | The script returned a non-zero exit code — usually the `sudo` problem above. The message carries the guest's own error. Fix it and re-run Generalize; do not publish. |
 | `error`, *"never stamped the completion sentinel"* | The script reported success but left no marker, so the cleanup cannot be shown to have run. Re-run Generalize; do not publish. |
 
-> [!note]
-> Windows is exempt from the marker. Sysprep is launched fire-and-forget and
-> powers the machine off on its own schedule, so there is no opportunity to
-> stamp anything and no window in which to read it. Windows generalize still
-> relies on the shutdown signal.
+Windows is exempt from the marker. Sysprep is launched fire-and-forget and
+powers the machine off on its own schedule, so there is no opportunity to
+stamp or read a marker. Windows generalize still relies on the shutdown signal.
 
 ---
 
@@ -515,7 +507,7 @@ being pulled in by `multi-user.target` (which is ordered *after*
 `sockets.target`, which is ordered after `ssh.socket`). Crucible's own
 `crucible-regen-ssh-hostkeys.service` shipped with exactly that mistake once.
 The fix is to order before `ssh.service` and **not** `ssh.socket` — see the
-danger callout in [Templates](templates.md). A `ConditionPathExists` guard on
+caution in [Templates](templates.md). A `ConditionPathExists` guard on
 the offending unit does not help: systemd resolves ordering cycles *before*
 it evaluates conditions, so a unit that gets skipped anyway can still take
 SSH down.
@@ -552,11 +544,10 @@ a transient fault): invalid source ISO path, missing folder, ambiguous
 resource pool, guest-auth failure. These fail immediately so you see the real
 cause without waiting through three backoff cycles.
 
-> [!tip]
-> If a template stays in `pending` longer than expected after an error,
-> it is likely sitting in a retry backoff window. Check the Jobs page
-> — the next-attempt time is shown there. Only intervene (reset to `error`)
-> if the message is a deterministic configuration error, not a transient one.
+If a template stays in `pending` longer than expected after an error, it is
+likely in a retry backoff window. Check the Jobs page for the next-attempt time.
+Only intervene (reset to `error`) for a deterministic configuration error, not
+a transient one.
 
 ---
 
