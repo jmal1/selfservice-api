@@ -473,6 +473,11 @@ type fakeISOVC struct {
 	detachErr   error
 	powerErr    error
 
+	// powerErrs is consumed one-per-call by PowerOnVM so a test can model
+	// "power-on faults disk-not-ready on the first try, succeeds after the disk
+	// is recreated". A call past the end of the slice falls back to powerErr.
+	powerErrs []error
+
 	// probeErrs is consumed one-per-call by ProbeSystemDiskReadable so a test
 	// can model "broken on the first probe, readable after the recreate". A
 	// call past the end of the slice returns nil (readable).
@@ -566,6 +571,11 @@ func (f *fakeISOVC) PowerOnVM(_ context.Context, moref string) error {
 	f.powerOnCalls++
 	f.seq = append(f.seq, "power_on")
 	f.powerOnMoref = moref
+	if len(f.powerErrs) > 0 {
+		err := f.powerErrs[0]
+		f.powerErrs = f.powerErrs[1:]
+		return err
+	}
 	return f.powerErr
 }
 

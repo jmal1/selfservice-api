@@ -494,38 +494,65 @@ func provisionTemplateFromISO(
 		return markErr(fmt.Errorf("record vCenter VM ID: %w", err))
 	}
 
+	// Repair a broken system disk in place, at most once per provision. The NFS
+	// datastore intermittently materializes a full-size descriptor over a 0-byte
+	// flat; deleting that disk device (backing and all) and recreating a fresh
+	// thin disk at the requested capacity reliably produces a valid flat that
+	// powers on first try (proven by hand with govc device.remove -keep=false +
+	// vm.disk.create). The guard means a disk that is STILL unreadable after one
+	// recreate is a real failure, not something to loop on.
+	diskRecreated := false
+	repairSystemDisk := func(cause error) error {
+		if diskRecreated {
+			return fmt.Errorf("system disk still not readable after one recreate: %w", cause)
+		}
+		diskRecreated = true
+		logger.Warn("staging VM system disk did not allocate on the datastore; recreating it once",
+			"vm", moref, "template_id", payload.TemplateID, "disk_gb", payload.DiskGB, "cause", cause)
+		prog("repair_disk", "System disk did not allocate on the datastore; recreating it")
+		if rerr := vc.RecreateSystemDisk(ctx, moref, payload.DiskGB); rerr != nil {
+			return fmt.Errorf("recreate broken system disk (cause: %v): %w", cause, rerr)
+		}
+		prog("verify_disk", "Re-verifying the recreated system disk")
+		if rerr := vc.ProbeSystemDiskReadable(ctx, moref); rerr != nil {
+			return fmt.Errorf("system disk still unreadable after recreate: %w", rerr)
+		}
+		logger.Info("staging VM system disk recreated and verified readable",
+			"vm", moref, "template_id", payload.TemplateID)
+		return nil
+	}
+
 	// GET before power-on: open the system disk to confirm the datastore
-	// actually materialized its flat extent. A blank shell on the NFS datastore
-	// intermittently comes back with a full-size descriptor over a 0-byte flat;
-	// powering that on emits "Module 'Disk' power on failed" and a pile of
-	// vmware-NN.log files before failing. Probing first catches the broken disk
-	// with no power-on and no log spew, and lets us repair it in place. The
-	// probe rides out a legitimately-slow allocation on its own bounded budget,
-	// so a fault that survives it is a genuinely broken disk, not a transient.
+	// actually materialized its flat extent. Probing first catches the broken
+	// disk with no VM power-on and no "Module 'Disk' power on failed" /
+	// vmware-NN.log spew, and lets us repair it in place. The probe rides out a
+	// legitimately-slow allocation on its own bounded budget, so a fault that
+	// survives it is a genuinely broken disk, not a transient.
 	prog("verify_disk", "Verifying the system disk allocated on the datastore")
 	if err := vc.ProbeSystemDiskReadable(ctx, moref); err != nil {
 		if !vcenter.IsDiskNotReadyErr(err) {
 			return markErr(fmt.Errorf("verify system disk: %w", err))
 		}
-		// Genuinely broken flat: recreate the disk once, then re-probe to
-		// confirm the fresh flat is readable before we ever power on.
-		logger.Warn("staging VM system disk did not allocate on the datastore; recreating it once",
-			"vm", moref, "template_id", payload.TemplateID, "disk_gb", payload.DiskGB, "cause", err)
-		prog("repair_disk", "System disk did not allocate on the datastore; recreating it")
-		if rerr := vc.RecreateSystemDisk(ctx, moref, payload.DiskGB); rerr != nil {
-			return markErr(fmt.Errorf("recreate broken system disk (original probe failed: %v): %w", err, rerr))
+		if rerr := repairSystemDisk(err); rerr != nil {
+			return markErr(rerr)
 		}
-		prog("verify_disk", "Re-verifying the recreated system disk")
-		if rerr := vc.ProbeSystemDiskReadable(ctx, moref); rerr != nil {
-			return markErr(fmt.Errorf("system disk still unreadable after recreate: %w", rerr))
-		}
-		logger.Info("staging VM system disk recreated and verified readable",
-			"vm", moref, "template_id", payload.TemplateID)
 	}
 
 	prog("power_on", "Powering on VM to begin install")
 	if err := vc.PowerOnVM(ctx, moref); err != nil {
-		return markErr(fmt.Errorf("power on: %w", err))
+		// Fallback classifier: the proactive probe passed but the hypervisor's
+		// own disk-open still faulted on the flat. Repair once and retry the
+		// power-on rather than burning the probe-clean path's guarantee and
+		// erroring the template.
+		if !vcenter.IsDiskNotReadyErr(err) {
+			return markErr(fmt.Errorf("power on: %w", err))
+		}
+		if rerr := repairSystemDisk(err); rerr != nil {
+			return markErr(rerr)
+		}
+		if err := vc.PowerOnVM(ctx, moref); err != nil {
+			return markErr(fmt.Errorf("power on after disk recreate: %w", err))
+		}
 	}
 
 	if unattended {
