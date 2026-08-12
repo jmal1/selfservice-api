@@ -179,6 +179,11 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 				r.Post("/{templateID}/cancel", h.AdminCancelTemplate)
 				r.Post("/{templateID}/retry", h.AdminRetryTemplate)
 
+				// Staging-VM power controls. The staging VM is a raw vCenter
+				// moref (tmpl.vcenter_vm_id), not a pod VM, so this is separate
+				// from the pod-power path. Body: {"action":"start|stop|restart|reset"}.
+				r.Post("/{templateID}/power", h.AdminTemplatePowerAction)
+
 				r.Get("/{templateID}/resolved-credentials", h.AdminGetResolvedCredentials)
 
 				// Build-VM console ticket (G4 / Phase G). The WS endpoint

@@ -302,6 +302,13 @@ Inside the console you can:
 - Use **Text Input** drawer if your browser blocks clipboard access
 - Send **Ctrl+Alt+Del**
 
+> [!tip]
+> The wizard also has **Start / Stop / Restart / Reset** buttons for the
+> staging VM. Use them if the build VM hangs, needs a reboot after
+> installing software, or you powered it off and want it back — the
+> wizard refreshes the power state automatically. These act on the build
+> VM only, never on any student pod.
+
 Do whatever you need to: install software, harden the OS, drop in
 configuration files, create user accounts. Save your work *inside the
 guest* (the snapshot is taken when you click Generalize, not before).

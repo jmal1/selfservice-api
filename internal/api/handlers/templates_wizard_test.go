@@ -192,6 +192,7 @@ func TestWizardStateHappy(t *testing.T) {
 type fakeVC struct {
 	info     *vcenter.GuestInfo
 	err      error
+	powerErr error
 	gotCalls []string
 }
 
@@ -208,6 +209,26 @@ func (f *fakeVC) GetGuestInfo(_ context.Context, moref string) (*vcenter.GuestIn
 func (f *fakeVC) DestroyVM(_ context.Context, moref string) error {
 	f.gotCalls = append(f.gotCalls, "destroy:"+moref)
 	return nil
+}
+
+func (f *fakeVC) PowerOnVM(_ context.Context, moref string) error {
+	f.gotCalls = append(f.gotCalls, "start:"+moref)
+	return f.powerErr
+}
+
+func (f *fakeVC) PowerOffVM(_ context.Context, moref string) error {
+	f.gotCalls = append(f.gotCalls, "stop:"+moref)
+	return f.powerErr
+}
+
+func (f *fakeVC) RestartVM(_ context.Context, moref string) error {
+	f.gotCalls = append(f.gotCalls, "restart:"+moref)
+	return f.powerErr
+}
+
+func (f *fakeVC) ResetVM(_ context.Context, moref string) error {
+	f.gotCalls = append(f.gotCalls, "reset:"+moref)
+	return f.powerErr
 }
 
 func TestWizardStatePopulatesBuildVMFields(t *testing.T) {
