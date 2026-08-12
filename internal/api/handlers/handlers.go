@@ -107,6 +107,19 @@ type VCenterConsole interface {
 	// DestroyVM powers off the VM (if running) and destroys it.
 	// IDEMPOTENT: returns nil if the VM was already gone in vCenter.
 	DestroyVM(ctx context.Context, moref string) error
+
+	// Power controls for a template's staging VM (a raw vCenter moref, not a
+	// pod VM). The wizard drives these so an instructor can start/stop/reboot
+	// the build VM without leaving Crucible. They call the vCenter *task* and
+	// return once it's accepted; they do not poll the guest power state.
+	//   - PowerOnVM is idempotent: no error if the VM is already on.
+	//   - PowerOffVM is idempotent: no error if the VM is already gone.
+	//   - RestartVM is a graceful guest reboot (via VMware Tools).
+	//   - ResetVM is a hard power-cycle.
+	PowerOnVM(ctx context.Context, moref string) error
+	PowerOffVM(ctx context.Context, moref string) error
+	RestartVM(ctx context.Context, moref string) error
+	ResetVM(ctx context.Context, moref string) error
 }
 
 // NewHandler creates a new Handler.

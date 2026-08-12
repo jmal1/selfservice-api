@@ -693,7 +693,129 @@ func (h *Handler) AdminGetWizardState(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, h.wizardState(r.Context(), tmpl))
 }
 
-// --- shared helpers ---
+// AdminTemplatePowerAction (POST /admin/templates/:id/power) — start/stop/
+// restart/reset the template's staging VM.
+//
+// A template's staging VM is tmpl.VCenterVMID (a raw vCenter moref), NOT a
+// pod VM, so the pod-power path (Handler.VMPowerAction → provisioner.PowerVM)
+// does not apply. This calls the vCenter client directly and synchronously —
+// the vCenter *task* wait is short; we deliberately do NOT poll the guest
+// power state (the UI re-fetches wizard-state, whose BuildVMPowerOn reflects
+// the new state).
+//
+// Body: {"action":"start|stop|restart|reset"}.
+//
+//	start   → PowerOnVM   (idempotent: no error if already on)
+//	stop    → PowerOffVM  (idempotent: no error if already gone)
+//	restart → RestartVM   (graceful guest reboot)
+//	reset   → ResetVM     (hard power-cycle)
+func (h *Handler) AdminTemplatePowerAction(w http.ResponseWriter, r *http.Request) {
+	templateID, err := uuid.Parse(chi.URLParam(r, "templateID"))
+	if err != nil {
+		http.Error(w, "invalid template id", http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		Action string `json:"action"`
+	}
+	if r.Body != nil && r.Body != http.NoBody {
+		_ = json.NewDecoder(r.Body).Decode(&req) // validated below
+	}
+	action := strings.ToLower(strings.TrimSpace(req.Action))
+
+	// Validate the action against the allowed set first so a bad request is a
+	// 400 regardless of vCenter wiring. Binding the method value happens after
+	// the nil-check below (a method value off a nil interface would panic).
+	switch action {
+	case "start", "stop", "restart", "reset":
+	default:
+		http.Error(w, `action must be one of "start", "stop", "restart", "reset"`, http.StatusBadRequest)
+		return
+	}
+
+	// vc is nil in test/dev configs without vCenter wired. Guard before we bind
+	// a method value off the interface below.
+	if h.vc == nil {
+		http.Error(w, "vCenter is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	var powerFn func(stdcontext.Context, string) error
+	switch action {
+	case "start":
+		powerFn = h.vc.PowerOnVM
+	case "stop":
+		powerFn = h.vc.PowerOffVM
+	case "restart":
+		powerFn = h.vc.RestartVM
+	case "reset":
+		powerFn = h.vc.ResetVM
+	}
+
+	tmpl, err := h.provisionStore().GetTemplateByID(r.Context(), templateID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			http.Error(w, "template not found", http.StatusNotFound)
+		} else {
+			h.logger.Error("power action: load template failed", "error", err, "template_id", templateID)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+		}
+		return
+	}
+	if tmpl == nil {
+		http.Error(w, "template not found", http.StatusNotFound)
+		return
+	}
+	if tmpl.VCenterVMID == "" {
+		http.Error(w, "template has no staging VM yet (provisioning has not created one)", http.StatusConflict)
+		return
+	}
+
+	if err := powerFn(r.Context(), tmpl.VCenterVMID); err != nil {
+		h.logger.Error("power action failed",
+			"action", action, "template_id", tmpl.ID, "moref", tmpl.VCenterVMID, "error", err)
+		// Audit is best-effort; skip when h.db is nil (test environments that
+		// inject a fake provDB but omit the real *database.Queries).
+		if h.db != nil {
+			audit.Log(r.Context(), h.db, "template.power."+action,
+				audit.Resource("template", tmpl.ID),
+				audit.IP(r.RemoteAddr),
+				audit.Detail("moref", tmpl.VCenterVMID),
+				audit.Detail("error", err.Error()),
+			)
+		}
+		// 502: an upstream system (vCenter) failed. Surface a legible,
+		// action-scoped message; the raw govmomi fault (often "The attempted
+		// operation cannot be performed in the current state") is appended so
+		// the operator can see why (e.g. reset/restart on an already-off VM).
+		http.Error(w, "vCenter could not "+action+" the staging VM: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	if h.db != nil {
+		audit.Log(r.Context(), h.db, "template.power."+action,
+			audit.Resource("template", tmpl.ID),
+			audit.IP(r.RemoteAddr),
+			audit.Detail("moref", tmpl.VCenterVMID),
+		)
+	}
+	h.logger.Info("template staging VM power action",
+		"action", action, "template_id", tmpl.ID, "moref", tmpl.VCenterVMID)
+
+	// Return the refreshed wizard state so the UI can reflect power state
+	// without a second round-trip. BuildVMPowerOn is only populated in build
+	// states, so callers should still re-fetch wizard-state if they need a
+	// settled value.
+	fresh, _ := h.provisionStore().GetTemplateByID(r.Context(), tmpl.ID)
+	if fresh == nil {
+		fresh = tmpl
+	}
+	respondJSON(w, http.StatusOK, map[string]any{
+		"state":  h.wizardState(r.Context(), fresh),
+		"action": action,
+	})
+}
 
 // requireTemplateInState loads the template by URL param, asserts the
 // current state matches `wantState`, and emits a 409 with the canonical
