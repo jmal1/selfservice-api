@@ -539,6 +539,16 @@ func retryWhileDiskNotReady(ctx context.Context, logger *slog.Logger, moref stri
 		attempts, time.Duration(attempts-1)*delay, err)
 }
 
+// IsDiskNotReadyErr reports whether err is the datastore-not-ready /
+// broken-flat signature ("is not a virtual disk" / "larger than real size" /
+// "Cannot open the disk"). It is the exported classifier the provisioner uses
+// to decide whether a failed pre-power-on disk probe means "recreate the disk"
+// versus a genuinely different fault it must surface as-is. It delegates to the
+// same narrow matcher used by the power-on retry so the two never drift.
+func IsDiskNotReadyErr(err error) bool {
+	return isDiskNotReadyErr(err)
+}
+
 // isDiskNotReadyErr reports whether a power-on failure is the datastore not
 // having finished materializing the VM's disk. Deliberately narrow: it does
 // not match "Failed to lock the file", which means another host holds the

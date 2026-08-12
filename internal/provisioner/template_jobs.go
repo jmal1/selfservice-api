@@ -344,6 +344,14 @@ const cloneFirstBootToolsTimeout = 15 * time.Minute
 type isoProvisionVCenter interface {
 	UploadToDatastore(ctx context.Context, datastore, remotePath string, r io.Reader, size int64, progress func(sent int64)) error
 	CreateBlankVM(ctx context.Context, p vcenter.BlankVMParams) (string, error)
+	// ProbeSystemDiskReadable opens the staging VM's system disk without
+	// powering it on, so a broken (0-byte flat) disk is caught — and repaired —
+	// before power-on rather than surfacing as a "Module 'Disk' power on failed"
+	// storm in vCenter.
+	ProbeSystemDiskReadable(ctx context.Context, moref string) error
+	// RecreateSystemDisk repairs a broken system disk by destroying it and
+	// adding a fresh one at the requested capacity.
+	RecreateSystemDisk(ctx context.Context, moref string, diskGB int) error
 	PowerOnVM(ctx context.Context, moref string) error
 	// WaitForPowerOff, not WaitForTools, is the unattended install's completion
 	// signal — see the long comment at the call site.
@@ -486,9 +494,65 @@ func provisionTemplateFromISO(
 		return markErr(fmt.Errorf("record vCenter VM ID: %w", err))
 	}
 
+	// Repair a broken system disk in place, at most once per provision. The NFS
+	// datastore intermittently materializes a full-size descriptor over a 0-byte
+	// flat; deleting that disk device (backing and all) and recreating a fresh
+	// thin disk at the requested capacity reliably produces a valid flat that
+	// powers on first try (proven by hand with govc device.remove -keep=false +
+	// vm.disk.create). The guard means a disk that is STILL unreadable after one
+	// recreate is a real failure, not something to loop on.
+	diskRecreated := false
+	repairSystemDisk := func(cause error) error {
+		if diskRecreated {
+			return fmt.Errorf("system disk still not readable after one recreate: %w", cause)
+		}
+		diskRecreated = true
+		logger.Warn("staging VM system disk did not allocate on the datastore; recreating it once",
+			"vm", moref, "template_id", payload.TemplateID, "disk_gb", payload.DiskGB, "cause", cause)
+		prog("repair_disk", "System disk did not allocate on the datastore; recreating it")
+		if rerr := vc.RecreateSystemDisk(ctx, moref, payload.DiskGB); rerr != nil {
+			return fmt.Errorf("recreate broken system disk (cause: %v): %w", cause, rerr)
+		}
+		prog("verify_disk", "Re-verifying the recreated system disk")
+		if rerr := vc.ProbeSystemDiskReadable(ctx, moref); rerr != nil {
+			return fmt.Errorf("system disk still unreadable after recreate: %w", rerr)
+		}
+		logger.Info("staging VM system disk recreated and verified readable",
+			"vm", moref, "template_id", payload.TemplateID)
+		return nil
+	}
+
+	// GET before power-on: open the system disk to confirm the datastore
+	// actually materialized its flat extent. Probing first catches the broken
+	// disk with no VM power-on and no "Module 'Disk' power on failed" /
+	// vmware-NN.log spew, and lets us repair it in place. The probe rides out a
+	// legitimately-slow allocation on its own bounded budget, so a fault that
+	// survives it is a genuinely broken disk, not a transient.
+	prog("verify_disk", "Verifying the system disk allocated on the datastore")
+	if err := vc.ProbeSystemDiskReadable(ctx, moref); err != nil {
+		if !vcenter.IsDiskNotReadyErr(err) {
+			return markErr(fmt.Errorf("verify system disk: %w", err))
+		}
+		if rerr := repairSystemDisk(err); rerr != nil {
+			return markErr(rerr)
+		}
+	}
+
 	prog("power_on", "Powering on VM to begin install")
 	if err := vc.PowerOnVM(ctx, moref); err != nil {
-		return markErr(fmt.Errorf("power on: %w", err))
+		// Fallback classifier: the proactive probe passed but the hypervisor's
+		// own disk-open still faulted on the flat. Repair once and retry the
+		// power-on rather than burning the probe-clean path's guarantee and
+		// erroring the template.
+		if !vcenter.IsDiskNotReadyErr(err) {
+			return markErr(fmt.Errorf("power on: %w", err))
+		}
+		if rerr := repairSystemDisk(err); rerr != nil {
+			return markErr(rerr)
+		}
+		if err := vc.PowerOnVM(ctx, moref); err != nil {
+			return markErr(fmt.Errorf("power on after disk recreate: %w", err))
+		}
 	}
 
 	if unattended {
