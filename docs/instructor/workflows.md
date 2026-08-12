@@ -3,9 +3,8 @@
 A **workflow** is one bash script that grades one thing. It's the unit
 of work students see in their assessment results.
 
-> [!note]
-> Read the [Overview](overview.md) first if you haven't — it explains
-> how workflows fit alongside actions, playlists, and pods.
+Read the [Overview](overview.md) first if you have not already; it explains how
+workflows fit alongside actions, playlists, and pods.
 
 ---
 
@@ -40,10 +39,9 @@ Three things to notice:
    `run_action` so the engine can capture per-step pass/fail, output,
    and duration.
 
-> [!important]
-> A workflow with no `run_action` calls is treated as a single anonymous
-> step. You almost always want explicit `run_action` blocks because they
-> give students named, individual line items in the result UI.
+A workflow with no `run_action` calls is treated as a single anonymous step.
+Use explicit `run_action` blocks to give students named, individual line items
+in the result UI.
 
 ---
 
@@ -138,11 +136,9 @@ run_action "audit-log-exists" bash -c '
 '
 ```
 
-> [!important]
-> When mixing library actions and inline checks, the **ordering still
-> matters** — failures abort the workflow (because of `set -e`). Put
-> setup steps first, then your most important assertion, then nice-to-
-> have follow-ups.
+When mixing library actions and inline checks, the **ordering still matters**:
+failures abort the workflow because of `set -e`. Put setup steps first, then
+your most important assertion, then nice-to-have follow-ups.
 
 ---
 
@@ -161,11 +157,10 @@ Transition via the admin UI Workflows page, or:
 - `PATCH /api/v1/admin/workflows/{id}/approve` (pending_review → approved, **admin only**)
 - `PATCH /api/v1/admin/workflows/{id}/activate` (approved → active)
 
-> [!warning]
-> Once a workflow is `active`, edits create a **new revision** rather
-> than mutating the existing record. Active revisions referenced by an
-> in-flight playlist run will continue to use the version they were
-> launched with — your edit becomes the new "head".
+Once a workflow is `active`, edits create a **new revision** rather than
+mutating the existing record. Active revisions referenced by an in-flight
+playlist run continue to use the version with which they launched; your edit
+becomes the new "head".
 
 ---
 

@@ -1,9 +1,8 @@
 # Building a Template
 
-> [!note]
-> Templates are the **frozen VM images** every lab pod is cloned from.
-> See [overview.md](overview.md) for how templates fit into the bigger
-> picture (template → blueprint → pod → playlist → workflow → action).
+Templates are the **frozen VM images** every lab pod is cloned from. See
+[overview.md](overview.md) for how templates fit into the bigger picture
+(template → blueprint → pod → playlist → workflow → action).
 
 This page walks through the **template-creation wizard** end-to-end, with
 special attention to the **browser-based build console** — you do not need
@@ -35,14 +34,13 @@ the page.
 | `active` | Published — students can launch pods from it | No |
 | `error` | A worker job failed; check Last error in the wizard | No |
 
-> [!note]
-> **Publish is gated by a smoke test.** When you click Publish, the
-> template first enters `verifying`: Crucible clones a disposable VM
-> from the freshly-generalized image, powers it on, and waits for it to
-> boot unattended (VMware Tools + an IP lease). If it boots cleanly the
-> template auto-advances to `active`; if it fails to boot the template
-> returns to `ready` with the failure recorded — so a bricked image can
-> never reach students. The throwaway VM is always cleaned up.
+**Publish is gated by a smoke test.** When you click Publish, the template
+first enters `verifying`: Crucible clones a disposable VM from the
+freshly-generalized image, powers it on, and waits for it to boot unattended
+(VMware Tools + an IP lease). If it boots cleanly the template auto-advances to
+`active`; if it fails to boot the template returns to `ready` with the failure
+recorded, so a bricked image cannot reach students. The throwaway VM is always
+cleaned up.
 
 ---
 
@@ -69,11 +67,11 @@ below say what to put in each. When in doubt, copy the recipe.
 
 ### Quick-start recipes (copy these)
 
-> [!tip] Want a full click-by-click recipe for **one specific OS**?
-> See [Per-OS Template Build Recipes](os-recipes.md) — it has a copy-me table and
-> numbered steps for Ubuntu Server/Desktop, Debian, Linux Mint, Windows 10/11,
-> and Windows Server 2016/2019/2025, including the exact Guest OS ID and the
-> Windows 11 TPM/Secure-Boot bypass. The table below is the one-line summary.
+For a full click-by-click recipe for one OS, see
+[Per-OS Template Build Recipes](os-recipes.md). It covers Ubuntu
+Server/Desktop, Debian, Linux Mint, Windows 10/11, and Windows Server
+2016/2019/2025, including the exact Guest OS ID and the Windows 11
+TPM/Secure-Boot bypass. The table below is the one-line summary.
 
 Pick the row that matches what you're building and use exactly those values.
 Anything not listed, **leave blank** — the wizard fills in sensible defaults.
@@ -86,11 +84,11 @@ Anything not listed, **leave blank** — the wizard fills in sensible defaults.
 | Windows from scratch | **ISO install** | `windows_autounattend` | `Student` | `Changeme123!` | leave blank |
 | A desktop OS I want to click through myself | **ISO install** | `manual` | leave blank | leave blank | leave blank |
 
-> [!important] The **standard build password** for this lab is `Changeme123!`.
-> Use it everywhere the wizard asks you to make up a password, unless your
-> teacher tells you otherwise. See
-> [The standard build login](#the-standard-build-login-studentchangeme123) below
-> for what this password is and is *not*.
+The **standard build password** for this lab is `Changeme123!`. Use it wherever
+the wizard asks you to make up a password, unless your teacher tells you
+otherwise. See
+[The standard build login](#the-standard-build-login-studentchangeme123) for
+what this password is and is not.
 
 ### Field reference — Identity
 
@@ -112,12 +110,11 @@ Anything not listed, **leave blank** — the wizard fills in sensible defaults.
 | **Clone an existing vCenter VM** | A teacher/admin points you at a specific VM or an imported OVA | Pick the VM from the dropdown |
 | **ISO install** | You're installing an OS from scratch off an installer disc | Pick your `.iso` from the dropdown |
 
-> [!note] Don't see your ISO in the list?
-> Upload it on the **Images** page and wait for it to finish importing, then
-> come back — it'll appear under "Uploaded & imported ISOs". ISOs already on the
-> server appear under "ISOs already on vCenter datastore". The value looks like
-> `[NAS-BackupsAndISOS] ISOs/ubuntu-24.04.iso` — you don't type that, you just
-> pick it.
+If an ISO is not in the list, upload it on the **Images** page and wait for the
+import to finish. It then appears under "Uploaded & imported ISOs." ISOs already
+on the server appear under "ISOs already on vCenter datastore." The value looks
+like `[NAS-BackupsAndISOS] ISOs/ubuntu-24.04.iso`; choose it rather than typing
+it.
 
 ### Field reference — Hardware
 
@@ -174,15 +171,14 @@ each one wants — **most can be left blank**:
 | **APT proxy** *(Linux only)* | `http://10.10.30.20:3142` to speed up package downloads | No proxy (installs still work, just slower) |
 | **Extra packages** | Comma-separated tools you want pre-installed, e.g. `curl, git, vim` | Nothing extra |
 
-> [!note] You type the password in plain text here.
-> Crucible stores it safely for you (encrypted on Windows, hashed on Linux) — you
-> never deal with that. This is the password you'll use to log into the build VM
-> in the next step.
+You type the password in plain text here. Crucible stores it safely (encrypted
+on Windows, hashed on Linux). This is the password you use to log into the build
+VM in the next step.
 
-> [!tip] A `cloudinit_cidata` Ubuntu build sets up everything Crucible needs
-> automatically (VMware Tools, the `student` account, passwordless sudo, SSH host
-> keys, the apt proxy). That's why it's the easiest path for Linux. See
-> [Linux template contract](#linux-template-contract) for the details it handles.
+A `cloudinit_cidata` Ubuntu build sets up VMware Tools, the `student` account,
+passwordless sudo, SSH host keys, and the apt proxy automatically. That is why
+it is the easiest Linux path; see [Linux template contract](#linux-template-contract)
+for the details it handles.
 
 For the full play-by-play of what happens after you click Provision on an ISO,
 see [Provisioning from an ISO](#provisioning-from-an-iso).
@@ -191,22 +187,19 @@ see [Provisioning from an ISO](#provisioning-from-an-iso).
 
 ### The standard build login (`Student`/`Changeme123!`)
 
-> [!important]
-> Whenever the wizard asks you to make up a username/password for the VM you're
-> building, use:
-> - **Username:** `student` (Linux) or `Student` (Windows)
-> - **Password:** `Changeme123!`
+Whenever the wizard asks you to make up a username/password for the VM you are
+building, use **`student`** for Linux or **`Student`** for Windows, with the
+password **`Changeme123!`**.
 
 This is the **build login** — the account *you* use to log into the VM in the
 console while you set it up. It is a shared, well-known convention so anyone on
 the team can pick up a half-built template.
 
-> [!danger] This is **not** the password students get.
-> When a student launches a pod, Crucible generates a **brand-new random
-> password just for them** and shows it on their pod page. `Changeme123!` only
-> ever lives on the build VM and is replaced on every student copy. So it is safe
-> to write it in docs — but it also means you must never tell a student "the
-> password is `Changeme123!`"; theirs is different.
+This is **not** the password students get. When a student launches a pod,
+Crucible generates a **brand-new random password just for them** and shows it
+on their pod page. `Changeme123!` only ever lives on the build VM and is
+replaced on every student copy. Never tell a student that their password is
+`Changeme123!`; theirs is different.
 
 When do you type it vs. leave things blank?
 
@@ -252,27 +245,22 @@ finishes, then it will become selectable.
 If the import fails (shown in the image list as an error with a message), click
 **Retry import** to re-run the import without re-uploading the file.
 
-> [!note]
-> OVAs are handled differently — they are imported into vCenter's Templates
-> folder as a ready-to-clone VM and are **not** available as ISO install media.
-> Use the `clone_vcenter` template source type to build from an OVA-derived VM.
+OVAs are imported into vCenter's Templates folder as ready-to-clone VMs and are
+**not** ISO install media. Use the `clone_vcenter` template source type to
+build from an OVA-derived VM.
 
-> [!warning]
-> The "ISO install" picker may show previously-uploaded ISOs that are still
-> importing (`Importing…`, greyed-out). These are not yet usable; wait for the
-> import to finish or check the image list for errors. If the picker is empty,
-> link: **Admin → Images** to upload an ISO first.
+The "ISO install" picker may show previously-uploaded ISOs that are still
+importing (`Importing…`, greyed-out). Wait for the import to finish or check the
+image list for errors. If the picker is empty, use **Admin → Images** to upload
+an ISO first.
 
-> [!note]
-> **An unattended install finishes when the VM powers itself off.**
-> The generated config ends with `shutdown: poweroff`, and the worker waits
-> for that — not for VMware Tools. This matters because the Ubuntu Server
-> installer runs VMware Tools *inside the installer environment*, roughly 40
-> seconds after power-on and long before anything is written to disk. Tools
-> appearing early is normal and is not a sign the install is done.
->
-> Once the VM powers off, the worker detaches both CDs, boots the installed
-> system, waits for *its* Tools, and moves the template to `configuring`.
+**An unattended install finishes when the VM powers itself off.** The generated
+config ends with `shutdown: poweroff`, and the worker waits for that, not for
+VMware Tools. The Ubuntu Server installer runs VMware Tools *inside the
+installer environment*, roughly 40 seconds after power-on and long before
+anything is written to disk. After the VM powers off, the worker detaches both
+CDs, boots the installed system, waits for *its* Tools, and moves the template
+to `configuring`.
 
 > [!warning]
 > **Ubuntu autoinstall needs the confirmation prompt answered.** The Ubuntu
@@ -290,10 +278,9 @@ Progress messages in the wizard tell you which phase you're in:
 
 ## Step 3 — Configure (the new part)
 
-> [!tip]
-> Click **Open Build Console ↗** in the wizard. A new tab opens with a
-> browser-native VM console — same as the pod-VM consoles students use.
-> No vCenter login, no VMware Remote Console install, no port forwarding.
+Click **Open Build Console ↗** in the wizard to open a browser-native VM
+console. No vCenter login, VMware Remote Console installation, or port
+forwarding is needed.
 
 Inside the console you can:
 
@@ -302,12 +289,9 @@ Inside the console you can:
 - Use **Text Input** drawer if your browser blocks clipboard access
 - Send **Ctrl+Alt+Del**
 
-> [!tip]
-> The wizard also has **Start / Stop / Restart / Reset** buttons for the
-> staging VM. Use them if the build VM hangs, needs a reboot after
-> installing software, or you powered it off and want it back — the
-> wizard refreshes the power state automatically. These act on the build
-> VM only, never on any student pod.
+The wizard also has **Start / Stop / Restart / Reset** buttons for the staging
+VM. Use them if the build VM hangs, needs a reboot after installing software,
+or needs to be restarted. They act on the build VM only, never on a student pod.
 
 Do whatever you need to: install software, harden the OS, drop in
 configuration files, create user accounts. Save your work *inside the
@@ -338,14 +322,13 @@ order: whatever you supply explicitly, then the template's
 platform generated and recorded when it built the seed ISO. That last case
 matters because those credentials are not displayed anywhere in the wizard.
 
-> [!note]
-> **Reaching `ready` means the cleanup provably finished**, not just that the
-> VM powered off. On Linux the cleanup script deliberately leaves the guest
-> running so Crucible can collect a real exit code and read a completion
-> marker; the platform then powers the VM down itself. If either signal is
-> missing the template goes to `error` rather than `ready`. See
-> [Generalize failed, or the template published but clones behave oddly](troubleshooting.md#generalize-failed-or-the-template-published-but-clones-behave-oddly)
-> for what each outcome means.
+**Reaching `ready` means the cleanup provably finished**, not merely that the
+VM powered off. On Linux the cleanup script deliberately leaves the guest
+running so Crucible can collect an exit code and read a completion marker; the
+platform then powers the VM down. If either signal is missing the template goes
+to `error` rather than `ready`. See
+[Generalize failed, or the template published but clones behave oddly](troubleshooting.md#generalize-failed-or-the-template-published-but-clones-behave-oddly)
+for each outcome.
 
 ## Step 5 — Publish
 
@@ -375,13 +358,10 @@ is useful when:
    - **Instructor only** — template is hidden from students and only
      visible to instructors and admins in the template picker
 
-> [!note]
-> **Visibility vs. Publish state are independent.** An active (published)
-> instructor-only template is fully functional — it just doesn't appear in the
-> student-facing catalog. An instructor can still click "Deploy" and use it
-> to create a pod for testing. Students **cannot** see instructor-only
-> templates in the list *or* reach them through any other path; attempting
-> to use one (if they knew its ID) results in a permission error.
+**Visibility and publish state are independent.** An active instructor-only
+template is fully functional but does not appear in the student-facing catalog.
+An instructor can still deploy it for testing. Students cannot see it or reach
+it through another path; using its ID returns a permission error.
 
 Once you're satisfied with the template, change it back to **Public** so
 students can access it.
@@ -390,7 +370,7 @@ students can access it.
 
 ## Linux template contract
 
-> [!danger]
+> [!caution]
 > **A Linux template that violates this contract still clones and boots —
 > the student just silently cannot log in.** There is no error in the
 > wizard, no failed job, no alert. The pod shows "running" and green, and
@@ -430,7 +410,7 @@ system_info:
     shell: /bin/bash
 ```
 
-> [!danger]
+> [!caution]
 > **The cloud-init default user MUST be `student`.** Crucible writes a
 > bare top-level `password:` into the `#cloud-config` payload, and
 > cloud-init applies that password to the **default user only**. Crucible
@@ -446,7 +426,7 @@ system_info:
 `rm -f /etc/ssh/ssh_host_*`. If nothing regenerates them on next boot,
 sshd fails its config test and the student cannot SSH in.
 
-> [!danger]
+> [!caution]
 > **Ubuntu 24.04 does NOT ship `ssh-keygen.service`.** Earlier versions of
 > this page said it did. Verified on a real 24.04.3 build:
 > `systemctl is-enabled ssh-keygen.service` returns **not-found**, ssh is
@@ -480,7 +460,7 @@ The `ConditionPathExists` guard makes it a no-op on every later boot, so
 it can never rotate a running pod's host key out from under an open
 session.
 
-> [!danger] Order before `ssh.service`, **never** before `ssh.socket`.
+> [!caution] Order before `ssh.service`, **never** before `ssh.socket`.
 > Adding `ssh.socket` to that `Before=` line looks stricter and is in fact a
 > **systemd ordering cycle** that disables SSH entirely. Because the unit is
 > `WantedBy=multi-user.target` it inherits `After=basic.target`, and
@@ -504,11 +484,10 @@ session.
 > run, systemd simply orders `ssh.service` after it, so `sshd` still never
 > starts without keys.
 
-> [!note]
-> On **Ubuntu 24.04** the SSH daemon unit is `ssh.service`, **not**
-> `sshd.service`, and it is socket-activated. Order host-key regeneration
-> `Before=ssh.service ssh.socket` — ordering before `ssh.service` alone is
-> not enough when the socket accepts the connection first.
+On **Ubuntu 24.04** the SSH daemon unit is `ssh.service`, not `sshd.service`,
+and it is socket-activated. Order host-key regeneration only
+`Before=ssh.service`; this is sufficient even when the socket accepts the
+connection first.
 
 **4. apt proxy pointed at the staging cache.** So package installs during
 build go through the lab's apt-cacher-ng. Create
@@ -534,7 +513,7 @@ Acquire::http::Proxy "http://10.10.30.20:3142";
 tty**, so a password prompt cannot be answered and the whole script
 aborts.
 
-> [!danger]
+> [!caution]
 > **Being in the `sudo` group is not enough, and the `sudo:` line in
 > `99-crucible.cfg` does not grant this.** cloud-init only applies
 > `system_info.default_user` when it *creates* the account. If the account
@@ -553,14 +532,12 @@ The `chmod 0440` is not cosmetic: **sudo silently ignores a drop-in that
 is group- or world-writable** and tells you nothing. Always finish with
 `sudo -n true`.
 
-> [!tip]
-> **A `cloudinit_cidata` ISO build does all five of these for you.** If you
-> provision from an Ubuntu Server ISO with `unattend_mode=cloudinit_cidata`,
-> the generated autoinstall installs open-vm-tools and cloud-init, writes
-> `99-crucible.cfg`, installs and enables the host-key regeneration unit,
-> configures the apt proxy, and drops in passwordless sudo. Run the
-> verification block below anyway — it is cheap, and it is the only thing
-> that proves it.
+**A `cloudinit_cidata` ISO build does all five of these for you.** If you
+provision from an Ubuntu Server ISO with `unattend_mode=cloudinit_cidata`, the
+generated autoinstall installs open-vm-tools and cloud-init, writes
+`99-crucible.cfg`, installs and enables the host-key regeneration unit,
+configures the apt proxy, and drops in passwordless sudo. Run the verification
+block below anyway; it proves the setup.
 
 > [!warning]
 > **Linux Mint does not ship cloud-init.** A Mint template will never
@@ -588,7 +565,7 @@ grep -rh -i proxy /etc/apt/apt.conf.d/               # a bare URL, not a dict (r
 sudo -n true && echo "sudo OK"                       # must print sudo OK (req 5)
 ```
 
-> [!danger]
+> [!caution]
 > **`sudo -n true` is the single most important line here.** It is the only
 > one that fails the way generalize fails: no tty, no prompt, non-zero
 > exit. If it does not print `sudo OK`, Generalize will abort partway and
@@ -624,22 +601,18 @@ its current state.
 
 ## Troubleshooting
 
-> [!warning]
-> **Console shows "Connecting…" indefinitely.** The staging VM might
-> not have power yet (early `provisioning`) or it might have just
-> rebooted. Click **Reconnect** in the console toolbar after ~30 seconds.
+If the console shows "Connecting…" indefinitely, the staging VM might not have
+power yet (early `provisioning`) or might have just rebooted. Click
+**Reconnect** in the console toolbar after about 30 seconds.
 
-> [!warning]
-> **Generalize fails.** Open the console, log in with the credentials
-> you provided, and check `/var/log/cloud-init.log` (Linux) or
-> `C:\Windows\System32\Sysprep\Panther\setupact.log` (Windows). The
-> wizard's **Last error** field also shows the worker's report.
+If Generalize fails, open the console, log in with the credentials you
+provided, and check `/var/log/cloud-init.log` (Linux) or
+`C:\Windows\System32\Sysprep\Panther\setupact.log` (Windows). The wizard's
+**Last error** field also shows the worker report.
 
-> [!note]
-> **The console disconnects after sysprep runs.** Expected — sysprep
-> reboots the guest, which kills the WebMKS session. The wizard
-> auto-advances to `ready` once the worker confirms the snapshot was
-> taken.
+The console disconnects after sysprep runs because sysprep reboots the guest and
+kills the WebMKS session. The wizard auto-advances to `ready` once the worker
+confirms the snapshot.
 
 See [troubleshooting.md](troubleshooting.md) for more general help.
 

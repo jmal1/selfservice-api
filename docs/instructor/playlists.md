@@ -98,11 +98,9 @@ When a student clicks **Run** on a playlist:
 4. The overall playlist result is **pass only if every `required: true`
    workflow passes**.
 
-> [!important]
-> A failed required workflow short-circuits the rest of the playlist
-> by default — see the engine's `stop_on_failure` config. If you want
-> "always run all checks even if one fails", set
-> `stop_on_failure: false` on the playlist.
+A failed required workflow short-circuits the rest of the playlist by default;
+see the engine's `stop_on_failure` config. To always run all checks after a
+failure, set `stop_on_failure: false` on the playlist.
 
 ---
 
@@ -131,10 +129,8 @@ Same rule as workflows: edits to an `active` playlist create a **new
 revision**. In-flight student runs continue against the version they
 launched with. The "head" revision is what new student clicks will use.
 
-> [!tip]
-> If you've published a playlist and notice a bug mid-class, fix it
-> immediately — already-running students stay on the buggy revision,
-> but new clicks pick up the fix. No need to disrupt anyone.
+If a published playlist has a mid-class bug, fix it immediately. Already-running
+students stay on the prior revision, while new clicks use the fix.
 
 ---
 

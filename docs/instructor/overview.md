@@ -11,14 +11,12 @@ grade them with **assessments** that run automated checks.
 
 This document explains how the pieces fit together.
 
-> [!note] What you can access
-> Members of the **`lab-instructors`** group get the **full admin panel**
-> — Overview, Users, Templates, Blueprints, Actions, Workflows, Playlists,
-> Runs, VLAN Pool, Jobs, and Health — the same surface an admin sees, with
-> one exception: the **Audit Log** (and the active-Sessions view) stays
-> admin-only. Your own actions are still recorded in the audit log even
-> though you can't read it. If you hit a `403 Forbidden` anywhere other than
-> `/admin/audit`, it's a bug — report it.
+Members of the **`lab-instructors`** group get the **full admin panel** —
+Overview, Users, Templates, Blueprints, Actions, Workflows, Playlists, Runs,
+VLAN Pool, Jobs, and Health — with one exception: the **Audit Log** (and the
+active-Sessions view) stays admin-only. Your own actions are still recorded in
+the audit log even though you cannot read it. If you hit a `403 Forbidden`
+anywhere other than `/admin/audit`, report it.
 
 ---
 
@@ -74,11 +72,9 @@ This document explains how the pieces fit together.
 | **Playlist** | Ordered list of workflows, presented as a lab | **Instructor** | Crucible DB |
 | **Action** | A reusable, parameterised one-step grading helper | Instructor / Admin | Crucible DB |
 
-> [!tip]
-> If you're new, you'll spend ~90% of your time writing **workflows** and
-> ~10% adding reusable **actions** to the library. You *can* also manage
-> templates, blueprints, users, and the VLAN pool from the admin panel, but
-> those are infrastructure concerns you'll usually touch far less often.
+Most instructors spend most of their time writing **workflows** and occasionally
+add reusable **actions** to the library. Templates, blueprints, users, and the
+VLAN pool are infrastructure concerns you will usually touch less often.
 
 ---
 
@@ -101,11 +97,9 @@ This document explains how the pieces fit together.
 4. Results are stored in the database. The student sees a pass/fail
    summary plus any student-facing messages.
 
-> [!important]
-> The engine **does not** rerun parts of a workflow if one step fails.
-> A workflow is one bash process with `set -euo pipefail` — author it
-> as you would any shell script. If you want independence between
-> grading steps, split them into separate workflows in the same playlist.
+The engine **does not** rerun parts of a workflow if one step fails. A workflow
+is one bash process with `set -euo pipefail`; if grading steps need to be
+independent, split them into separate workflows in the same playlist.
 
 ---
 
@@ -117,10 +111,9 @@ This document explains how the pieces fit together.
 | "I'm going to check **the same kind of thing in many workflows**" (e.g. 'is a service running') | Add a library **action** with parameters, then call it from workflows |
 | "I want to **assemble a full lab** for a class session" | Build a **playlist** by ordering the workflows you've already approved |
 
-> [!tip]
-> Start by writing workflows inline. Promote logic to a library action
-> only when you've copy-pasted it into a third workflow. Premature
-> generalisation hurts maintainability.
+Start by writing workflows inline. Promote logic to a library action only when
+you have copied it into a third workflow; premature generalisation hurts
+maintainability.
 
 ---
 

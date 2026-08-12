@@ -70,8 +70,8 @@
     {
       "path": "docs/instructor/actions.md",
       "title": "Building Library Actions",
-      "size": 6896,
-      "sha256": "b60b83f10ca4094f12a752cffadd1aa5c10b65d57aea18695990619d21bfefab",
+      "size": 6823,
+      "sha256": "6be069a3258c041d788ee8abf7a5b6630617c44d95bd7840d3f3677db1478eeb",
       "is_markdown": true,
       "links_out": [
         "AGENTS.md",
@@ -102,13 +102,12 @@
     {
       "path": "docs/instructor/os-recipes.md",
       "title": "Per-OS Template Build Recipes",
-      "size": 39732,
-      "sha256": "b79ee1f83097aa6cf8e8401a50aaa1eee8181a2b2fb5bf4dca1849be5950f7e3",
+      "size": 38208,
+      "sha256": "1621d8af0c1f7b7f5b88f6210ee68f69c86e32c4ffcfb25a07d1e90f0bcebe68",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/glossary.md",
         "docs/instructor/overview.md",
-        "docs/instructor/templates.md",
         "docs/instructor/templates.md",
         "docs/instructor/templates.md",
         "docs/instructor/templates.md",
@@ -132,8 +131,8 @@
     {
       "path": "docs/instructor/overview.md",
       "title": "Crucible for Instructors — Overview",
-      "size": 8307,
-      "sha256": "d13e8283bdcbdd56632628da54d4e81715ec7aceccd12ea8b323e340893b0434",
+      "size": 8053,
+      "sha256": "a2eb4bbc5c18112467b074234bb34daecf3947154d2accd102890ea166f41f94",
       "is_markdown": true,
       "links_out": [
         "AGENTS.md",
@@ -155,8 +154,8 @@
     {
       "path": "docs/instructor/playlists.md",
       "title": "Building Playlists",
-      "size": 7855,
-      "sha256": "b90899b357f6c721c27576aeb533ae23d5a0aaf609c15da50ee55d9a009a40f4",
+      "size": 7755,
+      "sha256": "26e653b4060fc5bbc49595fe5624ce3d4f119decb14092c4dbdd1373b4dbce01",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/overview.md",
@@ -169,8 +168,8 @@
     {
       "path": "docs/instructor/runner-environment.md",
       "title": "Runner Environment",
-      "size": 8854,
-      "sha256": "a6a689d3e4abc5c9639c0c13512af24d0d057f5c0368b9424d34c0421435e46b",
+      "size": 8612,
+      "sha256": "4916d0c328c6904f812221438b6ab02c74e7a31fa32c5f06296523709c86911f",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/overview.md",
@@ -183,8 +182,8 @@
     {
       "path": "docs/instructor/templates.md",
       "title": "Building a Template",
-      "size": 38619,
-      "sha256": "cdf9439f40fd1e8aa98b2b4bb5071ed24ff9f79d61d723fad56fbc5d25623610",
+      "size": 37451,
+      "sha256": "38dc2a3707902ded08ee508644492896d68123fe1c8ea36c830847e4c447d1ee",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/glossary.md",
@@ -201,8 +200,8 @@
     {
       "path": "docs/instructor/troubleshooting.md",
       "title": "Troubleshooting",
-      "size": 22845,
-      "sha256": "f0514ad0a09bcb72e9430d5d11f12411427f119f31fb03bad2cee027cb5aeae9",
+      "size": 22630,
+      "sha256": "d6c8e71267eb5506d13ae1fc6281eb7fe2eaead86d03451ab227b6cb62850aa2",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/actions.md",
@@ -219,8 +218,8 @@
     {
       "path": "docs/instructor/workflows.md",
       "title": "Building Workflows",
-      "size": 7771,
-      "sha256": "6db8cf5dedab6687262f6abfc15e3a8f3e0cd6b35ff52a0bab9db7ee43f59863",
+      "size": 7656,
+      "sha256": "630dbb9d96a2862024accd792407f15343ec36ff4e7ba41cb5341b903540d1fa",
       "is_markdown": true,
       "links_out": [
         "AGENTS.md",
@@ -324,5 +323,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 294948
+  "total_bytes": 291257
 }
