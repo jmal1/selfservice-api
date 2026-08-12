@@ -43,6 +43,7 @@ import (
 	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/middleware"
 	"github.com/jmal1/selfservice-api/internal/models"
+	"github.com/jmal1/selfservice-api/internal/unattend"
 	"github.com/jmal1/selfservice-api/internal/vcenter"
 )
 
@@ -709,6 +710,13 @@ func (h *Handler) AdminListVCenterISOs(w http.ResponseWriter, r *http.Request) {
 	seenByPath := make(map[string]bool, len(files))
 	isos := make([]ISOEntry, 0, len(files))
 	for _, f := range files {
+		// Provisioner-generated seed ISOs (cloud-init CIDATA / Windows
+		// autounattend) live in this same folder but are non-bootable
+		// unattended-install media, never valid installer sources. Drop
+		// them so the wizard cannot offer them.
+		if unattend.IsSeedISOFilename(f.Name) {
+			continue
+		}
 		seenByPath[f.Path] = true
 		mod := f.ModifiedTime
 		isos = append(isos, ISOEntry{
