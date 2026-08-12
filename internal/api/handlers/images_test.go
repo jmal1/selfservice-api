@@ -967,6 +967,58 @@ func TestAdminListVCenterISOs_DedupsByPath(t *testing.T) {
 	}
 }
 
+// TestAdminListVCenterISOs_ExcludesSeedISOs verifies that provisioner-generated
+// seed ISOs (cloud-init CIDATA / Windows autounattend) found on the datastore are
+// never offered as installer sources, while a legitimately named installer is.
+func TestAdminListVCenterISOs_ExcludesSeedISOs(t *testing.T) {
+	db := &fakeImageDB{}
+	lister := &fakeISOLister{files: []vcenter.DatastoreFile{
+		{
+			Name:         "tpl-mint-21d3e7-seed-cidata.iso",
+			Path:         "[NAS-BackupsAndISOS] ISOs/Linux/tpl-mint-21d3e7-seed-cidata.iso",
+			FolderPath:   "ISOs/Linux",
+			SizeBytes:    1 << 20,
+			ModifiedTime: time.Now(),
+		},
+		{
+			Name:         "tpl-win-abc123-seed-autounattend.iso",
+			Path:         "[NAS-BackupsAndISOS] ISOs/Windows/tpl-win-abc123-seed-autounattend.iso",
+			FolderPath:   "ISOs/Windows",
+			SizeBytes:    1 << 20,
+			ModifiedTime: time.Now(),
+		},
+		{
+			Name:         "linuxmint-22.3-mate-64bit.iso",
+			Path:         "[NAS-BackupsAndISOS] ISOs/Linux/linuxmint-22.3-mate-64bit.iso",
+			FolderPath:   "ISOs/Linux",
+			SizeBytes:    3 << 30,
+			ModifiedTime: time.Now(),
+		},
+	}}
+	h := newISOHandler(db, &fakeImageStore{}, lister, "NAS-BackupsAndISOS")
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/vcenter/isos", nil)
+	w := httptest.NewRecorder()
+	h.AdminListVCenterISOs(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200; body = %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		ISOs []ISOEntry `json:"isos"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(resp.ISOs) != 1 {
+		t.Fatalf("isos count = %d; want 1 (only the real installer); got %+v", len(resp.ISOs), resp.ISOs)
+	}
+	if resp.ISOs[0].Name != "linuxmint-22.3-mate-64bit.iso" {
+		t.Errorf("isos[0].Name = %q; want linuxmint-22.3-mate-64bit.iso", resp.ISOs[0].Name)
+	}
+}
+
 // TestAdminListVCenterISOs_ExcludesOVAs verifies that OVA image uploads never
 // appear in the ISO picker, regardless of their status.
 func TestAdminListVCenterISOs_ExcludesOVAs(t *testing.T) {

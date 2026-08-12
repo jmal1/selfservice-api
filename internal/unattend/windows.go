@@ -108,7 +108,7 @@ func buildAutounattendISO(s Spec) (name string, data []byte, err error) {
 	if err != nil {
 		return "", nil, err
 	}
-	return "seed-autounattend.iso", iso, nil
+	return SeedISONameAutounattend, iso, nil
 }
 
 // autounattendTemplate mirrors internal/provisioner/assets/windows-unattend.xml.

@@ -355,5 +355,5 @@ func buildCIDataISO(s Spec) (name string, data []byte, err error) {
 	if err != nil {
 		return "", nil, err
 	}
-	return "seed-cidata.iso", iso, nil
+	return SeedISONameCIData, iso, nil
 }
