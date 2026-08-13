@@ -221,7 +221,7 @@ var StudentGuideIndex = synthetic.CheckFunc{
 	NameVal:        "student_guide_index",
 	TitleVal:       "Student Guide Available",
 	DescriptionVal: "Calls /api/v1/student-guide/index as a student and requires a student-only manifest containing Getting Started. Catches route, bundle, and content-filtering regressions.",
-	RunbookVal:     "https://github.com/jmal1/selfservice-api/blob/main/docs/architecture/wiki.md",
+	RunbookVal:     "https://github.com/jmal1/Homelab/blob/main/future/Synthetic-Monitoring.md#when-student_guide_index-fails",
 	SeverityVal:    synthetic.SeverityWarning,
 	RunFn: func(ctx context.Context, c *synthetic.Client) (int, error) {
 		resp, err := c.Do(ctx, http.MethodGet, "/api/v1/student-guide/index", nil)

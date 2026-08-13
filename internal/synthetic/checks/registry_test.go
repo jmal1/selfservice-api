@@ -296,8 +296,9 @@ func TestStudentGuideIndex_Contract(t *testing.T) {
 	if StudentGuideIndex.Severity() != synthetic.SeverityWarning {
 		t.Errorf("severity=%q, want warning", StudentGuideIndex.Severity())
 	}
-	if strings.TrimSpace(StudentGuideIndex.Runbook()) == "" {
-		t.Error("student guide check must publish a runbook URL for alert responders")
+	const wantRunbook = "https://github.com/jmal1/Homelab/blob/main/future/Synthetic-Monitoring.md#when-student_guide_index-fails"
+	if StudentGuideIndex.Runbook() != wantRunbook {
+		t.Errorf("runbook=%q, want %q", StudentGuideIndex.Runbook(), wantRunbook)
 	}
 }
 

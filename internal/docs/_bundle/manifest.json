@@ -238,8 +238,8 @@
     {
       "path": "docs/student/connecting.md",
       "title": "Connecting to Your VM",
-      "size": 1734,
-      "sha256": "f549d82b9506bb56910d48e3a00f9f74ac5d53c24cb998aa401d771cd9a9fafa",
+      "size": 1696,
+      "sha256": "82f0cb5d0ea55b95ad0553f75a311aa8543441fadc262e5189295763c8db1ae8",
       "is_markdown": true,
       "links_out": [
         "docs/student/troubleshooting.md"
@@ -249,8 +249,8 @@
     {
       "path": "docs/student/labs.md",
       "title": "Creating and Managing Labs",
-      "size": 1398,
-      "sha256": "83506b5902dd5e4b76406295ef01934b2e44d14170386d3ac1ce808121577ddf",
+      "size": 1369,
+      "sha256": "9c0680052ea9fe6e32250a54ec8cb0b7b711c8de882eb25a7a066f5b4f11336f",
       "is_markdown": true,
       "links_out": [
         "docs/student/snapshots.md"
@@ -260,8 +260,8 @@
     {
       "path": "docs/student/overview.md",
       "title": "Getting Started",
-      "size": 983,
-      "sha256": "ef9da2bc73ea604387100293490833fdb68a3ad0db3e68dff6c79575c9936149",
+      "size": 963,
+      "sha256": "7567c1f8e54b5e1f1611e11a0021362dc7b9cc40ae304f2d164df38f5d905e85",
       "is_markdown": true,
       "links_out": [
         "docs/student/connecting.md",
@@ -273,24 +273,24 @@
     {
       "path": "docs/student/snapshots.md",
       "title": "Snapshots and Recovery",
-      "size": 1438,
-      "sha256": "962db31fa78c7d1482a06ecfc6c092e512c37cf2e37a30c549f730710cb9ba66",
+      "size": 1407,
+      "sha256": "42f0c82c2840ca360321b0f017203ccb5e7ae2e5c39e513edd88556641acafef",
       "is_markdown": true,
       "from_seed": false
     },
     {
       "path": "docs/student/testing.md",
       "title": "Testing and Feedback",
-      "size": 1074,
-      "sha256": "64060008d3f7a34f4bf0cb924f0b0a0f84bd84d1f891b9c22a84568c887ce123",
+      "size": 1052,
+      "sha256": "ba3f1bc9e8ed65da3b2f239fad549b56d5f2c30fda5433453b0a07d9079bcb07",
       "is_markdown": true,
       "from_seed": false
     },
     {
       "path": "docs/student/troubleshooting.md",
       "title": "Troubleshooting",
-      "size": 1973,
-      "sha256": "72b32929286abcf9a02dc2f1020a01b4230a465a277fcfa23f777e5464431374",
+      "size": 1932,
+      "sha256": "f13980927f7d2ca0ee7b267c35494c45b05311061dda05239081eee7c8d231fc",
       "is_markdown": true,
       "from_seed": false
     },
@@ -383,5 +383,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 300297
+  "total_bytes": 300116
 }
