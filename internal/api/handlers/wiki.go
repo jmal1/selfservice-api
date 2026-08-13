@@ -22,6 +22,11 @@ import (
 // is embedded into a freshly-built binary will succeed.
 func docsBundle() (*docs.Bundle, error) { return docs.Load() }
 
+const (
+	studentGuidePrefix   = "docs/student/"
+	studentGuideOverview = studentGuidePrefix + "overview.md"
+)
+
 // WikiIndex returns the manifest as JSON. The UI calls this once on
 // page load to render the sidebar tree.
 //
@@ -69,7 +74,107 @@ func (h *Handler) WikiPage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not in wiki bundle", http.StatusNotFound)
 		return
 	}
-	data, err := b.Read(rawPath)
+	h.serveBundleEntry(w, r, b, entry, true)
+}
+
+// StudentGuideIndex returns the student-only view of the embedded documentation
+// bundle. Its manifest intentionally has its own landing seed: student pages
+// enter the shared bundle through the instructor overview, not WIKI_SEEDS.
+//
+// Route: GET /api/v1/student-guide/index
+// Auth: any authenticated user.
+func (h *Handler) StudentGuideIndex(w http.ResponseWriter, r *http.Request) {
+	b, err := docsBundle()
+	if err != nil {
+		writeBundleError(w, h, "load bundle", err)
+		return
+	}
+
+	allEntries := b.ListPrefix(studentGuidePrefix)
+	entries := make([]docs.ManifestEntry, 0, len(allEntries))
+	var totalBytes int64
+	foundOverview := false
+	for _, entry := range allEntries {
+		if !entry.IsMarkdown {
+			continue
+		}
+		entries = append(entries, entry)
+		i := len(entries) - 1
+		totalBytes += entries[i].Size
+		if entries[i].Path == studentGuideOverview {
+			entries[i].FromSeed = true
+			foundOverview = true
+		}
+	}
+	if !foundOverview {
+		h.logger.Error("student guide overview missing from bundled manifest")
+		http.Error(w, "student guide not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	resp := struct {
+		Seeds      []string             `json:"seeds"`
+		Files      []docs.ManifestEntry `json:"files"`
+		TotalBytes int64                `json:"total_bytes"`
+	}{
+		Seeds:      []string{studentGuideOverview},
+		Files:      entries,
+		TotalBytes: totalBytes,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "private, max-age=300")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// StudentGuidePage serves one allowlisted student markdown page. The request
+// path must be canonical and match a docs/student manifest entry exactly; the
+// shared bundle can also contain instructor docs and source files.
+//
+// Route: GET /api/v1/student-guide/page/{path...}
+// Auth: any authenticated user.
+func (h *Handler) StudentGuidePage(w http.ResponseWriter, r *http.Request) {
+	normalized, ok := normalizeStudentGuidePath(chi.URLParam(r, "*"))
+	if !ok {
+		http.Error(w, "student guide page not found", http.StatusNotFound)
+		return
+	}
+
+	b, err := docsBundle()
+	if err != nil {
+		writeBundleError(w, h, "load bundle", err)
+		return
+	}
+	entry, err := b.Entry(normalized)
+	if err != nil || entry.Path != normalized || !entry.IsMarkdown || !strings.HasPrefix(entry.Path, studentGuidePrefix) {
+		http.Error(w, "student guide page not found", http.StatusNotFound)
+		return
+	}
+	h.serveBundleEntry(w, r, b, entry, false)
+}
+
+// normalizeStudentGuidePath accepts only a canonical relative docs/student
+// bundle path. Rejecting non-canonical input prevents path.Clean from turning a
+// traversal attempt into another allowlisted bundle file.
+func normalizeStudentGuidePath(raw string) (string, bool) {
+	if raw == "" || strings.HasPrefix(raw, "/") || strings.Contains(raw, `\`) || strings.ContainsRune(raw, '\x00') {
+		return "", false
+	}
+	for _, segment := range strings.Split(raw, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return "", false
+		}
+	}
+	normalized := path.Clean(raw)
+	if normalized != raw || !strings.HasPrefix(normalized, studentGuidePrefix) {
+		return "", false
+	}
+	return normalized, true
+}
+
+// serveBundleEntry applies the shared page response headers and cache semantics
+// after a handler has decided the caller may access a manifest entry.
+func (h *Handler) serveBundleEntry(w http.ResponseWriter, r *http.Request, b *docs.Bundle, entry *docs.ManifestEntry, allowDownload bool) {
+	data, err := b.Read(entry.Path)
 	if err != nil {
 		writeBundleError(w, h, "read file", err)
 		return
@@ -88,7 +193,7 @@ func (h *Handler) WikiPage(w http.ResponseWriter, r *http.Request) {
 	// download=1 query forces an attachment disposition so the link can
 	// be used as a "Save .md for my AI agent" button without a separate
 	// endpoint.
-	if r.URL.Query().Get("download") == "1" {
+	if allowDownload && r.URL.Query().Get("download") == "1" {
 		w.Header().Set("Content-Disposition",
 			fmt.Sprintf(`attachment; filename=%q`, path.Base(entry.Path)))
 	}

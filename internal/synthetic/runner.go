@@ -84,6 +84,7 @@ func (r *Runner) runOne(ctx context.Context, check Check) (res Result) {
 		Name:        check.Name(),
 		Title:       check.Title(),
 		Description: check.Description(),
+		Runbook:     check.Runbook(),
 		Severity:    check.Severity(),
 		Attempts:    0,
 	}

@@ -135,6 +135,25 @@ func (b *Bundle) List() []ManifestEntry {
 	return out
 }
 
+// ListPrefix returns a copy of manifest entries directly under a repo-relative
+// path prefix. It never reads bundle file contents.
+func (b *Bundle) ListPrefix(prefix string) []ManifestEntry {
+	prefix = strings.TrimSuffix(cleanPath(prefix), "/")
+	if prefix == "" {
+		return nil
+	}
+	prefix += "/"
+
+	out := make([]ManifestEntry, 0)
+	for _, entry := range b.manifest.Files {
+		if strings.HasPrefix(entry.Path, prefix) {
+			out = append(out, entry)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
+}
+
 // WalkFiles applies fn to every file in the bundle (excluding the
 // manifest itself). Used by the zip-download handler. Returning a
 // non-nil error from fn stops the walk and propagates the error.

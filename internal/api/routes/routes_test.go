@@ -1,6 +1,7 @@
 package routes
 
 import (
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	jwtlib "github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 
+	"github.com/jmal1/selfservice-api/internal/api/handlers"
 	"github.com/jmal1/selfservice-api/internal/auth"
 	"github.com/jmal1/selfservice-api/internal/models"
 )
@@ -186,6 +188,67 @@ func TestAdminRunsRequiresInstructorRole(t *testing.T) {
 		if rec.Code == http.StatusForbidden {
 			t.Errorf("instructor role: got 403 Forbidden; want guard to allow through "+
 				"(any non-403 is acceptable here, got %d)", rec.Code)
+		}
+	})
+}
+
+func TestStudentGuideRoutesAreRegistered(t *testing.T) {
+	found := walkRoutes(t)
+	for _, want := range []string{
+		"GET /api/v1/student-guide/index",
+		"GET /api/v1/student-guide/page",
+	} {
+		if !found[want] {
+			t.Errorf("route not registered: %s", want)
+		}
+	}
+	if found["GET /api/v1/student-guide/bundle.zip"] {
+		t.Error("student guide must not expose a bundle ZIP route")
+	}
+}
+
+func TestStudentGuideRequiresAuthenticationAndPreservesWikiRBAC(t *testing.T) {
+	provider := auth.NewTestProvider([]byte(testJWTSecret))
+	h := handlers.NewHandler(nil, nil, nil, slog.Default(), nil)
+	router := Setup(h, provider, nil, []string{"*"})
+
+	t.Run("unauthenticated student guide is rejected", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/student-guide/index", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("status = %d, want 401", rec.Code)
+		}
+	})
+
+	t.Run("student can read guide index and page", func(t *testing.T) {
+		for _, path := range []string{
+			"/api/v1/student-guide/index",
+			"/api/v1/student-guide/page/docs/student/overview.md",
+		} {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			req.AddCookie(makeSessionCookie(t, models.RoleStudent))
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Errorf("%s: status = %d, want 200 (body=%s)", path, rec.Code, rec.Body.String())
+			}
+		}
+	})
+
+	t.Run("student remains forbidden from instructor wiki", func(t *testing.T) {
+		for _, path := range []string{
+			"/api/v1/wiki/index",
+			"/api/v1/wiki/page/AGENTS.md",
+			"/api/v1/wiki/bundle.zip",
+		} {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			req.AddCookie(makeSessionCookie(t, models.RoleStudent))
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusForbidden {
+				t.Errorf("%s: status = %d, want 403", path, rec.Code)
+			}
 		}
 	})
 }

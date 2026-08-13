@@ -247,6 +247,7 @@ func TestAll_StableNames(t *testing.T) {
 		"admin_audit_403":              true,
 		"pod_testing_dashboard_404":    true,
 		"wiki_index_rbac":              true,
+		"student_guide_index":          true,
 		"image_upload_rbac":            true,
 		"template_health_status_rbac":  true,
 		"template_pin_rbac":            true,
@@ -277,5 +278,38 @@ func TestAll_HasFriendlyMetadata(t *testing.T) {
 		if len(c.Title()) > 60 {
 			t.Errorf("check %q Title() = %q is too long (>60 chars; keep it pill-sized)", c.Name(), c.Title())
 		}
+	}
+}
+
+func TestStudentGuideIndex_Contract(t *testing.T) {
+	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
+		"/api/v1/student-guide/index": func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"seeds":["docs/student/overview.md"],"files":[{"path":"docs/student/overview.md"}]}`))
+		},
+	})
+	status, err := StudentGuideIndex.Run(context.Background(), synthetic.NewClient(srv.URL, ""))
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("student guide index should pass: status=%d err=%v", status, err)
+	}
+	if StudentGuideIndex.Severity() != synthetic.SeverityWarning {
+		t.Errorf("severity=%q, want warning", StudentGuideIndex.Severity())
+	}
+	const wantRunbook = "https://github.com/jmal1/Homelab/blob/main/future/Synthetic-Monitoring.md#when-student_guide_index-fails"
+	if StudentGuideIndex.Runbook() != wantRunbook {
+		t.Errorf("runbook=%q, want %q", StudentGuideIndex.Runbook(), wantRunbook)
+	}
+}
+
+func TestStudentGuideIndex_RejectsLeakedPath(t *testing.T) {
+	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
+		"/api/v1/student-guide/index": func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"seeds":["docs/student/overview.md"],"files":[{"path":"docs/instructor/overview.md"}]}`))
+		},
+	})
+	if _, err := StudentGuideIndex.Run(context.Background(), synthetic.NewClient(srv.URL, "")); err == nil {
+		t.Fatal("a student-guide manifest containing instructor content must fail")
 	}
 }
