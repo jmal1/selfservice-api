@@ -16,6 +16,7 @@ type fakeCheck struct {
 	name     string
 	title    string
 	desc     string
+	runbook  string
 	severity Severity
 	run      func(ctx context.Context, c *Client) (int, error)
 }
@@ -23,6 +24,7 @@ type fakeCheck struct {
 func (f fakeCheck) Name() string                                    { return f.name }
 func (f fakeCheck) Title() string                                   { return f.title }
 func (f fakeCheck) Description() string                             { return f.desc }
+func (f fakeCheck) Runbook() string                                 { return f.runbook }
 func (f fakeCheck) Severity() Severity                              { return f.severity }
 func (f fakeCheck) Run(ctx context.Context, c *Client) (int, error) { return f.run(ctx, c) }
 

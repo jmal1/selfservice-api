@@ -26,12 +26,12 @@ func TestSerializeResults_ContainsRequiredFamilies(t *testing.T) {
 		"# TYPE crucible_synthetic_check_http_status gauge",
 		"# TYPE crucible_synthetic_check_info gauge",
 		"# TYPE crucible_synthetic_run_timestamp_seconds gauge",
-		`crucible_synthetic_check_success{check="healthz",title="API Liveness",severity="critical"} 1`,
-		`crucible_synthetic_check_success{check="auth_me",title="Session Auth + DB",severity="warning"} 0`,
-		`crucible_synthetic_check_http_status{check="healthz",title="API Liveness",severity="critical"} 200`,
-		`crucible_synthetic_check_http_status{check="auth_me",title="Session Auth + DB",severity="warning"} 500`,
-		`crucible_synthetic_check_info{check="healthz",title="API Liveness",description="hits /healthz",severity="critical"} 1`,
-		`crucible_synthetic_check_info{check="auth_me",title="Session Auth + DB",description="calls /auth/me",severity="warning"} 1`,
+		`crucible_synthetic_check_success{check="healthz",title="API Liveness",runbook="",severity="critical"} 1`,
+		`crucible_synthetic_check_success{check="auth_me",title="Session Auth + DB",runbook="",severity="warning"} 0`,
+		`crucible_synthetic_check_http_status{check="healthz",title="API Liveness",runbook="",severity="critical"} 200`,
+		`crucible_synthetic_check_http_status{check="auth_me",title="Session Auth + DB",runbook="",severity="warning"} 500`,
+		`crucible_synthetic_check_info{check="healthz",title="API Liveness",description="hits /healthz",runbook="",severity="critical"} 1`,
+		`crucible_synthetic_check_info{check="auth_me",title="Session Auth + DB",description="calls /auth/me",runbook="",severity="warning"} 1`,
 	}
 	for _, want := range required {
 		if !strings.Contains(body, want) {
@@ -221,7 +221,7 @@ func TestSerializeResults_AttemptsDefaultsToOneForUnsetField(t *testing.T) {
 		{Name: "x", Title: "X", Severity: SeverityCritical, Success: true, Attempts: 0},
 	}))
 	// The defensive fallback in serializeResults should normalise 0 → 1.
-	if !strings.Contains(body, `crucible_synthetic_check_attempts{check="x",title="X",severity="critical"} 1`) {
+	if !strings.Contains(body, `crucible_synthetic_check_attempts{check="x",title="X",runbook="",severity="critical"} 1`) {
 		t.Errorf("Attempts=0 in Result must be emitted as 1 (defensive fallback); got:\n%s", body)
 	}
 }

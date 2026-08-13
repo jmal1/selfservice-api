@@ -131,8 +131,8 @@
     {
       "path": "docs/instructor/overview.md",
       "title": "Crucible for Instructors — Overview",
-      "size": 8053,
-      "sha256": "a2eb4bbc5c18112467b074234bb34daecf3947154d2accd102890ea166f41f94",
+      "size": 8152,
+      "sha256": "00604b2085951d998a085bdfc9df3540ed912294c093cd8b7b8a4290bc412180",
       "is_markdown": true,
       "links_out": [
         "AGENTS.md",
@@ -147,7 +147,8 @@
         "docs/instructor/templates.md",
         "docs/instructor/troubleshooting.md",
         "docs/instructor/workflows.md",
-        "docs/instructor/workflows.md"
+        "docs/instructor/workflows.md",
+        "docs/student/overview.md"
       ],
       "from_seed": true
     },
@@ -235,10 +236,69 @@
       "from_seed": false
     },
     {
+      "path": "docs/student/connecting.md",
+      "title": "Connecting to Your VM",
+      "size": 1734,
+      "sha256": "f549d82b9506bb56910d48e3a00f9f74ac5d53c24cb998aa401d771cd9a9fafa",
+      "is_markdown": true,
+      "links_out": [
+        "docs/student/troubleshooting.md"
+      ],
+      "from_seed": false
+    },
+    {
+      "path": "docs/student/labs.md",
+      "title": "Creating and Managing Labs",
+      "size": 1398,
+      "sha256": "83506b5902dd5e4b76406295ef01934b2e44d14170386d3ac1ce808121577ddf",
+      "is_markdown": true,
+      "links_out": [
+        "docs/student/snapshots.md"
+      ],
+      "from_seed": false
+    },
+    {
+      "path": "docs/student/overview.md",
+      "title": "Getting Started",
+      "size": 983,
+      "sha256": "ef9da2bc73ea604387100293490833fdb68a3ad0db3e68dff6c79575c9936149",
+      "is_markdown": true,
+      "links_out": [
+        "docs/student/connecting.md",
+        "docs/student/labs.md",
+        "docs/student/testing.md"
+      ],
+      "from_seed": false
+    },
+    {
+      "path": "docs/student/snapshots.md",
+      "title": "Snapshots and Recovery",
+      "size": 1438,
+      "sha256": "962db31fa78c7d1482a06ecfc6c092e512c37cf2e37a30c549f730710cb9ba66",
+      "is_markdown": true,
+      "from_seed": false
+    },
+    {
+      "path": "docs/student/testing.md",
+      "title": "Testing and Feedback",
+      "size": 1074,
+      "sha256": "64060008d3f7a34f4bf0cb924f0b0a0f84bd84d1f891b9c22a84568c887ce123",
+      "is_markdown": true,
+      "from_seed": false
+    },
+    {
+      "path": "docs/student/troubleshooting.md",
+      "title": "Troubleshooting",
+      "size": 1973,
+      "sha256": "72b32929286abcf9a02dc2f1020a01b4230a465a277fcfa23f777e5464431374",
+      "is_markdown": true,
+      "from_seed": false
+    },
+    {
       "path": "internal/api/routes/routes.go",
       "title": "routes.go (Go)",
-      "size": 14036,
-      "sha256": "072f4e737dd161bdc73ebc3d7ebe7172b3717ce784361316ad6bd542ffd34c08",
+      "size": 14377,
+      "sha256": "3dd32d1f0063ca27780204e663adb19fa950956cbacc99bc6db36d4f08b5984d",
       "is_markdown": false,
       "from_seed": false
     },
@@ -323,5 +383,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 291257
+  "total_bytes": 300297
 }

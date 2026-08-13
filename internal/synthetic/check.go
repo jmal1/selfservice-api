@@ -43,15 +43,16 @@ const (
 // This is intentional: the stall is a meaningful signal even when the check
 // eventually passes.
 type Result struct {
-	Name           string
-	Title          string
-	Description    string
-	Success        bool
-	Duration       time.Duration
-	HTTPStatus     int
-	Severity       Severity
-	Err            error
-	Attempts       int
+	Name            string
+	Title           string
+	Description     string
+	Runbook         string
+	Success         bool
+	Duration        time.Duration
+	HTTPStatus      int
+	Severity        Severity
+	Err             error
+	Attempts        int
 	VCenterDegraded bool
 }
 
@@ -65,6 +66,7 @@ type Result struct {
 // Title() is a short human-readable name shown in dashboards and alert
 // summaries (e.g. "API Liveness"). Description() is the long-form one-line
 // explanation that appears in dashboard tooltips and the status table.
+// Runbook() is an operator URL emitted with alert-facing metric labels.
 // Neither field is allowed to contain commas, double-quotes, or newlines —
 // they are emitted directly into Prometheus exposition labels.
 //
@@ -76,6 +78,7 @@ type Check interface {
 	Name() string
 	Title() string
 	Description() string
+	Runbook() string
 	Severity() Severity
 	Run(ctx context.Context, client *Client) (httpStatus int, err error)
 }
@@ -86,6 +89,7 @@ type CheckFunc struct {
 	NameVal        string
 	TitleVal       string
 	DescriptionVal string
+	RunbookVal     string
 	SeverityVal    Severity
 	RunFn          func(ctx context.Context, client *Client) (int, error)
 }
@@ -98,6 +102,9 @@ func (c CheckFunc) Title() string { return c.TitleVal }
 
 // Description returns the long-form description.
 func (c CheckFunc) Description() string { return c.DescriptionVal }
+
+// Runbook returns the operator-facing runbook URL.
+func (c CheckFunc) Runbook() string { return c.RunbookVal }
 
 // Severity returns the check severity classification.
 func (c CheckFunc) Severity() Severity { return c.SeverityVal }

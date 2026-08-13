@@ -214,6 +214,56 @@ var WikiIndexRBAC = synthetic.CheckFunc{
 	},
 }
 
+// StudentGuideIndex verifies the student-facing documentation index is reachable
+// while ensuring its manifest cannot expose instructor documentation or bundled
+// implementation files.
+var StudentGuideIndex = synthetic.CheckFunc{
+	NameVal:        "student_guide_index",
+	TitleVal:       "Student Guide Available",
+	DescriptionVal: "Calls /api/v1/student-guide/index as a student and requires a student-only manifest containing Getting Started. Catches route, bundle, and content-filtering regressions.",
+	RunbookVal:     "https://github.com/jmal1/selfservice-api/blob/main/docs/architecture/wiki.md",
+	SeverityVal:    synthetic.SeverityWarning,
+	RunFn: func(ctx context.Context, c *synthetic.Client) (int, error) {
+		resp, err := c.Do(ctx, http.MethodGet, "/api/v1/student-guide/index", nil)
+		if err != nil {
+			return 0, err
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if resp.StatusCode != http.StatusOK {
+			return resp.StatusCode, fmt.Errorf("student-guide/index returned %d: %s", resp.StatusCode, snippet(body))
+		}
+		var manifest struct {
+			Seeds []string `json:"seeds"`
+			Files []struct {
+				Path string `json:"path"`
+			} `json:"files"`
+		}
+		if err := json.Unmarshal(body, &manifest); err != nil {
+			return resp.StatusCode, fmt.Errorf("student-guide/index body is not JSON: %w", err)
+		}
+		if len(manifest.Files) == 0 {
+			return resp.StatusCode, fmt.Errorf("student-guide/index returned no pages")
+		}
+		foundOverview := false
+		for _, file := range manifest.Files {
+			if !strings.HasPrefix(file.Path, "docs/student/") {
+				return resp.StatusCode, fmt.Errorf("student-guide/index exposed non-student path %q", file.Path)
+			}
+			if file.Path == "docs/student/overview.md" {
+				foundOverview = true
+			}
+		}
+		if !foundOverview {
+			return resp.StatusCode, fmt.Errorf("student-guide/index is missing docs/student/overview.md")
+		}
+		if len(manifest.Seeds) != 1 || manifest.Seeds[0] != "docs/student/overview.md" {
+			return resp.StatusCode, fmt.Errorf("student-guide/index seeds = %q, want [docs/student/overview.md]", manifest.Seeds)
+		}
+		return resp.StatusCode, nil
+	},
+}
+
 // AdminAudit403 asserts that a non-admin synthetic user is rejected from the
 // audit-log route with 403. The Audit Log (and active-Sessions listing) is the
 // one admin surface deliberately withheld from instructors when lab-instructors
@@ -354,6 +404,7 @@ func All() []synthetic.Check {
 		TemplateVisibilityEnforced,
 		PodTestingDashboard404,
 		WikiIndexRBAC,
+		StudentGuideIndex,
 		ImageUploadRBAC,
 		TemplateHealthStatusRBAC,
 		TemplatePinRBAC,

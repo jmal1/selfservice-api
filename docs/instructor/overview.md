@@ -169,4 +169,5 @@ Submit via the admin UI Workflows page, or via the lifecycle endpoints
 | Bundle workflows into a graded lab | [Building Playlists](playlists.md) |
 | Figure out why a workflow keeps failing | [Troubleshooting](troubleshooting.md) |
 | Look up a term | [Glossary](glossary.md) |
+| Review the student-facing lab guide | [Student Guide: Getting Started](../student/overview.md) |
 | Give an AI coding agent everything in one shot | [AGENTS.md](../../AGENTS.md) |

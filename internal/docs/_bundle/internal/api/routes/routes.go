@@ -150,6 +150,14 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 				r.Get("/page/*", h.WikiPage)
 			})
 
+			// Student Guide — a deliberately filtered view of the shared
+			// documentation bundle. This remains inside the authenticated API
+			// group, but does not inherit the instructor-only Wiki gate.
+			r.Route("/student-guide", func(r chi.Router) {
+				r.Get("/index", h.StudentGuideIndex)
+				r.Get("/page/*", h.StudentGuidePage)
+			})
+
 			// All /admin/templates/* routes live here. The wizard subset is
 			// open to instructors (lab-instructors AuthN group); the CRUD
 			// subset is admin-only. We must declare them in one chi.Route
