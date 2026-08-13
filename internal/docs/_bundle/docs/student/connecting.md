@@ -12,11 +12,15 @@ Connect only to the VM IP address and credentials displayed for **your own** lab
 
 ## Connect through NetBird
 
-1. Enroll your device in NetBird using your course or institution's enrollment instructions.
-2. Sign in to NetBird and wait until it shows that the VPN is connected.
-3. In Crucible, copy the IP address shown for the VM you own. Do not use an IP address from another lab.
+1. Install the NetBird desktop app from the [official download page](https://netbird.io/download/).
+2. Open NetBird. If it asks for a custom or self-hosted server, enter `https://netbird.jmal.io`.
+3. Select **Connect**. In the browser, authorize with your course Authentik account and complete multi-factor authentication.
+4. Return to NetBird and confirm that it shows **Connected**.
+5. In Crucible, copy the IP address shown for the VM you own. Do not use an IP address from another lab.
 
 **Expected result:** Your device can reach your own VM address through the VPN.
+
+If you cannot authorize or connect, ask your instructor for help before continuing.
 
 ## Connect to Linux with SSH
 
