@@ -646,25 +646,19 @@ full deep check roughly every 5 days.
 
 ### Anti-flap: when does "unhealthy" alert?
 
-A single bad 12-hour window never triggers an alert. Crucible requires
-**2 consecutive failing cycles** before marking a template unhealthy.
+A raw failed check never pages by itself.
 
-- Within each cycle, each failing check is retried **3 times with exponential
-  backoff** (1 s, 2 s, 4 s) to absorb transient vCenter blips.
-- One passing cycle **immediately** clears the unhealthy state — recovery is
-  not delayed by the same confirmation window.
+- Within each cycle, each failing check is retried **3 times with exponential backoff** to absorb transient vCenter blips.
+- Structural failures still require two separate 12-hour cycles.
+- A first failed deep cycle persists a pending failure and schedules a durable `template_health_confirm` job after a bounded backoff (5 minutes by default, capped at 30 minutes). The job creates a new clone and is therefore an independent observation with fresh validation artifacts.
+- Only that independently scheduled failure can advance deep health to the existing two-failure `unhealthy` threshold. A passing confirmation clears the pending failure immediately.
+- Structural and deep counters are independent. A passing structural check can no longer erase a confirmed deep failure; a passing check clears only its own failure state.
 
-This means the earliest an alert fires after a real breakage is approximately
-24 hours (two 12h cycles).
+Pending confirmation state and the job both live in PostgreSQL. Startup, periodic, and leader-failover repair paths may race safely without creating duplicate confirmation jobs.
 
 ### Checker-vs-template failures
 
-Crucible distinguishes between "this template is broken" and "the checker
-itself cannot reach vCenter." A vCenter outage sets a single
-`crucible_template_health_checker_up=0` metric — it does **not** mark every
-template unhealthy. Look for the `CrucibleTemplateHealthCheckerDown` alert
-first; if it's firing, the per-template status should be ignored until
-connectivity is restored.
+Crucible distinguishes between "this template is broken" and "the checker itself cannot reach vCenter." A vCenter outage sets a single `crucible_template_health_checker_up=0` metric — it does **not** mark every template unhealthy. Look for the `CrucibleTemplateHealthCheckerDown` alert first; if it is firing, per-template status should be ignored until connectivity is restored.
 
 ### Viewing health status
 
@@ -676,18 +670,22 @@ GET /api/v1/admin/templates/health
 
 Each row includes:
 - `health_status` — `"healthy"`, `"unhealthy"`, or `"unknown"` (not yet checked)
-- `consecutive_failures` — how many back-to-back cycles have failed
+- `consecutive_failures` — the maximum of the structural and deep counters
+- `structural_consecutive_failures`, `deep_consecutive_failures` — independent confirmation state for each check
 - `last_structural_check_at` — when the last structural check ran
 - `last_deep_check_at` — when the last full deep check ran
 - `last_error` — the most recent error message (truncated to 256 chars)
+- `last_structural_passed`, `last_deep_passed` — raw attempt outcomes
+- `last_structural_error`, `last_deep_error` — full persisted diagnostics (truncated to 256 chars)
+- `last_structural_fault_class`, `last_deep_fault_class` — stable diagnostic categories such as `vsphere_virtual_disk_corrupt_or_unsupported`
+- `last_structural_duration_seconds`, `last_deep_duration_seconds` — raw attempt duration
+- `pending_deep_failure_at`, `deep_confirmation_due_at` — the durable confirmation schedule, when present
 
-Templates appear in this list as soon as they are active, with
-`health_status="unknown"` until the first check cycle completes.
+Templates appear in this list as soon as they are active, with `health_status="unknown"` until the first check cycle completes.
 
 ### Interpreting an unhealthy template
 
-`health_status = "unhealthy"` means the template failed **both** the last two
-12-hour cycles. The `last_error` field says what went wrong.
+`health_status = "unhealthy"` is persisted, confirmed state. It means either two separate structural cycles failed or a failed deep cycle was followed by a separately scheduled failed confirmation. The `last_error` and per-check diagnostic fields say what went wrong.
 
 **Common causes:**
 
@@ -697,6 +695,7 @@ Templates appear in this list as soon as they are active, with
 | `clone failed: source VM "…" not found` | Same as above (deep check also detected it) |
 | `power-on failed: …` | Disk/config issue — the template VM exists but won't start |
 | `wait-for-IP failed: no IP within 10m` | OS boot hangs or guest tools not installed |
+| `The virtual disk is either corrupted or not a supported format` | Real vSphere storage/inventory observation. It is retained as `vsphere_virtual_disk_corrupt_or_unsupported`; inspect datastore health and vCenter task history even if a later confirmation passes. |
 
 **What to do:**
 1. Check the last error message at `GET /api/v1/admin/templates/health`.
@@ -704,16 +703,58 @@ Templates appear in this list as soon as they are active, with
 3. If the VM is missing, re-publish the template through the wizard.
 4. If the VM exists but won't boot, attach a console and investigate the OS.
 
-Once the underlying issue is fixed, the health check will clear automatically
-on the next passing cycle (~12 hours). No manual reset is needed.
+Once the underlying issue is fixed, the relevant passing check clears its own failure state automatically. No manual reset is needed.
+
+### Prometheus and Grafana contract
+
+The worker sends a complete PostgreSQL-backed snapshot with Pushgateway **PUT/replacement semantics**. Deleted templates, obsolete label sets, and raw attempts that are no longer in persisted state disappear on the next snapshot, including the startup/failover repair snapshot. The pusher has no process-lifetime result map.
+
+| Metric | Contract |
+|--------|----------|
+| `crucible_template_health_status{template}` | Confirmed persisted state only: `1` healthy, `0` unhealthy, `-1` unknown. Never derived directly from a raw attempt. |
+| `crucible_template_health_consecutive_failures{template}` | Maximum persisted structural/deep policy counter. |
+| `crucible_template_health_attempt_status{template,check_type}` | Last raw structural/deep observation: `1` pass, `0` fail. Diagnostic only. |
+| `crucible_template_health_last_check_timestamp_seconds{template,check_type}` | Persisted timestamp for that raw observation. |
+| `crucible_template_health_last_check_duration_seconds{template,check_type}` | Duration of that raw observation. |
+| `crucible_template_health_fault_info{template,check_type,fault_class}` | Classified last failure. Full text remains in PostgreSQL and worker logs. |
+| `crucible_template_health_deep_confirmation_pending{template}` | `1` while the first deep failure awaits independent confirmation. |
+| `crucible_template_health_deep_confirmation_due_timestamp_seconds{template}` | Durable job eligibility time. |
+| `crucible_template_health_checker_up` | `1` after the latest full reconciliation or startup replacement probe reached vCenter; `0` for a checker-level vCenter failure. Startup replacement always emits the series. |
+| `crucible_template_health_checker_last_success_timestamp_seconds` | Conservative persisted freshness timestamp: every currently visible template has a structural result at least this new. |
+| `crucible_template_health_snapshot_timestamp_seconds` | Complete snapshot generation time; useful for Pushgateway delivery diagnostics, not confirmation evidence. |
+
+This repository does not own the live Grafana resources. The proposed `CrucibleTemplateHealthFailing` expression is:
+
+```promql
+(crucible_template_health_status == 0)
+and on() (crucible_template_health_checker_up == 1)
+and on()
+  (time() - crucible_template_health_checker_last_success_timestamp_seconds < 30 * 60 * 60)
+```
+
+Use `for: 15m` only for scrape/deploy stability, not as a substitute for confirmation. Proposed annotations:
+
+```yaml
+summary: 'Confirmed template health failure: {{ $labels.template }}'
+description: 'PostgreSQL marks {{ $labels.template }} unhealthy after the required independent confirmation. The checker is fresh; inspect per-check fault metrics, the admin health endpoint, and vCenter task history.'
+runbook_url: 'https://github.com/jmal1/selfservice-api/blob/main/docs/instructor/templates.md#prometheus-and-grafana-contract'
+```
+
+Raw failure panels may query `crucible_template_health_attempt_status == 0`, but that expression must not page. Proposed checker freshness expression:
+
+```promql
+absent(crucible_template_health_checker_last_success_timestamp_seconds)
+or
+(time() - crucible_template_health_checker_last_success_timestamp_seconds > 30 * 60 * 60)
+```
+
+The proposed `CrucibleTemplateHealthCheckerDown` expression remains `crucible_template_health_checker_up == 0` with `for: 5m`.
+
+Keep the currently paused live template-health rule paused through deployment. After migration and worker rollout, verify the Pushgateway group contains no legacy `crucible_template_health_status{check_type=...}` series, compare the confirmed status metric with `GET /api/v1/admin/templates/health`, and observe one full snapshot. Only then replace the live expression and unpause the rule.
 
 ### Orphan cleanup
 
-The deep check names its clone `crucible-healthcheck-<template-uuid>`. If the
-worker crashes mid-check, the clone may be left behind on the datastore.
-Crucible sweeps for these orphaned clones whenever a worker becomes the elected
-leader and destroys any it finds. The distinctive prefix ensures the sweep
-cannot match a student pod VM.
+The deep check names each clone `crucible-healthcheck-<template-uuid>-<attempt-id>`. If the worker crashes mid-check, the clone may be left behind on the datastore. Crucible sweeps for old orphaned clones whenever a worker becomes the elected leader, but retains recent clones so failover cannot destroy an active confirmation claimed by another worker. The distinctive prefix ensures the sweep cannot match a student pod VM.
 
 ### When cycles actually run
 

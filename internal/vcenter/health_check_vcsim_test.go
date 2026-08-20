@@ -3,9 +3,49 @@ package vcenter
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/vmware/govmomi/vim25"
 )
+
+func TestHealthCheckOrphanSweepRetainsActiveAndUnknownAgeClones(t *testing.T) {
+	now := time.Now()
+	old := now.Add(-2 * time.Hour)
+	recent := now.Add(-5 * time.Minute)
+	cutoff := now.Add(-time.Hour)
+
+	tests := []struct {
+		name string
+		vm   FolderVM
+		want bool
+	}{
+		{
+			name: "old health clone",
+			vm:   FolderVM{Name: HealthCheckClonePrefix + "old", CreatedAt: &old},
+			want: true,
+		},
+		{
+			name: "active health clone",
+			vm:   FolderVM{Name: HealthCheckClonePrefix + "active", CreatedAt: &recent},
+		},
+		{
+			name: "unknown creation time is retained",
+			vm:   FolderVM{Name: HealthCheckClonePrefix + "unknown"},
+		},
+		{
+			name: "unrelated old VM",
+			vm:   FolderVM{Name: "student-vm", CreatedAt: &old},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isSweepableHealthCheckClone(tt.vm, cutoff); got != tt.want {
+				t.Fatalf("isSweepableHealthCheckClone() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
 
 // VMExists is the cheap half of the template structural health check, and it
 // panicked in production the first time it was ever executed:

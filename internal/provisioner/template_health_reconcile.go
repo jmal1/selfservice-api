@@ -16,10 +16,11 @@
 //   - Retries: each failing check is retried 3 times with exponential backoff
 //     (1s, 2s, 4s) before recording a failure. A transient vCenter API error
 //     does not count as a failure.
-//   - 2-cycle confirmation: a template is only marked unhealthy after 2
-//     consecutive failed cycles. A single bad 12-hour window never alerts.
-//   - Immediate recovery: one passing cycle resets consecutive_failures to 0
-//     and sets health_status='healthy'.
+//   - Structural confirmation: structural failures require 2 failed cycles.
+//   - Deep confirmation: a first failed deep cycle schedules a durable delayed
+//     job which creates fresh validation artifacts. Only that separate failure
+//     can mark deep health unhealthy.
+//   - Recovery: a passing check clears its own check-type failure state.
 //   - Checker-level failures: if vCenter is unreachable or the checker itself
 //     errors, crucible_template_health_checker_up is set to 0 and per-template
 //     states are NOT modified. This means a vCenter outage fires exactly one
@@ -27,7 +28,7 @@
 //
 // # Deep-check cleanup
 //
-//	The deep check names its clone "crucible-healthcheck-<templateID>" and
+//	The deep check names each clone "crucible-healthcheck-<templateID>-<attempt>" and
 //	places it in the Templates folder (not the Student-VMs folder, which the
 //	orphan reconciler scans). A deferred destroy runs even when the power-on
 //	or wait-for-IP step fails. A sweep at worker startup catches any clones
@@ -36,6 +37,7 @@ package provisioner
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
@@ -47,13 +49,6 @@ import (
 	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/models"
 	"github.com/jmal1/selfservice-api/internal/vcenter"
-)
-
-// TemplateHealthCheckerUp tracks whether the last checker cycle completed
-// without a vCenter-infrastructure-level failure.
-const (
-	checkerUp   = float64(1)
-	checkerDown = float64(0)
 )
 
 // TemplateHealthReconcilerConfig controls one health reconciler pass.
@@ -97,8 +92,36 @@ type TemplateHealthReconcilerConfig struct {
 	// Default 30s, giving attempts at t=0, t+30s, t+90s.
 	DeepRetryBaseDelay time.Duration
 
+	// ConfirmationBackoff is the durable delay between a first failed deep
+	// cycle and the independent confirmation job. Default 5 minutes.
+	ConfirmationBackoff time.Duration
+
 	// Pusher, if set, receives metrics after each cycle.
 	Pusher *TemplateHealthPusher
+}
+
+func applyTemplateHealthDefaults(cfg *TemplateHealthReconcilerConfig) {
+	if cfg.Interval <= 0 {
+		cfg.Interval = 12 * time.Hour
+	}
+	if cfg.DeepCheckTimeout <= 0 {
+		cfg.DeepCheckTimeout = 10 * time.Minute
+	}
+	if cfg.MaxRetries <= 0 {
+		cfg.MaxRetries = 3
+	}
+	if cfg.RetryBaseDelay <= 0 {
+		cfg.RetryBaseDelay = time.Second
+	}
+	if cfg.DeepRetryBaseDelay <= 0 {
+		cfg.DeepRetryBaseDelay = 30 * time.Second
+	}
+	if cfg.ConfirmationBackoff <= 0 {
+		cfg.ConfirmationBackoff = 5 * time.Minute
+	}
+	if cfg.ConfirmationBackoff > 30*time.Minute {
+		cfg.ConfirmationBackoff = 30 * time.Minute
+	}
 }
 
 // TemplateHealthCounts summarises one reconciler pass for logs and tests.
@@ -114,9 +137,14 @@ type TemplateHealthCounts struct {
 // templateHealthDB is the narrow DB surface the health reconciler uses.
 type templateHealthDB interface {
 	ListStudentVisibleTemplates(ctx context.Context) ([]models.Template, error)
+	GetTemplateByID(ctx context.Context, templateID uuid.UUID) (*models.Template, error)
 	GetLeastRecentlyDeepCheckedTemplate(ctx context.Context) (*models.Template, error)
 	GetTemplateHealthState(ctx context.Context, templateID uuid.UUID) (*database.TemplateHealthState, error)
-	UpsertTemplateHealthState(ctx context.Context, state database.TemplateHealthState) error
+	CompareAndSwapTemplateHealthState(ctx context.Context, state database.TemplateHealthState) (bool, error)
+	ListTemplateHealthStates(ctx context.Context) ([]database.TemplateHealthState, error)
+	CreateTemplateHealthConfirmationJob(ctx context.Context, templateID uuid.UUID, payload []byte, nextAt time.Time) (bool, error)
+	ApplyTemplateHealthDeepConfirmation(ctx context.Context, templateID uuid.UUID, expectedFailureAt time.Time, passed bool, checkedAt time.Time, durationSeconds float64, errMsg *string, faultClass *string) (bool, error)
+	ClearTemplateHealthDeepPending(ctx context.Context, templateID uuid.UUID, expectedFailureAt time.Time) (bool, error)
 	GetNewestTemplateHealthCheckTime(ctx context.Context) (*time.Time, error)
 }
 
@@ -132,12 +160,7 @@ type templateHealthVCenter interface {
 
 // templateHealthMetrics is the narrow metrics surface the reconciler pushes to.
 type templateHealthMetrics interface {
-	SetCheckerUp(up float64)
-	RecordStructuralResult(templateName string, durationSec float64, healthy bool)
-	RecordDeepResult(templateName string, durationSec float64, healthy bool)
-	SetHealthStatus(templateName, checkType string, healthy float64)
-	SetLastCheckTimestamp(templateName string, unixSec float64)
-	Push(ctx context.Context) error
+	ReplaceSnapshot(ctx context.Context, snapshot TemplateHealthSnapshot) error
 }
 
 // Compile-time satisfaction checks.
@@ -203,6 +226,40 @@ func templateHealthCycleDue(ctx context.Context, db templateHealthDB, interval t
 	return time.Since(*newest) >= interval, nil
 }
 
+const templateHealthCASAttempts = 5
+
+func mutateTemplateHealthState(
+	ctx context.Context,
+	db templateHealthDB,
+	templateID uuid.UUID,
+	templateName string,
+	mutate func(*database.TemplateHealthState),
+) (*database.TemplateHealthState, error) {
+	for attempt := 0; attempt < templateHealthCASAttempts; attempt++ {
+		state, err := db.GetTemplateHealthState(ctx, templateID)
+		if err != nil {
+			return nil, err
+		}
+		if state == nil {
+			state = &database.TemplateHealthState{
+				TemplateID:   templateID,
+				TemplateName: templateName,
+				HealthStatus: "unknown",
+			}
+		}
+		mutate(state)
+		refreshTemplateHealthAggregate(state)
+		applied, err := db.CompareAndSwapTemplateHealthState(ctx, *state)
+		if err != nil {
+			return nil, err
+		}
+		if applied {
+			return state, nil
+		}
+	}
+	return nil, fmt.Errorf("template health state changed during %d compare-and-swap attempts", templateHealthCASAttempts)
+}
+
 // ReconcileTemplateHealth is the Provisioner-bound entry point. The provision
 // worker calls this from its select loop and on leader acquisition.
 //
@@ -263,21 +320,7 @@ func reconcileTemplateHealth(
 		}
 	}()
 
-	if cfg.Interval <= 0 {
-		cfg.Interval = 12 * time.Hour
-	}
-	if cfg.DeepCheckTimeout <= 0 {
-		cfg.DeepCheckTimeout = 10 * time.Minute
-	}
-	if cfg.MaxRetries <= 0 {
-		cfg.MaxRetries = 3
-	}
-	if cfg.RetryBaseDelay <= 0 {
-		cfg.RetryBaseDelay = 1 * time.Second
-	}
-	if cfg.DeepRetryBaseDelay <= 0 {
-		cfg.DeepRetryBaseDelay = 30 * time.Second
-	}
+	applyTemplateHealthDefaults(&cfg)
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -288,10 +331,6 @@ func reconcileTemplateHealth(
 	if err != nil {
 		// DB is unavailable → checker-level failure.
 		log.Error("list student-visible templates failed", "error", err)
-		if metrics != nil {
-			metrics.SetCheckerUp(checkerDown)
-			_ = metrics.Push(ctx)
-		}
 		return TemplateHealthCounts{CheckerUp: false}, fmt.Errorf("list student-visible templates: %w", err)
 	}
 
@@ -316,10 +355,7 @@ func reconcileTemplateHealth(
 				// vCenter unreachable: mark checker down, leave template states alone.
 				log.Error("vCenter probe failed; marking checker_up=0; template states unchanged",
 					"error", probeErr)
-				if metrics != nil {
-					metrics.SetCheckerUp(checkerDown)
-					_ = metrics.Push(ctx)
-				}
+				_ = pushTemplateHealthSnapshot(ctx, db, metrics, boolPtr(false), log)
 				return TemplateHealthCounts{
 					Templates: len(templates),
 					CheckerUp: false,
@@ -349,63 +385,48 @@ func reconcileTemplateHealth(
 		})
 		durSec := time.Since(start).Seconds()
 
-		now := time.Now()
-		state, stateErr := db.GetTemplateHealthState(ctx, tmpl.ID)
-		if stateErr != nil {
-			log.Warn("get template health state failed; using zero state",
-				"template_id", tmpl.ID, "error", stateErr)
-		}
-		if state == nil {
-			state = &database.TemplateHealthState{
-				TemplateID:   tmpl.ID,
-				TemplateName: tmpl.Name,
-				HealthStatus: "unknown",
-			}
-		}
-		state.LastStructuralCheckAt = &now
-
+		now := time.Now().UTC().Truncate(time.Microsecond)
 		passed := checkErr == nil
+		state, stateErr := mutateTemplateHealthState(ctx, db, tmpl.ID, tmpl.Name, func(state *database.TemplateHealthState) {
+			state.LastStructuralCheckAt = &now
+			state.LastStructuralPassed = boolPtr(passed)
+			state.LastStructuralDurationSeconds = float64Ptr(durSec)
+			if passed {
+				state.StructuralConsecutiveFailures = 0
+				state.LastStructuralError = nil
+				state.LastStructuralFaultClass = nil
+			} else {
+				state.StructuralConsecutiveFailures++
+				errMsg := "structural check failed"
+				if checkErr != nil {
+					errMsg = truncateErr(checkErr.Error(), 256)
+				}
+				faultClass := classifyTemplateHealthFault(checkErr)
+				state.LastStructuralError = &errMsg
+				state.LastStructuralFaultClass = &faultClass
+			}
+		})
+		if stateErr != nil {
+			log.Error("persist structural template health attempt failed",
+				"template_id", tmpl.ID, "error", stateErr)
+			counts.CheckerUp = false
+			_ = pushTemplateHealthSnapshot(ctx, db, metrics, boolPtr(false), log)
+			return counts, fmt.Errorf("persist structural template health attempt %s: %w", tmpl.ID, stateErr)
+		}
 		if passed {
-			state.ConsecutiveFailures = 0
-			state.HealthStatus = "healthy"
-			state.LastError = nil
 			counts.Healthy++
 		} else {
-			state.ConsecutiveFailures++
 			counts.NewlyFailing++
-			errMsg := "structural check failed"
-			if checkErr != nil {
-				errMsg = truncateErr(checkErr.Error(), 256)
-			}
-			state.LastError = &errMsg
-
-			// Only mark unhealthy after 2 consecutive failed cycles.
-			if state.ConsecutiveFailures >= 2 {
-				state.HealthStatus = "unhealthy"
+			if state.StructuralConsecutiveFailures >= 2 {
 				counts.Unhealthy++
 			}
-		}
-
-		if err := db.UpsertTemplateHealthState(ctx, *state); err != nil {
-			log.Warn("upsert template health state failed",
-				"template_id", tmpl.ID, "error", err)
-		}
-
-		if metrics != nil {
-			healthVal := float64(0)
-			if passed {
-				healthVal = 1
-			}
-			metrics.RecordStructuralResult(tmpl.Name, durSec, passed)
-			metrics.SetHealthStatus(tmpl.Name, "structural", healthVal)
-			metrics.SetLastCheckTimestamp(tmpl.Name, float64(now.Unix()))
 		}
 
 		log.Info("structural check complete",
 			"template", tmpl.Name,
 			"ref", ref,
 			"passed", passed,
-			"consecutive_failures", state.ConsecutiveFailures,
+			"consecutive_failures", state.StructuralConsecutiveFailures,
 			"health_status", state.HealthStatus,
 			"duration_ms", int(durSec*1000),
 		)
@@ -439,49 +460,65 @@ func reconcileTemplateHealth(
 			})
 			durSec := time.Since(start).Seconds()
 			counts.DeepChecked = true
+			if deepErr != nil && isDeepCheckerLevelError(deepErr) {
+				counts.CheckerUp = false
+				log.Error("deep check could not reach vCenter; raw and confirmed template state unchanged",
+					"template", deepTarget.Name,
+					"fault_class", classifyTemplateHealthFault(deepErr),
+					"error", deepErr)
+				_ = pushTemplateHealthSnapshot(ctx, db, metrics, boolPtr(false), log)
+				return counts, nil
+			}
 
-			now := time.Now()
-			state, stateErr := db.GetTemplateHealthState(ctx, deepTarget.ID)
+			// PostgreSQL timestamptz has microsecond precision. The pending
+			// timestamp is also the confirmation job's compare-and-swap token,
+			// so truncate before both persistence and payload generation.
+			now := time.Now().UTC().Truncate(time.Microsecond)
+			passed := deepErr == nil
+			state, stateErr := mutateTemplateHealthState(ctx, db, deepTarget.ID, deepTarget.Name, func(state *database.TemplateHealthState) {
+				state.LastDeepCheckAt = &now
+				state.LastDeepPassed = boolPtr(passed)
+				state.LastDeepDurationSeconds = float64Ptr(durSec)
+				if passed {
+					state.DeepConsecutiveFailures = 0
+					state.LastDeepError = nil
+					state.LastDeepFaultClass = nil
+					state.PendingDeepFailureAt = nil
+					state.DeepConfirmationDueAt = nil
+				} else {
+					errMsg := truncateErr(deepErr.Error(), 256)
+					faultClass := classifyTemplateHealthFault(deepErr)
+					state.LastDeepError = &errMsg
+					state.LastDeepFaultClass = &faultClass
+					if state.DeepConsecutiveFailures < 2 {
+						state.DeepConsecutiveFailures = 1
+						if state.PendingDeepFailureAt == nil {
+							pendingAt := now
+							dueAt := now.Add(cfg.ConfirmationBackoff)
+							state.PendingDeepFailureAt = &pendingAt
+							state.DeepConfirmationDueAt = &dueAt
+						}
+					}
+				}
+			})
 			if stateErr != nil {
-				log.Warn("get deep-check state failed; using zero state",
+				log.Error("persist deep template health attempt failed",
 					"template_id", deepTarget.ID, "error", stateErr)
-			}
-			if state == nil {
-				state = &database.TemplateHealthState{
-					TemplateID:   deepTarget.ID,
-					TemplateName: deepTarget.Name,
-					HealthStatus: "unknown",
-				}
-			}
-			state.LastDeepCheckAt = &now
-
-			if deepErr == nil {
-				// Deep check passed — reset failure state immediately.
-				state.ConsecutiveFailures = 0
-				state.HealthStatus = "healthy"
-				state.LastError = nil
-			} else {
-				state.ConsecutiveFailures++
-				errMsg := truncateErr(deepErr.Error(), 256)
-				state.LastError = &errMsg
-				if state.ConsecutiveFailures >= 2 {
-					state.HealthStatus = "unhealthy"
-				}
+				counts.CheckerUp = false
+				_ = pushTemplateHealthSnapshot(ctx, db, metrics, boolPtr(false), log)
+				return counts, fmt.Errorf("persist deep template health attempt %s: %w", deepTarget.ID, stateErr)
 			}
 
-			if err := db.UpsertTemplateHealthState(ctx, *state); err != nil {
-				log.Warn("upsert deep-check state failed",
-					"template_id", deepTarget.ID, "error", err)
-			}
-
-			if metrics != nil {
-				healthVal := float64(0)
-				if deepErr == nil {
-					healthVal = 1
+			if state.PendingDeepFailureAt != nil {
+				if _, err := ensureTemplateHealthConfirmation(ctx, db, *state); err != nil {
+					log.Error("schedule deep-check confirmation failed",
+						"template_id", deepTarget.ID,
+						"pending_failure_at", state.PendingDeepFailureAt,
+						"error", err)
+					counts.CheckerUp = false
+					_ = pushTemplateHealthSnapshot(ctx, db, metrics, boolPtr(false), log)
+					return counts, fmt.Errorf("schedule deep-check confirmation %s: %w", deepTarget.ID, err)
 				}
-				metrics.RecordDeepResult(deepTarget.Name, durSec, deepErr == nil)
-				metrics.SetHealthStatus(deepTarget.Name, "deep", healthVal)
-				metrics.SetLastCheckTimestamp(deepTarget.Name, float64(now.Unix()))
 			}
 
 			// Log the error, not just the boolean. Without this the operator
@@ -493,24 +530,22 @@ func reconcileTemplateHealth(
 					"template", deepTarget.Name,
 					"attempts", cfg.MaxRetries,
 					"duration_ms", int(durSec*1000),
+					"fault_class", classifyTemplateHealthFault(deepErr),
 					"error", deepErr,
 				)
 			}
 
 			log.Info("deep check complete",
 				"template", deepTarget.Name,
-				"passed", deepErr == nil,
+				"passed", passed,
 				"duration_ms", int(durSec*1000),
 			)
 		}
 	}
 
 	// --- Step 4: push metrics -------------------------------------------------
-	if metrics != nil {
-		metrics.SetCheckerUp(checkerUp)
-		if err := metrics.Push(ctx); err != nil {
-			log.Warn("template health metrics push failed", "error", err)
-		}
+	if err := pushTemplateHealthSnapshot(ctx, db, metrics, boolPtr(true), log); err != nil {
+		return counts, err
 	}
 
 	log.Info("template health reconcile complete",
@@ -523,6 +558,344 @@ func reconcileTemplateHealth(
 	return counts, nil
 }
 
+// TemplateHealthConfirmationPayload ties a durable confirmation job to the
+// exact first failed deep attempt that created it.
+type TemplateHealthConfirmationPayload struct {
+	TemplateID       uuid.UUID `json:"template_id"`
+	PendingFailureAt time.Time `json:"pending_failure_at"`
+}
+
+// ReconcileTemplateHealthConfirmations repairs the durable schedule from
+// persisted pending state. It is safe to call concurrently from startup,
+// ticker, and failover paths because enqueue uses a deterministic job ID.
+func (p *Provisioner) ReconcileTemplateHealthConfirmations(ctx context.Context, cfg TemplateHealthReconcilerConfig) (int, error) {
+	return reconcileTemplateHealthConfirmations(ctx, p.db, cfg, p.logger)
+}
+
+// ReplaceTemplateHealthSnapshot clears Pushgateway series left by a previous
+// worker process before a due-check decides whether a full vCenter cycle is
+// needed. A lightweight vCenter probe always supplies checker_up, so a normal
+// deploy cannot leave the alert gate absent until the next 12-hour cycle.
+func (p *Provisioner) ReplaceTemplateHealthSnapshot(ctx context.Context, cfg TemplateHealthReconcilerConfig) error {
+	var metrics templateHealthMetrics
+	if cfg.Pusher != nil {
+		metrics = cfg.Pusher
+	}
+	return replaceTemplateHealthSnapshot(ctx, p.db, p.vc, metrics, p.logger, cfg)
+}
+
+func replaceTemplateHealthSnapshot(
+	ctx context.Context,
+	db templateHealthDB,
+	vc templateHealthVCenter,
+	metrics templateHealthMetrics,
+	logger *slog.Logger,
+	cfg TemplateHealthReconcilerConfig,
+) error {
+	if metrics == nil {
+		return nil
+	}
+	applyTemplateHealthDefaults(&cfg)
+	templates, err := db.ListStudentVisibleTemplates(ctx)
+	if err != nil {
+		return fmt.Errorf("list templates for replacement snapshot: %w", err)
+	}
+	checkerUp := true
+	for _, tmpl := range templates {
+		ref := tmpl.VCenterRef()
+		if ref == "" {
+			continue
+		}
+		_, probeErr := retryWithBackoff(ctx, cfg.MaxRetries, cfg.RetryBaseDelay, func() error {
+			_, err := vc.VMExists(ctx, ref)
+			return err
+		})
+		if probeErr != nil && isCheckerLevelError(probeErr) {
+			checkerUp = false
+		}
+		break
+	}
+	return pushTemplateHealthSnapshot(ctx, db, metrics, boolPtr(checkerUp), logger)
+}
+
+func reconcileTemplateHealthConfirmations(
+	ctx context.Context,
+	db templateHealthDB,
+	_ TemplateHealthReconcilerConfig,
+	_ *slog.Logger,
+) (int, error) {
+	states, err := db.ListTemplateHealthStates(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("list template health confirmation state: %w", err)
+	}
+	enqueued := 0
+	for _, state := range states {
+		if state.PendingDeepFailureAt == nil {
+			continue
+		}
+		created, err := ensureTemplateHealthConfirmation(ctx, db, state)
+		if err != nil {
+			return enqueued, err
+		}
+		if created {
+			enqueued++
+		}
+	}
+
+	return enqueued, nil
+}
+
+func ensureTemplateHealthConfirmation(
+	ctx context.Context,
+	db templateHealthDB,
+	state database.TemplateHealthState,
+) (bool, error) {
+	if state.PendingDeepFailureAt == nil {
+		return false, nil
+	}
+	nextAt := *state.PendingDeepFailureAt
+	if state.DeepConfirmationDueAt != nil {
+		nextAt = *state.DeepConfirmationDueAt
+	}
+	payload, err := json.Marshal(TemplateHealthConfirmationPayload{
+		TemplateID:       state.TemplateID,
+		PendingFailureAt: *state.PendingDeepFailureAt,
+	})
+	if err != nil {
+		return false, fmt.Errorf("marshal template health confirmation: %w", err)
+	}
+	created, err := db.CreateTemplateHealthConfirmationJob(ctx, state.TemplateID, payload, nextAt)
+	if err != nil {
+		return false, fmt.Errorf("create template health confirmation job: %w", err)
+	}
+	return created, nil
+}
+
+// ConfirmTemplateHealth runs a fresh clone artifact for a separately scheduled
+// deep confirmation. A template-level failure is a successful job outcome that
+// atomically confirms persisted health; checker-level infrastructure failures
+// return an error so the normal durable job retry policy applies.
+func (p *Provisioner) ConfirmTemplateHealth(ctx context.Context, job *models.Job) error {
+	var metrics templateHealthMetrics
+	if p.healthCfg.Pusher != nil {
+		metrics = p.healthCfg.Pusher
+	}
+	return confirmTemplateHealth(ctx, p.db, p.vc, metrics, p.logger, p.healthCfg, job)
+}
+
+func confirmTemplateHealth(
+	ctx context.Context,
+	db templateHealthDB,
+	vc templateHealthVCenter,
+	metrics templateHealthMetrics,
+	logger *slog.Logger,
+	cfg TemplateHealthReconcilerConfig,
+	job *models.Job,
+) error {
+	var payload TemplateHealthConfirmationPayload
+	if err := json.Unmarshal(job.Payload, &payload); err != nil {
+		return fmt.Errorf("parse template_health_confirm payload: %w", err)
+	}
+	if payload.TemplateID == uuid.Nil || payload.PendingFailureAt.IsZero() {
+		return fmt.Errorf("template_id and pending_failure_at are required")
+	}
+
+	state, err := db.GetTemplateHealthState(ctx, payload.TemplateID)
+	if err != nil {
+		return fmt.Errorf("load template health state: %w", err)
+	}
+	if state == nil || state.PendingDeepFailureAt == nil ||
+		!state.PendingDeepFailureAt.Equal(payload.PendingFailureAt) {
+		logger.Info("template health confirmation is stale; no-op",
+			"template_id", payload.TemplateID,
+			"pending_failure_at", payload.PendingFailureAt)
+		return nil
+	}
+
+	tmpl, err := db.GetTemplateByID(ctx, payload.TemplateID)
+	if err != nil {
+		return fmt.Errorf("load template for health confirmation: %w", err)
+	}
+	if tmpl == nil {
+		return fmt.Errorf("template_id not found in database: %s", payload.TemplateID)
+	}
+	if !tmpl.IsActive || tmpl.IsInternal ||
+		tmpl.TemplateState != models.TemplateStateActive || tmpl.Visibility != "public" {
+		cleared, err := db.ClearTemplateHealthDeepPending(ctx, payload.TemplateID, payload.PendingFailureAt)
+		if err != nil {
+			return fmt.Errorf("clear hidden template health confirmation: %w", err)
+		}
+		logger.Info("template health confirmation target is no longer student-visible; pending schedule cleared",
+			"template_id", payload.TemplateID)
+		if cleared {
+			if err := replaceTemplateHealthSnapshot(ctx, db, vc, metrics, logger, cfg); err != nil {
+				return fmt.Errorf("replace template health snapshot after visibility change: %w", err)
+			}
+		}
+		return nil
+	}
+
+	applyTemplateHealthDefaults(&cfg)
+
+	started := time.Now()
+	_, checkErr := retryWithBackoff(ctx, cfg.MaxRetries, cfg.DeepRetryBaseDelay, func() error {
+		return runDeepCheck(ctx, vc, tmpl, cfg, logger)
+	})
+	durationSeconds := time.Since(started).Seconds()
+	checkedAt := time.Now()
+	if checkErr != nil && isDeepCheckerLevelError(checkErr) {
+		return fmt.Errorf("template health confirmation checker failure: %w", checkErr)
+	}
+
+	var errMsg, faultClass *string
+	if checkErr != nil {
+		msg := truncateErr(checkErr.Error(), 256)
+		class := classifyTemplateHealthFault(checkErr)
+		errMsg, faultClass = &msg, &class
+	}
+	applied, err := db.ApplyTemplateHealthDeepConfirmation(
+		ctx,
+		payload.TemplateID,
+		payload.PendingFailureAt,
+		checkErr == nil,
+		checkedAt,
+		durationSeconds,
+		errMsg,
+		faultClass,
+	)
+	if err != nil {
+		return fmt.Errorf("apply template health confirmation: %w", err)
+	}
+	if !applied {
+		logger.Info("template health confirmation superseded before commit",
+			"template_id", payload.TemplateID,
+			"pending_failure_at", payload.PendingFailureAt)
+		return nil
+	}
+
+	if err := pushTemplateHealthSnapshot(ctx, db, metrics, boolPtr(true), logger); err != nil {
+		return err
+	}
+	if checkErr != nil {
+		logger.Error("deep check independently confirmed template unhealthy",
+			"template", tmpl.Name,
+			"fault_class", *faultClass,
+			"error", checkErr,
+			"duration_ms", int(durationSeconds*1000))
+	} else {
+		logger.Info("deep check confirmation passed; pending failure cleared",
+			"template", tmpl.Name,
+			"duration_ms", int(durationSeconds*1000))
+	}
+	return nil
+}
+
+func pushTemplateHealthSnapshot(
+	ctx context.Context,
+	db templateHealthDB,
+	metrics templateHealthMetrics,
+	checkerUp *bool,
+	logger *slog.Logger,
+) error {
+	if metrics == nil {
+		return nil
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	states, err := db.ListTemplateHealthStates(ctx)
+	if err != nil {
+		logger.Warn("list persisted template health snapshot failed", "error", err)
+		return fmt.Errorf("list persisted template health snapshot: %w", err)
+	}
+	if err := metrics.ReplaceSnapshot(ctx, TemplateHealthSnapshot{
+		CheckerUp: checkerUp,
+		States:    states,
+		CreatedAt: time.Now(),
+	}); err != nil {
+		logger.Warn("template health metrics snapshot replacement failed", "error", err)
+		return fmt.Errorf("replace template health metrics snapshot: %w", err)
+	}
+	return nil
+}
+
+func refreshTemplateHealthAggregate(state *database.TemplateHealthState) {
+	state.ConsecutiveFailures = maxInt(
+		state.StructuralConsecutiveFailures,
+		state.DeepConsecutiveFailures,
+	)
+	switch {
+	case state.StructuralConsecutiveFailures >= 2:
+		state.HealthStatus = "unhealthy"
+		state.LastError = state.LastStructuralError
+	case state.DeepConsecutiveFailures >= 2:
+		state.HealthStatus = "unhealthy"
+		state.LastError = state.LastDeepError
+	case state.LastStructuralPassed != nil && *state.LastStructuralPassed:
+		state.HealthStatus = "healthy"
+		state.LastError = firstNonNil(state.LastDeepError, state.LastStructuralError)
+	case state.LastDeepPassed != nil && *state.LastDeepPassed:
+		state.HealthStatus = "healthy"
+		state.LastError = state.LastStructuralError
+	default:
+		if state.HealthStatus == "" {
+			state.HealthStatus = "unknown"
+		}
+		state.LastError = firstNonNil(state.LastDeepError, state.LastStructuralError)
+	}
+}
+
+func classifyTemplateHealthFault(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "virtual disk is either corrupted or not a supported format"):
+		return "vsphere_virtual_disk_corrupt_or_unsupported"
+	case strings.Contains(msg, "wait-for-ip"):
+		return "guest_ip_timeout"
+	case isCheckerLevelError(err):
+		return "vsphere_connectivity"
+	case strings.Contains(msg, "does not exist"), strings.Contains(msg, "not found"):
+		return "vsphere_object_not_found"
+	case strings.Contains(msg, "power-on"):
+		return "vsphere_power_on"
+	case strings.Contains(msg, "clone"):
+		return "vsphere_clone"
+	default:
+		return "unknown"
+	}
+}
+
+func isDeepCheckerLevelError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if strings.Contains(strings.ToLower(err.Error()), "wait-for-ip") {
+		return false
+	}
+	return isCheckerLevelError(err)
+}
+
+func firstNonNil(values ...*string) *string {
+	for _, value := range values {
+		if value != nil {
+			return value
+		}
+	}
+	return nil
+}
+
+func boolPtr(v bool) *bool          { return &v }
+func float64Ptr(v float64) *float64 { return &v }
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 // runDeepCheck performs the full clone → power-on → wait-for-IP → destroy
 // cycle for a single template. The destroy is deferred and runs even when
 // earlier steps fail or the context is cancelled with a background timeout.
@@ -533,7 +906,7 @@ func runDeepCheck(
 	cfg TemplateHealthReconcilerConfig,
 	log *slog.Logger,
 ) (retErr error) {
-	cloneName := vcenter.HealthCheckClonePrefix + tmpl.ID.String()
+	cloneName := vcenter.HealthCheckClonePrefix + tmpl.ID.String() + "-" + uuid.NewString()[:8]
 	ref := tmpl.VCenterRef()
 
 	deepCtx, cancel := context.WithTimeout(ctx, cfg.DeepCheckTimeout)
@@ -642,6 +1015,11 @@ func isCheckerLevelError(err error) bool {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
+	// A guest that never acquires an IP is a valid deep-check observation,
+	// even when the underlying wait ends with context deadline exceeded.
+	if strings.Contains(msg, "wait-for-ip failed") {
+		return false
+	}
 	return strings.Contains(msg, "connection refused") ||
 		strings.Contains(msg, "connection reset") ||
 		strings.Contains(msg, "no such host") ||

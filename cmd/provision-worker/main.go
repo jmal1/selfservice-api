@@ -440,6 +440,8 @@ func main() {
 	healthReconcilerEnabled := strings.EqualFold(os.Getenv("WORKER_TEMPLATE_HEALTH_ENABLED"), "true")
 	healthReconcilerInterval := envDuration(logger, "WORKER_TEMPLATE_HEALTH_INTERVAL", 12*time.Hour)
 	healthReconcilerDeepTimeout := envDuration(logger, "WORKER_TEMPLATE_HEALTH_DEEP_TIMEOUT", 10*time.Minute)
+	healthConfirmationBackoff := envDuration(logger, "WORKER_TEMPLATE_HEALTH_CONFIRMATION_BACKOFF", 5*time.Minute)
+	healthConfirmationReconcileInterval := envDuration(logger, "WORKER_TEMPLATE_HEALTH_CONFIRMATION_RECONCILE_INTERVAL", time.Minute)
 	var healthReconcilerPusher *provisioner.TemplateHealthPusher
 	if pgURL := os.Getenv("WORKER_PUSHGATEWAY_URL"); pgURL != "" {
 		job := os.Getenv("WORKER_PUSHGATEWAY_JOB")
@@ -450,13 +452,15 @@ func main() {
 			map[string]string{"layer": "api"})
 	}
 	healthReconcilerCfg := provisioner.TemplateHealthReconcilerConfig{
-		Interval:         healthReconcilerInterval,
-		DeepCheckTimeout: healthReconcilerDeepTimeout,
-		TemplateFolder:   cfg.VCenter.TemplatesFolder,
-		MaxRetries:       3,
-		RetryBaseDelay:   1 * time.Second,
-		Pusher:           healthReconcilerPusher,
+		Interval:            healthReconcilerInterval,
+		DeepCheckTimeout:    healthReconcilerDeepTimeout,
+		TemplateFolder:      cfg.VCenter.TemplatesFolder,
+		MaxRetries:          3,
+		RetryBaseDelay:      1 * time.Second,
+		ConfirmationBackoff: healthConfirmationBackoff,
+		Pusher:              healthReconcilerPusher,
 	}
+	prov.ConfigureTemplateHealth(healthReconcilerCfg)
 
 	// Worker ID for job claiming
 	workerID, err := os.Hostname()
@@ -582,13 +586,19 @@ func main() {
 	}
 	// Template health reconciler ticker (opt-in; nil-safe).
 	var healthReconcilerTickerC <-chan time.Time
+	var healthConfirmationTickerC <-chan time.Time
 	if healthReconcilerEnabled {
 		t := time.NewTicker(healthReconcilerInterval)
 		defer t.Stop()
 		healthReconcilerTickerC = t.C
+		confirmationTicker := time.NewTicker(healthConfirmationReconcileInterval)
+		defer confirmationTicker.Stop()
+		healthConfirmationTickerC = confirmationTicker.C
 		logger.Info("template health reconciler enabled",
 			"interval", healthReconcilerInterval,
-			"deep_timeout", healthReconcilerDeepTimeout)
+			"deep_timeout", healthReconcilerDeepTimeout,
+			"confirmation_backoff", healthConfirmationBackoff,
+			"confirmation_reconcile_interval", healthConfirmationReconcileInterval)
 	}
 
 	// Immediately process any pending/recovered jobs
@@ -686,6 +696,13 @@ func main() {
 				if _, err := prov.ReconcileTemplateHealth(ctx, healthReconcilerCfg); err != nil {
 					logger.Error("template health reconcile failed", "error", err)
 				}
+			case <-healthConfirmationTickerC:
+				if !elec.IsLeader() {
+					continue
+				}
+				if _, err := prov.ReconcileTemplateHealthConfirmations(ctx, healthReconcilerCfg); err != nil {
+					logger.Error("template health confirmation schedule reconcile failed", "error", err)
+				}
 
 			// ── Leadership change notification ────────────────────────────────
 			// elec.Changes() fires true when this replica acquires the lock
@@ -727,8 +744,24 @@ func main() {
 				// own in-flight clone.
 				if healthReconcilerEnabled {
 					go func() {
-						if _, err := vcClient.SweepHealthCheckOrphans(ctx, cfg.VCenter.TemplatesFolder); err != nil {
+						orphanMinAge := time.Duration(healthReconcilerCfg.MaxRetries+1) * healthReconcilerCfg.DeepCheckTimeout
+						if orphanMinAge < time.Hour {
+							orphanMinAge = time.Hour
+						}
+						if _, err := vcClient.SweepHealthCheckOrphans(
+							ctx,
+							cfg.VCenter.TemplatesFolder,
+							time.Now().Add(-orphanMinAge),
+						); err != nil {
 							logger.Warn("health-check orphan sweep failed", "error", err)
+						}
+						// Replace any series retained from the previous worker
+						// before IfDue can skip a fresh vCenter cycle.
+						if err := prov.ReplaceTemplateHealthSnapshot(ctx, healthReconcilerCfg); err != nil {
+							logger.Error("template health startup snapshot replacement failed", "error", err)
+						}
+						if _, err := prov.ReconcileTemplateHealthConfirmations(ctx, healthReconcilerCfg); err != nil {
+							logger.Error("template health confirmation schedule repair on leader acquisition failed", "error", err)
 						}
 						// The 12h ticker is created at process start and reset
 						// by every restart. This service deploys several times

@@ -159,6 +159,10 @@ spec:
               value: {{ .Values.worker.templateHealth.interval | default "12h" | quote }}
             - name: WORKER_TEMPLATE_HEALTH_DEEP_TIMEOUT
               value: {{ .Values.worker.templateHealth.deepTimeout | default "10m" | quote }}
+            - name: WORKER_TEMPLATE_HEALTH_CONFIRMATION_BACKOFF
+              value: {{ .Values.worker.templateHealth.confirmationBackoff | default "5m" | quote }}
+            - name: WORKER_TEMPLATE_HEALTH_CONFIRMATION_RECONCILE_INTERVAL
+              value: {{ .Values.worker.templateHealth.confirmationReconcileInterval | default "1m" | quote }}
             # Idle-VM suspend evaluator. dryRun is the safety switch: when true
             # the evaluator logs what it WOULD suspend and makes no vCenter
             # mutations. Previously these were settable only via

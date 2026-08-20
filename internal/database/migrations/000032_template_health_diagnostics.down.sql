@@ -1,0 +1,14 @@
+DROP INDEX IF EXISTS idx_template_health_pending_deep_confirmation;
+
+ALTER TABLE template_health_state DROP COLUMN deep_confirmation_due_at;
+ALTER TABLE template_health_state DROP COLUMN pending_deep_failure_at;
+ALTER TABLE template_health_state DROP COLUMN last_deep_duration_seconds;
+ALTER TABLE template_health_state DROP COLUMN last_deep_fault_class;
+ALTER TABLE template_health_state DROP COLUMN last_deep_error;
+ALTER TABLE template_health_state DROP COLUMN last_deep_passed;
+ALTER TABLE template_health_state DROP COLUMN last_structural_duration_seconds;
+ALTER TABLE template_health_state DROP COLUMN last_structural_fault_class;
+ALTER TABLE template_health_state DROP COLUMN last_structural_error;
+ALTER TABLE template_health_state DROP COLUMN last_structural_passed;
+ALTER TABLE template_health_state DROP COLUMN deep_consecutive_failures;
+ALTER TABLE template_health_state DROP COLUMN structural_consecutive_failures;
