@@ -840,6 +840,23 @@ func (q *Queries) CreateJob(ctx context.Context, jobType string, payload []byte)
 	return &j, err
 }
 
+const lockTemplateForRevalidationSQL = `
+	SELECT id
+	FROM templates
+	WHERE id = $1
+	FOR UPDATE
+`
+
+const activeTemplateRevalidationJobSQL = `
+	SELECT EXISTS (
+		SELECT 1
+		FROM jobs
+		WHERE type = $1
+		  AND status IN ('pending', 'claimed', 'in_progress')
+		  AND payload->>'template_id' = $2
+	)
+`
+
 // CreateTemplateRevalidateJobIfAbsent inserts a template_revalidate job unless
 // the same template already has pending or executing work.
 //
@@ -862,12 +879,7 @@ func (q *Queries) CreateTemplateRevalidateJobIfAbsent(
 	}()
 
 	var lockedID uuid.UUID
-	if err := tx.QueryRow(ctx, `
-		SELECT id
-		FROM templates
-		WHERE id = $1
-		FOR UPDATE
-	`, templateID).Scan(&lockedID); err != nil {
+	if err := tx.QueryRow(ctx, lockTemplateForRevalidationSQL, templateID).Scan(&lockedID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, false, fmt.Errorf("lock template %s for revalidation enqueue: %w", templateID, ErrTemplateNotFound)
 		}
@@ -875,19 +887,8 @@ func (q *Queries) CreateTemplateRevalidateJobIfAbsent(
 	}
 
 	var active bool
-	if err := tx.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1
-			FROM jobs
-			WHERE type = $1
-			  AND status IN ($2, $3, $4)
-			  AND payload->>'template_id' = $5
-		)
-	`,
+	if err := tx.QueryRow(ctx, activeTemplateRevalidationJobSQL,
 		models.JobTypeTemplateRevalidate,
-		models.JobStatusPending,
-		models.JobStatusClaimed,
-		models.JobStatusInProgress,
 		templateID.String(),
 	).Scan(&active); err != nil {
 		return nil, false, fmt.Errorf("check active template revalidation job for %s: %w", templateID, err)

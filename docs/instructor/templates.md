@@ -648,9 +648,12 @@ minutes):
     (time() - crucible_l1_validation_scheduler_last_success_timestamp_seconds > 1800)
   for: 15m
   labels:
-    severity: critical
+    severity: warning
   annotations:
+    title: L1 validation scheduler is stale
     summary: Crucible L1 validation scheduler has not succeeded for 30 minutes
+    description: Check the elected provision-worker, database connectivity, and Pushgateway delivery before L1 template validation approaches its eight-day SLA.
+    runbook_url: https://github.com/jmal1/selfservice-api/blob/main/docs/instructor/templates.md#l1-template-revalidation
 
 - alert: CrucibleL1ValidationSchedulerErrors
   expr: increase(crucible_l1_validation_scheduler_errors_total[15m]) > 0
@@ -658,7 +661,10 @@ minutes):
   labels:
     severity: warning
   annotations:
+    title: L1 validation scheduler is reporting errors
     summary: Crucible L1 validation scheduler is failing
+    description: Inspect provision-worker logs for component=l1_validation_scheduler and resolve database, enqueue, leadership, or metrics-push errors.
+    runbook_url: https://github.com/jmal1/selfservice-api/blob/main/docs/instructor/templates.md#l1-template-revalidation
 
 - alert: CrucibleL1TemplateValidationApproachingSLA
   expr: time() - crucible_template_last_validated_timestamp > 648000
@@ -666,7 +672,10 @@ minutes):
   labels:
     severity: warning
   annotations:
+    title: L1 template validation is approaching the SLA
     summary: An L1 template has not completed validation for 7.5 days
+    description: Identify the template_id series, inspect its active template_revalidate job, and resolve worker or vCenter failures before eight days.
+    runbook_url: https://github.com/jmal1/selfservice-api/blob/main/docs/instructor/templates.md#l1-template-revalidation
 ```
 
 Scheduler metrics also expose the latest run timestamp, due-template count,
