@@ -48,6 +48,12 @@ synthetic:
 # replicas executes it. A first deep failure schedules a separate durable
 # confirmation, so a transient NFS blip cannot page confirmed health.
 worker:
+  # Poll persisted L1 validation due state every 5m. Any template older than
+  # seven days is enqueued immediately after startup or leader failover.
+  l1Validation:
+    enabled: true
+    validationInterval: "168h"
+    schedulerInterval: "5m"
   templateHealth:
     enabled: true
     interval: "12h"

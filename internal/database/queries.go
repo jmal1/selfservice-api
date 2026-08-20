@@ -840,6 +840,88 @@ func (q *Queries) CreateJob(ctx context.Context, jobType string, payload []byte)
 	return &j, err
 }
 
+// CreateTemplateRevalidateJobIfAbsent inserts a template_revalidate job unless
+// the same template already has pending or executing work.
+//
+// The template row lock is the serialization point. Concurrent startup,
+// periodic, and leader-failover reconciliations must all acquire it before
+// checking jobs, so the second transaction observes the first transaction's
+// insert and returns created=false. This keeps dedup durable without coupling
+// the generic jobs table to a payload-expression index.
+func (q *Queries) CreateTemplateRevalidateJobIfAbsent(
+	ctx context.Context,
+	templateID uuid.UUID,
+	payload []byte,
+) (_ *models.Job, created bool, err error) {
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return nil, false, fmt.Errorf("begin template revalidation enqueue: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	var lockedID uuid.UUID
+	if err := tx.QueryRow(ctx, `
+		SELECT id
+		FROM templates
+		WHERE id = $1
+		FOR UPDATE
+	`, templateID).Scan(&lockedID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, false, fmt.Errorf("lock template %s for revalidation enqueue: %w", templateID, ErrTemplateNotFound)
+		}
+		return nil, false, fmt.Errorf("lock template %s for revalidation enqueue: %w", templateID, err)
+	}
+
+	var active bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM jobs
+			WHERE type = $1
+			  AND status IN ($2, $3, $4)
+			  AND payload->>'template_id' = $5
+		)
+	`,
+		models.JobTypeTemplateRevalidate,
+		models.JobStatusPending,
+		models.JobStatusClaimed,
+		models.JobStatusInProgress,
+		templateID.String(),
+	).Scan(&active); err != nil {
+		return nil, false, fmt.Errorf("check active template revalidation job for %s: %w", templateID, err)
+	}
+	if active {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, false, fmt.Errorf("commit template revalidation dedup check for %s: %w", templateID, err)
+		}
+		return nil, false, nil
+	}
+
+	var job models.Job
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO jobs (type, payload)
+		VALUES ($1, $2)
+		RETURNING id, type, payload, status, retry_count, max_retries, rollback_steps, created_at
+	`, models.JobTypeTemplateRevalidate, payload).Scan(
+		&job.ID,
+		&job.Type,
+		&job.Payload,
+		&job.Status,
+		&job.RetryCount,
+		&job.MaxRetries,
+		&job.RollbackSteps,
+		&job.CreatedAt,
+	); err != nil {
+		return nil, false, fmt.Errorf("insert template revalidation job for %s: %w", templateID, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, false, fmt.Errorf("commit template revalidation job for %s: %w", templateID, err)
+	}
+	return &job, true, nil
+}
+
 // ClaimJob atomically claims the next pending job for a worker.
 // Jobs whose next_attempt_at is in the future are skipped (they are
 // sleeping between retry attempts).

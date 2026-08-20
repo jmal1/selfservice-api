@@ -85,6 +85,14 @@ worker:
     enabled: true
     interval: "5m"
     staleThreshold: "2h"
+  # L1 template revalidation. The scheduler wakes frequently but uses
+  # templates.last_validated_at as its durable clock; validationInterval is the
+  # SLA cadence, not a process-local ticker. Database enqueue dedup permits safe
+  # startup catch-up and leader failover.
+  l1Validation:
+    enabled: true
+    validationInterval: "168h"
+    schedulerInterval: "5m"
   # Template health checks (roadmap J-2). Every cycle runs a cheap structural
   # check (vCenter object exists, powered off, has a base-image snapshot,
   # datastore accessible) against every student-visible template, plus ONE deep

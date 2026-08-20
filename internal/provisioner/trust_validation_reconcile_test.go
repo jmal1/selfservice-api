@@ -28,6 +28,8 @@ type fakeL1DB struct {
 	staleL1Err   error
 	createdJobs  []models.Job
 	createJobErr error
+	activeJobs   map[uuid.UUID]string
+	deriveStale  bool
 	// For round-trip store tests
 	validationState map[uuid.UUID]struct {
 		result string
@@ -40,17 +42,39 @@ func (f *fakeL1DB) ListAllActiveL1Templates(_ context.Context) ([]models.Templat
 	return f.allL1, f.allL1Err
 }
 
-func (f *fakeL1DB) ListStaleL1Templates(_ context.Context, _ time.Duration) ([]models.Template, error) {
+func (f *fakeL1DB) ListStaleL1Templates(_ context.Context, olderThan time.Duration) ([]models.Template, error) {
+	if f.deriveStale {
+		var stale []models.Template
+		for _, tmpl := range f.allL1 {
+			if tmpl.LastValidatedAt == nil || time.Since(*tmpl.LastValidatedAt) >= olderThan {
+				stale = append(stale, tmpl)
+			}
+		}
+		return stale, f.staleL1Err
+	}
 	return f.staleL1, f.staleL1Err
 }
 
-func (f *fakeL1DB) CreateJob(_ context.Context, jobType string, payload []byte) (*models.Job, error) {
+func (f *fakeL1DB) CreateTemplateRevalidateJobIfAbsent(
+	_ context.Context,
+	templateID uuid.UUID,
+	payload []byte,
+) (*models.Job, bool, error) {
 	if f.createJobErr != nil {
-		return nil, f.createJobErr
+		return nil, false, f.createJobErr
 	}
-	j := models.Job{ID: uuid.New(), Type: jobType, Payload: payload}
+	if status := f.activeJobs[templateID]; status == models.JobStatusPending ||
+		status == models.JobStatusClaimed ||
+		status == models.JobStatusInProgress {
+		return nil, false, nil
+	}
+	j := models.Job{ID: uuid.New(), Type: models.JobTypeTemplateRevalidate, Payload: payload}
 	f.createdJobs = append(f.createdJobs, j)
-	return &j, nil
+	if f.activeJobs == nil {
+		f.activeJobs = make(map[uuid.UUID]string)
+	}
+	f.activeJobs[templateID] = models.JobStatusPending
+	return &j, true, nil
 }
 
 func (f *fakeL1DB) SetTemplateValidationState(_ context.Context, id uuid.UUID, result string, at time.Time) error {
@@ -200,6 +224,7 @@ func TestReconcileL1_IdentifierSelection(t *testing.T) {
 		vcenterTemplate string
 		wantEnqueued    int
 		wantVMMoref     string
+		wantError       bool
 	}{
 		{
 			name:            "enqueues when only vcenter_template is set",
@@ -210,6 +235,7 @@ func TestReconcileL1_IdentifierSelection(t *testing.T) {
 		{
 			name:         "skips when neither identifier is set",
 			wantEnqueued: 0,
+			wantError:    true,
 		},
 		{
 			name:         "preserves existing vcenter_vm_id",
@@ -234,8 +260,11 @@ func TestReconcileL1_IdentifierSelection(t *testing.T) {
 
 			counts, err := reconcileL1TrustValidation(context.Background(), db, m, discardLogger(),
 				L1TrustValidationReconcilerConfig{Interval: 7 * 24 * time.Hour})
-			if err != nil {
+			if err != nil && !tc.wantError {
 				t.Fatalf("unexpected error: %v", err)
+			}
+			if err == nil && tc.wantError {
+				t.Fatal("expected missing template identifier to surface as an error")
 			}
 			if counts.Enqueued != tc.wantEnqueued {
 				t.Fatalf("enqueued %d jobs, want %d", counts.Enqueued, tc.wantEnqueued)
@@ -260,6 +289,105 @@ func TestReconcileL1_IdentifierSelection(t *testing.T) {
 				t.Errorf("payload.VMMoref = %q, want %q", payload.VMMoref, tc.wantVMMoref)
 			}
 		})
+	}
+}
+
+func TestReconcileL1_RestartAfterValidationIntervalCatchesUp(t *testing.T) {
+	id := uuid.New()
+	lastValidated := time.Now().Add(-8 * 24 * time.Hour)
+	tmpl := makeL1Template(id, &lastValidated)
+	db := &fakeL1DB{
+		allL1:       []models.Template{tmpl},
+		deriveStale: true,
+	}
+
+	counts, err := reconcileL1TrustValidation(context.Background(), db, nil, discardLogger(),
+		L1TrustValidationReconcilerConfig{Interval: 7 * 24 * time.Hour})
+	if err != nil {
+		t.Fatalf("catch-up reconcile: %v", err)
+	}
+	if counts.Due != 1 || counts.Enqueued != 1 {
+		t.Fatalf("catch-up counts = %+v, want due=1 enqueued=1", counts)
+	}
+}
+
+func TestReconcileL1_ExistingActiveJobIsDatabaseIdempotent(t *testing.T) {
+	for _, status := range []string{
+		models.JobStatusPending,
+		models.JobStatusClaimed,
+		models.JobStatusInProgress,
+	} {
+		t.Run(status, func(t *testing.T) {
+			id := uuid.New()
+			tmpl := makeL1Template(id, nil)
+			db := &fakeL1DB{
+				allL1:      []models.Template{tmpl},
+				staleL1:    []models.Template{tmpl},
+				activeJobs: map[uuid.UUID]string{id: status},
+			}
+
+			counts, err := reconcileL1TrustValidation(context.Background(), db, nil, discardLogger(),
+				L1TrustValidationReconcilerConfig{Interval: 7 * 24 * time.Hour})
+			if err != nil {
+				t.Fatalf("reconcile with active %s job: %v", status, err)
+			}
+			if counts.Due != 1 || counts.Enqueued != 0 {
+				t.Fatalf("counts = %+v, want due=1 enqueued=0", counts)
+			}
+			if len(db.createdJobs) != 0 {
+				t.Fatalf("created %d duplicate jobs", len(db.createdJobs))
+			}
+		})
+	}
+}
+
+func TestReconcileL1_EnqueueFailureIsSurfaced(t *testing.T) {
+	id := uuid.New()
+	tmpl := makeL1Template(id, nil)
+	db := &fakeL1DB{
+		allL1:        []models.Template{tmpl},
+		staleL1:      []models.Template{tmpl},
+		createJobErr: errors.New("insert failed"),
+	}
+
+	counts, err := reconcileL1TrustValidation(context.Background(), db, nil, discardLogger(),
+		L1TrustValidationReconcilerConfig{Interval: 7 * 24 * time.Hour})
+	if err == nil || !contains(err.Error(), "insert failed") {
+		t.Fatalf("enqueue error = %v, want surfaced insert failure", err)
+	}
+	if counts.Due != 1 || counts.Enqueued != 0 {
+		t.Fatalf("counts = %+v, want due=1 enqueued=0", counts)
+	}
+}
+
+func TestReconcileL1_StopsEnqueueingAfterLeadershipLoss(t *testing.T) {
+	firstID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
+	secondID := uuid.MustParse("00000000-0000-0000-0000-000000000002")
+	first := makeL1Template(firstID, nil)
+	second := makeL1Template(secondID, nil)
+	db := &fakeL1DB{
+		allL1:   []models.Template{first, second},
+		staleL1: []models.Template{first, second},
+	}
+	leaderChecks := 0
+	isLeader := func() bool {
+		leaderChecks++
+		return leaderChecks <= 2
+	}
+
+	counts, err := reconcileL1TrustValidation(context.Background(), db, nil, discardLogger(),
+		L1TrustValidationReconcilerConfig{
+			Interval: 7 * 24 * time.Hour,
+			IsLeader: isLeader,
+		})
+	if !errors.Is(err, ErrL1ValidationLeadershipLost) {
+		t.Fatalf("reconcile error = %v, want ErrL1ValidationLeadershipLost", err)
+	}
+	if counts.Enqueued != 1 {
+		t.Fatalf("enqueued after leadership loss = %d, want exactly first template", counts.Enqueued)
+	}
+	if len(db.createdJobs) != 1 {
+		t.Fatalf("created jobs after leadership loss = %d, want 1", len(db.createdJobs))
 	}
 }
 
