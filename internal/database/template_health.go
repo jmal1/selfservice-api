@@ -219,30 +219,36 @@ func (q *Queries) GetTemplateHealthState(ctx context.Context, templateID uuid.UU
 	return &s, nil
 }
 
-// GetNewestTemplateHealthCheckTime returns the most recent structural check
-// timestamp across all templates, or nil when no cycle has ever completed.
-//
-// This exists so the worker can decide, on leader acquisition, whether a cycle
-// is actually due. The reconciler is driven by a 12h time.Ticker that restarts
-// from zero every time the worker process restarts; this platform deploys
-// several times a day, so a ticker-only reconciler would in practice never
-// fire at all. Persisted state is the only restart-durable clock available.
-//
-// Structural (not deep) is the right column: the structural pass runs for every
-// template on every cycle, so its max is the true "when did a cycle last run",
-// whereas last_deep_check_at only advances for the one round-robin template.
-func (q *Queries) GetNewestTemplateHealthCheckTime(ctx context.Context) (*time.Time, error) {
-	var newest *time.Time
+// GetLastTemplateHealthCycleCompletedAt returns the durable completion marker
+// written only after all state changes and the replacement snapshot succeed.
+// Per-template timestamps cannot serve as this clock because a failed cycle may
+// have updated only its first few templates.
+func (q *Queries) GetLastTemplateHealthCycleCompletedAt(ctx context.Context) (*time.Time, error) {
+	var completedAt *time.Time
 	err := q.pool.QueryRow(ctx, `
-		SELECT MAX(last_structural_check_at) FROM template_health_state
-	`).Scan(&newest)
+		SELECT last_completed_at
+		FROM template_health_reconcile_state
+		WHERE singleton = TRUE
+	`).Scan(&completedAt)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	return newest, nil
+	return completedAt, nil
+}
+
+// MarkTemplateHealthCycleCompleted advances the durable cycle clock after the
+// full reconciliation and complete Pushgateway replacement have succeeded.
+func (q *Queries) MarkTemplateHealthCycleCompleted(ctx context.Context, completedAt time.Time) error {
+	_, err := q.pool.Exec(ctx, `
+		INSERT INTO template_health_reconcile_state (singleton, last_completed_at)
+		VALUES (TRUE, $1)
+		ON CONFLICT (singleton) DO UPDATE
+		SET last_completed_at = EXCLUDED.last_completed_at
+	`, completedAt)
+	return err
 }
 
 // ListTemplateHealthStates returns health state rows for all student-visible

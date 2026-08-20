@@ -1,4 +1,5 @@
 DROP INDEX IF EXISTS idx_template_health_pending_deep_confirmation;
+DROP TABLE IF EXISTS template_health_reconcile_state;
 
 ALTER TABLE template_health_state DROP COLUMN deep_confirmation_due_at;
 ALTER TABLE template_health_state DROP COLUMN pending_deep_failure_at;

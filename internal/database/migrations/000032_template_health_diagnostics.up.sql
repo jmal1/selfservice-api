@@ -24,6 +24,11 @@ ALTER TABLE template_health_state ADD COLUMN deep_confirmation_due_at TIMESTAMPT
 UPDATE template_health_state
 SET structural_consecutive_failures = consecutive_failures;
 
+CREATE TABLE template_health_reconcile_state (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    last_completed_at TIMESTAMPTZ
+);
+
 CREATE INDEX idx_template_health_pending_deep_confirmation
     ON template_health_state (deep_confirmation_due_at)
     WHERE pending_deep_failure_at IS NOT NULL;

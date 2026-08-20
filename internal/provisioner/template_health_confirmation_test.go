@@ -170,6 +170,30 @@ func TestHealthPersistenceFailureCannotPublishCheckerSuccess(t *testing.T) {
 	if checkerUp == nil || *checkerUp {
 		t.Fatalf("persistence failure snapshot checker_up = %v, want false", checkerUp)
 	}
+	if db.cycleCompletedAt != nil {
+		t.Fatal("failed cycle advanced the durable completion marker")
+	}
+}
+
+func TestMidCycleStructuralOutageDoesNotMutateTemplateState(t *testing.T) {
+	tmpl := makeTemplate("cccccccc-cccc-cccc-cccc-cccccccccccc", "vm-1212")
+	db := newFakeHealthDB([]models.Template{tmpl})
+	vc := newFakeHealthVC()
+	outage := errors.New("connection refused")
+	vc.transientErrors[tmpl.VCenterRef()] = []error{nil, outage, outage, outage}
+	metrics := newFakeHealthMetrics()
+
+	counts, err := reconcileTemplateHealth(context.Background(), db, vc, metrics,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), defaultCfg())
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if counts.CheckerUp {
+		t.Fatal("mid-cycle structural outage returned checker_up=true")
+	}
+	if state := db.states[tmpl.ID]; state != nil {
+		t.Fatalf("mid-cycle structural outage mutated template state: %+v", state)
+	}
 }
 
 func TestStartupReplacementSnapshotAlwaysIncludesCheckerUp(t *testing.T) {
@@ -193,6 +217,65 @@ func TestStartupReplacementSnapshotAlwaysIncludesCheckerUp(t *testing.T) {
 	checkerUp = metrics.snapshots[len(metrics.snapshots)-1].CheckerUp
 	if checkerUp == nil || *checkerUp {
 		t.Fatalf("unreachable startup probe checker_up = %v, want false", checkerUp)
+	}
+}
+
+func TestStaleConfirmationRetryRepublishesCommittedState(t *testing.T) {
+	tmpl := makeTemplate("dddddddd-dddd-dddd-dddd-dddddddddddd", "vm-1313")
+	db := newFakeHealthDB([]models.Template{tmpl})
+	vc := newFakeHealthVC()
+	vc.cloneErr = errors.New(clonePlatformFault)
+	cfg := defaultCfg()
+
+	if _, err := reconcileTemplateHealth(context.Background(), db, vc, nil, nil, cfg); err != nil {
+		t.Fatalf("initial reconcile: %v", err)
+	}
+	payload := db.confirmationJobs[tmpl.ID]
+	job := confirmationJob(t, payload)
+	metrics := newFakeHealthMetrics()
+	metrics.err = errors.New("pushgateway unavailable")
+	if err := confirmTemplateHealth(context.Background(), db, vc, metrics,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), cfg, job); err == nil {
+		t.Fatal("confirmation publication failure did not request a job retry")
+	}
+	if db.states[tmpl.ID].HealthStatus != "unhealthy" {
+		t.Fatal("precondition: confirmation state was not committed before publication failed")
+	}
+
+	metrics.err = nil
+	if err := confirmTemplateHealth(context.Background(), db, vc, metrics,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), cfg, job); err != nil {
+		t.Fatalf("stale confirmation retry: %v", err)
+	}
+	last := metrics.snapshots[len(metrics.snapshots)-1]
+	if len(last.States) != 1 || last.States[0].HealthStatus != "unhealthy" {
+		t.Fatalf("stale retry did not republish committed state: %+v", last.States)
+	}
+}
+
+func TestConfirmationCheckerOutagePublishesCheckerDown(t *testing.T) {
+	tmpl := makeTemplate("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", "vm-1414")
+	db := newFakeHealthDB([]models.Template{tmpl})
+	vc := newFakeHealthVC()
+	vc.cloneErr = errors.New(clonePlatformFault)
+	cfg := defaultCfg()
+
+	if _, err := reconcileTemplateHealth(context.Background(), db, vc, nil, nil, cfg); err != nil {
+		t.Fatalf("initial reconcile: %v", err)
+	}
+	payload := db.confirmationJobs[tmpl.ID]
+	vc.cloneErr = errors.New("connection refused")
+	metrics := newFakeHealthMetrics()
+	if err := confirmTemplateHealth(context.Background(), db, vc, metrics,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), cfg, confirmationJob(t, payload)); err == nil {
+		t.Fatal("confirmation checker outage was not retried")
+	}
+	checkerUp := metrics.snapshots[len(metrics.snapshots)-1].CheckerUp
+	if checkerUp == nil || *checkerUp {
+		t.Fatalf("confirmation outage checker_up = %v, want false", checkerUp)
+	}
+	if db.states[tmpl.ID].PendingDeepFailureAt == nil {
+		t.Fatal("checker outage consumed pending confirmation state")
 	}
 }
 

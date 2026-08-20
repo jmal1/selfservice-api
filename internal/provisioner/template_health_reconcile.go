@@ -145,7 +145,8 @@ type templateHealthDB interface {
 	CreateTemplateHealthConfirmationJob(ctx context.Context, templateID uuid.UUID, payload []byte, nextAt time.Time) (bool, error)
 	ApplyTemplateHealthDeepConfirmation(ctx context.Context, templateID uuid.UUID, expectedFailureAt time.Time, passed bool, checkedAt time.Time, durationSeconds float64, errMsg *string, faultClass *string) (bool, error)
 	ClearTemplateHealthDeepPending(ctx context.Context, templateID uuid.UUID, expectedFailureAt time.Time) (bool, error)
-	GetNewestTemplateHealthCheckTime(ctx context.Context) (*time.Time, error)
+	GetLastTemplateHealthCycleCompletedAt(ctx context.Context) (*time.Time, error)
+	MarkTemplateHealthCycleCompleted(ctx context.Context, completedAt time.Time) error
 }
 
 // templateHealthVCenter is the narrow vCenter surface the health reconciler
@@ -216,14 +217,14 @@ func templateHealthCycleDue(ctx context.Context, db templateHealthDB, interval t
 	if interval <= 0 {
 		interval = 12 * time.Hour
 	}
-	newest, err := db.GetNewestTemplateHealthCheckTime(ctx)
+	completedAt, err := db.GetLastTemplateHealthCycleCompletedAt(ctx)
 	if err != nil {
 		return false, fmt.Errorf("read last template health check time: %w", err)
 	}
-	if newest == nil {
+	if completedAt == nil {
 		return true, nil
 	}
-	return time.Since(*newest) >= interval, nil
+	return time.Since(*completedAt) >= interval, nil
 }
 
 const templateHealthCASAttempts = 5
@@ -384,6 +385,15 @@ func reconcileTemplateHealth(
 			return nil
 		})
 		durSec := time.Since(start).Seconds()
+		if checkErr != nil && isCheckerLevelError(checkErr) {
+			counts.CheckerUp = false
+			log.Error("structural check lost vCenter connectivity; template state unchanged",
+				"template", tmpl.Name,
+				"fault_class", classifyTemplateHealthFault(checkErr),
+				"error", checkErr)
+			_ = pushTemplateHealthSnapshot(ctx, db, metrics, boolPtr(false), log)
+			return counts, nil
+		}
 
 		now := time.Now().UTC().Truncate(time.Microsecond)
 		passed := checkErr == nil
@@ -547,6 +557,11 @@ func reconcileTemplateHealth(
 	if err := pushTemplateHealthSnapshot(ctx, db, metrics, boolPtr(true), log); err != nil {
 		return counts, err
 	}
+	if err := db.MarkTemplateHealthCycleCompleted(ctx, time.Now().UTC()); err != nil {
+		counts.CheckerUp = false
+		_ = pushTemplateHealthSnapshot(ctx, db, metrics, boolPtr(false), log)
+		return counts, fmt.Errorf("mark template health cycle completed: %w", err)
+	}
 
 	log.Info("template health reconcile complete",
 		"templates", counts.Templates,
@@ -709,6 +724,9 @@ func confirmTemplateHealth(
 		logger.Info("template health confirmation is stale; no-op",
 			"template_id", payload.TemplateID,
 			"pending_failure_at", payload.PendingFailureAt)
+		if err := replaceTemplateHealthSnapshot(ctx, db, vc, metrics, logger, cfg); err != nil {
+			return fmt.Errorf("republish template health snapshot for stale confirmation: %w", err)
+		}
 		return nil
 	}
 
@@ -744,6 +762,7 @@ func confirmTemplateHealth(
 	durationSeconds := time.Since(started).Seconds()
 	checkedAt := time.Now()
 	if checkErr != nil && isDeepCheckerLevelError(checkErr) {
+		_ = pushTemplateHealthSnapshot(ctx, db, metrics, boolPtr(false), logger)
 		return fmt.Errorf("template health confirmation checker failure: %w", checkErr)
 	}
 

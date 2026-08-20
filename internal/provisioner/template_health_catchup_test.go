@@ -52,9 +52,9 @@ func TestCycleDueWhenNoCycleHasEverRun(t *testing.T) {
 // clone → power-on → destroy, so an unguarded catch-up would turn every deploy
 // into vCenter load against the same NFS datastores this check monitors.
 func TestCycleNotDueWithinInterval(t *testing.T) {
-	id := uuid.New()
 	db := newFakeHealthDB(nil)
-	db.states[id] = healthStateCheckedAt(id, time.Now().Add(-30*time.Minute))
+	completedAt := time.Now().Add(-30 * time.Minute)
+	db.cycleCompletedAt = &completedAt
 
 	due, err := templateHealthCycleDue(context.Background(), db, 12*time.Hour)
 	if err != nil {
@@ -68,9 +68,9 @@ func TestCycleNotDueWithinInterval(t *testing.T) {
 // A worker that has been down (or redeployed) across the interval boundary
 // must catch up rather than wait a further full interval.
 func TestCycleDueAfterIntervalElapsed(t *testing.T) {
-	id := uuid.New()
 	db := newFakeHealthDB(nil)
-	db.states[id] = healthStateCheckedAt(id, time.Now().Add(-13*time.Hour))
+	completedAt := time.Now().Add(-13 * time.Hour)
+	db.cycleCompletedAt = &completedAt
 
 	due, err := templateHealthCycleDue(context.Background(), db, 12*time.Hour)
 	if err != nil {
@@ -81,20 +81,19 @@ func TestCycleDueAfterIntervalElapsed(t *testing.T) {
 	}
 }
 
-// Freshness must be judged by the newest check across all templates, not an
-// arbitrary row. Using the oldest would re-run a cycle on every restart.
-func TestCycleDueUsesNewestCheckAcrossTemplates(t *testing.T) {
-	oldID, newID := uuid.New(), uuid.New()
+// Sabotage: deriving completion from per-template timestamps makes this false,
+// allowing a partial cycle to suppress the failover catch-up pass.
+func TestPartialCycleWithoutCompletionMarkerRemainsDue(t *testing.T) {
 	db := newFakeHealthDB(nil)
-	db.states[oldID] = healthStateCheckedAt(oldID, time.Now().Add(-40*time.Hour))
-	db.states[newID] = healthStateCheckedAt(newID, time.Now().Add(-10*time.Minute))
+	id := uuid.New()
+	db.states[id] = healthStateCheckedAt(id, time.Now())
 
 	due, err := templateHealthCycleDue(context.Background(), db, 12*time.Hour)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if due {
-		t.Fatal("due-check keyed off the oldest row; a single stale template would force a clone on every restart")
+	if !due {
+		t.Fatal("partial per-template writes were mistaken for a completed cycle")
 	}
 }
 
@@ -104,7 +103,7 @@ func TestCycleDueUsesNewestCheckAcrossTemplates(t *testing.T) {
 // 12h ticker remains as the backstop.
 func TestCycleDueFailsClosedOnDBError(t *testing.T) {
 	db := newFakeHealthDB(nil)
-	db.newestErr = errors.New("connection refused")
+	db.cycleErr = errors.New("connection refused")
 
 	due, err := templateHealthCycleDue(context.Background(), db, 12*time.Hour)
 	if err == nil {
@@ -118,9 +117,9 @@ func TestCycleDueFailsClosedOnDBError(t *testing.T) {
 // A zero/absent interval must fall back to 12h rather than 0, which would make
 // every call due and reintroduce the clone storm.
 func TestCycleDueZeroIntervalFallsBackTo12h(t *testing.T) {
-	id := uuid.New()
 	db := newFakeHealthDB(nil)
-	db.states[id] = healthStateCheckedAt(id, time.Now().Add(-1*time.Hour))
+	completedAt := time.Now().Add(-1 * time.Hour)
+	db.cycleCompletedAt = &completedAt
 
 	due, err := templateHealthCycleDue(context.Background(), db, 0)
 	if err != nil {

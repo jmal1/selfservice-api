@@ -24,7 +24,8 @@ type fakeHealthDB struct {
 	templates            []models.Template
 	states               map[uuid.UUID]*database.TemplateHealthState
 	deepOrder            []uuid.UUID // controlled least-recently-checked order
-	newestErr            error       // forces GetNewestTemplateHealthCheckTime to fail
+	cycleCompletedAt     *time.Time
+	cycleErr             error
 	confirmationJobs     map[uuid.UUID]TemplateHealthConfirmationPayload
 	confirmationEnqueues int
 	casErr               error
@@ -205,26 +206,27 @@ func (f *fakeHealthDB) CompareAndSwapTemplateHealthState(_ context.Context, stat
 	return true, nil
 }
 
-// GetNewestTemplateHealthCheckTime mirrors the production MAX() query over the
-// fake's stored state, so due/not-due tests exercise real bookkeeping rather
-// than a hand-set flag.
-func (f *fakeHealthDB) GetNewestTemplateHealthCheckTime(_ context.Context) (*time.Time, error) {
+func (f *fakeHealthDB) GetLastTemplateHealthCycleCompletedAt(_ context.Context) (*time.Time, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.newestErr != nil {
-		return nil, f.newestErr
+	if f.cycleErr != nil {
+		return nil, f.cycleErr
 	}
-	var newest *time.Time
-	for _, s := range f.states {
-		if s.LastStructuralCheckAt == nil {
-			continue
-		}
-		if newest == nil || s.LastStructuralCheckAt.After(*newest) {
-			t := *s.LastStructuralCheckAt
-			newest = &t
-		}
+	if f.cycleCompletedAt == nil {
+		return nil, nil
 	}
-	return newest, nil
+	completedAt := *f.cycleCompletedAt
+	return &completedAt, nil
+}
+
+func (f *fakeHealthDB) MarkTemplateHealthCycleCompleted(_ context.Context, completedAt time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.cycleErr != nil {
+		return f.cycleErr
+	}
+	f.cycleCompletedAt = &completedAt
+	return nil
 }
 
 // fakeHealthVC implements templateHealthVCenter.
@@ -347,6 +349,7 @@ type fakeHealthMetrics struct {
 	mu sync.Mutex
 
 	snapshots []TemplateHealthSnapshot
+	err       error
 }
 
 func newFakeHealthMetrics() *fakeHealthMetrics {
@@ -357,7 +360,7 @@ func (m *fakeHealthMetrics) ReplaceSnapshot(_ context.Context, snapshot Template
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.snapshots = append(m.snapshots, snapshot)
-	return nil
+	return m.err
 }
 
 // Compiler check: fakeHealthMetrics must satisfy templateHealthMetrics.
