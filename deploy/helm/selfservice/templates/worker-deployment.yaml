@@ -149,6 +149,14 @@ spec:
               value: {{ .Values.worker.pipelineReconciler.interval | default "5m" | quote }}
             - name: WORKER_PIPELINE_RECONCILER_STALE_THRESHOLD
               value: {{ .Values.worker.pipelineReconciler.staleThreshold | default "2h" | quote }}
+            # L1 template revalidation: poll persisted due state frequently;
+            # enqueue at most one active revalidation job per template.
+            - name: WORKER_L1_VALIDATION_ENABLED
+              value: {{ .Values.worker.l1Validation.enabled | quote }}
+            - name: WORKER_L1_VALIDATION_INTERVAL
+              value: {{ .Values.worker.l1Validation.validationInterval | default "168h" | quote }}
+            - name: WORKER_L1_VALIDATION_SCHEDULER_INTERVAL
+              value: {{ .Values.worker.l1Validation.schedulerInterval | default "5m" | quote }}
             # Template health checks (roadmap J-2). Structural check on every
             # student-visible template each cycle + one rotating deep check.
             # Leader-gated, so only one replica runs it. Off by default so

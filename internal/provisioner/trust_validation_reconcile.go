@@ -6,8 +6,9 @@
 // corrupted, a dependency becomes unavailable) and students would clone a
 // broken VM without any automated signal.
 //
-// The reconciler runs on a configurable ticker (default weekly via
-// WORKER_L1_VALIDATION_INTERVAL). Each pass:
+// A short scheduler poll runs this reconciler; persisted last_validated_at state
+// and WORKER_L1_VALIDATION_INTERVAL (default weekly) decide what is due. Each
+// pass:
 //
 //  1. Queries ALL active L1 templates and emits the
 //     crucible_template_last_validated_timestamp gauge so the staleness alert
@@ -24,9 +25,12 @@ package provisioner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/models"
@@ -38,19 +42,29 @@ type L1TrustValidationReconcilerConfig struct {
 	// reconciler enqueues a new revalidation job. Zero falls back to 168h
 	// (one week). Configurable via WORKER_L1_VALIDATION_INTERVAL.
 	Interval time.Duration
+
+	// IsLeader is checked before querying and before every enqueue. Nil is
+	// accepted for direct calls and tests. The worker supplies its elector so a
+	// reconciliation that outlives leadership cannot continue filling the queue.
+	IsLeader func() bool
 }
 
 // L1TrustValidationCounts summarises one pass for logs and tests.
 type L1TrustValidationCounts struct {
 	L1Templates int // total active L1 templates seen
+	Due         int // templates whose persisted validation timestamp is overdue
 	Enqueued    int // new template_revalidate jobs created this pass
 }
+
+// ErrL1ValidationLeadershipLost reports that a pass stopped because this worker
+// no longer holds the reconciler advisory lock.
+var ErrL1ValidationLeadershipLost = errors.New("l1 validation scheduler lost leadership")
 
 // l1TrustValidationDB is the narrow DB surface the reconciler needs.
 type l1TrustValidationDB interface {
 	ListAllActiveL1Templates(ctx context.Context) ([]models.Template, error)
 	ListStaleL1Templates(ctx context.Context, olderThan time.Duration) ([]models.Template, error)
-	CreateJob(ctx context.Context, jobType string, payload []byte) (*models.Job, error)
+	CreateTemplateRevalidateJobIfAbsent(ctx context.Context, templateID uuid.UUID, payload []byte) (*models.Job, bool, error)
 }
 
 // l1TrustValidationMetrics is the narrow metrics surface the reconciler needs.
@@ -90,6 +104,20 @@ func reconcileL1TrustValidation(
 		logger = slog.Default()
 	}
 	log := logger.With("component", "l1_trust_validation_reconciler")
+	checkLeadership := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if cfg.IsLeader != nil && !cfg.IsLeader() {
+			return ErrL1ValidationLeadershipLost
+		}
+		return nil
+	}
+	if err := checkLeadership(); err != nil {
+		return L1TrustValidationCounts{}, err
+	}
+
+	var reconcileErr error
 
 	// Step 1: query ALL active L1 templates so we can update the staleness
 	// gauge for every one of them, even those recently validated. Without this
@@ -112,7 +140,7 @@ func reconcileL1TrustValidation(
 			metrics.SetTemplateLastValidated(tmpl.ID.String(), ts)
 		}
 		if err := metrics.Push(ctx); err != nil {
-			log.Warn("l1 validation staleness gauge push failed", "error", err)
+			reconcileErr = errors.Join(reconcileErr, fmt.Errorf("push l1 validation staleness metrics: %w", err))
 		}
 	}
 
@@ -121,13 +149,18 @@ func reconcileL1TrustValidation(
 	// Step 2: find templates that are stale and enqueue revalidation jobs.
 	stale, err := db.ListStaleL1Templates(ctx, cfg.Interval)
 	if err != nil {
-		return counts, fmt.Errorf("list stale l1 templates: %w", err)
+		return counts, errors.Join(reconcileErr, fmt.Errorf("list stale l1 templates: %w", err))
 	}
+	counts.Due = len(stale)
 
 	for _, tmpl := range stale {
+		if err := checkLeadership(); err != nil {
+			return counts, errors.Join(reconcileErr, err)
+		}
 		if tmpl.VCenterVMID == "" && tmpl.VCenterTemplate == "" {
-			log.Warn("l1 template has no vcenter_vm_id and no vcenter_template; skipping revalidation",
-				"template_id", tmpl.ID, "name", tmpl.Name)
+			err := fmt.Errorf("l1 template %s (%s) has no vcenter_vm_id or vcenter_template", tmpl.ID, tmpl.Name)
+			log.Error("cannot enqueue l1 template revalidation", "error", err)
+			reconcileErr = errors.Join(reconcileErr, err)
 			continue
 		}
 		payload, merr := json.Marshal(TemplateRevalidatePayload{
@@ -137,11 +170,19 @@ func reconcileL1TrustValidation(
 		if merr != nil {
 			log.Error("failed to marshal revalidate payload",
 				"template_id", tmpl.ID, "error", merr)
+			reconcileErr = errors.Join(reconcileErr, fmt.Errorf("marshal revalidate payload for %s: %w", tmpl.ID, merr))
 			continue
 		}
-		if _, err := db.CreateJob(ctx, models.JobTypeTemplateRevalidate, payload); err != nil {
+		_, created, err := db.CreateTemplateRevalidateJobIfAbsent(ctx, tmpl.ID, payload)
+		if err != nil {
 			log.Error("failed to enqueue revalidate job",
 				"template_id", tmpl.ID, "name", tmpl.Name, "error", err)
+			reconcileErr = errors.Join(reconcileErr, fmt.Errorf("enqueue revalidate job for %s: %w", tmpl.ID, err))
+			continue
+		}
+		if !created {
+			log.Info("active l1 revalidation job already exists",
+				"template_id", tmpl.ID, "name", tmpl.Name)
 			continue
 		}
 		counts.Enqueued++
@@ -152,8 +193,10 @@ func reconcileL1TrustValidation(
 
 	log.Info("l1 trust validation reconcile complete",
 		"l1_templates", counts.L1Templates,
+		"due", counts.Due,
 		"enqueued", counts.Enqueued,
 		"interval", cfg.Interval,
+		"error", reconcileErr,
 	)
-	return counts, nil
+	return counts, reconcileErr
 }

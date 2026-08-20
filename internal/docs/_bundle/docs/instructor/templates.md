@@ -618,6 +618,74 @@ See [troubleshooting.md](troubleshooting.md) for more general help.
 
 ---
 
+## L1 Template Revalidation
+
+Active templates in the `l1` trust tier receive a full smoke-clone validation
+at least once every seven days. Revalidation is alert-only: a failed check
+records the failure and alerts operators, but does not automatically unpublish
+the template.
+
+The worker checks persisted `last_validated_at` timestamps every five minutes.
+It also checks immediately when an elected worker starts or a follower becomes
+leader. The seven-day interval is therefore a database due-state threshold, not
+a process-local timer; restarts and leader failovers cannot postpone overdue
+work for another week.
+
+Only one pending or executing `template_revalidate` job can exist per template.
+Startup catch-up, a periodic poll, and leader failover may all discover the same
+overdue template, but enqueue is serialized in the database and later attempts
+reuse the active job.
+
+The API repository does not own the live PrometheusRule. The observability
+deployment should install these rules (the scheduler's default poll is five
+minutes):
+
+```yaml
+- alert: CrucibleL1ValidationSchedulerStale
+  expr: |
+    absent(crucible_l1_validation_scheduler_last_success_timestamp_seconds)
+    or
+    (time() - crucible_l1_validation_scheduler_last_success_timestamp_seconds > 1800)
+  for: 15m
+  labels:
+    severity: warning
+  annotations:
+    title: L1 validation scheduler is stale
+    summary: Crucible L1 validation scheduler has not succeeded for 30 minutes
+    description: Check the elected provision-worker, database connectivity, and Pushgateway delivery before L1 template validation approaches its eight-day SLA.
+    runbook_url: https://github.com/jmal1/selfservice-api/blob/main/docs/instructor/templates.md#l1-template-revalidation
+
+- alert: CrucibleL1ValidationSchedulerErrors
+  expr: increase(crucible_l1_validation_scheduler_errors_total[15m]) > 0
+  for: 5m
+  labels:
+    severity: warning
+  annotations:
+    title: L1 validation scheduler is reporting errors
+    summary: Crucible L1 validation scheduler is failing
+    description: Inspect provision-worker logs for component=l1_validation_scheduler and resolve database, enqueue, leadership, or metrics-push errors.
+    runbook_url: https://github.com/jmal1/selfservice-api/blob/main/docs/instructor/templates.md#l1-template-revalidation
+
+- alert: CrucibleL1TemplateValidationApproachingSLA
+  expr: time() - crucible_template_last_validated_timestamp > 648000
+  for: 15m
+  labels:
+    severity: warning
+  annotations:
+    title: L1 template validation is approaching the SLA
+    summary: An L1 template has not completed validation for 7.5 days
+    description: Identify the template_id series, inspect its active template_revalidate job, and resolve worker or vCenter failures before eight days.
+    runbook_url: https://github.com/jmal1/selfservice-api/blob/main/docs/instructor/templates.md#l1-template-revalidation
+```
+
+Scheduler metrics also expose the latest run timestamp, due-template count,
+and enqueued-job count as
+`crucible_l1_validation_scheduler_last_run_timestamp_seconds`,
+`crucible_l1_validation_scheduler_due_templates`, and
+`crucible_l1_validation_scheduler_enqueued_jobs`.
+
+---
+
 ## Template Health Checks
 
 Crucible runs automated health checks for every student-visible template every

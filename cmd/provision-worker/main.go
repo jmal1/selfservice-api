@@ -408,19 +408,46 @@ func main() {
 		Pusher: idleEvalPusher,
 	}
 
-	// L1 trust-tier revalidation reconciler. Periodically enqueues
+	// L1 trust-tier revalidation reconciler. A short scheduler poll queries
+	// persisted due state and enqueues
 	// template_revalidate jobs for active L1 templates whose last_validated_at
 	// is NULL or older than the configured interval.
-	// Enabled by default when a Pushgateway is configured (metrics are the
-	// whole point); set WORKER_L1_VALIDATION_ENABLED=false to opt out.
+	// Enabled by default; set WORKER_L1_VALIDATION_ENABLED=false to opt out.
 	// WORKER_L1_VALIDATION_INTERVAL overrides the default 168h (weekly) cadence.
-	l1ValidationEnabled := pipeline != nil // requires metrics to be useful
+	// WORKER_L1_VALIDATION_SCHEDULER_INTERVAL controls the persisted-state poll
+	// cadence and defaults to 5m. It is intentionally much shorter than the
+	// validation interval: process uptime is not the scheduling clock.
+	l1ValidationEnabled := true
 	if v := os.Getenv("WORKER_L1_VALIDATION_ENABLED"); v != "" {
 		l1ValidationEnabled = strings.EqualFold(v, "true")
 	}
 	l1ValidationInterval := envDuration(logger, "WORKER_L1_VALIDATION_INTERVAL", 168*time.Hour)
+	l1ValidationSchedulerInterval := envDuration(logger, "WORKER_L1_VALIDATION_SCHEDULER_INTERVAL", 5*time.Minute)
 	l1ValidationCfg := provisioner.L1TrustValidationReconcilerConfig{
 		Interval: l1ValidationInterval,
+		IsLeader: elec.IsLeader,
+	}
+	var l1ValidationSchedulerMetrics *provisioner.L1ValidationSchedulerMetrics
+	if pgURL := os.Getenv("WORKER_PUSHGATEWAY_URL"); pgURL != "" {
+		job := os.Getenv("WORKER_PUSHGATEWAY_JOB")
+		l1ValidationSchedulerMetrics = provisioner.NewL1ValidationSchedulerMetrics(
+			pgURL,
+			job,
+			map[string]string{"layer": "api"},
+		)
+	}
+	var l1ValidationScheduler *provisioner.L1TrustValidationScheduler
+	if l1ValidationEnabled {
+		reconcile := func(runCtx context.Context) (provisioner.L1TrustValidationCounts, error) {
+			return prov.ReconcileL1TrustValidation(runCtx, l1ValidationCfg)
+		}
+		if l1ValidationSchedulerMetrics == nil {
+			l1ValidationScheduler = provisioner.NewL1TrustValidationScheduler(
+				elec.IsLeader, reconcile, nil, logger)
+		} else {
+			l1ValidationScheduler = provisioner.NewL1TrustValidationScheduler(
+				elec.IsLeader, reconcile, l1ValidationSchedulerMetrics, logger)
+		}
 	}
 
 	// Template health reconciler. Checks every student-visible template
@@ -554,18 +581,19 @@ func main() {
 		}
 	}
 
-	// L1 trust-validation reconciler ticker. Enabled when WORKER_L1_VALIDATION_ENABLED
-	// is true (defaults to true when a pipeline/Pushgateway is configured).
+	// L1 trust-validation scheduler ticker. This short poll is only a trigger;
+	// each pass queries persisted last_validated_at state to decide what is due.
 	var l1ValidationTickerC <-chan time.Time
 	if l1ValidationEnabled {
-		t := time.NewTicker(l1ValidationInterval)
+		t := time.NewTicker(l1ValidationSchedulerInterval)
 		defer t.Stop()
 		l1ValidationTickerC = t.C
 		logger.Info("l1 trust validation reconciler enabled",
-			"interval", l1ValidationInterval)
-		// Initial run: handled via elec.Changes() in the main select loop below
-		// so the first pass fires as soon as leadership is elected, not speculatively
-		// before the lock is acquired.
+			"validation_interval", l1ValidationInterval,
+			"scheduler_interval", l1ValidationSchedulerInterval)
+		// Do not rely on the acquisition event: leadership may already be held
+		// by the time this goroutine is ready to consume Changes().
+		l1ValidationScheduler.Start(ctx)
 	}
 
 	// Expiration cron ticker: gated by leader election (integrated into the main
@@ -682,12 +710,7 @@ func main() {
 					logger.Error("retry-pending reconcile failed", "error", err)
 				}
 			case <-l1ValidationTickerC:
-				if !elec.IsLeader() {
-					continue
-				}
-				if _, err := prov.ReconcileL1TrustValidation(ctx, l1ValidationCfg); err != nil {
-					logger.Error("l1 trust validation reconcile failed", "error", err)
-				}
+				l1ValidationScheduler.Tick(ctx)
 
 			case <-healthReconcilerTickerC:
 				if !elec.IsLeader() {
@@ -713,6 +736,9 @@ func main() {
 			// The channel is buffered (size 1), so the event is safe even if the
 			// select loop is busy; it will be delivered on the next iteration.
 			case isLeader := <-elec.Changes():
+				if l1ValidationScheduler != nil {
+					l1ValidationScheduler.LeadershipChanged(ctx, isLeader)
+				}
 				if !isLeader {
 					continue
 				}
@@ -725,15 +751,6 @@ func main() {
 					go func() {
 						if _, err := prov.ReconcileNetwork(ctx, networkReconcilerCfg); err != nil {
 							logger.Error("network reconcile on leader acquisition failed", "error", err)
-						}
-					}()
-				}
-				// L1 trust validation runs a heavyweight DB query; goroutine for
-				// the same reason.
-				if l1ValidationEnabled {
-					go func() {
-						if _, err := prov.ReconcileL1TrustValidation(ctx, l1ValidationCfg); err != nil {
-							logger.Error("l1 trust validation on leader acquisition failed", "error", err)
 						}
 					}()
 				}
@@ -814,6 +831,10 @@ func main() {
 
 	logger.Info("shutting down worker")
 	cancel()
+	if l1ValidationScheduler != nil {
+		l1ValidationScheduler.Stop()
+		l1ValidationScheduler.Wait()
+	}
 }
 
 // processJobs claims and processes available jobs via the provisioner.
