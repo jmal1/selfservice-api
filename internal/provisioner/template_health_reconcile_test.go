@@ -2,6 +2,7 @@ package provisioner
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -19,18 +20,114 @@ import (
 
 // fakeHealthDB implements templateHealthDB with in-memory storage.
 type fakeHealthDB struct {
-	mu        sync.Mutex
-	templates []models.Template
-	states    map[uuid.UUID]*database.TemplateHealthState
-	deepOrder []uuid.UUID // controlled least-recently-checked order
-	newestErr error       // forces GetNewestTemplateHealthCheckTime to fail
+	mu                   sync.Mutex
+	templates            []models.Template
+	states               map[uuid.UUID]*database.TemplateHealthState
+	deepOrder            []uuid.UUID // controlled least-recently-checked order
+	cycleCompletedAt     *time.Time
+	cycleErr             error
+	confirmationJobs     map[uuid.UUID]TemplateHealthConfirmationPayload
+	confirmationEnqueues int
+	casErr               error
 }
 
 func newFakeHealthDB(templates []models.Template) *fakeHealthDB {
 	return &fakeHealthDB{
-		templates: templates,
-		states:    map[uuid.UUID]*database.TemplateHealthState{},
+		templates:        templates,
+		states:           map[uuid.UUID]*database.TemplateHealthState{},
+		confirmationJobs: map[uuid.UUID]TemplateHealthConfirmationPayload{},
 	}
+}
+
+func (f *fakeHealthDB) ListTemplateHealthStates(_ context.Context) ([]database.TemplateHealthState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	states := make([]database.TemplateHealthState, 0, len(f.templates))
+	for _, tmpl := range f.templates {
+		if state := f.states[tmpl.ID]; state != nil {
+			copy := *state
+			copy.TemplateName = tmpl.Name
+			states = append(states, copy)
+			continue
+		}
+		states = append(states, database.TemplateHealthState{
+			TemplateID: tmpl.ID, TemplateName: tmpl.Name, HealthStatus: "unknown",
+		})
+	}
+	return states, nil
+}
+
+func (f *fakeHealthDB) CreateTemplateHealthConfirmationJob(
+	_ context.Context,
+	templateID uuid.UUID,
+	payload []byte,
+	_ time.Time,
+) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, exists := f.confirmationJobs[templateID]; exists {
+		return false, nil
+	}
+	var parsed TemplateHealthConfirmationPayload
+	if err := json.Unmarshal(payload, &parsed); err != nil {
+		return false, err
+	}
+	f.confirmationJobs[templateID] = parsed
+	f.confirmationEnqueues++
+	return true, nil
+}
+
+func (f *fakeHealthDB) ApplyTemplateHealthDeepConfirmation(
+	_ context.Context,
+	templateID uuid.UUID,
+	expectedFailureAt time.Time,
+	passed bool,
+	checkedAt time.Time,
+	durationSeconds float64,
+	errMsg *string,
+	faultClass *string,
+) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	state := f.states[templateID]
+	if state == nil || state.PendingDeepFailureAt == nil || !state.PendingDeepFailureAt.Equal(expectedFailureAt) {
+		return false, nil
+	}
+	state.LastDeepCheckAt = &checkedAt
+	state.LastDeepPassed = boolPtr(passed)
+	state.LastDeepDurationSeconds = float64Ptr(durationSeconds)
+	state.LastDeepError = errMsg
+	state.LastDeepFaultClass = faultClass
+	if passed {
+		state.DeepConsecutiveFailures = 0
+	} else {
+		state.DeepConsecutiveFailures = max(state.DeepConsecutiveFailures+1, 2)
+	}
+	state.PendingDeepFailureAt = nil
+	state.DeepConfirmationDueAt = nil
+	refreshTemplateHealthAggregate(state)
+	state.UpdatedAt = state.UpdatedAt.Add(time.Microsecond)
+	delete(f.confirmationJobs, templateID)
+	return true, nil
+}
+
+func (f *fakeHealthDB) ClearTemplateHealthDeepPending(
+	_ context.Context,
+	templateID uuid.UUID,
+	expectedFailureAt time.Time,
+) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	state := f.states[templateID]
+	if state == nil || state.PendingDeepFailureAt == nil ||
+		!state.PendingDeepFailureAt.Equal(expectedFailureAt) {
+		return false, nil
+	}
+	state.PendingDeepFailureAt = nil
+	state.DeepConfirmationDueAt = nil
+	state.UpdatedAt = state.UpdatedAt.Add(time.Microsecond)
+	delete(f.confirmationJobs, templateID)
+	return true, nil
 }
 
 func (f *fakeHealthDB) ListStudentVisibleTemplates(_ context.Context) ([]models.Template, error) {
@@ -39,6 +136,18 @@ func (f *fakeHealthDB) ListStudentVisibleTemplates(_ context.Context) ([]models.
 	out := make([]models.Template, len(f.templates))
 	copy(out, f.templates)
 	return out, nil
+}
+
+func (f *fakeHealthDB) GetTemplateByID(_ context.Context, id uuid.UUID) (*models.Template, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, tmpl := range f.templates {
+		if tmpl.ID == id {
+			copy := tmpl
+			return &copy, nil
+		}
+	}
+	return nil, fmt.Errorf("template not found")
 }
 
 func (f *fakeHealthDB) GetLeastRecentlyDeepCheckedTemplate(_ context.Context) (*models.Template, error) {
@@ -72,34 +181,52 @@ func (f *fakeHealthDB) GetTemplateHealthState(_ context.Context, id uuid.UUID) (
 	return &copy, nil
 }
 
-func (f *fakeHealthDB) UpsertTemplateHealthState(_ context.Context, state database.TemplateHealthState) error {
+func (f *fakeHealthDB) CompareAndSwapTemplateHealthState(_ context.Context, state database.TemplateHealthState) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.casErr != nil {
+		return false, f.casErr
+	}
+	current, exists := f.states[state.TemplateID]
+	if !exists {
+		if !state.UpdatedAt.IsZero() {
+			return false, nil
+		}
+		state.UpdatedAt = time.Now().UTC()
+		copy := state
+		f.states[state.TemplateID] = &copy
+		return true, nil
+	}
+	if !current.UpdatedAt.Equal(state.UpdatedAt) {
+		return false, nil
+	}
+	state.UpdatedAt = current.UpdatedAt.Add(time.Microsecond)
 	copy := state
 	f.states[state.TemplateID] = &copy
-	return nil
+	return true, nil
 }
 
-// GetNewestTemplateHealthCheckTime mirrors the production MAX() query over the
-// fake's stored state, so due/not-due tests exercise real bookkeeping rather
-// than a hand-set flag.
-func (f *fakeHealthDB) GetNewestTemplateHealthCheckTime(_ context.Context) (*time.Time, error) {
+func (f *fakeHealthDB) GetLastTemplateHealthCycleCompletedAt(_ context.Context) (*time.Time, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.newestErr != nil {
-		return nil, f.newestErr
+	if f.cycleErr != nil {
+		return nil, f.cycleErr
 	}
-	var newest *time.Time
-	for _, s := range f.states {
-		if s.LastStructuralCheckAt == nil {
-			continue
-		}
-		if newest == nil || s.LastStructuralCheckAt.After(*newest) {
-			t := *s.LastStructuralCheckAt
-			newest = &t
-		}
+	if f.cycleCompletedAt == nil {
+		return nil, nil
 	}
-	return newest, nil
+	completedAt := *f.cycleCompletedAt
+	return &completedAt, nil
+}
+
+func (f *fakeHealthDB) MarkTemplateHealthCycleCompleted(_ context.Context, completedAt time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.cycleErr != nil {
+		return f.cycleErr
+	}
+	f.cycleCompletedAt = &completedAt
+	return nil
 }
 
 // fakeHealthVC implements templateHealthVCenter.
@@ -120,6 +247,7 @@ type fakeHealthVC struct {
 	// cloneCalls counts CloneForHealthCheck invocations, so a test can
 	// assert the deep check actually retried rather than merely succeeded.
 	cloneCalls int
+	cloneNames []string
 
 	// lastCloneParams records the params of the most recent clone call so a
 	// test can assert what the deep check actually asked vCenter for.
@@ -177,6 +305,7 @@ func (f *fakeHealthVC) CloneForHealthCheck(_ context.Context, params vcenter.Hea
 	f.mu.Lock()
 	f.cloneCalls++
 	f.lastCloneParams = params
+	f.cloneNames = append(f.cloneNames, params.CloneName)
 	// Consume one queued transient clone failure, if any. Lets a test model
 	// the documented "fails now, succeeds 68s later" environmental fault.
 	if len(f.cloneTransient) > 0 {
@@ -219,44 +348,19 @@ func (f *fakeHealthVC) DestroyVM(_ context.Context, _ string) error {
 type fakeHealthMetrics struct {
 	mu sync.Mutex
 
-	checkerUpValues     []float64
-	healthStatusValues  map[string]float64 // "template|checkType" → value
-	lastCheckTimestamps map[string]float64
-	pushCalls           int
+	snapshots []TemplateHealthSnapshot
+	err       error
 }
 
 func newFakeHealthMetrics() *fakeHealthMetrics {
-	return &fakeHealthMetrics{
-		healthStatusValues:  map[string]float64{},
-		lastCheckTimestamps: map[string]float64{},
-	}
+	return &fakeHealthMetrics{}
 }
 
-func (m *fakeHealthMetrics) SetCheckerUp(up float64) {
+func (m *fakeHealthMetrics) ReplaceSnapshot(_ context.Context, snapshot TemplateHealthSnapshot) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.checkerUpValues = append(m.checkerUpValues, up)
-}
-
-func (m *fakeHealthMetrics) SetHealthStatus(template, checkType string, healthy float64) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.healthStatusValues[template+"|"+checkType] = healthy
-}
-
-func (m *fakeHealthMetrics) SetLastCheckTimestamp(template string, unixSec float64) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.lastCheckTimestamps[template] = unixSec
-}
-
-func (m *fakeHealthMetrics) RecordStructuralResult(_ string, _ float64, _ bool) {}
-func (m *fakeHealthMetrics) RecordDeepResult(_ string, _ float64, _ bool)       {}
-func (m *fakeHealthMetrics) Push(_ context.Context) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.pushCalls++
-	return nil
+	m.snapshots = append(m.snapshots, snapshot)
+	return m.err
 }
 
 // Compiler check: fakeHealthMetrics must satisfy templateHealthMetrics.
@@ -273,6 +377,7 @@ func makeTemplate(id, ref string) models.Template {
 		TemplateState:  models.TemplateStateActive,
 		IsActive:       true,
 		IsInternal:     false,
+		Visibility:     "public",
 		DefaultVCPUs:   2,
 		DefaultRAMMB:   1024,
 		StagingNetwork: testStagingNetwork,
@@ -451,8 +556,12 @@ func TestCheckerLevelFailure(t *testing.T) {
 	}
 
 	// Metrics must record checker_up=0.
-	if len(metrics.checkerUpValues) == 0 || metrics.checkerUpValues[len(metrics.checkerUpValues)-1] != 0 {
-		t.Errorf("metrics.checkerUp = %v, want [0]", metrics.checkerUpValues)
+	if len(metrics.snapshots) == 0 {
+		t.Fatal("expected a persisted-state metrics snapshot")
+	}
+	checkerUp := metrics.snapshots[len(metrics.snapshots)-1].CheckerUp
+	if checkerUp == nil || *checkerUp {
+		t.Errorf("metrics checker_up = %v, want false", checkerUp)
 	}
 }
 

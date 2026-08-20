@@ -49,6 +49,7 @@ var requiredWiring = map[string][]struct {
 		{"TemplateFolder", "without it the vCenter client has no folder for source_type=iso template builds: CreateBlankVM resolves an empty path and every ISO template provision dies with `find folder \"\"` before creating anything -- the clone path hides this because it inherits the SOURCE VM's parent folder, and no ISO build had ever run"},
 		{"ReconcileTemplateHealth", "without it no template health checks run, crucible_template_health_* metrics are never pushed, and a silently-rotting template is invisible until students hit it live"},
 		{"ReconcileTemplateHealthIfDue", "the 12h ticker is created at process start and reset by every restart; this service deploys several times a day, so WITHOUT the leader-acquisition catch-up the ticker never fires and the feature above is dead on arrival. Note the plain ReconcileTemplateHealth row does not cover this -- it is a substring of this symbol, so it stays green even if the catch-up is deleted"},
+		{"ReplaceTemplateHealthSnapshot", "without the leader-acquisition replacement, Pushgateway retains deleted templates and obsolete raw check_type series from the previous worker process whenever the due-check skips a fresh vCenter cycle"},
 	},
 	"cmd/crucible-runner/main.go": {
 		{"MaterializeActionLibrary", "without it the engine-generated action library is never written to disk, so every library action (http_get, port_open, ssh_exec, …) fails with exit 127 — the original defect, in which workflows appeared to run, the Job exited 0, and no action could possibly pass"},

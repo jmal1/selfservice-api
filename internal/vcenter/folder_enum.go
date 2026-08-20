@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/vmware/govmomi/property"
 	"github.com/vmware/govmomi/vim25/mo"
@@ -13,17 +14,18 @@ import (
 // FolderVM is the enriched description of a VM living in a vCenter folder,
 // suitable for surfacing to admin UIs that need to register Crucible templates.
 type FolderVM struct {
-	Name              string `json:"name"`
-	MoRef             string `json:"moref"`
-	PowerState        string `json:"power_state"`
-	OSType            string `json:"os_type"`
-	GuestFullName     string `json:"guest_full_name"`
-	NumCPU            int32  `json:"num_cpu"`
-	MemoryMB          int32  `json:"memory_mb"`
-	DiskGB            int64  `json:"disk_gb"`
-	SnapshotCount     int    `json:"snapshot_count"`
-	HasSnapshot       bool   `json:"has_initial_snapshot"`
-	VMwareToolsStatus string `json:"vmware_tools_status"`
+	Name              string     `json:"name"`
+	MoRef             string     `json:"moref"`
+	PowerState        string     `json:"power_state"`
+	OSType            string     `json:"os_type"`
+	GuestFullName     string     `json:"guest_full_name"`
+	NumCPU            int32      `json:"num_cpu"`
+	MemoryMB          int32      `json:"memory_mb"`
+	DiskGB            int64      `json:"disk_gb"`
+	SnapshotCount     int        `json:"snapshot_count"`
+	HasSnapshot       bool       `json:"has_initial_snapshot"`
+	VMwareToolsStatus string     `json:"vmware_tools_status"`
+	CreatedAt         *time.Time `json:"-"`
 }
 
 // ListVMsInFolder enumerates VirtualMachine children of a vCenter folder by path
@@ -61,6 +63,7 @@ func (c *Client) ListVMsInFolder(ctx context.Context, folderPath string) ([]Fold
 		"name",
 		"config.hardware.numCPU",
 		"config.hardware.memoryMB",
+		"config.createDate",
 		"guest.guestFullName",
 		"guest.guestFamily",
 		"guest.toolsStatus",
@@ -94,6 +97,7 @@ func vmToFolderVM(vm *mo.VirtualMachine) FolderVM {
 	if vm.Config != nil {
 		out.NumCPU = vm.Config.Hardware.NumCPU
 		out.MemoryMB = vm.Config.Hardware.MemoryMB
+		out.CreatedAt = vm.Config.CreateDate
 	}
 
 	if vm.Guest != nil {

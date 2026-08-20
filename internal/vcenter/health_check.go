@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/types"
@@ -272,10 +273,11 @@ func containsAny(s string, subs ...string) bool {
 // match a student pod name; the sweep is therefore safe to run automatically.
 const HealthCheckClonePrefix = "crucible-healthcheck-"
 
-// SweepHealthCheckOrphans lists VMs in folderPath and destroys any whose
-// name starts with HealthCheckClonePrefix. Errors during individual destroys
-// are logged and counted but do not abort the sweep.
-func (c *Client) SweepHealthCheckOrphans(ctx context.Context, folderPath string) (int, error) {
+// SweepHealthCheckOrphans lists VMs in folderPath and destroys health-check
+// clones created before cutoff. A newly elected leader can overlap a
+// confirmation job already claimed by another worker, so deleting every
+// prefixed VM would destroy that job's active validation artifact.
+func (c *Client) SweepHealthCheckOrphans(ctx context.Context, folderPath string, cutoff time.Time) (int, error) {
 	if folderPath == "" {
 		folderPath = c.config.TemplateFolder
 	}
@@ -290,7 +292,11 @@ func (c *Client) SweepHealthCheckOrphans(ctx context.Context, folderPath string)
 
 	var destroyed int
 	for _, vm := range vms {
-		if !strings.HasPrefix(vm.Name, HealthCheckClonePrefix) {
+		if !isSweepableHealthCheckClone(vm, cutoff) {
+			if strings.HasPrefix(vm.Name, HealthCheckClonePrefix) {
+				c.logger.Info("retaining recent health-check clone during orphan sweep",
+					"name", vm.Name, "moref", vm.MoRef, "created_at", vm.CreatedAt)
+			}
 			continue
 		}
 		c.logger.Warn("sweeping orphaned health-check clone",
@@ -307,4 +313,10 @@ func (c *Client) SweepHealthCheckOrphans(ctx context.Context, folderPath string)
 		c.logger.Info("swept health-check orphans", "destroyed", destroyed, "folder", folderPath)
 	}
 	return destroyed, nil
+}
+
+func isSweepableHealthCheckClone(vm FolderVM, cutoff time.Time) bool {
+	return strings.HasPrefix(vm.Name, HealthCheckClonePrefix) &&
+		vm.CreatedAt != nil &&
+		vm.CreatedAt.Before(cutoff)
 }

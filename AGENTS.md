@@ -519,6 +519,45 @@ Source: [`internal/scriptvalidator/wrap.go`](internal/scriptvalidator/wrap.go), 
 
 ---
 
+## 14. Template-health operator contract
+
+Template-health paging uses persisted, independently confirmed state:
+
+- `crucible_template_health_status{template}` is `1` healthy, `0` unhealthy, `-1` unknown. It is rebuilt from PostgreSQL and replaced in Pushgateway with `PUT`; it has no `check_type` label.
+- `crucible_template_health_attempt_status{template,check_type}` and `crucible_template_health_last_check_timestamp_seconds{template,check_type}` are raw diagnostics only. Never page from a raw attempt.
+- `crucible_template_health_checker_up` is included in every replacement snapshot. Leader startup performs a lightweight vCenter probe before replacing the group, so deploys do not leave the alert gate absent.
+- A first deep failure persists pending state and schedules a durable `template_health_confirm` job after a 5-minute default backoff (hard-capped at 30 minutes). Only a failed fresh confirmation clone can mark deep health unhealthy; success clears pending state.
+- The virtual-disk corrupt/unsupported vSphere observation is retained under fault class `vsphere_virtual_disk_corrupt_or_unsupported` and in PostgreSQL error text/logs. Do not suppress it.
+
+This repository does not own live Grafana resources. Proposed confirmed alert:
+
+```promql
+(crucible_template_health_status == 0)
+and on() (crucible_template_health_checker_up == 1)
+and on()
+  (time() - crucible_template_health_checker_last_success_timestamp_seconds < 30 * 60 * 60)
+```
+
+Use `for: 15m`; do not infer confirmation with a 13-hour `for`. Proposed annotations:
+
+```yaml
+summary: 'Confirmed template health failure: {{ $labels.template }}'
+description: 'PostgreSQL marks {{ $labels.template }} unhealthy after the required independent confirmation. The checker is fresh; inspect per-check fault metrics, the admin health endpoint, and vCenter task history.'
+runbook_url: 'https://github.com/jmal1/selfservice-api/blob/main/docs/instructor/templates.md#prometheus-and-grafana-contract'
+```
+
+Freshness alert:
+
+```promql
+absent(crucible_template_health_checker_last_success_timestamp_seconds)
+or
+(time() - crucible_template_health_checker_last_success_timestamp_seconds > 30 * 60 * 60)
+```
+
+Keep the paused live rule paused until migration + worker rollout completes, legacy `crucible_template_health_status{check_type=...}` series are absent, and the replacement metric agrees with `GET /api/v1/admin/templates/health`.
+
+---
+
 ## 15. Image Upload → Auto-Import → Wizard Flow
 
 This section documents the full lifecycle for getting an ISO or OVA into vCenter so it can be referenced by a template. This is an **operational** flow (not authoring), but it is documented here because AI agents sometimes need to explain it to instructors.

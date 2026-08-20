@@ -71,9 +71,10 @@ type Provisioner struct {
 	// so a worker deployed without an object store still starts and serves
 	// every other job type; image_import jobs then fail loudly with a clear
 	// message rather than nil-panicking mid-upload.
-	objects  imageObjectStore
-	pipeline pipelineMetricsSink
-	imageCfg ImageImportConfig
+	objects   imageObjectStore
+	pipeline  pipelineMetricsSink
+	imageCfg  ImageImportConfig
+	healthCfg TemplateHealthReconcilerConfig
 
 	// cloneMu serialises concurrent clones from the same source VM moref.
 	// Key: source moref (string), value: chan struct{} (semaphore of size 1).
@@ -98,6 +99,12 @@ func (p *Provisioner) EnableImageImport(objects *objectstore.Client, metrics pip
 		p.pipeline = metrics
 	}
 	p.imageCfg = cfg
+}
+
+// ConfigureTemplateHealth stores the production configuration used by durable
+// confirmation jobs. A job can outlive the leader cycle that created it.
+func (p *Provisioner) ConfigureTemplateHealth(cfg TemplateHealthReconcilerConfig) {
+	p.healthCfg = cfg
 }
 
 // New creates a provisioner with all required clients.
@@ -154,6 +161,8 @@ func (p *Provisioner) ProcessJob(ctx context.Context, job *models.Job) error {
 			return p.VerifyTemplate(ctx, job)
 		case models.JobTypeTemplateRevalidate:
 			return p.RevalidateL1Template(ctx, job)
+		case models.JobTypeTemplateHealthConfirm:
+			return p.ConfirmTemplateHealth(ctx, job)
 		case models.JobTypeImageImport:
 			return p.ImportImage(ctx, job)
 		case models.JobTypeVMSuspend:
@@ -167,7 +176,8 @@ func (p *Provisioner) ProcessJob(ctx context.Context, job *models.Job) error {
 func isTemplateJobType(jobType string) bool {
 	switch jobType {
 	case models.JobTypeTemplateProvision, models.JobTypeTemplateGeneralize,
-		models.JobTypeTemplateVerify, models.JobTypeTemplateRevalidate:
+		models.JobTypeTemplateVerify, models.JobTypeTemplateRevalidate,
+		models.JobTypeTemplateHealthConfirm:
 		return true
 	default:
 		return false
