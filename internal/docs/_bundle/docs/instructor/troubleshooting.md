@@ -266,6 +266,160 @@ of those links is broken.
 
 ---
 
+## Student content filter policy
+
+Student pods in `10.100.0.0/16` use fwpodv01 for gateway and DNS. The platform
+blocks adult/explicit, gambling, drugs, violence, social-media, and streaming
+categories; forces SafeSearch; and blocks common external DNS, DoH/DoT/DoQ,
+VPN, proxy, and Tor bypass paths. It does **not** intercept TLS.
+
+Global quick logged denies cover TCP/UDP 853, UDP 784 and 8853 (DoQ), UDP 443
+(forcing QUIC/HTTP3 fallback), and external GRE, ESP, and AH before broad
+per-pod interface passes. Intentional traffic within `10.100.0.0/16` is
+preserved for the tunnel protocols. TCP 443 is not blocked globally, so custom
+tunnels disguised as ordinary HTTPS remain a residual limitation.
+
+The allowlist is permanent and admin-managed through reviewed deployment
+configuration. Instructors and students cannot add temporary exceptions. Send
+a false-positive request to a platform admin with the exact domain, course,
+reason, and expiry review date; do not tell students to switch DNS or install a
+VPN.
+
+Only blocked DNS/firewall events are sent to telemetry. The external log store
+retains them for 30 days. Successful browsing and DNS queries are not part of
+this policy's telemetry.
+
+### `content_filter_policy` is firing
+
+This synthetic is read-only. It checks the live OPNsense firewall and Unbound
+model without creating a pod or changing the firewall. It fails when:
+
+- policy is expected while the current client cannot safely manage and verify
+  source-scoped SafeSearch (the built-in switch is global, and management and
+  staging must remain unchanged);
+- a required global quick rule is missing, duplicated, reordered, unlogged, or
+  no longer scoped to `10.100.0.0/16`;
+- the source-scoped DNSBL policy, internal category feed, or permanent
+  allowlist drifts;
+- an uncached controlled query from the student source does not prove the
+  effective DNSBL/SafeSearch behavior; or
+- policy is expected but the synthetic's dedicated read-only OPNsense
+  credentials are absent.
+
+The validated internal feed is
+`https://student-filter-feed.lab.jmal.io`. The deployment value
+`categoryFeedBaseURL` is this exact base URL, not a list URL; the worker expands
+it in order to `/lists/drogue.txt`, `/lists/agressif.txt`,
+`/lists/audio-video.txt`, and `/lists/social_networks.txt`. Arbitrary hosts,
+ports, paths, queries, fragments, and userinfo are rejected. Its hostname-only LKG inputs are
+`drogue` (436), `blacklists/agressif/domains` (266), `audio-video` (3,620),
+and `social_networks` (715); IP entries are excluded. OPNsense 26.1 has no
+built-in social-media selector. The capacity-tested built-in selection is
+exactly `oisd2`, `hgz014`, and `hgz021` (Gambling Mini). Do not substitute the
+larger `hgz019` or `hgz020` gambling lists; `hgz022` does not exist. The
+supervised 4 GB pilot measured 626,913 final domains and 389 MB Unbound RSS
+with this exact selection.
+
+The repository integration is intentionally read-only even if source-scoped
+SafeSearch capability becomes available: it validates configuration, inspects
+exact firewall/DNSBL state, and verifies effective behavior, but never mutates,
+refreshes, or applies the policy. Supervised activation remains a live-only
+step until a transactional owner can roll back every firewall, DNSBL, Unbound,
+and runtime-verification failure without leaving staged policy behind.
+While policy is enabled but inspection is unhealthy, the network reconciler
+also suppresses unrelated firewall applies so they cannot activate a partial
+staged model.
+
+Do not treat a successful DNSBL API action as proof of runtime enforcement.
+Activation is asynchronous, the Python module reloads `dnsbl.json` only on an
+uncached query after its 60-second gate, and the action can mask shell failures.
+
+OPNsense does support a source-scoped mechanism outside its built-in switch. A
+reversible pilot used an unmanaged
+`/usr/local/etc/unbound.opnsense.d/*.conf` fragment with
+`access-control-view`, a `view` using `view-first: yes`, and SafeSearch
+`local-zone` / `local-data` CNAME rewrites; `configctl unbound check` validated
+the result, and removing the fragment restored normal answers. This integration
+does not yet transactionally own that fragment, so activation remains blocked.
+A follow-up must stage a stable owned fragment, reject conflicts, validate before
+reconfigure, roll back and reconfigure on failure, then prove forced answers from
+a real student source and unchanged answers from a control source. The synthetic
+must repeat the effective uncached student-source check rather than trusting
+configuration readback.
+
+The policy must remain disabled until the synthetic can flush/use controlled
+uncached fixtures and verify actual answers from `10.100.0.0/16`.
+
+Check `crucible_content_filter_policy` and
+`crucible_opnsense_firewall_rules` first. Do not “fix” the alert by disabling
+the synthetic or pointing it at the Crucible API; that would be a tautology and
+would not inspect the firewall.
+
+### Generated firewall-rule growth
+
+On 2026-08-21, fwpodv01 exposed 3,088 automation rules, 3,078 with blank
+descriptions. `/conf/config.xml` had reached 5,272,716 bytes. One semantic rule
+(`opt6`, source `10.100.15.0/24`, pass to any) existed 86 times.
+
+The growth had four coupled causes:
+
+1. `CreatePod` added the broad pod pass unconditionally, including on retries.
+2. `DestroyPod` removed DHCP/interface/VLAN state but not the pass rule.
+3. Reused VLANs and dynamic `optN` assignments therefore accumulated old
+   rules.
+4. The client sent legacy JSON key `descr`; OPNsense 26.1 expects
+   `description`, so generated rules were blank and could not carry ownership.
+
+The repair inventories only `firewall/filter/get` (never `searchRule`), compares
+content independent of UUID/description/sequence, and deletes only exact
+blank-description legacy or `crucible:pod-pass:v1` shapes. It preserves every
+named/manual rule. Malformed, truncated, ambiguous, or over-limit inventories
+cause no firewall mutation. Cleanup deletes at most the configured bound and
+applies once.
+
+If duplicate/stale counts remain positive, leave the worker controlled and let
+subsequent supervised passes converge. Never bulk-delete all blank rules by
+description alone.
+
+### Alert rules owned by the observability deployment
+
+This repository emits the metric/check contract but does not provision live
+Grafana resources. The observability owner should install:
+
+```promql
+1 - crucible_synthetic_check_success{check="content_filter_policy"} > 0
+```
+
+```promql
+crucible_opnsense_firewall_rules{kind=~"duplicate|stale"} > 0
+or
+crucible_opnsense_firewall_cleanup_limited == 1
+```
+
+```promql
+delta(crucible_opnsense_firewall_rules{kind="total"}[15m]) > 25
+```
+
+```promql
+(crucible_content_filter_policy{kind="expected"} == 1)
+and on(job, component, layer)
+(crucible_content_filter_policy{kind="healthy"} == 0)
+```
+
+```promql
+absent(crucible_content_filter_last_success_timestamp_seconds)
+or
+(time() - crucible_content_filter_last_success_timestamp_seconds > 15 * 60)
+or
+(time() - crucible_network_reconcile_run_timestamp_seconds > 15 * 60)
+```
+
+Use this section as the runbook URL. Do not enable the policy or alerts until
+the internal validated category feed, read-only synthetic identity, external
+30-day blocked-only retention, and supervised rollout are ready.
+
+---
+
 If you've checked the above and the workflow still misbehaves, capture:
 
 1. The workflow JSON (`GET /api/v1/admin/workflows/{slug}`).

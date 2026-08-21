@@ -408,6 +408,7 @@ func All() []synthetic.Check {
 		ImageUploadRBAC,
 		TemplateHealthStatusRBAC,
 		TemplatePinRBAC,
+		ContentFilterPolicy(ContentFilterPolicyConfig{}),
 	}
 }
 

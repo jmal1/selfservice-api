@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -344,6 +345,28 @@ func main() {
 			logger.Warn("invalid WORKER_NETWORK_RECONCILER_INTERVAL; using default 5m", "value", v, "error", err)
 		}
 	}
+	networkMaxFirewallRules := 4096
+	if v := os.Getenv("WORKER_NETWORK_RECONCILER_MAX_FIREWALL_RULES"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			networkMaxFirewallRules = parsed
+		} else {
+			logger.Warn("invalid WORKER_NETWORK_RECONCILER_MAX_FIREWALL_RULES; using default 4096", "value", v)
+		}
+	}
+	networkFirewallCleanupLimit := 100
+	if v := os.Getenv("WORKER_NETWORK_RECONCILER_FIREWALL_CLEANUP_LIMIT"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			networkFirewallCleanupLimit = parsed
+		} else {
+			logger.Warn("invalid WORKER_NETWORK_RECONCILER_FIREWALL_CLEANUP_LIMIT; using default 100", "value", v)
+		}
+	}
+	contentFilterEnabled := strings.EqualFold(os.Getenv("WORKER_CONTENT_FILTER_ENABLED"), "true")
+	contentFilterSourceNetwork := os.Getenv("WORKER_CONTENT_FILTER_SOURCE_NETWORK")
+	if contentFilterSourceNetwork == "" {
+		contentFilterSourceNetwork = "10.100.0.0/16"
+	}
+	contentFilterAllowlist := splitNonEmpty(os.Getenv("WORKER_CONTENT_FILTER_ALLOWLIST"))
 	var networkReconcilerPusher *provisioner.NetworkReconcilePusher
 	if pgURL := os.Getenv("WORKER_PUSHGATEWAY_URL"); pgURL != "" {
 		job := os.Getenv("WORKER_PUSHGATEWAY_JOB")
@@ -356,7 +379,17 @@ func main() {
 			GroupingLabels: map[string]string{"layer": "api"},
 		}
 	}
-	networkReconcilerCfg := provisioner.NetworkReconcilerConfig{Pusher: networkReconcilerPusher}
+	networkReconcilerCfg := provisioner.NetworkReconcilerConfig{
+		MaxFirewallRules:     networkMaxFirewallRules,
+		FirewallCleanupLimit: networkFirewallCleanupLimit,
+		ContentFilter: provisioner.ContentFilterConfig{
+			Enabled:             contentFilterEnabled,
+			SourceNetwork:       contentFilterSourceNetwork,
+			CategoryFeedBaseURL: os.Getenv("WORKER_CONTENT_FILTER_CATEGORY_FEED_BASE_URL"),
+			Allowlist:           contentFilterAllowlist,
+		},
+		Pusher: networkReconcilerPusher,
+	}
 
 	// Idle VM suspend evaluator. Checks for running pod VMs that have been
 	// idle (no console activity AND low CPU/net) for longer than the configured
@@ -872,10 +905,21 @@ func envDuration(logger *slog.Logger, key string, def time.Duration) time.Durati
 	if v == "" {
 		return def
 	}
+
 	parsed, err := time.ParseDuration(v)
 	if err != nil || parsed <= 0 {
 		logger.Warn("invalid duration in env; using default", "key", key, "value", v, "default", def, "error", err)
 		return def
 	}
 	return parsed
+}
+
+func splitNonEmpty(value string) []string {
+	var out []string
+	for _, part := range strings.Split(value, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }

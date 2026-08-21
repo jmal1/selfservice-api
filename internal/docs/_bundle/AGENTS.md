@@ -651,3 +651,105 @@ If an import fails (`status=error`), the MinIO object is retained so retry is ch
 - Engine (how runs are orchestrated): [`internal/engine/engine.go`](internal/engine/engine.go)
 - API routes: [`internal/api/routes/routes.go`](internal/api/routes/routes.go) — workflow + action endpoints under `/api/v1/admin/`
 - Live action catalog (the *real* source of truth for available actions): `GET /api/v1/admin/actions` against your Crucible instance.
+
+---
+
+## 16. Student content-filter operator contract
+
+Student pod traffic originates from `10.100.0.0/16` and uses fwpodv01
+(OPNsense 26.1) as gateway and DNS. The approved policy:
+
+- blocks adult/explicit, gambling, drugs, violence, social-media, and
+  audio/video streaming categories;
+- forces the OPNsense Unbound SafeSearch rewrites;
+- blocks external DNS plus common DoH, DoT, DoQ, VPN, proxy, and Tor bypasses;
+- has no TLS interception;
+- accepts permanent deployment-reviewed admin allowlist entries only; and
+- ships blocked events only, with 30-day retention configured in the external
+  log store.
+
+Global quick logged denies cover TCP/UDP 853, UDP 784 and 8853 (DoQ), UDP 443
+(forcing QUIC/HTTP3 fallback), and external GRE, ESP, and AH. Intentional
+traffic within `10.100.0.0/16` is preserved for the tunnel protocols. TCP 443
+is not blocked globally; custom tunnels over ordinary HTTPS remain a residual
+limitation.
+
+The worker owns quick global/floating firewall rules scoped by source network.
+In OPNsense 26.1 those rules are priority group 200000 and therefore evaluate
+before per-interface broad pod passes (priority group 400000). They deliberately
+have an empty `interface`, so dynamic VLAN-to-`optN` remapping cannot move the
+policy behind or around a pod pass.
+
+Content-filter activation is disabled by default. `categoryFeedBaseURL` must be
+exactly `https://student-filter-feed.lab.jmal.io` (an optional trailing slash is
+accepted). The worker deterministically expands it to
+`/lists/drogue.txt`, `/lists/agressif.txt`, `/lists/audio-video.txt`, and
+`/lists/social_networks.txt`; arbitrary hosts and paths are rejected. These
+validated, OPNsense-reachable internal HTTPS lists cover UT1
+`drogue`, `audio-video`, and `social_networks` plus the maintained
+`blacklists/agressif/domains` violence/aggression category. The validated feed
+is `https://student-filter-feed.lab.jmal.io`; its hostname-only LKG counts are
+436, 3,620, 715, and 266 respectively. The capacity-tested built-in selection
+is exactly `oisd2`, `hgz014`, and `hgz021` (Gambling Mini); `hgz019` and
+`hgz020` are larger gambling variants, and `hgz022` does not exist. The
+supervised 4 GB pilot measured 626,913 final domains and 389 MB Unbound RSS
+with this exact selection. Missing/invalid feed configuration fails before any
+partial policy mutation.
+
+Activation is also intentionally read-only in the worker today: it validates
+configuration, inspects exact firewall/DNSBL state, and verifies runtime
+behavior, but does not create, update, delete, refresh, or apply policy. This
+prevents a failed multi-system activation from leaving a partial model that a
+later unrelated firewall apply could activate. While policy is enabled but
+inspection is unhealthy, the network reconciler also suppresses unrelated
+firewall applies.
+
+OPNsense 26.1's
+built-in Force SafeSearch setting is a general/global Unbound switch, while the
+approved scope must leave management and staging unchanged. Do not enable the
+global switch. A reversible live pilot proved source-scoped SafeSearch can use
+an unmanaged `/usr/local/etc/unbound.opnsense.d/*.conf` fragment with
+`access-control-view`, `view-first: yes`, and SafeSearch `local-zone` /
+`local-data` rewrites. The current HTTP client does not transactionally own,
+validate, activate, or roll back that custom view, so it must continue to report
+the capability as unsupported.
+
+A follow-up implementation must render a stable owned fragment, reject
+conflicting fragments, stage and validate it with `configctl unbound check`,
+reconfigure Unbound, verify effective answers from both a student source and an
+unchanged control source, and restore the previous fragment plus reconfigure on
+any failure. The read-only synthetic must independently use uncached controlled
+fixtures from a real student-source query path. DNSBL apply is asynchronous, and
+its action can return OK while masking shell errors; never trust API/model status
+alone.
+
+### Firewall generated-rule ownership
+
+Always inventory automation rules with `GET /api/firewall/filter/get`.
+`searchRule` is not authoritative: it has returned `total=1` while thousands of
+rules existed. OPNsense 26.1 writes the rule field `description`; sending the
+legacy `descr` key silently creates an unnamed rule.
+
+Automatic cleanup may delete only an exact pod-pass shape that is either:
+
+1. a blank-description legacy rule, or
+2. marked `crucible:pod-pass:v1:...`.
+
+Every named/manual rule is preserved. A generated pod pass must be one `optN`
+interface, pass/in/IPv4/any, one `10.100.x.0/24` source, destination `any`, and
+empty ports/inversions. A partial or ambiguous match aborts mutation. Cleanup is
+bounded per pass and applies once; a destroy that hits the bound remains
+`destroy_failed` so retry can finish it.
+
+The 2026-08-21 incident demonstrated why these constraints are mandatory:
+fwpodv01 had 3,088 automation rules (3,078 blank descriptions), including 86
+copies of `opt6 + 10.100.15.0/24 -> any pass`, and a 5,272,716-byte
+`/conf/config.xml`. Root causes were unconditional creation in `CreatePod`,
+missing destroy cleanup, VLAN/`optN` reuse, and the `descr`/`description`
+mismatch. The supervised cleanup retained all ten named/manual rules plus one
+pass for each of six assigned pod interfaces.
+
+Do not deploy content-filter changes, scale workers, or restore destructive
+synthetics while an infrastructure containment hold is active. Read-only policy
+inspection through `content_filter_policy` is the only non-destructive
+synthetic defined for this feature.

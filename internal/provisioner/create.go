@@ -543,21 +543,16 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 	// --- Step 4b: Create firewall rule to allow pod traffic ---
 	p.publishProgress(job.ID, "firewall_create", "Creating firewall rule for pod network")
 
-	fwRule := opnsense.FirewallRule{
-		Enabled:     "1",
-		Action:      "pass",
-		Interface:   ifName,
-		Direction:   "in",
-		IPProtocol:  "inet",
-		Protocol:    "any",
-		Source:      subnet,
-		Destination: "any",
-		Description: fmt.Sprintf("Allow Pod VLAN %d traffic", vlanTag),
-	}
-	fwRuleUUID, err := p.opn.CreateFirewallRule(ctx, fwRule)
-	if err != nil {
-		p.logger.Warn("failed to create firewall rule (non-fatal)", "error", err)
-	} else {
+	fwRuleUUID, fwRuleCreated, err := ensurePodFirewallRule(
+		ctx,
+		p.opn,
+		int(vlanTag),
+		ifName,
+		subnet,
+		defaultMaxFirewallRules,
+		defaultFirewallCleanupLimit,
+	)
+	if fwRuleCreated {
 		rb.RegisterUndo("firewall_create", func(ctx context.Context, data json.RawMessage) error {
 			var d struct {
 				UUID string `json:"uuid"`
@@ -571,9 +566,10 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		if err := rb.Record(ctx, "firewall_create", map[string]string{"uuid": fwRuleUUID}); err != nil {
 			return err
 		}
-		if err := p.opn.ApplyFirewall(ctx); err != nil {
-			p.logger.Warn("failed to apply firewall (non-fatal)", "error", err)
-		}
+	}
+	if err != nil {
+		rbErrs := rb.Rollback(ctx)
+		return fmt.Errorf("ensure firewall rule (rollback errors: %v): %w", rbErrs, err)
 	}
 
 	// --- Step 5: Create port groups on all ESXi hosts ---

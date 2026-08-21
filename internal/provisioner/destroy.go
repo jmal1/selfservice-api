@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/google/uuid"
 	"github.com/jmal1/selfservice-api/internal/models"
 )
 
@@ -93,7 +94,33 @@ func (p *Provisioner) DestroyPod(ctx context.Context, job *models.Job) error {
 		}
 	}
 
-	// --- Step 5: Remove OPNsense interface (SSH) ---
+	// --- Step 5: Remove generated firewall rules before unassigning interface ---
+	p.publishProgress(job.ID, "firewall_delete", "Removing generated firewall rules")
+	ifName, findErr := p.opnSSH.FindInterfaceByVLAN(ctx, int(vlanTag))
+	if findErr != nil {
+		p.logger.Warn("failed to find interface for firewall cleanup", "vlan", vlanTag, "error", findErr)
+		cleanupErr := fmt.Errorf("find interface for firewall cleanup: %w", findErr)
+		errors = append(errors, cleanupErr)
+		return p.failPodDestroy(ctx, pod.ID, errors)
+	} else if ifName != "" {
+		if removed, cleanupErr := deletePodFirewallRules(
+			ctx,
+			p.opn,
+			ifName,
+			subnet,
+			defaultMaxFirewallRules,
+			defaultFirewallCleanupLimit,
+		); cleanupErr != nil {
+			p.logger.Warn("failed to clean generated firewall rules",
+				"vlan", vlanTag, "interface", ifName, "removed", removed, "error", cleanupErr)
+			errors = append(errors, fmt.Errorf("delete firewall rules: %w", cleanupErr))
+			// Keep the interface assignment intact so the retry can identify
+			// the exact generated signature and finish bounded cleanup.
+			return p.failPodDestroy(ctx, pod.ID, errors)
+		}
+	}
+
+	// --- Step 6: Remove OPNsense interface (SSH) ---
 	p.publishProgress(job.ID, "interface_delete", "Removing OPNsense interface")
 	unassignedIf, err := p.opnSSH.UnassignInterfaceByVLAN(ctx, int(vlanTag))
 	if err != nil {
@@ -108,7 +135,7 @@ func (p *Provisioner) DestroyPod(ctx context.Context, job *models.Job) error {
 		_ = p.opn.RestartDHCP(ctx)
 	}
 
-	// --- Step 6: Delete VLAN ---
+	// --- Step 7: Delete VLAN ---
 	p.publishProgress(job.ID, "vlan_delete", fmt.Sprintf("Deleting VLAN %d", vlanTag))
 	existingVLAN, _ := p.opn.GetVLANByTag(ctx, vlanTag)
 	if existingVLAN != nil {
@@ -120,13 +147,9 @@ func (p *Provisioner) DestroyPod(ctx context.Context, job *models.Job) error {
 		}
 	}
 
-	// --- Step 7: Mark pod as destroyed and release VLAN ---
+	// --- Step 8: Mark pod as destroyed and release VLAN ---
 	if len(errors) > 0 {
-		errMsg := fmt.Sprintf("%d cleanup errors occurred", len(errors))
-		_ = p.db.UpdatePodStatus(ctx, pod.ID, models.PodStatusDestroyFailed, errMsg)
-		p.logger.Warn("pod destruction incomplete, marked destroy_failed",
-			"pod_id", pod.ID, "error_count", len(errors))
-		return fmt.Errorf("pod destroy incomplete with %d errors: %v", len(errors), errors)
+		return p.failPodDestroy(ctx, pod.ID, errors)
 	}
 
 	_ = p.db.UpdatePodStatus(ctx, pod.ID, "destroyed", "")
@@ -134,6 +157,14 @@ func (p *Provisioner) DestroyPod(ctx context.Context, job *models.Job) error {
 	p.publishProgress(job.ID, "destroyed", "Pod destroyed successfully")
 	p.logger.Info("pod destroyed successfully", "pod_id", pod.ID, "vlan", vlanTag)
 	return nil
+}
+
+func (p *Provisioner) failPodDestroy(ctx context.Context, podID uuid.UUID, errors []error) error {
+	errMsg := fmt.Sprintf("%d cleanup errors occurred", len(errors))
+	_ = p.db.UpdatePodStatus(ctx, podID, models.PodStatusDestroyFailed, errMsg)
+	p.logger.Warn("pod destruction incomplete, marked destroy_failed",
+		"pod_id", podID, "error_count", len(errors))
+	return fmt.Errorf("pod destroy incomplete with %d errors: %v", len(errors), errors)
 }
 
 // RetryFailedDestroys finds pods stuck in "destroy_failed" and re-runs

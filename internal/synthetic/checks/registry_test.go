@@ -252,6 +252,7 @@ func TestAll_StableNames(t *testing.T) {
 		"template_health_status_rbac":  true,
 		"template_pin_rbac":            true,
 		"template_visibility_enforced": true,
+		"content_filter_policy":        true,
 	}
 	for _, c := range All() {
 		if !wantNames[c.Name()] {

@@ -78,6 +78,34 @@ spec:
                       optional: true
                 - name: SYNTHETIC_INSTRUCTOR_USERNAME
                   value: {{ .Values.synthetic.instructorUsername | quote }}
+                - name: SYNTHETIC_CONTENT_FILTER_EXPECTED
+                  value: {{ .Values.worker.contentFilter.enabled | default false | quote }}
+                - name: SYNTHETIC_CONTENT_FILTER_SOURCE_NETWORK
+                  value: {{ .Values.worker.contentFilter.sourceNetwork | default "10.100.0.0/16" | quote }}
+                - name: SYNTHETIC_CONTENT_FILTER_CATEGORY_FEED_BASE_URL
+                  value: {{ .Values.worker.contentFilter.categoryFeedBaseURL | default "" | quote }}
+                - name: SYNTHETIC_CONTENT_FILTER_ALLOWLIST
+                  value: {{ join "," (.Values.worker.contentFilter.allowlist | default (list)) | quote }}
+                - name: SYNTHETIC_CONTENT_FILTER_MAX_GENERATED_RULES
+                  value: {{ .Values.synthetic.contentFilter.maxGeneratedRules | default 256 | quote }}
+                - name: SYNTHETIC_OPNSENSE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.synthetic.contentFilter.opnsenseSecretName }}
+                      key: opnsense-url
+                      optional: true
+                - name: SYNTHETIC_OPNSENSE_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.synthetic.contentFilter.opnsenseSecretName }}
+                      key: opnsense-api-key
+                      optional: true
+                - name: SYNTHETIC_OPNSENSE_API_SECRET
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.synthetic.contentFilter.opnsenseSecretName }}
+                      key: opnsense-api-secret
+                      optional: true
                 {{- if .Values.synthetic.lifecycle.enabled }}
                 - name: SYNTHETIC_LIFECYCLE_ENABLED
                   value: "true"

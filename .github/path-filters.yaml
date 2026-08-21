@@ -70,7 +70,14 @@ synthetic-api-monitor:
   - 'cmd/synthetic-api-monitor/**'
   - 'internal/audit/**'
   - 'internal/auth/**'
+  - 'internal/objectstore/**'
+  - 'internal/opnsense/**'
+  - 'internal/provisioner/**'
+  - 'internal/rollback/**'
   - 'internal/synthetic/**'
+  - 'internal/templates/**'
+  - 'internal/unattend/**'
+  - 'internal/vcenter/**'
 
 crucible-runner:
   # deploy/runner/Dockerfile does NOT just package a bash library: its builder
