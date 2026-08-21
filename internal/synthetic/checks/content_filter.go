@@ -31,7 +31,7 @@ func ContentFilterPolicy(cfg ContentFilterPolicyConfig) synthetic.Check {
 	return synthetic.CheckFunc{
 		NameVal:        "content_filter_policy",
 		TitleVal:       "Student Content Filter Policy",
-		DescriptionVal: "Reads OPNsense without mutating it. Refuses global Force SafeSearch, verifies global quick bypass controls and source-scoped DNSBL configuration, then requires effective student-source queries.",
+		DescriptionVal: "Reads OPNsense without mutating it. Requires client-managed source-scoped SafeSearch, verifies global quick bypass controls and source-scoped DNSBL configuration, then requires effective student-source queries.",
 		RunbookVal:     "https://github.com/jmal1/selfservice-api/blob/main/docs/instructor/troubleshooting.md#student-content-filter-policy",
 		SeverityVal:    synthetic.SeverityCritical,
 		RunFn: func(ctx context.Context, _ *synthetic.Client) (int, error) {
@@ -46,7 +46,7 @@ func ContentFilterPolicy(cfg ContentFilterPolicyConfig) synthetic.Check {
 				return 0, fmt.Errorf("check source-scoped SafeSearch support: %w", err)
 			}
 			if !supported {
-				return 0, fmt.Errorf("content filter is expected but OPNsense 26.1 Force SafeSearch is global and source-scoped verification is unavailable")
+				return 0, fmt.Errorf("content filter is expected but OPNsense 26.1 built-in Force SafeSearch is global and this integration does not manage or verify the proven custom Unbound view")
 			}
 			rules, err := cfg.Reader.GetFirewallRules(ctx)
 			if err != nil {

@@ -141,7 +141,7 @@ func reconcileContentFilter(
 		return result, fmt.Errorf("check source-scoped SafeSearch support: %w", err)
 	}
 	if !supported {
-		return result, fmt.Errorf("content filter activation blocked: OPNsense 26.1 Force SafeSearch is global; source-scoped SafeSearch for 10.100.0.0/16 is not implemented")
+		return result, fmt.Errorf("content filter activation blocked: OPNsense 26.1 built-in Force SafeSearch is global; this client does not transactionally manage and verify the proven custom Unbound view required for 10.100.0.0/16")
 	}
 
 	desiredRules := desiredContentFilterRules(cfg)

@@ -288,8 +288,9 @@ this policy's telemetry.
 This synthetic is read-only. It checks the live OPNsense firewall and Unbound
 model without creating a pod or changing the firewall. It fails when:
 
-- policy is expected while OPNsense 26.1 still offers only global Force
-  SafeSearch (management and staging must remain unchanged);
+- policy is expected while the current client cannot safely manage and verify
+  source-scoped SafeSearch (the built-in switch is global, and management and
+  staging must remain unchanged);
 - a required global quick rule is missing, duplicated, reordered, unlogged, or
   no longer scoped to `10.100.0.0/16`;
 - the source-scoped DNSBL policy, internal category feed, or permanent
@@ -308,6 +309,20 @@ built-in social-media selector.
 Do not treat a successful DNSBL API action as proof of runtime enforcement.
 Activation is asynchronous, the Python module reloads `dnsbl.json` only on an
 uncached query after its 60-second gate, and the action can mask shell failures.
+
+OPNsense does support a source-scoped mechanism outside its built-in switch. A
+reversible pilot used an unmanaged
+`/usr/local/etc/unbound.opnsense.d/*.conf` fragment with
+`access-control-view`, a `view` using `view-first: yes`, and SafeSearch
+`local-zone` / `local-data` CNAME rewrites; `configctl unbound check` validated
+the result, and removing the fragment restored normal answers. This integration
+does not yet transactionally own that fragment, so activation remains blocked.
+A follow-up must stage a stable owned fragment, reject conflicts, validate before
+reconfigure, roll back and reconfigure on failure, then prove forced answers from
+a real student source and unchanged answers from a control source. The synthetic
+must repeat the effective uncached student-source check rather than trusting
+configuration readback.
+
 The policy must remain disabled until the synthetic can flush/use controlled
 uncached fixtures and verify actual answers from `10.100.0.0/16`.
 

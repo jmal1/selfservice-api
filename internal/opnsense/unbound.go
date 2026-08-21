@@ -26,9 +26,10 @@ type DNSBLPolicy struct {
 	Description string `json:"description"`
 }
 
-// SupportsSourceScopedSafeSearch is deliberately false for OPNsense 26.1.
-// Its built-in Force SafeSearch switch is global and would change management
-// and staging clients, which are outside the approved student-only scope.
+// SupportsSourceScopedSafeSearch is deliberately false for this client.
+// OPNsense's built-in Force SafeSearch switch is global. Source-scoped rewrites
+// are possible through custom Unbound views, but this client does not yet own,
+// validate, activate, or roll back those unmanaged configuration fragments.
 func (*Client) SupportsSourceScopedSafeSearch(context.Context) (bool, error) {
 	return false, nil
 }

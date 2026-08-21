@@ -95,7 +95,7 @@ func TestContentFilterPolicy_UsesDedicatedReaderAndEnforcesGeneratedRuleCeiling(
 	}
 }
 
-func TestContentFilterPolicy_GlobalSafeSearchLimitationFailsBeforeInventoryRead(t *testing.T) {
+func TestContentFilterPolicy_UnmanagedSourceScopedSafeSearchFailsBeforeInventoryRead(t *testing.T) {
 	reader := &fakeContentFilterReader{}
 	check := ContentFilterPolicy(ContentFilterPolicyConfig{
 		Reader: reader,
@@ -106,7 +106,7 @@ func TestContentFilterPolicy_GlobalSafeSearchLimitationFailsBeforeInventoryRead(
 		},
 	})
 	if _, err := check.Run(context.Background(), synthetic.NewClient("http://unused", "")); err == nil {
-		t.Fatal("global OPNsense SafeSearch must keep student-only activation red")
+		t.Fatal("unmanaged source-scoped SafeSearch must keep student-only activation red")
 	}
 	if reader.ruleCalls != 0 {
 		t.Fatalf("unsupported activation read firewall inventory %d times", reader.ruleCalls)

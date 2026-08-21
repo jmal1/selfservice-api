@@ -277,11 +277,12 @@ func TestReconcileContentFilter_InvalidFeedFailsBeforeAnyMutation(t *testing.T) 
 	}
 }
 
-func TestReconcileContentFilter_GlobalSafeSearchLimitationFailsBeforeMutation(t *testing.T) {
+func TestReconcileContentFilter_UnmanagedSourceScopedSafeSearchFailsBeforeMutation(t *testing.T) {
 	opn := &fakeContentFilterOPN{fakeNetworkOPN: &fakeNetworkOPN{}}
 	if _, err := reconcileContentFilter(context.Background(), opn, nil, validContentFilterConfig()); err == nil ||
-		!strings.Contains(err.Error(), "Force SafeSearch is global") {
-		t.Fatalf("global SafeSearch limitation was not surfaced: %v", err)
+		!strings.Contains(err.Error(), "built-in Force SafeSearch is global") ||
+		!strings.Contains(err.Error(), "does not transactionally manage") {
+		t.Fatalf("source-scoped SafeSearch integration limitation was not surfaced: %v", err)
 	}
 	if len(opn.createFirewallCalls) != 0 || len(opn.createDNSBLCalls) != 0 || opn.refreshDNSBLCalls != 0 {
 		t.Fatalf("unsupported source-scoped policy mutated OPNsense: fw=%v dns=%v refresh=%d",

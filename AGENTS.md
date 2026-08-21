@@ -683,14 +683,24 @@ is `https://student-filter-feed.lab.jmal.io`; its hostname-only LKG counts are
 `oisd2`, `hgz014`, and `hgz019`; it has no built-in social-media selector.
 Missing/invalid feed configuration fails before any partial policy mutation.
 
-Activation is also intentionally blocked in the worker today: OPNsense 26.1
-Force SafeSearch is a general/global Unbound switch, while the approved scope
-must leave management and staging unchanged. Do not enable the global switch.
-Policy activation may proceed only after a source-scoped SafeSearch mechanism
-and an effective student-source runtime check are implemented. DNSBL apply is
-asynchronous, and its action can return OK while masking shell errors; a valid
-check must flush/use uncached controlled fixtures and query from the student
-source network rather than trusting API/model status.
+Activation is also intentionally blocked in the worker today: OPNsense 26.1's
+built-in Force SafeSearch setting is a general/global Unbound switch, while the
+approved scope must leave management and staging unchanged. Do not enable the
+global switch. A reversible live pilot proved source-scoped SafeSearch can use
+an unmanaged `/usr/local/etc/unbound.opnsense.d/*.conf` fragment with
+`access-control-view`, `view-first: yes`, and SafeSearch `local-zone` /
+`local-data` rewrites. The current HTTP client does not transactionally own,
+validate, activate, or roll back that custom view, so it must continue to report
+the capability as unsupported.
+
+A follow-up implementation must render a stable owned fragment, reject
+conflicting fragments, stage and validate it with `configctl unbound check`,
+reconfigure Unbound, verify effective answers from both a student source and an
+unchanged control source, and restore the previous fragment plus reconfigure on
+any failure. The read-only synthetic must independently use uncached controlled
+fixtures from a real student-source query path. DNSBL apply is asynchronous, and
+its action can return OK while masking shell errors; never trust API/model status
+alone.
 
 ### Firewall generated-rule ownership
 
