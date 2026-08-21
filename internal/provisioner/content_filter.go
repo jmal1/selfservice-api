@@ -285,7 +285,7 @@ func equivalentContentFilterRule(current opnsense.FirewallRuleInfo, desired opns
 		canonicalField(current.Sequence) == canonicalField(desired.Sequence) &&
 		canonicalField(current.Quick) == canonicalField(desired.Quick) &&
 		canonicalInterfaceList(current.Interface) == canonicalInterfaceList(desired.Interface) &&
-		canonicalField(current.InterfaceInvert) == canonicalField(desired.InterfaceInvert) &&
+		canonicalFirewallBoolean(current.InterfaceInvert) == canonicalFirewallBoolean(desired.InterfaceInvert) &&
 		canonicalField(current.Action) == canonicalField(desired.Action) &&
 		canonicalField(current.Direction) == canonicalField(desired.Direction) &&
 		canonicalField(current.IPProtocol) == canonicalField(desired.IPProtocol) &&
@@ -294,8 +294,8 @@ func equivalentContentFilterRule(current opnsense.FirewallRuleInfo, desired opns
 		canonicalCSV(current.SourcePort) == canonicalCSV(desired.SourcePort) &&
 		canonicalCSV(current.Destination) == canonicalCSV(desired.Destination) &&
 		canonicalCSV(current.DestinationPort) == canonicalCSV(desired.DestinationPort) &&
-		canonicalField(current.SourceInvert) == canonicalField(desired.SourceInvert) &&
-		canonicalField(current.DestinationInvert) == canonicalField(desired.DestinationInvert) &&
+		canonicalFirewallBoolean(current.SourceInvert) == canonicalFirewallBoolean(desired.SourceInvert) &&
+		canonicalFirewallBoolean(current.DestinationInvert) == canonicalFirewallBoolean(desired.DestinationInvert) &&
 		canonicalField(current.Log) == canonicalField(desired.Log) &&
 		strings.TrimSpace(current.Description) == desired.Description
 }

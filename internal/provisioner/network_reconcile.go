@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/jmal1/selfservice-api/internal/database"
+	"github.com/jmal1/selfservice-api/internal/models"
 	"github.com/jmal1/selfservice-api/internal/opnsense"
 )
 
@@ -142,6 +143,11 @@ func reconcileNetwork(
 				continue
 			}
 			counts.VLANsReleased++
+			continue
+		}
+		if row.PodStatus == models.PodStatusDestroyFailed {
+			// Destruction retries still need the original VLAN/interface/subnet
+			// mapping to finish exact firewall cleanup safely.
 			continue
 		}
 
@@ -375,7 +381,7 @@ func reconcileNetwork(
 }
 
 func isTerminalPodStatus(status string) bool {
-	return status == "destroyed" || status == "destroy_failed"
+	return status == "destroyed"
 }
 
 // firewallRuleSignature reduces a to-be-created FirewallRule to the canonical
@@ -386,48 +392,22 @@ func isTerminalPodStatus(status string) bool {
 // on the firewall.
 func firewallRuleSignature(rule opnsense.FirewallRule) opnsense.FirewallRuleInfo {
 	return opnsense.FirewallRuleInfo{
-		Interface:       canonicalInterfaceList(rule.Interface),
-		InterfaceInvert: canonicalField(rule.InterfaceInvert),
-		Direction:       canonicalField(rule.Direction),
-		IPProtocol:      canonicalField(rule.IPProtocol),
-		Protocol:        canonicalField(rule.Protocol),
-		Source:          canonicalField(rule.Source),
-		Destination:     canonicalField(rule.Destination),
-		Action:          canonicalField(rule.Action),
+		Interface:         canonicalInterfaceList(rule.Interface),
+		InterfaceInvert:   canonicalFirewallBoolean(rule.InterfaceInvert),
+		Direction:         canonicalField(rule.Direction),
+		IPProtocol:        canonicalField(rule.IPProtocol),
+		Protocol:          canonicalField(rule.Protocol),
+		SourceInvert:      canonicalFirewallBoolean(rule.SourceInvert),
+		Source:            canonicalField(rule.Source),
+		DestinationInvert: canonicalFirewallBoolean(rule.DestinationInvert),
+		Destination:       canonicalField(rule.Destination),
+		Action:            canonicalField(rule.Action),
 		// The reconciler never sets source/destination ports on the pod pass
 		// rule, so they are empty in the signature and must be empty on the
 		// existing rule too for a match.
 		SourcePort:      "",
 		DestinationPort: "",
 	}
-}
-
-// hasEquivalentPassRule reports whether a content-equivalent rule for the
-// desired rule already exists. Matching is by CONTENT signature — interface-set,
-// action, direction, ipprotocol, protocol, source(+port) and destination(+port)
-// — NOT by description, uuid or sequence, all of which OPNsense
-// normalizes/omits. This is the idempotency guard that prevents the reconciler
-// from re-adding an identical per-VLAN pass rule every cycle (root cause of the
-// 2026-08-02 config.xml bloat / OPNsense OOM incident).
-func hasEquivalentPassRule(rules []opnsense.FirewallRuleInfo, desired opnsense.FirewallRule) bool {
-	want := firewallRuleSignature(desired)
-	for _, r := range rules {
-		if canonicalField(r.Action) != want.Action ||
-			canonicalField(r.InterfaceInvert) != want.InterfaceInvert ||
-			canonicalField(r.Source) != want.Source ||
-			canonicalField(r.SourcePort) != want.SourcePort ||
-			canonicalField(r.Destination) != want.Destination ||
-			canonicalField(r.DestinationPort) != want.DestinationPort ||
-			canonicalField(r.Protocol) != want.Protocol ||
-			canonicalField(r.Direction) != want.Direction ||
-			canonicalField(r.IPProtocol) != want.IPProtocol {
-			continue
-		}
-		if interfaceListContains(r.Interface, want.Interface) {
-			return true
-		}
-	}
-	return false
 }
 
 // canonicalField normalizes a firewall enum/string field for comparison.
@@ -448,23 +428,6 @@ func canonicalInterfaceList(v string) string {
 	}
 	sort.Strings(out)
 	return strings.Join(out, ",")
-}
-
-// interfaceListContains reports whether the desired logical interface name
-// appears in a candidate rule's (possibly comma-joined) interface field. Both
-// sides are compared in canonical form so casing/label differences from the
-// OPNsense search API don't defeat the match.
-func interfaceListContains(candidate, want string) bool {
-	want = canonicalField(want)
-	if want == "" {
-		return false
-	}
-	for _, part := range strings.Split(candidate, ",") {
-		if canonicalField(part) == want {
-			return true
-		}
-	}
-	return false
 }
 
 func containsString(values []string, needle string) bool {

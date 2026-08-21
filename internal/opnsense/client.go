@@ -721,8 +721,25 @@ func decodeFirewallRulesObject(dec *json.Decoder) ([]FirewallRuleInfo, error) {
 			continue
 		}
 		foundRuleMap = true
-		if err := expectJSONDelim(dec, '{'); err != nil {
+		tok, err := dec.Token()
+		if err != nil {
 			return nil, fmt.Errorf("rule map: %w", err)
+		}
+		delim, ok := tok.(json.Delim)
+		if !ok {
+			return nil, fmt.Errorf("rule map: expected object or empty array, got %v", tok)
+		}
+		if delim == '[' {
+			if dec.More() {
+				return nil, fmt.Errorf("rule map: non-empty array is invalid")
+			}
+			if err := expectJSONDelim(dec, ']'); err != nil {
+				return nil, fmt.Errorf("rule map: %w", err)
+			}
+			continue
+		}
+		if delim != '{' {
+			return nil, fmt.Errorf("rule map: expected object or empty array, got %q", delim)
 		}
 		for dec.More() {
 			uuid, err := nextJSONKey(dec)

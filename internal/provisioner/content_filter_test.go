@@ -302,3 +302,18 @@ func TestContentFilterRulesDoNotDependOnDynamicOPTMapping(t *testing.T) {
 		}
 	}
 }
+
+func TestEquivalentContentFilterRule_NormalizesLiveFalseInversions(t *testing.T) {
+	desired := desiredContentFilterRules(validContentFilterConfig())[0]
+	current := opnsenseFilterGetReadback(desired, "live-rule")
+	if current.InterfaceInvert != "0" || current.SourceInvert != "0" || current.DestinationInvert != "0" {
+		t.Fatalf("test readback is not production-shaped: %+v", current)
+	}
+	if !equivalentContentFilterRule(current, desired) {
+		t.Fatalf("live false-like inversion readback drifted from empty desired fields: current=%+v desired=%+v", current, desired)
+	}
+	current.SourceInvert = "1"
+	if equivalentContentFilterRule(current, desired) {
+		t.Fatal("true source inversion was normalized as false")
+	}
+}

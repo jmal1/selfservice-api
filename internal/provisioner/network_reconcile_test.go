@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,6 +17,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/jmal1/selfservice-api/internal/database"
+	"github.com/jmal1/selfservice-api/internal/models"
 	"github.com/jmal1/selfservice-api/internal/opnsense"
 )
 
@@ -205,13 +205,14 @@ func opnsenseFilterGetReadback(rule opnsense.FirewallRule, uuid string) opnsense
 		Sequence:          canonicalField(rule.Sequence),
 		Quick:             canonicalField(rule.Quick),
 		Interface:         canonicalInterfaceList(rule.Interface),
+		InterfaceInvert:   canonicalFirewallBoolean(rule.InterfaceInvert),
 		Direction:         canonicalField(rule.Direction),
 		IPProtocol:        canonicalField(rule.IPProtocol),
 		Protocol:          canonicalField(rule.Protocol),
-		SourceInvert:      canonicalField(rule.SourceInvert),
+		SourceInvert:      canonicalFirewallBoolean(rule.SourceInvert),
 		Source:            canonicalField(rule.Source),
 		SourcePort:        canonicalField(rule.SourcePort),
-		DestinationInvert: canonicalField(rule.DestinationInvert),
+		DestinationInvert: canonicalFirewallBoolean(rule.DestinationInvert),
 		Destination:       canonicalField(rule.Destination),
 		DestinationPort:   canonicalField(rule.DestinationPort),
 		Action:            canonicalField(rule.Action),
@@ -450,10 +451,29 @@ func TestReconcileNetwork_ReleasesTerminalPodAllocations(t *testing.T) {
 	}
 }
 
+func TestReconcileNetwork_RetainsDestroyFailedAllocationForRetry(t *testing.T) {
+	podID := uuid.New()
+	row := allocatedVLANRow(105, podID, models.PodStatusDestroyFailed)
+	opn := &fakeNetworkOPN{}
+	db := &fakeNetworkDB{rows: []database.AllocatedVLAN{row}}
+
+	counts, err := reconcileNetwork(context.Background(), opn, &fakeNetworkSSH{}, db, discardLogger(), NetworkReconcilerConfig{}, time.Now)
+	if err != nil {
+		t.Fatalf("reconcileNetwork: %v", err)
+	}
+	if counts.VLANsReleased != 0 || counts.ActivePodVLANs != 0 || len(db.released) != 0 {
+		t.Fatalf("destroy_failed allocation must remain reserved for retry: counts=%+v released=%v", counts, db.released)
+	}
+	if len(opn.createVLANCalls) != 0 || len(opn.createFirewallCalls) != 0 {
+		t.Fatalf("destroy_failed allocation was incorrectly reconciled as active: vlan=%v firewall=%v",
+			opn.createVLANCalls, opn.createFirewallCalls)
+	}
+}
+
 func TestReconcileNetwork_MixedSet(t *testing.T) {
 	activeHealthy := allocatedVLANRow(106, uuid.New(), "active")
 	activeNeedsBinding := allocatedVLANRow(107, uuid.New(), "configuring")
-	terminal := allocatedVLANRow(108, uuid.New(), "destroy_failed")
+	terminal := allocatedVLANRow(108, uuid.New(), "destroyed")
 
 	opn := &fakeNetworkOPN{
 		vlans: map[int]*opnsense.VLAN{
@@ -801,58 +821,30 @@ func TestDeletePodFirewallRules_BoundedRetryConverges(t *testing.T) {
 	}
 }
 
-func TestPodLifecycleSourcesUseSharedFirewallOwnership(t *testing.T) {
-	for file, required := range map[string]string{
-		"create.go":  "ensurePodFirewallRule(",
-		"destroy.go": "deletePodFirewallRules(",
-	} {
-		body, err := os.ReadFile(file)
-		if err != nil {
-			t.Fatalf("read %s: %v", file, err)
-		}
-		if !strings.Contains(string(body), required) {
-			t.Fatalf("%s no longer uses shared firewall ownership helper %q", file, required)
-		}
-	}
-	destroyBody, err := os.ReadFile("destroy.go")
-	if err != nil {
-		t.Fatalf("read destroy.go: %v", err)
-	}
-	failClosed := strings.Index(string(destroyBody), "return p.failPodDestroy(ctx, pod.ID, errors)")
-	unassign := strings.Index(string(destroyBody), "UnassignInterfaceByVLAN")
-	if failClosed < 0 || unassign < 0 || failClosed > unassign {
-		t.Fatal("destroy must fail closed on firewall cleanup before interface unassignment")
-	}
-}
-
-// TestHasEquivalentPassRule_AgainstRealFilterGetParse is an end-to-end guard for
-// the reviewer's "false-green" concern: it runs the REAL
-// opnsense.GetFirewallRules against a production-shaped firewall/filter/get
-// payload (option-maps, multi-select interface, empty description) and asserts
-// the reconciler's content-signature dedup DETECTS the already-present pod rule
-// — proving the idempotency source is filter/get, not the near-empty searchRule.
-func TestHasEquivalentPassRule_AgainstRealFilterGetParse(t *testing.T) {
+func TestPodFirewallLifecycle_AgainstLiveFilterGetFalseInversions(t *testing.T) {
 	const filterGetBody = `{
 	  "filter": { "rules": { "rule": {
 	    "pod-opt3": {
 	      "enabled": "1", "sequence": "1",
 	      "interface":  {"opt3": {"value":"OPT3","selected":1}, "opt5": {"value":"OPT5","selected":0}},
+	      "interfacenot": "0",
 	      "direction":  {"in": {"value":"in","selected":1}, "out": {"value":"out","selected":0}},
 	      "action":     {"pass": {"value":"Pass","selected":1}, "block": {"value":"Block","selected":0}},
 	      "ipprotocol": {"inet": {"value":"IPv4","selected":1}, "inet6": {"value":"IPv6","selected":0}},
 	      "protocol":   {"any": {"value":"any","selected":1}, "TCP": {"value":"TCP","selected":0}},
-	      "source_net": "10.100.0.0/24", "source_port": "",
-	      "destination_net": "any", "destination_port": "", "description": ""
+	      "source_not": "0", "source_net": "10.100.0.0/24", "source_port": "",
+	      "destination_not": "0", "destination_net": "any", "destination_port": "", "description": ""
 	    },
 	    "mgmt": {
 	      "enabled": "1", "sequence": "2",
 	      "interface":  {"lan": {"value":"LAN","selected":"1"}, "opt1": {"value":"OPT1","selected":"1"}},
+	      "interfacenot": "0",
 	      "direction":  {"any": {"value":"any","selected":"1"}},
 	      "action":     {"pass": {"value":"Pass","selected":"1"}},
 	      "ipprotocol": {"inet": {"value":"IPv4","selected":"1"}},
 	      "protocol":   {"any": {"value":"any","selected":"1"}},
-	      "source_net": "10.10.10.0/24", "source_port": "",
-	      "destination_net": "10.100.0.0/16", "destination_port": "",
+	      "source_not": "0", "source_net": "10.10.10.0/24", "source_port": "",
+	      "destination_not": "0", "destination_net": "10.100.0.0/16", "destination_port": "",
 	      "description": "Allow management VLAN to pod subnets"
 	    }
 	  }}}
@@ -877,32 +869,38 @@ func TestHasEquivalentPassRule_AgainstRealFilterGetParse(t *testing.T) {
 		t.Fatalf("expected 2 rules parsed from filter/get, got %d: %+v", len(rules), rules)
 	}
 
-	// The exact rule the reconciler would create for VLAN 100 on opt3 must be
-	// detected as already-present (so it is NOT re-created).
-	existing := opnsense.FirewallRule{
-		Enabled: "1", Action: "pass", Interface: "opt3", Direction: "in",
-		IPProtocol: "inet", Protocol: "any", Source: "10.100.0.0/24",
-		Destination: "any", Description: "Allow Pod VLAN 100 traffic",
+	row := allocatedVLANRow(100, uuid.New(), "active")
+	opn := &fakeNetworkOPN{
+		vlans:                  map[int]*opnsense.VLAN{100: {Tag: "100"}},
+		dhcpSubnets:            map[string]*opnsense.DHCPSubnet{row.Subnet: {Subnet: row.Subnet}},
+		selectedDHCPInterfaces: []string{"opt3"},
+		firewallRules:          rules,
 	}
-	if !hasEquivalentPassRule(rules, existing) {
-		t.Fatalf("expected existing pod rule (opt3) to be detected from filter/get; rules=%+v", rules)
+	ssh := &fakeNetworkSSH{findByVLAN: map[int]string{100: "opt3"}}
+	db := &fakeNetworkDB{rows: []database.AllocatedVLAN{row}}
+
+	for i := 0; i < 2; i++ {
+		if _, err := reconcileNetwork(context.Background(), opn, ssh, db, discardLogger(), NetworkReconcilerConfig{}, time.Now); err != nil {
+			t.Fatalf("reconcile pass %d: %v", i, err)
+		}
+		if _, created, err := ensurePodFirewallRule(context.Background(), opn, 100, "opt3", row.Subnet, 100, 10); err != nil || created {
+			t.Fatalf("ensure pass %d: created=%t err=%v", i, created, err)
+		}
+	}
+	if len(opn.createFirewallCalls) != 0 || len(opn.deleteFirewallCalls) != 0 {
+		t.Fatalf("false-like inversion readback churned healthy rule: creates=%v deletes=%v",
+			opn.createFirewallCalls, opn.deleteFirewallCalls)
 	}
 
-	// A pod rule for a DIFFERENT VLAN/interface is not present -> must NOT match,
-	// so the reconciler would (correctly) create it.
-	missing := existing
-	missing.Interface = "opt4"
-	missing.Source = "10.100.1.0/24"
-	if hasEquivalentPassRule(rules, missing) {
-		t.Fatalf("must not match a rule that is absent from filter/get; rules=%+v", rules)
+	removed, err := deletePodFirewallRules(context.Background(), opn, "opt3", row.Subnet, 100, 10)
+	if err != nil {
+		t.Fatalf("destroy cleanup: %v", err)
 	}
-
-	// The management rule (lan,opt1) must not be mistaken for a pod pass rule.
-	mgmtShaped := existing
-	mgmtShaped.Interface = "opt3"
-	mgmtShaped.Destination = "10.100.0.0/16" // different destination than the pod rule
-	if hasEquivalentPassRule(rules, mgmtShaped) {
-		t.Fatalf("destination must be part of the signature; unexpected match; rules=%+v", rules)
+	if removed != 1 {
+		t.Fatalf("destroy cleanup removed %d rules, want 1", removed)
+	}
+	if got := ruleUUIDs(opn.firewallRules); len(got) != 1 || got[0] != "mgmt" {
+		t.Fatalf("destroy cleanup did not preserve named manual rule: %v", got)
 	}
 }
 

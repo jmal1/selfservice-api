@@ -353,10 +353,17 @@ func isTruthyFirewallField(value string) bool {
 	}
 }
 
+func canonicalFirewallBoolean(value string) string {
+	if isTruthyFirewallField(value) {
+		return "1"
+	}
+	return "0"
+}
+
 func podPassSignature(rule opnsense.FirewallRuleInfo) string {
 	return strings.Join([]string{
 		canonicalInterfaceList(rule.Interface),
-		canonicalField(rule.InterfaceInvert),
+		canonicalFirewallBoolean(rule.InterfaceInvert),
 		canonicalField(rule.Action),
 		canonicalField(rule.Direction),
 		canonicalField(rule.IPProtocol),
@@ -365,5 +372,7 @@ func podPassSignature(rule opnsense.FirewallRuleInfo) string {
 		canonicalField(rule.SourcePort),
 		canonicalField(rule.Destination),
 		canonicalField(rule.DestinationPort),
+		canonicalFirewallBoolean(rule.SourceInvert),
+		canonicalFirewallBoolean(rule.DestinationInvert),
 	}, "|")
 }

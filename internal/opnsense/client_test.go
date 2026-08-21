@@ -238,6 +238,7 @@ func TestGetFirewallRules_RejectsMalformedOrTruncatedInventory(t *testing.T) {
 			"ipprotocol":{"inet":{"value":"IPv4","selected":1}},
 			"protocol":{"any":{"value":"any","selected":1}}
 		}}}}}`,
+		`{"filter":{"rules":{"rule":[{}]}}}`,
 	} {
 		t.Run(body, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -250,6 +251,22 @@ func TestGetFirewallRules_RejectsMalformedOrTruncatedInventory(t *testing.T) {
 				t.Fatal("GetFirewallRules succeeded for malformed/ambiguous inventory")
 			}
 		})
+	}
+}
+
+func TestGetFirewallRules_AcceptsEmptyArrayField(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"filter":{"rules":{"rule":[]}}}`)
+	}))
+	defer srv.Close()
+
+	c := New(Config{BaseURL: srv.URL}, discardLogger())
+	rules, err := c.GetFirewallRules(context.Background())
+	if err != nil {
+		t.Fatalf("GetFirewallRules: %v", err)
+	}
+	if len(rules) != 0 {
+		t.Fatalf("empty ArrayField decoded %d rules", len(rules))
 	}
 }
 
