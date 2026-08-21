@@ -326,6 +326,9 @@ exact firewall/DNSBL state, and verifies effective behavior, but never mutates,
 refreshes, or applies the policy. Supervised activation remains a live-only
 step until a transactional owner can roll back every firewall, DNSBL, Unbound,
 and runtime-verification failure without leaving staged policy behind.
+While policy is enabled but inspection is unhealthy, the network reconciler
+also suppresses unrelated firewall applies so they cannot activate a partial
+staged model.
 
 Do not treat a successful DNSBL API action as proof of runtime enforcement.
 Activation is asynchronous, the Python module reloads `dnsbl.json` only on an

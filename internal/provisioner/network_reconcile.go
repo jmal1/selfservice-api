@@ -112,6 +112,7 @@ func reconcileNetwork(
 	counts.AllocatedVLANs = len(allocations)
 	var needsKeaRestart bool
 	var needsFirewallApply bool
+	contentFilterSafeToApply := !cfg.ContentFilter.Enabled
 	var desiredFirewallRules []desiredPodFirewallRule
 	firewallMappingComplete := true
 
@@ -140,9 +141,10 @@ func reconcileNetwork(
 			counts.VLANsReleased++
 			continue
 		}
-		if row.PodStatus == models.PodStatusDestroyFailed {
+		if row.PodStatus == models.PodStatusDestroying || row.PodStatus == models.PodStatusDestroyFailed {
 			// Destruction retries still need the original VLAN/interface/subnet
-			// mapping to finish exact firewall cleanup safely.
+			// mapping to finish exact firewall cleanup safely. Do not race an
+			// in-progress destroy by recreating state it has already removed.
 			continue
 		}
 
@@ -304,6 +306,7 @@ func reconcileNetwork(
 			counts.ContentFilterRemoved = policyResult.RemovedRules
 			if policyResult.Healthy {
 				counts.ContentFilterHealthy = 1
+				contentFilterSafeToApply = true
 			}
 			if policyErr != nil {
 				counts.Errors++
@@ -324,7 +327,9 @@ func reconcileNetwork(
 	}
 
 	if needsFirewallApply {
-		if err := opn.ApplyFirewall(ctx); err != nil {
+		if !contentFilterSafeToApply {
+			log.Warn("network reconcile: refusing firewall apply while content-filter inspection is unhealthy")
+		} else if err := opn.ApplyFirewall(ctx); err != nil {
 			counts.Errors++
 			if counts.ContentFilterExpected == 1 {
 				counts.ContentFilterHealthy = 0

@@ -400,6 +400,39 @@ func TestReconcileNetwork_ContentFilterWaitsForGeneratedCleanup(t *testing.T) {
 		t.Fatalf("partial content policy mutated before generated cleanup converged: dns=%v verify=%d",
 			opn.createDNSBLCalls, opn.verifyRuntimeCalls)
 	}
+	if opn.applyFirewallCalls != 0 {
+		t.Fatalf("partial content policy was activated by an unrelated firewall apply: %d", opn.applyFirewallCalls)
+	}
+}
+
+func TestReconcileNetwork_ContentFilterInspectionFailureBlocksUnrelatedApply(t *testing.T) {
+	row := allocatedVLANRow(104, uuid.New(), "active")
+	pass := podPassRuleReadback("opt7", row.Subnet)
+	opn := &fakeContentFilterOPN{
+		fakeNetworkOPN: &fakeNetworkOPN{
+			vlans:                  map[int]*opnsense.VLAN{104: {Tag: "104"}},
+			dhcpSubnets:            map[string]*opnsense.DHCPSubnet{row.Subnet: {Subnet: row.Subnet}},
+			selectedDHCPInterfaces: []string{"opt7"},
+			firewallRules:          []opnsense.FirewallRuleInfo{pass},
+		},
+		sourceScopedSupported: true,
+	}
+	ssh := &fakeNetworkSSH{findByVLAN: map[int]string{104: "opt7"}}
+	db := &fakeNetworkDB{rows: []database.AllocatedVLAN{row}}
+
+	counts, err := reconcileNetwork(context.Background(), opn, ssh, db, discardLogger(), NetworkReconcilerConfig{
+		ContentFilter: validContentFilterConfig(),
+	}, time.Now)
+	if err != nil {
+		t.Fatalf("reconcileNetwork: %v", err)
+	}
+	if counts.ContentFilterHealthy != 0 || counts.Errors != 1 {
+		t.Fatalf("failed inspection reported a healthy policy: %+v", counts)
+	}
+	if opn.applyFirewallCalls != 0 {
+		t.Fatalf("failed inspection activated staged firewall model: applies=%d", opn.applyFirewallCalls)
+	}
+	assertNoContentFilterMutation(t, opn)
 }
 
 func TestReconcileNetwork_FirewallApplyFailureKeepsContentFilterUnhealthy(t *testing.T) {
@@ -461,21 +494,25 @@ func TestReconcileNetwork_ReleasesTerminalPodAllocations(t *testing.T) {
 }
 
 func TestReconcileNetwork_RetainsDestroyFailedAllocationForRetry(t *testing.T) {
-	podID := uuid.New()
-	row := allocatedVLANRow(105, podID, models.PodStatusDestroyFailed)
-	opn := &fakeNetworkOPN{}
-	db := &fakeNetworkDB{rows: []database.AllocatedVLAN{row}}
+	for _, status := range []string{models.PodStatusDestroying, models.PodStatusDestroyFailed} {
+		t.Run(status, func(t *testing.T) {
+			podID := uuid.New()
+			row := allocatedVLANRow(105, podID, status)
+			opn := &fakeNetworkOPN{}
+			db := &fakeNetworkDB{rows: []database.AllocatedVLAN{row}}
 
-	counts, err := reconcileNetwork(context.Background(), opn, &fakeNetworkSSH{}, db, discardLogger(), NetworkReconcilerConfig{}, time.Now)
-	if err != nil {
-		t.Fatalf("reconcileNetwork: %v", err)
-	}
-	if counts.VLANsReleased != 0 || counts.ActivePodVLANs != 0 || len(db.released) != 0 {
-		t.Fatalf("destroy_failed allocation must remain reserved for retry: counts=%+v released=%v", counts, db.released)
-	}
-	if len(opn.createVLANCalls) != 0 || len(opn.createFirewallCalls) != 0 {
-		t.Fatalf("destroy_failed allocation was incorrectly reconciled as active: vlan=%v firewall=%v",
-			opn.createVLANCalls, opn.createFirewallCalls)
+			counts, err := reconcileNetwork(context.Background(), opn, &fakeNetworkSSH{}, db, discardLogger(), NetworkReconcilerConfig{}, time.Now)
+			if err != nil {
+				t.Fatalf("reconcileNetwork: %v", err)
+			}
+			if counts.VLANsReleased != 0 || counts.ActivePodVLANs != 0 || len(db.released) != 0 {
+				t.Fatalf("%s allocation must remain reserved for destroy: counts=%+v released=%v", status, counts, db.released)
+			}
+			if len(opn.createVLANCalls) != 0 || len(opn.createFirewallCalls) != 0 {
+				t.Fatalf("%s allocation was incorrectly reconciled as active: vlan=%v firewall=%v",
+					status, opn.createVLANCalls, opn.createFirewallCalls)
+			}
+		})
 	}
 }
 

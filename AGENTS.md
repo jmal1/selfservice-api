@@ -700,7 +700,9 @@ Activation is also intentionally read-only in the worker today: it validates
 configuration, inspects exact firewall/DNSBL state, and verifies runtime
 behavior, but does not create, update, delete, refresh, or apply policy. This
 prevents a failed multi-system activation from leaving a partial model that a
-later unrelated firewall apply could activate.
+later unrelated firewall apply could activate. While policy is enabled but
+inspection is unhealthy, the network reconciler also suppresses unrelated
+firewall applies.
 
 OPNsense 26.1's
 built-in Force SafeSearch setting is a general/global Unbound switch, while the
