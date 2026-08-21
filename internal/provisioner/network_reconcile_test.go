@@ -3,10 +3,13 @@ package provisioner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -40,6 +43,9 @@ type fakeNetworkOPN struct {
 	getFirewallErr         error
 	createFirewallErr      error
 	createFirewallCalls    []opnsense.FirewallRule
+	deleteFirewallErr      map[string]error
+	deleteFirewallCalls    []string
+	updateFirewallCalls    []opnsense.FirewallRule
 	applyFirewallErr       error
 	applyFirewallCalls     int
 }
@@ -135,27 +141,96 @@ func (f *fakeNetworkOPN) CreateFirewallRule(_ context.Context, rule opnsense.Fir
 	return "fw-uuid", nil
 }
 
+func (f *fakeNetworkOPN) DeleteFirewallRule(_ context.Context, ruleUUID string) error {
+	if err := f.deleteFirewallErr[ruleUUID]; err != nil {
+		return err
+	}
+
+	f.deleteFirewallCalls = append(f.deleteFirewallCalls, ruleUUID)
+	for i, rule := range f.firewallRules {
+		if rule.UUID == ruleUUID {
+			f.firewallRules = append(f.firewallRules[:i], f.firewallRules[i+1:]...)
+			break
+		}
+	}
+	return nil
+}
+
+func (f *fakeNetworkOPN) UpdateFirewallRule(_ context.Context, ruleUUID string, replacement opnsense.FirewallRule) error {
+	f.updateFirewallCalls = append(f.updateFirewallCalls, replacement)
+	for i, rule := range f.firewallRules {
+		if rule.UUID == ruleUUID {
+			f.firewallRules[i] = opnsenseFilterGetReadback(replacement, ruleUUID)
+			return nil
+		}
+	}
+	return errors.New("rule not found")
+}
+
+func (f *fakeNetworkOPN) GetUnboundSafeSearch(context.Context) (bool, error) {
+	return true, nil
+}
+
+func (f *fakeNetworkOPN) SetUnboundSafeSearch(context.Context, bool) error { return nil }
+
+func (f *fakeNetworkOPN) ListDNSBLPolicies(context.Context) ([]opnsense.DNSBLPolicy, error) {
+	return nil, nil
+}
+
+func (f *fakeNetworkOPN) GetDNSBLPolicy(context.Context, string) (opnsense.DNSBLPolicy, error) {
+	return opnsense.DNSBLPolicy{}, nil
+}
+
+func (f *fakeNetworkOPN) CreateDNSBLPolicy(context.Context, opnsense.DNSBLPolicy) (string, error) {
+	return "dnsbl", nil
+}
+
+func (f *fakeNetworkOPN) UpdateDNSBLPolicy(context.Context, string, opnsense.DNSBLPolicy) error {
+	return nil
+}
+
+func (f *fakeNetworkOPN) DeleteDNSBLPolicy(context.Context, string) error { return nil }
+
+func (f *fakeNetworkOPN) ReconfigureUnbound(context.Context) error { return nil }
+
+func (f *fakeNetworkOPN) RefreshUnboundDNSBL(context.Context) error { return nil }
+
 // opnsenseFilterGetReadback models the canonical FirewallRuleInfo that
 // opnsense.GetFirewallRules produces for a rule created via addRule, after
 // parsing firewall/filter/get and canonicalizing its option-map/plain fields.
 func opnsenseFilterGetReadback(rule opnsense.FirewallRule, uuid string) opnsense.FirewallRuleInfo {
 	return opnsense.FirewallRuleInfo{
-		UUID:        uuid,
-		Interface:   canonicalInterfaceList(rule.Interface),
-		Direction:   canonicalField(rule.Direction),
-		IPProtocol:  canonicalField(rule.IPProtocol),
-		Protocol:    canonicalField(rule.Protocol),
-		Source:      canonicalField(rule.Source),
-		Destination: canonicalField(rule.Destination),
-		Action:      canonicalField(rule.Action),
-		// firewall/filter/get drops the description and the reconciler sets no
-		// ports; leave SourcePort/DestinationPort empty.
+		UUID:              uuid,
+		Enabled:           canonicalField(rule.Enabled),
+		Sequence:          canonicalField(rule.Sequence),
+		Quick:             canonicalField(rule.Quick),
+		Interface:         canonicalInterfaceList(rule.Interface),
+		Direction:         canonicalField(rule.Direction),
+		IPProtocol:        canonicalField(rule.IPProtocol),
+		Protocol:          canonicalField(rule.Protocol),
+		SourceInvert:      canonicalField(rule.SourceInvert),
+		Source:            canonicalField(rule.Source),
+		SourcePort:        canonicalField(rule.SourcePort),
+		DestinationInvert: canonicalField(rule.DestinationInvert),
+		Destination:       canonicalField(rule.Destination),
+		DestinationPort:   canonicalField(rule.DestinationPort),
+		Action:            canonicalField(rule.Action),
+		Log:               canonicalField(rule.Log),
+		Description:       rule.Description,
 	}
 }
 
 func (f *fakeNetworkOPN) ApplyFirewall(_ context.Context) error {
 	f.applyFirewallCalls++
 	return f.applyFirewallErr
+}
+
+func (*fakeNetworkOPN) SupportsSourceScopedSafeSearch(context.Context) (bool, error) {
+	return false, nil
+}
+
+func (*fakeNetworkOPN) VerifySourceScopedContentFilter(context.Context, string) error {
+	return errors.New("effective student-source verification unavailable")
 }
 
 type fakeNetworkSSH struct {
@@ -210,7 +285,7 @@ func (f *fakeNetworkDB) ReleaseVLAN(_ context.Context, podID uuid.UUID) error {
 // Used to pre-seed "healthy" fixtures the way the live firewall would report
 // them (re-cased fields, no description).
 func podPassRuleReadback(ifName, subnet string) opnsense.FirewallRuleInfo {
-	return opnsenseFilterGetReadback(opnsense.FirewallRule{
+	rule := opnsenseFilterGetReadback(opnsense.FirewallRule{
 		Enabled:     "1",
 		Action:      "pass",
 		Interface:   ifName,
@@ -220,6 +295,8 @@ func podPassRuleReadback(ifName, subnet string) opnsense.FirewallRuleInfo {
 		Source:      subnet,
 		Destination: "any",
 	}, "fw-existing")
+	rule.Description = ""
+	return rule
 }
 
 func TestReconcileNetwork_RepairsMissingInterfaceSubnetAndBinding(t *testing.T) {
@@ -282,11 +359,73 @@ func TestReconcileNetwork_HealthyActivePodNoChanges(t *testing.T) {
 	if counts.InterfacesRepaired != 0 || counts.SubnetsRepaired != 0 || counts.KeaBindingsRepaired != 0 || counts.KeaRestarted != 0 {
 		t.Fatalf("expected no repairs/restart, got %+v", counts)
 	}
-	if counts.FirewallRulesRepaired != 0 || counts.FirewallApplied != 0 || opn.applyFirewallCalls != 0 {
-		t.Fatalf("expected no firewall changes, got counts=%+v applyCalls=%d", counts, opn.applyFirewallCalls)
+	if counts.FirewallRulesRepaired != 0 || counts.FirewallApplied != 1 || opn.applyFirewallCalls != 1 {
+		t.Fatalf("expected no model changes and one convergence apply, got counts=%+v applyCalls=%d", counts, opn.applyFirewallCalls)
 	}
 	if opn.restartDHPCCalls != 0 {
 		t.Fatalf("expected no Kea restart call, got %d", opn.restartDHPCCalls)
+	}
+}
+
+func TestReconcileNetwork_ContentFilterWaitsForGeneratedCleanup(t *testing.T) {
+	row := allocatedVLANRow(104, uuid.New(), "active")
+	first := podPassRuleReadback("opt7", row.Subnet)
+	first.UUID = "legacy-1"
+	second := first
+	second.UUID = "legacy-2"
+	opn := &fakeContentFilterOPN{
+		fakeNetworkOPN: &fakeNetworkOPN{
+			vlans:                  map[int]*opnsense.VLAN{104: {Tag: "104"}},
+			dhcpSubnets:            map[string]*opnsense.DHCPSubnet{row.Subnet: {Subnet: row.Subnet}},
+			selectedDHCPInterfaces: []string{"opt7"},
+			firewallRules:          []opnsense.FirewallRuleInfo{first, second},
+		},
+	}
+	ssh := &fakeNetworkSSH{findByVLAN: map[int]string{104: "opt7"}}
+	db := &fakeNetworkDB{rows: []database.AllocatedVLAN{row}}
+
+	counts, err := reconcileNetwork(context.Background(), opn, ssh, db, discardLogger(), NetworkReconcilerConfig{
+		ContentFilter: validContentFilterConfig(),
+	}, func() time.Time { return time.Unix(123, 0) })
+	if err != nil {
+		t.Fatalf("reconcileNetwork: %v", err)
+	}
+	if counts.FirewallRulesDuplicate != 1 || counts.FirewallRulesRemoved != 1 ||
+		counts.ContentFilterExpected != 1 || counts.ContentFilterHealthy != 0 {
+		t.Fatalf("content filter did not wait for cleanup convergence: %+v", counts)
+	}
+	if len(opn.createDNSBLCalls) != 0 || opn.verifyRuntimeCalls != 0 {
+		t.Fatalf("partial content policy mutated before generated cleanup converged: dns=%v verify=%d",
+			opn.createDNSBLCalls, opn.verifyRuntimeCalls)
+	}
+}
+
+func TestReconcileNetwork_FirewallApplyFailureKeepsContentFilterUnhealthy(t *testing.T) {
+	row := allocatedVLANRow(104, uuid.New(), "active")
+	pass := podPassRuleReadback("opt7", row.Subnet)
+	pass.UUID = "legacy"
+	opn := &fakeContentFilterOPN{
+		fakeNetworkOPN: &fakeNetworkOPN{
+			vlans:                  map[int]*opnsense.VLAN{104: {Tag: "104"}},
+			dhcpSubnets:            map[string]*opnsense.DHCPSubnet{row.Subnet: {Subnet: row.Subnet}},
+			selectedDHCPInterfaces: []string{"opt7"},
+			firewallRules:          []opnsense.FirewallRuleInfo{pass},
+			applyFirewallErr:       errors.New("transient apply failure"),
+		},
+		sourceScopedSupported: true,
+	}
+	ssh := &fakeNetworkSSH{findByVLAN: map[int]string{104: "opt7"}}
+	db := &fakeNetworkDB{rows: []database.AllocatedVLAN{row}}
+
+	counts, err := reconcileNetwork(context.Background(), opn, ssh, db, discardLogger(), NetworkReconcilerConfig{
+		ContentFilter: validContentFilterConfig(),
+	}, func() time.Time { return time.Unix(123, 0) })
+	if err != nil {
+		t.Fatalf("reconcileNetwork: %v", err)
+	}
+	if counts.ContentFilterExpected != 1 || counts.ContentFilterHealthy != 0 ||
+		counts.ContentFilterSuccessAt != 0 || counts.Errors != 1 {
+		t.Fatalf("failed apply reported a false-green policy: %+v", counts)
 	}
 }
 
@@ -383,6 +522,306 @@ func TestReconcileNetwork_IsIdempotent_NoDuplicatePassRules(t *testing.T) {
 	if len(opn.firewallRules) != 1 {
 		t.Fatalf("expected exactly one stored firewall rule (no duplicates), got %d: %+v",
 			len(opn.firewallRules), opn.firewallRules)
+	}
+}
+
+func TestReconcileNetwork_CompactsLegacyDuplicatesAndStaleRulesWithoutTouchingManualRules(t *testing.T) {
+	active := allocatedVLANRow(115, uuid.New(), "active")
+	desired := podPassRuleReadback("opt6", active.Subnet)
+	desired.UUID = "legacy-keep"
+	duplicate1 := desired
+	duplicate1.UUID = "legacy-z"
+	duplicate2 := desired
+	duplicate2.UUID = "legacy-y"
+	manual := desired
+	manual.UUID = "manual"
+	manual.Description = "Instructor emergency pass"
+	manual.Interface = "lan,opt1"
+	manual.Source = "10.10.10.0/24"
+	manual.Destination = "10.100.0.0/16"
+	stale := podPassRuleReadback("opt9", "10.100.99.0/24")
+	stale.UUID = "stale"
+
+	opn := &fakeNetworkOPN{
+		vlans:                  map[int]*opnsense.VLAN{115: {Tag: "115"}},
+		dhcpSubnets:            map[string]*opnsense.DHCPSubnet{active.Subnet: {Subnet: active.Subnet}},
+		selectedDHCPInterfaces: []string{"opt6"},
+		firewallRules:          []opnsense.FirewallRuleInfo{manual, duplicate1, stale, duplicate2, desired},
+	}
+	ssh := &fakeNetworkSSH{findByVLAN: map[int]string{115: "opt6"}}
+	db := &fakeNetworkDB{rows: []database.AllocatedVLAN{active}}
+
+	counts, err := reconcileNetwork(context.Background(), opn, ssh, db, discardLogger(), NetworkReconcilerConfig{}, time.Now)
+	if err != nil {
+		t.Fatalf("reconcileNetwork: %v", err)
+	}
+	if counts.FirewallRulesDuplicate != 2 || counts.FirewallRulesStale != 1 || counts.FirewallRulesRemoved != 3 {
+		t.Fatalf("unexpected cleanup counts: %+v", counts)
+	}
+	if len(opn.createFirewallCalls) != 0 {
+		t.Fatalf("existing content-equivalent rules must prevent creation: %+v", opn.createFirewallCalls)
+	}
+	if !containsString(ruleUUIDs(opn.firewallRules), "manual") {
+		t.Fatalf("named/manual rule was removed: %+v", opn.firewallRules)
+	}
+	if got := countRulesWithSignature(opn.firewallRules, desired); got != 1 {
+		t.Fatalf("want one generated desired rule, got %d: %+v", got, opn.firewallRules)
+	}
+	if containsString(ruleUUIDs(opn.firewallRules), "stale") {
+		t.Fatalf("stale generated rule was retained: %+v", opn.firewallRules)
+	}
+	if opn.applyFirewallCalls != 1 {
+		t.Fatalf("cleanup must apply exactly once, got %d", opn.applyFirewallCalls)
+	}
+}
+
+func TestReconcileNetwork_ManualEquivalentReplacesAllGeneratedDuplicates(t *testing.T) {
+	active := allocatedVLANRow(115, uuid.New(), "active")
+	manual := podPassRuleReadback("opt6", active.Subnet)
+	manual.UUID = "manual"
+	manual.Description = "Instructor-owned pass"
+	legacy1 := podPassRuleReadback("opt6", active.Subnet)
+	legacy1.UUID = "legacy-1"
+	legacy2 := legacy1
+	legacy2.UUID = "legacy-2"
+
+	opn := &fakeNetworkOPN{
+		vlans:                  map[int]*opnsense.VLAN{115: {Tag: "115"}},
+		dhcpSubnets:            map[string]*opnsense.DHCPSubnet{active.Subnet: {Subnet: active.Subnet}},
+		selectedDHCPInterfaces: []string{"opt6"},
+		firewallRules:          []opnsense.FirewallRuleInfo{legacy1, manual, legacy2},
+	}
+	ssh := &fakeNetworkSSH{findByVLAN: map[int]string{115: "opt6"}}
+	db := &fakeNetworkDB{rows: []database.AllocatedVLAN{active}}
+
+	counts, err := reconcileNetwork(context.Background(), opn, ssh, db, discardLogger(), NetworkReconcilerConfig{}, time.Now)
+	if err != nil {
+		t.Fatalf("reconcileNetwork: %v", err)
+	}
+	if counts.FirewallRulesDuplicate != 2 || counts.FirewallRulesRemoved != 2 {
+		t.Fatalf("unexpected cleanup counts: %+v", counts)
+	}
+	if got := ruleUUIDs(opn.firewallRules); len(got) != 1 || got[0] != "manual" {
+		t.Fatalf("manual equivalent must be the only survivor, got %v", got)
+	}
+}
+
+func TestReconcileNetwork_BoundsCleanupAndReportsRemainingGrowth(t *testing.T) {
+	active := allocatedVLANRow(115, uuid.New(), "active")
+	var rules []opnsense.FirewallRuleInfo
+	for i := 0; i < 6; i++ {
+		rule := podPassRuleReadback("opt6", active.Subnet)
+		rule.UUID = fmt.Sprintf("legacy-%d", i)
+		rules = append(rules, rule)
+	}
+	opn := &fakeNetworkOPN{
+		vlans:                  map[int]*opnsense.VLAN{115: {Tag: "115"}},
+		dhcpSubnets:            map[string]*opnsense.DHCPSubnet{active.Subnet: {Subnet: active.Subnet}},
+		selectedDHCPInterfaces: []string{"opt6"},
+		firewallRules:          rules,
+	}
+	ssh := &fakeNetworkSSH{findByVLAN: map[int]string{115: "opt6"}}
+	db := &fakeNetworkDB{rows: []database.AllocatedVLAN{active}}
+
+	counts, err := reconcileNetwork(context.Background(), opn, ssh, db, discardLogger(), NetworkReconcilerConfig{
+		FirewallCleanupLimit: 2,
+	}, time.Now)
+	if err != nil {
+		t.Fatalf("reconcileNetwork: %v", err)
+	}
+	if counts.FirewallRulesDuplicate != 5 || counts.FirewallRulesRemoved != 2 || counts.FirewallCleanupLimited != 1 {
+		t.Fatalf("bounded cleanup was not reported: %+v", counts)
+	}
+	if len(opn.firewallRules) != 4 {
+		t.Fatalf("want four rules after deleting two, got %d", len(opn.firewallRules))
+	}
+}
+
+func TestReconcileNetwork_AmbiguousLegacyRuleFailsClosed(t *testing.T) {
+	active := allocatedVLANRow(115, uuid.New(), "active")
+	ambiguous := podPassRuleReadback("opt6", active.Subnet)
+	ambiguous.UUID = "ambiguous"
+	ambiguous.DestinationPort = "443"
+
+	opn := &fakeNetworkOPN{
+		vlans:                  map[int]*opnsense.VLAN{115: {Tag: "115"}},
+		dhcpSubnets:            map[string]*opnsense.DHCPSubnet{active.Subnet: {Subnet: active.Subnet}},
+		selectedDHCPInterfaces: []string{"opt6"},
+		firewallRules:          []opnsense.FirewallRuleInfo{ambiguous},
+	}
+
+	ssh := &fakeNetworkSSH{findByVLAN: map[int]string{115: "opt6"}}
+	db := &fakeNetworkDB{rows: []database.AllocatedVLAN{active}}
+
+	counts, err := reconcileNetwork(context.Background(), opn, ssh, db, discardLogger(), NetworkReconcilerConfig{}, time.Now)
+	if err != nil {
+		t.Fatalf("reconcileNetwork: %v", err)
+	}
+	if counts.Errors != 1 {
+		t.Fatalf("ambiguous inventory must be reported as an error: %+v", counts)
+	}
+	if len(opn.createFirewallCalls) != 0 || len(opn.deleteFirewallCalls) != 0 || opn.applyFirewallCalls != 0 {
+		t.Fatalf("ambiguous inventory must cause no firewall mutation: create=%v delete=%v apply=%d",
+			opn.createFirewallCalls, opn.deleteFirewallCalls, opn.applyFirewallCalls)
+	}
+}
+
+func TestReconcileNetwork_OverLimitInventoryFailsClosed(t *testing.T) {
+	active := allocatedVLANRow(115, uuid.New(), "active")
+	var rules []opnsense.FirewallRuleInfo
+	for i := 0; i < 4; i++ {
+		rule := podPassRuleReadback("opt6", active.Subnet)
+		rule.UUID = fmt.Sprintf("legacy-%d", i)
+		rules = append(rules, rule)
+	}
+	opn := &fakeNetworkOPN{
+		vlans:                  map[int]*opnsense.VLAN{115: {Tag: "115"}},
+		dhcpSubnets:            map[string]*opnsense.DHCPSubnet{active.Subnet: {Subnet: active.Subnet}},
+		selectedDHCPInterfaces: []string{"opt6"},
+		firewallRules:          rules,
+	}
+	ssh := &fakeNetworkSSH{findByVLAN: map[int]string{115: "opt6"}}
+	db := &fakeNetworkDB{rows: []database.AllocatedVLAN{active}}
+
+	counts, err := reconcileNetwork(context.Background(), opn, ssh, db, discardLogger(), NetworkReconcilerConfig{
+		MaxFirewallRules: 3,
+	}, time.Now)
+	if err != nil {
+		t.Fatalf("reconcileNetwork: %v", err)
+	}
+	if counts.Errors != 1 {
+		t.Fatalf("over-limit inventory must report error: %+v", counts)
+	}
+	if len(opn.createFirewallCalls) != 0 || len(opn.deleteFirewallCalls) != 0 || opn.applyFirewallCalls != 0 {
+		t.Fatalf("over-limit inventory mutated firewall: create=%v delete=%v apply=%d",
+			opn.createFirewallCalls, opn.deleteFirewallCalls, opn.applyFirewallCalls)
+	}
+}
+
+func TestEnsurePodFirewallRule_IsRetryIdempotent(t *testing.T) {
+	opn := &fakeNetworkOPN{}
+	for i := 0; i < 3; i++ {
+		_, _, err := ensurePodFirewallRule(context.Background(), opn, 115, "opt6", "10.100.15.0/24", 100, 10)
+		if err != nil {
+			t.Fatalf("ensure pass %d: %v", i, err)
+		}
+	}
+	if len(opn.createFirewallCalls) != 1 || opn.applyFirewallCalls != 3 {
+		t.Fatalf("retry created more than once or skipped convergence apply: creates=%d applies=%d",
+			len(opn.createFirewallCalls), opn.applyFirewallCalls)
+	}
+	if got := opn.firewallRules[0].Description; got != "crucible:pod-pass:v1:vlan=115" {
+		t.Fatalf("ownership description = %q", got)
+	}
+}
+
+func TestEnsurePodFirewallRule_RetriesApplyAfterModelMutationSucceeded(t *testing.T) {
+	opn := &fakeNetworkOPN{applyFirewallErr: errors.New("transient apply failure")}
+	createdUUID, created, err := ensurePodFirewallRule(
+		context.Background(), opn, 115, "opt6", "10.100.15.0/24", 100, 10,
+	)
+	if err == nil || !created || createdUUID == "" {
+		t.Fatalf("first ensure must expose created rule and apply error: uuid=%q created=%t err=%v", createdUUID, created, err)
+	}
+
+	opn.applyFirewallErr = nil
+	createdUUID, created, err = ensurePodFirewallRule(
+		context.Background(), opn, 115, "opt6", "10.100.15.0/24", 100, 10,
+	)
+	if err != nil || created || createdUUID != "" {
+		t.Fatalf("retry must apply existing model without another create: uuid=%q created=%t err=%v", createdUUID, created, err)
+	}
+	if len(opn.createFirewallCalls) != 1 || opn.applyFirewallCalls != 2 {
+		t.Fatalf("unexpected retry calls: creates=%d applies=%d", len(opn.createFirewallCalls), opn.applyFirewallCalls)
+	}
+}
+
+func TestDeletePodFirewallRules_PreservesNamedManualRules(t *testing.T) {
+	legacy := podPassRuleReadback("opt6", "10.100.15.0/24")
+	legacy.UUID = "legacy"
+	owned := legacy
+	owned.UUID = "owned"
+	owned.Description = "crucible:pod-pass:v1:vlan=115"
+	manual := legacy
+	manual.UUID = "manual"
+	manual.Description = "Keep this emergency pass"
+	opn := &fakeNetworkOPN{firewallRules: []opnsense.FirewallRuleInfo{legacy, owned, manual}}
+
+	removed, err := deletePodFirewallRules(context.Background(), opn, "opt6", "10.100.15.0/24", 100, 10)
+	if err != nil {
+		t.Fatalf("deletePodFirewallRules: %v", err)
+	}
+	if removed != 2 {
+		t.Fatalf("removed = %d, want 2", removed)
+	}
+	if got := ruleUUIDs(opn.firewallRules); len(got) != 1 || got[0] != "manual" {
+		t.Fatalf("manual rule was not preserved: %v", got)
+	}
+}
+
+func TestDeletePodFirewallRules_RetryAppliesAlreadyDeletedModel(t *testing.T) {
+	owned := podPassRuleReadback("opt6", "10.100.15.0/24")
+	owned.UUID = "owned"
+	owned.Description = "crucible:pod-pass:v1:vlan=115"
+	opn := &fakeNetworkOPN{
+		firewallRules:    []opnsense.FirewallRuleInfo{owned},
+		applyFirewallErr: errors.New("transient apply failure"),
+	}
+
+	if removed, err := deletePodFirewallRules(context.Background(), opn, "opt6", "10.100.15.0/24", 100, 10); err == nil || removed != 0 {
+		t.Fatalf("first delete must report apply failure: removed=%d err=%v", removed, err)
+	}
+	opn.applyFirewallErr = nil
+	if removed, err := deletePodFirewallRules(context.Background(), opn, "opt6", "10.100.15.0/24", 100, 10); err != nil || removed != 0 {
+		t.Fatalf("retry must apply already-deleted model: removed=%d err=%v", removed, err)
+	}
+	if len(opn.deleteFirewallCalls) != 1 || opn.applyFirewallCalls != 2 {
+		t.Fatalf("unexpected retry calls: deletes=%v applies=%d", opn.deleteFirewallCalls, opn.applyFirewallCalls)
+	}
+}
+
+func TestDeletePodFirewallRules_BoundedRetryConverges(t *testing.T) {
+	var rules []opnsense.FirewallRuleInfo
+	for i := 0; i < 3; i++ {
+		owned := podPassRuleReadback("opt6", "10.100.15.0/24")
+		owned.UUID = fmt.Sprintf("owned-%d", i)
+		owned.Description = "crucible:pod-pass:v1:vlan=115"
+		rules = append(rules, owned)
+	}
+	opn := &fakeNetworkOPN{firewallRules: rules}
+
+	if removed, err := deletePodFirewallRules(context.Background(), opn, "opt6", "10.100.15.0/24", 100, 2); err == nil || removed != 2 {
+		t.Fatalf("first bounded pass: removed=%d err=%v", removed, err)
+	}
+	if removed, err := deletePodFirewallRules(context.Background(), opn, "opt6", "10.100.15.0/24", 100, 2); err != nil || removed != 1 {
+		t.Fatalf("retry pass: removed=%d err=%v", removed, err)
+	}
+	if len(opn.firewallRules) != 0 || opn.applyFirewallCalls != 2 {
+		t.Fatalf("bounded retry did not converge: rules=%v applies=%d", ruleUUIDs(opn.firewallRules), opn.applyFirewallCalls)
+	}
+}
+
+func TestPodLifecycleSourcesUseSharedFirewallOwnership(t *testing.T) {
+	for file, required := range map[string]string{
+		"create.go":  "ensurePodFirewallRule(",
+		"destroy.go": "deletePodFirewallRules(",
+	} {
+		body, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatalf("read %s: %v", file, err)
+		}
+		if !strings.Contains(string(body), required) {
+			t.Fatalf("%s no longer uses shared firewall ownership helper %q", file, required)
+		}
+	}
+	destroyBody, err := os.ReadFile("destroy.go")
+	if err != nil {
+		t.Fatalf("read destroy.go: %v", err)
+	}
+	failClosed := strings.Index(string(destroyBody), "return p.failPodDestroy(ctx, pod.ID, errors)")
+	unassign := strings.Index(string(destroyBody), "UnassignInterfaceByVLAN")
+	if failClosed < 0 || unassign < 0 || failClosed > unassign {
+		t.Fatal("destroy must fail closed on firewall cleanup before interface unassignment")
 	}
 }
 
@@ -569,14 +1008,26 @@ func TestNetworkReconcilePusher_Push_SerializesExpectedMetrics(t *testing.T) {
 		HTTP:           srv.Client(),
 	}
 	err := p.Push(context.Background(), NetworkReconcileCounts{
-		AllocatedVLANs:      4,
-		ActivePodVLANs:      3,
-		InterfacesRepaired:  1,
-		SubnetsRepaired:     2,
-		KeaBindingsRepaired: 3,
-		VLANsReleased:       1,
-		Errors:              2,
-		KeaRestarted:        1,
+		AllocatedVLANs:         4,
+		ActivePodVLANs:         3,
+		InterfacesRepaired:     1,
+		SubnetsRepaired:        2,
+		KeaBindingsRepaired:    3,
+		FirewallRulesTotal:     16,
+		FirewallRulesGenerated: 6,
+		FirewallRulesDuplicate: 1,
+		FirewallRulesStale:     2,
+		FirewallRulesRemoved:   3,
+		FirewallCleanupLimited: 1,
+		ContentFilterExpected:  1,
+		ContentFilterHealthy:   0,
+		ContentFilterMissing:   2,
+		ContentFilterDrifted:   1,
+		ContentFilterRemoved:   3,
+		ContentFilterSuccessAt: 1234567890,
+		VLANsReleased:          1,
+		Errors:                 2,
+		KeaRestarted:           1,
 	})
 	if err != nil {
 		t.Fatalf("Push: %v", err)
@@ -595,6 +1046,18 @@ func TestNetworkReconcilePusher_Push_SerializesExpectedMetrics(t *testing.T) {
 		`crucible_network_reconcile_errors_total 2`,
 		`crucible_network_reconcile_kea_restarted 1`,
 		`crucible_network_reconcile_firewall_applied 0`,
+		`crucible_opnsense_firewall_rules{kind="total"} 16`,
+		`crucible_opnsense_firewall_rules{kind="generated"} 6`,
+		`crucible_opnsense_firewall_rules{kind="duplicate"} 1`,
+		`crucible_opnsense_firewall_rules{kind="stale"} 2`,
+		`crucible_opnsense_firewall_rules{kind="removed"} 3`,
+		`crucible_opnsense_firewall_cleanup_limited 1`,
+		`crucible_content_filter_policy{kind="expected"} 1`,
+		`crucible_content_filter_policy{kind="healthy"} 0`,
+		`crucible_content_filter_policy{kind="missing"} 2`,
+		`crucible_content_filter_policy{kind="drifted"} 1`,
+		`crucible_content_filter_policy{kind="removed"} 3`,
+		`crucible_content_filter_last_success_timestamp_seconds 1234567890`,
 		`crucible_network_reconcile_run_timestamp_seconds `,
 	} {
 		if !strings.Contains(gotBody, want) {
@@ -637,4 +1100,24 @@ func allocatedVLANRow(vlanTag int, podID uuid.UUID, status string) database.Allo
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func ruleUUIDs(rules []opnsense.FirewallRuleInfo) []string {
+	out := make([]string, 0, len(rules))
+	for _, rule := range rules {
+		out = append(out, rule.UUID)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func countRulesWithSignature(rules []opnsense.FirewallRuleInfo, desired opnsense.FirewallRuleInfo) int {
+	want := podPassSignature(desired)
+	count := 0
+	for _, rule := range rules {
+		if isExactPodPassShape(rule) && podPassSignature(rule) == want {
+			count++
+		}
+	}
+	return count
 }

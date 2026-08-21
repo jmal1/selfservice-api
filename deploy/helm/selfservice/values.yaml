@@ -77,6 +77,28 @@ worker:
   networkReconciler:
     enabled: true
     interval: "5m"
+    # Hard fail-closed inventory bound. The live 2026-08-21 incident reached
+    # 3,088 rules, so 4,096 permits diagnosis/repair without accepting unbounded
+    # memory use or mutation against an implausibly large model.
+    maxFirewallRules: 4096
+    # Delete at most this many exact blank/Crucible-owned generated rules per
+    # pass, apply once, then report cleanup_limited until the next pass.
+    firewallCleanupLimit: 100
+  # Student egress/DNS content policy. Activation is deliberately separate
+  # from the network reconciler and defaults off. Do not enable until the
+  # supervised firewall inventory check is clean and categoryFeedURL is an
+  # OPNsense-reachable internal validated last-known-good feed. Activation also
+  # fails closed while OPNsense 26.1 offers only global Force SafeSearch and no
+  # effective student-source verification exists.
+  contentFilter:
+    enabled: false
+    sourceNetwork: "10.100.0.0/16"
+    # Validated feed: https://student-filter-feed.lab.jmal.io. Keep this empty
+    # until the source-scoped SafeSearch/runtime-verification blocker is closed.
+    categoryFeedURL: ""
+    # Permanent deployment-reviewed exceptions only. There is intentionally no
+    # student/instructor mutation API for this list.
+    allowlist: []
   # Image-upload reconciler: refreshes crucible_image_uploads_stuck and
   # crucible_template_stuck by scanning for rows wedged in a non-terminal
   # state past staleThreshold. Feeds the CrucibleImageUploadStuck and
@@ -302,6 +324,15 @@ synthetic:
   # `instructor-user-id`; when that key is absent the elevated checks are
   # skipped with a warning rather than failing the monitor.
   instructorUsername: "synthetic-instructor"
+  contentFilter:
+    # A dedicated read-only OPNsense API identity. Secret keys:
+    # opnsense-url, opnsense-api-key, opnsense-api-secret.
+    # Refs are optional while policy is disabled; once worker.contentFilter is
+    # enabled, missing credentials make content_filter_policy red.
+    opnsenseSecretName: selfservice-opnsense-monitor-creds
+    # One generated broad pass is expected per live pod. The /16 source design
+    # can never legitimately require more than 256 distinct /24 pod passes.
+    maxGeneratedRules: 256
   resources:
     requests:
       cpu: 25m

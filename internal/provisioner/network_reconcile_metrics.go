@@ -87,6 +87,45 @@ func serializeNetworkReconcileCounts(c NetworkReconcileCounts) []byte {
 	b.WriteString("# TYPE crucible_network_reconcile_firewall_applied gauge\n")
 	fmt.Fprintf(&b, "crucible_network_reconcile_firewall_applied %d\n", c.FirewallApplied)
 
+	b.WriteString("# HELP crucible_opnsense_firewall_rules OPNsense firewall inventory and generated pod-rule health at the latest reconcile.\n")
+	b.WriteString("# TYPE crucible_opnsense_firewall_rules gauge\n")
+	for _, row := range []struct {
+		kind  string
+		value int
+	}{
+		{"total", c.FirewallRulesTotal},
+		{"generated", c.FirewallRulesGenerated},
+		{"duplicate", c.FirewallRulesDuplicate},
+		{"stale", c.FirewallRulesStale},
+		{"removed", c.FirewallRulesRemoved},
+	} {
+		fmt.Fprintf(&b, "crucible_opnsense_firewall_rules{kind=%q} %d\n", row.kind, row.value)
+	}
+
+	b.WriteString("# HELP crucible_opnsense_firewall_cleanup_limited Whether generated-rule cleanup hit its per-run deletion bound (0 or 1).\n")
+	b.WriteString("# TYPE crucible_opnsense_firewall_cleanup_limited gauge\n")
+	fmt.Fprintf(&b, "crucible_opnsense_firewall_cleanup_limited %d\n", c.FirewallCleanupLimited)
+
+	b.WriteString("# HELP crucible_content_filter_policy Content-filter expectation, health, and repaired drift at the latest reconcile.\n")
+	b.WriteString("# TYPE crucible_content_filter_policy gauge\n")
+	for _, row := range []struct {
+		kind  string
+		value int
+	}{
+		{"expected", c.ContentFilterExpected},
+		{"healthy", c.ContentFilterHealthy},
+		{"missing", c.ContentFilterMissing},
+		{"drifted", c.ContentFilterDrifted},
+		{"removed", c.ContentFilterRemoved},
+	} {
+		fmt.Fprintf(&b, "crucible_content_filter_policy{kind=%q} %d\n", row.kind, row.value)
+	}
+	if c.ContentFilterSuccessAt > 0 {
+		b.WriteString("# HELP crucible_content_filter_last_success_timestamp_seconds Unix time of the latest successful firewall and Unbound policy convergence.\n")
+		b.WriteString("# TYPE crucible_content_filter_last_success_timestamp_seconds gauge\n")
+		fmt.Fprintf(&b, "crucible_content_filter_last_success_timestamp_seconds %d\n", c.ContentFilterSuccessAt)
+	}
+
 	b.WriteString("# HELP crucible_network_reconcile_run_timestamp_seconds Unix time of the latest network reconciler run.\n")
 	b.WriteString("# TYPE crucible_network_reconcile_run_timestamp_seconds gauge\n")
 	fmt.Fprintf(&b, "crucible_network_reconcile_run_timestamp_seconds %d\n", time.Now().Unix())

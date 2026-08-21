@@ -141,6 +141,18 @@ spec:
               value: {{ .Values.worker.networkReconciler.enabled | default false | quote }}
             - name: WORKER_NETWORK_RECONCILER_INTERVAL
               value: {{ .Values.worker.networkReconciler.interval | default "5m" | quote }}
+            - name: WORKER_NETWORK_RECONCILER_MAX_FIREWALL_RULES
+              value: {{ .Values.worker.networkReconciler.maxFirewallRules | default 4096 | quote }}
+            - name: WORKER_NETWORK_RECONCILER_FIREWALL_CLEANUP_LIMIT
+              value: {{ .Values.worker.networkReconciler.firewallCleanupLimit | default 100 | quote }}
+            - name: WORKER_CONTENT_FILTER_ENABLED
+              value: {{ .Values.worker.contentFilter.enabled | default false | quote }}
+            - name: WORKER_CONTENT_FILTER_SOURCE_NETWORK
+              value: {{ .Values.worker.contentFilter.sourceNetwork | default "10.100.0.0/16" | quote }}
+            - name: WORKER_CONTENT_FILTER_CATEGORY_FEED_URL
+              value: {{ .Values.worker.contentFilter.categoryFeedURL | default "" | quote }}
+            - name: WORKER_CONTENT_FILTER_ALLOWLIST
+              value: {{ join "," (.Values.worker.contentFilter.allowlist | default (list)) | quote }}
             # Template pipeline reconciler: refreshes crucible_template_state
             # and crucible_template_stuck from the live templates table.
             - name: WORKER_PIPELINE_RECONCILER_ENABLED

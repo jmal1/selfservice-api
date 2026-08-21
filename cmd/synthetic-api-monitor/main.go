@@ -29,6 +29,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jmal1/selfservice-api/internal/opnsense"
+	"github.com/jmal1/selfservice-api/internal/provisioner"
 	"github.com/jmal1/selfservice-api/internal/synthetic"
 	"github.com/jmal1/selfservice-api/internal/synthetic/checks"
 )
@@ -37,16 +39,24 @@ import (
 // of truth; the K8s manifest in deploy/helm/selfservice/templates/synthetic-cronjob.yaml
 // MUST stay in sync.
 const (
-	envBaseURL        = "SYNTHETIC_BASE_URL"        // e.g. https://crucible.jmal.io
-	envJWTSecret      = "SYNTHETIC_JWT_SECRET"      // same HMAC the API uses
-	envUserID         = "SYNTHETIC_USER_ID"         // UUID of synthetic@lab.jmal.io DB row
-	envUsername       = "SYNTHETIC_USERNAME"        // synthetic
-	envRole           = "SYNTHETIC_ROLE"            // student (default) | instructor | admin
-	envPushgatewayURL = "SYNTHETIC_PUSHGATEWAY_URL" // e.g. http://pushgateway.observability:9091
-	envJob            = "SYNTHETIC_JOB"             // pushgateway job label, default crucible_synthetic_api
-	envLayer          = "SYNTHETIC_LAYER"           // grouping label `layer`, default api
-	envLoopInterval   = "SYNTHETIC_LOOP_INTERVAL"   // optional duration; if set, runs forever
-	envCheckTimeout   = "SYNTHETIC_CHECK_TIMEOUT"   // optional duration, default 30s
+	envBaseURL                = "SYNTHETIC_BASE_URL"        // e.g. https://crucible.jmal.io
+	envJWTSecret              = "SYNTHETIC_JWT_SECRET"      // same HMAC the API uses
+	envUserID                 = "SYNTHETIC_USER_ID"         // UUID of synthetic@lab.jmal.io DB row
+	envUsername               = "SYNTHETIC_USERNAME"        // synthetic
+	envRole                   = "SYNTHETIC_ROLE"            // student (default) | instructor | admin
+	envPushgatewayURL         = "SYNTHETIC_PUSHGATEWAY_URL" // e.g. http://pushgateway.observability:9091
+	envJob                    = "SYNTHETIC_JOB"             // pushgateway job label, default crucible_synthetic_api
+	envLayer                  = "SYNTHETIC_LAYER"           // grouping label `layer`, default api
+	envLoopInterval           = "SYNTHETIC_LOOP_INTERVAL"   // optional duration; if set, runs forever
+	envCheckTimeout           = "SYNTHETIC_CHECK_TIMEOUT"   // optional duration, default 30s
+	envContentFilterExpected  = "SYNTHETIC_CONTENT_FILTER_EXPECTED"
+	envContentFilterSource    = "SYNTHETIC_CONTENT_FILTER_SOURCE_NETWORK"
+	envContentFilterFeed      = "SYNTHETIC_CONTENT_FILTER_CATEGORY_FEED_URL"
+	envContentFilterAllowlist = "SYNTHETIC_CONTENT_FILTER_ALLOWLIST"
+	envContentFilterMaxRules  = "SYNTHETIC_CONTENT_FILTER_MAX_GENERATED_RULES"
+	envOPNsenseURL            = "SYNTHETIC_OPNSENSE_URL"
+	envOPNsenseAPIKey         = "SYNTHETIC_OPNSENSE_API_KEY"
+	envOPNsenseAPISecret      = "SYNTHETIC_OPNSENSE_API_SECRET"
 
 	// envLifecycleEnabled enables the (expensive) pod_lifecycle check that
 	// creates + destroys a real pod. OFF by default so the binary is safe to
@@ -215,6 +225,26 @@ func run(logger *slog.Logger) error {
 	}
 
 	activeChecks := checks.All()
+	maxGeneratedRules := 256
+	if v := os.Getenv(envContentFilterMaxRules); v != "" {
+		maxGeneratedRules, err = strconv.Atoi(v)
+		if err != nil || maxGeneratedRules < 1 {
+			return fmt.Errorf("invalid %s=%q: must be a positive integer", envContentFilterMaxRules, v)
+		}
+	}
+	var contentFilterReader checks.ContentFilterReader
+	if os.Getenv(envOPNsenseURL) != "" && os.Getenv(envOPNsenseAPIKey) != "" && os.Getenv(envOPNsenseAPISecret) != "" {
+		contentFilterReader = opnsense.New(opnsense.Config{
+			BaseURL:   os.Getenv(envOPNsenseURL),
+			APIKey:    os.Getenv(envOPNsenseAPIKey),
+			APISecret: os.Getenv(envOPNsenseAPISecret),
+		}, logger.With("component", "content_filter_policy"))
+	}
+	activeChecks = replaceCheck(activeChecks, checks.ContentFilterPolicy(checks.ContentFilterPolicyConfig{
+		Reader:            contentFilterReader,
+		Policy:            provisionerContentFilterConfig(os.Getenv),
+		MaxGeneratedRules: maxGeneratedRules,
+	}))
 	switch mode.kind {
 	case modeJanitor:
 		cfg := checks.DefaultJanitorConfig()
@@ -224,6 +254,7 @@ func run(logger *slog.Logger) error {
 			if err != nil {
 				return fmt.Errorf("invalid %s=%q: %w", envJanitorMaxAge, v, err)
 			}
+
 			cfg.MaxAge = d
 		}
 		logger.Info("janitor mode: registering synthetic_janitor only",
@@ -833,4 +864,37 @@ func resolveMode(getenv func(string) string) (resolvedMode, error) {
 	}
 
 	return m, nil
+}
+
+func replaceCheck(all []synthetic.Check, replacement synthetic.Check) []synthetic.Check {
+	for i, check := range all {
+		if check.Name() == replacement.Name() {
+			all[i] = replacement
+			return all
+		}
+	}
+	return append(all, replacement)
+}
+
+func provisionerContentFilterConfig(getenv func(string) string) provisioner.ContentFilterConfig {
+	source := getenv(envContentFilterSource)
+	if source == "" {
+		source = "10.100.0.0/16"
+	}
+	return provisioner.ContentFilterConfig{
+		Enabled:       strings.EqualFold(getenv(envContentFilterExpected), "true"),
+		SourceNetwork: source,
+		CategoryFeed:  getenv(envContentFilterFeed),
+		Allowlist:     splitCSV(getenv(envContentFilterAllowlist)),
+	}
+}
+
+func splitCSV(value string) []string {
+	var out []string
+	for _, part := range strings.Split(value, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }

@@ -18,22 +18,37 @@ const defaultNetworkReconcilerVLANParent = "vmx1"
 
 // NetworkReconcilerConfig controls one network reconciliation pass.
 type NetworkReconcilerConfig struct {
-	VLANParent string
-	Pusher     *NetworkReconcilePusher
+	VLANParent           string
+	MaxFirewallRules     int
+	FirewallCleanupLimit int
+	ContentFilter        ContentFilterConfig
+	Pusher               *NetworkReconcilePusher
 }
 
 // NetworkReconcileCounts summarizes one network reconciliation pass.
 type NetworkReconcileCounts struct {
-	AllocatedVLANs        int
-	ActivePodVLANs        int
-	InterfacesRepaired    int
-	SubnetsRepaired       int
-	KeaBindingsRepaired   int
-	FirewallRulesRepaired int
-	VLANsReleased         int
-	Errors                int
-	KeaRestarted          int
-	FirewallApplied       int
+	AllocatedVLANs         int
+	ActivePodVLANs         int
+	InterfacesRepaired     int
+	SubnetsRepaired        int
+	KeaBindingsRepaired    int
+	FirewallRulesRepaired  int
+	FirewallRulesTotal     int
+	FirewallRulesGenerated int
+	FirewallRulesDuplicate int
+	FirewallRulesStale     int
+	FirewallRulesRemoved   int
+	FirewallCleanupLimited int
+	ContentFilterExpected  int
+	ContentFilterHealthy   int
+	ContentFilterMissing   int
+	ContentFilterDrifted   int
+	ContentFilterRemoved   int
+	ContentFilterSuccessAt int64
+	VLANsReleased          int
+	Errors                 int
+	KeaRestarted           int
+	FirewallApplied        int
 }
 
 type networkReconcileOPN interface {
@@ -47,7 +62,17 @@ type networkReconcileOPN interface {
 	RestartDHCP(ctx context.Context) error
 	GetFirewallRules(ctx context.Context) ([]opnsense.FirewallRuleInfo, error)
 	CreateFirewallRule(ctx context.Context, rule opnsense.FirewallRule) (string, error)
+	DeleteFirewallRule(ctx context.Context, uuid string) error
+	UpdateFirewallRule(ctx context.Context, uuid string, rule opnsense.FirewallRule) error
 	ApplyFirewall(ctx context.Context) error
+	SupportsSourceScopedSafeSearch(ctx context.Context) (bool, error)
+	VerifySourceScopedContentFilter(ctx context.Context, sourceNetwork string) error
+	ListDNSBLPolicies(ctx context.Context) ([]opnsense.DNSBLPolicy, error)
+	GetDNSBLPolicy(ctx context.Context, uuid string) (opnsense.DNSBLPolicy, error)
+	CreateDNSBLPolicy(ctx context.Context, policy opnsense.DNSBLPolicy) (string, error)
+	UpdateDNSBLPolicy(ctx context.Context, uuid string, policy opnsense.DNSBLPolicy) error
+	DeleteDNSBLPolicy(ctx context.Context, uuid string) error
+	RefreshUnboundDNSBL(ctx context.Context) error
 }
 
 type networkReconcileSSH interface {
@@ -91,6 +116,8 @@ func reconcileNetwork(
 	counts.AllocatedVLANs = len(allocations)
 	var needsKeaRestart bool
 	var needsFirewallApply bool
+	var desiredFirewallRules []desiredPodFirewallRule
+	firewallMappingComplete := true
 
 	// Fetch existing firewall rules once so we can verify each active pod has a
 	// pass rule on its current interface. Without this, a repaired/renumbered
@@ -126,6 +153,7 @@ func reconcileNetwork(
 
 		vlan, err := opn.GetVLANByTag(ctx, row.VLANTag)
 		if err != nil {
+			firewallMappingComplete = false
 			counts.Errors++
 			log.Warn("network reconcile: failed to read vlan",
 				"pod_id", row.PodID, "pod_name", row.PodName,
@@ -134,6 +162,7 @@ func reconcileNetwork(
 		}
 		if vlan == nil {
 			if _, err := opn.CreateVLAN(ctx, cfg.VLANParent, row.VLANTag, descr); err != nil {
+				firewallMappingComplete = false
 				counts.Errors++
 				log.Warn("network reconcile: failed to create vlan",
 					"pod_id", row.PodID, "pod_name", row.PodName,
@@ -141,6 +170,7 @@ func reconcileNetwork(
 				continue
 			}
 			if err := opn.ReconfigureVLANs(ctx); err != nil {
+				firewallMappingComplete = false
 				counts.Errors++
 				log.Warn("network reconcile: failed to reconfigure vlans",
 					"pod_id", row.PodID, "pod_name", row.PodName,
@@ -152,6 +182,7 @@ func reconcileNetwork(
 
 		ifName, err := opnSSH.FindInterfaceByVLAN(ctx, row.VLANTag)
 		if err != nil {
+			firewallMappingComplete = false
 			counts.Errors++
 			log.Warn("network reconcile: failed to find interface by vlan",
 				"pod_id", row.PodID, "pod_name", row.PodName,
@@ -161,6 +192,7 @@ func reconcileNetwork(
 		if ifName == "" {
 			ifName, err = opnSSH.AssignInterface(ctx, row.VLANTag, gateway)
 			if err != nil {
+				firewallMappingComplete = false
 				counts.Errors++
 				log.Warn("network reconcile: failed to assign interface",
 					"pod_id", row.PodID, "pod_name", row.PodName,
@@ -171,6 +203,7 @@ func reconcileNetwork(
 			needsKeaRestart = true
 			needsFirewallApply = true
 		}
+		desiredFirewallRules = append(desiredFirewallRules, newDesiredPodFirewallRule(row.VLANTag, ifName, row.Subnet))
 
 		subnet, err := opn.GetDHCPSubnetByNetwork(ctx, row.Subnet)
 		if err != nil {
@@ -212,35 +245,75 @@ func reconcileNetwork(
 			needsKeaRestart = true
 		}
 
-		// Ensure a firewall pass rule exists on the pod's current interface.
-		// A freshly assigned OPT interface defaults to deny; without this the
-		// pod has DHCP but no routed/internet connectivity. Automatic outbound
-		// NAT is regenerated by ApplyFirewall below.
-		fwRule := opnsense.FirewallRule{
-			Enabled:     "1",
-			Action:      "pass",
-			Interface:   ifName,
-			Direction:   "in",
-			IPProtocol:  "inet",
-			Protocol:    "any",
-			Source:      row.Subnet,
-			Destination: "any",
-			Description: fmt.Sprintf("Allow Pod VLAN %d traffic", row.VLANTag),
+	}
+
+	var fwResult podFirewallReconcileResult
+	var fwReconcileErr error
+	if fwRulesAvailable {
+		fwResult, _, fwReconcileErr = reconcilePodFirewallRules(
+			ctx,
+			opn,
+			fwRules,
+			desiredFirewallRules,
+			firewallMappingComplete,
+			cfg.MaxFirewallRules,
+			cfg.FirewallCleanupLimit,
+		)
+		counts.FirewallRulesTotal = fwResult.TotalRules
+		counts.FirewallRulesGenerated = fwResult.GeneratedRules
+		counts.FirewallRulesDuplicate = fwResult.DuplicateRules
+		counts.FirewallRulesStale = fwResult.StaleRules
+		counts.FirewallRulesRepaired = fwResult.CreatedRules
+		counts.FirewallRulesRemoved = fwResult.RemovedRules
+		if fwResult.CleanupLimited {
+			counts.FirewallCleanupLimited = 1
 		}
-		if fwRulesAvailable && !hasEquivalentPassRule(fwRules, fwRule) {
-			if _, err := opn.CreateFirewallRule(ctx, fwRule); err != nil {
-				counts.Errors++
-				log.Warn("network reconcile: failed to create firewall rule",
-					"pod_id", row.PodID, "pod_name", row.PodName,
-					"vlan_tag", row.VLANTag, "interface", ifName, "error", err)
-				continue
-			}
-			// Track locally (in canonical form) so a later pod in the same run
-			// doesn't re-create a content-equivalent rule.
-			fwRules = append(fwRules, firewallRuleSignature(fwRule))
-			counts.FirewallRulesRepaired++
+		// A successful model comparison cannot prove that a previous apply
+		// reached the running packet filter. Re-apply after every complete,
+		// unambiguous inventory so transient apply failures converge.
+		if fwResult.Mutated || fwReconcileErr == nil {
 			needsFirewallApply = true
 		}
+		if fwReconcileErr != nil {
+			counts.Errors++
+			log.Warn("network reconcile: firewall ownership reconciliation failed", "error", fwReconcileErr)
+		}
+	}
+
+	if cfg.ContentFilter.Enabled {
+		counts.ContentFilterExpected = 1
+		switch {
+		case !fwRulesAvailable:
+			log.Warn("network reconcile: skipping content filter because firewall inventory is unavailable")
+		case fwReconcileErr != nil:
+			log.Warn("network reconcile: skipping content filter because generated-rule reconciliation failed")
+		case !firewallMappingComplete:
+			counts.Errors++
+			log.Warn("network reconcile: skipping content filter because active pod interface mapping is incomplete")
+		case fwResult.DuplicateRules > 0 || fwResult.StaleRules > 0 || fwResult.CleanupLimited:
+			counts.Errors++
+			log.Warn("network reconcile: content filter activation blocked until generated-rule cleanup converges",
+				"duplicates", fwResult.DuplicateRules,
+				"stale", fwResult.StaleRules,
+				"cleanup_limited", fwResult.CleanupLimited)
+		default:
+			policyResult, policyErr := reconcileContentFilter(ctx, opn, fwRules, cfg.ContentFilter)
+			counts.ContentFilterMissing = policyResult.MissingRules
+			counts.ContentFilterDrifted = policyResult.DriftedRules
+			counts.ContentFilterRemoved = policyResult.RemovedRules
+			if policyResult.Healthy {
+				counts.ContentFilterHealthy = 1
+			}
+			if policyResult.FirewallMutated {
+				needsFirewallApply = true
+			}
+			if policyErr != nil {
+				counts.Errors++
+				log.Warn("network reconcile: content filter reconciliation failed", "error", policyErr)
+			}
+		}
+	} else {
+		counts.ContentFilterHealthy = 1
 	}
 
 	if needsKeaRestart {
@@ -255,9 +328,15 @@ func reconcileNetwork(
 	if needsFirewallApply {
 		if err := opn.ApplyFirewall(ctx); err != nil {
 			counts.Errors++
+			if counts.ContentFilterExpected == 1 {
+				counts.ContentFilterHealthy = 0
+			}
 			log.Warn("network reconcile: failed to apply firewall", "error", err)
 		} else {
 			counts.FirewallApplied = 1
+			if counts.ContentFilterExpected == 1 && counts.ContentFilterHealthy == 1 {
+				counts.ContentFilterSuccessAt = now().Unix()
+			}
 		}
 	}
 
@@ -268,6 +347,18 @@ func reconcileNetwork(
 		"subnets_repaired", counts.SubnetsRepaired,
 		"kea_bindings_repaired", counts.KeaBindingsRepaired,
 		"firewall_rules_repaired", counts.FirewallRulesRepaired,
+		"firewall_rules_total", counts.FirewallRulesTotal,
+		"firewall_rules_generated", counts.FirewallRulesGenerated,
+		"firewall_rules_duplicate", counts.FirewallRulesDuplicate,
+		"firewall_rules_stale", counts.FirewallRulesStale,
+		"firewall_rules_removed", counts.FirewallRulesRemoved,
+		"firewall_cleanup_limited", counts.FirewallCleanupLimited,
+		"content_filter_expected", counts.ContentFilterExpected,
+		"content_filter_healthy", counts.ContentFilterHealthy,
+		"content_filter_missing", counts.ContentFilterMissing,
+		"content_filter_drifted", counts.ContentFilterDrifted,
+		"content_filter_removed", counts.ContentFilterRemoved,
+		"content_filter_success_timestamp", counts.ContentFilterSuccessAt,
 		"vlans_released", counts.VLANsReleased,
 		"errors", counts.Errors,
 		"kea_restarted", counts.KeaRestarted,
@@ -295,13 +386,14 @@ func isTerminalPodStatus(status string) bool {
 // on the firewall.
 func firewallRuleSignature(rule opnsense.FirewallRule) opnsense.FirewallRuleInfo {
 	return opnsense.FirewallRuleInfo{
-		Interface:   canonicalInterfaceList(rule.Interface),
-		Direction:   canonicalField(rule.Direction),
-		IPProtocol:  canonicalField(rule.IPProtocol),
-		Protocol:    canonicalField(rule.Protocol),
-		Source:      canonicalField(rule.Source),
-		Destination: canonicalField(rule.Destination),
-		Action:      canonicalField(rule.Action),
+		Interface:       canonicalInterfaceList(rule.Interface),
+		InterfaceInvert: canonicalField(rule.InterfaceInvert),
+		Direction:       canonicalField(rule.Direction),
+		IPProtocol:      canonicalField(rule.IPProtocol),
+		Protocol:        canonicalField(rule.Protocol),
+		Source:          canonicalField(rule.Source),
+		Destination:     canonicalField(rule.Destination),
+		Action:          canonicalField(rule.Action),
 		// The reconciler never sets source/destination ports on the pod pass
 		// rule, so they are empty in the signature and must be empty on the
 		// existing rule too for a match.
@@ -321,6 +413,7 @@ func hasEquivalentPassRule(rules []opnsense.FirewallRuleInfo, desired opnsense.F
 	want := firewallRuleSignature(desired)
 	for _, r := range rules {
 		if canonicalField(r.Action) != want.Action ||
+			canonicalField(r.InterfaceInvert) != want.InterfaceInvert ||
 			canonicalField(r.Source) != want.Source ||
 			canonicalField(r.SourcePort) != want.SourcePort ||
 			canonicalField(r.Destination) != want.Destination ||

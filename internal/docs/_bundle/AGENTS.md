@@ -651,3 +651,74 @@ If an import fails (`status=error`), the MinIO object is retained so retry is ch
 - Engine (how runs are orchestrated): [`internal/engine/engine.go`](internal/engine/engine.go)
 - API routes: [`internal/api/routes/routes.go`](internal/api/routes/routes.go) — workflow + action endpoints under `/api/v1/admin/`
 - Live action catalog (the *real* source of truth for available actions): `GET /api/v1/admin/actions` against your Crucible instance.
+
+---
+
+## 16. Student content-filter operator contract
+
+Student pod traffic originates from `10.100.0.0/16` and uses fwpodv01
+(OPNsense 26.1) as gateway and DNS. The approved policy:
+
+- blocks adult/explicit, gambling, drugs, violence, social-media, and
+  audio/video streaming categories;
+- forces the OPNsense Unbound SafeSearch rewrites;
+- blocks external DNS plus common DoH, DoT, DoQ, VPN, proxy, and Tor bypasses;
+- has no TLS interception;
+- accepts permanent deployment-reviewed admin allowlist entries only; and
+- ships blocked events only, with 30-day retention configured in the external
+  log store.
+
+The worker owns quick global/floating firewall rules scoped by source network.
+In OPNsense 26.1 those rules are priority group 200000 and therefore evaluate
+before per-interface broad pod passes (priority group 400000). They deliberately
+have an empty `interface`, so dynamic VLAN-to-`optN` remapping cannot move the
+policy behind or around a pod pass.
+
+Content-filter activation is disabled by default. Enabling it requires a
+validated, OPNsense-reachable internal HTTPS category feed covering UT1
+`drogue`, `audio-video`, and `social_networks` plus the maintained
+`blacklists/agressif/domains` violence/aggression category. The validated feed
+is `https://student-filter-feed.lab.jmal.io`; its hostname-only LKG counts are
+436, 3,620, 715, and 266 respectively. The running 26.1 model supports
+`oisd2`, `hgz014`, and `hgz019`; it has no built-in social-media selector.
+Missing/invalid feed configuration fails before any partial policy mutation.
+
+Activation is also intentionally blocked in the worker today: OPNsense 26.1
+Force SafeSearch is a general/global Unbound switch, while the approved scope
+must leave management and staging unchanged. Do not enable the global switch.
+Policy activation may proceed only after a source-scoped SafeSearch mechanism
+and an effective student-source runtime check are implemented. DNSBL apply is
+asynchronous, and its action can return OK while masking shell errors; a valid
+check must flush/use uncached controlled fixtures and query from the student
+source network rather than trusting API/model status.
+
+### Firewall generated-rule ownership
+
+Always inventory automation rules with `GET /api/firewall/filter/get`.
+`searchRule` is not authoritative: it has returned `total=1` while thousands of
+rules existed. OPNsense 26.1 writes the rule field `description`; sending the
+legacy `descr` key silently creates an unnamed rule.
+
+Automatic cleanup may delete only an exact pod-pass shape that is either:
+
+1. a blank-description legacy rule, or
+2. marked `crucible:pod-pass:v1:...`.
+
+Every named/manual rule is preserved. A generated pod pass must be one `optN`
+interface, pass/in/IPv4/any, one `10.100.x.0/24` source, destination `any`, and
+empty ports/inversions. A partial or ambiguous match aborts mutation. Cleanup is
+bounded per pass and applies once; a destroy that hits the bound remains
+`destroy_failed` so retry can finish it.
+
+The 2026-08-21 incident demonstrated why these constraints are mandatory:
+fwpodv01 had 3,088 automation rules (3,078 blank descriptions), including 86
+copies of `opt6 + 10.100.15.0/24 -> any pass`, and a 5,272,716-byte
+`/conf/config.xml`. Root causes were unconditional creation in `CreatePod`,
+missing destroy cleanup, VLAN/`optN` reuse, and the `descr`/`description`
+mismatch. The supervised cleanup retained all ten named/manual rules plus one
+pass for each of six assigned pod interfaces.
+
+Do not deploy content-filter changes, scale workers, or restore destructive
+synthetics while an infrastructure containment hold is active. Read-only policy
+inspection through `content_filter_policy` is the only non-destructive
+synthetic defined for this feature.
