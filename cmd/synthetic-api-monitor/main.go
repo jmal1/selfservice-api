@@ -51,7 +51,7 @@ const (
 	envCheckTimeout           = "SYNTHETIC_CHECK_TIMEOUT"   // optional duration, default 30s
 	envContentFilterExpected  = "SYNTHETIC_CONTENT_FILTER_EXPECTED"
 	envContentFilterSource    = "SYNTHETIC_CONTENT_FILTER_SOURCE_NETWORK"
-	envContentFilterFeed      = "SYNTHETIC_CONTENT_FILTER_CATEGORY_FEED_URL"
+	envContentFilterFeedBase  = "SYNTHETIC_CONTENT_FILTER_CATEGORY_FEED_BASE_URL"
 	envContentFilterAllowlist = "SYNTHETIC_CONTENT_FILTER_ALLOWLIST"
 	envContentFilterMaxRules  = "SYNTHETIC_CONTENT_FILTER_MAX_GENERATED_RULES"
 	envOPNsenseURL            = "SYNTHETIC_OPNSENSE_URL"
@@ -882,10 +882,10 @@ func provisionerContentFilterConfig(getenv func(string) string) provisioner.Cont
 		source = "10.100.0.0/16"
 	}
 	return provisioner.ContentFilterConfig{
-		Enabled:       strings.EqualFold(getenv(envContentFilterExpected), "true"),
-		SourceNetwork: source,
-		CategoryFeed:  getenv(envContentFilterFeed),
-		Allowlist:     splitCSV(getenv(envContentFilterAllowlist)),
+		Enabled:             strings.EqualFold(getenv(envContentFilterExpected), "true"),
+		SourceNetwork:       source,
+		CategoryFeedBaseURL: getenv(envContentFilterFeedBase),
+		Allowlist:           splitCSV(getenv(envContentFilterAllowlist)),
 	}
 }
 

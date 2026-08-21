@@ -82,8 +82,8 @@ spec:
                   value: {{ .Values.worker.contentFilter.enabled | default false | quote }}
                 - name: SYNTHETIC_CONTENT_FILTER_SOURCE_NETWORK
                   value: {{ .Values.worker.contentFilter.sourceNetwork | default "10.100.0.0/16" | quote }}
-                - name: SYNTHETIC_CONTENT_FILTER_CATEGORY_FEED_URL
-                  value: {{ .Values.worker.contentFilter.categoryFeedURL | default "" | quote }}
+                - name: SYNTHETIC_CONTENT_FILTER_CATEGORY_FEED_BASE_URL
+                  value: {{ .Values.worker.contentFilter.categoryFeedBaseURL | default "" | quote }}
                 - name: SYNTHETIC_CONTENT_FILTER_ALLOWLIST
                   value: {{ join "," (.Values.worker.contentFilter.allowlist | default (list)) | quote }}
                 - name: SYNTHETIC_CONTENT_FILTER_MAX_GENERATED_RULES

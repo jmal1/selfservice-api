@@ -84,16 +84,16 @@ func (f *fakeContentFilterOPN) RefreshUnboundDNSBL(context.Context) error {
 
 func validContentFilterConfig() ContentFilterConfig {
 	return ContentFilterConfig{
-		Enabled:       true,
-		SourceNetwork: "10.100.0.0/16",
-		CategoryFeed:  "https://student-filter-feed.lab.jmal.io",
-		Allowlist:     []string{"course.example"},
+		Enabled:             true,
+		SourceNetwork:       "10.100.0.0/16",
+		CategoryFeedBaseURL: "https://student-filter-feed.lab.jmal.io",
+		Allowlist:           []string{"course.example"},
 	}
 }
 
 func TestDesiredContentFilterRules_AreGlobalQuickAndPrecedeInterfacePasses(t *testing.T) {
 	rules := desiredContentFilterRules(validContentFilterConfig())
-	if len(rules) != 4+len(contentFilterBypassPorts)+1 {
+	if len(rules) != 7+len(contentFilterBypassPorts)+3 {
 		t.Fatalf("len(rules) = %d", len(rules))
 	}
 	lastSequence := 0
@@ -136,111 +136,150 @@ func TestDesiredContentFilterRules_AreGlobalQuickAndPrecedeInterfacePasses(t *te
 			t.Fatalf("bypass-port rule is missing %s", port)
 		}
 	}
+
+	expectedAntiBypass := map[string]struct {
+		protocol          string
+		port              string
+		destination       string
+		destinationInvert string
+	}{
+		contentFilterRulePrefix + "doq-784":  {protocol: "UDP", port: "784", destination: "any"},
+		contentFilterRulePrefix + "doq-8853": {protocol: "UDP", port: "8853", destination: "any"},
+		contentFilterRulePrefix + "quic-443": {protocol: "UDP", port: "443", destination: "any"},
+		contentFilterRulePrefix + "vpn-gre":  {protocol: "GRE", destination: "10.100.0.0/16", destinationInvert: "1"},
+		contentFilterRulePrefix + "vpn-esp":  {protocol: "ESP", destination: "10.100.0.0/16", destinationInvert: "1"},
+		contentFilterRulePrefix + "vpn-ah":   {protocol: "AH", destination: "10.100.0.0/16", destinationInvert: "1"},
+	}
+	for _, rule := range rules {
+		want, ok := expectedAntiBypass[rule.Description]
+		if !ok {
+			continue
+		}
+		if rule.Action != "block" || rule.Protocol != want.protocol ||
+			rule.DestinationPort != want.port || rule.Destination != want.destination ||
+			rule.DestinationInvert != want.destinationInvert || rule.Interface != "" ||
+			rule.Source != "10.100.0.0/16" || rule.Quick != "1" || rule.Log != "1" {
+			t.Fatalf("anti-bypass rule %q has unsafe shape: %+v", rule.Description, rule)
+		}
+		delete(expectedAntiBypass, rule.Description)
+	}
+	if len(expectedAntiBypass) != 0 {
+		t.Fatalf("missing anti-bypass rules: %v", expectedAntiBypass)
+	}
+	for _, rule := range rules {
+		if rule.DestinationPort == "443" && rule.Destination == "any" && rule.Protocol != "UDP" {
+			t.Fatalf("only UDP 443 may be blocked globally: %+v", rule)
+		}
+	}
 }
 
-func TestDesiredDNSBLPolicy_UsesOnlyRunning26OptionsAndRequiredFeed(t *testing.T) {
+func TestDesiredDNSBLPolicy_PinsCapacityTestedRunning26OptionsAndRequiredFeed(t *testing.T) {
 	policy := desiredDNSBLPolicy(validContentFilterConfig())
-	if policy.Types != "hgz014,hgz019,oisd2" {
+	if policy.Types != "hgz014,hgz021,oisd2" {
 		t.Fatalf("Types = %q", policy.Types)
 	}
-	if policy.Lists == "" || policy.SourceNets != "10.100.0.0/16" || policy.NXDomain != "1" {
+	for _, forbidden := range []string{"hgz019", "hgz020", "hgz022"} {
+		if strings.Contains(policy.Types, forbidden) {
+			t.Fatalf("Types %q includes forbidden selector %q", policy.Types, forbidden)
+		}
+	}
+	const wantLists = "https://student-filter-feed.lab.jmal.io/lists/drogue.txt," +
+		"https://student-filter-feed.lab.jmal.io/lists/agressif.txt," +
+		"https://student-filter-feed.lab.jmal.io/lists/audio-video.txt," +
+		"https://student-filter-feed.lab.jmal.io/lists/social_networks.txt"
+	if policy.Lists != wantLists {
+		t.Fatalf("Lists = %q, want %q", policy.Lists, wantLists)
+	}
+	withSlash := validContentFilterConfig()
+	withSlash.CategoryFeedBaseURL += "/"
+	if err := validateContentFilterConfig(withSlash); err != nil {
+		t.Fatalf("trailing slash base URL rejected: %v", err)
+	}
+	if got := desiredDNSBLPolicy(withSlash).Lists; got != wantLists {
+		t.Fatalf("trailing slash Lists = %q, want %q", got, wantLists)
+	}
+	if policy.SourceNets != "10.100.0.0/16" || policy.NXDomain != "1" {
 		t.Fatalf("incomplete DNSBL policy: %+v", policy)
 	}
 }
 
-func TestReconcileContentFilter_ConvergesAndIsIdempotent(t *testing.T) {
-	opn := &fakeContentFilterOPN{
-		fakeNetworkOPN:        &fakeNetworkOPN{},
-		sourceScopedSupported: true,
-	}
+func TestReconcileContentFilter_ReadOnlyInspectionPassesWithoutMutation(t *testing.T) {
 	cfg := validContentFilterConfig()
-
-	first, err := reconcileContentFilter(context.Background(), opn, nil, cfg)
-	if err != nil {
-		t.Fatalf("first reconcile: %v", err)
-	}
-	if !first.Healthy || first.MissingRules != 19 || !first.FirewallMutated || !first.DNSBLMutated {
-		t.Fatalf("unexpected first result: %+v", first)
-	}
-	if len(opn.createFirewallCalls) != 19 || len(opn.createDNSBLCalls) != 1 ||
-		opn.refreshDNSBLCalls != 1 || opn.verifyRuntimeCalls != 1 {
-		t.Fatalf("first reconcile did not apply and verify complete policy: fw=%d dns=%d refresh=%d verify=%d",
-			len(opn.createFirewallCalls), len(opn.createDNSBLCalls),
-			opn.refreshDNSBLCalls, opn.verifyRuntimeCalls)
-	}
-
-	second, err := reconcileContentFilter(context.Background(), opn, opn.firewallRules, cfg)
-	if err != nil {
-		t.Fatalf("second reconcile: %v", err)
-	}
-	if !second.Healthy || second.FirewallMutated || second.DNSBLMutated {
-		t.Fatalf("second reconcile was not idempotent: %+v", second)
-	}
-	if len(opn.createFirewallCalls) != 19 || len(opn.createDNSBLCalls) != 1 {
-		t.Fatalf("idempotent pass created more policy: fw=%d dns=%d",
-			len(opn.createFirewallCalls), len(opn.createDNSBLCalls))
-	}
-	if opn.refreshDNSBLCalls != 2 || opn.verifyRuntimeCalls != 2 {
-		t.Fatalf("runtime activation must be retried and verified on an idempotent model: refresh=%d verify=%d",
-			opn.refreshDNSBLCalls, opn.verifyRuntimeCalls)
-	}
-}
-
-func TestReconcileContentFilter_RetriesUnboundActivationAfterModelMutation(t *testing.T) {
-	opn := &fakeContentFilterOPN{
-		fakeNetworkOPN:        &fakeNetworkOPN{},
-		sourceScopedSupported: true,
-		verifyRuntimeErr:      errors.New("effective query still misses DNSBL"),
-	}
-	cfg := validContentFilterConfig()
-	if _, err := reconcileContentFilter(context.Background(), opn, nil, cfg); err == nil {
-		t.Fatal("first reconcile must report runtime activation failure")
-	}
-	opn.verifyRuntimeErr = nil
-	result, err := reconcileContentFilter(context.Background(), opn, opn.firewallRules, cfg)
-	if err != nil {
-		t.Fatalf("retry reconcile: %v", err)
-	}
-	if !result.Healthy || result.FirewallMutated || result.DNSBLMutated {
-		t.Fatalf("retry should activate the converged model without rewriting it: %+v", result)
-	}
-	if opn.refreshDNSBLCalls != 2 || opn.verifyRuntimeCalls != 2 {
-		t.Fatalf("activation retry calls: refresh=%d verify=%d", opn.refreshDNSBLCalls, opn.verifyRuntimeCalls)
-	}
-}
-
-func TestReconcileContentFilter_RepairsSabotagedGlobalRule(t *testing.T) {
-	cfg := validContentFilterConfig()
-	want := desiredContentFilterRules(cfg)
 	var inventory []opnsense.FirewallRuleInfo
-	for i, rule := range want {
+	for i, rule := range desiredContentFilterRules(cfg) {
 		inventory = append(inventory, opnsenseFilterGetReadback(rule, fmt.Sprintf("rule-%d", i)))
 	}
-	inventory[1].Quick = "0"
-	inventory[1].Sequence = "999999"
-	inventory[1].Source = "any"
+	manualFirewall := opnsenseFilterGetReadback(opnsense.FirewallRule{
+		Enabled: "1", Quick: "1", Action: "pass", Direction: "in",
+		IPProtocol: "inet", Protocol: "TCP", Source: "10.10.10.0/24",
+		Destination: "10.100.0.0/16", Description: "Instructor management access",
+	}, "manual-firewall")
+	inventory = append(inventory, manualFirewall)
+	dns := desiredDNSBLPolicy(cfg)
+	dns.UUID = "dns-owned"
+	manualDNS := opnsense.DNSBLPolicy{UUID: "dns-manual", Description: "Instructor DNS policy"}
 	opn := &fakeContentFilterOPN{
 		fakeNetworkOPN:        &fakeNetworkOPN{firewallRules: inventory},
 		sourceScopedSupported: true,
-		dnsPolicies: []opnsense.DNSBLPolicy{
-			func() opnsense.DNSBLPolicy {
-				p := desiredDNSBLPolicy(cfg)
-				p.UUID = "dns"
-				return p
-			}(),
-		},
+		dnsPolicies:           []opnsense.DNSBLPolicy{manualDNS, dns},
 	}
 
 	result, err := reconcileContentFilter(context.Background(), opn, inventory, cfg)
 	if err != nil {
 		t.Fatalf("reconcileContentFilter: %v", err)
 	}
-	if result.DriftedRules != 1 || len(opn.updateFirewallCalls) != 1 {
-		t.Fatalf("sabotage was not repaired: result=%+v updates=%v", result, opn.updateFirewallCalls)
+	if !result.Healthy || result.ExpectedRules != len(desiredContentFilterRules(cfg)) {
+		t.Fatalf("unexpected inspection result: %+v", result)
 	}
-	repaired := opn.updateFirewallCalls[0]
-	if repaired.Quick != "1" || repaired.Sequence != "110" || repaired.Source != "10.100.0.0/16" {
-		t.Fatalf("repair did not restore ordering/scope: %+v", repaired)
+	if opn.verifyRuntimeCalls != 1 {
+		t.Fatalf("effective verification calls = %d, want 1", opn.verifyRuntimeCalls)
+	}
+	assertNoContentFilterMutation(t, opn)
+	if !containsString(ruleUUIDs(opn.firewallRules), "manual-firewall") ||
+		len(opn.dnsPolicies) != 2 || opn.dnsPolicies[0].UUID != "dns-manual" {
+		t.Fatalf("manual policy changed: firewall=%v dns=%+v", ruleUUIDs(opn.firewallRules), opn.dnsPolicies)
+	}
+}
+
+func TestReconcileContentFilter_ReadOnlyFailuresNeverStagePartialPolicy(t *testing.T) {
+	cfg := validContentFilterConfig()
+	var healthyInventory []opnsense.FirewallRuleInfo
+	for i, rule := range desiredContentFilterRules(cfg) {
+		healthyInventory = append(healthyInventory, opnsenseFilterGetReadback(rule, fmt.Sprintf("rule-%d", i)))
+	}
+	healthyDNS := desiredDNSBLPolicy(cfg)
+	healthyDNS.UUID = "dns"
+	drifted := append([]opnsense.FirewallRuleInfo(nil), healthyInventory...)
+	drifted[1].Quick = "0"
+	duplicateDNS := healthyDNS
+	duplicateDNS.UUID = "dns-duplicate"
+
+	tests := []struct {
+		name      string
+		inventory []opnsense.FirewallRuleInfo
+		policies  []opnsense.DNSBLPolicy
+		verifyErr error
+	}{
+		{name: "missing firewall", policies: []opnsense.DNSBLPolicy{healthyDNS}},
+		{name: "missing DNSBL", inventory: healthyInventory},
+		{name: "drifted firewall", inventory: drifted, policies: []opnsense.DNSBLPolicy{healthyDNS}},
+		{name: "duplicate DNSBL", inventory: healthyInventory, policies: []opnsense.DNSBLPolicy{healthyDNS, duplicateDNS}},
+		{name: "runtime verification", inventory: healthyInventory, policies: []opnsense.DNSBLPolicy{healthyDNS}, verifyErr: errors.New("effective query failed")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opn := &fakeContentFilterOPN{
+				fakeNetworkOPN:        &fakeNetworkOPN{firewallRules: tt.inventory},
+				sourceScopedSupported: true,
+				dnsPolicies:           tt.policies,
+				verifyRuntimeErr:      tt.verifyErr,
+			}
+			if _, err := reconcileContentFilter(context.Background(), opn, tt.inventory, cfg); err == nil {
+				t.Fatal("unsafe or incomplete policy was accepted")
+			}
+			assertNoContentFilterMutation(t, opn)
+		})
 	}
 }
 
@@ -265,15 +304,26 @@ func TestInspectContentFilterPolicy_RejectsUnknownOwnedRule(t *testing.T) {
 }
 
 func TestReconcileContentFilter_InvalidFeedFailsBeforeAnyMutation(t *testing.T) {
-	opn := &fakeContentFilterOPN{fakeNetworkOPN: &fakeNetworkOPN{}}
-	cfg := validContentFilterConfig()
-	cfg.CategoryFeed = ""
-	if _, err := reconcileContentFilter(context.Background(), opn, nil, cfg); err == nil {
-		t.Fatal("missing required internal feed was accepted")
-	}
-	if len(opn.createFirewallCalls) != 0 || len(opn.createDNSBLCalls) != 0 {
-		t.Fatalf("partial policy mutation occurred: fw=%v dns=%v",
-			opn.createFirewallCalls, opn.createDNSBLCalls)
+	for _, value := range []string{
+		"",
+		"http://student-filter-feed.lab.jmal.io",
+		"https://example.com",
+		"https://STUDENT-FILTER-FEED.LAB.JMAL.IO",
+		"https://student-filter-feed.lab.jmal.io/lists/drogue.txt",
+		"https://student-filter-feed.lab.jmal.io?list=drogue",
+		"https://student-filter-feed.lab.jmal.io#fragment",
+		"https://user@student-filter-feed.lab.jmal.io",
+		"https://student-filter-feed.lab.jmal.io:443",
+	} {
+		t.Run(value, func(t *testing.T) {
+			opn := &fakeContentFilterOPN{fakeNetworkOPN: &fakeNetworkOPN{}}
+			cfg := validContentFilterConfig()
+			cfg.CategoryFeedBaseURL = value
+			if _, err := reconcileContentFilter(context.Background(), opn, nil, cfg); err == nil {
+				t.Fatalf("invalid feed base URL %q was accepted", value)
+			}
+			assertNoContentFilterMutation(t, opn)
+		})
 	}
 }
 
@@ -287,6 +337,23 @@ func TestReconcileContentFilter_UnmanagedSourceScopedSafeSearchFailsBeforeMutati
 	if len(opn.createFirewallCalls) != 0 || len(opn.createDNSBLCalls) != 0 || opn.refreshDNSBLCalls != 0 {
 		t.Fatalf("unsupported source-scoped policy mutated OPNsense: fw=%v dns=%v refresh=%d",
 			opn.createFirewallCalls, opn.createDNSBLCalls, opn.refreshDNSBLCalls)
+	}
+}
+
+func assertNoContentFilterMutation(t *testing.T, opn *fakeContentFilterOPN) {
+	t.Helper()
+	if len(opn.createFirewallCalls) != 0 ||
+		len(opn.updateFirewallCalls) != 0 ||
+		len(opn.deleteFirewallCalls) != 0 ||
+		opn.applyFirewallCalls != 0 ||
+		len(opn.createDNSBLCalls) != 0 ||
+		len(opn.updateDNSBLCalls) != 0 ||
+		len(opn.deleteDNSBLCalls) != 0 ||
+		opn.refreshDNSBLCalls != 0 {
+		t.Fatalf("read-only content-filter path mutated policy: createFW=%v updateFW=%v deleteFW=%v apply=%d createDNS=%v updateDNS=%v deleteDNS=%v refresh=%d",
+			opn.createFirewallCalls, opn.updateFirewallCalls, opn.deleteFirewallCalls,
+			opn.applyFirewallCalls, opn.createDNSBLCalls, opn.updateDNSBLCalls,
+			opn.deleteDNSBLCalls, opn.refreshDNSBLCalls)
 	}
 }
 
@@ -316,5 +383,10 @@ func TestEquivalentContentFilterRule_NormalizesLiveFalseInversions(t *testing.T)
 	current.SourceInvert = "1"
 	if equivalentContentFilterRule(current, desired) {
 		t.Fatal("true source inversion was normalized as false")
+	}
+	current = opnsenseFilterGetReadback(desired, "live-rule")
+	current.Quick = "2"
+	if equivalentContentFilterRule(current, desired) {
+		t.Fatal("malformed quick value matched desired true")
 	}
 }

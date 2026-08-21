@@ -121,6 +121,8 @@ func deletePodFirewallRules(
 		return 0, fmt.Errorf("firewall inventory has %d rules, exceeds safe inspection limit %d", len(rules), maxRules)
 	}
 	want := podPassSignature(opnsense.FirewallRuleInfo{
+		Quick:           "1",
+		Log:             "0",
 		Interface:       canonicalInterfaceList(ifName),
 		Action:          "pass",
 		Direction:       "in",
@@ -304,6 +306,8 @@ func classifyManagedPodPassRule(rule opnsense.FirewallRuleInfo) (managed bool, s
 func isExactPodPassShape(rule opnsense.FirewallRuleInfo) bool {
 	if rule.UUID == "" ||
 		(rule.Enabled != "" && canonicalField(rule.Enabled) != "1") ||
+		!isTrueFirewallField(rule.Quick) ||
+		isTruthyFirewallField(rule.Log) ||
 		isTruthyFirewallField(rule.InterfaceInvert) ||
 		canonicalField(rule.Action) != "pass" ||
 		canonicalField(rule.Direction) != "in" ||
@@ -353,16 +357,39 @@ func isTruthyFirewallField(value string) bool {
 	}
 }
 
-func canonicalFirewallBoolean(value string) string {
-	if isTruthyFirewallField(value) {
-		return "1"
+func isTrueFirewallField(value string) bool {
+	switch canonicalField(value) {
+	case "1", "true":
+		return true
+	default:
+		return false
 	}
-	return "0"
+}
+
+func canonicalFirewallBoolean(value string) string {
+	switch canonicalField(value) {
+	case "", "0", "false":
+		return "0"
+	case "1", "true":
+		return "1"
+	default:
+		return "invalid:" + canonicalField(value)
+	}
+}
+
+func equivalentFirewallBoolean(current, desired string) bool {
+	currentValue := canonicalFirewallBoolean(current)
+	desiredValue := canonicalFirewallBoolean(desired)
+	return !strings.HasPrefix(currentValue, "invalid:") &&
+		!strings.HasPrefix(desiredValue, "invalid:") &&
+		currentValue == desiredValue
 }
 
 func podPassSignature(rule opnsense.FirewallRuleInfo) string {
 	return strings.Join([]string{
 		canonicalInterfaceList(rule.Interface),
+		canonicalFirewallBoolean(rule.Quick),
+		canonicalFirewallBoolean(rule.Log),
 		canonicalFirewallBoolean(rule.InterfaceInvert),
 		canonicalField(rule.Action),
 		canonicalField(rule.Direction),

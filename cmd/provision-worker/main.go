@@ -383,10 +383,10 @@ func main() {
 		MaxFirewallRules:     networkMaxFirewallRules,
 		FirewallCleanupLimit: networkFirewallCleanupLimit,
 		ContentFilter: provisioner.ContentFilterConfig{
-			Enabled:       contentFilterEnabled,
-			SourceNetwork: contentFilterSourceNetwork,
-			CategoryFeed:  os.Getenv("WORKER_CONTENT_FILTER_CATEGORY_FEED_URL"),
-			Allowlist:     contentFilterAllowlist,
+			Enabled:             contentFilterEnabled,
+			SourceNetwork:       contentFilterSourceNetwork,
+			CategoryFeedBaseURL: os.Getenv("WORKER_CONTENT_FILTER_CATEGORY_FEED_BASE_URL"),
+			Allowlist:           contentFilterAllowlist,
 		},
 		Pusher: networkReconcilerPusher,
 	}

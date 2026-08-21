@@ -13,6 +13,7 @@ import (
 const (
 	contentFilterRulePrefix       = "crucible:content-filter:v1:"
 	contentFilterDNSBLDescription = "crucible:content-filter:v1"
+	contentFilterFeedBaseURL      = "https://student-filter-feed.lab.jmal.io"
 )
 
 var contentFilterBypassPorts = []string{
@@ -20,36 +21,35 @@ var contentFilterBypassPorts = []string{
 	"8080", "8118", "9001", "9030", "9050", "9150", "51820",
 }
 
+var contentFilterFeedPaths = []string{
+	"/lists/drogue.txt",
+	"/lists/agressif.txt",
+	"/lists/audio-video.txt",
+	"/lists/social_networks.txt",
+}
+
 // ContentFilterConfig is deliberately deployment-owned. There is no student or
 // instructor API for modifying policy or its permanent allowlist.
 type ContentFilterConfig struct {
-	Enabled       bool
-	SourceNetwork string
-	CategoryFeed  string
-	Allowlist     []string
+	Enabled             bool
+	SourceNetwork       string
+	CategoryFeedBaseURL string
+	Allowlist           []string
 }
 
 type contentFilterClient interface {
-	podFirewallRuleClient
-	UpdateFirewallRule(ctx context.Context, uuid string, rule opnsense.FirewallRule) error
 	SupportsSourceScopedSafeSearch(ctx context.Context) (bool, error)
 	VerifySourceScopedContentFilter(ctx context.Context, sourceNetwork string) error
 	ListDNSBLPolicies(ctx context.Context) ([]opnsense.DNSBLPolicy, error)
 	GetDNSBLPolicy(ctx context.Context, uuid string) (opnsense.DNSBLPolicy, error)
-	CreateDNSBLPolicy(ctx context.Context, policy opnsense.DNSBLPolicy) (string, error)
-	UpdateDNSBLPolicy(ctx context.Context, uuid string, policy opnsense.DNSBLPolicy) error
-	DeleteDNSBLPolicy(ctx context.Context, uuid string) error
-	RefreshUnboundDNSBL(ctx context.Context) error
 }
 
 type contentFilterReconcileResult struct {
-	ExpectedRules   int
-	MissingRules    int
-	DriftedRules    int
-	RemovedRules    int
-	FirewallMutated bool
-	DNSBLMutated    bool
-	Healthy         bool
+	ExpectedRules int
+	MissingRules  int
+	DriftedRules  int
+	RemovedRules  int
+	Healthy       bool
 }
 
 func validateContentFilterConfig(cfg ContentFilterConfig) error {
@@ -59,14 +59,28 @@ func validateContentFilterConfig(cfg ContentFilterConfig) error {
 	if canonicalField(cfg.SourceNetwork) != "10.100.0.0/16" {
 		return fmt.Errorf("content filter source network must be 10.100.0.0/16, got %q", cfg.SourceNetwork)
 	}
-	feed, err := url.ParseRequestURI(strings.TrimSpace(cfg.CategoryFeed))
-	if err != nil || feed.Scheme != "https" || feed.Host == "" {
-		return fmt.Errorf("content filter category feed must be an internal HTTPS URL")
+	if err := validateContentFilterFeedBaseURL(cfg.CategoryFeedBaseURL); err != nil {
+		return err
 	}
 	for _, domain := range cfg.Allowlist {
 		if !validPolicyDomain(domain) {
 			return fmt.Errorf("invalid permanent allowlist domain %q", domain)
 		}
+	}
+	return nil
+}
+
+func validateContentFilterFeedBaseURL(value string) error {
+	feed, err := url.ParseRequestURI(strings.TrimSpace(value))
+	if err != nil ||
+		feed.Scheme != "https" ||
+		feed.Host != "student-filter-feed.lab.jmal.io" ||
+		feed.User != nil ||
+		feed.RawQuery != "" ||
+		feed.ForceQuery ||
+		feed.Fragment != "" ||
+		(feed.Path != "" && feed.Path != "/") {
+		return fmt.Errorf("content filter category feed base URL must be exactly %s", contentFilterFeedBaseURL)
 	}
 	return nil
 }
@@ -93,6 +107,24 @@ func desiredContentFilterRules(cfg ContentFilterConfig) []opnsense.FirewallRule 
 			Description: contentFilterRulePrefix + "dot-doq",
 		},
 		{
+			Enabled: "1", Sequence: "121", Quick: "1", Action: "block",
+			Interface: "", Direction: "in", IPProtocol: "inet", Protocol: "UDP",
+			Source: source, Destination: "any", DestinationPort: "784", Log: "1",
+			Description: contentFilterRulePrefix + "doq-784",
+		},
+		{
+			Enabled: "1", Sequence: "122", Quick: "1", Action: "block",
+			Interface: "", Direction: "in", IPProtocol: "inet", Protocol: "UDP",
+			Source: source, Destination: "any", DestinationPort: "8853", Log: "1",
+			Description: contentFilterRulePrefix + "doq-8853",
+		},
+		{
+			Enabled: "1", Sequence: "123", Quick: "1", Action: "block",
+			Interface: "", Direction: "in", IPProtocol: "inet", Protocol: "UDP",
+			Source: source, Destination: "any", DestinationPort: "443", Log: "1",
+			Description: contentFilterRulePrefix + "quic-443",
+		},
+		{
 			Enabled: "1", Sequence: "130", Quick: "1", Action: "block",
 			Interface: "", Direction: "in", IPProtocol: "inet", Protocol: "TCP/UDP",
 			Source: source,
@@ -113,12 +145,14 @@ func desiredContentFilterRules(cfg ContentFilterConfig) []opnsense.FirewallRule 
 			Description: contentFilterRulePrefix + "bypass-port-" + port,
 		})
 	}
-	rules = append(rules, opnsense.FirewallRule{
-		Enabled: "1", Sequence: "160", Quick: "1", Action: "block",
-		Interface: "", Direction: "in", IPProtocol: "inet", Protocol: "GRE",
-		Source: source, DestinationInvert: "1", Destination: source, Log: "1",
-		Description: contentFilterRulePrefix + "vpn-gre",
-	})
+	for i, protocol := range []string{"GRE", "ESP", "AH"} {
+		rules = append(rules, opnsense.FirewallRule{
+			Enabled: "1", Sequence: fmt.Sprintf("%d", 160+i), Quick: "1", Action: "block",
+			Interface: "", Direction: "in", IPProtocol: "inet", Protocol: protocol,
+			Source: source, DestinationInvert: "1", Destination: source, Log: "1",
+			Description: contentFilterRulePrefix + "vpn-" + strings.ToLower(protocol),
+		})
+	}
 	return rules
 }
 
@@ -144,122 +178,39 @@ func reconcileContentFilter(
 		return result, fmt.Errorf("content filter activation blocked: OPNsense 26.1 built-in Force SafeSearch is global; this client does not transactionally manage and verify the proven custom Unbound view required for 10.100.0.0/16")
 	}
 
-	desiredRules := desiredContentFilterRules(cfg)
-	result.ExpectedRules = len(desiredRules)
-	desiredByDescription := make(map[string]opnsense.FirewallRule, len(desiredRules))
-	for _, rule := range desiredRules {
-		desiredByDescription[rule.Description] = rule
-	}
-	ownedByDescription := make(map[string][]opnsense.FirewallRuleInfo)
-	for _, rule := range inventory {
-		if strings.HasPrefix(strings.TrimSpace(rule.Description), contentFilterRulePrefix) {
-			ownedByDescription[rule.Description] = append(ownedByDescription[rule.Description], rule)
-		}
-	}
-	for description := range ownedByDescription {
-		sort.Slice(ownedByDescription[description], func(i, j int) bool {
-			return ownedByDescription[description][i].UUID < ownedByDescription[description][j].UUID
-		})
-	}
-
-	for description, desired := range desiredByDescription {
-		candidates := ownedByDescription[description]
-		if len(candidates) == 0 {
-			if _, err := opn.CreateFirewallRule(ctx, desired); err != nil {
-				return result, fmt.Errorf("create content-filter rule %q: %w", description, err)
-			}
-			result.MissingRules++
-			result.FirewallMutated = true
-			continue
-		}
-		if !equivalentContentFilterRule(candidates[0], desired) {
-			if err := opn.UpdateFirewallRule(ctx, candidates[0].UUID, desired); err != nil {
-				return result, fmt.Errorf("repair content-filter rule %q: %w", description, err)
-			}
-			result.DriftedRules++
-			result.FirewallMutated = true
-		}
-		for _, duplicate := range candidates[1:] {
-			if err := opn.DeleteFirewallRule(ctx, duplicate.UUID); err != nil {
-				return result, fmt.Errorf("delete duplicate content-filter rule %q: %w", duplicate.UUID, err)
-			}
-			result.RemovedRules++
-			result.FirewallMutated = true
-		}
-	}
-	for description, candidates := range ownedByDescription {
-		if _, desired := desiredByDescription[description]; desired {
-			continue
-		}
-		for _, stale := range candidates {
-			if err := opn.DeleteFirewallRule(ctx, stale.UUID); err != nil {
-				return result, fmt.Errorf("delete stale content-filter rule %q: %w", stale.UUID, err)
-			}
-			result.RemovedRules++
-			result.FirewallMutated = true
-		}
-	}
-
-	dnsResult, err := reconcileContentFilterDNS(ctx, opn, cfg)
-	if err != nil {
-		return result, err
-	}
-	result.DNSBLMutated = dnsResult.DNSBLMutated
-	result.Healthy = true
-	return result, nil
-}
-
-func reconcileContentFilterDNS(
-	ctx context.Context,
-	opn contentFilterClient,
-	cfg ContentFilterConfig,
-) (contentFilterReconcileResult, error) {
-	var result contentFilterReconcileResult
-	want := desiredDNSBLPolicy(cfg)
+	result.ExpectedRules = len(desiredContentFilterRules(cfg))
 	rows, err := opn.ListDNSBLPolicies(ctx)
 	if err != nil {
-		return result, err
+		return result, fmt.Errorf("inspect content-filter DNSBL policies: %w", err)
 	}
-	var owned []opnsense.DNSBLPolicy
+	var policies []opnsense.DNSBLPolicy
 	for _, row := range rows {
-		if row.Description == contentFilterDNSBLDescription {
-			owned = append(owned, row)
+		if strings.TrimSpace(row.Description) != contentFilterDNSBLDescription {
+			continue
 		}
-	}
-	sort.Slice(owned, func(i, j int) bool { return owned[i].UUID < owned[j].UUID })
-	if len(owned) == 0 {
-		if _, err := opn.CreateDNSBLPolicy(ctx, want); err != nil {
-			return result, err
-		}
-		result.DNSBLMutated = true
-	} else {
-		current, err := opn.GetDNSBLPolicy(ctx, owned[0].UUID)
+		current, err := opn.GetDNSBLPolicy(ctx, row.UUID)
 		if err != nil {
-			return result, err
+			return result, fmt.Errorf("inspect content-filter DNSBL policy %s: %w", row.UUID, err)
 		}
-		if !equivalentDNSBLPolicy(current, want) {
-			if err := opn.UpdateDNSBLPolicy(ctx, owned[0].UUID, want); err != nil {
-				return result, err
-			}
-			result.DNSBLMutated = true
-		}
-		for _, duplicate := range owned[1:] {
-			if err := opn.DeleteDNSBLPolicy(ctx, duplicate.UUID); err != nil {
-				return result, err
-			}
-			result.DNSBLMutated = true
-		}
+		policies = append(policies, current)
 	}
-	// Model readback does not reveal whether a prior asynchronous activation
-	// reached the runtime, so retries refresh and then verify from the approved
-	// student-source scope even without model drift.
-	if err := opn.RefreshUnboundDNSBL(ctx); err != nil {
-		return result, err
+	if err := InspectContentFilterPolicy(inventory, policies, cfg); err != nil {
+		return result, fmt.Errorf("content filter activation blocked: read-only policy inspection failed: %w", err)
 	}
 	if err := opn.VerifySourceScopedContentFilter(ctx, cfg.SourceNetwork); err != nil {
 		return result, fmt.Errorf("verify effective source-scoped content filter: %w", err)
 	}
+	result.Healthy = true
 	return result, nil
+}
+
+func contentFilterFeedListURLs(baseURL string) string {
+	baseURL = strings.TrimSuffix(strings.TrimSpace(baseURL), "/")
+	urls := make([]string, 0, len(contentFilterFeedPaths))
+	for _, path := range contentFilterFeedPaths {
+		urls = append(urls, baseURL+path)
+	}
+	return strings.Join(urls, ",")
 }
 
 func desiredDNSBLPolicy(cfg ContentFilterConfig) opnsense.DNSBLPolicy {
@@ -270,8 +221,8 @@ func desiredDNSBLPolicy(cfg ContentFilterConfig) opnsense.DNSBLPolicy {
 	sort.Strings(allowlist)
 	return opnsense.DNSBLPolicy{
 		Enabled:     "1",
-		Types:       "hgz014,hgz019,oisd2",
-		Lists:       strings.TrimSpace(cfg.CategoryFeed),
+		Types:       "hgz014,hgz021,oisd2",
+		Lists:       contentFilterFeedListURLs(cfg.CategoryFeedBaseURL),
 		Allowlists:  strings.Join(allowlist, ","),
 		SourceNets:  canonicalField(cfg.SourceNetwork),
 		NXDomain:    "1",
@@ -283,9 +234,9 @@ func desiredDNSBLPolicy(cfg ContentFilterConfig) opnsense.DNSBLPolicy {
 func equivalentContentFilterRule(current opnsense.FirewallRuleInfo, desired opnsense.FirewallRule) bool {
 	return canonicalField(current.Enabled) == canonicalField(desired.Enabled) &&
 		canonicalField(current.Sequence) == canonicalField(desired.Sequence) &&
-		canonicalField(current.Quick) == canonicalField(desired.Quick) &&
+		equivalentFirewallBoolean(current.Quick, desired.Quick) &&
 		canonicalInterfaceList(current.Interface) == canonicalInterfaceList(desired.Interface) &&
-		canonicalFirewallBoolean(current.InterfaceInvert) == canonicalFirewallBoolean(desired.InterfaceInvert) &&
+		equivalentFirewallBoolean(current.InterfaceInvert, desired.InterfaceInvert) &&
 		canonicalField(current.Action) == canonicalField(desired.Action) &&
 		canonicalField(current.Direction) == canonicalField(desired.Direction) &&
 		canonicalField(current.IPProtocol) == canonicalField(desired.IPProtocol) &&
@@ -294,9 +245,9 @@ func equivalentContentFilterRule(current opnsense.FirewallRuleInfo, desired opns
 		canonicalCSV(current.SourcePort) == canonicalCSV(desired.SourcePort) &&
 		canonicalCSV(current.Destination) == canonicalCSV(desired.Destination) &&
 		canonicalCSV(current.DestinationPort) == canonicalCSV(desired.DestinationPort) &&
-		canonicalFirewallBoolean(current.SourceInvert) == canonicalFirewallBoolean(desired.SourceInvert) &&
-		canonicalFirewallBoolean(current.DestinationInvert) == canonicalFirewallBoolean(desired.DestinationInvert) &&
-		canonicalField(current.Log) == canonicalField(desired.Log) &&
+		equivalentFirewallBoolean(current.SourceInvert, desired.SourceInvert) &&
+		equivalentFirewallBoolean(current.DestinationInvert, desired.DestinationInvert) &&
+		equivalentFirewallBoolean(current.Log, desired.Log) &&
 		strings.TrimSpace(current.Description) == desired.Description
 }
 

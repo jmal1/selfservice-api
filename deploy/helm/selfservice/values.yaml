@@ -86,16 +86,16 @@ worker:
     firewallCleanupLimit: 100
   # Student egress/DNS content policy. Activation is deliberately separate
   # from the network reconciler and defaults off. Do not enable until the
-  # supervised firewall inventory check is clean and categoryFeedURL is an
-  # OPNsense-reachable internal validated last-known-good feed. Activation also
-  # fails closed while OPNsense 26.1 offers only global Force SafeSearch and no
-  # effective student-source verification exists.
+  # supervised firewall inventory check is clean and categoryFeedBaseURL is the
+  # validated internal publisher base. Activation also
+  # remains read-only until transactional custom-view ownership and effective
+  # student-source verification are implemented.
   contentFilter:
     enabled: false
     sourceNetwork: "10.100.0.0/16"
     # Validated feed: https://student-filter-feed.lab.jmal.io. Keep this empty
     # until the source-scoped SafeSearch/runtime-verification blocker is closed.
-    categoryFeedURL: ""
+    categoryFeedBaseURL: ""
     # Permanent deployment-reviewed exceptions only. There is intentionally no
     # student/instructor mutation API for this list.
     allowlist: []

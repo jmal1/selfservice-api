@@ -668,22 +668,41 @@ Student pod traffic originates from `10.100.0.0/16` and uses fwpodv01
 - ships blocked events only, with 30-day retention configured in the external
   log store.
 
+Global quick logged denies cover TCP/UDP 853, UDP 784 and 8853 (DoQ), UDP 443
+(forcing QUIC/HTTP3 fallback), and external GRE, ESP, and AH. Intentional
+traffic within `10.100.0.0/16` is preserved for the tunnel protocols. TCP 443
+is not blocked globally; custom tunnels over ordinary HTTPS remain a residual
+limitation.
+
 The worker owns quick global/floating firewall rules scoped by source network.
 In OPNsense 26.1 those rules are priority group 200000 and therefore evaluate
 before per-interface broad pod passes (priority group 400000). They deliberately
 have an empty `interface`, so dynamic VLAN-to-`optN` remapping cannot move the
 policy behind or around a pod pass.
 
-Content-filter activation is disabled by default. Enabling it requires a
-validated, OPNsense-reachable internal HTTPS category feed covering UT1
+Content-filter activation is disabled by default. `categoryFeedBaseURL` must be
+exactly `https://student-filter-feed.lab.jmal.io` (an optional trailing slash is
+accepted). The worker deterministically expands it to
+`/lists/drogue.txt`, `/lists/agressif.txt`, `/lists/audio-video.txt`, and
+`/lists/social_networks.txt`; arbitrary hosts and paths are rejected. These
+validated, OPNsense-reachable internal HTTPS lists cover UT1
 `drogue`, `audio-video`, and `social_networks` plus the maintained
 `blacklists/agressif/domains` violence/aggression category. The validated feed
 is `https://student-filter-feed.lab.jmal.io`; its hostname-only LKG counts are
-436, 3,620, 715, and 266 respectively. The running 26.1 model supports
-`oisd2`, `hgz014`, and `hgz019`; it has no built-in social-media selector.
-Missing/invalid feed configuration fails before any partial policy mutation.
+436, 3,620, 715, and 266 respectively. The capacity-tested built-in selection
+is exactly `oisd2`, `hgz014`, and `hgz021` (Gambling Mini); `hgz019` and
+`hgz020` are larger gambling variants, and `hgz022` does not exist. The
+supervised 4 GB pilot measured 626,913 final domains and 389 MB Unbound RSS
+with this exact selection. Missing/invalid feed configuration fails before any
+partial policy mutation.
 
-Activation is also intentionally blocked in the worker today: OPNsense 26.1's
+Activation is also intentionally read-only in the worker today: it validates
+configuration, inspects exact firewall/DNSBL state, and verifies runtime
+behavior, but does not create, update, delete, refresh, or apply policy. This
+prevents a failed multi-system activation from leaving a partial model that a
+later unrelated firewall apply could activate.
+
+OPNsense 26.1's
 built-in Force SafeSearch setting is a general/global Unbound switch, while the
 approved scope must leave management and staging unchanged. Do not enable the
 global switch. A reversible live pilot proved source-scoped SafeSearch can use

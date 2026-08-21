@@ -64,16 +64,11 @@ type networkReconcileOPN interface {
 	GetFirewallRules(ctx context.Context) ([]opnsense.FirewallRuleInfo, error)
 	CreateFirewallRule(ctx context.Context, rule opnsense.FirewallRule) (string, error)
 	DeleteFirewallRule(ctx context.Context, uuid string) error
-	UpdateFirewallRule(ctx context.Context, uuid string, rule opnsense.FirewallRule) error
 	ApplyFirewall(ctx context.Context) error
 	SupportsSourceScopedSafeSearch(ctx context.Context) (bool, error)
 	VerifySourceScopedContentFilter(ctx context.Context, sourceNetwork string) error
 	ListDNSBLPolicies(ctx context.Context) ([]opnsense.DNSBLPolicy, error)
 	GetDNSBLPolicy(ctx context.Context, uuid string) (opnsense.DNSBLPolicy, error)
-	CreateDNSBLPolicy(ctx context.Context, policy opnsense.DNSBLPolicy) (string, error)
-	UpdateDNSBLPolicy(ctx context.Context, uuid string, policy opnsense.DNSBLPolicy) error
-	DeleteDNSBLPolicy(ctx context.Context, uuid string) error
-	RefreshUnboundDNSBL(ctx context.Context) error
 }
 
 type networkReconcileSSH interface {
@@ -310,9 +305,6 @@ func reconcileNetwork(
 			if policyResult.Healthy {
 				counts.ContentFilterHealthy = 1
 			}
-			if policyResult.FirewallMutated {
-				needsFirewallApply = true
-			}
 			if policyErr != nil {
 				counts.Errors++
 				log.Warn("network reconcile: content filter reconciliation failed", "error", policyErr)
@@ -392,6 +384,8 @@ func isTerminalPodStatus(status string) bool {
 // on the firewall.
 func firewallRuleSignature(rule opnsense.FirewallRule) opnsense.FirewallRuleInfo {
 	return opnsense.FirewallRuleInfo{
+		Quick:             canonicalFirewallBoolean(rule.Quick),
+		Log:               canonicalFirewallBoolean(rule.Log),
 		Interface:         canonicalInterfaceList(rule.Interface),
 		InterfaceInvert:   canonicalFirewallBoolean(rule.InterfaceInvert),
 		Direction:         canonicalField(rule.Direction),

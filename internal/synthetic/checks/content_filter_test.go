@@ -51,9 +51,9 @@ func TestContentFilterPolicy_RemainsGreenWhileActivationIsDeliberatelyDisabled(t
 func TestContentFilterPolicy_ExpectedWithoutReaderFailsLoudly(t *testing.T) {
 	check := ContentFilterPolicy(ContentFilterPolicyConfig{
 		Policy: provisioner.ContentFilterConfig{
-			Enabled:       true,
-			SourceNetwork: "10.100.0.0/16",
-			CategoryFeed:  "https://filter.internal.example/ut1.txt",
+			Enabled:             true,
+			SourceNetwork:       "10.100.0.0/16",
+			CategoryFeedBaseURL: "https://student-filter-feed.lab.jmal.io",
 		},
 	})
 	if _, err := check.Run(context.Background(), synthetic.NewClient("http://unused", "")); err == nil {
@@ -81,9 +81,9 @@ func TestContentFilterPolicy_UsesDedicatedReaderAndEnforcesGeneratedRuleCeiling(
 	check := ContentFilterPolicy(ContentFilterPolicyConfig{
 		Reader: reader,
 		Policy: provisioner.ContentFilterConfig{
-			Enabled:       true,
-			SourceNetwork: "10.100.0.0/16",
-			CategoryFeed:  "https://filter.internal.example/ut1.txt",
+			Enabled:             true,
+			SourceNetwork:       "10.100.0.0/16",
+			CategoryFeedBaseURL: "https://student-filter-feed.lab.jmal.io",
 		},
 		MaxGeneratedRules: 1,
 	})
@@ -100,9 +100,9 @@ func TestContentFilterPolicy_UnmanagedSourceScopedSafeSearchFailsBeforeInventory
 	check := ContentFilterPolicy(ContentFilterPolicyConfig{
 		Reader: reader,
 		Policy: provisioner.ContentFilterConfig{
-			Enabled:       true,
-			SourceNetwork: "10.100.0.0/16",
-			CategoryFeed:  "https://student-filter-feed.lab.jmal.io",
+			Enabled:             true,
+			SourceNetwork:       "10.100.0.0/16",
+			CategoryFeedBaseURL: "https://student-filter-feed.lab.jmal.io",
 		},
 	})
 	if _, err := check.Run(context.Background(), synthetic.NewClient("http://unused", "")); err == nil {

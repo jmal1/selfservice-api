@@ -16,7 +16,7 @@ func TestGetDNSBLPolicy_ParsesOPNsense26ModelShape(t *testing.T) {
 	    "type": {
 	      "oisd2": {"value":"NSFW Blocklist","selected":1},
 	      "hgz014": {"value":"DoH/VPN/TOR/Proxy Bypass","selected":"1"},
-	      "hgz019": {"value":"Gambling","selected":1}
+	      "hgz021": {"value":"Gambling - Mini","selected":1}
 	    },
 	    "lists": "https://filter.internal.example/ut1.txt",
 	    "allowlists": "classroom.example",
@@ -47,7 +47,7 @@ func TestGetDNSBLPolicy_ParsesOPNsense26ModelShape(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetDNSBLPolicy: %v", err)
 	}
-	if got.Types != "hgz014,hgz019,oisd2" {
+	if got.Types != "hgz014,hgz021,oisd2" {
 		t.Fatalf("Types = %q", got.Types)
 	}
 	if got.SourceNets != "10.100.0.0/16,10.200.0.0/16" || got.Lists != "https://filter.internal.example/ut1.txt" {

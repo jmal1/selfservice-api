@@ -149,8 +149,8 @@ spec:
               value: {{ .Values.worker.contentFilter.enabled | default false | quote }}
             - name: WORKER_CONTENT_FILTER_SOURCE_NETWORK
               value: {{ .Values.worker.contentFilter.sourceNetwork | default "10.100.0.0/16" | quote }}
-            - name: WORKER_CONTENT_FILTER_CATEGORY_FEED_URL
-              value: {{ .Values.worker.contentFilter.categoryFeedURL | default "" | quote }}
+            - name: WORKER_CONTENT_FILTER_CATEGORY_FEED_BASE_URL
+              value: {{ .Values.worker.contentFilter.categoryFeedBaseURL | default "" | quote }}
             - name: WORKER_CONTENT_FILTER_ALLOWLIST
               value: {{ join "," (.Values.worker.contentFilter.allowlist | default (list)) | quote }}
             # Template pipeline reconciler: refreshes crucible_template_state

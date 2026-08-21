@@ -273,6 +273,12 @@ blocks adult/explicit, gambling, drugs, violence, social-media, and streaming
 categories; forces SafeSearch; and blocks common external DNS, DoH/DoT/DoQ,
 VPN, proxy, and Tor bypass paths. It does **not** intercept TLS.
 
+Global quick logged denies cover TCP/UDP 853, UDP 784 and 8853 (DoQ), UDP 443
+(forcing QUIC/HTTP3 fallback), and external GRE, ESP, and AH before broad
+per-pod interface passes. Intentional traffic within `10.100.0.0/16` is
+preserved for the tunnel protocols. TCP 443 is not blocked globally, so custom
+tunnels disguised as ordinary HTTPS remain a residual limitation.
+
 The allowlist is permanent and admin-managed through reviewed deployment
 configuration. Instructors and students cannot add temporary exceptions. Send
 a false-positive request to a platform admin with the exact domain, course,
@@ -301,10 +307,25 @@ model without creating a pod or changing the firewall. It fails when:
   credentials are absent.
 
 The validated internal feed is
-`https://student-filter-feed.lab.jmal.io`. Its hostname-only LKG inputs are
+`https://student-filter-feed.lab.jmal.io`. The deployment value
+`categoryFeedBaseURL` is this exact base URL, not a list URL; the worker expands
+it in order to `/lists/drogue.txt`, `/lists/agressif.txt`,
+`/lists/audio-video.txt`, and `/lists/social_networks.txt`. Arbitrary hosts,
+ports, paths, queries, fragments, and userinfo are rejected. Its hostname-only LKG inputs are
 `drogue` (436), `blacklists/agressif/domains` (266), `audio-video` (3,620),
 and `social_networks` (715); IP entries are excluded. OPNsense 26.1 has no
-built-in social-media selector.
+built-in social-media selector. The capacity-tested built-in selection is
+exactly `oisd2`, `hgz014`, and `hgz021` (Gambling Mini). Do not substitute the
+larger `hgz019` or `hgz020` gambling lists; `hgz022` does not exist. The
+supervised 4 GB pilot measured 626,913 final domains and 389 MB Unbound RSS
+with this exact selection.
+
+The repository integration is intentionally read-only even if source-scoped
+SafeSearch capability becomes available: it validates configuration, inspects
+exact firewall/DNSBL state, and verifies effective behavior, but never mutates,
+refreshes, or applies the policy. Supervised activation remains a live-only
+step until a transactional owner can roll back every firewall, DNSBL, Unbound,
+and runtime-verification failure without leaving staged policy behind.
 
 Do not treat a successful DNSBL API action as proof of runtime enforcement.
 Activation is asynchronous, the Python module reloads `dnsbl.json` only on an

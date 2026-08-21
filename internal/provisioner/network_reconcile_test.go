@@ -288,6 +288,7 @@ func (f *fakeNetworkDB) ReleaseVLAN(_ context.Context, podID uuid.UUID) error {
 func podPassRuleReadback(ifName, subnet string) opnsense.FirewallRuleInfo {
 	rule := opnsenseFilterGetReadback(opnsense.FirewallRule{
 		Enabled:     "1",
+		Quick:       "1",
 		Action:      "pass",
 		Interface:   ifName,
 		Direction:   "in",
@@ -403,23 +404,31 @@ func TestReconcileNetwork_ContentFilterWaitsForGeneratedCleanup(t *testing.T) {
 
 func TestReconcileNetwork_FirewallApplyFailureKeepsContentFilterUnhealthy(t *testing.T) {
 	row := allocatedVLANRow(104, uuid.New(), "active")
+	cfg := validContentFilterConfig()
 	pass := podPassRuleReadback("opt7", row.Subnet)
 	pass.UUID = "legacy"
+	firewallRules := []opnsense.FirewallRuleInfo{pass}
+	for i, rule := range desiredContentFilterRules(cfg) {
+		firewallRules = append(firewallRules, opnsenseFilterGetReadback(rule, fmt.Sprintf("policy-%d", i)))
+	}
+	dns := desiredDNSBLPolicy(cfg)
+	dns.UUID = "dns"
 	opn := &fakeContentFilterOPN{
 		fakeNetworkOPN: &fakeNetworkOPN{
 			vlans:                  map[int]*opnsense.VLAN{104: {Tag: "104"}},
 			dhcpSubnets:            map[string]*opnsense.DHCPSubnet{row.Subnet: {Subnet: row.Subnet}},
 			selectedDHCPInterfaces: []string{"opt7"},
-			firewallRules:          []opnsense.FirewallRuleInfo{pass},
+			firewallRules:          firewallRules,
 			applyFirewallErr:       errors.New("transient apply failure"),
 		},
 		sourceScopedSupported: true,
+		dnsPolicies:           []opnsense.DNSBLPolicy{dns},
 	}
 	ssh := &fakeNetworkSSH{findByVLAN: map[int]string{104: "opt7"}}
 	db := &fakeNetworkDB{rows: []database.AllocatedVLAN{row}}
 
 	counts, err := reconcileNetwork(context.Background(), opn, ssh, db, discardLogger(), NetworkReconcilerConfig{
-		ContentFilter: validContentFilterConfig(),
+		ContentFilter: cfg,
 	}, func() time.Time { return time.Unix(123, 0) })
 	if err != nil {
 		t.Fatalf("reconcileNetwork: %v", err)
@@ -821,11 +830,11 @@ func TestDeletePodFirewallRules_BoundedRetryConverges(t *testing.T) {
 	}
 }
 
-func TestPodFirewallLifecycle_AgainstLiveFilterGetFalseInversions(t *testing.T) {
+func TestPodFirewallLifecycle_AgainstLiveFilterGetFalseInversionsQuickAndLog(t *testing.T) {
 	const filterGetBody = `{
 	  "filter": { "rules": { "rule": {
 	    "pod-opt3": {
-	      "enabled": "1", "sequence": "1",
+	      "enabled": "1", "sequence": "1", "quick": "1", "log": "0",
 	      "interface":  {"opt3": {"value":"OPT3","selected":1}, "opt5": {"value":"OPT5","selected":0}},
 	      "interfacenot": "0",
 	      "direction":  {"in": {"value":"in","selected":1}, "out": {"value":"out","selected":0}},
@@ -902,6 +911,94 @@ func TestPodFirewallLifecycle_AgainstLiveFilterGetFalseInversions(t *testing.T) 
 	if got := ruleUUIDs(opn.firewallRules); len(got) != 1 || got[0] != "mgmt" {
 		t.Fatalf("destroy cleanup did not preserve named manual rule: %v", got)
 	}
+}
+
+func TestPodFirewallQuickAndLogReadbackControlOwnership(t *testing.T) {
+	liveRuleBody := func(quick, log, description string) string {
+		return fmt.Sprintf(`{
+		  "filter": { "rules": { "rule": {
+		    "pod-opt3": {
+		      "enabled": "1", "sequence": "1", "quick": %q, "log": %q,
+		      "interface": {"opt3": {"value":"OPT3","selected":1}},
+		      "interfacenot": "0",
+		      "direction": {"in": {"value":"in","selected":1}},
+		      "action": {"pass": {"value":"Pass","selected":1}},
+		      "ipprotocol": {"inet": {"value":"IPv4","selected":1}},
+		      "protocol": {"any": {"value":"any","selected":1}},
+		      "source_not": "0", "source_net": "10.100.0.0/24", "source_port": "",
+		      "destination_not": "0", "destination_net": "any", "destination_port": "",
+		      "description": %q
+		    }
+		  }}}
+		}`, quick, log, description)
+	}
+	parseRules := func(t *testing.T, body string) []opnsense.FirewallRuleInfo {
+		t.Helper()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/firewall/filter/get" {
+				http.Error(w, "unexpected path", http.StatusNotFound)
+				return
+			}
+			_, _ = io.WriteString(w, body)
+		}))
+		defer srv.Close()
+
+		c := opnsense.New(opnsense.Config{BaseURL: srv.URL}, discardLogger())
+		rules, err := c.GetFirewallRules(context.Background())
+		if err != nil {
+			t.Fatalf("GetFirewallRules: %v", err)
+		}
+		if len(rules) != 1 {
+			t.Fatalf("parsed rules = %d, want 1: %+v", len(rules), rules)
+		}
+		return rules
+	}
+
+	for _, tt := range []struct {
+		name        string
+		quick       string
+		log         string
+		description string
+	}{
+		{name: "owned quick zero", quick: "0", log: "0", description: "crucible:pod-pass:v1:vlan=100"},
+		{name: "owned malformed quick", quick: "2", log: "0", description: "crucible:pod-pass:v1:vlan=100"},
+		{name: "blank logged pass", quick: "1", log: "1", description: ""},
+	} {
+		t.Run(tt.name+" fails closed", func(t *testing.T) {
+			rules := parseRules(t, liveRuleBody(tt.quick, tt.log, tt.description))
+			opn := &fakeNetworkOPN{firewallRules: rules}
+			desired := newDesiredPodFirewallRule(100, "opt3", "10.100.0.0/24")
+
+			if _, _, err := reconcilePodFirewallRules(context.Background(), opn, rules, []desiredPodFirewallRule{desired}, true, 100, 10); err == nil {
+				t.Fatal("ambiguous quick/log drift was accepted as a healthy pod pass")
+			}
+			if len(opn.createFirewallCalls) != 0 || len(opn.deleteFirewallCalls) != 0 {
+				t.Fatalf("ambiguous drift must fail closed: creates=%v deletes=%v",
+					opn.createFirewallCalls, opn.deleteFirewallCalls)
+			}
+		})
+	}
+
+	t.Run("named manual quick zero logged rule is preserved", func(t *testing.T) {
+		rules := parseRules(t, liveRuleBody("0", "1", "Instructor non-quick logged pass"))
+		opn := &fakeNetworkOPN{firewallRules: rules}
+		desired := newDesiredPodFirewallRule(100, "opt3", "10.100.0.0/24")
+
+		if _, _, err := reconcilePodFirewallRules(context.Background(), opn, rules, []desiredPodFirewallRule{desired}, true, 100, 10); err != nil {
+			t.Fatalf("reconcilePodFirewallRules: %v", err)
+		}
+		if len(opn.deleteFirewallCalls) != 0 {
+			t.Fatalf("named manual drifted rule was deleted: %v", opn.deleteFirewallCalls)
+		}
+		if len(opn.createFirewallCalls) != 1 ||
+			opn.createFirewallCalls[0].Quick != "1" ||
+			isTruthyFirewallField(opn.createFirewallCalls[0].Log) {
+			t.Fatalf("desired quick rule was not created: %+v", opn.createFirewallCalls)
+		}
+		if !containsString(ruleUUIDs(opn.firewallRules), "pod-opt3") {
+			t.Fatalf("named manual rule was not preserved: %+v", opn.firewallRules)
+		}
+	})
 }
 
 func TestReconcileNetwork_ListErrorSkipsFirewallRepair(t *testing.T) {
