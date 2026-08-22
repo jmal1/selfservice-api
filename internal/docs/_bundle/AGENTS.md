@@ -787,9 +787,14 @@ uses the normal error envelope:
 ```
 
 Delete/destroy, delete-VM, power, and cleanup paths are intentionally not
-gated. When worker provisioning claims are disabled, `pod_create` and
-`vm_add` are excluded inside the atomic claim query and remain pending; destroy
-and cleanup jobs remain claimable.
+gated. When worker provisioning claims are disabled, ordinary `pod_create`
+jobs and every `vm_add` job are excluded inside the atomic claim query and
+remain pending; destroy and cleanup jobs remain claimable. If rollback of an
+already-started `pod_create` is incomplete, its retry is atomically marked
+`cleanup_only` in the job payload and remains claimable. That retry only replays
+persisted compensation steps and refuses to run while the pod is pending,
+provisioning, active, or in an unknown state; it cannot resume forward
+provisioning.
 
 Authenticated clients and the non-destructive API synthetic use
 `GET /api/v1/provisioning/status`. Its complete stable response contract is:

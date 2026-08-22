@@ -62,12 +62,12 @@ func (s *pipelineMetricsSpy) Push(context.Context) error {
 }
 
 // Retry metric stubs — satisfy pipelineMetricsSink; not asserted in these tests.
-func (s *pipelineMetricsSpy) RecordJobRetry(_, _ string)    {}
+func (s *pipelineMetricsSpy) RecordJobRetry(_, _ string)       {}
 func (s *pipelineMetricsSpy) RecordJobRetryExhausted(_ string) {}
-func (s *pipelineMetricsSpy) SetJobRetryPending(_ int)        {}
+func (s *pipelineMetricsSpy) SetJobRetryPending(_ int)         {}
 
 // L1 trust-tier validation stubs — satisfy pipelineMetricsSink.
-func (s *pipelineMetricsSpy) RecordTemplateValidation(_, _ string) {}
+func (s *pipelineMetricsSpy) RecordTemplateValidation(_, _ string)         {}
 func (s *pipelineMetricsSpy) SetTemplateLastValidated(_ string, _ float64) {}
 
 var _ pipelineMetricsSink = (*pipelineMetricsSpy)(nil)
@@ -115,7 +115,7 @@ func (f *fakeJobStatusDB) UpdateJobStatus(_ context.Context, _ uuid.UUID, status
 }
 
 // RetryJob stub — satisfies jobStatusUpdater; not asserted in these tests.
-func (f *fakeJobStatusDB) RetryJob(_ context.Context, _ uuid.UUID, _ time.Time) error {
+func (f *fakeJobStatusDB) RetryJob(_ context.Context, _ uuid.UUID, _ time.Time, _ bool) error {
 	return nil
 }
 

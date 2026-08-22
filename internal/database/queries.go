@@ -931,7 +931,11 @@ const claimJobSQL = `
 	WHERE id = (
 		SELECT id FROM jobs
 		WHERE status = 'pending'
-		  AND type <> ALL($2)
+		  AND (
+		    $2
+		    OR type NOT IN ('pod_create', 'vm_add')
+		    OR (type = 'pod_create' AND payload->>'cleanup_only' = 'true')
+		  )
 		  AND (next_attempt_at IS NULL OR next_attempt_at <= now())
 		ORDER BY created_at ASC
 		FOR UPDATE SKIP LOCKED
@@ -941,21 +945,15 @@ const claimJobSQL = `
 	          retry_count, max_retries, next_attempt_at, rollback_steps, created_at
 `
 
-func blockedJobTypesForClaim(provisioningClaimsEnabled bool) []string {
-	if provisioningClaimsEnabled {
-		return []string{}
-	}
-	return []string{models.JobTypePodCreate, models.JobTypeVMAdd}
-}
-
 // ClaimJob atomically claims the next pending job for a worker.
 // Jobs whose next_attempt_at is in the future are skipped (they are
 // sleeping between retry attempts). When provisioning claims are disabled,
-// pod_create and vm_add are excluded inside the selecting transaction and
-// remain pending; cleanup and every other job type stay claimable.
+// ordinary pod_create and every vm_add are excluded inside the selecting
+// transaction and remain pending. A pod_create carrying cleanup_only=true is
+// still claimable, as are cleanup and every other non-provisioning job type.
 func (q *Queries) ClaimJob(ctx context.Context, workerID string, provisioningClaimsEnabled bool) (*models.Job, error) {
 	var j models.Job
-	err := q.pool.QueryRow(ctx, claimJobSQL, workerID, blockedJobTypesForClaim(provisioningClaimsEnabled)).Scan(
+	err := q.pool.QueryRow(ctx, claimJobSQL, workerID, provisioningClaimsEnabled).Scan(
 		&j.ID, &j.Type, &j.Payload, &j.Status, &j.ClaimedBy, &j.ClaimedAt,
 		&j.RetryCount, &j.MaxRetries, &j.NextAttemptAt, &j.RollbackSteps, &j.CreatedAt,
 	)
@@ -982,25 +980,110 @@ func (q *Queries) UpdateJobRollbackSteps(ctx context.Context, id uuid.UUID, step
 	return err
 }
 
-// RetryJob resets a failed job back to pending and schedules it for a
-// future attempt.  retry_count is incremented; claimed_by, claimed_at,
-// started_at, and completed_at are cleared; next_attempt_at is set to
-// nextAt so ClaimJob ignores the row until the delay expires.
+const markPodCreateCleanupOnlySQL = `
+	UPDATE jobs
+	SET payload = jsonb_set(payload, '{cleanup_only}', 'true'::jsonb, true)
+	WHERE id = $1 AND type = 'pod_create'
+`
+
+func podCreateCleanupStatusSafe(status string) bool {
+	switch status {
+	case models.PodStatusError,
+		models.PodStatusDestroying,
+		models.PodStatusDestroyFailed,
+		models.PodStatusDestroyed:
+		return true
+	default:
+		return false
+	}
+}
+
+// BeginPodCreateCleanup atomically makes a pod safe for compensation and marks
+// its job cleanup-only. Forward execution may transition a pod it owns from
+// provisioning to error; an already cleanup-only retry may not. Pending, active,
+// and unknown states always fail closed. The returned status is the state
+// committed by the transaction; podExists is false when the pod was already
+// deleted.
+func (q *Queries) BeginPodCreateCleanup(
+	ctx context.Context,
+	jobID uuid.UUID,
+	podID uuid.UUID,
+	allowProvisioningTransition bool,
+) (status string, podExists bool, err error) {
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return "", false, fmt.Errorf("begin pod-create cleanup transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	err = tx.QueryRow(ctx, `SELECT status FROM pods WHERE id = $1 FOR UPDATE`, podID).Scan(&status)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// A missing pod is safe: only persisted external-resource compensation runs.
+		status = ""
+	case err != nil:
+		return "", false, fmt.Errorf("lock pod for cleanup: %w", err)
+	case status == models.PodStatusProvisioning && allowProvisioningTransition:
+		tag, updateErr := tx.Exec(ctx, `
+			UPDATE pods
+			SET status = $2,
+			    error_message = 'Provisioning stopped; cleanup is in progress.',
+			    updated_at = now()
+			WHERE id = $1 AND status = $3
+		`, podID, models.PodStatusError, models.PodStatusProvisioning)
+		if updateErr != nil {
+			return "", false, fmt.Errorf("mark pod error before cleanup: %w", updateErr)
+		}
+		if tag.RowsAffected() != 1 {
+			return "", false, fmt.Errorf("pod %s changed state before cleanup could start", podID)
+		}
+		status = models.PodStatusError
+	case podCreateCleanupStatusSafe(status):
+		// Terminal/error states are safe for persisted compensation.
+	default:
+		return "", false, fmt.Errorf("cleanup-only pod_create refused for pod %s in unsafe status %q", podID, status)
+	}
+
+	tag, err := tx.Exec(ctx, markPodCreateCleanupOnlySQL, jobID)
+	if err != nil {
+		return "", false, fmt.Errorf("mark pod_create cleanup-only: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return "", false, fmt.Errorf("pod_create job %s was not marked cleanup-only", jobID)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", false, fmt.Errorf("commit pod-create cleanup transition: %w", err)
+	}
+	return status, status != "", nil
+}
+
+// RetryJob resets a failed job back to pending and schedules it for a future
+// attempt. retry_count is incremented; claimed_by, claimed_at, started_at, and
+// completed_at are cleared; next_attempt_at is set to nextAt so ClaimJob
+// ignores the row until the delay expires. cleanupOnly permanently marks a
+// pod_create retry as compensation-only so maintenance workers may claim it
+// without reopening forward provisioning.
 //
 // Called by the worker when ProcessJob returns a retryable error and
 // retry_count < max_retries.
-func (q *Queries) RetryJob(ctx context.Context, id uuid.UUID, nextAt time.Time) error {
-	_, err := q.pool.Exec(ctx, `
-		UPDATE jobs SET
-			status          = 'pending',
-			retry_count     = retry_count + 1,
-			claimed_by      = NULL,
-			claimed_at      = NULL,
-			started_at      = NULL,
-			completed_at    = NULL,
-			next_attempt_at = $2
-		WHERE id = $1
-	`, id, nextAt)
+const retryJobSQL = `
+	UPDATE jobs SET
+		status          = 'pending',
+		retry_count     = retry_count + 1,
+		claimed_by      = NULL,
+		claimed_at      = NULL,
+		started_at      = NULL,
+		completed_at    = NULL,
+		next_attempt_at = $2,
+		payload         = CASE
+			WHEN $3 THEN jsonb_set(payload, '{cleanup_only}', 'true'::jsonb, true)
+			ELSE payload
+		END
+	WHERE id = $1
+`
+
+func (q *Queries) RetryJob(ctx context.Context, id uuid.UUID, nextAt time.Time, cleanupOnly bool) error {
+	_, err := q.pool.Exec(ctx, retryJobSQL, id, nextAt, cleanupOnly)
 	return err
 }
 

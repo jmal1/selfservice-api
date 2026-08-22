@@ -39,8 +39,9 @@ type statusRecord struct {
 }
 
 type retryRecord struct {
-	id     uuid.UUID
-	nextAt time.Time
+	id          uuid.UUID
+	nextAt      time.Time
+	cleanupOnly bool
 }
 
 type fakeJobDB struct {
@@ -50,13 +51,13 @@ type fakeJobDB struct {
 	retryErr error // if set, RetryJob returns this
 }
 
-func (f *fakeJobDB) RetryJob(_ context.Context, id uuid.UUID, nextAt time.Time) error {
+func (f *fakeJobDB) RetryJob(_ context.Context, id uuid.UUID, nextAt time.Time, cleanupOnly bool) error {
 	if f.retryErr != nil {
 		return f.retryErr
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.retried = append(f.retried, retryRecord{id: id, nextAt: nextAt})
+	f.retried = append(f.retried, retryRecord{id: id, nextAt: nextAt, cleanupOnly: cleanupOnly})
 	return nil
 }
 
@@ -130,10 +131,96 @@ func TestHandleJobOutcome_RetryableReturnsPending(t *testing.T) {
 	if !db.retried[0].nextAt.After(time.Now()) {
 		t.Errorf("next_attempt_at %s is not in the future", db.retried[0].nextAt)
 	}
+	if db.retried[0].cleanupOnly {
+		t.Error("ordinary provisioning retry was incorrectly marked cleanup-only")
+	}
 	// Metric must be recorded.
 	key := "template_provision|" + RetryReasonTransientClone
 	if m.jobRetries[key] == 0 {
 		t.Errorf("crucible_job_retries_total[%s] not incremented", key)
+	}
+}
+
+func TestHandleJobOutcome_PodCreateCleanupRetryIsDurablyMarked(t *testing.T) {
+	db := &fakeJobDB{}
+	m := NewPipelineMetrics("", "", nil)
+	job := &models.Job{
+		ID:         uuid.New(),
+		Type:       models.JobTypePodCreate,
+		RetryCount: 0,
+		MaxRetries: 3,
+	}
+	cleanupErr := newPodCreateCleanupRetryError(
+		"test rollback",
+		[]error{errors.New("delete stale port group: connection refused")},
+	)
+
+	if result := runLifecycle(context.Background(), db, m, job, cleanupErr); result != nil {
+		t.Fatalf("processJobLifecycle returned %v, want nil (cleanup retry rescheduled)", result)
+	}
+	if len(db.retried) != 1 {
+		t.Fatalf("RetryJob called %d times, want 1", len(db.retried))
+	}
+	if !db.retried[0].cleanupOnly {
+		t.Fatal("failed pod-create rollback was not marked cleanup-only")
+	}
+	if got := m.jobRetries[models.JobTypePodCreate+"|"+RetryReasonCleanup]; got != 1 {
+		t.Fatalf("cleanup retry metric = %v, want 1", got)
+	}
+}
+
+func TestHandleJobOutcome_OrdinaryPodCreateRetryIsNotCleanupOnly(t *testing.T) {
+	db := &fakeJobDB{}
+	job := &models.Job{
+		ID:         uuid.New(),
+		Type:       models.JobTypePodCreate,
+		RetryCount: 0,
+		MaxRetries: 3,
+	}
+
+	if result := runLifecycle(
+		context.Background(),
+		db,
+		NewPipelineMetrics("", "", nil),
+		job,
+		errors.New("clone source VM: connection refused"),
+	); result != nil {
+		t.Fatalf("processJobLifecycle returned %v, want nil (ordinary retry rescheduled)", result)
+	}
+	if len(db.retried) != 1 {
+		t.Fatalf("RetryJob called %d times, want 1", len(db.retried))
+	}
+	if db.retried[0].cleanupOnly {
+		t.Fatal("ordinary pending pod_create would bypass the maintenance claim gate")
+	}
+}
+
+func TestHandleJobOutcome_CompletedPodCreateCompensationDoesNotRetry(t *testing.T) {
+	db := &fakeJobDB{}
+	job := &models.Job{
+		ID:         uuid.New(),
+		Type:       models.JobTypePodCreate,
+		RetryCount: 0,
+		MaxRetries: 3,
+	}
+	compensatedErr := &podCreateCompensatedError{
+		err: errors.New("reconfigure VLANs: connection refused"),
+	}
+
+	if result := runLifecycle(
+		context.Background(),
+		db,
+		NewPipelineMetrics("", "", nil),
+		job,
+		compensatedErr,
+	); result == nil {
+		t.Fatal("processJobLifecycle returned nil, want terminal compensated failure")
+	}
+	if len(db.retried) != 0 {
+		t.Fatal("fully compensated pod_create was unnecessarily retried")
+	}
+	if got := db.statusesWithStatus(models.JobStatusFailed); len(got) != 1 {
+		t.Fatalf("failed status updates = %d, want 1", len(got))
 	}
 }
 

@@ -44,7 +44,9 @@ The response uses the normal JSON error envelope and includes
 This is a platform-wide maintenance state, not a problem with your template,
 blueprint, quota, or request body. Wait for the maintenance window to end
 before retrying. Deleting pods or VMs, power operations, and platform cleanup
-remain available so existing environments can be made safe.
+remain available so existing environments can be made safe. The worker also
+continues compensation-only retries for cleanup that began before maintenance;
+those retries cannot resume pod or VM creation.
 
 Authenticated clients can check the stable read-only contract at
 `GET /api/v1/provisioning/status`:

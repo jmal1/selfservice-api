@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/big"
@@ -47,7 +48,7 @@ type pipelineMetricsSink interface {
 // tests inject a lightweight stub.
 type jobStatusUpdater interface {
 	UpdateJobStatus(ctx context.Context, id uuid.UUID, status string, result []byte) error
-	RetryJob(ctx context.Context, id uuid.UUID, nextAt time.Time) error
+	RetryJob(ctx context.Context, id uuid.UUID, nextAt time.Time, cleanupOnly bool) error
 }
 
 var _ pipelineMetricsSink = (*PipelineMetrics)(nil)
@@ -220,7 +221,8 @@ func processJobLifecycle(
 	retryable, reason := ClassifyError(err, job.Type)
 	if retryable && job.RetryCount < job.MaxRetries {
 		nextAt := time.Now().Add(RetryBackoff(job.RetryCount))
-		if schedErr := db.RetryJob(ctx, job.ID, nextAt); schedErr == nil {
+		cleanupOnly := job.Type == models.JobTypePodCreate && isPodCreateCleanupRetry(err)
+		if schedErr := db.RetryJob(ctx, job.ID, nextAt, cleanupOnly); schedErr == nil {
 			if pipeline != nil {
 				pipeline.RecordJobRetry(job.Type, reason)
 			}
@@ -426,8 +428,9 @@ func (d *dbPersister) SaveRollbackSteps(ctx context.Context, jobID uuid.UUID, st
 
 // CreatePodPayload is the expected shape of job.Payload for pod_create.
 type CreatePodPayload struct {
-	PodID uuid.UUID `json:"pod_id"`
-	VMs   []VMSpec  `json:"vms"`
+	PodID       uuid.UUID `json:"pod_id"`
+	VMs         []VMSpec  `json:"vms"`
+	CleanupOnly bool      `json:"cleanup_only,omitempty"`
 }
 
 // VMSpec describes a VM to create within a pod.
@@ -449,43 +452,70 @@ type VMSpec struct {
 	AssignIP bool `json:"assign_ip"`
 }
 
-func (p *Provisioner) stopPodCreateIfStale(
+type podCreateCleanupRetryError struct {
+	err error
+}
+
+type podCreateCompensatedError struct {
+	err error
+}
+
+func (e *podCreateCompensatedError) Error() string {
+	return e.err.Error()
+}
+
+func (e *podCreateCompensatedError) Unwrap() error {
+	return e.err
+}
+
+func (e *podCreateCleanupRetryError) Error() string {
+	return e.err.Error()
+}
+
+func (e *podCreateCleanupRetryError) Unwrap() error {
+	return e.err
+}
+
+func newPodCreateCleanupRetryError(stage string, cleanupErrs []error) error {
+	return &podCreateCleanupRetryError{
+		err: fmt.Errorf("stale pod_create cleanup incomplete after %s: %v", stage, cleanupErrs),
+	}
+}
+
+func isPodCreateCleanupRetry(err error) bool {
+	var cleanupErr *podCreateCleanupRetryError
+	return errors.As(err, &cleanupErr)
+}
+
+func (p *Provisioner) cleanupPodCreateResources(
 	ctx context.Context,
+	jobID uuid.UUID,
 	podID uuid.UUID,
 	vmSpecs []VMSpec,
 	rb *rollback.Engine,
 	stage string,
-) (bool, error) {
-	pod, err := p.db.GetPodByID(ctx, podID)
+	allowProvisioningTransition bool,
+) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Minute)
+	defer cancel()
+
+	status, podExists, err := p.db.BeginPodCreateCleanup(
+		cleanupCtx,
+		jobID,
+		podID,
+		allowProvisioningTransition,
+	)
 	if err != nil {
-		return true, fmt.Errorf("recheck pod state after %s: %w", stage, err)
-	}
-	if pod == nil {
-		rbErrs := rb.Rollback(ctx)
-		p.logger.Warn("pod disappeared during create; rolled back completed resources",
-			"pod_id", podID, "stage", stage, "rollback_errors", rbErrs)
-		if len(rbErrs) > 0 {
-			return true, fmt.Errorf("stale pod_create cleanup incomplete after %s: %v", stage, rbErrs)
-		}
-		return true, nil
-	}
-	if pod.Status == models.PodStatusProvisioning {
-		return false, nil
-	}
-	if pod.Status == models.PodStatusActive {
-		p.logger.Info("pod create already completed; skipping duplicate job",
-			"pod_id", podID, "stage", stage)
-		return true, nil
+		return fmt.Errorf("prepare pod_create cleanup after %s: %w", stage, err)
 	}
 
-	rbErrs := rb.Rollback(ctx)
-	cleanupErrs := append([]error(nil), rbErrs...)
-	if pod.Status == models.PodStatusDestroying ||
-		pod.Status == models.PodStatusDestroyFailed ||
-		pod.Status == models.PodStatusDestroyed {
+	cleanupErrs := append([]error(nil), rb.Rollback(cleanupCtx)...)
+	if status == models.PodStatusDestroying ||
+		status == models.PodStatusDestroyFailed ||
+		status == models.PodStatusDestroyed {
 		for _, vmSpec := range vmSpecs {
 			if _, updateErr := p.db.UpdatePodVMStatusFrom(
-				ctx,
+				cleanupCtx,
 				vmSpec.PodVMID,
 				[]string{
 					models.VMStatusPending,
@@ -503,12 +533,84 @@ func (p *Provisioner) stopPodCreateIfStale(
 			}
 		}
 	}
-	p.logger.Warn("stopped stale pod create and rolled back completed resources",
-		"pod_id", podID, "status", pod.Status, "stage", stage, "rollback_errors", cleanupErrs)
-	if len(cleanupErrs) > 0 {
-		return true, fmt.Errorf("stale pod_create cleanup incomplete after %s: %v", stage, cleanupErrs)
+
+	statusForLog := status
+	if !podExists {
+		statusForLog = "missing"
 	}
-	return true, nil
+	p.logger.Warn("stopped stale pod create and rolled back completed resources",
+		"pod_id", podID, "status", statusForLog, "stage", stage, "rollback_errors", cleanupErrs)
+	if len(cleanupErrs) > 0 {
+		return newPodCreateCleanupRetryError(stage, cleanupErrs)
+	}
+	return nil
+}
+
+func (p *Provisioner) failPodCreateWithCleanup(
+	ctx context.Context,
+	jobID uuid.UUID,
+	payload CreatePodPayload,
+	rb *rollback.Engine,
+	stage string,
+	cause error,
+) error {
+	cleanupErr := p.cleanupPodCreateResources(
+		ctx,
+		jobID,
+		payload.PodID,
+		payload.VMs,
+		rb,
+		stage,
+		true,
+	)
+	if cleanupErr != nil {
+		return fmt.Errorf("%v; cleanup: %w", cause, cleanupErr)
+	}
+	return &podCreateCompensatedError{err: cause}
+}
+
+func (p *Provisioner) runPodCreateCleanup(
+	ctx context.Context,
+	jobID uuid.UUID,
+	payload CreatePodPayload,
+	rb *rollback.Engine,
+) error {
+	return p.cleanupPodCreateResources(
+		ctx,
+		jobID,
+		payload.PodID,
+		payload.VMs,
+		rb,
+		"cleanup-only retry",
+		false,
+	)
+}
+
+func (p *Provisioner) stopPodCreateIfStale(
+	ctx context.Context,
+	jobID uuid.UUID,
+	podID uuid.UUID,
+	vmSpecs []VMSpec,
+	rb *rollback.Engine,
+	stage string,
+) (bool, error) {
+	pod, err := p.db.GetPodByID(ctx, podID)
+	if err != nil {
+		return true, fmt.Errorf("recheck pod state after %s: %w", stage, err)
+	}
+	if pod == nil {
+		return true, p.cleanupPodCreateResources(ctx, jobID, podID, vmSpecs, rb, stage, false)
+	}
+	if pod.Status == models.PodStatusProvisioning {
+		return false, nil
+	}
+	if pod.Status == models.PodStatusActive {
+		p.logger.Info("pod create already completed; skipping duplicate job",
+			"pod_id", podID, "stage", stage)
+		return true, nil
+	}
+
+	return true, p.cleanupPodCreateResources(ctx, jobID, podID, vmSpecs, rb, stage, false)
 }
 
 // generatePassword creates a random password with uppercase, lowercase, digits, and a special char.
@@ -555,6 +657,9 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 	if err != nil {
 		return err
 	}
+	if payload.CleanupOnly {
+		return p.runPodCreateCleanup(ctx, job.ID, payload, rb)
+	}
 
 	// Get pod from DB
 	pod, err := p.db.GetPodByID(ctx, payload.PodID)
@@ -562,11 +667,15 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		return fmt.Errorf("get pod: %w", err)
 	}
 	if pod == nil {
-		rbErrs := rb.Rollback(ctx)
-		if len(rbErrs) > 0 {
-			return fmt.Errorf("pod %s not found; persisted cleanup incomplete: %v", payload.PodID, rbErrs)
-		}
-		return nil
+		return p.cleanupPodCreateResources(
+			ctx,
+			job.ID,
+			payload.PodID,
+			payload.VMs,
+			rb,
+			"initial pod lookup",
+			false,
+		)
 	}
 
 	// --- Step 1: Update pod status to provisioning ---
@@ -584,7 +693,7 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 	if !applied {
 		p.logger.Warn("stale pod create job skipped because pod is no longer provisionable",
 			"pod_id", pod.ID, "status", pod.Status, "job_id", job.ID)
-		_, cleanupErr := p.stopPodCreateIfStale(ctx, pod.ID, payload.VMs, rb, "job_start")
+		_, cleanupErr := p.stopPodCreateIfStale(ctx, job.ID, pod.ID, payload.VMs, rb, "job_start")
 		return cleanupErr
 	}
 
@@ -593,7 +702,7 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 	subnet := pod.Subnet
 	gateway := fmt.Sprintf("10.100.%d.1/24", octet)
 	pgName := fmt.Sprintf("Pod-VLAN%d", vlanTag)
-	if stopped, err := p.stopPodCreateIfStale(ctx, pod.ID, payload.VMs, rb, "admission"); err != nil {
+	if stopped, err := p.stopPodCreateIfStale(ctx, job.ID, pod.ID, payload.VMs, rb, "admission"); err != nil {
 		return err
 	} else if stopped {
 		return nil
@@ -624,15 +733,14 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 	if err := rb.Record(ctx, "vlan_create", map[string]string{"uuid": vlanUUID, "preexisting": preexStr}); err != nil {
 		return err
 	}
-	if stopped, err := p.stopPodCreateIfStale(ctx, pod.ID, payload.VMs, rb, "vlan_create"); err != nil {
+	if stopped, err := p.stopPodCreateIfStale(ctx, job.ID, pod.ID, payload.VMs, rb, "vlan_create"); err != nil {
 		return err
 	} else if stopped {
 		return nil
 	}
 
 	if err := p.opn.ReconfigureVLANs(ctx); err != nil {
-		rbErrs := rb.Rollback(ctx)
-		return fmt.Errorf("reconfigure VLANs (rollback errors: %v): %w", rbErrs, err)
+		return p.failPodCreateWithCleanup(ctx, job.ID, payload, rb, "reconfigure VLANs", fmt.Errorf("reconfigure VLANs: %w", err))
 	}
 
 	// --- Step 3: Assign OPNsense interface via SSH ---
@@ -640,14 +748,13 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 
 	ifName, err := p.opnSSH.AssignInterface(ctx, vlanTag, gateway)
 	if err != nil {
-		rbErrs := rb.Rollback(ctx)
-		return fmt.Errorf("assign interface (rollback errors: %v): %w", rbErrs, err)
+		return p.failPodCreateWithCleanup(ctx, job.ID, payload, rb, "assign interface", fmt.Errorf("assign interface: %w", err))
 	}
 
 	if err := rb.Record(ctx, "interface_assign", map[string]interface{}{"if_name": ifName, "vlan_tag": vlanTag}); err != nil {
 		return err
 	}
-	if stopped, err := p.stopPodCreateIfStale(ctx, pod.ID, payload.VMs, rb, "interface_assign"); err != nil {
+	if stopped, err := p.stopPodCreateIfStale(ctx, job.ID, pod.ID, payload.VMs, rb, "interface_assign"); err != nil {
 		return err
 	} else if stopped {
 		return nil
@@ -667,8 +774,7 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		poolRange := fmt.Sprintf("10.100.%d.10-10.100.%d.250", octet, octet)
 		dhcpUUID, err = p.opn.CreateDHCPSubnet(ctx, subnet, poolRange, gateway)
 		if err != nil {
-			rbErrs := rb.Rollback(ctx)
-			return fmt.Errorf("create DHCP (rollback errors: %v): %w", rbErrs, err)
+			return p.failPodCreateWithCleanup(ctx, job.ID, payload, rb, "create DHCP", fmt.Errorf("create DHCP: %w", err))
 		}
 	}
 
@@ -679,7 +785,7 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 	if err := rb.Record(ctx, "dhcp_create", map[string]string{"uuid": dhcpUUID, "preexisting": dhcpPreexStr}); err != nil {
 		return err
 	}
-	if stopped, err := p.stopPodCreateIfStale(ctx, pod.ID, payload.VMs, rb, "dhcp_create"); err != nil {
+	if stopped, err := p.stopPodCreateIfStale(ctx, job.ID, pod.ID, payload.VMs, rb, "dhcp_create"); err != nil {
 		return err
 	} else if stopped {
 		return nil
@@ -697,8 +803,7 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 	time.Sleep(2 * time.Second)
 
 	if err := p.opn.ReconfigureDHCP(ctx); err != nil {
-		rbErrs := rb.Rollback(ctx)
-		return fmt.Errorf("reconfigure DHCP (rollback errors: %v): %w", rbErrs, err)
+		return p.failPodCreateWithCleanup(ctx, job.ID, payload, rb, "reconfigure DHCP", fmt.Errorf("reconfigure DHCP: %w", err))
 	}
 
 	// --- Step 4b: Create firewall rule to allow pod traffic ---
@@ -717,23 +822,21 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		if err := rb.Record(ctx, "firewall_create", map[string]string{"uuid": fwRuleUUID}); err != nil {
 			return err
 		}
-		if stopped, err := p.stopPodCreateIfStale(ctx, pod.ID, payload.VMs, rb, "firewall_create"); err != nil {
+		if stopped, err := p.stopPodCreateIfStale(ctx, job.ID, pod.ID, payload.VMs, rb, "firewall_create"); err != nil {
 			return err
 		} else if stopped {
 			return nil
 		}
 	}
 	if err != nil {
-		rbErrs := rb.Rollback(ctx)
-		return fmt.Errorf("ensure firewall rule (rollback errors: %v): %w", rbErrs, err)
+		return p.failPodCreateWithCleanup(ctx, job.ID, payload, rb, "ensure firewall rule", fmt.Errorf("ensure firewall rule: %w", err))
 	}
 
 	// --- Step 5: Create port groups on all ESXi hosts ---
 	p.publishProgress(job.ID, "portgroup_create", fmt.Sprintf("Creating port group %s on all hosts", pgName))
 
 	if err := p.vc.CreatePortGroupOnAllHosts(ctx, pgName, vlanTag); err != nil {
-		rbErrs := rb.Rollback(ctx)
-		return fmt.Errorf("create port groups (rollback errors: %v): %w", rbErrs, err)
+		return p.failPodCreateWithCleanup(ctx, job.ID, payload, rb, "create port groups", fmt.Errorf("create port groups: %w", err))
 	}
 
 	// Port groups are always idempotent (already-exists is ignored), so treat as preexisting
@@ -745,7 +848,7 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 	if err := rb.Record(ctx, "portgroup_create", map[string]string{"name": pgName, "preexisting": pgPreexStr}); err != nil {
 		return err
 	}
-	if stopped, err := p.stopPodCreateIfStale(ctx, pod.ID, payload.VMs, rb, "portgroup_create"); err != nil {
+	if stopped, err := p.stopPodCreateIfStale(ctx, job.ID, pod.ID, payload.VMs, rb, "portgroup_create"); err != nil {
 		return err
 	} else if stopped {
 		return nil
@@ -913,7 +1016,7 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		if err := rb.Record(ctx, stepName, map[string]string{"moref": moref}); err != nil {
 			return err
 		}
-		if stopped, err := p.stopPodCreateIfStale(ctx, pod.ID, payload.VMs, rb, stepName); err != nil {
+		if stopped, err := p.stopPodCreateIfStale(ctx, job.ID, pod.ID, payload.VMs, rb, stepName); err != nil {
 			return err
 		} else if stopped {
 			return nil
@@ -923,8 +1026,14 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 
 	// If no VMs were cloned at all, rollback infrastructure
 	if len(clonedVMs) == 0 {
-		rbErrs := rb.Rollback(ctx)
-		return fmt.Errorf("all VM clones failed (rollback errors: %v)", rbErrs)
+		return p.failPodCreateWithCleanup(
+			ctx,
+			job.ID,
+			payload,
+			rb,
+			"all VM clones failed",
+			errors.New("all VM clones failed"),
+		)
 	}
 
 	// --- Step 7: Power on VMs by boot order and wait for IPs per group ---
@@ -1095,7 +1204,7 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		return fmt.Errorf("update pod to active: %w", err)
 	}
 	if !applied {
-		_, stopErr := p.stopPodCreateIfStale(ctx, pod.ID, payload.VMs, rb, "activate")
+		_, stopErr := p.stopPodCreateIfStale(ctx, job.ID, pod.ID, payload.VMs, rb, "activate")
 		return stopErr
 	}
 

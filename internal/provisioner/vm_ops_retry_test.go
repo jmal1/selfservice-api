@@ -67,7 +67,10 @@ func TestStaleVMCloneCleanupFailureIsRetryable(t *testing.T) {
 
 func TestStalePodCreateCleanupFailureIsRetryable(t *testing.T) {
 	retryable, reason := ClassifyError(
-		errors.New("stale pod_create cleanup incomplete after activate: rollback vm_clone_0"),
+		newPodCreateCleanupRetryError(
+			"activate",
+			[]error{errors.New("rollback vm_clone_0")},
+		),
 		models.JobTypePodCreate,
 	)
 	if !retryable || reason != RetryReasonCleanup {

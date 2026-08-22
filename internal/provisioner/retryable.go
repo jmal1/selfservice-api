@@ -24,6 +24,7 @@ package provisioner
 
 import (
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"math/big"
 	"strings"
@@ -81,6 +82,16 @@ func ClassifyError(err error, jobType string) (retryable bool, reason string) {
 	if err == nil {
 		return false, ""
 	}
+	var compensatedErr *podCreateCompensatedError
+	if errors.As(err, &compensatedErr) {
+		return false, ""
+	}
+	if isPodCreateCleanupRetry(err) {
+		if jobType == "pod_create" {
+			return true, RetryReasonCleanup
+		}
+		return false, ""
+	}
 	s := err.Error()
 
 	// Deterministic failures: check first and never retry.
@@ -89,9 +100,7 @@ func ClassifyError(err error, jobType string) (retryable bool, reason string) {
 			return false, ""
 		}
 	}
-	if strings.Contains(s, "stale VM clone") ||
-		strings.Contains(s, "stale pod_create cleanup incomplete") ||
-		strings.Contains(s, "persisted cleanup incomplete") {
+	if strings.Contains(s, "stale VM clone") {
 		return true, RetryReasonCleanup
 	}
 

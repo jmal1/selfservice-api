@@ -182,7 +182,8 @@ func TestProvisioningJobEntryTransitionsAreGuarded(t *testing.T) {
 			"models.PodStatusProvisioning",
 			"stale pod create job skipped",
 			"stopPodCreateIfStale",
-			"rb.Rollback(ctx)",
+			"BeginPodCreateCleanup(",
+			"rb.Rollback(cleanupCtx)",
 			"cleanupStaleVMClone",
 		},
 		"internal/provisioner/vm_ops.go": {
@@ -194,6 +195,7 @@ func TestProvisioningJobEntryTransitionsAreGuarded(t *testing.T) {
 			"models.JobTypeVMDestroy",
 		},
 	}
+
 	for relPath, fragments := range files {
 		body, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(relPath)))
 		if err != nil {
@@ -205,6 +207,104 @@ func TestProvisioningJobEntryTransitionsAreGuarded(t *testing.T) {
 			}
 		}
 
+	}
+}
+
+func TestCleanupOnlyPodCreateCannotReachForwardProvisioning(t *testing.T) {
+	root := findRepoRoot(t)
+	body, err := os.ReadFile(filepath.Join(root, "internal", "provisioner", "create.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(body)
+
+	createStart := strings.Index(src, "func (p *Provisioner) CreatePod(")
+	if createStart < 0 {
+		t.Fatal("CreatePod function not found")
+	}
+	cleanupBranch := strings.Index(src[createStart:], "if payload.CleanupOnly {")
+	forwardStart := strings.Index(src[createStart:], "// Get pod from DB")
+	if cleanupBranch < 0 || forwardStart < 0 || cleanupBranch > forwardStart {
+		t.Fatal("cleanup-only dispatch must return before the forward pod-create path")
+	}
+	branch := src[createStart+cleanupBranch : createStart+forwardStart]
+	if !strings.Contains(branch, "return p.runPodCreateCleanup(ctx, job.ID, payload, rb)") {
+		t.Fatal("cleanup-only dispatch must return directly into compensation")
+	}
+
+	cleanupStart := strings.Index(src, "func (p *Provisioner) runPodCreateCleanup(")
+	if cleanupStart < 0 {
+		t.Fatal("runPodCreateCleanup function not found")
+	}
+	cleanupEnd := strings.Index(src[cleanupStart+1:], "\nfunc ")
+	if cleanupEnd < 0 {
+		t.Fatal("could not isolate runPodCreateCleanup")
+	}
+	cleanupBody := src[cleanupStart : cleanupStart+1+cleanupEnd]
+	for _, forbidden := range []string{
+		"CreateVLAN(",
+		"CreateDHCPSubnet(",
+		"AddDHCPInterface(",
+		"CreatePortGroupOnAllHosts(",
+		"CloneVM(",
+		"PowerOnVM(",
+		"CreateVMSnapshot(",
+	} {
+		if strings.Contains(cleanupBody, forbidden) {
+			t.Errorf("cleanup-only execution contains forward provisioning call %q", forbidden)
+		}
+	}
+
+	if got := strings.Count(src, "rb.Rollback("); got != 1 {
+		t.Fatalf("pod-create rollback has %d call sites, want one guarded compensation path", got)
+	}
+	commonCleanupStart := strings.Index(src, "func (p *Provisioner) cleanupPodCreateResources(")
+	if commonCleanupStart < 0 {
+		t.Fatal("cleanupPodCreateResources function not found")
+	}
+	marker := strings.Index(src[commonCleanupStart:], "BeginPodCreateCleanup(")
+	rollback := strings.Index(src[commonCleanupStart:], "rb.Rollback(cleanupCtx)")
+	if marker < 0 || rollback < 0 || marker > rollback {
+		t.Fatal("cleanup-only state must be committed before rollback starts")
+	}
+
+	failCleanupStart := strings.Index(src, "func (p *Provisioner) failPodCreateWithCleanup(")
+	if failCleanupStart < 0 {
+		t.Fatal("failPodCreateWithCleanup function not found")
+	}
+	failCleanupEnd := strings.Index(src[failCleanupStart+1:], "\nfunc ")
+	if failCleanupEnd < 0 {
+		t.Fatal("could not isolate failPodCreateWithCleanup")
+	}
+	failCleanupBody := src[failCleanupStart : failCleanupStart+1+failCleanupEnd]
+	if !strings.Contains(failCleanupBody, "\n\t\ttrue,\n") {
+		t.Fatal("forward pod-create failure must atomically relinquish provisioning before cleanup")
+	}
+	if !strings.Contains(cleanupBody, "\n\t\tfalse,\n") {
+		t.Fatal("cleanup-only retry must not transition a provisioning pod")
+	}
+
+	queryBody, err := os.ReadFile(filepath.Join(root, "internal", "database", "queries.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	querySrc := string(queryBody)
+	beginStart := strings.Index(querySrc, "func (q *Queries) BeginPodCreateCleanup(")
+	retryStart := strings.Index(querySrc, "const retryJobSQL")
+	if beginStart < 0 || retryStart < 0 || beginStart > retryStart {
+		t.Fatal("BeginPodCreateCleanup transaction not found")
+	}
+	beginBody := querySrc[beginStart:retryStart]
+	for _, required := range []string{
+		"SELECT status FROM pods WHERE id = $1 FOR UPDATE",
+		"status == models.PodStatusProvisioning && allowProvisioningTransition",
+		"podCreateCleanupStatusSafe(status)",
+		"markPodCreateCleanupOnlySQL",
+		"tx.Commit(ctx)",
+	} {
+		if !strings.Contains(beginBody, required) {
+			t.Errorf("atomic cleanup transition is missing %q", required)
+		}
 	}
 }
 
