@@ -219,6 +219,13 @@ Click **Provision**. The worker clones the source VM into the
 Templates folder, attaches a NIC on the staging network, powers it on,
 and waits for VMware Tools. This is the slow step.
 
+Before creating anything, Crucible requires one explicitly allowlisted vCenter
+host that is compatible with the source/resource pool, connected, outside
+maintenance mode, mounted to the target datastore, and carrying the staging
+standard portgroup. A **No eligible allowlisted vCenter placement** error is an
+operator safety block; do not change the template or broaden the host list to
+work around it. See [Troubleshooting](troubleshooting.md#no-eligible-allowlisted-vcenter-placement).
+
 As soon as state flips to `configuring`, the **Open Build Console**
 button appears.
 

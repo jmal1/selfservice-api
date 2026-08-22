@@ -13,8 +13,8 @@
     {
       "path": "AGENTS.md",
       "title": "AGENTS.md — Crucible AI Authoring Reference",
-      "size": 43218,
-      "sha256": "d9b10f8843e356a944680c0fd43ae3b14823555ddf9b2c1da8c8c570bcf7964d",
+      "size": 53144,
+      "sha256": "daa0f8f89d4533441847863b31bf274408104e5158e39e646f00cc958c81ec3e",
       "is_markdown": true,
       "links_out": [
         "deploy/runner/actions.sh",
@@ -183,14 +183,15 @@
     {
       "path": "docs/instructor/templates.md",
       "title": "Building a Template",
-      "size": 46020,
-      "sha256": "ee15b15559d53d5404c5566f662153cde73d34193d1a823ba29dfc70f7d4b052",
+      "size": 46509,
+      "sha256": "7656c5e7dc818fff59fd6cbb439ab44053d42a2c98371b0dbe02b74490e39cf1",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/glossary.md",
         "docs/instructor/os-recipes.md",
         "docs/instructor/overview.md",
         "docs/instructor/overview.md",
+        "docs/instructor/troubleshooting.md",
         "docs/instructor/troubleshooting.md",
         "docs/instructor/troubleshooting.md",
         "docs/instructor/troubleshooting.md",
@@ -201,8 +202,8 @@
     {
       "path": "docs/instructor/troubleshooting.md",
       "title": "Troubleshooting",
-      "size": 29936,
-      "sha256": "d68bfde4b000b21dab9c38fae4ee10ece5079a44548ec296c45bb9e768d05a31",
+      "size": 36859,
+      "sha256": "3bd2ebf06a3d87a235e4e6ca48fa9fc146b9f3b697c57dc3389d1a64f1c5d2b1",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/actions.md",
@@ -297,8 +298,8 @@
     {
       "path": "internal/api/routes/routes.go",
       "title": "routes.go (Go)",
-      "size": 14377,
-      "sha256": "3dd32d1f0063ca27780204e663adb19fa950956cbacc99bc6db36d4f08b5984d",
+      "size": 14470,
+      "sha256": "854bd7f2255b8a231b3ed552ae5f96b1dceb5795dea026c6ed616cd6354b1270",
       "is_markdown": false,
       "from_seed": false
     },
@@ -383,5 +384,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 324247
+  "total_bytes": 341678
 }

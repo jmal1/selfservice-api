@@ -6,6 +6,14 @@ replicaCount:
   worker: 1
   engine: 1
 
+# Independent maintenance controls. API admission and worker claims are
+# separate so operators can start a worker for cleanup while pod deployment,
+# add-VM, and template smoke-clone jobs remain queued. Invalid environment
+# values fail process startup.
+provisioning:
+  enabled: true
+  workerClaimsEnabled: true
+
 image:
   api: ghcr.io/jmal1/selfservice-api-gateway
   worker: ghcr.io/jmal1/selfservice-provision-worker
@@ -25,6 +33,8 @@ api:
   # processes do not overwrite each other's Pushgateway group.
   pipelinePushgatewayURL: "http://pushgateway.observability:9091"
   pipelinePushgatewayJob: "crucible_pipeline_api"
+  provisioningPushgatewayURL: "http://pushgateway.observability:9091"
+  provisioningPushgatewayJob: "crucible_provisioning_admission"
   resources:
     requests:
       cpu: 100m
@@ -34,6 +44,9 @@ api:
       memory: 256Mi
 
 worker:
+  # The worker bounds in-process durable handoff at two minutes. Leave enough
+  # pod termination grace for that handoff and process teardown.
+  shutdownGracePeriodSeconds: 150
   # Pushgateway endpoint for the DestroyFailedPusher (drives the
   # CruciblePodsStuckInDestroyFailed Prometheus alert). Set to empty
   # string to disable cleanly. Job label is the Pushgateway grouping key.
@@ -303,6 +316,9 @@ engine:
 # pushes results to Pushgateway → Prometheus → Grafana alerts.
 synthetic:
   enabled: true
+  # Expected response from GET /api/v1/provisioning/status. Keep explicit so
+  # planned maintenance reads green only when the API reports the same state.
+  provisioningExpectedEnabled: true
   image: ghcr.io/jmal1/selfservice-synthetic-api-monitor
   imageTag: ""  # defaults to .Values.image.tag
   schedule: "*/10 * * * *"

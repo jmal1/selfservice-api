@@ -28,6 +28,7 @@ shared:
   - 'internal/database/**'
   - 'internal/models/**'
   - 'internal/nats/**'
+  - 'internal/provisioning/**'
 
 api-gateway:
   - 'cmd/api-gateway/**'
@@ -104,4 +105,6 @@ go-tests:
   - 'go.sum'
   - 'cmd/**'
   - 'internal/**'
+  # Production containment values have load-bearing Go guard tests.
+  - 'deploy/helm/selfservice/**'
   - '.github/workflows/ci.yaml'

@@ -7,9 +7,11 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jmal1/selfservice-api/internal/config"
 	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/leader"
@@ -39,7 +41,6 @@ func main() {
 		logger.Error("database connection failed", "error", err)
 		os.Exit(1)
 	}
-	defer pool.Close()
 	queries := database.NewQueries(pool)
 
 	// Leader election: gate all periodic reconcilers behind a session-scoped
@@ -94,6 +95,18 @@ func main() {
 		os.Exit(1)
 	}
 	defer vcClient.Disconnect(ctx)
+	resolvedHosts, err := vcClient.ResolveProvisioningHosts(ctx)
+	if err != nil {
+		logger.Error("VCENTER_HOSTS failed strict inventory resolution", "error", err)
+		os.Exit(1)
+	}
+	for _, host := range resolvedHosts {
+		logger.Info("provisioning host allowlisted",
+			"host", host.Name,
+			"inventory_path", host.InventoryPath,
+			"moref", host.MoRef,
+			"compute_moref", host.ComputeMoRef)
+	}
 
 	// Initialize OPNsense clients
 	opnCfg := opnsense.Config{
@@ -174,8 +187,9 @@ func main() {
 		if err != nil {
 			logger.Error("object store init failed; image_import disabled", "error", err)
 		} else {
-			// Imported OVAs land in the first configured Student-VMs pool;
-			// empty lets vCenter pick the datacenter default.
+			// Imported OVAs land in the first configured Student-VMs pool.
+			// An empty explicit value still uses the canonical configured-pool
+			// resolver; vCenter default placement is never allowed.
 			ovaPool := ""
 			if len(cfg.VCenter.ResourcePools) > 0 {
 				ovaPool = cfg.VCenter.ResourcePools[0]
@@ -454,6 +468,10 @@ func main() {
 	if v := os.Getenv("WORKER_L1_VALIDATION_ENABLED"); v != "" {
 		l1ValidationEnabled = strings.EqualFold(v, "true")
 	}
+	l1ValidationEnabled = cloneSchedulerEnabled(
+		cfg.Provisioning.WorkerClaimsEnabled,
+		l1ValidationEnabled,
+	)
 	l1ValidationInterval := envDuration(logger, "WORKER_L1_VALIDATION_INTERVAL", 168*time.Hour)
 	l1ValidationSchedulerInterval := envDuration(logger, "WORKER_L1_VALIDATION_SCHEDULER_INTERVAL", 5*time.Minute)
 	l1ValidationCfg := provisioner.L1TrustValidationReconcilerConfig{
@@ -498,6 +516,10 @@ func main() {
 	//   WORKER_TEMPLATE_HEALTH_INTERVAL              — default 12h
 	//   WORKER_TEMPLATE_HEALTH_DEEP_TIMEOUT          — default 10m
 	healthReconcilerEnabled := strings.EqualFold(os.Getenv("WORKER_TEMPLATE_HEALTH_ENABLED"), "true")
+	healthReconcilerEnabled = cloneSchedulerEnabled(
+		cfg.Provisioning.WorkerClaimsEnabled,
+		healthReconcilerEnabled,
+	)
 	healthReconcilerInterval := envDuration(logger, "WORKER_TEMPLATE_HEALTH_INTERVAL", 12*time.Hour)
 	healthReconcilerDeepTimeout := envDuration(logger, "WORKER_TEMPLATE_HEALTH_DEEP_TIMEOUT", 10*time.Minute)
 	healthConfirmationBackoff := envDuration(logger, "WORKER_TEMPLATE_HEALTH_CONFIRMATION_BACKOFF", 5*time.Minute)
@@ -523,19 +545,21 @@ func main() {
 	prov.ConfigureTemplateHealth(healthReconcilerCfg)
 
 	// Worker ID for job claiming
-	workerID, err := os.Hostname()
+	workerHost, err := os.Hostname()
 	if err != nil {
-		workerID = "worker-unknown"
+		workerHost = "worker-unknown"
 	}
+	workerID := workerHost + "-" + uuid.NewString()
 
 	logger.Info("starting provision worker",
 		"worker_id", workerID,
 		"vcenter", cfg.VCenter.URL,
 		"opnsense", cfg.OPNsense.BaseURL,
+		"provisioning_claims_enabled", cfg.Provisioning.WorkerClaimsEnabled,
 	)
 
-	// Recover any jobs that were abandoned by a previous worker instance
-	recovered, err := queries.RecoverStaleJobs(ctx)
+	// Recover only jobs whose ownership heartbeat lease has expired.
+	recovered, err := queries.RecoverStaleJobs(ctx, provisioner.JobLeaseDuration)
 	if err != nil {
 		logger.Error("failed to recover stale jobs", "error", err)
 	} else if recovered > 0 {
@@ -545,10 +569,14 @@ func main() {
 	// Retry any pods stuck in destroy_failed from previous runs
 	prov.RetryFailedDestroys(ctx)
 
+	jobRuns := &jobRunner{}
+
 	// Subscribe to job notifications from NATS
 	_, err = natsClient.SubscribeJobCreated(func(jobID string, jobType string) {
 		logger.Info("received job notification", "job_id", jobID, "type", jobType)
-		processJobs(ctx, queries, prov, workerID, logger)
+		jobRuns.Go(func() {
+			processJobs(ctx, queries, prov, workerID, cfg.Provisioning.WorkerClaimsEnabled, logger)
+		})
 	})
 	if err != nil {
 		logger.Error("NATS subscription failed", "error", err)
@@ -558,6 +586,8 @@ func main() {
 	// Polling fallback: check for jobs every 30 seconds
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
+	leaseRecoveryTicker := time.NewTicker(provisioner.JobLeaseRecoveryInterval)
+	defer leaseRecoveryTicker.Stop()
 
 	// Retry failed destroys every 5 minutes
 	retryTicker := time.NewTicker(5 * time.Minute)
@@ -663,7 +693,9 @@ func main() {
 	}
 
 	// Immediately process any pending/recovered jobs
-	go processJobs(ctx, queries, prov, workerID, logger)
+	jobRuns.Go(func() {
+		processJobs(ctx, queries, prov, workerID, cfg.Provisioning.WorkerClaimsEnabled, logger)
+	})
 
 	go func() {
 		for {
@@ -674,7 +706,23 @@ func main() {
 			// ── Job-claim loop: NOT gated by leader election ──────────────────
 			// All replicas claim jobs via SELECT ... FOR UPDATE SKIP LOCKED.
 			case <-ticker.C:
-				processJobs(ctx, queries, prov, workerID, logger)
+				jobRuns.Go(func() {
+					processJobs(ctx, queries, prov, workerID, cfg.Provisioning.WorkerClaimsEnabled, logger)
+				})
+
+			case <-leaseRecoveryTicker.C:
+				recovered, err := queries.RecoverStaleJobs(
+					ctx,
+					provisioner.JobLeaseDuration,
+				)
+				if err != nil {
+					logger.Error("expired job lease recovery failed", "error", err)
+				} else if recovered > 0 {
+					logger.Warn("recovered expired job leases", "count", recovered)
+					jobRuns.Go(func() {
+						processJobs(ctx, queries, prov, workerID, cfg.Provisioning.WorkerClaimsEnabled, logger)
+					})
+				}
 
 			// ── Periodic reconcilers: ALL gated by leader election ─────────────
 			// When not leader the tick fires but the body is a cheap no-op.
@@ -863,21 +911,95 @@ func main() {
 	<-sigCh
 
 	logger.Info("shutting down worker")
+	shutdownDeadline := time.Now().Add(2 * time.Minute)
 	cancel()
 	if l1ValidationScheduler != nil {
 		l1ValidationScheduler.Stop()
-		l1ValidationScheduler.Wait()
+	}
+	if !jobRuns.StopAndWait(time.Until(shutdownDeadline)) {
+		logger.Error("worker shutdown deadline reached; durable job recovery will resume unfinished work")
+	}
+	if l1ValidationScheduler != nil &&
+		!l1ValidationScheduler.WaitTimeout(time.Until(shutdownDeadline)) {
+		logger.Error("worker shutdown deadline reached while waiting for L1 trust validation")
+	}
+	if !closeBeforeDeadline(pool, time.Until(shutdownDeadline)) {
+		logger.Error("worker shutdown deadline reached while closing database pool")
 	}
 }
 
+type jobRunner struct {
+	mu       sync.Mutex
+	stopping bool
+	wg       sync.WaitGroup
+}
+
+func (r *jobRunner) Go(run func()) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stopping {
+		return false
+	}
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		run()
+	}()
+	return true
+}
+
+func (r *jobRunner) StopAndWait(timeout time.Duration) bool {
+	r.mu.Lock()
+	r.stopping = true
+	r.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		r.wg.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+type closer interface {
+	Close()
+}
+
+func closeBeforeDeadline(resource closer, timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		resource.Close()
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+func cloneSchedulerEnabled(provisioningClaimsEnabled, configured bool) bool {
+	return provisioningClaimsEnabled && configured
+}
+
 // processJobs claims and processes available jobs via the provisioner.
-func processJobs(ctx context.Context, queries *database.Queries, prov *provisioner.Provisioner, workerID string, logger *slog.Logger) {
+func processJobs(ctx context.Context, queries *database.Queries, prov *provisioner.Provisioner, workerID string, provisioningClaimsEnabled bool, logger *slog.Logger) {
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 
-		job, err := queries.ClaimJob(ctx, workerID)
+		claimID := newJobClaimID(workerID)
+		job, err := queries.ClaimJob(ctx, claimID, provisioningClaimsEnabled)
 		if err != nil {
 			logger.Error("claim job failed", "error", err)
 			return
@@ -886,7 +1008,7 @@ func processJobs(ctx context.Context, queries *database.Queries, prov *provision
 			return // no pending jobs
 		}
 
-		logger.Info("claimed job", "job_id", job.ID, "type", job.Type)
+		logger.Info("claimed job", "job_id", job.ID, "type", job.Type, "claim_id", claimID)
 
 		if err := prov.ProcessJob(ctx, job); err != nil {
 			logger.Error("job failed", "job_id", job.ID, "type", job.Type, "error", err)
@@ -894,6 +1016,10 @@ func processJobs(ctx context.Context, queries *database.Queries, prov *provision
 			logger.Info("job completed", "job_id", job.ID, "type", job.Type)
 		}
 	}
+}
+
+func newJobClaimID(workerID string) string {
+	return workerID + ":" + uuid.NewString()
 }
 
 // envDuration reads a time.Duration from the environment, falling back to def

@@ -99,6 +99,16 @@ func withSimulator(t *testing.T, fn func(ctx context.Context, c *Client, vimc *v
 		datacenter: dc,
 		logger:     slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
 	}
+	hosts, err := finder.HostSystemList(ctx, "*")
+	if err != nil {
+		t.Fatalf("list simulator hosts: %v", err)
+	}
+	for _, host := range hosts {
+		c.config.Hosts = append(c.config.Hosts, host.Name())
+	}
+	if _, err := c.ResolveProvisioningHosts(ctx); err != nil {
+		t.Fatalf("resolve simulator hosts: %v", err)
+	}
 	t.Cleanup(func() { c.Disconnect(context.Background()) })
 
 	fn(ctx, c, gc.Client)

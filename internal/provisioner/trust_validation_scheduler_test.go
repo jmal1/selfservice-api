@@ -185,3 +185,33 @@ func TestL1SchedulerSuccessfulCatchUpRecordsCounts(t *testing.T) {
 		t.Fatalf("successful catch-up error = %v", metrics.observed[0])
 	}
 }
+
+func TestL1SchedulerWaitTimeoutIsBounded(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	scheduler := NewL1TrustValidationScheduler(
+		func() bool { return true },
+		func(context.Context) (L1TrustValidationCounts, error) {
+			close(started)
+			<-release
+			return L1TrustValidationCounts{}, nil
+		},
+		nil,
+		discardLogger(),
+	)
+	scheduler.Start(context.Background())
+	<-started
+
+	start := time.Now()
+	if scheduler.WaitTimeout(20 * time.Millisecond) {
+		t.Fatal("scheduler wait reported completion while reconcile remained blocked")
+	}
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		t.Fatalf("bounded scheduler wait took %s", elapsed)
+	}
+
+	close(release)
+	if !scheduler.WaitTimeout(time.Second) {
+		t.Fatal("scheduler did not finish after reconcile was released")
+	}
+}

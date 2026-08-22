@@ -131,43 +131,43 @@ func (c *Client) cloneTemplateSourceVMInner(ctx context.Context, params Template
 		return "", fmt.Errorf("source VM has no parent folder; FolderPath must be provided")
 	}
 
-	// Idempotency: if a VM with this name already exists in the target
-	// folder, return it. The wizard may be resumed after a worker crash.
-	if existing, err := c.findVMInFolder(ctx, folder, params.VMName); err == nil && existing != "" {
-		c.logger.Info("template VM already exists, reusing", "name", params.VMName, "moref", existing)
-		return existing, nil
-	}
-
-	// Pick a resource pool. For template clones we MUST stay in the same
-	// cluster as the source VM — cross-cluster clone-from-snapshot is
-	// rejected by vCenter with the misleading "virtual disk is either
-	// corrupted or not a supported format" error (most likely CPU-vendor
-	// compatibility validation: Intel→AMD, or vice versa, on a guest
-	// with cpuid masks). Verified by `govc vm.clone -pool <source-cluster>`
-	// succeeding for the same source where `-pool <other-cluster>` fails
-	// in 300ms with the same error.
 	vcpus := params.VCPUs
 	if vcpus == 0 {
-		// Fall back to "any" by passing 1 (the smallest reasonable value).
 		vcpus = 1
 	}
 	rammb := params.RAMmb
 	if rammb == 0 {
 		rammb = 1024
 	}
-	pool, err := c.selectBestPoolInSourceCluster(ctx, sourceProps.Runtime.Host, vcpus, rammb)
-	if err != nil {
-		return "", fmt.Errorf("select resource pool: %w", err)
+	placementRequest := PlacementRequest{
+		SourceHost:        sourceProps.Runtime.Host,
+		RequireSourceHost: true,
+		DatastoreName:     c.config.Datastore,
+		NetworkName:       params.Network,
+		VCPUs:             vcpus,
+		RAMMB:             rammb,
 	}
-	poolRef := pool.Reference()
+	placement, err := c.ResolvePlacement(ctx, placementRequest)
+	if err != nil {
+		return "", fmt.Errorf("select template clone placement: %w", err)
+	}
 
-	// Find datastore. Use the configured one for now; future work could
-	// let the instructor pick.
-	ds, err := c.finder.Datastore(ctx, c.config.Datastore)
-	if err != nil {
-		return "", fmt.Errorf("find datastore %s: %w", c.config.Datastore, err)
+	// Idempotency: if a VM with this name already exists in the target
+	// folder, return it. The wizard may be resumed after a worker crash.
+	if existing, err := c.findVMInFolderStrict(ctx, folder, params.VMName); err != nil {
+		return "", fmt.Errorf("check existing template VM %q: %w", params.VMName, err)
+	} else if existing != "" {
+		if err := c.ValidateVMPlacement(ctx, existing, ""); err != nil {
+			return "", fmt.Errorf("refuse to reuse template VM %s: %w", existing, err)
+		}
+		c.logger.Info("template VM already exists, reusing", "name", params.VMName, "moref", existing)
+		return existing, nil
 	}
-	dsRef := ds.Reference()
+
+	pool := placement.Pool
+	poolRef := pool.Reference()
+	dsRef := placement.Datastore.Reference()
+	hostRef := placement.Host.Reference()
 
 	folderRef := folder.Reference()
 	hasSnapshot := sourceProps.Snapshot != nil && sourceProps.Snapshot.CurrentSnapshot != nil
@@ -217,6 +217,7 @@ func (c *Client) cloneTemplateSourceVMInner(ctx context.Context, params Template
 			Datastore: &dsRef,
 			Folder:    &folderRef,
 			Pool:      &poolRef,
+			Host:      &hostRef,
 		},
 		PowerOn:  false, // we power on after hardware + NIC are configured
 		Template: false, // keep as regular VM so it can be edited
@@ -246,6 +247,11 @@ func (c *Client) cloneTemplateSourceVMInner(ctx context.Context, params Template
 		cloneSpec.Config.ExtraConfig = append(cloneSpec.Config.ExtraConfig, extra...)
 	}
 
+	placementRequest.PinnedHostMoRef = placement.Identity.MoRef
+	placementRequest.PinnedPoolMoRef = placement.PoolMoRef
+	if _, err := c.ResolvePlacement(ctx, placementRequest); err != nil {
+		return "", fmt.Errorf("revalidate template clone placement immediately before submission: %w", err)
+	}
 	task, err := source.Clone(ctx, folder, params.VMName, cloneSpec)
 	if err != nil {
 		return "", fmt.Errorf("clone source VM %s → %s: %w", params.SourceMoref, params.VMName, err)
@@ -257,6 +263,9 @@ func (c *Client) cloneTemplateSourceVMInner(ctx context.Context, params Template
 	newRef, ok := info.Result.(types.ManagedObjectReference)
 	if !ok {
 		return "", fmt.Errorf("clone task returned unexpected result type %T", info.Result)
+	}
+	if err := c.ValidateVMPlacement(ctx, newRef.Value, placement.Identity.MoRef); err != nil {
+		return "", fmt.Errorf("template clone completed on invalid host: %w", err)
 	}
 	c.logger.Info("template source VM cloned", "source", params.SourceMoref, "new", newRef.Value, "name", params.VMName)
 	return newRef.Value, nil
@@ -326,6 +335,9 @@ func (c *Client) WaitForTools(ctx context.Context, moref string, timeout time.Du
 	if err := c.ensureConnected(ctx); err != nil {
 		return err
 	}
+	if err := c.ValidateVMPlacement(ctx, moref, ""); err != nil {
+		return fmt.Errorf("refuse to wait for VMware Tools on invalid host: %w", err)
+	}
 	deadline := time.Now().Add(timeout)
 
 	for {
@@ -376,6 +388,9 @@ func (c *Client) WaitForPowerOff(ctx context.Context, moref string, timeout time
 	if err := c.ensureConnected(ctx); err != nil {
 		return err
 	}
+	if err := c.ValidateVMPlacement(ctx, moref, ""); err != nil {
+		return fmt.Errorf("refuse to wait for power-off on invalid host: %w", err)
+	}
 	deadline := time.Now().Add(timeout)
 
 	for {
@@ -422,6 +437,9 @@ func toolsStatusString(g *types.GuestInfo) string {
 // so the source must have a NIC already).
 func (c *Client) AttachNetworkAdapter(ctx context.Context, moref, network string) error {
 	if err := c.ensureConnected(ctx); err != nil {
+		return err
+	}
+	if err := c.validateVMForMutation(ctx, moref, "", false); err != nil {
 		return err
 	}
 	return c.withRetry(ctx, "attach NIC", func() error {
@@ -614,16 +632,18 @@ func (c *Client) createBlankVMInner(ctx context.Context, p BlankVMParams) (strin
 	if datastore == "" {
 		datastore = c.config.Datastore
 	}
-	ds, err := c.finder.Datastore(ctx, datastore)
-	if err != nil {
-		return "", fmt.Errorf("find datastore %q (set BlankVMParams.Datastore or vcenter Datastore config): %w", datastore, err)
+	placementRequest := PlacementRequest{
+		ResourcePoolPath: p.ResourcePool,
+		DatastoreName:    datastore,
+		NetworkName:      p.Network,
+		VCPUs:            p.VCPUs,
+		RAMMB:            p.RAMmb,
 	}
-	dsRef := ds.Reference()
-
-	pool, err := c.resolvePlacementPool(ctx, p.ResourcePool, p.VCPUs, p.RAMmb)
+	placement, err := c.ResolvePlacement(ctx, placementRequest)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("select blank VM placement: %w", err)
 	}
+	dsRef := placement.Datastore.Reference()
 
 	firmware := p.Firmware
 	if firmware == "" {
@@ -647,7 +667,7 @@ func (c *Client) createBlankVMInner(ctx context.Context, p BlankVMParams) (strin
 		Firmware:     firmware,
 		DeviceChange: deviceChange,
 		Files: &types.VirtualMachineFileInfo{
-			VmPathName: fmt.Sprintf("[%s]", ds.Name()),
+			VmPathName: fmt.Sprintf("[%s]", placement.Datastore.Name()),
 		},
 		// Boot the installer media first, falling back to the (empty) system
 		// disk once the OS is installed and the ISO is detached.
@@ -659,7 +679,12 @@ func (c *Client) createBlankVMInner(ctx context.Context, p BlankVMParams) (strin
 		},
 	}
 
-	task, err := folder.CreateVM(ctx, spec, pool, nil)
+	placementRequest.PinnedHostMoRef = placement.Identity.MoRef
+	placementRequest.PinnedPoolMoRef = placement.PoolMoRef
+	if _, err := c.ResolvePlacement(ctx, placementRequest); err != nil {
+		return "", fmt.Errorf("revalidate blank VM placement immediately before creation: %w", err)
+	}
+	task, err := folder.CreateVM(ctx, spec, placement.Pool, placement.Host)
 	if err != nil {
 		return "", fmt.Errorf("create VM %q: %w", p.VMName, err)
 	}
@@ -670,6 +695,9 @@ func (c *Client) createBlankVMInner(ctx context.Context, p BlankVMParams) (strin
 	newRef, ok := info.Result.(types.ManagedObjectReference)
 	if !ok {
 		return "", fmt.Errorf("create VM task returned unexpected result type %T", info.Result)
+	}
+	if err := c.ValidateVMPlacement(ctx, newRef.Value, placement.Identity.MoRef); err != nil {
+		return "", fmt.Errorf("blank VM created on invalid host: %w", err)
 	}
 	c.logger.Info("blank VM created", "name", p.VMName, "moref", newRef.Value, "guest_id", p.GuestID)
 	return newRef.Value, nil
@@ -795,6 +823,9 @@ func (c *Client) DetachCDROMs(ctx context.Context, moref string) error {
 	if err := c.ensureConnected(ctx); err != nil {
 		return err
 	}
+	if err := c.validateVMForMutation(ctx, moref, "", false); err != nil {
+		return err
+	}
 	return c.withRetry(ctx, "detach CD-ROMs", func() error {
 		return c.detachCDROMsInner(ctx, moref)
 	})
@@ -916,6 +947,9 @@ func (c *Client) RecreateSystemDisk(ctx context.Context, moref string, diskGB in
 		return fmt.Errorf("disk size must be greater than 0 GB (got %d)", diskGB)
 	}
 	if err := c.ensureConnected(ctx); err != nil {
+		return err
+	}
+	if err := c.validateVMForMutation(ctx, moref, "", false); err != nil {
 		return err
 	}
 	return c.withRetry(ctx, "recreate system disk", func() error {

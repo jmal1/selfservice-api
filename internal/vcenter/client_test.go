@@ -1,6 +1,9 @@
 package vcenter
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 func TestIsVMMoref(t *testing.T) {
 	cases := []struct {
@@ -18,9 +21,59 @@ func TestIsVMMoref(t *testing.T) {
 		{"vm-8942 ", false},
 		{"host-12", false},
 	}
+
 	for _, c := range cases {
 		if got := isVMMoref(c.in); got != c.want {
 			t.Errorf("isVMMoref(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestDestroyVMAlreadyGoneErrorsAreRecognized(t *testing.T) {
+	for _, message := range []string{
+		"the object has already been deleted or has not been completely created",
+		"ServerFaultCode: ManagedObjectNotFound: the object could not be found",
+	} {
+		err := errors.New(message)
+		if !isAlreadyDeletedErr(err) && !isResourceNotFoundErr(err) {
+			t.Fatalf("already-gone VM error was not recognized: %q", message)
+		}
+	}
+}
+
+func TestDuplicateCloneNameErrorsAreRecognized(t *testing.T) {
+	for _, message := range []string{
+		"ServerFaultCode: DuplicateName",
+		"duplicate name in target folder",
+		"the object already exists",
+	} {
+		if !isDuplicateNameErr(errors.New(message)) {
+			t.Fatalf("duplicate clone name error was not recognized: %q", message)
+		}
+	}
+}
+
+func TestCloneOperationExtraConfigCarriesCompleteIdentity(t *testing.T) {
+	params := CloneVMParams{
+		OperationID:       "operation-1",
+		PodVMID:           "pod-vm-1",
+		TemplateName:      "vm-source",
+		HostMoRef:         "host-1",
+		ResourcePoolMoRef: "resgroup-1",
+	}
+	values, err := cloneOperationExtraConfig(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{
+		CloneOperationIDKey:     params.OperationID,
+		CloneOperationSourceKey: params.TemplateName,
+		CloneOperationPodVMKey:  params.PodVMID,
+		CloneOperationHostKey:   params.HostMoRef,
+		CloneOperationPoolKey:   params.ResourcePoolMoRef,
+	} {
+		if got := optionValueString(values, key); got != want {
+			t.Errorf("%s = %q, want %q", key, got, want)
 		}
 	}
 }

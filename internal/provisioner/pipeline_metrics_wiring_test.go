@@ -62,12 +62,12 @@ func (s *pipelineMetricsSpy) Push(context.Context) error {
 }
 
 // Retry metric stubs — satisfy pipelineMetricsSink; not asserted in these tests.
-func (s *pipelineMetricsSpy) RecordJobRetry(_, _ string)    {}
+func (s *pipelineMetricsSpy) RecordJobRetry(_, _ string)       {}
 func (s *pipelineMetricsSpy) RecordJobRetryExhausted(_ string) {}
-func (s *pipelineMetricsSpy) SetJobRetryPending(_ int)        {}
+func (s *pipelineMetricsSpy) SetJobRetryPending(_ int)         {}
 
 // L1 trust-tier validation stubs — satisfy pipelineMetricsSink.
-func (s *pipelineMetricsSpy) RecordTemplateValidation(_, _ string) {}
+func (s *pipelineMetricsSpy) RecordTemplateValidation(_, _ string)         {}
 func (s *pipelineMetricsSpy) SetTemplateLastValidated(_ string, _ float64) {}
 
 var _ pipelineMetricsSink = (*pipelineMetricsSpy)(nil)
@@ -109,13 +109,26 @@ type fakeJobStatusDB struct {
 	err     error
 }
 
-func (f *fakeJobStatusDB) UpdateJobStatus(_ context.Context, _ uuid.UUID, status string, _ []byte) error {
+func (f *fakeJobStatusDB) UpdateJobStatus(
+	_ context.Context,
+	_ uuid.UUID,
+	_ string,
+	status string,
+	_ []byte,
+) error {
 	f.updates = append(f.updates, status)
 	return f.err
 }
 
 // RetryJob stub — satisfies jobStatusUpdater; not asserted in these tests.
-func (f *fakeJobStatusDB) RetryJob(_ context.Context, _ uuid.UUID, _ time.Time) error {
+func (f *fakeJobStatusDB) RetryJob(
+	_ context.Context,
+	_ uuid.UUID,
+	_ time.Time,
+	_ bool,
+	_ []byte,
+	_ string,
+) error {
 	return nil
 }
 
@@ -229,6 +242,7 @@ func TestProcessJobLifecycle_RecordsTemplateJobDuration(t *testing.T) {
 	db := &fakeJobStatusDB{}
 	metrics := &pipelineMetricsSpy{}
 	job := &models.Job{ID: uuid.New(), Type: models.JobTypeTemplateVerify}
+	claimTestJob(job)
 
 	err := processJobLifecycle(context.Background(), db, metrics, job, nil, func(context.Context, *models.Job) error { return nil })
 	if err != nil {

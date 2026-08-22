@@ -14,14 +14,17 @@
 //     rejection ("virtual disk is either corrupted or not a supported
 //     format") that was misdiagnosed three times as a CloneSpec bug.
 //     Evidence from the live system (2026-08-03):
-//       • job d62777e7 cloned student-ubuntu-2404 at 20:36:11 → FAILED
-//       • job a3ba9028, same source + params, at 20:37:19 → SUCCEEDED
+//
+//   - job d62777e7 cloned student-ubuntu-2404 at 20:36:11 → FAILED
+//
+//   - job a3ba9028, same source + params, at 20:37:19 → SUCCEEDED
 //     68 seconds apart, identical spec.  The fault is environmental and
 //     transient; a retry is the correct fix.
 package provisioner
 
 import (
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"math/big"
 	"strings"
@@ -34,6 +37,7 @@ const (
 	RetryReasonConnection     = "connection"
 	RetryReasonTimeout        = "timeout"
 	RetryReasonUnavailable    = "unavailable"
+	RetryReasonCleanup        = "cleanup"
 )
 
 // deterministicPhrases are substrings that identify errors that will never
@@ -78,6 +82,24 @@ func ClassifyError(err error, jobType string) (retryable bool, reason string) {
 	if err == nil {
 		return false, ""
 	}
+	var compensatedErr *compensatedJobError
+	if errors.As(err, &compensatedErr) {
+		return false, ""
+	}
+	var manualErr *manualCleanupRequiredError
+	if errors.As(err, &manualErr) {
+		return false, ""
+	}
+	var compensationErr *compensationRetryError
+	if errors.As(err, &compensationErr) {
+		return true, RetryReasonCleanup
+	}
+	if isPodCreateCleanupRetry(err) {
+		if jobType == "pod_create" {
+			return true, RetryReasonCleanup
+		}
+		return false, ""
+	}
 	s := err.Error()
 
 	// Deterministic failures: check first and never retry.
@@ -85,6 +107,9 @@ func ClassifyError(err error, jobType string) (retryable bool, reason string) {
 		if strings.Contains(s, phrase) {
 			return false, ""
 		}
+	}
+	if strings.Contains(s, "stale VM clone") {
+		return true, RetryReasonCleanup
 	}
 
 	// -----------------------------------------------------------------------
@@ -170,9 +195,13 @@ const (
 // and is capped at retryBackoffMax, then a uniform jitter of up to 25%
 // of the computed delay is added to spread load.
 func RetryBackoff(retryCount int) time.Duration {
-	delay := retryBackoffBase * (1 << uint(retryCount))
-	if delay > retryBackoffMax {
-		delay = retryBackoffMax
+	delay := retryBackoffBase
+	for i := 0; i < retryCount && delay < retryBackoffMax; i++ {
+		if delay > retryBackoffMax/2 {
+			delay = retryBackoffMax
+			break
+		}
+		delay *= 2
 	}
 	// Jitter: up to 25% of delay.
 	jitterBound := int64(delay / 4)

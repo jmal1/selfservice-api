@@ -16,7 +16,9 @@ package provisioner
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -39,31 +41,66 @@ type statusRecord struct {
 }
 
 type retryRecord struct {
-	id     uuid.UUID
-	nextAt time.Time
+	id            uuid.UUID
+	nextAt        time.Time
+	cleanupOnly   bool
+	cleanupTarget []byte
 }
 
 type fakeJobDB struct {
-	mu       sync.Mutex
-	statuses []statusRecord
-	retried  []retryRecord
-	retryErr error // if set, RetryJob returns this
+	mu          sync.Mutex
+	statuses    []statusRecord
+	retried     []retryRecord
+	retryErr    error
+	retryErrs   []error
+	retryCalls  int
+	retrySignal chan struct{}
+	statusErr   map[string]error
 }
 
-func (f *fakeJobDB) RetryJob(_ context.Context, id uuid.UUID, nextAt time.Time) error {
+func (f *fakeJobDB) RetryJob(
+	_ context.Context,
+	id uuid.UUID,
+	nextAt time.Time,
+	cleanupOnly bool,
+	cleanupTarget []byte,
+	_ string,
+) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	call := f.retryCalls
+	f.retryCalls++
+	if f.retrySignal != nil {
+		select {
+		case f.retrySignal <- struct{}{}:
+		default:
+		}
+	}
+	if call < len(f.retryErrs) && f.retryErrs[call] != nil {
+		return f.retryErrs[call]
+	}
 	if f.retryErr != nil {
 		return f.retryErr
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.retried = append(f.retried, retryRecord{id: id, nextAt: nextAt})
+	f.retried = append(f.retried, retryRecord{
+		id: id, nextAt: nextAt, cleanupOnly: cleanupOnly, cleanupTarget: cleanupTarget,
+	})
 	return nil
 }
 
-func (f *fakeJobDB) UpdateJobStatus(_ context.Context, id uuid.UUID, status string, result []byte) error {
+func (f *fakeJobDB) UpdateJobStatus(
+	_ context.Context,
+	id uuid.UUID,
+	_ string,
+	status string,
+	result []byte,
+) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.statuses = append(f.statuses, statusRecord{id: id, status: status, result: result})
+	if err := f.statusErr[status]; err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -91,9 +128,21 @@ func testProvisioner() *Provisioner {
 
 func noPublish(_ uuid.UUID, _, _ string) {}
 
+func claimTestJob(job *models.Job) {
+	if job.ClaimedBy == nil {
+		workerID := "test-worker"
+		job.ClaimedBy = &workerID
+	}
+	if job.ClaimedAt == nil {
+		claimedAt := time.Now()
+		job.ClaimedAt = &claimedAt
+	}
+}
+
 // runLifecycle drives processJobLifecycle with a dispatch function that simply
 // returns dispatchErr, mirroring what ProcessJob does when a handler returns.
 func runLifecycle(ctx context.Context, db *fakeJobDB, m *PipelineMetrics, job *models.Job, dispatchErr error) error {
+	claimTestJob(job)
 	return processJobLifecycle(ctx, db, m, job, noPublish,
 		func(_ context.Context, _ *models.Job) error { return dispatchErr })
 }
@@ -130,10 +179,530 @@ func TestHandleJobOutcome_RetryableReturnsPending(t *testing.T) {
 	if !db.retried[0].nextAt.After(time.Now()) {
 		t.Errorf("next_attempt_at %s is not in the future", db.retried[0].nextAt)
 	}
+	if db.retried[0].cleanupOnly {
+		t.Error("ordinary provisioning retry was incorrectly marked cleanup-only")
+	}
 	// Metric must be recorded.
 	key := "template_provision|" + RetryReasonTransientClone
 	if m.jobRetries[key] == 0 {
 		t.Errorf("crucible_job_retries_total[%s] not incremented", key)
+	}
+}
+
+func TestHandleJobOutcome_PodCreateCleanupRetryIsDurablyMarked(t *testing.T) {
+	db := &fakeJobDB{}
+	m := NewPipelineMetrics("", "", nil)
+	job := &models.Job{
+		ID:         uuid.New(),
+		Type:       models.JobTypePodCreate,
+		RetryCount: 3,
+		MaxRetries: 3,
+	}
+	cleanupErr := newPodCreateCleanupRetryError(
+		"test rollback",
+		[]error{errors.New("delete stale port group: connection refused")},
+	)
+
+	if result := runLifecycle(context.Background(), db, m, job, cleanupErr); result != nil {
+		t.Fatalf("processJobLifecycle returned %v, want nil (cleanup retry rescheduled)", result)
+	}
+	if len(db.retried) != 1 {
+		t.Fatalf("RetryJob called %d times, want 1", len(db.retried))
+	}
+	if !db.retried[0].cleanupOnly {
+		t.Fatal("failed pod-create rollback was not marked cleanup-only")
+	}
+	if got := m.jobRetries[models.JobTypePodCreate+"|"+RetryReasonCleanup]; got != 1 {
+		t.Fatalf("cleanup retry metric = %v, want 1", got)
+	}
+}
+
+func TestHandleJobOutcome_ManualCleanupSurvivesCleanupAggregation(t *testing.T) {
+	target := &VMCloneCleanupTarget{
+		PodID:       uuid.NewString(),
+		PodVMID:     uuid.NewString(),
+		VCenterVMID: "vm-42",
+	}
+	newManualErr := func() error {
+		return &manualCleanupRequiredError{
+			err: errors.New("immutable clone ownership is ambiguous"),
+		}
+	}
+	tests := []struct {
+		name    string
+		jobType string
+		err     error
+	}{
+		{
+			name:    "pod cleanup aggregate",
+			jobType: models.JobTypePodCreate,
+			err: newPodCreateCleanupRetryError(
+				"clone reconciliation",
+				[]error{errors.New("transient rollback failure"), newManualErr()},
+			),
+		},
+		{
+			name:    "pod failure and cleanup aggregate",
+			jobType: models.JobTypePodCreate,
+			err: combineProvisioningAndCleanupErrors(
+				newManualErr(),
+				newPodCreateCleanupRetryError(
+					"rollback",
+					[]error{errors.New("transient rollback failure")},
+				),
+			),
+		},
+		{
+			name:    "vm add cleanup wrapper",
+			jobType: models.JobTypeVMAdd,
+			err: &compensationRetryError{
+				err: fmt.Errorf("clean exact clone: %w", newManualErr()),
+			},
+		},
+		{
+			name:    "template smoke cleanup aggregate",
+			jobType: models.JobTypeTemplateVerify,
+			err: cloneRecoveryError(
+				fmt.Errorf(
+					"cleanup smoke clone: %w",
+					errors.Join(errors.New("transient destroy failure"), newManualErr()),
+				),
+				target,
+			),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := &fakeJobDB{}
+			job := &models.Job{
+				ID:         uuid.New(),
+				Type:       tt.jobType,
+				Payload:    []byte(`{"cleanup_only":true}`),
+				RetryCount: 3,
+				MaxRetries: 3,
+			}
+			var published []string
+			claimTestJob(job)
+
+			result := processJobLifecycle(
+				context.Background(),
+				db,
+				NewPipelineMetrics("", "", nil),
+				job,
+				func(_ uuid.UUID, step, _ string) { published = append(published, step) },
+				func(context.Context, *models.Job) error { return tt.err },
+			)
+			if result == nil {
+				t.Fatal("manual cleanup error returned nil")
+			}
+			if !isManualCleanupRequired(result) {
+				t.Fatalf("result = %v, want manual cleanup classification", result)
+			}
+			if db.retryCalls != 0 || len(db.retried) != 0 {
+				t.Fatalf("RetryJob calls = %d, records = %d; want none", db.retryCalls, len(db.retried))
+			}
+			failed := db.statusesWithStatus(models.JobStatusFailed)
+			if len(failed) != 1 {
+				t.Fatalf("failed status updates = %d, want 1", len(failed))
+			}
+			if !strings.Contains(string(failed[0].result), `"manual_cleanup_required":true`) {
+				t.Fatalf("failed result does not report manual cleanup: %s", failed[0].result)
+			}
+			if got := published[len(published)-1]; got != "manual_cleanup_required" {
+				t.Fatalf("final event = %q, want manual_cleanup_required", got)
+			}
+		})
+	}
+}
+
+func TestHandleJobOutcome_TransientCleanupRemainsRetryableAfterBudgetExhaustion(t *testing.T) {
+	target := &VMCloneCleanupTarget{
+		PodID:       uuid.NewString(),
+		PodVMID:     uuid.NewString(),
+		VCenterVMID: "vm-42",
+	}
+	tests := []struct {
+		name    string
+		jobType string
+		err     error
+	}{
+		{
+			name:    "pod cleanup aggregate",
+			jobType: models.JobTypePodCreate,
+			err: newPodCreateCleanupRetryError(
+				"rollback",
+				[]error{errors.New("vCenter connection refused")},
+			),
+		},
+		{
+			name:    "vm add cleanup wrapper",
+			jobType: models.JobTypeVMAdd,
+			err: &compensationRetryError{
+				err: errors.New("destroy exact clone: vCenter connection refused"),
+			},
+		},
+		{
+			name:    "template smoke cleanup wrapper",
+			jobType: models.JobTypeTemplateVerify,
+			err: cloneRecoveryError(
+				errors.New("destroy smoke clone: vCenter connection refused"),
+				target,
+			),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := &fakeJobDB{}
+			job := &models.Job{
+				ID:         uuid.New(),
+				Type:       tt.jobType,
+				Payload:    []byte(`{"cleanup_only":true}`),
+				RetryCount: 3,
+				MaxRetries: 3,
+			}
+
+			if result := runLifecycle(
+				context.Background(),
+				db,
+				NewPipelineMetrics("", "", nil),
+				job,
+				tt.err,
+			); result != nil {
+				t.Fatalf("transient cleanup returned %v, want durable retry", result)
+			}
+			if db.retryCalls != 1 || len(db.retried) != 1 {
+				t.Fatalf("RetryJob calls = %d, records = %d; want one", db.retryCalls, len(db.retried))
+			}
+			if !db.retried[0].cleanupOnly {
+				t.Fatal("transient cleanup retry was not marked cleanup-only")
+			}
+			if got := db.statusesWithStatus(models.JobStatusFailed); len(got) != 0 {
+				t.Fatal("transient cleanup was terminalized after exhausting the original retry budget")
+			}
+		})
+	}
+}
+
+func TestHandleJobOutcome_OrdinaryPodCreateRetryIsNotCleanupOnly(t *testing.T) {
+	db := &fakeJobDB{}
+	job := &models.Job{
+		ID:         uuid.New(),
+		Type:       models.JobTypePodCreate,
+		RetryCount: 0,
+		MaxRetries: 3,
+	}
+
+	if result := runLifecycle(
+		context.Background(),
+		db,
+		NewPipelineMetrics("", "", nil),
+		job,
+		errors.New("clone source VM: connection refused"),
+	); result != nil {
+		t.Fatalf("processJobLifecycle returned %v, want nil (ordinary retry rescheduled)", result)
+	}
+	if len(db.retried) != 1 {
+		t.Fatalf("RetryJob called %d times, want 1", len(db.retried))
+	}
+	if db.retried[0].cleanupOnly {
+		t.Fatal("ordinary pending pod_create would bypass the maintenance claim gate")
+	}
+}
+
+func TestHandleJobOutcome_CompletedPodCreateCompensationDoesNotRetry(t *testing.T) {
+	db := &fakeJobDB{}
+	job := &models.Job{
+		ID:         uuid.New(),
+		Type:       models.JobTypePodCreate,
+		RetryCount: 0,
+		MaxRetries: 3,
+	}
+	compensatedErr := &compensatedJobError{
+		err: errors.New("reconfigure VLANs: connection refused"),
+	}
+	var published []string
+	claimTestJob(job)
+
+	if result := processJobLifecycle(
+		context.Background(),
+		db,
+		NewPipelineMetrics("", "", nil),
+		job,
+		func(_ uuid.UUID, step, _ string) { published = append(published, step) },
+		func(context.Context, *models.Job) error { return compensatedErr },
+	); result == nil {
+		t.Fatal("processJobLifecycle returned nil, want terminal compensated failure")
+	}
+	if len(db.retried) != 0 {
+		t.Fatal("fully compensated pod_create was unnecessarily retried")
+	}
+	if got := db.statusesWithStatus(models.JobStatusFailed); len(got) != 1 {
+		t.Fatalf("failed status updates = %d, want 1", len(got))
+	} else if !strings.Contains(string(got[0].result), `"compensated":true`) {
+		t.Fatalf("failed result does not report compensation: %s", got[0].result)
+	}
+	if got := published[len(published)-1]; got != "compensated" {
+		t.Fatalf("final event = %q, want compensated", got)
+	}
+}
+
+func TestHandleJobOutcome_CleanupIgnoresExhaustedOriginalRetryBudget(t *testing.T) {
+	for _, jobType := range []string{models.JobTypePodCreate, models.JobTypeVMAdd, models.JobTypeVMDestroy} {
+		t.Run(jobType, func(t *testing.T) {
+			db := &fakeJobDB{}
+			job := &models.Job{
+				ID:         uuid.New(),
+				Type:       jobType,
+				Payload:    []byte(`{"cleanup_only":true}`),
+				RetryCount: 3,
+				MaxRetries: 3,
+			}
+
+			if result := runLifecycle(
+				context.Background(),
+				db,
+				NewPipelineMetrics("", "", nil),
+				job,
+				errors.New("cleanup connection refused"),
+			); result != nil {
+				t.Fatalf("cleanup retry returned %v, want nil", result)
+			}
+			if len(db.retried) != 1 || !db.retried[0].cleanupOnly {
+				t.Fatalf("cleanup retry records = %+v, want one durable retry", db.retried)
+			}
+			if got := db.statusesWithStatus(models.JobStatusFailed); len(got) != 0 {
+				t.Fatal("exhausted original retry budget terminalized cleanup")
+			}
+		})
+	}
+}
+
+func TestHandleJobOutcome_CleanupRescheduleRetriesUntilDurable(t *testing.T) {
+	target := &VMCloneCleanupTarget{
+		PodID:       uuid.NewString(),
+		PodVMID:     uuid.NewString(),
+		VCenterVMID: "vm-4242",
+	}
+	db := &fakeJobDB{
+		retryErrs: []error{errors.New("database unavailable"), nil},
+	}
+	job := &models.Job{
+		ID:         uuid.New(),
+		Type:       models.JobTypeVMAdd,
+		RetryCount: 20,
+		MaxRetries: 3,
+	}
+	dispatchErr := &compensationRetryError{
+		err:    errors.New("destroy exact stale VM: connection refused"),
+		target: target,
+	}
+	var published []string
+	started := time.Now()
+	claimTestJob(job)
+
+	if result := processJobLifecycle(
+		context.Background(),
+		db,
+		NewPipelineMetrics("", "", nil),
+		job,
+		func(_ uuid.UUID, step, _ string) { published = append(published, step) },
+		func(context.Context, *models.Job) error { return dispatchErr },
+	); result != nil {
+		t.Fatalf("cleanup reschedule returned %v, want nil after transient DB recovery", result)
+	}
+	if elapsed := time.Since(started); elapsed < cleanupRescheduleBackoffBase {
+		t.Fatalf("cleanup reschedule retried after %s, want at least %s backoff",
+			elapsed, cleanupRescheduleBackoffBase)
+	}
+	if db.retryCalls != 2 {
+		t.Fatalf("RetryJob calls = %d, want 2", db.retryCalls)
+	}
+	if len(db.retried) != 1 || !db.retried[0].cleanupOnly {
+		t.Fatalf("durable cleanup retries = %+v, want one successful cleanup-only write", db.retried)
+	}
+	var gotTarget VMCloneCleanupTarget
+	if err := json.Unmarshal(db.retried[0].cleanupTarget, &gotTarget); err != nil {
+		t.Fatalf("cleanup target is invalid JSON: %v", err)
+	}
+	if gotTarget != *target {
+		t.Fatalf("cleanup target = %+v, want %+v", gotTarget, *target)
+	}
+	if got := db.statusesWithStatus(models.JobStatusFailed); len(got) != 0 {
+		t.Fatal("cleanup was terminalized while its durable retry write recovered")
+	}
+	for _, event := range published {
+		if event == "completed" || event == "compensated" || event == "failed" {
+			t.Fatalf("published terminal event %q while cleanup rescheduling recovered", event)
+		}
+	}
+	if published[len(published)-1] != "retry_scheduled" {
+		t.Fatalf("final event = %q, want retry_scheduled", published[len(published)-1])
+	}
+}
+
+func TestHandleJobOutcome_CleanupRescheduleShutdownHandsOffToStartupRecovery(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	db := &fakeJobDB{
+		retryErr:    errors.New("database unavailable"),
+		retrySignal: make(chan struct{}, 1),
+	}
+	job := &models.Job{
+		ID:         uuid.New(),
+		Type:       models.JobTypePodCreate,
+		Payload:    []byte(`{"cleanup_only":true}`),
+		RetryCount: 20,
+		MaxRetries: 3,
+	}
+	var published []string
+	resultCh := make(chan error, 1)
+	claimTestJob(job)
+	go func() {
+		resultCh <- processJobLifecycle(
+			ctx,
+			db,
+			NewPipelineMetrics("", "", nil),
+			job,
+			func(_ uuid.UUID, step, _ string) { published = append(published, step) },
+			func(context.Context, *models.Job) error {
+				return errors.New("destroy exact stale VM: connection refused")
+			},
+		)
+	}()
+
+	select {
+	case <-db.retrySignal:
+	case <-time.After(time.Second):
+		t.Fatal("RetryJob was not attempted")
+	}
+	cancel()
+
+	select {
+	case result := <-resultCh:
+		if !errors.Is(result, context.Canceled) {
+			t.Fatalf("shutdown result = %v, want context.Canceled", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cleanup reschedule did not stop promptly on shutdown")
+	}
+	if got := db.statusesWithStatus(models.JobStatusFailed); len(got) != 0 {
+		t.Fatal("shutdown terminalized cleanup instead of leaving startup recovery handoff")
+	}
+	if len(db.retried) != 0 {
+		t.Fatal("failed cleanup reschedule unexpectedly recorded a durable retry")
+	}
+	for _, event := range published {
+		if event == "completed" || event == "compensated" || event == "failed" {
+			t.Fatalf("published terminal event %q during cleanup reschedule shutdown", event)
+		}
+	}
+}
+
+func TestCleanupRescheduleBackoffIsBounded(t *testing.T) {
+	for _, failures := range []int{1, 2, 6, 63, 1_000_000} {
+		delay := cleanupRescheduleBackoff(failures)
+		if delay < cleanupRescheduleBackoffBase || delay > cleanupRescheduleBackoffMax {
+			t.Fatalf("cleanupRescheduleBackoff(%d) = %s, want [%s,%s]",
+				failures, delay, cleanupRescheduleBackoffBase, cleanupRescheduleBackoffMax)
+		}
+	}
+}
+
+func TestHandleJobOutcome_CompensatedStatusFailurePublishesNoSuccess(t *testing.T) {
+	db := &fakeJobDB{
+		statusErr: map[string]error{
+			models.JobStatusFailed: errors.New("database unavailable"),
+		},
+	}
+	job := &models.Job{ID: uuid.New(), Type: models.JobTypePodCreate}
+	var published []string
+	claimTestJob(job)
+
+	result := processJobLifecycle(
+		context.Background(),
+		db,
+		NewPipelineMetrics("", "", nil),
+		job,
+		func(_ uuid.UUID, step, _ string) { published = append(published, step) },
+		func(context.Context, *models.Job) error {
+			return newPodCreateCompensatedError("test")
+		},
+	)
+	if result == nil || !strings.Contains(result.Error(), "persist terminal job status") {
+		t.Fatalf("result = %v, want terminal status persistence error", result)
+	}
+	for _, event := range published {
+		if event == "compensated" || event == "completed" {
+			t.Fatalf("published false success event %q after status write failed", event)
+		}
+	}
+}
+
+func TestHandleJobOutcome_CompletedStatusFailurePublishesNoSuccess(t *testing.T) {
+	db := &fakeJobDB{
+		statusErr: map[string]error{
+			models.JobStatusCompleted: errors.New("database unavailable"),
+		},
+	}
+	job := &models.Job{ID: uuid.New(), Type: models.JobTypePodDestroy}
+	var published []string
+	claimTestJob(job)
+
+	result := processJobLifecycle(
+		context.Background(),
+		db,
+		NewPipelineMetrics("", "", nil),
+		job,
+		func(_ uuid.UUID, step, _ string) { published = append(published, step) },
+		func(context.Context, *models.Job) error { return nil },
+	)
+	if result == nil || !strings.Contains(result.Error(), "persist completed job status") {
+		t.Fatalf("result = %v, want completed status persistence error", result)
+	}
+	for _, event := range published {
+		if event == "completed" {
+			t.Fatal("published completed event after status write failed")
+		}
+	}
+}
+
+func TestHandleJobOutcome_PersistsExactCleanupTargetWhenInitialStageFailed(t *testing.T) {
+	db := &fakeJobDB{}
+	target := &VMCloneCleanupTarget{
+		PodID:       uuid.NewString(),
+		PodVMID:     uuid.NewString(),
+		VCenterVMID: "vm-4242",
+	}
+	job := &models.Job{
+		ID:         uuid.New(),
+		Type:       models.JobTypeVMAdd,
+		RetryCount: 3,
+		MaxRetries: 3,
+	}
+	stageErr := &compensationRetryError{
+		err:    errors.New("persist exact VM cleanup target: connection refused"),
+		target: target,
+	}
+
+	if result := runLifecycle(
+		context.Background(),
+		db,
+		NewPipelineMetrics("", "", nil),
+		job,
+		stageErr,
+	); result != nil {
+		t.Fatalf("cleanup target retry returned %v, want nil", result)
+	}
+	if len(db.retried) != 1 || !db.retried[0].cleanupOnly {
+		t.Fatalf("cleanup retry records = %+v, want one cleanup-only retry", db.retried)
+	}
+	var got VMCloneCleanupTarget
+	if err := json.Unmarshal(db.retried[0].cleanupTarget, &got); err != nil {
+		t.Fatalf("retry target is not valid JSON: %v", err)
+	}
+	if got != *target {
+		t.Fatalf("retry target = %+v, want %+v", got, *target)
 	}
 }
 
@@ -228,7 +797,17 @@ func TestBackoffGrows(t *testing.T) {
 		if i > 0 && d < prev {
 			t.Errorf("RetryBackoff(%d) = %s, should be >= RetryBackoff(%d) = %s", i, d, i-1, prev)
 		}
+
 		prev = d
+	}
+}
+
+func TestBackoffDoesNotOverflowForUnlimitedCleanupRetries(t *testing.T) {
+	for _, retryCount := range []int{29, 63, 1_000_000} {
+		delay := RetryBackoff(retryCount)
+		if delay < retryBackoffMax || delay >= retryBackoffMax+retryBackoffMax/4 {
+			t.Fatalf("RetryBackoff(%d) = %s, want capped positive delay with bounded jitter", retryCount, delay)
+		}
 	}
 }
 

@@ -49,6 +49,7 @@ const (
 	envLayer                  = "SYNTHETIC_LAYER"           // grouping label `layer`, default api
 	envLoopInterval           = "SYNTHETIC_LOOP_INTERVAL"   // optional duration; if set, runs forever
 	envCheckTimeout           = "SYNTHETIC_CHECK_TIMEOUT"   // optional duration, default 30s
+	envProvisioningExpected   = "SYNTHETIC_PROVISIONING_EXPECTED_ENABLED"
 	envContentFilterExpected  = "SYNTHETIC_CONTENT_FILTER_EXPECTED"
 	envContentFilterSource    = "SYNTHETIC_CONTENT_FILTER_SOURCE_NETWORK"
 	envContentFilterFeedBase  = "SYNTHETIC_CONTENT_FILTER_CATEGORY_FEED_BASE_URL"
@@ -224,7 +225,20 @@ func run(logger *slog.Logger) error {
 		logger.Warn(w.msg, "env", w.env)
 	}
 
+	expectedProvisioning, err := strictEnvBool(os.Getenv, envProvisioningExpected, true)
+	if err != nil {
+		return err
+	}
 	activeChecks := checks.All()
+	if !expectedProvisioning {
+		activeChecks = checks.ReadOnly()
+	}
+	activeChecks = replaceCheck(activeChecks, checks.ProvisioningStatus(checks.ProvisioningStatusConfig{
+		ExpectedEnabled: expectedProvisioning,
+	}))
+	activeChecks = replaceCheck(activeChecks, checks.TemplateVisibilityEnforced(checks.TemplateVisibilityConfig{
+		ProvisioningEnabled: expectedProvisioning,
+	}))
 	maxGeneratedRules := 256
 	if v := os.Getenv(envContentFilterMaxRules); v != "" {
 		maxGeneratedRules, err = strconv.Atoi(v)
@@ -874,6 +888,18 @@ func replaceCheck(all []synthetic.Check, replacement synthetic.Check) []syntheti
 		}
 	}
 	return append(all, replacement)
+}
+
+func strictEnvBool(getenv func(string) string, key string, fallback bool) (bool, error) {
+	value := strings.TrimSpace(getenv(key))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("invalid %s=%q: must be a boolean: %w", key, value, err)
+	}
+	return parsed, nil
 }
 
 func provisionerContentFilterConfig(getenv func(string) string) provisioner.ContentFilterConfig {

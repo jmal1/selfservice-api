@@ -63,11 +63,11 @@ type GuestExecResult struct {
 }
 
 const (
-	maxGuestScriptBytes  = 64 * 1024
-	maxGuestOutputBytes  = 1 * 1024 * 1024
-	defaultGuestTimeout  = 5 * time.Minute
-	maxGuestTimeout      = 15 * time.Minute
-	guestPollInterval    = 1500 * time.Millisecond
+	maxGuestScriptBytes = 64 * 1024
+	maxGuestOutputBytes = 1 * 1024 * 1024
+	defaultGuestTimeout = 5 * time.Minute
+	maxGuestTimeout     = 15 * time.Minute
+	guestPollInterval   = 1500 * time.Millisecond
 )
 
 // RunScriptInGuest uploads the script to the target VM via VMware Tools,
@@ -104,6 +104,9 @@ func (c *Client) RunScriptInGuest(ctx context.Context, req GuestExecRequest) (*G
 
 	if err := c.ensureConnected(ctx); err != nil {
 		return nil, fmt.Errorf("ensure vCenter connection: %w", err)
+	}
+	if err := c.ValidateVMPlacement(ctx, req.VMMoref, ""); err != nil {
+		return nil, fmt.Errorf("refuse guest script on invalid host: %w", err)
 	}
 
 	var result *GuestExecResult
@@ -187,8 +190,8 @@ func (c *Client) runScriptInGuestInner(ctx context.Context, req GuestExecRequest
 	// `bash <scriptPath> > stdout 2> stderr` via /bin/sh -c.
 	programPath, programArgs := buildGuestInvocation(req.Language, scriptPath, stdoutPath, stderrPath)
 	spec := &types.GuestProgramSpec{
-		ProgramPath: programPath,
-		Arguments:   programArgs,
+		ProgramPath:  programPath,
+		Arguments:    programArgs,
 		EnvVariables: req.Env,
 	}
 	startedAt := time.Now()
@@ -335,6 +338,9 @@ func (c *Client) ValidateGuestCredentials(ctx context.Context, moref, guestUser,
 	if err := c.ensureConnected(ctx); err != nil {
 		return fmt.Errorf("ensure vCenter connection: %w", err)
 	}
+	if err := c.ValidateVMPlacement(ctx, moref, ""); err != nil {
+		return fmt.Errorf("refuse guest credential validation on invalid host: %w", err)
+	}
 	vm, err := c.vmFromMoref(moref)
 	if err != nil {
 		return err
@@ -373,6 +379,9 @@ func (c *Client) ValidateGuestCredentials(ctx context.Context, moref, guestUser,
 func (c *Client) UploadFileToGuest(ctx context.Context, moref, guestUser, guestPassword, guestPath string, data []byte) error {
 	if err := c.ensureConnected(ctx); err != nil {
 		return fmt.Errorf("ensure vCenter connection: %w", err)
+	}
+	if err := c.ValidateVMPlacement(ctx, moref, ""); err != nil {
+		return fmt.Errorf("refuse guest upload on invalid host: %w", err)
 	}
 	return c.withRetry(ctx, "upload file to guest", func() error {
 		vm, err := c.vmFromMoref(moref)

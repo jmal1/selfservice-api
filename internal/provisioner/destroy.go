@@ -3,10 +3,13 @@ package provisioner
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 
 	"github.com/google/uuid"
+	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/models"
+	"github.com/jmal1/selfservice-api/internal/vcenter"
 )
 
 // DestroyPodPayload is the expected shape of job.Payload for pod_destroy.
@@ -68,18 +71,43 @@ func (p *Provisioner) DestroyPod(ctx context.Context, job *models.Job) error {
 				if err := p.vc.DestroyVM(ctx, *vm.VCenterVMID); err != nil {
 					p.logger.Warn("failed to destroy VM", "moref", *vm.VCenterVMID, "error", err)
 					errors = append(errors, fmt.Errorf("destroy VM %s: %w", *vm.VCenterVMID, err))
+					continue
 				}
 			}
-			// Always mark VM as deleted — vCenter VM is gone (or never existed)
+			// Mark deleted only after vCenter confirms destruction or absence.
+			// A disallowed-host guard must leave the persisted VM reference intact
+			// for manual escalation rather than hiding a live ESXi2 VM.
 			_ = p.db.UpdatePodVMStatus(ctx, vm.ID, "deleted")
 		}
 	}
 
-	// --- Step 3: Delete port groups from all ESXi hosts ---
+	// --- Step 3: Delete only port groups owned by the durable create receipt ---
 	p.publishProgress(job.ID, "portgroup_delete", fmt.Sprintf("Deleting port group %s", pgName))
-	if err := p.vc.DeletePortGroupOnAllHosts(ctx, pgName); err != nil {
+	rawReceipt, err := p.db.GetPodPortGroupReceipt(ctx, pod.ID)
+	if err != nil {
+		p.logger.Warn("failed to load durable port group receipt", "name", pgName, "error", err)
+		errors = append(errors, fmt.Errorf("load port group receipt: %w", err))
+		if portGroupReceiptRequiresManualCleanup(err) {
+			return p.failPodDestroyManual(ctx, pod.ID, errors)
+		}
+		return p.failPodDestroy(ctx, pod.ID, errors)
+	}
+	var receipt vcenter.PortGroupReceipt
+	if err := json.Unmarshal(rawReceipt, &receipt); err != nil {
+		errors = append(errors, fmt.Errorf("parse port group receipt: %w", err))
+		return p.failPodDestroyManual(ctx, pod.ID, errors)
+	}
+	if err := p.db.WithVCenterPortGroupMutationLock(ctx, func(lockCtx context.Context) error {
+		return p.vc.DeletePortGroupMutation(lockCtx, receipt)
+	}); err != nil {
 		p.logger.Warn("failed to delete port groups", "name", pgName, "error", err)
 		errors = append(errors, fmt.Errorf("delete port groups: %w", err))
+		// Keep the VLAN and interface allocated so a retry can safely remove
+		// exactly the receipt-owned port groups before releasing network state.
+		if portGroupReceiptRequiresManualCleanup(err) {
+			return p.failPodDestroyManual(ctx, pod.ID, errors)
+		}
+		return p.failPodDestroy(ctx, pod.ID, errors)
 	}
 
 	// --- Step 4: Remove DHCP subnet ---
@@ -160,11 +188,34 @@ func (p *Provisioner) DestroyPod(ctx context.Context, job *models.Job) error {
 }
 
 func (p *Provisioner) failPodDestroy(ctx context.Context, podID uuid.UUID, errors []error) error {
-	errMsg := fmt.Sprintf("%d cleanup errors occurred", len(errors))
-	_ = p.db.UpdatePodStatus(ctx, podID, models.PodStatusDestroyFailed, errMsg)
+	destroyErr := fmt.Errorf("pod destroy incomplete with %d errors: %v", len(errors), errors)
+	_ = p.db.UpdatePodStatus(ctx, podID, models.PodStatusDestroyFailed, destroyErr.Error())
 	p.logger.Warn("pod destruction incomplete, marked destroy_failed",
 		"pod_id", podID, "error_count", len(errors))
-	return fmt.Errorf("pod destroy incomplete with %d errors: %v", len(errors), errors)
+	return destroyErr
+}
+
+func (p *Provisioner) failPodDestroyManual(ctx context.Context, podID uuid.UUID, errors []error) error {
+	destroyErr := fmt.Errorf("pod destroy incomplete with %d errors: %v", len(errors), errors)
+	manualErr := fmt.Errorf(
+		"%s %w; durable port group ownership cannot be proven, so the VLAN remains allocated and manual cleanup is required",
+		models.PodErrorManualCleanupRequiredPrefix,
+		destroyErr,
+	)
+	_ = p.db.UpdatePodStatus(ctx, podID, models.PodStatusDestroyFailed, manualErr.Error())
+	p.logger.Warn("pod destruction requires manual cleanup",
+		"pod_id", podID, "error_count", len(errors))
+	return &manualCleanupRequiredError{
+		err: manualErr,
+	}
+}
+
+func portGroupReceiptRequiresManualCleanup(err error) bool {
+	return stderrors.Is(err, database.ErrPortGroupReceiptNotFound) ||
+		stderrors.Is(err, vcenter.ErrInvalidPortGroupReceipt) ||
+		stderrors.Is(err, vcenter.ErrLegacyPortGroupReceipt) ||
+		stderrors.Is(err, vcenter.ErrHostNotAllowed) ||
+		stderrors.Is(err, vcenter.ErrAmbiguousHostIdentity)
 }
 
 // RetryFailedDestroys finds pods stuck in "destroy_failed" and re-runs
@@ -176,13 +227,13 @@ func (p *Provisioner) failPodDestroy(ctx context.Context, podID uuid.UUID, error
 // alert reflects steady-state, not pre-retry state. A push failure is logged
 // but never blocks the retry itself.
 func (p *Provisioner) RetryFailedDestroys(ctx context.Context) {
-	pods, err := p.db.ListDestroyFailedPods(ctx)
+	pods, err := p.db.ListRetryableDestroyFailedPods(ctx)
 	if err != nil {
 		p.logger.Error("failed to list destroy_failed pods", "error", err)
 		return
 	}
 	if len(pods) == 0 {
-		p.publishDestroyFailedCount(ctx, 0)
+		p.publishCurrentDestroyFailedCount(ctx)
 		return
 	}
 
@@ -204,12 +255,18 @@ func (p *Provisioner) RetryFailedDestroys(ctx context.Context) {
 		}
 	}
 
-	// Re-read so the gauge reflects post-retry state, not what we started
-	// with. A retry that fully succeeded drops the count to 0 immediately;
-	// a retry that failed leaves the count at len(pods) for the alert.
-	if remaining, err := p.db.ListDestroyFailedPods(ctx); err == nil {
-		p.publishDestroyFailedCount(ctx, len(remaining))
+	// Re-count every destroy_failed pod so ownership-ambiguous failures remain
+	// visible to alerting even though the automated sweep does not retry them.
+	p.publishCurrentDestroyFailedCount(ctx)
+}
+
+func (p *Provisioner) publishCurrentDestroyFailedCount(ctx context.Context) {
+	count, err := p.db.CountDestroyFailedPods(ctx)
+	if err != nil {
+		p.logger.Warn("failed to count destroy_failed pods", "error", err)
+		return
 	}
+	p.publishDestroyFailedCount(ctx, count)
 }
 
 // publishDestroyFailedCount pushes the count to Pushgateway when a pusher

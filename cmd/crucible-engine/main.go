@@ -121,9 +121,14 @@ func main() {
 				"error", err)
 		} else {
 			defer vcClient.Disconnect(ctx)
-			dispatcher := engine.NewVMwareToolsDispatcher(vcClient, queries, eng, logger)
-			eng.WithVMwareToolsDispatcher(dispatcher)
-			logger.Info("vmware_tools dispatcher configured", "vcenter_url", cfg.VCenter.URL)
+			if _, err := vcClient.ResolveProvisioningHosts(ctx); err != nil {
+				logger.Warn("VCENTER_HOSTS failed strict inventory resolution; vmware_tools workflows will be rejected",
+					"error", err)
+			} else {
+				dispatcher := engine.NewVMwareToolsDispatcher(vcClient, queries, eng, logger)
+				eng.WithVMwareToolsDispatcher(dispatcher)
+				logger.Info("vmware_tools dispatcher configured", "vcenter_url", cfg.VCenter.URL)
+			}
 		}
 	} else {
 		logger.Info("vCenter config not provided; vmware_tools workflows will be rejected")

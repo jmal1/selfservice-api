@@ -37,6 +37,11 @@ var requiredWiring = map[string][]struct {
 	"cmd/api-gateway/main.go": {
 		{"WithImageStore", "without it every /admin/images route answers 503 and image upload is dead in prod"},
 		{"WithVCenterISOs", "without it the template wizard's ISO picker is permanently empty"},
+		{"WithProvisioningAdmission", "without it PROVISIONING_ENABLED is parsed but new pod and VM requests remain admitted during maintenance"},
+		{"NewProvisioningAdmissionMetrics", "without it maintenance state and rejection counters are absent from Pushgateway"},
+	},
+	"internal/api/routes/routes.go": {
+		{"r.Use(h.ProvisioningAdmission)", "the admission gate must run after authentication but before AuditRequests can touch the database"},
 	},
 	"cmd/crucible-engine/main.go": {
 		{"NewRunnerMetrics", "without it e.metrics stays nil and every runner metric call is a silent no-op"},
@@ -78,6 +83,7 @@ func TestCmdMains_WireOptionalDependencies(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read %s: %v", relPath, err)
 			}
+
 			src := string(data)
 
 			for _, req := range required {
@@ -92,6 +98,20 @@ func TestCmdMains_WireOptionalDependencies(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestProvisioningAdmissionPrecedesDatabaseTouchingAudit(t *testing.T) {
+	root := findRepoRoot(t)
+	body, err := os.ReadFile(filepath.Join(root, "internal", "api", "routes", "routes.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(body)
+	admission := strings.Index(src, "r.Use(h.ProvisioningAdmission)")
+	audit := strings.Index(src, "r.Use(middleware.AuditRequests(db))")
+	if admission < 0 || audit < 0 || admission > audit {
+		t.Fatal("provisioning admission must be registered before database-touching request auditing")
 	}
 }
 
@@ -124,6 +144,7 @@ func TestCreatePod_ActiveTransitionIsGuarded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read %s: %v", relPath, err)
 	}
+
 	src := string(data)
 
 	const guarded = `UpdatePodStatusFrom(ctx, pod.ID, []string{"provisioning"}, "active", "")`
@@ -147,5 +168,459 @@ func TestCreatePod_ActiveTransitionIsGuarded(t *testing.T) {
 				"in \"provisioning\".",
 			relPath, unguarded,
 		)
+	}
+}
+
+func TestProvisioningJobEntryTransitionsAreGuarded(t *testing.T) {
+	root := findRepoRoot(t)
+	files := map[string][]string{
+		"internal/provisioner/create.go": {
+			"UpdatePodStatusFrom(",
+			"UpdatePodVMStatusFrom(",
+			"AdoptPodVMClone(",
+			"models.PodStatusPending",
+			"models.PodStatusProvisioning",
+			"stale pod create job skipped",
+			"stopPodCreateIfStale",
+			"BeginPodCreateCleanup(",
+			"rb.Rollback(cleanupCtx)",
+			"failPodCreateForStaleVM",
+		},
+		"internal/provisioner/vm_ops.go": {
+			"UpdatePodVMStatusFrom(",
+			"AdoptPodVMClone(",
+			"stale vm_add job skipped",
+			"VCenterVMID string",
+			"CleanupOnly bool",
+			"stageVMCloneCleanup",
+		},
+	}
+
+	for relPath, fragments := range files {
+		body, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(relPath)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, fragment := range fragments {
+			if !strings.Contains(string(body), fragment) {
+				t.Errorf("%s is missing %q; a stale provisioning job could overwrite terminal cleanup state", relPath, fragment)
+			}
+		}
+
+	}
+}
+
+func TestCleanupOnlyPodCreateCannotReachForwardProvisioning(t *testing.T) {
+	root := findRepoRoot(t)
+	body, err := os.ReadFile(filepath.Join(root, "internal", "provisioner", "create.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(body)
+
+	createStart := strings.Index(src, "func (p *Provisioner) CreatePod(")
+	if createStart < 0 {
+		t.Fatal("CreatePod function not found")
+	}
+	cleanupBranch := strings.Index(src[createStart:], "if payload.CleanupOnly {")
+	forwardStart := strings.Index(src[createStart:], "// Get pod from DB")
+	if cleanupBranch < 0 || forwardStart < 0 || cleanupBranch > forwardStart {
+		t.Fatal("cleanup-only dispatch must return before the forward pod-create path")
+	}
+	branch := src[createStart+cleanupBranch : createStart+forwardStart]
+	if !strings.Contains(branch, "return p.runPodCreateCleanup(ctx, job, payload, rb)") {
+		t.Fatal("cleanup-only dispatch must return directly into compensation")
+	}
+
+	cleanupStart := strings.Index(src, "func (p *Provisioner) runPodCreateCleanup(")
+	if cleanupStart < 0 {
+		t.Fatal("runPodCreateCleanup function not found")
+	}
+	cleanupEnd := strings.Index(src[cleanupStart+1:], "\nfunc ")
+	if cleanupEnd < 0 {
+		t.Fatal("could not isolate runPodCreateCleanup")
+	}
+	cleanupBody := src[cleanupStart : cleanupStart+1+cleanupEnd]
+	for _, forbidden := range []string{
+		"CreateVLAN(",
+		"CreateDHCPSubnet(",
+		"AddDHCPInterface(",
+		"CreatePortGroupOnAllHosts(",
+		"CloneVM(",
+		"PowerOnVM(",
+		"CreateVMSnapshot(",
+	} {
+		if strings.Contains(cleanupBody, forbidden) {
+			t.Errorf("cleanup-only execution contains forward provisioning call %q", forbidden)
+		}
+	}
+	if got := strings.Count(src, "rb.Rollback("); got != 1 {
+		t.Fatalf("pod-create rollback has %d call sites, want one guarded compensation path", got)
+	}
+	commonCleanupStart := strings.Index(src, "func (p *Provisioner) cleanupPodCreateResources(")
+	if commonCleanupStart < 0 {
+		t.Fatal("cleanupPodCreateResources function not found")
+	}
+	marker := strings.Index(src[commonCleanupStart:], "BeginPodCreateCleanup(")
+	rollback := strings.Index(src[commonCleanupStart:], "rb.Rollback(cleanupCtx)")
+	if marker < 0 || rollback < 0 || marker > rollback {
+		t.Fatal("cleanup-only state must be committed before rollback starts")
+	}
+
+	failCleanupStart := strings.Index(src, "func (p *Provisioner) failPodCreateWithCleanup(")
+	if failCleanupStart < 0 {
+		t.Fatal("failPodCreateWithCleanup function not found")
+	}
+	failCleanupEnd := strings.Index(src[failCleanupStart+1:], "\nfunc ")
+	if failCleanupEnd < 0 {
+		t.Fatal("could not isolate failPodCreateWithCleanup")
+	}
+	failCleanupBody := src[failCleanupStart : failCleanupStart+1+failCleanupEnd]
+	if !strings.Contains(failCleanupBody, "\n\t\ttrue,\n") {
+		t.Fatal("forward pod-create failure must atomically relinquish provisioning before cleanup")
+	}
+	if !strings.Contains(cleanupBody, "podCreateCleanupOwnsStagedClone(payload)") {
+		t.Fatal("cleanup-only retry may transition provisioning only with an exact staged clone target")
+	}
+
+	queryBody, err := os.ReadFile(filepath.Join(root, "internal", "database", "queries.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	querySrc := string(queryBody)
+	beginStart := strings.Index(querySrc, "func (q *Queries) BeginPodCreateCleanup(")
+	retryStart := strings.Index(querySrc, "const retryJobSQL")
+	if beginStart < 0 || retryStart < 0 || beginStart > retryStart {
+		t.Fatal("BeginPodCreateCleanup transaction not found")
+	}
+	beginBody := querySrc[beginStart:retryStart]
+	for _, required := range []string{
+		"SELECT status FROM pods WHERE id = $1 FOR UPDATE",
+		"status == models.PodStatusProvisioning && allowProvisioningTransition",
+		"podCreateCleanupStatusSafe(status)",
+		"markPodCreateCleanupOnlySQL",
+		"tx.Commit(ctx)",
+	} {
+		if !strings.Contains(beginBody, required) {
+			t.Errorf("atomic cleanup transition is missing %q", required)
+		}
+	}
+}
+
+func TestVMCloneCompensationUsesOnlyDurableExactTargets(t *testing.T) {
+	root := findRepoRoot(t)
+	read := func(relPath string) string {
+		t.Helper()
+		body, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(relPath)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(body)
+	}
+
+	createSrc := read("internal/provisioner/create.go")
+	vmOpsSrc := read("internal/provisioner/vm_ops.go")
+	querySrc := read("internal/database/queries.go")
+	cloneOperationSrc := read("internal/provisioner/clone_operation.go")
+	cloneDBSrc := read("internal/database/clone_operations.go")
+
+	if strings.Contains(vmOpsSrc, "ResolveVMByName(") {
+		t.Fatal("stale-clone compensation must never resolve a mutable VM name")
+	}
+	for relPath, src := range map[string]string{
+		"internal/provisioner/create.go": createSrc,
+		"internal/provisioner/vm_ops.go": vmOpsSrc,
+	} {
+		clone := strings.Index(src, "executeDurableVMClone(")
+		if clone < 0 {
+			t.Errorf("%s has no durable clone operation call", relPath)
+			continue
+		}
+		adopt := strings.Index(src[clone:], "p.db.AdoptPodVMClone(")
+		disarm := strings.Index(src[clone:], "p.db.DisarmVMCloneCleanup(")
+		if adopt < 0 || disarm < 0 || adopt > disarm {
+			t.Errorf("%s must adopt then disarm the durable clone", relPath)
+		}
+		if relPath == "internal/provisioner/create.go" {
+			record := strings.Index(src[clone:], "rb.Record(")
+			if record < 0 || record > adopt {
+				t.Errorf("%s must persist rollback before adopting and disarming the clone", relPath)
+			}
+		}
+	}
+	prepare := strings.Index(cloneOperationSrc, "store.PrepareVMCloneOperation(")
+	submit := strings.Index(cloneOperationSrc, "client.StartCloneVMOperation(")
+	persistTask := strings.Index(cloneOperationSrc, "store.PersistVMCloneTask(")
+	waitTask := strings.Index(cloneOperationSrc, "client.WaitCloneVMTask(")
+	stage := strings.Index(cloneOperationSrc, "store.StageVMCloneCleanup(")
+	configure := strings.Index(cloneOperationSrc, "client.ConfigureClonedVM(")
+	if prepare < 0 || submit < prepare || persistTask < submit || waitTask < persistTask ||
+		stage < waitTask || configure < stage {
+		t.Fatal("durable clone order must be prepare, arm/submit, persist task, wait, stage exact MoRef, configure")
+	}
+	if strings.Contains(createSrc, "cleanupStaleVMClone(") ||
+		strings.Contains(vmOpsSrc, "cleanupStaleVMClone(") {
+		t.Fatal("legacy stale-clone cleanup bypasses the durable exact-target lifecycle")
+	}
+	if got := strings.Count(createSrc, "failPodCreateForStaleVM("); got != 8 {
+		t.Fatalf("pod_create stale-clone compensation sites = %d, want 7 calls plus helper", got)
+	}
+	if got := strings.Count(vmOpsSrc, "failVMAddWithCleanup("); got != 6 {
+		t.Fatalf("vm_add stale-clone compensation sites = %d, want 5 calls plus helper", got)
+	}
+
+	addStart := strings.Index(vmOpsSrc, "func (p *Provisioner) AddVM(")
+	if addStart < 0 {
+		t.Fatal("AddVM function not found")
+	}
+	cleanupBranch := strings.Index(vmOpsSrc[addStart:], "if payload.CleanupOnly {")
+	forwardStart := strings.Index(vmOpsSrc[addStart:], "pod, err := p.db.GetPodByID")
+	if cleanupBranch < 0 || forwardStart < 0 || cleanupBranch > forwardStart {
+		t.Fatal("vm_add cleanup-only dispatch must precede all forward provisioning")
+	}
+	runCleanupStart := strings.Index(vmOpsSrc, "func (p *Provisioner) runVMAddCleanup(")
+	if runCleanupStart < 0 {
+		t.Fatal("runVMAddCleanup function not found")
+	}
+	runCleanupEnd := strings.Index(vmOpsSrc[runCleanupStart+1:], "\nfunc ")
+	if runCleanupEnd < 0 {
+		t.Fatal("could not isolate runVMAddCleanup")
+	}
+	runCleanupBody := vmOpsSrc[runCleanupStart : runCleanupStart+1+runCleanupEnd]
+	for _, forbidden := range []string{
+		"CloneVM(",
+		"executeDurableVMClone(",
+		"StartCloneVMOperation(",
+		"ConfigureClonedVM(",
+		"PowerOnVM(",
+		"CreateVMSnapshot(",
+		"ResolveVMByName(",
+	} {
+		if strings.Contains(runCleanupBody, forbidden) {
+			t.Errorf("vm_add cleanup-only execution contains forward/unsafe call %q", forbidden)
+		}
+	}
+	if !strings.Contains(runCleanupBody, "p.db.UpdatePodVMStatusFrom(") ||
+		!strings.Contains(runCleanupBody, "models.VMStatusError") {
+		t.Fatal("vm_add cleanup does not move a resourceless VM out of provisioning state")
+	}
+
+	for _, required := range []string{
+		"func (q *Queries) StageVMCloneCleanup(",
+		"'{cleanup_target}'",
+		"func (q *Queries) AdoptPodVMClone(",
+		"func (q *Queries) DisarmVMCloneCleanup(",
+		"payload - 'cleanup_target' - 'cleanup_only'",
+		"func (q *Queries) CompleteVMCloneCleanup(",
+		"vcenter_vm_id = $2\n\t\t    OR (vcenter_vm_id IS NULL AND status IN ('pending', 'cloning', 'configuring'))",
+		"func (q *Queries) MarkJobCompensationCompleted(",
+		"if !updated && !alreadyScheduled {\n\t\treturn fmt.Errorf(\"%w: job %s is not owned by %s for retry scheduling\"",
+		"return fmt.Errorf(\"%w: job %s is not owned by %s for status %s\"",
+	} {
+		if !strings.Contains(querySrc+cloneDBSrc, required) {
+			t.Errorf("database compensation lifecycle is missing %q", required)
+		}
+	}
+	if strings.Contains(querySrc, "func (q *Queries) SetPodVMVCenterReference(") {
+		t.Fatal("legacy clone-reference persistence can bypass the staged cleanup transaction")
+	}
+	for _, required := range []string{
+		"return true, newPodCreateCompensatedError(stage)",
+		"return newPodCreateCompensatedError(\"initial pod lookup\")",
+		"return &compensationRetryError{\n\t\t\terr: fmt.Errorf(\"prepare pod_create cleanup",
+		"return &manualCleanupRequiredError{\n\t\t\terr: errors.New(\"cleanup-only vm_add lacks durable completion proof",
+		"return newVMAddCompensatedError(fmt.Sprintf(\"pod entered %s\", pod.Status))",
+	} {
+		if !strings.Contains(createSrc+vmOpsSrc, required) {
+			t.Errorf("compensation terminal/retry semantics are missing %q", required)
+		}
+	}
+}
+
+func TestCreatePodDoesNotUseUnguardedVMStatusWrites(t *testing.T) {
+	root := findRepoRoot(t)
+	body, err := os.ReadFile(filepath.Join(root, "internal", "provisioner", "create.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "UpdatePodVMStatus(ctx") {
+		t.Fatal("pod create contains an unconditional VM status write that can resurrect deleted state")
+	}
+}
+
+func TestJobRecoveryUsesOwnedHeartbeatLeases(t *testing.T) {
+	root := findRepoRoot(t)
+	read := func(relPath string) string {
+		t.Helper()
+		body, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(relPath)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(body)
+	}
+
+	mainSrc := read("cmd/provision-worker/main.go")
+	querySrc := read("internal/database/queries.go")
+	createSrc := read("internal/provisioner/create.go")
+	cloneOperationSrc := read("internal/provisioner/clone_operation.go")
+	cloneDBSrc := read("internal/database/clone_operations.go")
+	vcenterInventorySrc := read("internal/vcenter/inventory_lookup.go")
+	rollbackSrc := read("internal/rollback/engine.go")
+	templateJobsSrc := read("internal/provisioner/template_jobs.go")
+
+	for _, required := range []string{
+		`workerID := workerHost + "-" + uuid.NewString()`,
+		"claimID := newJobClaimID(workerID)",
+		`return workerID + ":" + uuid.NewString()`,
+		"queries.RecoverStaleJobs(ctx, provisioner.JobLeaseDuration)",
+		"time.NewTicker(provisioner.JobLeaseRecoveryInterval)",
+		"shutdownDeadline := time.Now().Add(2 * time.Minute)",
+		"jobRuns.StopAndWait(time.Until(shutdownDeadline))",
+		"l1ValidationScheduler.WaitTimeout(time.Until(shutdownDeadline))",
+		"closeBeforeDeadline(pool, time.Until(shutdownDeadline))",
+	} {
+		if !strings.Contains(mainSrc, required) {
+			t.Errorf("worker lease wiring is missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		"AND claimed_by = $4",
+		"AND NOT ($2 = 'completed' AND COALESCE(payload->>'cleanup_only', 'false') = 'true')",
+		"func (q *Queries) RenewJobLease(",
+		"AND claimed_by = $5",
+		"claimed_at < now() - ($1 * interval '1 second')",
+		"claimed_by = $3",
+		"claimed_by = $4 AND status IN ('claimed', 'in_progress')",
+		`fields["destroyed_cleanup_targets"]`,
+		"status = 'pending'",
+		"ErrVMCloneAlreadyDestroyed",
+		"func (q *Queries) UpdateJobRollbackSteps(",
+		"SET rollback_steps = $2, claimed_at = now()",
+		"cannot update rollback steps",
+		"func (q *Queries) PrepareVMCloneOperation(",
+		"type IN ('pod_create', 'vm_add', 'template_verify', 'template_revalidate')",
+		"func (q *Queries) ArmVMCloneOperation(",
+		"func (q *Queries) AbandonUnsubmittedVMCloneOperation(",
+		"SELECT NOT (payload ? 'clone_operation')",
+		"'{clone_operation,phase}'",
+		"'{cleanup_only}'",
+		"func (q *Queries) PersistVMCloneTask(",
+		"func (q *Queries) FinishStandaloneVMCloneCleanup(",
+		"func (q *Queries) AdoptJobRollbackStep(",
+		"rollback_steps = $2",
+		"status = 'pending'",
+	} {
+		if !strings.Contains(querySrc+cloneDBSrc, required) {
+			t.Errorf("database lease ownership is missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		"context.WithCancelCause(ctx)",
+		"maintainJobLease(",
+		"persistCleanupRetry(ctx, db, job, workerID, cleanupTarget)",
+	} {
+		if !strings.Contains(createSrc, required) {
+			t.Errorf("job execution lease is missing %q", required)
+		}
+	}
+	if strings.Contains(mainSrc, "RecoverStaleJobs(ctx)") {
+		t.Fatal("worker still contains broad owner-unaware stale-job recovery")
+	}
+	if strings.Contains(mainSrc, "defer pool.Close()") {
+		t.Fatal("database pool close can bypass the bounded worker shutdown deadline")
+	}
+
+	vcenterSrc := read("internal/vcenter/client.go")
+	for _, required := range []string{
+		"context.WithTimeout(ctx, cloneTaskOperationalTimeout)",
+		"context.WithTimeout(overallCtx, cloneTaskWaitSlice)",
+		"task.WaitForResult(waitCtx, nil)",
+		"return task.Reference().Value, nil",
+		"task = object.NewTask(c.client.Client, ref)",
+		"already exists without immutable ownership proof",
+	} {
+		if !strings.Contains(vcenterSrc, required) {
+			t.Errorf("clone task handoff is missing %q", required)
+		}
+	}
+	if strings.Contains(vcenterSrc, `c.withRetry(ctx, "clone VM"`) {
+		t.Fatal("CloneVM can retry the whole clone after a remote task was issued")
+	}
+	if strings.Contains(vcenterSrc, "func (c *Client) CloneVM(") ||
+		strings.Contains(vcenterSrc, "func (c *Client) StartCloneVM(") {
+		t.Fatal("vCenter still exposes a clone path that bypasses durable operation arming")
+	}
+	if strings.Contains(templateJobsSrc, "p.vc.CloneVM(") ||
+		!strings.Contains(templateJobsSrc, "executeDurableVMClone(") ||
+		!strings.Contains(templateJobsSrc, "FinishStandaloneVMCloneCleanup(") {
+		t.Fatal("template smoke clones bypass durable operation identity or exact cleanup")
+	}
+	if !strings.Contains(templateJobsSrc, `smokeName := fmt.Sprintf("smoke-%s-%s"`) {
+		t.Fatal("smoke clone target name is not stable across retries")
+	}
+	verifyStart := strings.Index(templateJobsSrc, "func (p *Provisioner) VerifyTemplate(")
+	if verifyStart < 0 {
+		t.Fatal("VerifyTemplate not found")
+	}
+	verifyBody := templateJobsSrc[verifyStart:]
+	cleanupGate := strings.Index(verifyBody, "if jobPayloadCleanupOnly(job)")
+	templateLookup := strings.Index(verifyBody, "p.db.GetTemplateByID(")
+	stateGate := strings.Index(verifyBody, "if tmpl.TemplateState != models.TemplateStateVerifying")
+	if cleanupGate < 0 || templateLookup < 0 || stateGate < 0 ||
+		cleanupGate > templateLookup || cleanupGate > stateGate {
+		t.Fatal("template_verify lookup or lifecycle state gate blocks cleanup-only clone recovery")
+	}
+	revalidateStart := strings.Index(templateJobsSrc, "func (p *Provisioner) RevalidateL1Template(")
+	if revalidateStart < 0 {
+		t.Fatal("RevalidateL1Template not found")
+	}
+	revalidateBody := templateJobsSrc[revalidateStart:]
+	if cleanup := strings.Index(revalidateBody, "if jobPayloadCleanupOnly(job)"); cleanup < 0 ||
+		cleanup > strings.Index(revalidateBody, "return revalidateL1TemplateJob(") {
+		t.Fatal("template_revalidate mutable lookups block cleanup-only clone recovery")
+	}
+	arm := strings.Index(vcenterSrc, "if err := arm(ctx); err != nil")
+	remoteSubmit := strings.Index(vcenterSrc, "template.Clone(ctx, folder, params.VMName, cloneSpec)")
+	if arm < 0 || remoteSubmit < 0 || arm > remoteSubmit {
+		t.Fatal("durable cleanup intent must be armed immediately before CloneVM_Task submission")
+	}
+	for _, required := range []string{
+		"CloneOperationIDKey",
+		"CloneOperationSourceKey",
+		"CloneOperationPodVMKey",
+		"client.StartCloneVMOperation(",
+		"store.PersistVMCloneTask(",
+		"client.WaitCloneVMTask(",
+		"client.FindVMByCloneOperation(",
+		"store.StageVMCloneCleanup(",
+		"client.ConfigureClonedVM(",
+		"cloneSubmissionReconcileDeadline",
+	} {
+		if !strings.Contains(vcenterSrc+cloneOperationSrc, required) {
+			t.Errorf("durable clone recovery is missing %q", required)
+		}
+	}
+	if !strings.Contains(vcenterInventorySrc, "isManagedObjectNotFound(err)") ||
+		!strings.Contains(vcenterInventorySrc, "continue") {
+		t.Fatal("clone reconciliation no longer tolerates per-child inventory deletion races")
+	}
+	if !strings.Contains(rollbackSrc, "handoff.HandoffRollbackStep(") {
+		t.Fatal("rollback persistence failure no longer hands its exact receipt to the successor")
+	}
+	if !strings.Contains(rollbackSrc, "context.WithTimeout(context.WithoutCancel(ctx), rollbackFenceTimeout)") ||
+		!strings.Contains(rollbackSrc, "e.persister.SaveRollbackSteps(fenceCtx, e.jobID, remaining)") {
+		t.Fatal("rollback destructive undo is missing its active ownership fence")
+	}
+	if strings.Contains(rollbackSrc, "undoErr = undoFn(") {
+		t.Fatal("rollback Record can still destructively undo after ambiguous persistence")
+	}
+	if !strings.Contains(rollbackSrc, "checkpoint rollback %s after undo") {
+		t.Fatal("successful rollback steps are not checkpointed before continuing")
+	}
+	vmOpsSrc := read("internal/provisioner/vm_ops.go")
+	if strings.Contains(querySrc, "func (q *Queries) StageVMCloneDestructionHandoff(") ||
+		strings.Contains(querySrc, "func (q *Queries) RecordDestroyedVMCloneHandoff(") ||
+		strings.Contains(vmOpsSrc, "destroyer.DestroyVM(") {
+		t.Fatal("a lease-lost clone owner can still destroy behind its successor")
 	}
 }

@@ -62,6 +62,10 @@ func (h *Handler) GetBlueprint(w http.ResponseWriter, r *http.Request) {
 
 // DeployBlueprint creates a new pod from a blueprint definition.
 func (h *Handler) DeployBlueprint(w http.ResponseWriter, r *http.Request) {
+	if h.rejectProvisioning(w, r, provisioningRouteBlueprintDeploy) {
+		return
+	}
+
 	bpID, err := uuid.Parse(chi.URLParam(r, "blueprintID"))
 	if err != nil {
 		respondError(w, r, http.StatusBadRequest, "invalid blueprint id")

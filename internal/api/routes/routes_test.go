@@ -207,6 +207,36 @@ func TestStudentGuideRoutesAreRegistered(t *testing.T) {
 	}
 }
 
+func TestProvisioningStatusRouteIsAuthenticated(t *testing.T) {
+	found := walkRoutes(t)
+	if !found["GET /api/v1/provisioning/status"] {
+		t.Fatal("GET /api/v1/provisioning/status is not registered")
+	}
+
+	provider := auth.NewTestProvider([]byte(testJWTSecret))
+	h := handlers.NewHandler(nil, nil, nil, slog.Default(), nil)
+	router := Setup(h, provider, nil, []string{"*"})
+
+	t.Run("unauthenticated", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/provisioning/status", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", rec.Code)
+		}
+	})
+
+	t.Run("authenticated student", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/provisioning/status", nil)
+		req.AddCookie(makeSessionCookie(t, models.RoleStudent))
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+		}
+	})
+}
+
 func TestStudentGuideRequiresAuthenticationAndPreservesWikiRBAC(t *testing.T) {
 	provider := auth.NewTestProvider([]byte(testJWTSecret))
 	h := handlers.NewHandler(nil, nil, nil, slog.Default(), nil)

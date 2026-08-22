@@ -21,6 +21,142 @@ If you need an audit trail, ask a platform admin.
 
 ---
 
+## "Provisioning is temporarily unavailable for maintenance"
+
+Crucible can intentionally pause **new** pod and VM provisioning while
+operators perform infrastructure maintenance. During that window, these
+requests return `503 Service Unavailable`:
+
+- `POST /api/v1/pods`
+- `POST /api/v1/blueprints/{blueprintID}/deploy`
+- `POST /api/v1/pods/{podID}/vms`
+
+The response uses the normal JSON error envelope and includes
+`Retry-After: 300`:
+
+```json
+{
+  "error": "Provisioning is temporarily unavailable for maintenance.",
+  "request_id": "..."
+}
+```
+
+This is a platform-wide maintenance state, not a problem with your template,
+blueprint, quota, or request body. Wait for the maintenance window to end
+before retrying. Deleting pods or VMs, power operations, and platform cleanup
+remain available so existing environments can be made safe. The worker also
+continues compensation-only retries for cleanup that began before maintenance;
+those retries cannot resume pod or VM creation.
+
+Operators can distinguish ordinary queued work from recovery work in the job
+payload. Pod/VM creation, template staging/generalization/verification/health,
+and image-import jobs are withheld while provisioning claims are disabled
+unless they carry `cleanup_only: true`. Before submitting a clone, the worker
+persists a per-attempt operation UUID, the selected host and pool identities,
+and embeds those identities with the source template and pod VM identity (or
+job/template scope for a smoke clone) in vCenter `extraConfig`. The returned
+task MoRef is persisted before waiting. A
+replacement worker resumes that exact task, or reconciles a lost SOAP response
+by the complete marker and target name; it never submits a second clone or
+adopts a same-name VM without matching ownership proof. The exact resulting VM
+MoRef is then staged before any reconfiguration. Cleanup never resolves a VM by
+display name and never resumes forward configuration, power-on, or snapshots.
+
+Clone task waits have a 15-minute operational deadline. An armed submission
+with no task reference and no discoverable marked VM remains cleanup-only for
+30 minutes, then surfaces `manual_cleanup_required` for operator resolution
+rather than retrying or cloning indefinitely. Pod creation keeps exact clone
+cleanup intent armed until its rollback record is durable and the same claim
+finishes adoption.
+Failed cleanup remains pending with capped backoff independently of the
+original provisioning retry limit. Successful compensation records the parent
+job as failed with `compensated: true`; ambiguous ownership records
+`manual_cleanup_required: true` and requires operator resolution rather than
+deleting or adopting an uncertain VM by name.
+
+A transient database failure while rescheduling compensation does not strand
+the job on a live worker. The worker retries the durable pending-state write
+with bounded backoff until it succeeds. Each worker process owns jobs with a
+unique process identity plus a per-claim fencing token and refreshes a heartbeat
+lease. Startup and periodic recovery reset only expired claims, never fresh
+work owned by another replica; ownership loss cancels execution and blocks
+stale finalization. On shutdown, unfinished claims become recoverable only
+after their conservative lease expires. If ownership changes while a completed
+infrastructure step is being recorded, the stale worker does not undo it behind
+the successor. Any ambiguous persistence failure uses the same handoff path.
+Before every destructive rollback step, the worker re-persists the receipt under
+its active claim and refreshes the lease; failure to prove ownership stops the
+rollback. The handoff appends the exact receipt, fences the current generation
+into cleanup-only work, and leaves destructive compensation to the next owner.
+Worker shutdown, including scheduler and database-pool closure, is bounded at
+two minutes, with 150 seconds of pod termination grace for that handoff.
+
+### "No eligible allowlisted vCenter placement"
+
+This message is a safety block, not a transient DRS hint. `VCENTER_HOSTS` is the
+only host allowlist for both VM placement and standard-vSwitch portgroup
+changes. A candidate must also be connected, outside maintenance mode, in the
+configured/source-compatible resource pool, able to access the datastore, have
+the required standard portgroup, and satisfy the VM's capacity requirements.
+PF-03 and PF-11 use this same resolver, so a failed preflight cannot be
+overridden by cluster-wide availability elsewhere.
+
+Do not add another host or broaden `VCENTER_HOSTS` merely to clear the error.
+Check the named host's connection and maintenance state, resource-pool
+membership, datastore mount, standard portgroup, and available capacity. During
+an isolated-host canary, keep API admission and worker provisioning claims off,
+keep worker replicas at zero until the approved step, and keep lifecycle,
+runner, template-health, L1, and other destructive synthetics/schedulers off.
+
+Host pinning controls creation but cannot prevent a later DRS or manual vMotion.
+A vCenter administrator must install and verify a VM-host affinity/must-run rule
+or equivalent host exclusion before the canary. For the ESXi2 containment
+canary, `VCENTER_HOSTS` must contain ESXi1 only, the resource pool must be the
+compatible Intel pool, and the external rule must keep Crucible and temporary
+VMs off ESXi2. Leave the pending production pod/job untouched until a human
+approves the canary.
+
+### "Durable port group ownership cannot be proven"
+
+Destroy never guesses which host portgroups a pod owns. A missing, malformed,
+legacy receipt without immutable host identities, or receipt naming a host
+outside the current `VCENTER_HOSTS` allowlist makes the destroy job report
+`manual_cleanup_required`. The pod remains `destroy_failed`, and its
+VLAN/interface allocation remains reserved so the VLAN cannot be reused while a
+portgroup may still exist.
+
+Do not widen `VCENTER_HOSTS` or infer ownership from OPNsense VLAN state to clear
+this condition. An operator must inspect the historical job and vCenter state,
+then either backfill an exact per-host receipt with reliable ownership evidence
+or complete the cleanup manually. A transient `RemovePortGroup` failure follows
+the same resource-retention rule but remains retryable.
+
+Authenticated clients can check the stable read-only contract at
+`GET /api/v1/provisioning/status`:
+
+```json
+{
+  "enabled": false,
+  "message": "Provisioning is temporarily unavailable for maintenance."
+}
+```
+
+When provisioning is available, the same endpoint returns:
+
+```json
+{
+  "enabled": true,
+  "message": "Provisioning is available."
+}
+```
+
+The API synthetic monitor expects this state through
+`SYNTHETIC_PROVISIONING_EXPECTED_ENABLED`. While disabled, its normal check set
+is read-only; the separately scheduled synthetic janitor may still delete old
+synthetic pods because cleanup remains intentionally available.
+
+---
+
 ## "My workflow always passes — even on a fresh, untouched pod"
 
 This is the worst kind of bug because students think they've succeeded.

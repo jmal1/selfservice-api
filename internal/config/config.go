@@ -10,14 +10,23 @@ import (
 
 // Config holds all application configuration.
 type Config struct {
-	Server      ServerConfig
-	Database    DatabaseConfig
-	OIDC        OIDCConfig
-	NATS        NATSConfig
-	Vault       VaultConfig
-	VCenter     VCenterConfig
-	OPNsense    OPNsenseConfig
-	ObjectStore ObjectStoreConfig
+	Server       ServerConfig
+	Database     DatabaseConfig
+	OIDC         OIDCConfig
+	NATS         NATSConfig
+	Vault        VaultConfig
+	VCenter      VCenterConfig
+	OPNsense     OPNsenseConfig
+	ObjectStore  ObjectStoreConfig
+	Provisioning ProvisioningConfig
+}
+
+// ProvisioningConfig holds the two independent maintenance controls. Enabled
+// governs API admission; WorkerClaimsEnabled governs whether workers may claim
+// pod_create and vm_add jobs. Both default to true for backward compatibility.
+type ProvisioningConfig struct {
+	Enabled             bool
+	WorkerClaimsEnabled bool
 }
 
 // ObjectStoreConfig holds the S3/MinIO settings used to stage browser-uploaded
@@ -128,6 +137,22 @@ type OPNsenseConfig struct {
 // Load reads configuration from environment variables.
 // In production, these are injected by Vault sidecar or K8s secrets.
 func Load() (*Config, error) {
+	provisioningEnabled, err := getEnvBoolStrict("PROVISIONING_ENABLED", true)
+	if err != nil {
+		return nil, err
+	}
+	workerClaimsEnabled, err := getEnvBoolStrict("WORKER_PROVISIONING_CLAIMS_ENABLED", true)
+	if err != nil {
+		return nil, err
+	}
+	vcenterHosts, err := getEnvListStrict(
+		"VCENTER_HOSTS",
+		"esxi1.lab.jmal.io,esxi2.lab.jmal.io,nuc1.lab.jmal.io,nuc2.lab.jmal.io,nuc3.lab.jmal.io",
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
 		Server: ServerConfig{
 			Host:           getEnv("SERVER_HOST", "0.0.0.0"),
@@ -170,7 +195,7 @@ func Load() (*Config, error) {
 			VMFolder:             getEnv("VCENTER_VM_FOLDER", "Student-VMs"),
 			TemplatesFolder:      getEnv("VCENTER_TEMPLATES_FOLDER", "/JMAL-Datacenter/vm/Templates"),
 			ResourcePools:        splitEnv("VCENTER_RESOURCE_POOLS", "/JMAL-Datacenter/host/Intel-Cluster/Resources/Student-VMs,/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs"),
-			Hosts:                splitEnv("VCENTER_HOSTS", "esxi1.lab.jmal.io,esxi2.lab.jmal.io,nuc1.lab.jmal.io,nuc2.lab.jmal.io,nuc3.lab.jmal.io"),
+			Hosts:                vcenterHosts,
 			Insecure:             getEnvBool("VCENTER_INSECURE", true),
 			HealthPushgatewayURL: getEnv("VCENTER_HEALTH_PUSHGATEWAY_URL", ""),
 			HealthCheckInterval:  getEnvDuration("VCENTER_HEALTH_INTERVAL", 5*time.Minute),
@@ -190,6 +215,10 @@ func Load() (*Config, error) {
 			Bucket:    getEnv("OBJECTSTORE_BUCKET", "isos"),
 			Prefix:    getEnv("OBJECTSTORE_PREFIX", "crucible"),
 			UseSSL:    getEnvBool("OBJECTSTORE_USE_SSL", true),
+		},
+		Provisioning: ProvisioningConfig{
+			Enabled:             provisioningEnabled,
+			WorkerClaimsEnabled: workerClaimsEnabled,
 		},
 	}
 
@@ -222,6 +251,18 @@ func getEnvBool(key string, fallback bool) bool {
 	return fallback
 }
 
+func getEnvBoolStrict(key string, fallback bool) (bool, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(v) == "" {
+		return fallback, nil
+	}
+	b, err := strconv.ParseBool(strings.TrimSpace(v))
+	if err != nil {
+		return false, fmt.Errorf("invalid %s=%q: must be a boolean: %w", key, v, err)
+	}
+	return b, nil
+}
+
 func getEnvDuration(key string, fallback time.Duration) time.Duration {
 	if v := os.Getenv(key); v != "" {
 		d, err := time.ParseDuration(v)
@@ -246,4 +287,31 @@ func splitEnv(key, fallback string) []string {
 		}
 	}
 	return result
+}
+
+func getEnvListStrict(key, fallback string) ([]string, error) {
+	raw, ok := os.LookupEnv(key)
+	if !ok {
+		raw = fallback
+	}
+	if strings.TrimSpace(raw) == "" {
+		return nil, fmt.Errorf("%s must contain at least one value", key)
+	}
+
+	parts := strings.Split(raw, ",")
+	result := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for i, part := range parts {
+		value := strings.TrimSpace(part)
+		if value == "" {
+			return nil, fmt.Errorf("%s contains an empty value at position %d", key, i+1)
+		}
+		canonical := strings.ToLower(value)
+		if _, exists := seen[canonical]; exists {
+			return nil, fmt.Errorf("%s contains duplicate value %q", key, value)
+		}
+		seen[canonical] = struct{}{}
+		result = append(result, value)
+	}
+	return result, nil
 }

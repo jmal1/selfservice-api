@@ -753,3 +753,179 @@ Do not deploy content-filter changes, scale workers, or restore destructive
 synthetics while an infrastructure containment hold is active. Read-only policy
 inspection through `content_filter_policy` is the only non-destructive
 synthetic defined for this feature.
+
+---
+
+## 17. Provisioning maintenance operator contract
+
+Crucible has two independent, strict maintenance controls:
+
+- `PROVISIONING_ENABLED` controls API admission for new user provisioning.
+- `WORKER_PROVISIONING_CLAIMS_ENABLED` controls whether workers claim
+  clone-, create-, staging-, and import-capable jobs: `pod_create`, `vm_add`,
+  `template_provision`, `template_generalize`, `template_verify`,
+  `template_revalidate`, `template_health_confirm`, and `image_import`.
+
+Both default to `true` for backward compatibility. If either variable is set,
+it must parse as a Go boolean; an invalid value fails process startup rather
+than silently enabling provisioning. Helm exposes these as
+`provisioning.enabled` and `provisioning.workerClaimsEnabled`.
+
+When API admission is disabled, the first instruction in each of these
+handlers rejects the request before parsing, allocation, or database access:
+
+- `POST /api/v1/pods`
+- `POST /api/v1/blueprints/{blueprintID}/deploy`
+- `POST /api/v1/pods/{podID}/vms`
+
+The response is `503 Service Unavailable`, includes `Retry-After: 300`, and
+uses the normal error envelope:
+
+```json
+{
+  "error": "Provisioning is temporarily unavailable for maintenance.",
+  "request_id": "..."
+}
+```
+
+Delete/destroy, delete-VM, power, and cleanup paths are intentionally not
+gated. When worker provisioning claims are disabled, ordinary clone-, create-,
+template-staging/validation, and image-import jobs are excluded inside the
+atomic claim query and remain pending; destroy jobs and any withheld type marked
+`cleanup_only` remain claimable.
+
+`VCENTER_HOSTS` is the single canonical allowlist for both VM placement and
+standard-vSwitch portgroup mutation. Worker startup resolves every configured
+entry against the configured datacenter and fails if the list is empty, has
+duplicates, is missing from inventory, is ambiguous, or resolves without a
+complete immutable host/compute-resource identity. The resolved host names,
+inventory paths, and MoRefs are logged and frozen for the process lifetime.
+There is no second placement-host setting.
+
+Every clone, blank-VM create, and OVA import carries an explicit allowed
+`HostSystem` plus a compatible configured resource pool. The shared placement
+resolver requires the destination host to be connected, outside maintenance
+mode, in the selected pool/source compute resource, able to access the target
+datastore, and equipped with the required standard portgroup and capacity. It
+does not fall back to `DefaultResourcePool` or unpinned DRS. Template staging,
+publish/L1 smoke clones, deep template-health clones, pod creation, and add-VM
+all use the same resolver. An existing, resumed, or recovered VM on a host
+outside the current allowlist is never reused, powered on, reconfigured, or
+destroyed automatically.
+
+Standard portgroup creation records one durable per-host receipt before the
+first vCenter mutation. Each entry contains immutable host identity and whether
+the portgroup already existed. A partial failure removes only portgroups newly
+created by that receipt, in reverse order. Rollback and destroy never infer
+ownership from OPNsense VLAN state and never delete preexisting portgroups. A
+missing, malformed, legacy receipt without immutable host identities, or
+historical receipt naming a host outside the current allowlist fails closed for
+manual escalation. The destroy job reports `manual_cleanup_required`, the pod
+remains `destroy_failed`, and its VLAN/interface allocation remains reserved;
+operators must inspect or backfill exact ownership rather than broaden the
+allowlist. All AddPortGroup/RemovePortGroup sections, including compensation,
+hold the stable PostgreSQL session advisory lock on one acquired connection; no
+database transaction is held across vCenter calls. A transient deletion failure
+also leaves the pod `destroy_failed` and retains its VLAN/interface allocation
+for a safe retry.
+
+Compensation intent is durable before clone submission. The fenced job first
+persists a per-attempt operation UUID, pod id, pod VM id, target name, source
+template identity, selected host name/MoRef, and resource-pool MoRef. Immediately
+before `CloneVM_Task`, it atomically arms `cleanup_only` and embeds the operation
+UUID, source identity, pod VM id, host MoRef, and pool MoRef in the clone's
+vCenter `extraConfig`. If vCenter accepts the request but the SOAP response is
+lost, recovery searches the target folder by that complete marker; a same-name
+VM without the marker is ambiguous and is never adopted or deleted.
+Once vCenter returns a task MoRef, the worker persists it before waiting.
+Successors resume that exact task and never submit a second clone for an armed
+operation. Template verification and revalidation smoke clones use this same
+protocol; their job and template ids provide the immutable operation scope, and
+an interrupted smoke check is cleanup-only before it can be claimed again.
+
+Clone task waits have a 15-minute operational deadline and honor lease loss.
+Task or marker recovery stages the exact VM MoRef before any mutable
+reconfiguration. Cleanup never resolves a VM by display name and never performs
+forward configuration, power-on, or snapshots. An armed submission with neither
+a task nor a marked VM remains cleanup-only while reconciliation is credible;
+after 30 minutes it becomes `manual_cleanup_required` rather than retrying or
+submitting a duplicate indefinitely. For pod creation, rollback identity is
+persisted before clone adoption and the cleanup marker plus operation identity
+are disarmed only by the same fenced claim afterward.
+If ownership is lost or cleanup fails, the parent job remains `cleanup_only`
+and retries with capped backoff independently of its original provisioning
+retry budget. It cannot resume cloning, power-on, or snapshots. A cleanup-only
+`pod_create` may move a `provisioning` pod to `error` only when an exact staged
+target belongs to a VM in the job; marker-only, mismatched, active, pending, and
+unknown states fail closed.
+
+If the database write that returns cleanup work from `in_progress` to `pending`
+fails, the live worker does not abandon or terminalize it. It retries that
+idempotent write in-process with a 10-second per-write deadline and exponential
+backoff from 1 to 30 seconds until persistence succeeds or the worker shuts
+down.
+
+Every worker process uses a unique `hostname-UUID` identity and every claim adds
+a second UUID fencing token. Active jobs renew `claimed_at` every 30 seconds and
+use a conservative 15-minute lease.
+Startup and the one-minute recovery pass reset only claims expired according to
+the PostgreSQL clock; they never broadly reset another replica's fresh work.
+Loss of ownership or lease freshness cancels execution. In-progress, retry,
+terminal-status, cleanup-target staging, and clone-adoption writes all verify
+the same claim owner, so a superseded worker cannot finalize or attach a clone.
+If ownership is lost while recording a completed infrastructure step, the old
+worker does not run destructive undo. Any ambiguous rollback-receipt persistence
+uses the same non-destructive handoff path. Before every rollback undo, the
+worker re-persists the receipt under its current claim, refreshing the lease and
+failing closed if ownership cannot be proven. The handoff idempotently appends
+the exact receipt, fences the current generation into `cleanup_only`, and lets
+the successor perform rollback. Worker shutdown, including scheduler and
+database-pool closure, waits at most two minutes; the chart grants 150 seconds
+of termination grace. Any unfinished claim then becomes recoverable only after
+its lease expires.
+
+Completed compensation finalizes the parent job as `failed` with
+`compensated: true` and publishes a `compensated` event; it is never reported
+as successful provisioning. Missing or ambiguous immutable ownership proof
+finalizes with `manual_cleanup_required: true` instead of risking deletion of
+an unrelated VM. No production worker scale-up is implied by this contract.
+
+### Host-isolated canary prerequisite
+
+During ESXi host containment, production must keep API admission disabled,
+worker provisioning claims disabled, worker replicas at zero, destructive
+synthetics disabled, and all clone-capable schedulers disabled until an operator
+opens the canary. The canary configuration must set `VCENTER_HOSTS` to
+`esxi1.lab.jmal.io` only and `VCENTER_RESOURCE_POOLS` to the compatible Intel
+pool only. The pool restriction is defense in depth, not the host-isolation
+boundary.
+
+Explicit placement controls initial creation only. It cannot stop DRS or an
+operator from moving a VM later. Before any canary worker is started, a vCenter
+administrator must create and verify an external DRS VM-host affinity/must-run
+rule (or equivalent host exclusion) that keeps all Crucible-created and
+temporary VMs off ESXi2, and must verify that no automated vMotion policy can
+move them there. Do not claim code-only isolation. Do not widen `VCENTER_HOSTS`
+to work around a placement diagnostic. Keep the pending production pod/job
+untouched until the canary is explicitly approved.
+
+Authenticated clients and the non-destructive API synthetic use
+`GET /api/v1/provisioning/status`. Its complete stable response contract is:
+
+```json
+{"enabled": false, "message": "Provisioning is temporarily unavailable for maintenance."}
+```
+
+or:
+
+```json
+{"enabled": true, "message": "Provisioning is available."}
+```
+
+`SYNTHETIC_PROVISIONING_EXPECTED_ENABLED` declares which state the monitor
+expects. When it is `false`, the main synthetic registry runs only read-only
+checks; POST-based RBAC probes and pod lifecycle creation are omitted. The
+separate janitor remains permitted because it only exercises the preserved
+delete/cleanup path. Admission observability is published through
+`crucible_provisioning_admission_enabled` and the bounded-route counter
+`crucible_provisioning_admission_rejected_total{route=...}`.

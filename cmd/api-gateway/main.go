@@ -79,14 +79,22 @@ func main() {
 	var vcClient handlers.VCenterConsole
 	if cfg.VCenter.URL != "" && cfg.VCenter.User != "" {
 		vc := vcenter.New(vcenter.Config{
-			URL:        cfg.VCenter.URL,
-			User:       cfg.VCenter.User,
-			Password:   cfg.VCenter.Password,
-			Datacenter: cfg.VCenter.Datacenter,
-			Insecure:   cfg.VCenter.Insecure,
+			URL:            cfg.VCenter.URL,
+			User:           cfg.VCenter.User,
+			Password:       cfg.VCenter.Password,
+			Datacenter:     cfg.VCenter.Datacenter,
+			Datastore:      cfg.VCenter.Datastore,
+			VMFolder:       cfg.VCenter.VMFolder,
+			TemplateFolder: cfg.VCenter.TemplatesFolder,
+			ResourcePools:  cfg.VCenter.ResourcePools,
+			Hosts:          cfg.VCenter.Hosts,
+			Insecure:       cfg.VCenter.Insecure,
 		}, logger)
 		if err := vc.Connect(ctx); err != nil {
 			logger.Warn("vCenter connection failed — console access disabled", "error", err)
+		} else if _, err := vc.ResolveProvisioningHosts(ctx); err != nil {
+			logger.Warn("VCENTER_HOSTS failed strict inventory resolution — console and preflight disabled", "error", err)
+			vc.Disconnect(ctx)
 		} else {
 			vcClient = vc
 			logger.Info("vCenter connected for console access")
@@ -95,6 +103,15 @@ func main() {
 
 	// Create handlers and router
 	handler := handlers.NewHandler(queries, natsClient, vcClient, logger, cfg.Server.AllowedOrigins)
+	admissionMetrics := handlers.NewProvisioningAdmissionMetrics(
+		os.Getenv("PROVISIONING_PUSHGATEWAY_URL"),
+		os.Getenv("PROVISIONING_PUSHGATEWAY_JOB"),
+		map[string]string{"layer": "api"},
+		cfg.Provisioning.Enabled,
+	)
+	handler.WithProvisioningAdmission(cfg.Provisioning.Enabled, admissionMetrics)
+	go admissionMetrics.RunPusher(ctx, 30*time.Second, logger)
+	logger.Info("provisioning admission configured", "enabled", cfg.Provisioning.Enabled)
 	if vc, ok := vcClient.(*vcenter.Client); ok && vc != nil && cfg.VCenter.TemplatesFolder != "" {
 		handler.WithVCenterFolders(vc, cfg.VCenter.TemplatesFolder)
 		logger.Info("vCenter folder enumeration enabled", "folder", cfg.VCenter.TemplatesFolder)

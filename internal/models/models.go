@@ -503,6 +503,8 @@ const (
 	PodStatusDestroyFailed = "destroy_failed"
 	PodStatusDestroyed     = "destroyed"
 	PodStatusError         = "error"
+
+	PodErrorManualCleanupRequiredPrefix = "manual_cleanup_required:"
 )
 
 // VM status constants.

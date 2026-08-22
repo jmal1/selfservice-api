@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -44,6 +45,9 @@ var ErrImageUploadStale = errors.New("image upload is not in the expected state"
 
 var ErrTemplateNotFound = errors.New("template not found")
 var ErrBlueprintNotFound = errors.New("blueprint not found")
+var ErrUnsafePodCreateCleanupState = errors.New("pod state is unsafe for pod-create cleanup")
+var ErrJobLeaseLost = errors.New("job lease ownership lost")
+var ErrVMCloneAlreadyDestroyed = errors.New("exact VM clone was already destroyed")
 
 // TemplatePinOrderClause is the canonical ordering for template lists (migration 000030).
 // Pinned items appear first (ordered by pin_order, then pinned_at), then unpinned items (by name).
@@ -923,27 +927,59 @@ func (q *Queries) CreateTemplateRevalidateJobIfAbsent(
 	return &job, true, nil
 }
 
+const claimJobSQL = `
+	UPDATE jobs SET
+		status = 'claimed',
+		claimed_by = $1,
+		claimed_at = now()
+	WHERE id = (
+		SELECT id FROM jobs
+		WHERE status = 'pending'
+		  AND (
+		    $2
+		    OR type NOT IN (
+		      'pod_create',
+		      'vm_add',
+		      'template_provision',
+		      'template_generalize',
+		      'template_verify',
+		      'template_revalidate',
+		      'template_health_confirm',
+		      'image_import'
+		    )
+		    OR (
+		      type IN (
+		        'pod_create',
+		        'vm_add',
+		        'template_provision',
+		        'template_generalize',
+		        'template_verify',
+		        'template_revalidate',
+		        'template_health_confirm',
+		        'image_import'
+		      )
+		      AND payload->>'cleanup_only' = 'true'
+		    )
+		  )
+		  AND (next_attempt_at IS NULL OR next_attempt_at <= now())
+		ORDER BY created_at ASC
+		FOR UPDATE SKIP LOCKED
+		LIMIT 1
+	)
+	RETURNING id, type, payload, status, claimed_by, claimed_at,
+	          retry_count, max_retries, next_attempt_at, rollback_steps, created_at
+`
+
 // ClaimJob atomically claims the next pending job for a worker.
 // Jobs whose next_attempt_at is in the future are skipped (they are
-// sleeping between retry attempts).
-func (q *Queries) ClaimJob(ctx context.Context, workerID string) (*models.Job, error) {
+// sleeping between retry attempts). When provisioning claims are disabled,
+// ordinary VM-creation, template-staging/validation, and image-import jobs are
+// excluded inside the selecting transaction and remain pending. Any withheld
+// type carrying cleanup_only=true is still claimable, as are cleanup and other
+// non-provisioning job types.
+func (q *Queries) ClaimJob(ctx context.Context, workerID string, provisioningClaimsEnabled bool) (*models.Job, error) {
 	var j models.Job
-	err := q.pool.QueryRow(ctx, `
-		UPDATE jobs SET
-			status = 'claimed',
-			claimed_by = $1,
-			claimed_at = now()
-		WHERE id = (
-			SELECT id FROM jobs
-			WHERE status = 'pending'
-			  AND (next_attempt_at IS NULL OR next_attempt_at <= now())
-			ORDER BY created_at ASC
-			FOR UPDATE SKIP LOCKED
-			LIMIT 1
-		)
-		RETURNING id, type, payload, status, claimed_by, claimed_at,
-		          retry_count, max_retries, next_attempt_at, rollback_steps, created_at
-	`, workerID).Scan(
+	err := q.pool.QueryRow(ctx, claimJobSQL, workerID, provisioningClaimsEnabled).Scan(
 		&j.ID, &j.Type, &j.Payload, &j.Status, &j.ClaimedBy, &j.ClaimedAt,
 		&j.RetryCount, &j.MaxRetries, &j.NextAttemptAt, &j.RollbackSteps, &j.CreatedAt,
 	)
@@ -953,32 +989,180 @@ func (q *Queries) ClaimJob(ctx context.Context, workerID string) (*models.Job, e
 	return &j, err
 }
 
-// UpdateJobStatus updates a job's status and optional result.
-func (q *Queries) UpdateJobStatus(ctx context.Context, id uuid.UUID, status string, result []byte) error {
-	_, err := q.pool.Exec(ctx, `
+// UpdateJobStatus updates a job only while workerID still owns its active lease.
+func (q *Queries) UpdateJobStatus(
+	ctx context.Context,
+	id uuid.UUID,
+	workerID string,
+	status string,
+	result []byte,
+) error {
+	tag, err := q.pool.Exec(ctx, `
 		UPDATE jobs SET status = $2, result = $3,
 			started_at = CASE WHEN $2 = 'in_progress' AND started_at IS NULL THEN now() ELSE started_at END,
-			completed_at = CASE WHEN $2 IN ('completed', 'failed', 'rollback') THEN now() ELSE completed_at END
+			completed_at = CASE WHEN $2 IN ('completed', 'failed', 'rollback') THEN now() ELSE completed_at END,
+			claimed_at = CASE WHEN $2 = 'in_progress' THEN now() ELSE claimed_at END
 		WHERE id = $1
-	`, id, status, result)
-	return err
+		  AND claimed_by = $4
+		  AND NOT ($2 = 'completed' AND COALESCE(payload->>'cleanup_only', 'false') = 'true')
+		  AND (
+		    ($2 = 'in_progress' AND status = 'claimed')
+		    OR ($2 IN ('completed', 'failed', 'rollback') AND status = 'in_progress')
+		  )
+	`, id, status, result, workerID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("%w: job %s is not owned by %s for status %s", ErrJobLeaseLost, id, workerID, status)
+	}
+	return nil
 }
 
-// UpdateJobRollbackSteps updates the rollback steps for a job.
-func (q *Queries) UpdateJobRollbackSteps(ctx context.Context, id uuid.UUID, steps []byte) error {
-	_, err := q.pool.Exec(ctx, `UPDATE jobs SET rollback_steps = $2 WHERE id = $1`, id, steps)
-	return err
+// RenewJobLease refreshes claimed_at only while workerID still owns an active
+// claimed/in-progress job. A false result means the worker must cancel execution.
+func (q *Queries) RenewJobLease(ctx context.Context, id uuid.UUID, workerID string) (bool, error) {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE jobs
+		SET claimed_at = now()
+		WHERE id = $1
+		  AND claimed_by = $2
+		  AND status IN ('claimed', 'in_progress')
+	`, id, workerID)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
-// RetryJob resets a failed job back to pending and schedules it for a
-// future attempt.  retry_count is incremented; claimed_by, claimed_at,
-// started_at, and completed_at are cleared; next_attempt_at is set to
-// nextAt so ClaimJob ignores the row until the delay expires.
+// UpdateJobRollbackSteps updates rollback state only for the active claim
+// generation, preventing a recovered predecessor from overwriting cleanup data.
+func (q *Queries) UpdateJobRollbackSteps(ctx context.Context, id uuid.UUID, workerID string, steps []byte) error {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE jobs
+		SET rollback_steps = $2, claimed_at = now()
+		WHERE id = $1
+		  AND claimed_by = $3
+		  AND status IN ('claimed', 'in_progress')
+	`, id, steps, workerID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("%w: job %s cannot update rollback steps for %s", ErrJobLeaseLost, id, workerID)
+	}
+	return nil
+}
+
+const markPodCreateCleanupOnlySQL = `
+	UPDATE jobs
+	SET payload = jsonb_set(payload, '{cleanup_only}', 'true'::jsonb, true)
+	WHERE id = $1 AND type = 'pod_create'
+`
+
+func podCreateCleanupStatusSafe(status string) bool {
+	switch status {
+	case models.PodStatusError,
+		models.PodStatusDestroying,
+		models.PodStatusDestroyFailed,
+		models.PodStatusDestroyed:
+		return true
+	default:
+		return false
+	}
+}
+
+// BeginPodCreateCleanup atomically makes a pod safe for compensation and marks
+// its job cleanup-only. Forward execution may transition a pod it owns from
+// provisioning to error; an already cleanup-only retry may not. Pending, active,
+// and unknown states always fail closed. The returned status is the state
+// committed by the transaction; podExists is false when the pod was already
+// deleted.
+func (q *Queries) BeginPodCreateCleanup(
+	ctx context.Context,
+	jobID uuid.UUID,
+	workerID string,
+	podID uuid.UUID,
+	allowProvisioningTransition bool,
+) (status string, podExists bool, err error) {
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return "", false, fmt.Errorf("begin pod-create cleanup transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var owned bool
+	if err := tx.QueryRow(ctx, `
+		SELECT claimed_by = $2 AND status IN ('claimed', 'in_progress')
+		FROM jobs
+		WHERE id = $1
+		FOR UPDATE
+	`, jobID, workerID).Scan(&owned); err != nil {
+		return "", false, fmt.Errorf("lock pod-create cleanup job: %w", err)
+	}
+	if !owned {
+		return "", false, fmt.Errorf("%w: job %s cannot begin pod-create cleanup for %s", ErrJobLeaseLost, jobID, workerID)
+	}
+
+	err = tx.QueryRow(ctx, `SELECT status FROM pods WHERE id = $1 FOR UPDATE`, podID).Scan(&status)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// A missing pod is safe: only persisted external-resource compensation runs.
+		status = ""
+	case err != nil:
+		return "", false, fmt.Errorf("lock pod for cleanup: %w", err)
+	case status == models.PodStatusProvisioning && allowProvisioningTransition:
+		tag, updateErr := tx.Exec(ctx, `
+			UPDATE pods
+			SET status = $2,
+			    error_message = 'Provisioning stopped; cleanup is in progress.',
+			    updated_at = now()
+			WHERE id = $1 AND status = $3
+		`, podID, models.PodStatusError, models.PodStatusProvisioning)
+		if updateErr != nil {
+			return "", false, fmt.Errorf("mark pod error before cleanup: %w", updateErr)
+		}
+		if tag.RowsAffected() != 1 {
+			return "", false, fmt.Errorf("pod %s changed state before cleanup could start", podID)
+		}
+		status = models.PodStatusError
+	case podCreateCleanupStatusSafe(status):
+		// Terminal/error states are safe for persisted compensation.
+	default:
+		return "", false, fmt.Errorf(
+			"%w: cleanup-only pod_create refused for pod %s in status %q",
+			ErrUnsafePodCreateCleanupState,
+			podID,
+			status,
+		)
+	}
+
+	tag, err := tx.Exec(ctx, markPodCreateCleanupOnlySQL, jobID)
+	if err != nil {
+		return "", false, fmt.Errorf("mark pod_create cleanup-only: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return "", false, fmt.Errorf("pod_create job %s was not marked cleanup-only", jobID)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", false, fmt.Errorf("commit pod-create cleanup transition: %w", err)
+	}
+	return status, status != "", nil
+}
+
+// RetryJob resets a failed job back to pending and schedules it for a future
+// attempt. retry_count is incremented; claimed_by, claimed_at, started_at, and
+// completed_at are cleared; next_attempt_at is set to nextAt so ClaimJob
+// ignores the row until the delay expires. cleanupOnly permanently marks a
+// pod_create or vm_add retry as compensation-only so maintenance workers may
+// claim it without reopening forward provisioning.
 //
-// Called by the worker when ProcessJob returns a retryable error and
-// retry_count < max_retries.
-func (q *Queries) RetryJob(ctx context.Context, id uuid.UUID, nextAt time.Time) error {
-	_, err := q.pool.Exec(ctx, `
+// Called by the worker when ProcessJob returns a retryable error. Ordinary jobs
+// stop at max_retries; cleanup-only jobs use an independent durable lifecycle.
+// The pending-state branch makes a repeated cleanup write idempotent when the
+// first statement committed but its client observed an ambiguous error.
+const retryJobSQL = `
+	WITH updated AS (
 		UPDATE jobs SET
 			status          = 'pending',
 			retry_count     = retry_count + 1,
@@ -986,10 +1170,59 @@ func (q *Queries) RetryJob(ctx context.Context, id uuid.UUID, nextAt time.Time) 
 			claimed_at      = NULL,
 			started_at      = NULL,
 			completed_at    = NULL,
-			next_attempt_at = $2
+			next_attempt_at = $2,
+			payload         = CASE
+				WHEN $3 AND $4::jsonb IS NOT NULL THEN jsonb_set(
+					jsonb_set(
+						payload - 'cleanup_completed',
+						'{cleanup_only}',
+						'true'::jsonb,
+						true
+					),
+					'{cleanup_target}',
+					$4::jsonb,
+					true
+				)
+				WHEN $3 THEN jsonb_set(payload, '{cleanup_only}', 'true'::jsonb, true)
+				ELSE payload
+			END
 		WHERE id = $1
-	`, id, nextAt)
-	return err
+		  AND claimed_by = $5
+		  AND status IN ('claimed', 'in_progress')
+		RETURNING 1
+	)
+	SELECT
+		EXISTS (SELECT 1 FROM updated),
+		EXISTS (
+			SELECT 1 FROM jobs
+			WHERE id = $1
+			  AND status = 'pending'
+			  AND $3
+			  AND payload->>'cleanup_only' = 'true'
+			  AND ($4::jsonb IS NULL OR payload->'cleanup_target' = $4::jsonb)
+		)
+`
+
+func (q *Queries) RetryJob(
+	ctx context.Context,
+	id uuid.UUID,
+	nextAt time.Time,
+	cleanupOnly bool,
+	cleanupTarget []byte,
+	workerID string,
+) error {
+	var updated, alreadyScheduled bool
+	err := q.pool.QueryRow(ctx, retryJobSQL, id, nextAt, cleanupOnly, cleanupTarget, workerID).Scan(
+		&updated,
+		&alreadyScheduled,
+	)
+	if err != nil {
+		return err
+	}
+	if !updated && !alreadyScheduled {
+		return fmt.Errorf("%w: job %s is not owned by %s for retry scheduling", ErrJobLeaseLost, id, workerID)
+	}
+	return nil
 }
 
 // CountRetryPendingJobs returns the number of jobs currently sleeping
@@ -1004,12 +1237,17 @@ func (q *Queries) CountRetryPendingJobs(ctx context.Context) (int, error) {
 	return n, err
 }
 
-// RecoverStaleJobs resets in_progress/claimed jobs that were abandoned (e.g., worker restart).
-func (q *Queries) RecoverStaleJobs(ctx context.Context) (int64, error) {
-	tag, err := q.pool.Exec(ctx, `
+const recoverStaleJobsSQL = `
 		UPDATE jobs SET status = 'pending', claimed_by = NULL, claimed_at = NULL, started_at = NULL
-		WHERE status IN ('in_progress', 'claimed') AND completed_at IS NULL
-	`)
+		WHERE status IN ('in_progress', 'claimed')
+		  AND completed_at IS NULL
+		  AND (claimed_at IS NULL OR claimed_at < now() - ($1 * interval '1 second'))
+`
+
+// RecoverStaleJobs resets only active claims whose heartbeat lease has expired.
+// Fresh work owned by another replica is never touched.
+func (q *Queries) RecoverStaleJobs(ctx context.Context, leaseDuration time.Duration) (int64, error) {
+	tag, err := q.pool.Exec(ctx, recoverStaleJobsSQL, leaseDuration.Seconds())
 	if err != nil {
 		return 0, err
 	}
@@ -1197,13 +1435,23 @@ func (q *Queries) UpdatePodStatusFrom(ctx context.Context, id uuid.UUID, fromSta
 	return tag.RowsAffected() > 0, nil
 }
 
-// ListDestroyFailedPods returns pods stuck in "destroy_failed" status.
-func (q *Queries) ListDestroyFailedPods(ctx context.Context) ([]models.Pod, error) {
-	rows, err := q.pool.Query(ctx, `
-		SELECT id, owner_id, name, status, error_message, expires_at, created_at, updated_at, salt, vlan_id, subnet
-		FROM pods WHERE status = 'destroy_failed'
-		ORDER BY updated_at ASC
-	`)
+const listRetryableDestroyFailedPodsSQL = `
+	SELECT id, owner_id, name, status, error_message, expires_at, created_at, updated_at, salt, vlan_id, subnet
+	FROM pods
+	WHERE status = 'destroy_failed'
+	  AND LEFT(COALESCE(error_message, ''), LENGTH($1)) <> $1
+	ORDER BY updated_at ASC
+`
+
+// ListRetryableDestroyFailedPods returns retryable pods stuck in "destroy_failed"
+// status. Ownership-ambiguous failures require human resolution and must not
+// flap through "destroying" on every automated sweep.
+func (q *Queries) ListRetryableDestroyFailedPods(ctx context.Context) ([]models.Pod, error) {
+	rows, err := q.pool.Query(
+		ctx,
+		listRetryableDestroyFailedPodsSQL,
+		models.PodErrorManualCleanupRequiredPrefix,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -1219,6 +1467,21 @@ func (q *Queries) ListDestroyFailedPods(ctx context.Context) ([]models.Pod, erro
 		pods = append(pods, p)
 	}
 	return pods, rows.Err()
+}
+
+// CountDestroyFailedPods returns every pod in destroy_failed status, including
+// ownership-ambiguous pods that are intentionally excluded from automated
+// retries but must remain visible to alerting.
+func (q *Queries) CountDestroyFailedPods(ctx context.Context) (int, error) {
+	var count int
+	if err := q.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM pods
+		WHERE status = 'destroy_failed'
+	`).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count destroy_failed pods: %w", err)
+	}
+	return count, nil
 }
 
 // --- Pod VMs ---
@@ -1287,10 +1550,525 @@ func (q *Queries) UpdatePodVM(ctx context.Context, id uuid.UUID, vcenterVMID, vc
 	return err
 }
 
+// UpdatePodVMFrom updates vCenter details only while a VM remains in one of
+// the allowed source states. Terminal delete/error intent therefore wins over
+// a stale or concurrently finishing add job.
+func (q *Queries) UpdatePodVMFrom(ctx context.Context, id uuid.UUID, fromStatuses []string, vcenterVMID, vcenterVMName, status string) (bool, error) {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE pod_vms SET vcenter_vm_id = $1, vcenter_vm_name = $2, status = $3
+		WHERE id = $4 AND status = ANY($5)
+	`, vcenterVMID, vcenterVMName, status, id, fromStatuses)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// StageVMCloneCleanup durably records the exact clone owned by a provisioning
+// or smoke-test attempt before forward configuration continues. A recovered job
+// therefore enters compensation instead of cloning or resolving by name.
+func (q *Queries) StageVMCloneCleanup(
+	ctx context.Context,
+	jobID uuid.UUID,
+	workerID string,
+	target []byte,
+) error {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE jobs
+		SET payload = jsonb_set(
+			jsonb_set(payload - 'cleanup_completed', '{cleanup_only}', 'true'::jsonb, true),
+			'{cleanup_target}',
+			$2::jsonb,
+			true
+		)
+		WHERE id = $1
+		  AND claimed_by = $3
+		  AND type IN ('pod_create', 'vm_add', 'template_verify', 'template_revalidate')
+		  AND status IN ('claimed', 'in_progress')
+		  AND NOT (
+		    COALESCE(payload->'destroyed_cleanup_targets', '[]'::jsonb)
+		      @> jsonb_build_array($2::jsonb)
+		  )
+	`, jobID, target, workerID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		var destroyed bool
+		if err := q.pool.QueryRow(ctx, `
+			SELECT COALESCE(payload->'destroyed_cleanup_targets', '[]'::jsonb)
+				@> jsonb_build_array($2::jsonb)
+			FROM jobs
+			WHERE id = $1
+		`, jobID, target).Scan(&destroyed); err == nil && destroyed {
+			return fmt.Errorf("%w: job %s already recorded target %s", ErrVMCloneAlreadyDestroyed, jobID, target)
+		}
+		return fmt.Errorf("%w: job %s could not stage VM clone cleanup for %s", ErrJobLeaseLost, jobID, workerID)
+	}
+	return nil
+}
+
+type persistedVMCloneTarget struct {
+	PodID       string `json:"pod_id"`
+	PodVMID     string `json:"pod_vm_id"`
+	VCenterVMID string `json:"vcenter_vm_id"`
+}
+
+func samePersistedVMCloneTarget(a, b persistedVMCloneTarget) bool {
+	return a.PodID == b.PodID && a.PodVMID == b.PodVMID && a.VCenterVMID == b.VCenterVMID
+}
+
+func decodePersistedVMCloneTarget(raw []byte) (persistedVMCloneTarget, error) {
+	var target persistedVMCloneTarget
+	if err := json.Unmarshal(raw, &target); err != nil {
+		return target, err
+	}
+	if target.PodID == "" || target.PodVMID == "" || target.VCenterVMID == "" {
+		return target, errors.New("VM clone handoff target is incomplete")
+	}
+	if _, err := uuid.Parse(target.PodID); err != nil {
+		return target, fmt.Errorf("invalid handoff pod_id: %w", err)
+	}
+	if _, err := uuid.Parse(target.PodVMID); err != nil {
+		return target, fmt.Errorf("invalid handoff pod_vm_id: %w", err)
+	}
+	return target, nil
+}
+
+func parsePersistedVMCloneTargets(raw json.RawMessage) ([]persistedVMCloneTarget, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var targets []persistedVMCloneTarget
+	if err := json.Unmarshal(raw, &targets); err != nil {
+		return nil, err
+	}
+	for _, target := range targets {
+		encoded, err := json.Marshal(target)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := decodePersistedVMCloneTarget(encoded); err != nil {
+			return nil, err
+		}
+	}
+	return targets, nil
+}
+
+func prepareVMCloneDestructionPayload(payload, targetRaw []byte) ([]byte, bool, error) {
+	target, err := decodePersistedVMCloneTarget(targetRaw)
+	if err != nil {
+		return nil, false, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &fields); err != nil {
+		return nil, false, err
+	}
+	destroyed, err := parsePersistedVMCloneTargets(fields["destroyed_cleanup_targets"])
+	if err != nil {
+		return nil, false, err
+	}
+	for _, existing := range destroyed {
+		if samePersistedVMCloneTarget(existing, target) {
+			return payload, true, nil
+		}
+	}
+
+	var primary persistedVMCloneTarget
+	hasPrimary := len(fields["cleanup_target"]) > 0
+	if hasPrimary {
+		if err := json.Unmarshal(fields["cleanup_target"], &primary); err != nil {
+			return nil, false, err
+		}
+	}
+	if !hasPrimary {
+		fields["cleanup_target"] = append(json.RawMessage(nil), targetRaw...)
+	} else if !samePersistedVMCloneTarget(primary, target) {
+		handoffs, err := parsePersistedVMCloneTargets(fields["cleanup_handoff_targets"])
+		if err != nil {
+			return nil, false, err
+		}
+		found := false
+		for _, existing := range handoffs {
+			if samePersistedVMCloneTarget(existing, target) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			handoffs = append(handoffs, target)
+			fields["cleanup_handoff_targets"], err = json.Marshal(handoffs)
+			if err != nil {
+				return nil, false, err
+			}
+		}
+	}
+	fields["cleanup_only"] = json.RawMessage("true")
+	delete(fields, "cleanup_completed")
+	updated, err := json.Marshal(fields)
+	return updated, false, err
+}
+
+func completeVMCloneDestructionPayload(payload, targetRaw []byte) ([]byte, bool, error) {
+	target, err := decodePersistedVMCloneTarget(targetRaw)
+	if err != nil {
+		return nil, false, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &fields); err != nil {
+		return nil, false, err
+	}
+	destroyed, err := parsePersistedVMCloneTargets(fields["destroyed_cleanup_targets"])
+	if err != nil {
+		return nil, false, err
+	}
+	for _, existing := range destroyed {
+		if samePersistedVMCloneTarget(existing, target) {
+			return payload, true, nil
+		}
+	}
+	destroyed = append(destroyed, target)
+	fields["destroyed_cleanup_targets"], err = json.Marshal(destroyed)
+	if err != nil {
+		return nil, false, err
+	}
+
+	if raw := fields["cleanup_target"]; len(raw) > 0 {
+		var primary persistedVMCloneTarget
+		if err := json.Unmarshal(raw, &primary); err != nil {
+			return nil, false, err
+		}
+		if samePersistedVMCloneTarget(primary, target) {
+			delete(fields, "cleanup_target")
+		}
+	}
+	handoffs, err := parsePersistedVMCloneTargets(fields["cleanup_handoff_targets"])
+	if err != nil {
+		return nil, false, err
+	}
+	remaining := handoffs[:0]
+	for _, existing := range handoffs {
+		if !samePersistedVMCloneTarget(existing, target) {
+			remaining = append(remaining, existing)
+		}
+	}
+	if len(remaining) == 0 {
+		delete(fields, "cleanup_handoff_targets")
+	} else {
+		if len(fields["cleanup_target"]) == 0 {
+			fields["cleanup_target"], err = json.Marshal(remaining[0])
+			if err != nil {
+				return nil, false, err
+			}
+			remaining = remaining[1:]
+		}
+		if len(remaining) == 0 {
+			delete(fields, "cleanup_handoff_targets")
+		} else {
+			fields["cleanup_handoff_targets"], err = json.Marshal(remaining)
+			if err != nil {
+				return nil, false, err
+			}
+		}
+	}
+	fields["cleanup_only"] = json.RawMessage("true")
+	if raw := fields["clone_operation"]; len(raw) > 0 {
+		var operation models.VMCloneOperation
+		if err := json.Unmarshal(raw, &operation); err != nil {
+			return nil, false, err
+		}
+		if operation.PodVMID == target.PodVMID {
+			delete(fields, "clone_operation")
+		}
+	}
+	if len(fields["cleanup_target"]) == 0 && len(fields["cleanup_handoff_targets"]) == 0 {
+		fields["cleanup_completed"] = json.RawMessage("true")
+	} else {
+		delete(fields, "cleanup_completed")
+	}
+	updated, err := json.Marshal(fields)
+	return updated, false, err
+}
+
+func findVMCloneCleanupTarget(
+	payload []byte,
+	podVMID uuid.UUID,
+	vcenterVMID string,
+) (persistedVMCloneTarget, bool, bool, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &fields); err != nil {
+		return persistedVMCloneTarget{}, false, false, err
+	}
+	if raw := fields["cleanup_target"]; len(raw) > 0 {
+		primary, err := decodePersistedVMCloneTarget(raw)
+		if err != nil {
+			return persistedVMCloneTarget{}, false, false, err
+		}
+		if primary.PodVMID == podVMID.String() && primary.VCenterVMID == vcenterVMID {
+			return primary, true, false, nil
+		}
+	}
+	handoffs, err := parsePersistedVMCloneTargets(fields["cleanup_handoff_targets"])
+	if err != nil {
+		return persistedVMCloneTarget{}, false, false, err
+	}
+	for _, existing := range handoffs {
+		if existing.PodVMID == podVMID.String() && existing.VCenterVMID == vcenterVMID {
+			return existing, true, false, nil
+		}
+	}
+	destroyed, err := parsePersistedVMCloneTargets(fields["destroyed_cleanup_targets"])
+	if err != nil {
+		return persistedVMCloneTarget{}, false, false, err
+	}
+	for _, existing := range destroyed {
+		if existing.PodVMID == podVMID.String() && existing.VCenterVMID == vcenterVMID {
+			return existing, false, true, nil
+		}
+	}
+	return persistedVMCloneTarget{}, false, false, nil
+}
+
+// AdoptPodVMClone atomically attaches a staged clone to pod_vms while retaining
+// cleanup intent. The caller disarms that intent only after any separate
+// rollback record is durable.
+func (q *Queries) AdoptPodVMClone(
+	ctx context.Context,
+	jobID uuid.UUID,
+	workerID string,
+	podVMID uuid.UUID,
+	fromStatuses []string,
+	vcenterVMID, vcenterVMName, status string,
+) (bool, error) {
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var staged, owned, destroyed bool
+	err = tx.QueryRow(ctx, `
+		SELECT
+			COALESCE(
+				payload->'cleanup_target'->>'pod_vm_id' = $2
+				AND payload->'cleanup_target'->>'vcenter_vm_id' = $3,
+				false
+			),
+			claimed_by = $4 AND status IN ('claimed', 'in_progress'),
+			COALESCE(payload->'destroyed_cleanup_targets', '[]'::jsonb)
+				@> jsonb_build_array(jsonb_build_object(
+					'pod_id', payload->'cleanup_target'->>'pod_id',
+					'pod_vm_id', $2,
+					'vcenter_vm_id', $3
+				))
+		FROM jobs
+		WHERE id = $1
+		FOR UPDATE
+	`, jobID, podVMID.String(), vcenterVMID, workerID).Scan(&staged, &owned, &destroyed)
+	if err != nil {
+		return false, fmt.Errorf("lock staged clone cleanup: %w", err)
+	}
+	if !owned {
+		return false, fmt.Errorf("%w: job %s cannot adopt clone for %s", ErrJobLeaseLost, jobID, workerID)
+	}
+	if destroyed {
+		return false, fmt.Errorf("%w: job %s cannot adopt clone %s", ErrVMCloneAlreadyDestroyed, jobID, vcenterVMID)
+	}
+	if !staged {
+		return false, fmt.Errorf("job %s has no exact staged cleanup target for VM %s (%s)", jobID, podVMID, vcenterVMID)
+	}
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE pod_vms
+		SET vcenter_vm_id = $1, vcenter_vm_name = $2, status = $3
+		WHERE id = $4 AND status = ANY($5)
+	`, vcenterVMID, vcenterVMName, status, podVMID, fromStatuses)
+	if err != nil {
+		return false, err
+	}
+	applied := tag.RowsAffected() == 1
+	if err := tx.Commit(ctx); err != nil {
+		var adopted, cleanupStaged bool
+		resolveErr := q.pool.QueryRow(ctx, `
+			SELECT
+				EXISTS (
+					SELECT 1 FROM pod_vms
+					WHERE id = $1 AND vcenter_vm_id = $2 AND status = $3
+				),
+				EXISTS (
+					SELECT 1 FROM jobs
+					WHERE id = $4
+					  AND payload->'cleanup_target'->>'pod_vm_id' = $5
+					  AND payload->'cleanup_target'->>'vcenter_vm_id' = $2
+				)
+		`, podVMID, vcenterVMID, status, jobID, podVMID.String()).Scan(&adopted, &cleanupStaged)
+		if resolveErr == nil {
+			if adopted && cleanupStaged {
+				return true, nil
+			}
+			if !adopted && cleanupStaged {
+				return false, nil
+			}
+		}
+		return false, fmt.Errorf("commit clone adoption: %w", err)
+	}
+	return applied, nil
+}
+
+// DisarmVMCloneCleanup clears exact cleanup intent only after the clone is
+// durably adopted and any rollback record is persisted by the same claim.
+func (q *Queries) DisarmVMCloneCleanup(
+	ctx context.Context,
+	jobID uuid.UUID,
+	workerID string,
+	podVMID uuid.UUID,
+	vcenterVMID string,
+) error {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE jobs
+		SET payload = payload - 'cleanup_target' - 'cleanup_only' - 'cleanup_completed' - 'clone_operation'
+		WHERE id = $1
+		  AND claimed_by = $2
+		  AND status IN ('claimed', 'in_progress')
+		  AND payload->'cleanup_target'->>'pod_vm_id' = $3
+		  AND payload->'cleanup_target'->>'vcenter_vm_id' = $4
+		  AND jsonb_array_length(COALESCE(payload->'cleanup_handoff_targets', '[]'::jsonb)) = 0
+	`, jobID, workerID, podVMID.String(), vcenterVMID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("%w: job %s cannot disarm clone %s for %s", ErrJobLeaseLost, jobID, vcenterVMID, workerID)
+	}
+	return nil
+}
+
+// CompleteVMCloneCleanup clears only the exact destroyed reference and removes
+// the staged target. cleanup_only remains set so a recovered parent job can
+// finalize with compensated-failure semantics instead of resuming provisioning.
+func (q *Queries) CompleteVMCloneCleanup(
+	ctx context.Context,
+	jobID uuid.UUID,
+	podVMID uuid.UUID,
+	vcenterVMID string,
+) error {
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var payload []byte
+	err = tx.QueryRow(ctx, `
+		SELECT payload
+		FROM jobs
+		WHERE id = $1
+		FOR UPDATE
+	`, jobID).Scan(&payload)
+	if err != nil {
+		return fmt.Errorf("lock completed clone cleanup: %w", err)
+	}
+	targetWithPod, staged, alreadyRecorded, err := findVMCloneCleanupTarget(payload, podVMID, vcenterVMID)
+	if err != nil {
+		return fmt.Errorf("inspect completed clone cleanup target: %w", err)
+	}
+	if !staged && !alreadyRecorded {
+		return fmt.Errorf("job %s has no exact cleanup target for VM %s (%s)", jobID, podVMID, vcenterVMID)
+	}
+	target, err := json.Marshal(targetWithPod)
+	if err != nil {
+		return err
+	}
+	updated, alreadyRecordedByUpdate, err := completeVMCloneDestructionPayload(payload, target)
+	if err != nil {
+		return fmt.Errorf("prepare completed clone cleanup: %w", err)
+	}
+	if alreadyRecordedByUpdate != alreadyRecorded {
+		return errors.New("destroyed clone proof changed while job row was locked")
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE pod_vms
+		SET vcenter_vm_id = CASE WHEN vcenter_vm_id = $2 THEN NULL ELSE vcenter_vm_id END,
+		    vcenter_vm_name = CASE WHEN vcenter_vm_id = $2 THEN NULL ELSE vcenter_vm_name END,
+		    ip_address = CASE WHEN vcenter_vm_id = $2 THEN NULL ELSE ip_address END,
+		    status = CASE
+		        WHEN status IN ('pending', 'cloning', 'configuring')
+		          AND (vcenter_vm_id = $2 OR vcenter_vm_id IS NULL)
+		        THEN 'error'
+		        ELSE status
+		    END
+		WHERE id = $1
+		  AND (
+		    vcenter_vm_id = $2
+		    OR (vcenter_vm_id IS NULL AND status IN ('pending', 'cloning', 'configuring'))
+		  )
+	`, podVMID, vcenterVMID); err != nil {
+		return fmt.Errorf("clear exact stale VM reference: %w", err)
+	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE jobs
+		SET payload = $2
+		WHERE id = $1
+	`, jobID, updated)
+	if err != nil {
+		return fmt.Errorf("complete staged clone cleanup: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("job %s lost cleanup target while completing VM %s", jobID, podVMID)
+	}
+	return tx.Commit(ctx)
+}
+
+// MarkJobCompensationCompleted records durable proof that all compensation for
+// a cleanup-only parent job finished. It deliberately leaves cleanup_only set
+// so crash recovery finalizes the job as compensated instead of provisioning.
+func (q *Queries) MarkJobCompensationCompleted(ctx context.Context, jobID uuid.UUID, workerID string) error {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE jobs
+		SET payload = jsonb_set(payload, '{cleanup_completed}', 'true'::jsonb, true)
+		WHERE id = $1
+		  AND claimed_by = $2
+		  AND status IN ('claimed', 'in_progress')
+		  AND payload->>'cleanup_only' = 'true'
+		  AND NOT (payload ? 'cleanup_target')
+		  AND jsonb_array_length(COALESCE(payload->'cleanup_handoff_targets', '[]'::jsonb)) = 0
+	`, jobID, workerID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("%w: job %s could not record completed compensation for %s", ErrJobLeaseLost, jobID, workerID)
+	}
+	return nil
+}
+
+// ClearPodVMVCenterReference clears exactly the clone reference that was
+// destroyed, preserving a newer reference if another operation won the race.
+func (q *Queries) ClearPodVMVCenterReference(ctx context.Context, id uuid.UUID, vcenterVMID string) (bool, error) {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE pod_vms SET vcenter_vm_id = NULL, vcenter_vm_name = NULL, ip_address = NULL
+		WHERE id = $1 AND vcenter_vm_id = $2
+	`, id, vcenterVMID)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // UpdatePodVMStatus updates a pod VM's status.
 func (q *Queries) UpdatePodVMStatus(ctx context.Context, id uuid.UUID, status string) error {
 	_, err := q.pool.Exec(ctx, `UPDATE pod_vms SET status = $1 WHERE id = $2`, status, id)
 	return err
+}
+
+// UpdatePodVMStatusFrom transitions a pod VM only from an allowed source state.
+func (q *Queries) UpdatePodVMStatusFrom(ctx context.Context, id uuid.UUID, fromStatuses []string, status string) (bool, error) {
+	tag, err := q.pool.Exec(ctx, `UPDATE pod_vms SET status = $1 WHERE id = $2 AND status = ANY($3)`, status, id, fromStatuses)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 // UpdatePodVMIP sets the IP address on a pod VM.

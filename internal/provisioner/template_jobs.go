@@ -335,7 +335,10 @@ const runningVMToolsCheckTimeout = 30 * time.Second
 // sequence routinely exceeds five minutes. Waiting longer costs nothing on the
 // happy path — WaitForTools returns as soon as tools report — while a short
 // deadline turns a working template into a hard failure.
-const cloneFirstBootToolsTimeout = 15 * time.Minute
+const (
+	cloneFirstBootToolsTimeout = 15 * time.Minute
+	smokeCloneCleanupTimeout   = 90 * time.Second
+)
 
 // isoProvisionVCenter is the vCenter subset the iso template-provision path
 // needs. The real *vcenter.Client satisfies it (asserted below), so production
@@ -997,9 +1000,83 @@ type TemplateVerifyPayload struct {
 // destroyed on return, on every path. publish is called with (slug, message)
 // progress pairs; pass nil to suppress events. Returns nil on success or a
 // descriptive error identifying which check failed.
-func (p *Provisioner) runSmokeCheck(ctx context.Context, tmpl *models.Template, vmMoref string, publish func(slug, msg string)) error {
+func (p *Provisioner) runSmokeCheck(
+	ctx context.Context,
+	job *models.Job,
+	tmpl *models.Template,
+	vmMoref string,
+	publish func(slug, msg string),
+) (resultErr error) {
 	if publish == nil {
 		publish = func(_, _ string) {}
+	}
+	workerID, _, err := claimedJobLease(job)
+	if err != nil {
+		return err
+	}
+	var recovery struct {
+		CleanupOnly      bool                     `json:"cleanup_only"`
+		CleanupCompleted bool                     `json:"cleanup_completed"`
+		CleanupTarget    *VMCloneCleanupTarget    `json:"cleanup_target"`
+		CloneOperation   *models.VMCloneOperation `json:"clone_operation"`
+	}
+	if err := json.Unmarshal(job.Payload, &recovery); err != nil {
+		return fmt.Errorf("parse smoke-clone recovery state: %w", err)
+	}
+	if recovery.CleanupOnly {
+		target := recovery.CleanupTarget
+		if recovery.CloneOperation != nil {
+			reconciled, err := reconcileCloneOperationTargetForCleanup(
+				ctx,
+				p.db,
+				p.vc,
+				job.ID,
+				workerID,
+				recovery.CloneOperation,
+			)
+			if err != nil {
+				return err
+			}
+			if reconciled != nil {
+				target = reconciled
+			}
+		}
+		if target == nil {
+			if !recovery.CleanupCompleted && recovery.CloneOperation == nil {
+				return &manualCleanupRequiredError{err: errors.New(
+					"smoke-clone cleanup intent has no exact target or operation identity",
+				)}
+			}
+			return &compensatedJobError{err: errors.New(
+				"interrupted smoke-clone operation completed without a created VM",
+			)}
+		}
+		if target.PodID != job.ID.String() || target.PodVMID != tmpl.ID.String() {
+			return &manualCleanupRequiredError{err: fmt.Errorf(
+				"smoke-clone cleanup target does not match job %s and template %s",
+				job.ID,
+				tmpl.ID,
+			)}
+		}
+		rawTarget, err := json.Marshal(target)
+		if err != nil {
+			return err
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), smokeCloneCleanupTimeout)
+		defer cancel()
+		if err := p.vc.DestroyVM(cleanupCtx, target.VCenterVMID); err != nil {
+			return cloneRecoveryError(fmt.Errorf("destroy recovered smoke clone %s: %w", target.VCenterVMID, err), target)
+		}
+		if err := p.db.FinishStandaloneVMCloneCleanup(
+			cleanupCtx,
+			job.ID,
+			workerID,
+			rawTarget,
+			true,
+		); err != nil {
+			return cloneRecoveryError(fmt.Errorf("complete recovered smoke clone %s: %w", target.VCenterVMID, err), target)
+		}
+		return &compensatedJobError{err: errors.New("interrupted smoke clone was destroyed")}
 	}
 	osType := strings.ToLower(tmpl.OSType)
 	network := tmpl.StagingNetwork
@@ -1014,36 +1091,73 @@ func (p *Provisioner) runSmokeCheck(ctx context.Context, tmpl *models.Template, 
 	if ram <= 0 {
 		ram = 4096
 	}
-	smokeName := fmt.Sprintf("smoke-%s-%d", tmpl.ID.String()[:8], time.Now().Unix())
+	smokeName := fmt.Sprintf("smoke-%s-%s", tmpl.ID.String()[:8], job.ID.String()[:8])
 	smokePassword := generatePassword(12)
 
-	// The throwaway clone is ALWAYS destroyed, on every return path. Uses a
-	// background context so cleanup still runs if the job context is
-	// cancelled. DestroyVM treats an already-deleted VM as success, so a
-	// double-destroy (defer + explicit) is harmless.
+	// The throwaway clone is always destroyed. Its exact MoRef and operation
+	// identity are durable before any forward smoke-test action can run.
 	var cloneMoref string
 	defer func() {
 		if cloneMoref == "" {
 			return
 		}
-		if derr := p.vc.DestroyVM(context.Background(), cloneMoref); derr != nil {
-			p.logger.Warn("smoke clone cleanup failed (manual cleanup may be needed)",
-				"template_id", tmpl.ID, "moref", cloneMoref, "name", smokeName, "error", derr)
+		target := &VMCloneCleanupTarget{
+			PodID:       job.ID.String(),
+			PodVMID:     tmpl.ID.String(),
+			VCenterVMID: cloneMoref,
+		}
+		rawTarget, marshalErr := json.Marshal(target)
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), smokeCloneCleanupTimeout)
+		defer cancel()
+		cleanupErr := marshalErr
+		if cleanupErr == nil {
+			cleanupErr = p.vc.DestroyVM(cleanupCtx, cloneMoref)
+		}
+		if cleanupErr == nil {
+			cleanupErr = p.db.FinishStandaloneVMCloneCleanup(
+				cleanupCtx,
+				job.ID,
+				workerID,
+				rawTarget,
+				false,
+			)
+		}
+		if cleanupErr != nil {
+			if resultErr != nil {
+				cleanupErr = errors.Join(resultErr, cleanupErr)
+			}
+			resultErr = cloneRecoveryError(
+				fmt.Errorf("cleanup smoke clone %s: %w", cloneMoref, cleanupErr),
+				target,
+			)
+			return
+		}
+		var retryErr *compensationRetryError
+		if errors.As(resultErr, &retryErr) {
+			resultErr = retryErr.err
 		}
 	}()
 
 	// Step 1: clone the base-image the same way a pod clone does.
 	publish("smoke_clone", fmt.Sprintf("Cloning base-image for smoke test (%s)", smokeName))
-	var err error
-	cloneMoref, err = p.vc.CloneVM(ctx, vcenter.CloneVMParams{
-		TemplateName: vmMoref,
-		VMName:       smokeName,
-		VCPUs:        vcpus,
-		RAMmb:        ram,
-		Network:      network,
-		OSType:       osType,
-		Password:     smokePassword,
-	})
+	cloneMoref, err = executeDurableVMClone(
+		ctx,
+		p.db,
+		p.vc,
+		job.ID,
+		workerID,
+		job.ID,
+		tmpl.ID,
+		vcenter.CloneVMParams{
+			TemplateName: vmMoref,
+			VMName:       smokeName,
+			VCPUs:        vcpus,
+			RAMmb:        ram,
+			Network:      network,
+			OSType:       osType,
+			Password:     smokePassword,
+		},
+	)
 	if err != nil {
 		return fmt.Errorf("smoke clone failed (template may be unclonable): %w", err)
 	}
@@ -1145,6 +1259,19 @@ func (p *Provisioner) VerifyTemplate(ctx context.Context, job *models.Job) (err 
 	if payload.VMMoref == "" {
 		return fmt.Errorf("vm_moref is required")
 	}
+	if jobPayloadCleanupOnly(job) {
+		checkErr := p.runSmokeCheck(
+			ctx,
+			job,
+			&models.Template{ID: payload.TemplateID},
+			payload.VMMoref,
+			func(slug, msg string) { p.publishProgress(job.ID, slug, msg) },
+		)
+		if checkErr == nil {
+			return nil
+		}
+		return p.verifyFailedToReady(ctx, payload.TemplateID, checkErr)
+	}
 
 	tmpl, err := p.db.GetTemplateByID(ctx, payload.TemplateID)
 	if err != nil {
@@ -1160,7 +1287,7 @@ func (p *Provisioner) VerifyTemplate(ctx context.Context, job *models.Job) (err 
 
 	// Run the smoke check. On failure, move the template back to 'ready' so
 	// the instructor can fix the image and re-publish.
-	if checkErr := p.runSmokeCheck(ctx, tmpl, payload.VMMoref, func(slug, msg string) {
+	if checkErr := p.runSmokeCheck(ctx, job, tmpl, payload.VMMoref, func(slug, msg string) {
 		p.publishProgress(job.ID, slug, msg)
 	}); checkErr != nil {
 		return p.verifyFailedToReady(ctx, tmpl.ID, checkErr)
@@ -1360,9 +1487,27 @@ func revalidateL1TemplateJob(
 // crucible_template_validation_total counter so an alert fires. The job is
 // marked failed (for observability) but the template remains live.
 func (p *Provisioner) RevalidateL1Template(ctx context.Context, job *models.Job) error {
+	if jobPayloadCleanupOnly(job) {
+		var payload TemplateRevalidatePayload
+		if err := json.Unmarshal(job.Payload, &payload); err != nil {
+			return fmt.Errorf("parse template_revalidate cleanup payload: %w", err)
+		}
+		if payload.TemplateID == uuid.Nil {
+			return fmt.Errorf("template_id is required")
+		}
+		return p.runSmokeCheck(
+			ctx,
+			job,
+			&models.Template{ID: payload.TemplateID},
+			payload.VMMoref,
+			func(slug, msg string) { p.publishProgress(job.ID, slug, msg) },
+		)
+	}
 	return revalidateL1TemplateJob(ctx, p.db, p.vc, p.pipeline, p.logger, job,
 		func(slug, msg string) { p.publishProgress(job.ID, slug, msg) },
-		p.runSmokeCheck,
+		func(ctx context.Context, tmpl *models.Template, vmMoref string, publish func(slug, msg string)) error {
+			return p.runSmokeCheck(ctx, job, tmpl, vmMoref, publish)
+		},
 	)
 }
 

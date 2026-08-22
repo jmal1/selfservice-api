@@ -1,11 +1,13 @@
 package rollback
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
-	"slices"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -24,6 +26,10 @@ type Persister interface {
 	SaveRollbackSteps(ctx context.Context, jobID uuid.UUID, steps []Step) error
 }
 
+type ownershipHandoffPersister interface {
+	HandoffRollbackStep(ctx context.Context, jobID uuid.UUID, step Step) error
+}
+
 // Engine tracks completed provisioning steps and can reverse them on failure.
 // Steps are persisted after each Record() so rollback survives worker crashes.
 type Engine struct {
@@ -33,6 +39,13 @@ type Engine struct {
 	persister Persister
 	logger    *slog.Logger
 }
+
+const (
+	recordCleanupTimeout = 90 * time.Second
+	rollbackFenceTimeout = 10 * time.Second
+)
+
+var ErrOwnershipLost = errors.New("rollback persistence ownership lost")
 
 // New creates a rollback engine for a specific job.
 func New(jobID uuid.UUID, persister Persister, logger *slog.Logger) *Engine {
@@ -59,12 +72,44 @@ func (e *Engine) Record(ctx context.Context, name string, data any) error {
 	}
 
 	step := Step{Name: name, Data: raw}
+	for _, existing := range e.steps {
+		if existing.Name == name && bytes.Equal(existing.Data, step.Data) {
+			e.logger.Info("identical rollback step already recorded",
+				"job_id", e.jobID, "step", name)
+			return nil
+		}
+	}
 	e.steps = append(e.steps, step)
 
 	if e.persister != nil {
 		if err := e.persister.SaveRollbackSteps(ctx, e.jobID, e.steps); err != nil {
 			e.logger.Error("failed to persist rollback steps", "job_id", e.jobID, "error", err)
-			// Don't fail the provisioning step just because persistence failed
+			handoff, ok := e.persister.(ownershipHandoffPersister)
+			if !ok {
+				return fmt.Errorf("persist rollback step %s with uncertain ownership: %w", name, err)
+			}
+			handoffCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), recordCleanupTimeout)
+			defer cancel()
+			var handoffErr error
+			for attempt := 0; ; attempt++ {
+				handoffErr = handoff.HandoffRollbackStep(handoffCtx, e.jobID, step)
+				if handoffErr == nil {
+					return fmt.Errorf("persist rollback step %s after handing receipt to successor: %w", name, err)
+				}
+				delay := time.Second << min(attempt, 4)
+				timer := time.NewTimer(delay)
+				select {
+				case <-handoffCtx.Done():
+					timer.Stop()
+					return fmt.Errorf(
+						"persist rollback step %s: %w; successor handoff failed: %v",
+						name,
+						err,
+						handoffErr,
+					)
+				case <-timer.C:
+				}
+			}
 		}
 	}
 
@@ -76,16 +121,26 @@ func (e *Engine) Record(ctx context.Context, name string, data any) error {
 // Returns a slice of errors (one per failed undo). Empty slice = full success.
 func (e *Engine) Rollback(ctx context.Context) []error {
 	var errs []error
+	remaining := append([]Step(nil), e.steps...)
 
-	// Process steps in reverse order
-	reversed := make([]Step, len(e.steps))
-	copy(reversed, e.steps)
-	slices.Reverse(reversed)
+	for i := len(remaining) - 1; i >= 0; i-- {
+		step := remaining[i]
+		if e.persister != nil {
+			fenceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackFenceTimeout)
+			err := e.persister.SaveRollbackSteps(fenceCtx, e.jobID, remaining)
+			cancel()
+			if err != nil {
+				e.logger.Error("rollback ownership fence failed",
+					"step", step.Name, "job_id", e.jobID, "error", err)
+				e.steps = remaining
+				return []error{fmt.Errorf("fence rollback %s before undo: %w", step.Name, err)}
+			}
+		}
 
-	for _, step := range reversed {
 		undoFn, ok := e.undoFuncs[step.Name]
 		if !ok {
 			e.logger.Warn("no undo function registered", "step", step.Name, "job_id", e.jobID)
+			errs = append(errs, fmt.Errorf("rollback %s: no undo function registered", step.Name))
 			continue
 		}
 
@@ -96,9 +151,29 @@ func (e *Engine) Rollback(ctx context.Context) []error {
 			// Continue rolling back remaining steps even if one fails
 		} else {
 			e.logger.Info("rollback step succeeded", "step", step.Name, "job_id", e.jobID)
+			beforeCheckpoint := append([]Step(nil), remaining...)
+			remaining = append(remaining[:i], remaining[i+1:]...)
+			if e.persister != nil {
+				checkpointCtx, cancel := context.WithTimeout(
+					context.WithoutCancel(ctx),
+					rollbackFenceTimeout,
+				)
+				err := e.persister.SaveRollbackSteps(checkpointCtx, e.jobID, remaining)
+				cancel()
+				if err != nil {
+					e.steps = beforeCheckpoint
+					errs = append(errs, fmt.Errorf(
+						"checkpoint rollback %s after undo: %w",
+						step.Name,
+						err,
+					))
+					return errs
+				}
+			}
 		}
 	}
 
+	e.steps = remaining
 	return errs
 }
 
