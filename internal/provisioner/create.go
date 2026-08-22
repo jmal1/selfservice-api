@@ -558,18 +558,31 @@ func (d *dbPersister) SaveRollbackSteps(ctx context.Context, jobID uuid.UUID, st
 	if err != nil {
 		return err
 	}
-	return d.db.UpdateJobRollbackSteps(ctx, jobID, d.workerID, data)
+	err = d.db.UpdateJobRollbackSteps(ctx, jobID, d.workerID, data)
+	if errors.Is(err, database.ErrJobLeaseLost) {
+		return fmt.Errorf("%w: %v", rollback.ErrOwnershipLost, err)
+	}
+	return err
+}
+
+func (d *dbPersister) HandoffRollbackStep(ctx context.Context, jobID uuid.UUID, step rollback.Step) error {
+	data, err := json.Marshal(step)
+	if err != nil {
+		return err
+	}
+	return d.db.AdoptJobRollbackStep(ctx, jobID, data)
 }
 
 // ---------- Pod Creation ----------
 
 // CreatePodPayload is the expected shape of job.Payload for pod_create.
 type CreatePodPayload struct {
-	PodID         uuid.UUID             `json:"pod_id"`
-	VMs           []VMSpec              `json:"vms"`
-	CleanupOnly   bool                  `json:"cleanup_only,omitempty"`
-	CleanupTarget *VMCloneCleanupTarget `json:"cleanup_target,omitempty"`
-	CleanupDone   bool                  `json:"cleanup_completed,omitempty"`
+	PodID          uuid.UUID                `json:"pod_id"`
+	VMs            []VMSpec                 `json:"vms"`
+	CleanupOnly    bool                     `json:"cleanup_only,omitempty"`
+	CleanupTarget  *VMCloneCleanupTarget    `json:"cleanup_target,omitempty"`
+	CleanupDone    bool                     `json:"cleanup_completed,omitempty"`
+	CloneOperation *models.VMCloneOperation `json:"clone_operation,omitempty"`
 }
 
 // VMSpec describes a VM to create within a pod.
@@ -692,8 +705,24 @@ func jobPayloadCleanupOnly(job *models.Job) bool {
 }
 
 func podCreateCleanupOwnsStagedClone(payload CreatePodPayload) bool {
-	podID, podVMID, err := validateVMCloneCleanupTarget(payload.CleanupTarget)
-	if err != nil || podID != payload.PodID {
+	var podVMID uuid.UUID
+	if payload.CleanupTarget != nil {
+		podID, targetPodVMID, err := validateVMCloneCleanupTarget(payload.CleanupTarget)
+		if err != nil || podID != payload.PodID {
+			return false
+		}
+		podVMID = targetPodVMID
+	} else if payload.CloneOperation != nil {
+		podID, err := uuid.Parse(payload.CloneOperation.PodID)
+		if err != nil || podID != payload.PodID {
+			return false
+		}
+		targetPodVMID, err := uuid.Parse(payload.CloneOperation.PodVMID)
+		if err != nil {
+			return false
+		}
+		podVMID = targetPodVMID
+	} else {
 		return false
 	}
 	for _, vmSpec := range payload.VMs {
@@ -737,7 +766,7 @@ func (p *Provisioner) cleanupPodCreateResources(
 	}
 
 	var cleanupErrs []error
-	if err := p.cleanupStagedVMClone(cleanupCtx, job.ID); err != nil {
+	if err := p.cleanupStagedVMClone(cleanupCtx, job.ID, workerID); err != nil {
 		cleanupErrs = append(cleanupErrs, err)
 	}
 	cleanupErrs = append(cleanupErrs, rb.Rollback(cleanupCtx)...)
@@ -841,8 +870,9 @@ func (p *Provisioner) runPodCreateCleanup(
 	payload CreatePodPayload,
 	rb *rollback.Engine,
 ) error {
-	allowProvisioningTransition := podCreateCleanupOwnsStagedClone(payload)
-	if payload.CleanupTarget != nil && !allowProvisioningTransition {
+	ownsStagedClone := podCreateCleanupOwnsStagedClone(payload)
+	allowProvisioningTransition := podCreateCleanupCanTransition(payload, rb.Steps())
+	if payload.CleanupTarget != nil && !ownsStagedClone {
 		return &manualCleanupRequiredError{
 			err: errors.New("cleanup-only pod_create has an invalid or mismatched exact clone target"),
 		}
@@ -859,6 +889,10 @@ func (p *Provisioner) runPodCreateCleanup(
 		return err
 	}
 	return newPodCreateCompensatedError("cleanup-only retry")
+}
+
+func podCreateCleanupCanTransition(payload CreatePodPayload, steps []rollback.Step) bool {
+	return podCreateCleanupOwnsStagedClone(payload) || len(steps) > 0
 }
 
 func (p *Provisioner) stopPodCreateIfStale(
@@ -1240,7 +1274,7 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 			}
 
 			var cloneErr error
-			moref, cloneErr = p.vc.CloneVM(ctx, vcenter.CloneVMParams{
+			moref, cloneErr = executeDurableVMClone(ctx, p.db, p.vc, job.ID, workerID, pod.ID, vmSpec.PodVMID, vcenter.CloneVMParams{
 				TemplateName: vmSpec.TemplateName,
 				VMName:       vmSpec.VMName,
 				VCPUs:        vmSpec.VCPUs,
@@ -1263,6 +1297,16 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 						"clone post-processing",
 					)
 				}
+				if isCompensationRetry(cloneErr) {
+					return p.failPodCreateWithCleanup(
+						ctx,
+						job,
+						payload,
+						rb,
+						"clone operation recovery",
+						cloneErr,
+					)
+				}
 				if errors.Is(cloneErr, vcenter.ErrAmbiguousVMOwnership) {
 					return p.failPodCreateWithCleanup(
 						ctx,
@@ -1280,11 +1324,6 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 					models.VMStatusError,
 				)
 				continue // Skip this VM, try the rest
-			}
-			if err := p.stageVMCloneCleanup(ctx, job, pod.ID, vmSpec.PodVMID, moref); err != nil {
-				return p.failPodCreateWithCleanup(
-					ctx, job, payload, rb, "stage cloned VM cleanup", err,
-				)
 			}
 			if err := rb.Record(ctx, stepName, map[string]string{"moref": moref}); err != nil {
 				return &compensationRetryError{

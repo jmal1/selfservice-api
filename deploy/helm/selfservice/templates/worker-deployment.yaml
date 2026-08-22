@@ -28,6 +28,7 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ .Release.Name }}-worker
+      terminationGracePeriodSeconds: {{ .Values.worker.shutdownGracePeriodSeconds }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}

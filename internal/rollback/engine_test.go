@@ -71,6 +71,7 @@ func TestRecordRetainsDistinctRecoveredResourceIdentities(t *testing.T) {
 	if err := engine.Record(context.Background(), "vm_clone_0", map[string]string{"moref": "vm-new"}); err != nil {
 		t.Fatal(err)
 	}
+
 	if len(persister.steps) != 2 {
 		t.Fatalf("persisted steps = %+v, want both clone identities", persister.steps)
 	}
@@ -102,5 +103,30 @@ func TestRecordRetainsDistinctRecoveredResourceIdentities(t *testing.T) {
 	}
 	if len(rolledBack) != 2 || rolledBack[0] != "vm-new" || rolledBack[1] != "vm-old" {
 		t.Fatalf("rollback order = %v, want [vm-new vm-old]", rolledBack)
+	}
+}
+
+func TestRollbackCheckpointsEachSuccessfulUndoBeforeContinuing(t *testing.T) {
+	persister := &recordingPersister{}
+	engine := New(uuid.New(), persister, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	engine.LoadSteps([]Step{
+		{Name: "first", Data: json.RawMessage(`{"id":"first"}`)},
+		{Name: "second", Data: json.RawMessage(`{"id":"second"}`)},
+	})
+	engine.RegisterUndo("second", func(context.Context, json.RawMessage) error {
+		return nil
+	})
+	engine.RegisterUndo("first", func(context.Context, json.RawMessage) error {
+		if len(persister.steps) != 1 || persister.steps[0].Name != "first" {
+			t.Fatalf("remaining steps before next undo = %+v, want only first", persister.steps)
+		}
+		return nil
+	})
+
+	if errs := engine.Rollback(context.Background()); len(errs) != 0 {
+		t.Fatalf("rollback errors = %v", errs)
+	}
+	if len(persister.steps) != 0 {
+		t.Fatalf("final persisted steps = %+v, want empty", persister.steps)
 	}
 }

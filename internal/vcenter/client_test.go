@@ -52,3 +52,24 @@ func TestDuplicateCloneNameErrorsAreRecognized(t *testing.T) {
 		}
 	}
 }
+
+func TestCloneOperationExtraConfigCarriesCompleteIdentity(t *testing.T) {
+	params := CloneVMParams{
+		OperationID:  "operation-1",
+		PodVMID:      "pod-vm-1",
+		TemplateName: "vm-source",
+	}
+	values, err := cloneOperationExtraConfig(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{
+		CloneOperationIDKey:     params.OperationID,
+		CloneOperationSourceKey: params.TemplateName,
+		CloneOperationPodVMKey:  params.PodVMID,
+	} {
+		if got := optionValueString(values, key); got != want {
+			t.Errorf("%s = %q, want %q", key, got, want)
+		}
+	}
+}

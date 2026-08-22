@@ -49,14 +49,24 @@ continues compensation-only retries for cleanup that began before maintenance;
 those retries cannot resume pod or VM creation.
 
 Operators can distinguish ordinary queued work from recovery work in the job
-payload: only `pod_create` or `vm_add` jobs carrying `cleanup_only: true` remain
-claimable while provisioning claims are disabled. Clone cleanup uses the exact
-vCenter MoRef persisted for that attempt, never a VM display name. If shutdown
-or lease loss occurs immediately after cloning, the worker persists and fences
-that exact cleanup target before destroying it, then records durable proof
-before exiting. Concurrent exact targets are retained and cleaned in sequence.
-Pod creation keeps exact clone cleanup intent armed until its rollback record is
-durable and the same claim finishes adoption.
+payload: `pod_create`, `vm_add`, `template_verify`, and `template_revalidate`
+jobs are withheld while provisioning claims are disabled unless they carry
+`cleanup_only: true`. Before submitting a clone, the worker persists a
+per-attempt operation UUID and embeds that UUID, the source template identity,
+and the pod VM identity (or job/template scope for a smoke clone) in the clone's
+vCenter `extraConfig`. The returned task MoRef is persisted before waiting. A
+replacement worker resumes that exact task, or reconciles a lost SOAP response
+by the complete marker and target name; it never submits a second clone or
+adopts a same-name VM without matching ownership proof. The exact resulting VM
+MoRef is then staged before any reconfiguration. Cleanup never resolves a VM by
+display name and never resumes forward configuration, power-on, or snapshots.
+
+Clone task waits have a 15-minute operational deadline. An armed submission
+with no task reference and no discoverable marked VM remains cleanup-only for
+30 minutes, then surfaces `manual_cleanup_required` for operator resolution
+rather than retrying or cloning indefinitely. Pod creation keeps exact clone
+cleanup intent armed until its rollback record is durable and the same claim
+finishes adoption.
 Failed cleanup remains pending with capped backoff independently of the
 original provisioning retry limit. Successful compensation records the parent
 job as failed with `compensated: true`; ambiguous ownership records
@@ -70,7 +80,15 @@ unique process identity plus a per-claim fencing token and refreshes a heartbeat
 lease. Startup and periodic recovery reset only expired claims, never fresh
 work owned by another replica; ownership loss cancels execution and blocks
 stale finalization. On shutdown, unfinished claims become recoverable only
-after their conservative lease expires.
+after their conservative lease expires. If ownership changes while a completed
+infrastructure step is being recorded, the stale worker does not undo it behind
+the successor. Any ambiguous persistence failure uses the same handoff path.
+Before every destructive rollback step, the worker re-persists the receipt under
+its active claim and refreshes the lease; failure to prove ownership stops the
+rollback. The handoff appends the exact receipt, fences the current generation
+into cleanup-only work, and leaves destructive compensation to the next owner.
+Worker shutdown, including scheduler and database-pool closure, is bounded at
+two minutes, with 150 seconds of pod termination grace for that handoff.
 
 Authenticated clients can check the stable read-only contract at
 `GET /api/v1/provisioning/status`:

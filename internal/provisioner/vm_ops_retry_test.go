@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/models"
+	"github.com/jmal1/selfservice-api/internal/rollback"
 )
 
 type fakeCloneHandoffStore struct {
@@ -65,18 +67,6 @@ func (f *fakeCloneHandoffStore) RecordDestroyedVMCloneHandoff(
 		return err
 	}
 	f.proofTargets = append(f.proofTargets, append([]byte(nil), target...))
-	return nil
-}
-
-type fakeCloneHandoffDestroyer struct {
-	morefs []string
-}
-
-func (f *fakeCloneHandoffDestroyer) DestroyVM(ctx context.Context, moref string) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	f.morefs = append(f.morefs, moref)
 	return nil
 }
 
@@ -165,7 +155,7 @@ func TestAddVMPayloadCleanupOnlyRoundTrip(t *testing.T) {
 	}
 }
 
-func TestCanceledCloneHandoffDestroysExactTargetAndPersistsProof(t *testing.T) {
+func TestCanceledCloneHandoffPersistsExactTargetWithoutStaleDestroy(t *testing.T) {
 	target := VMCloneCleanupTarget{
 		PodID:       uuid.NewString(),
 		PodVMID:     uuid.NewString(),
@@ -178,14 +168,12 @@ func TestCanceledCloneHandoffDestroysExactTargetAndPersistsProof(t *testing.T) {
 	store := &fakeCloneHandoffStore{
 		stageErrs: []error{errors.New("database unavailable"), nil},
 	}
-	destroyer := &fakeCloneHandoffDestroyer{}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
 	destroyed, err := persistVMCloneHandoff(
 		ctx,
 		store,
-		destroyer,
 		uuid.New(),
 		"worker-a",
 		targetJSON,
@@ -194,31 +182,22 @@ func TestCanceledCloneHandoffDestroysExactTargetAndPersistsProof(t *testing.T) {
 	if err != nil {
 		t.Fatalf("persistVMCloneHandoff returned %v", err)
 	}
-	if !destroyed {
-		t.Fatal("canceled handoff neither persisted ownership nor destroyed the exact clone")
+	if destroyed {
+		t.Fatal("canceled owner destructively cleaned a clone after durable staging")
 	}
-	if store.stageCalls != 1 {
-		t.Fatalf("stage calls = %d, want one bounded attempt before shutdown-safe cleanup", store.stageCalls)
+	if store.stageCalls != 2 {
+		t.Fatalf("stage calls = %d, want transient failure then durable handoff", store.stageCalls)
 	}
-	if len(store.stageTargets) != 1 ||
-		string(store.stageTargets[0]) != string(targetJSON) {
+	if len(store.stageTargets) != 2 ||
+		string(store.stageTargets[1]) != string(targetJSON) {
 		t.Fatalf("exact target was not preserved during canceled handoff: %q", store.stageTargets)
 	}
-	if len(destroyer.morefs) != 1 || destroyer.morefs[0] != target.VCenterVMID {
-		t.Fatalf("destroyed MoRefs = %v, want exact %q", destroyer.morefs, target.VCenterVMID)
-	}
-	if store.destructionStageCalls != 1 ||
-		len(store.destructionTargets) != 1 ||
-		string(store.destructionTargets[0]) != string(targetJSON) {
-		t.Fatalf("durable pre-destroy handoff = %q, want exact target %q", store.destructionTargets, targetJSON)
-	}
-	if len(store.proofTargets) != 1 ||
-		string(store.proofTargets[0]) != string(targetJSON) {
-		t.Fatalf("destroyed-clone proof = %q, want exact target %q", store.proofTargets, targetJSON)
+	if store.destructionStageCalls != 0 || len(store.proofTargets) != 0 {
+		t.Fatal("canceled owner attempted destructive fallback instead of durable successor handoff")
 	}
 }
 
-func TestLostLeaseCloneHandoffDestroysExactMoRefAndRecordsProof(t *testing.T) {
+func TestLostLeaseCloneHandoffNeverDestroysBehindSuccessor(t *testing.T) {
 	target := VMCloneCleanupTarget{
 		PodID:       uuid.NewString(),
 		PodVMID:     uuid.NewString(),
@@ -231,34 +210,22 @@ func TestLostLeaseCloneHandoffDestroysExactMoRefAndRecordsProof(t *testing.T) {
 	store := &fakeCloneHandoffStore{
 		stageErrs: []error{database.ErrJobLeaseLost},
 	}
-	destroyer := &fakeCloneHandoffDestroyer{}
-
 	destroyed, err := persistVMCloneHandoff(
 		context.Background(),
 		store,
-		destroyer,
 		uuid.New(),
 		"worker-a",
 		targetJSON,
 		target.VCenterVMID,
 	)
-	if err != nil {
-		t.Fatalf("persistVMCloneHandoff returned %v", err)
+	if !errors.Is(err, database.ErrJobLeaseLost) {
+		t.Fatalf("persistVMCloneHandoff error = %v, want lease lost", err)
 	}
-	if !destroyed {
-		t.Fatal("lost-lease clone handoff did not use synchronous exact cleanup")
+	if destroyed {
+		t.Fatal("lost owner reported a destructive handoff")
 	}
-	if store.destructionStageCalls != 1 ||
-		len(store.destructionTargets) != 1 ||
-		string(store.destructionTargets[0]) != string(targetJSON) {
-		t.Fatalf("durable pre-destroy handoff = %q, want exact target %q", store.destructionTargets, targetJSON)
-	}
-	if len(destroyer.morefs) != 1 || destroyer.morefs[0] != target.VCenterVMID {
-		t.Fatalf("destroyed MoRefs = %v, want exact %q", destroyer.morefs, target.VCenterVMID)
-	}
-	if len(store.proofTargets) != 1 ||
-		string(store.proofTargets[0]) != string(targetJSON) {
-		t.Fatalf("destroyed-clone proof = %q, want exact target %q", store.proofTargets, targetJSON)
+	if store.destructionStageCalls != 0 || len(store.proofTargets) != 0 {
+		t.Fatal("lost owner destroyed or rewrote successor-owned state")
 	}
 }
 
@@ -275,12 +242,9 @@ func TestPreviouslyDestroyedCloneCannotBeStagedOrDestroyedAgain(t *testing.T) {
 	store := &fakeCloneHandoffStore{
 		stageErrs: []error{database.ErrVMCloneAlreadyDestroyed},
 	}
-	destroyer := &fakeCloneHandoffDestroyer{}
-
 	destroyed, err := persistVMCloneHandoff(
 		context.Background(),
 		store,
-		destroyer,
 		uuid.New(),
 		"worker-a:claim-a",
 		targetJSON,
@@ -292,15 +256,12 @@ func TestPreviouslyDestroyedCloneCannotBeStagedOrDestroyedAgain(t *testing.T) {
 	if !destroyed {
 		t.Fatal("durable destruction proof was not treated as completed handoff")
 	}
-	if len(destroyer.morefs) != 0 {
-		t.Fatalf("already-destroyed target was destroyed again: %v", destroyer.morefs)
-	}
 	if len(store.proofTargets) != 0 {
 		t.Fatal("existing destruction proof was redundantly rewritten")
 	}
 }
 
-func TestLostLeaseHandoffRetriesDurableIntentBeforeDestroy(t *testing.T) {
+func TestLostLeaseHandoffStopsWithoutDestructiveRetry(t *testing.T) {
 	target := VMCloneCleanupTarget{
 		PodID:       uuid.NewString(),
 		PodVMID:     uuid.NewString(),
@@ -311,31 +272,21 @@ func TestLostLeaseHandoffRetriesDurableIntentBeforeDestroy(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := &fakeCloneHandoffStore{
-		stageErrs:            []error{database.ErrJobLeaseLost},
-		destructionStageErrs: []error{errors.New("database unavailable"), nil},
+		stageErrs: []error{database.ErrJobLeaseLost},
 	}
-	destroyer := &fakeCloneHandoffDestroyer{}
-
 	destroyed, err := persistVMCloneHandoff(
 		context.Background(),
 		store,
-		destroyer,
 		uuid.New(),
 		"worker-a:claim-a",
 		targetJSON,
 		target.VCenterVMID,
 	)
-	if err != nil {
-		t.Fatalf("persistVMCloneHandoff returned %v", err)
+	if !errors.Is(err, database.ErrJobLeaseLost) || destroyed {
+		t.Fatalf("destroyed=%t err=%v, want non-destructive lease-loss handoff", destroyed, err)
 	}
-	if !destroyed {
-		t.Fatal("lost-lease handoff did not complete exact destruction")
-	}
-	if store.destructionStageCalls != 2 {
-		t.Fatalf("destruction-stage calls = %d, want transient failure then success", store.destructionStageCalls)
-	}
-	if len(destroyer.morefs) != 1 {
-		t.Fatalf("destroy ran %d times, want once after durable handoff", len(destroyer.morefs))
+	if store.stageCalls != 1 || store.destructionStageCalls != 0 {
+		t.Fatalf("stage=%d destruction_stage=%d", store.stageCalls, store.destructionStageCalls)
 	}
 }
 
@@ -347,11 +298,25 @@ func TestPodCreateCleanupProvisioningTransitionRequiresOwnedExactTarget(t *testi
 		VMs:   []VMSpec{{PodVMID: podVMID}},
 	}
 	tests := []struct {
-		name   string
-		target *VMCloneCleanupTarget
-		want   bool
+		name      string
+		target    *VMCloneCleanupTarget
+		operation *models.VMCloneOperation
+		want      bool
 	}{
 		{name: "marker only", want: false},
+		{
+			name: "durable operation",
+			operation: &models.VMCloneOperation{
+				OperationID: uuid.NewString(),
+				PodID:       podID.String(),
+				PodVMID:     podVMID.String(),
+				TargetName:  "target",
+				SourceRef:   "vm-source",
+				Phase:       models.VMCloneOperationSubmitting,
+				PreparedAt:  time.Now(),
+			},
+			want: true,
+		},
 		{
 			name: "exact target",
 			target: &VMCloneCleanupTarget{
@@ -392,6 +357,7 @@ func TestPodCreateCleanupProvisioningTransitionRequiresOwnedExactTarget(t *testi
 		t.Run(tc.name, func(t *testing.T) {
 			payload := base
 			payload.CleanupTarget = tc.target
+			payload.CloneOperation = tc.operation
 			if got := podCreateCleanupOwnsStagedClone(payload); got != tc.want {
 				t.Fatalf("podCreateCleanupOwnsStagedClone() = %t, want %t", got, tc.want)
 			}
@@ -406,6 +372,21 @@ func TestStaleVMCloneCleanupFailureIsRetryable(t *testing.T) {
 	)
 	if !retryable || reason != RetryReasonCleanup {
 		t.Fatalf("retryable=%t reason=%q, want true/%q", retryable, reason, RetryReasonCleanup)
+	}
+
+}
+
+func TestPodCreateRollbackReceiptAuthorizesPreCloneCleanup(t *testing.T) {
+	payload := CreatePodPayload{PodID: uuid.New()}
+	if podCreateCleanupCanTransition(payload, nil) {
+		t.Fatal("cleanup without a clone target or rollback receipt was authorized")
+	}
+	steps := []rollback.Step{{
+		Name: "vlan",
+		Data: json.RawMessage(`{"vlan_id":123}`),
+	}}
+	if !podCreateCleanupCanTransition(payload, steps) {
+		t.Fatal("durable pre-clone rollback receipt did not authorize cleanup")
 	}
 }
 

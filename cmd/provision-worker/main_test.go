@@ -2,6 +2,7 @@ package main
 
 import (
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -34,7 +35,7 @@ func TestJobRunnerShutdownWaitsForInFlightHandoff(t *testing.T) {
 
 	stopped := make(chan struct{})
 	go func() {
-		runner.StopAndWait()
+		runner.StopAndWait(time.Second)
 		close(stopped)
 	}()
 	select {
@@ -52,4 +53,44 @@ func TestJobRunnerShutdownWaitsForInFlightHandoff(t *testing.T) {
 	if runner.Go(func() {}) {
 		t.Fatal("runner accepted new work after shutdown began")
 	}
+}
+
+func TestJobRunnerShutdownIsBounded(t *testing.T) {
+	runner := &jobRunner{}
+	release := make(chan struct{})
+	if !runner.Go(func() { <-release }) {
+		t.Fatal("runner rejected work before shutdown")
+	}
+	started := time.Now()
+	if runner.StopAndWait(20 * time.Millisecond) {
+		t.Fatal("shutdown reported completion while work remained blocked")
+	}
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("bounded shutdown took %s", elapsed)
+	}
+	close(release)
+}
+
+type blockingCloser struct {
+	once    sync.Once
+	started chan struct{}
+	release chan struct{}
+}
+
+func (c *blockingCloser) Close() {
+	c.once.Do(func() { close(c.started) })
+	<-c.release
+}
+
+func TestCloseBeforeDeadlineIsBounded(t *testing.T) {
+	resource := &blockingCloser{started: make(chan struct{}), release: make(chan struct{})}
+	start := time.Now()
+	if closeBeforeDeadline(resource, 20*time.Millisecond) {
+		t.Fatal("close reported completion while resource remained blocked")
+	}
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		t.Fatalf("bounded close took %s", elapsed)
+	}
+	<-resource.started
+	close(resource.release)
 }

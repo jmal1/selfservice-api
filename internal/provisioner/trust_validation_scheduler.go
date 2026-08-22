@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"time"
 )
 
 type l1ValidationReconcileFunc func(context.Context) (L1TrustValidationCounts, error)
@@ -178,4 +179,21 @@ func (s *L1TrustValidationScheduler) Stop() {
 // Wait blocks until all started reconciliations return.
 func (s *L1TrustValidationScheduler) Wait() {
 	s.wait.Wait()
+}
+
+// WaitTimeout blocks until all reconciliations return or the deadline elapses.
+func (s *L1TrustValidationScheduler) WaitTimeout(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.wait.Wait()
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
 }

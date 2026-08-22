@@ -21,9 +21,31 @@ import (
 	"github.com/vmware/govmomi/vim25/types"
 )
 
-const cloneTaskWaitSlice = 2 * time.Minute
+const (
+	cloneTaskWaitSlice          = 2 * time.Minute
+	cloneTaskOperationalTimeout = 15 * time.Minute
+
+	CloneOperationIDKey     = "guestinfo.crucible.clone_operation_id"
+	CloneOperationSourceKey = "guestinfo.crucible.clone_source_ref"
+	CloneOperationPodVMKey  = "guestinfo.crucible.clone_pod_vm_id"
+)
 
 var ErrAmbiguousVMOwnership = errors.New("VM ownership cannot be proven")
+var ErrCloneTaskFailed = errors.New("vCenter clone task failed")
+
+func cloneOperationExtraConfig(params CloneVMParams) ([]types.BaseOptionValue, error) {
+	if params.OperationID == "" {
+		return nil, nil
+	}
+	if params.PodVMID == "" {
+		return nil, errors.New("clone operation requires pod VM identity")
+	}
+	return []types.BaseOptionValue{
+		&types.OptionValue{Key: CloneOperationIDKey, Value: params.OperationID},
+		&types.OptionValue{Key: CloneOperationSourceKey, Value: params.TemplateName},
+		&types.OptionValue{Key: CloneOperationPodVMKey, Value: params.PodVMID},
+	}, nil
+}
 
 // Config holds vCenter connection settings.
 type Config struct {
@@ -176,15 +198,21 @@ type CloneVMParams struct {
 	Network      string // port group name
 	OSType       string // "linux" or "windows"
 	Password     string // generated password for cloud-init
+	OperationID  string // durable provisioning-attempt identity
+	PodVMID      string // immutable database VM identity
 }
 
-// CloneVM clones a template into the Student-VMs folder.
-// Returns the VM's managed object reference (MoRef) as a string.
-func (c *Client) CloneVM(ctx context.Context, params CloneVMParams) (string, error) {
+// StartCloneVMOperation runs all read-only clone preparation before invoking
+// arm. Once arm succeeds, the next remote call is CloneVM_Task itself.
+func (c *Client) StartCloneVMOperation(
+	ctx context.Context,
+	params CloneVMParams,
+	arm func(context.Context) error,
+) (string, error) {
 	if err := c.ensureConnected(ctx); err != nil {
 		return "", err
 	}
-	return c.cloneVMInner(ctx, params)
+	return c.startCloneVMInner(ctx, params, arm)
 }
 
 // resolveSourceVM looks up a VM by either inventory name or moref. A
@@ -229,8 +257,11 @@ func isVMMoref(s string) bool {
 	return true
 }
 
-// cloneVMInner contains the actual clone logic (called by CloneVM via withRetry).
-func (c *Client) cloneVMInner(ctx context.Context, params CloneVMParams) (string, error) {
+func (c *Client) startCloneVMInner(
+	ctx context.Context,
+	params CloneVMParams,
+	arm func(context.Context) error,
+) (string, error) {
 	// Find template — accepts inventory name OR moref (e.g. "vm-8942").
 	template, err := c.resolveSourceVM(ctx, params.TemplateName)
 	if err != nil {
@@ -260,12 +291,7 @@ func (c *Client) cloneVMInner(ctx context.Context, params CloneVMParams) (string
 	// when the caller already persisted the exact MoRef on its pod_vms row.
 	existing, lookupErr := c.findVMInFolderStrict(ctx, folder, params.VMName)
 	if lookupErr != nil {
-		return "", fmt.Errorf(
-			"%w: cannot verify clone target %q is unused: %v",
-			ErrAmbiguousVMOwnership,
-			params.VMName,
-			lookupErr,
-		)
+		return "", fmt.Errorf("verify clone target %q is unused: %w", params.VMName, lookupErr)
 	}
 	if existing != "" {
 		return "", fmt.Errorf(
@@ -289,15 +315,6 @@ func (c *Client) cloneVMInner(ctx context.Context, params CloneVMParams) (string
 	}
 	dsRef := ds.Reference()
 
-	// For standard vSwitch port groups, construct the backing info directly by name.
-	// finder.Network() can't find per-host port groups; using the name directly works
-	// because vCenter resolves it on the target host at clone time.
-	netBacking := &types.VirtualEthernetCardNetworkBackingInfo{
-		VirtualDeviceDeviceBackingInfo: types.VirtualDeviceDeviceBackingInfo{
-			DeviceName: params.Network,
-		},
-	}
-
 	// Build clone spec — use linked clones for fast provisioning.
 	// Linked clones create a thin delta disk referencing the template's snapshot,
 	// reducing clone time from minutes (full copy) to seconds.
@@ -309,6 +326,15 @@ func (c *Client) cloneVMInner(ctx context.Context, params CloneVMParams) (string
 		},
 		PowerOn:  false,
 		Template: false,
+	}
+	if params.OperationID != "" {
+		operationConfig, err := cloneOperationExtraConfig(params)
+		if err != nil {
+			return "", err
+		}
+		cloneSpec.Config = &types.VirtualMachineConfigSpec{
+			ExtraConfig: operationConfig,
+		}
 	}
 
 	// Get or create a snapshot on the template for linked cloning
@@ -330,6 +356,11 @@ func (c *Client) cloneVMInner(ctx context.Context, params CloneVMParams) (string
 		"network", params.Network,
 	)
 
+	if arm != nil {
+		if err := arm(ctx); err != nil {
+			return "", fmt.Errorf("arm clone operation before submission: %w", err)
+		}
+	}
 	task, err := template.Clone(ctx, folder, params.VMName, cloneSpec)
 	if err != nil {
 		if isDuplicateNameErr(err) {
@@ -337,67 +368,88 @@ func (c *Client) cloneVMInner(ctx context.Context, params CloneVMParams) (string
 		}
 		return "", fmt.Errorf("start clone: %w", err)
 	}
-	taskRef := task.Reference()
+	return task.Reference().Value, nil
+}
 
-	// Once vCenter accepts a clone task, cancellation cannot safely abandon it:
-	// the resulting immutable MoRef is required for durable adoption or cleanup.
-	// Each collector wait is bounded, but timeout only rotates the collector;
-	// it never discards the live remote task identity.
-	var info *types.TaskInfo
+// WaitCloneVMTask resumes an existing vCenter task reference. The wait has an
+// operational deadline and always honors lease loss or worker shutdown.
+func (c *Client) WaitCloneVMTask(ctx context.Context, taskRef string) (string, error) {
+	if taskRef == "" {
+		return "", errors.New("clone task reference is empty")
+	}
+	if err := c.ensureConnected(ctx); err != nil {
+		return "", err
+	}
+	overallCtx, cancelOverall := context.WithTimeout(ctx, cloneTaskOperationalTimeout)
+	defer cancelOverall()
+
+	ref := types.ManagedObjectReference{Type: "Task", Value: taskRef}
+	task := object.NewTask(c.client.Client, ref)
 	for {
-		waitCtx, cancelWait := context.WithTimeout(context.WithoutCancel(ctx), cloneTaskWaitSlice)
-		info, err = task.WaitForResult(waitCtx, nil)
+		waitCtx, cancelWait := context.WithTimeout(overallCtx, cloneTaskWaitSlice)
+		info, err := task.WaitForResult(waitCtx, nil)
 		cancelWait()
 		switch {
 		case err == nil:
-			break
-		case errors.Is(err, context.DeadlineExceeded):
+			vmRef, ok := info.Result.(types.ManagedObjectReference)
+			if !ok || vmRef.Type != "VirtualMachine" || vmRef.Value == "" {
+				return "", fmt.Errorf("clone task %s returned unexpected result %T", taskRef, info.Result)
+			}
+			c.logger.Info("VM clone task completed", "task", taskRef, "moref", vmRef.Value)
+			return vmRef.Value, nil
+		case errors.Is(err, context.DeadlineExceeded) && overallCtx.Err() == nil:
 			c.logger.Warn("clone task still running after wait slice",
-				"name", params.VMName, "task", taskRef.Value, "wait_slice", cloneTaskWaitSlice)
+				"task", taskRef, "wait_slice", cloneTaskWaitSlice)
 			continue
+		case errors.Is(err, context.Canceled), errors.Is(overallCtx.Err(), context.DeadlineExceeded):
+			waitErr := overallCtx.Err()
+			if waitErr == nil {
+				waitErr = err
+			}
+			return "", fmt.Errorf("wait for clone task %s: %w", taskRef, waitErr)
 		case isNotAuthenticatedErr(err):
-			reconnectCtx, cancelReconnect := context.WithTimeout(context.WithoutCancel(ctx), cloneTaskWaitSlice)
+			reconnectCtx, cancelReconnect := context.WithTimeout(overallCtx, 30*time.Second)
 			reconnectErr := c.Connect(reconnectCtx)
 			cancelReconnect()
 			if reconnectErr != nil {
-				c.logger.Warn("clone task wait reconnect failed; retaining task identity",
-					"name", params.VMName, "task", taskRef.Value, "error", reconnectErr)
-				time.Sleep(time.Second)
-				continue
+				return "", fmt.Errorf("reconnect while waiting for clone task %s: %w", taskRef, reconnectErr)
 			}
-			task = object.NewTask(c.client.Client, taskRef)
-			continue
+			task = object.NewTask(c.client.Client, ref)
 		default:
 			var taskErr vimtask.Error
 			if errors.As(err, &taskErr) {
 				if isDuplicateNameErr(err) {
-					return "", fmt.Errorf("%w: clone task %s: %v", ErrAmbiguousVMOwnership, taskRef.Value, err)
+					return "", fmt.Errorf("%w: clone task %s: %v", ErrAmbiguousVMOwnership, taskRef, err)
 				}
-				return "", fmt.Errorf("clone task %s: %w", taskRef.Value, err)
+				return "", fmt.Errorf("%w: task %s: %v", ErrCloneTaskFailed, taskRef, err)
 			}
-			c.logger.Warn("clone task wait failed; retaining task identity",
-				"name", params.VMName, "task", taskRef.Value, "error", err)
-			time.Sleep(time.Second)
-			continue
+			return "", fmt.Errorf("wait for clone task %s: %w", taskRef, err)
 		}
-		break
 	}
+}
 
-	vmRef := info.Result.(types.ManagedObjectReference)
-	c.logger.Info("VM cloned", "name", params.VMName, "moref", vmRef.Value)
-
-	// Reconfigure the cloned VM: CPU, RAM, and network.
+// ConfigureClonedVM applies the mutable VM settings after the exact clone MoRef
+// is known and has been staged for compensation.
+func (c *Client) ConfigureClonedVM(ctx context.Context, moref string, params CloneVMParams) error {
+	if err := c.ensureConnected(ctx); err != nil {
+		return err
+	}
+	vmRef := types.ManagedObjectReference{Type: "VirtualMachine", Value: moref}
 	clonedVM := object.NewVirtualMachine(c.client.Client, vmRef)
-
 	configSpec := types.VirtualMachineConfigSpec{
 		NumCPUs:  params.VCPUs,
 		MemoryMB: params.RAMmb,
+	}
+	netBacking := &types.VirtualEthernetCardNetworkBackingInfo{
+		VirtualDeviceDeviceBackingInfo: types.VirtualDeviceDeviceBackingInfo{
+			DeviceName: params.Network,
+		},
 	}
 
 	// Set network adapter on the first NIC
 	var vmMo mo.VirtualMachine
 	if err := clonedVM.Properties(ctx, vmRef, []string{"config.hardware.device"}, &vmMo); err != nil {
-		return vmRef.Value, fmt.Errorf("get cloned VM devices: %w", err)
+		return fmt.Errorf("get cloned VM devices: %w", err)
 	}
 
 	for _, dev := range vmMo.Config.Hardware.Device {
@@ -420,14 +472,14 @@ func (c *Client) cloneVMInner(ctx context.Context, params CloneVMParams) (string
 
 	reconfigTask, err := clonedVM.Reconfigure(ctx, configSpec)
 	if err != nil {
-		return vmRef.Value, fmt.Errorf("start reconfigure: %w", err)
+		return fmt.Errorf("start reconfigure: %w", err)
 	}
 	if err := reconfigTask.Wait(ctx); err != nil {
-		return vmRef.Value, fmt.Errorf("reconfigure task: %w", err)
+		return fmt.Errorf("reconfigure task: %w", err)
 	}
 
 	c.logger.Info("VM reconfigured", "name", params.VMName, "vcpus", params.VCPUs, "ram_mb", params.RAMmb)
-	return vmRef.Value, nil
+	return nil
 }
 
 // ensureTemplateSnapshot checks if the template has a snapshot for linked cloning.

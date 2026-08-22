@@ -7,8 +7,9 @@ replicaCount:
   engine: 1
 
 # Independent maintenance controls. API admission and worker claims are
-# separate so operators can start a worker for cleanup while create/add jobs
-# remain queued. Invalid environment values fail process startup.
+# separate so operators can start a worker for cleanup while pod deployment,
+# add-VM, and template smoke-clone jobs remain queued. Invalid environment
+# values fail process startup.
 provisioning:
   enabled: true
   workerClaimsEnabled: true
@@ -43,6 +44,9 @@ api:
       memory: 256Mi
 
 worker:
+  # The worker bounds in-process durable handoff at two minutes. Leave enough
+  # pod termination grace for that handoff and process teardown.
+  shutdownGracePeriodSeconds: 150
   # Pushgateway endpoint for the DestroyFailedPusher (drives the
   # CruciblePodsStuckInDestroyFailed Prometheus alert). Set to empty
   # string to disable cleanly. Job label is the Pushgateway grouping key.

@@ -762,7 +762,7 @@ Crucible has two independent, strict maintenance controls:
 
 - `PROVISIONING_ENABLED` controls API admission for new user provisioning.
 - `WORKER_PROVISIONING_CLAIMS_ENABLED` controls whether workers claim
-  `pod_create` and `vm_add` jobs.
+  `pod_create`, `vm_add`, `template_verify`, and `template_revalidate` jobs.
 
 Both default to `true` for backward compatibility. If either variable is set,
 it must parse as a Go boolean; an invalid value fails process startup rather
@@ -787,21 +787,33 @@ uses the normal error envelope:
 ```
 
 Delete/destroy, delete-VM, power, and cleanup paths are intentionally not
-gated. When worker provisioning claims are disabled, ordinary `pod_create` and
-`vm_add` jobs are excluded inside the atomic claim query and remain pending;
-destroy jobs and either provisioning type marked `cleanup_only` remain
-claimable.
+gated. When worker provisioning claims are disabled, ordinary `pod_create`,
+`vm_add`, `template_verify`, and `template_revalidate` jobs are excluded inside
+the atomic claim query and remain pending; destroy jobs and any withheld type
+marked `cleanup_only` remain claimable.
 
-Compensation intent is durable. A clone's exact vCenter MoRef, pod id, and pod
-VM id are persisted on its parent job before the clone can be adopted by the VM
-row. That post-clone handoff ignores worker cancellation. If its lease was
-already lost, it first persists cleanup-only intent and fences the claim, then
-synchronously destroys only that exact MoRef and persists append-only
-destruction proof before returning; graceful shutdown waits for the handoff.
-Concurrent exact targets are retained and cleaned in sequence, never
-overwritten. Cleanup never resolves or adopts a VM by its mutable display name.
-For pod creation, rollback identity is persisted before clone adoption and the
-cleanup marker is disarmed only by the same fenced claim afterward.
+Compensation intent is durable before clone submission. The fenced job first
+persists a per-attempt operation UUID, pod id, pod VM id, target name, and
+source template identity. Immediately before `CloneVM_Task`, it atomically arms
+`cleanup_only` and embeds the operation UUID, source identity, and pod VM id in
+the clone's vCenter `extraConfig`. If vCenter accepts the request but the SOAP
+response is lost, recovery searches the target folder by that complete marker;
+a same-name VM without the marker is ambiguous and is never adopted or deleted.
+Once vCenter returns a task MoRef, the worker persists it before waiting.
+Successors resume that exact task and never submit a second clone for an armed
+operation. Template verification and revalidation smoke clones use this same
+protocol; their job and template ids provide the immutable operation scope, and
+an interrupted smoke check is cleanup-only before it can be claimed again.
+
+Clone task waits have a 15-minute operational deadline and honor lease loss.
+Task or marker recovery stages the exact VM MoRef before any mutable
+reconfiguration. Cleanup never resolves a VM by display name and never performs
+forward configuration, power-on, or snapshots. An armed submission with neither
+a task nor a marked VM remains cleanup-only while reconciliation is credible;
+after 30 minutes it becomes `manual_cleanup_required` rather than retrying or
+submitting a duplicate indefinitely. For pod creation, rollback identity is
+persisted before clone adoption and the cleanup marker plus operation identity
+are disarmed only by the same fenced claim afterward.
 If ownership is lost or cleanup fails, the parent job remains `cleanup_only`
 and retries with capped backoff independently of its original provisioning
 retry budget. It cannot resume cloning, power-on, or snapshots. A cleanup-only
@@ -823,8 +835,16 @@ the PostgreSQL clock; they never broadly reset another replica's fresh work.
 Loss of ownership or lease freshness cancels execution. In-progress, retry,
 terminal-status, cleanup-target staging, and clone-adoption writes all verify
 the same claim owner, so a superseded worker cannot finalize or attach a clone.
-Shutdown leaves the claim to expire for the replacement worker instead of
-stealing it immediately.
+If ownership is lost while recording a completed infrastructure step, the old
+worker does not run destructive undo. Any ambiguous rollback-receipt persistence
+uses the same non-destructive handoff path. Before every rollback undo, the
+worker re-persists the receipt under its current claim, refreshing the lease and
+failing closed if ownership cannot be proven. The handoff idempotently appends
+the exact receipt, fences the current generation into `cleanup_only`, and lets
+the successor perform rollback. Worker shutdown, including scheduler and
+database-pool closure, waits at most two minutes; the chart grants 150 seconds
+of termination grace. Any unfinished claim then becomes recoverable only after
+its lease expires.
 
 Completed compensation finalizes the parent job as `failed` with
 `compensated: true` and publishes a `compensated` event; it is never reported

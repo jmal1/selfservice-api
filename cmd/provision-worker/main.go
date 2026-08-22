@@ -41,7 +41,6 @@ func main() {
 		logger.Error("database connection failed", "error", err)
 		os.Exit(1)
 	}
-	defer pool.Close()
 	queries := database.NewQueries(pool)
 
 	// Leader election: gate all periodic reconcilers behind a session-scoped
@@ -891,11 +890,20 @@ func main() {
 	<-sigCh
 
 	logger.Info("shutting down worker")
+	shutdownDeadline := time.Now().Add(2 * time.Minute)
 	cancel()
-	jobRuns.StopAndWait()
 	if l1ValidationScheduler != nil {
 		l1ValidationScheduler.Stop()
-		l1ValidationScheduler.Wait()
+	}
+	if !jobRuns.StopAndWait(time.Until(shutdownDeadline)) {
+		logger.Error("worker shutdown deadline reached; durable job recovery will resume unfinished work")
+	}
+	if l1ValidationScheduler != nil &&
+		!l1ValidationScheduler.WaitTimeout(time.Until(shutdownDeadline)) {
+		logger.Error("worker shutdown deadline reached while waiting for L1 trust validation")
+	}
+	if !closeBeforeDeadline(pool, time.Until(shutdownDeadline)) {
+		logger.Error("worker shutdown deadline reached while closing database pool")
 	}
 }
 
@@ -919,11 +927,43 @@ func (r *jobRunner) Go(run func()) bool {
 	return true
 }
 
-func (r *jobRunner) StopAndWait() {
+func (r *jobRunner) StopAndWait(timeout time.Duration) bool {
 	r.mu.Lock()
 	r.stopping = true
 	r.mu.Unlock()
-	r.wg.Wait()
+	done := make(chan struct{})
+	go func() {
+		r.wg.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+type closer interface {
+	Close()
+}
+
+func closeBeforeDeadline(resource closer, timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		resource.Close()
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
 }
 
 // processJobs claims and processes available jobs via the provisioner.

@@ -33,15 +33,7 @@ type VMCloneCleanupTarget struct {
 
 type vmCloneHandoffStore interface {
 	StageVMCloneCleanup(ctx context.Context, jobID uuid.UUID, workerID string, target []byte) error
-	StageVMCloneDestructionHandoff(ctx context.Context, jobID uuid.UUID, target []byte) error
-	RecordDestroyedVMCloneHandoff(ctx context.Context, jobID uuid.UUID, target []byte) error
 }
-
-type vmCloneHandoffDestroyer interface {
-	DestroyVM(ctx context.Context, moref string) error
-}
-
-const cloneHandoffDestroyTimeout = 2 * time.Minute
 
 func validateVMCloneCleanupTarget(target *VMCloneCleanupTarget) (uuid.UUID, uuid.UUID, error) {
 	if target == nil {
@@ -156,14 +148,15 @@ func (p *Provisioner) DestroyVM(ctx context.Context, job *models.Job) error {
 
 // AddVMPayload is the expected shape of job.Payload for vm_add.
 type AddVMPayload struct {
-	PodID         string                `json:"pod_id"`
-	PodVMID       string                `json:"pod_vm_id"`
-	TemplateName  string                `json:"template_name"`
-	VMName        string                `json:"vm_name"`
-	DisplayName   string                `json:"display_name"`
-	CleanupOnly   bool                  `json:"cleanup_only,omitempty"`
-	CleanupTarget *VMCloneCleanupTarget `json:"cleanup_target,omitempty"`
-	CleanupDone   bool                  `json:"cleanup_completed,omitempty"`
+	PodID          string                   `json:"pod_id"`
+	PodVMID        string                   `json:"pod_vm_id"`
+	TemplateName   string                   `json:"template_name"`
+	VMName         string                   `json:"vm_name"`
+	DisplayName    string                   `json:"display_name"`
+	CleanupOnly    bool                     `json:"cleanup_only,omitempty"`
+	CleanupTarget  *VMCloneCleanupTarget    `json:"cleanup_target,omitempty"`
+	CleanupDone    bool                     `json:"cleanup_completed,omitempty"`
+	CloneOperation *models.VMCloneOperation `json:"clone_operation,omitempty"`
 }
 
 func shouldMarkVMAddError(job *models.Job, jobErr error) bool {
@@ -215,7 +208,6 @@ func (p *Provisioner) stageVMCloneCleanup(
 	destroyed, err := persistVMCloneHandoff(
 		ctx,
 		p.db,
-		p.vc,
 		job.ID,
 		workerID,
 		target,
@@ -235,85 +227,24 @@ func (p *Provisioner) stageVMCloneCleanup(
 func persistVMCloneHandoff(
 	ctx context.Context,
 	store vmCloneHandoffStore,
-	destroyer vmCloneHandoffDestroyer,
 	jobID uuid.UUID,
 	workerID string,
 	target []byte,
 	moref string,
 ) (bool, error) {
-	handoffCtx := context.WithoutCancel(ctx)
-	failures := 0
-	for {
-		if failures > 0 {
-			time.Sleep(cleanupRescheduleBackoff(failures))
-		}
-		writeCtx, cancel := context.WithTimeout(handoffCtx, cleanupRescheduleWriteTimeout)
-		err := store.StageVMCloneCleanup(writeCtx, jobID, workerID, target)
-		cancel()
-		switch {
-		case err == nil:
-			return false, nil
-		case errors.Is(err, database.ErrVMCloneAlreadyDestroyed):
-			return true, nil
-		case errors.Is(err, database.ErrJobLeaseLost):
-			goto destroy
-		case ctx.Err() != nil:
-			goto destroy
-		default:
-			failures++
-		}
+	err := persistCloneOperationWrite(ctx, func(writeCtx context.Context) error {
+		return store.StageVMCloneCleanup(writeCtx, jobID, workerID, target)
+	})
+	if errors.Is(err, database.ErrVMCloneAlreadyDestroyed) {
+		return true, nil
 	}
-
-destroy:
-	failures = 0
-	for {
-		if failures > 0 {
-			time.Sleep(cleanupRescheduleBackoff(failures))
-		}
-		writeCtx, cancel := context.WithTimeout(handoffCtx, cleanupRescheduleWriteTimeout)
-		err := store.StageVMCloneDestructionHandoff(writeCtx, jobID, target)
-		cancel()
-		switch {
-		case err == nil:
-			goto destroyExact
-		case errors.Is(err, database.ErrVMCloneAlreadyDestroyed):
-			return true, nil
-		default:
-			failures++
-		}
+	if err != nil {
+		return false, fmt.Errorf("stage exact clone %s for successor cleanup: %w", moref, err)
 	}
-
-destroyExact:
-	failures = 0
-	for {
-		if failures > 0 {
-			time.Sleep(cleanupRescheduleBackoff(failures))
-		}
-		destroyCtx, cancel := context.WithTimeout(handoffCtx, cloneHandoffDestroyTimeout)
-		err := destroyer.DestroyVM(destroyCtx, moref)
-		cancel()
-		if err == nil {
-			break
-		}
-		failures++
-	}
-
-	failures = 0
-	for {
-		if failures > 0 {
-			time.Sleep(cleanupRescheduleBackoff(failures))
-		}
-		writeCtx, cancel := context.WithTimeout(handoffCtx, cleanupRescheduleWriteTimeout)
-		err := store.RecordDestroyedVMCloneHandoff(writeCtx, jobID, target)
-		cancel()
-		if err == nil {
-			return true, nil
-		}
-		failures++
-	}
+	return false, nil
 }
 
-func (p *Provisioner) cleanupStagedVMClone(ctx context.Context, jobID uuid.UUID) error {
+func (p *Provisioner) cleanupStagedVMClone(ctx context.Context, jobID uuid.UUID, workerID string) error {
 	job, err := p.db.GetJob(ctx, jobID)
 	if err != nil {
 		return &compensationRetryError{err: fmt.Errorf("load staged VM cleanup target: %w", err)}
@@ -324,11 +255,31 @@ func (p *Provisioner) cleanupStagedVMClone(ctx context.Context, jobID uuid.UUID)
 		}
 	}
 	var payload struct {
-		CleanupTarget         *VMCloneCleanupTarget  `json:"cleanup_target"`
-		CleanupHandoffTargets []VMCloneCleanupTarget `json:"cleanup_handoff_targets"`
+		CleanupTarget         *VMCloneCleanupTarget    `json:"cleanup_target"`
+		CleanupHandoffTargets []VMCloneCleanupTarget   `json:"cleanup_handoff_targets"`
+		CloneOperation        *models.VMCloneOperation `json:"clone_operation"`
 	}
 	if err := json.Unmarshal(job.Payload, &payload); err != nil {
 		return &compensationRetryError{err: fmt.Errorf("parse staged VM cleanup target: %w", err)}
+	}
+	if payload.CloneOperation != nil {
+		if err := reconcileCloneOperationForCleanup(
+			ctx,
+			p.db,
+			p.vc,
+			jobID,
+			workerID,
+			payload.CloneOperation,
+		); err != nil {
+			return err
+		}
+		job, err = p.db.GetJob(ctx, jobID)
+		if err != nil {
+			return &compensationRetryError{err: fmt.Errorf("reload reconciled VM cleanup target: %w", err)}
+		}
+		if err := json.Unmarshal(job.Payload, &payload); err != nil {
+			return &compensationRetryError{err: fmt.Errorf("parse reconciled VM cleanup target: %w", err)}
+		}
 	}
 	var targets []VMCloneCleanupTarget
 	if payload.CleanupTarget != nil {
@@ -403,7 +354,11 @@ func (p *Provisioner) failVMAddWithCleanup(
 	if err := p.stageVMCloneCleanup(ctx, job, podID, podVMID, moref); err != nil {
 		return err
 	}
-	if err := p.cleanupStagedVMClone(ctx, job.ID); err != nil {
+	workerID, _, err := claimedJobLease(job)
+	if err != nil {
+		return err
+	}
+	if err := p.cleanupStagedVMClone(ctx, job.ID, workerID); err != nil {
 		return err
 	}
 	completed, err := p.jobCompensationCompleted(ctx, job.ID)
@@ -427,7 +382,27 @@ func newVMAddCompensatedError(reason string) error {
 }
 
 func (p *Provisioner) runVMAddCleanup(ctx context.Context, job *models.Job) error {
-	if err := p.cleanupStagedVMClone(ctx, job.ID); err != nil {
+	var payload AddVMPayload
+	if err := json.Unmarshal(job.Payload, &payload); err != nil {
+		return fmt.Errorf("parse cleanup-only vm_add payload: %w", err)
+	}
+	podVMID, err := parseUUID(payload.PodVMID)
+	if err != nil {
+		return &manualCleanupRequiredError{err: fmt.Errorf("invalid cleanup pod_vm_id: %w", err)}
+	}
+	workerID, _, err := claimedJobLease(job)
+	if err != nil {
+		return err
+	}
+	if _, err := p.db.UpdatePodVMStatusFrom(
+		ctx,
+		podVMID,
+		[]string{models.VMStatusPending, models.VMStatusCloning, models.VMStatusConfiguring},
+		models.VMStatusError,
+	); err != nil {
+		return &compensationRetryError{err: fmt.Errorf("mark cleanup-only VM as error: %w", err)}
+	}
+	if err := p.cleanupStagedVMClone(ctx, job.ID, workerID); err != nil {
 		return err
 	}
 	completed, err := p.jobCompensationCompleted(ctx, job.ID)
@@ -564,7 +539,7 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) error {
 		p.publishProgress(job.ID, "vm_clone", fmt.Sprintf("Cloning %s from %s", payload.VMName, payload.TemplateName))
 
 		var err error
-		moref, err = p.vc.CloneVM(ctx, vcenter.CloneVMParams{
+		moref, err = executeDurableVMClone(ctx, p.db, p.vc, job.ID, workerID, podID, podVMID, vcenter.CloneVMParams{
 			TemplateName: payload.TemplateName,
 			VMName:       payload.VMName,
 			VCPUs:        int32(podVM.VCPUs),
@@ -591,10 +566,6 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) error {
 			}
 			return jobErr
 		}
-		if err := p.stageVMCloneCleanup(ctx, job, podID, podVMID, moref); err != nil {
-			return err
-		}
-
 		applied, err = p.db.AdoptPodVMClone(
 			ctx,
 			job.ID,

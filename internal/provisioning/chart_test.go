@@ -17,6 +17,9 @@ type chartValues struct {
 		Enabled             bool `yaml:"enabled"`
 		WorkerClaimsEnabled bool `yaml:"workerClaimsEnabled"`
 	} `yaml:"provisioning"`
+	Worker struct {
+		ShutdownGracePeriodSeconds int `yaml:"shutdownGracePeriodSeconds"`
+	} `yaml:"worker"`
 	Synthetic struct {
 		ProvisioningExpectedEnabled bool `yaml:"provisioningExpectedEnabled"`
 		Lifecycle                   struct {
@@ -83,6 +86,12 @@ func TestChartProvisioningDefaultsRemainCompatible(t *testing.T) {
 	if !values.Synthetic.ProvisioningExpectedEnabled {
 		t.Fatal("default synthetic must expect provisioning enabled")
 	}
+	if values.Worker.ShutdownGracePeriodSeconds < 120 {
+		t.Fatalf(
+			"worker shutdown grace = %d seconds, want at least the two-minute durable handoff window",
+			values.Worker.ShutdownGracePeriodSeconds,
+		)
+	}
 	for path, want := range map[string]string{
 		"provisioning.enabled":                  "true",
 		"provisioning.workerClaimsEnabled":      "true",
@@ -140,6 +149,7 @@ func TestChartWiresEveryProvisioningControl(t *testing.T) {
 		"worker-deployment.yaml": {
 			"WORKER_PROVISIONING_CLAIMS_ENABLED",
 			".Values.provisioning.workerClaimsEnabled",
+			"terminationGracePeriodSeconds: {{ .Values.worker.shutdownGracePeriodSeconds }}",
 		},
 		"synthetic-cronjob.yaml": {
 			"SYNTHETIC_PROVISIONING_EXPECTED_ENABLED",

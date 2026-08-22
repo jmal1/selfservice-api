@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jmal1/selfservice-api/internal/models"
@@ -17,8 +18,9 @@ func validateMaintenanceClaimSQL(query string) error {
 	for _, fragment := range []string{
 		"WHERE STATUS = 'PENDING'",
 		"$2",
-		"TYPE NOT IN ('POD_CREATE', 'VM_ADD')",
-		"TYPE IN ('POD_CREATE', 'VM_ADD') AND PAYLOAD->>'CLEANUP_ONLY' = 'TRUE'",
+		"TYPE NOT IN ('POD_CREATE', 'VM_ADD', 'TEMPLATE_VERIFY', 'TEMPLATE_REVALIDATE')",
+		"TYPE IN ('POD_CREATE', 'VM_ADD', 'TEMPLATE_VERIFY', 'TEMPLATE_REVALIDATE')",
+		"PAYLOAD->>'CLEANUP_ONLY' = 'TRUE'",
 		"FOR UPDATE SKIP LOCKED",
 	} {
 		if !strings.Contains(sql, fragment) {
@@ -38,20 +40,26 @@ func TestClaimJobMaintenancePolicySabotageIsDetected(t *testing.T) {
 	sabotages := map[string]string{
 		"ordinary pod create allowed": strings.Replace(
 			claimJobSQL,
-			"type NOT IN ('pod_create', 'vm_add')",
+			"type NOT IN ('pod_create', 'vm_add', 'template_verify', 'template_revalidate')",
 			"type <> 'vm_add'",
 			1,
 		),
 		"cleanup retry blocked": strings.Replace(
 			claimJobSQL,
-			"OR (type IN ('pod_create', 'vm_add') AND payload->>'cleanup_only' = 'true')",
-			"",
+			"type IN ('pod_create', 'vm_add', 'template_verify', 'template_revalidate')",
+			"type IN ('pod_create', 'vm_add')",
 			1,
 		),
 		"all vm add allowed": strings.Replace(
 			claimJobSQL,
-			"type NOT IN ('pod_create', 'vm_add')",
+			"type NOT IN ('pod_create', 'vm_add', 'template_verify', 'template_revalidate')",
 			"type <> 'pod_create'",
+			1,
+		),
+		"smoke clone allowed": strings.Replace(
+			claimJobSQL,
+			"type NOT IN ('pod_create', 'vm_add', 'template_verify', 'template_revalidate')",
+			"type NOT IN ('pod_create', 'vm_add')",
 			1,
 		),
 	}
@@ -90,8 +98,24 @@ func TestCompletedJobStatusAllowsPayloadWithoutCleanupMarker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if !strings.Contains(string(body), required) {
 		t.Fatalf("normal job completion is not null-safe; missing %q", required)
+	}
+}
+
+func TestAppendRollbackReceiptUsesSemanticJSONEquality(t *testing.T) {
+	existing := []byte(`[{"name":"network","data":{"b":2,"a":1}}]`)
+	reordered := []byte(`{"data":{"a":1,"b":2},"name":"network"}`)
+	updated, duplicate, err := appendRollbackReceipt(existing, reordered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !duplicate {
+		t.Fatal("semantically identical JSON receipt was appended twice")
+	}
+	if string(updated) != string(existing) {
+		t.Fatalf("duplicate receipt changed payload: %s", updated)
 	}
 }
 
@@ -271,6 +295,80 @@ func TestVMCloneDestructionProofIsIdempotent(t *testing.T) {
 	}
 	if string(updated) != string(payload) {
 		t.Fatal("idempotent destruction proof changed the payload")
+	}
+}
+
+func TestCompletingCloneCleanupRemovesMatchingOperationIdentity(t *testing.T) {
+	target := persistedVMCloneTarget{
+		PodID:       uuid.NewString(),
+		PodVMID:     uuid.NewString(),
+		VCenterVMID: "vm-301",
+	}
+	operation := models.VMCloneOperation{
+		OperationID: uuid.NewString(),
+		PodID:       target.PodID,
+		PodVMID:     target.PodVMID,
+		TargetName:  "target",
+		SourceRef:   "vm-source",
+		TaskRef:     "task-301",
+		Phase:       models.VMCloneOperationSubmitted,
+		PreparedAt:  time.Now(),
+	}
+	targetJSON, err := json.Marshal(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(map[string]any{
+		"cleanup_only":    true,
+		"cleanup_target":  target,
+		"clone_operation": operation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, _, err := completeVMCloneDestructionPayload(payload, targetJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(updated, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := fields["clone_operation"]; ok {
+		t.Fatal("completed exact cleanup retained a resumable clone operation")
+	}
+	if string(fields["cleanup_completed"]) != "true" {
+		t.Fatalf("cleanup completion = %s, want true", fields["cleanup_completed"])
+	}
+}
+
+func TestRollbackReceiptHandoffIsAppendOnlyAndIdempotent(t *testing.T) {
+	first := json.RawMessage(`{"name":"vlan_create","data":{"uuid":"vlan-1"}}`)
+	second := json.RawMessage(`{"name":"portgroup_create","data":{"name":"pg-1"}}`)
+	existing, err := json.Marshal([]json.RawMessage{first})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, duplicate, err := appendRollbackReceipt(existing, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if duplicate {
+		t.Fatal("new rollback receipt was treated as a duplicate")
+	}
+	var steps []json.RawMessage
+	if err := json.Unmarshal(updated, &steps); err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 2 || string(steps[0]) != string(first) || string(steps[1]) != string(second) {
+		t.Fatalf("rollback receipts = %s", updated)
+	}
+	again, duplicate, err := appendRollbackReceipt(updated, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !duplicate || string(again) != string(updated) {
+		t.Fatalf("idempotent receipt changed: duplicate=%t before=%s after=%s", duplicate, updated, again)
 	}
 }
 
