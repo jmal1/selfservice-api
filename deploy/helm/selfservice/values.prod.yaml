@@ -23,8 +23,9 @@ provisioning:
 vcenter:
   # Production placement and standard-vSwitch mutation remain restricted to ESXi1.
   # The AMD pool is the resource-pool compatibility constraint for ESXi1, not
-  # a substitute for the host allowlist. Keep the external DRS VM-host affinity
-  # rule in force.
+  # a substitute for the host allowlist. Explicit host pinning controls initial
+  # placement. While ESXi2 is quarantined, do not accept DRS recommendations or
+  # manually move provisioning or source VMs to it.
   hosts: "esxi1.lab.jmal.io"
   resourcePools: "/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs"
 
