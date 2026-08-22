@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -34,6 +35,8 @@ type Engine struct {
 	persister Persister
 	logger    *slog.Logger
 }
+
+const recordCleanupTimeout = 15 * time.Minute
 
 // New creates a rollback engine for a specific job.
 func New(jobID uuid.UUID, persister Persister, logger *slog.Logger) *Engine {
@@ -72,7 +75,33 @@ func (e *Engine) Record(ctx context.Context, name string, data any) error {
 	if e.persister != nil {
 		if err := e.persister.SaveRollbackSteps(ctx, e.jobID, e.steps); err != nil {
 			e.logger.Error("failed to persist rollback steps", "job_id", e.jobID, "error", err)
-			// Don't fail the provisioning step just because persistence failed
+			undoFn, ok := e.undoFuncs[name]
+			if !ok {
+				return fmt.Errorf("persist rollback step %s: %w", name, err)
+			}
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), recordCleanupTimeout)
+			defer cancel()
+			var undoErr error
+			for attempt := 0; ; attempt++ {
+				undoErr = undoFn(cleanupCtx, raw)
+				if undoErr == nil {
+					e.steps = e.steps[:len(e.steps)-1]
+					return fmt.Errorf("persist rollback step %s after synchronous undo: %w", name, err)
+				}
+				delay := time.Second << min(attempt, 4)
+				timer := time.NewTimer(delay)
+				select {
+				case <-cleanupCtx.Done():
+					timer.Stop()
+					return fmt.Errorf(
+						"persist rollback step %s: %w; synchronous undo failed: %v",
+						name,
+						err,
+						undoErr,
+					)
+				case <-timer.C:
+				}
+			}
 		}
 	}
 

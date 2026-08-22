@@ -2,6 +2,7 @@ package vcenter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -14,10 +15,15 @@ import (
 	"github.com/vmware/govmomi/find"
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/session"
+	vimtask "github.com/vmware/govmomi/task"
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/soap"
 	"github.com/vmware/govmomi/vim25/types"
 )
+
+const cloneTaskWaitSlice = 2 * time.Minute
+
+var ErrAmbiguousVMOwnership = errors.New("VM ownership cannot be proven")
 
 // Config holds vCenter connection settings.
 type Config struct {
@@ -178,14 +184,7 @@ func (c *Client) CloneVM(ctx context.Context, params CloneVMParams) (string, err
 	if err := c.ensureConnected(ctx); err != nil {
 		return "", err
 	}
-
-	var moref string
-	err := c.withRetry(ctx, "clone VM", func() error {
-		var cloneErr error
-		moref, cloneErr = c.cloneVMInner(ctx, params)
-		return cloneErr
-	})
-	return moref, err
+	return c.cloneVMInner(ctx, params)
 }
 
 // resolveSourceVM looks up a VM by either inventory name or moref. A
@@ -257,18 +256,23 @@ func (c *Client) cloneVMInner(ctx context.Context, params CloneVMParams) (string
 		return "", fmt.Errorf("find folder %s: %w", c.config.VMFolder, err)
 	}
 
-	// Idempotency: if a VM with this name already exists in the target
-	// folder, return it instead of cloning again. The pod_create job may
-	// be re-executed after a worker crash (RecoverStaleJobs re-queues any
-	// in_progress job at worker startup). The provisioner-layer guard in
-	// create.go covers the common case where the pod_vms row recorded
-	// vcenter_vm_id before the worker died; this lower-level guard covers
-	// the race where the clone task completed but the DB update did not.
-	// Mirrors CloneTemplate's idempotency in template_ops.go.
-	if existing, lookupErr := c.findVMInFolder(ctx, folder, params.VMName); lookupErr == nil && existing != "" {
-		c.logger.Info("clone target already exists, reusing",
-			"name", params.VMName, "moref", existing)
-		return existing, nil
+	// Never adopt an existing VM by mutable inventory name. Resume is safe only
+	// when the caller already persisted the exact MoRef on its pod_vms row.
+	existing, lookupErr := c.findVMInFolderStrict(ctx, folder, params.VMName)
+	if lookupErr != nil {
+		return "", fmt.Errorf(
+			"%w: cannot verify clone target %q is unused: %v",
+			ErrAmbiguousVMOwnership,
+			params.VMName,
+			lookupErr,
+		)
+	}
+	if existing != "" {
+		return "", fmt.Errorf(
+			"%w: clone target %q already exists without immutable ownership proof; manual cleanup required",
+			ErrAmbiguousVMOwnership,
+			params.VMName,
+		)
 	}
 
 	// Select best resource pool based on available resources, but
@@ -328,12 +332,55 @@ func (c *Client) cloneVMInner(ctx context.Context, params CloneVMParams) (string
 
 	task, err := template.Clone(ctx, folder, params.VMName, cloneSpec)
 	if err != nil {
+		if isDuplicateNameErr(err) {
+			return "", fmt.Errorf("%w: start clone %q: %v", ErrAmbiguousVMOwnership, params.VMName, err)
+		}
 		return "", fmt.Errorf("start clone: %w", err)
 	}
+	taskRef := task.Reference()
 
-	info, err := task.WaitForResult(ctx, nil)
-	if err != nil {
-		return "", fmt.Errorf("clone task: %w", err)
+	// Once vCenter accepts a clone task, cancellation cannot safely abandon it:
+	// the resulting immutable MoRef is required for durable adoption or cleanup.
+	// Each collector wait is bounded, but timeout only rotates the collector;
+	// it never discards the live remote task identity.
+	var info *types.TaskInfo
+	for {
+		waitCtx, cancelWait := context.WithTimeout(context.WithoutCancel(ctx), cloneTaskWaitSlice)
+		info, err = task.WaitForResult(waitCtx, nil)
+		cancelWait()
+		switch {
+		case err == nil:
+			break
+		case errors.Is(err, context.DeadlineExceeded):
+			c.logger.Warn("clone task still running after wait slice",
+				"name", params.VMName, "task", taskRef.Value, "wait_slice", cloneTaskWaitSlice)
+			continue
+		case isNotAuthenticatedErr(err):
+			reconnectCtx, cancelReconnect := context.WithTimeout(context.WithoutCancel(ctx), cloneTaskWaitSlice)
+			reconnectErr := c.Connect(reconnectCtx)
+			cancelReconnect()
+			if reconnectErr != nil {
+				c.logger.Warn("clone task wait reconnect failed; retaining task identity",
+					"name", params.VMName, "task", taskRef.Value, "error", reconnectErr)
+				time.Sleep(time.Second)
+				continue
+			}
+			task = object.NewTask(c.client.Client, taskRef)
+			continue
+		default:
+			var taskErr vimtask.Error
+			if errors.As(err, &taskErr) {
+				if isDuplicateNameErr(err) {
+					return "", fmt.Errorf("%w: clone task %s: %v", ErrAmbiguousVMOwnership, taskRef.Value, err)
+				}
+				return "", fmt.Errorf("clone task %s: %w", taskRef.Value, err)
+			}
+			c.logger.Warn("clone task wait failed; retaining task identity",
+				"name", params.VMName, "task", taskRef.Value, "error", err)
+			time.Sleep(time.Second)
+			continue
+		}
+		break
 	}
 
 	vmRef := info.Result.(types.ManagedObjectReference)
@@ -1316,6 +1363,13 @@ func isNotAuthenticatedErr(err error) bool {
 	return strings.Contains(msg, "NotAuthenticated") ||
 		strings.Contains(strings.ToLower(msg), "not authenticated") ||
 		strings.Contains(strings.ToLower(msg), "session is not authenticated")
+}
+
+func isDuplicateNameErr(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "duplicatename") ||
+		strings.Contains(msg, "duplicate name") ||
+		strings.Contains(msg, "already exists")
 }
 
 // isAlreadyDeletedErr checks if a vSphere error indicates the object was already deleted.

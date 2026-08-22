@@ -7,9 +7,11 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jmal1/selfservice-api/internal/config"
 	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/leader"
@@ -523,10 +525,11 @@ func main() {
 	prov.ConfigureTemplateHealth(healthReconcilerCfg)
 
 	// Worker ID for job claiming
-	workerID, err := os.Hostname()
+	workerHost, err := os.Hostname()
 	if err != nil {
-		workerID = "worker-unknown"
+		workerHost = "worker-unknown"
 	}
+	workerID := workerHost + "-" + uuid.NewString()
 
 	logger.Info("starting provision worker",
 		"worker_id", workerID,
@@ -535,8 +538,8 @@ func main() {
 		"provisioning_claims_enabled", cfg.Provisioning.WorkerClaimsEnabled,
 	)
 
-	// Recover any jobs that were abandoned by a previous worker instance
-	recovered, err := queries.RecoverStaleJobs(ctx)
+	// Recover only jobs whose ownership heartbeat lease has expired.
+	recovered, err := queries.RecoverStaleJobs(ctx, provisioner.JobLeaseDuration)
 	if err != nil {
 		logger.Error("failed to recover stale jobs", "error", err)
 	} else if recovered > 0 {
@@ -546,10 +549,14 @@ func main() {
 	// Retry any pods stuck in destroy_failed from previous runs
 	prov.RetryFailedDestroys(ctx)
 
+	jobRuns := &jobRunner{}
+
 	// Subscribe to job notifications from NATS
 	_, err = natsClient.SubscribeJobCreated(func(jobID string, jobType string) {
 		logger.Info("received job notification", "job_id", jobID, "type", jobType)
-		processJobs(ctx, queries, prov, workerID, cfg.Provisioning.WorkerClaimsEnabled, logger)
+		jobRuns.Go(func() {
+			processJobs(ctx, queries, prov, workerID, cfg.Provisioning.WorkerClaimsEnabled, logger)
+		})
 	})
 	if err != nil {
 		logger.Error("NATS subscription failed", "error", err)
@@ -559,6 +566,8 @@ func main() {
 	// Polling fallback: check for jobs every 30 seconds
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
+	leaseRecoveryTicker := time.NewTicker(provisioner.JobLeaseRecoveryInterval)
+	defer leaseRecoveryTicker.Stop()
 
 	// Retry failed destroys every 5 minutes
 	retryTicker := time.NewTicker(5 * time.Minute)
@@ -664,7 +673,9 @@ func main() {
 	}
 
 	// Immediately process any pending/recovered jobs
-	go processJobs(ctx, queries, prov, workerID, cfg.Provisioning.WorkerClaimsEnabled, logger)
+	jobRuns.Go(func() {
+		processJobs(ctx, queries, prov, workerID, cfg.Provisioning.WorkerClaimsEnabled, logger)
+	})
 
 	go func() {
 		for {
@@ -675,7 +686,23 @@ func main() {
 			// ── Job-claim loop: NOT gated by leader election ──────────────────
 			// All replicas claim jobs via SELECT ... FOR UPDATE SKIP LOCKED.
 			case <-ticker.C:
-				processJobs(ctx, queries, prov, workerID, cfg.Provisioning.WorkerClaimsEnabled, logger)
+				jobRuns.Go(func() {
+					processJobs(ctx, queries, prov, workerID, cfg.Provisioning.WorkerClaimsEnabled, logger)
+				})
+
+			case <-leaseRecoveryTicker.C:
+				recovered, err := queries.RecoverStaleJobs(
+					ctx,
+					provisioner.JobLeaseDuration,
+				)
+				if err != nil {
+					logger.Error("expired job lease recovery failed", "error", err)
+				} else if recovered > 0 {
+					logger.Warn("recovered expired job leases", "count", recovered)
+					jobRuns.Go(func() {
+						processJobs(ctx, queries, prov, workerID, cfg.Provisioning.WorkerClaimsEnabled, logger)
+					})
+				}
 
 			// ── Periodic reconcilers: ALL gated by leader election ─────────────
 			// When not leader the tick fires but the body is a cheap no-op.
@@ -865,10 +892,38 @@ func main() {
 
 	logger.Info("shutting down worker")
 	cancel()
+	jobRuns.StopAndWait()
 	if l1ValidationScheduler != nil {
 		l1ValidationScheduler.Stop()
 		l1ValidationScheduler.Wait()
 	}
+}
+
+type jobRunner struct {
+	mu       sync.Mutex
+	stopping bool
+	wg       sync.WaitGroup
+}
+
+func (r *jobRunner) Go(run func()) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stopping {
+		return false
+	}
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		run()
+	}()
+	return true
+}
+
+func (r *jobRunner) StopAndWait() {
+	r.mu.Lock()
+	r.stopping = true
+	r.mu.Unlock()
+	r.wg.Wait()
 }
 
 // processJobs claims and processes available jobs via the provisioner.
@@ -878,7 +933,8 @@ func processJobs(ctx context.Context, queries *database.Queries, prov *provision
 			return
 		}
 
-		job, err := queries.ClaimJob(ctx, workerID, provisioningClaimsEnabled)
+		claimID := newJobClaimID(workerID)
+		job, err := queries.ClaimJob(ctx, claimID, provisioningClaimsEnabled)
 		if err != nil {
 			logger.Error("claim job failed", "error", err)
 			return
@@ -887,7 +943,7 @@ func processJobs(ctx context.Context, queries *database.Queries, prov *provision
 			return // no pending jobs
 		}
 
-		logger.Info("claimed job", "job_id", job.ID, "type", job.Type)
+		logger.Info("claimed job", "job_id", job.ID, "type", job.Type, "claim_id", claimID)
 
 		if err := prov.ProcessJob(ctx, job); err != nil {
 			logger.Error("job failed", "job_id", job.ID, "type", job.Type, "error", err)
@@ -895,6 +951,10 @@ func processJobs(ctx context.Context, queries *database.Queries, prov *provision
 			logger.Info("job completed", "job_id", job.ID, "type", job.Type)
 		}
 	}
+}
+
+func newJobClaimID(workerID string) string {
+	return workerID + ":" + uuid.NewString()
 }
 
 // envDuration reads a time.Duration from the environment, falling back to def

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/models"
 	"github.com/jmal1/selfservice-api/internal/vcenter"
 )
@@ -29,6 +30,18 @@ type VMCloneCleanupTarget struct {
 	PodVMID     string `json:"pod_vm_id"`
 	VCenterVMID string `json:"vcenter_vm_id"`
 }
+
+type vmCloneHandoffStore interface {
+	StageVMCloneCleanup(ctx context.Context, jobID uuid.UUID, workerID string, target []byte) error
+	StageVMCloneDestructionHandoff(ctx context.Context, jobID uuid.UUID, target []byte) error
+	RecordDestroyedVMCloneHandoff(ctx context.Context, jobID uuid.UUID, target []byte) error
+}
+
+type vmCloneHandoffDestroyer interface {
+	DestroyVM(ctx context.Context, moref string) error
+}
+
+const cloneHandoffDestroyTimeout = 2 * time.Minute
 
 func validateVMCloneCleanupTarget(target *VMCloneCleanupTarget) (uuid.UUID, uuid.UUID, error) {
 	if target == nil {
@@ -172,7 +185,7 @@ func podVMHasLiveClone(vm *models.PodVM, moref string) bool {
 
 func (p *Provisioner) stageVMCloneCleanup(
 	ctx context.Context,
-	jobID uuid.UUID,
+	job *models.Job,
 	podID, podVMID uuid.UUID,
 	moref string,
 ) error {
@@ -195,17 +208,109 @@ func (p *Provisioner) stageVMCloneCleanup(
 			err: fmt.Errorf("marshal exact VM cleanup target %s: %w", moref, err),
 		}
 	}
-	if err := p.db.StageVMCloneCleanup(ctx, jobID, target); err != nil {
-		return &compensationRetryError{
-			err: fmt.Errorf("persist exact VM cleanup target %s: %w", moref, err),
-			target: &VMCloneCleanupTarget{
-				PodID:       podID.String(),
-				PodVMID:     podVMID.String(),
-				VCenterVMID: moref,
-			},
+	workerID, _, err := claimedJobLease(job)
+	if err != nil {
+		return err
+	}
+	destroyed, err := persistVMCloneHandoff(
+		ctx,
+		p.db,
+		p.vc,
+		job.ID,
+		workerID,
+		target,
+		moref,
+	)
+	if err != nil {
+		return err
+	}
+	if destroyed {
+		return &compensatedJobError{
+			err: fmt.Errorf("job lease was lost after cloning %s; exact clone was destroyed and recorded", moref),
 		}
 	}
 	return nil
+}
+
+func persistVMCloneHandoff(
+	ctx context.Context,
+	store vmCloneHandoffStore,
+	destroyer vmCloneHandoffDestroyer,
+	jobID uuid.UUID,
+	workerID string,
+	target []byte,
+	moref string,
+) (bool, error) {
+	handoffCtx := context.WithoutCancel(ctx)
+	failures := 0
+	for {
+		if failures > 0 {
+			time.Sleep(cleanupRescheduleBackoff(failures))
+		}
+		writeCtx, cancel := context.WithTimeout(handoffCtx, cleanupRescheduleWriteTimeout)
+		err := store.StageVMCloneCleanup(writeCtx, jobID, workerID, target)
+		cancel()
+		switch {
+		case err == nil:
+			return false, nil
+		case errors.Is(err, database.ErrVMCloneAlreadyDestroyed):
+			return true, nil
+		case errors.Is(err, database.ErrJobLeaseLost):
+			goto destroy
+		case ctx.Err() != nil:
+			goto destroy
+		default:
+			failures++
+		}
+	}
+
+destroy:
+	failures = 0
+	for {
+		if failures > 0 {
+			time.Sleep(cleanupRescheduleBackoff(failures))
+		}
+		writeCtx, cancel := context.WithTimeout(handoffCtx, cleanupRescheduleWriteTimeout)
+		err := store.StageVMCloneDestructionHandoff(writeCtx, jobID, target)
+		cancel()
+		switch {
+		case err == nil:
+			goto destroyExact
+		case errors.Is(err, database.ErrVMCloneAlreadyDestroyed):
+			return true, nil
+		default:
+			failures++
+		}
+	}
+
+destroyExact:
+	failures = 0
+	for {
+		if failures > 0 {
+			time.Sleep(cleanupRescheduleBackoff(failures))
+		}
+		destroyCtx, cancel := context.WithTimeout(handoffCtx, cloneHandoffDestroyTimeout)
+		err := destroyer.DestroyVM(destroyCtx, moref)
+		cancel()
+		if err == nil {
+			break
+		}
+		failures++
+	}
+
+	failures = 0
+	for {
+		if failures > 0 {
+			time.Sleep(cleanupRescheduleBackoff(failures))
+		}
+		writeCtx, cancel := context.WithTimeout(handoffCtx, cleanupRescheduleWriteTimeout)
+		err := store.RecordDestroyedVMCloneHandoff(writeCtx, jobID, target)
+		cancel()
+		if err == nil {
+			return true, nil
+		}
+		failures++
+	}
 }
 
 func (p *Provisioner) cleanupStagedVMClone(ctx context.Context, jobID uuid.UUID) error {
@@ -219,35 +324,50 @@ func (p *Provisioner) cleanupStagedVMClone(ctx context.Context, jobID uuid.UUID)
 		}
 	}
 	var payload struct {
-		CleanupTarget *VMCloneCleanupTarget `json:"cleanup_target"`
+		CleanupTarget         *VMCloneCleanupTarget  `json:"cleanup_target"`
+		CleanupHandoffTargets []VMCloneCleanupTarget `json:"cleanup_handoff_targets"`
 	}
 	if err := json.Unmarshal(job.Payload, &payload); err != nil {
 		return &compensationRetryError{err: fmt.Errorf("parse staged VM cleanup target: %w", err)}
 	}
-	if payload.CleanupTarget == nil {
+	var targets []VMCloneCleanupTarget
+	if payload.CleanupTarget != nil {
+		targets = append(targets, *payload.CleanupTarget)
+	}
+	targets = append(targets, payload.CleanupHandoffTargets...)
+	if len(targets) == 0 {
 		return nil
 	}
-	target := payload.CleanupTarget
-	_, podVMID, err := validateVMCloneCleanupTarget(target)
-	if err != nil {
-		return &manualCleanupRequiredError{
-			err: fmt.Errorf("staged VM cleanup target is invalid: %v; manual cleanup required", err),
-		}
-	}
 
-	_ = p.vc.PowerOffVM(ctx, target.VCenterVMID)
-	if err := p.vc.DestroyVM(ctx, target.VCenterVMID); err != nil {
-		return &compensationRetryError{
-			err: fmt.Errorf("destroy exact stale VM %s: %w", target.VCenterVMID, err),
+	seen := make(map[string]struct{}, len(targets))
+	for i := range targets {
+		target := &targets[i]
+		_, podVMID, err := validateVMCloneCleanupTarget(target)
+		if err != nil {
+			return &manualCleanupRequiredError{
+				err: fmt.Errorf("staged VM cleanup target is invalid: %v; manual cleanup required", err),
+			}
 		}
-	}
-	if err := p.db.CompleteVMCloneCleanup(ctx, jobID, podVMID, target.VCenterVMID); err != nil {
-		return &compensationRetryError{
-			err: fmt.Errorf("complete exact stale VM cleanup %s: %w", target.VCenterVMID, err),
+		key := target.PodVMID + "\x00" + target.VCenterVMID
+		if _, ok := seen[key]; ok {
+			continue
 		}
+		seen[key] = struct{}{}
+
+		_ = p.vc.PowerOffVM(ctx, target.VCenterVMID)
+		if err := p.vc.DestroyVM(ctx, target.VCenterVMID); err != nil {
+			return &compensationRetryError{
+				err: fmt.Errorf("destroy exact stale VM %s: %w", target.VCenterVMID, err),
+			}
+		}
+		if err := p.db.CompleteVMCloneCleanup(ctx, jobID, podVMID, target.VCenterVMID); err != nil {
+			return &compensationRetryError{
+				err: fmt.Errorf("complete exact stale VM cleanup %s: %w", target.VCenterVMID, err),
+			}
+		}
+		p.logger.Info("exact stale VM clone cleanup completed",
+			"job_id", jobID, "pod_vm_id", podVMID, "moref", target.VCenterVMID)
 	}
-	p.logger.Info("exact stale VM clone cleanup completed",
-		"job_id", jobID, "pod_vm_id", podVMID, "moref", target.VCenterVMID)
 	return nil
 }
 
@@ -280,7 +400,7 @@ func (p *Provisioner) failVMAddWithCleanup(
 		[]string{models.VMStatusPending, models.VMStatusCloning, models.VMStatusConfiguring},
 		models.VMStatusError,
 	)
-	if err := p.stageVMCloneCleanup(ctx, job.ID, podID, podVMID, moref); err != nil {
+	if err := p.stageVMCloneCleanup(ctx, job, podID, podVMID, moref); err != nil {
 		return err
 	}
 	if err := p.cleanupStagedVMClone(ctx, job.ID); err != nil {
@@ -343,6 +463,10 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) error {
 	var payload AddVMPayload
 	if err := json.Unmarshal(job.Payload, &payload); err != nil {
 		return fmt.Errorf("parse vm_add payload: %w", err)
+	}
+	workerID, _, err := claimedJobLease(job)
+	if err != nil {
+		return err
 	}
 	if payload.CleanupOnly {
 		return p.runVMAddCleanup(ctx, job)
@@ -451,16 +575,30 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) error {
 		})
 		if err != nil {
 			jobErr := fmt.Errorf("clone VM: %w", err)
+			if moref != "" {
+				return p.failVMAddWithCleanup(
+					ctx,
+					job,
+					podID,
+					podVMID,
+					moref,
+					jobErr.Error(),
+				)
+			}
 			p.recordVMAddFailure(ctx, job, podVMID, jobErr)
+			if errors.Is(err, vcenter.ErrAmbiguousVMOwnership) {
+				return &manualCleanupRequiredError{err: jobErr}
+			}
 			return jobErr
 		}
-		if err := p.stageVMCloneCleanup(ctx, job.ID, podID, podVMID, moref); err != nil {
+		if err := p.stageVMCloneCleanup(ctx, job, podID, podVMID, moref); err != nil {
 			return err
 		}
 
 		applied, err = p.db.AdoptPodVMClone(
 			ctx,
 			job.ID,
+			workerID,
 			podVMID,
 			[]string{models.VMStatusCloning},
 			moref,
@@ -483,6 +621,16 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) error {
 				moref,
 				"lost VM lifecycle ownership after clone",
 			)
+		}
+		if err := p.db.DisarmVMCloneCleanup(ctx, job.ID, workerID, podVMID, moref); err != nil {
+			return &compensationRetryError{
+				err: fmt.Errorf("disarm adopted clone %s: %w", moref, err),
+				target: &VMCloneCleanupTarget{
+					PodID:       podID.String(),
+					PodVMID:     podVMID.String(),
+					VCenterVMID: moref,
+				},
+			}
 		}
 
 		// Store generated credentials

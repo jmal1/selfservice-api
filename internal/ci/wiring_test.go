@@ -228,7 +228,7 @@ func TestCleanupOnlyPodCreateCannotReachForwardProvisioning(t *testing.T) {
 		t.Fatal("cleanup-only dispatch must return before the forward pod-create path")
 	}
 	branch := src[createStart+cleanupBranch : createStart+forwardStart]
-	if !strings.Contains(branch, "return p.runPodCreateCleanup(ctx, job.ID, payload, rb)") {
+	if !strings.Contains(branch, "return p.runPodCreateCleanup(ctx, job, payload, rb)") {
 		t.Fatal("cleanup-only dispatch must return directly into compensation")
 	}
 
@@ -337,19 +337,26 @@ func TestVMCloneCompensationUsesOnlyDurableExactTargets(t *testing.T) {
 		}
 		stage := strings.Index(src[clone:], "p.stageVMCloneCleanup(")
 		adopt := strings.Index(src[clone:], "p.db.AdoptPodVMClone(")
-		if stage < 0 || adopt < 0 || stage > adopt {
+		disarm := strings.Index(src[clone:], "p.db.DisarmVMCloneCleanup(")
+		if stage < 0 || adopt < 0 || disarm < 0 || stage > adopt || adopt > disarm {
 			t.Errorf("%s must durably stage the returned MoRef before adoption", relPath)
+		}
+		if relPath == "internal/provisioner/create.go" {
+			record := strings.Index(src[clone:], "rb.Record(")
+			if record < stage || record > adopt {
+				t.Errorf("%s must persist rollback before adopting and disarming the clone", relPath)
+			}
 		}
 	}
 	if strings.Contains(createSrc, "cleanupStaleVMClone(") ||
 		strings.Contains(vmOpsSrc, "cleanupStaleVMClone(") {
 		t.Fatal("legacy stale-clone cleanup bypasses the durable exact-target lifecycle")
 	}
-	if got := strings.Count(createSrc, "failPodCreateForStaleVM("); got != 7 {
-		t.Fatalf("pod_create stale-clone compensation sites = %d, want 6 calls plus helper", got)
+	if got := strings.Count(createSrc, "failPodCreateForStaleVM("); got != 8 {
+		t.Fatalf("pod_create stale-clone compensation sites = %d, want 7 calls plus helper", got)
 	}
-	if got := strings.Count(vmOpsSrc, "failVMAddWithCleanup("); got != 5 {
-		t.Fatalf("vm_add stale-clone compensation sites = %d, want 4 calls plus helper", got)
+	if got := strings.Count(vmOpsSrc, "failVMAddWithCleanup("); got != 6 {
+		t.Fatalf("vm_add stale-clone compensation sites = %d, want 5 calls plus helper", got)
 	}
 
 	addStart := strings.Index(vmOpsSrc, "func (p *Provisioner) AddVM(")
@@ -385,12 +392,13 @@ func TestVMCloneCompensationUsesOnlyDurableExactTargets(t *testing.T) {
 		"func (q *Queries) StageVMCloneCleanup(",
 		"'{cleanup_target}'",
 		"func (q *Queries) AdoptPodVMClone(",
+		"func (q *Queries) DisarmVMCloneCleanup(",
 		"payload - 'cleanup_target' - 'cleanup_only'",
 		"func (q *Queries) CompleteVMCloneCleanup(",
 		"vcenter_vm_id = $2\n\t\t    OR (vcenter_vm_id IS NULL AND status IN ('pending', 'cloning', 'configuring'))",
 		"func (q *Queries) MarkJobCompensationCompleted(",
-		"if !updated && !alreadyScheduled {\n\t\treturn fmt.Errorf(\"job %s is not owned for retry scheduling\"",
-		"if tag.RowsAffected() != 1 {\n\t\treturn fmt.Errorf(\"job %s status update affected %d rows\"",
+		"if !updated && !alreadyScheduled {\n\t\treturn fmt.Errorf(\"%w: job %s is not owned by %s for retry scheduling\"",
+		"return fmt.Errorf(\"%w: job %s is not owned by %s for status %s\"",
 	} {
 		if !strings.Contains(querySrc, required) {
 			t.Errorf("database compensation lifecycle is missing %q", required)
@@ -420,5 +428,84 @@ func TestCreatePodDoesNotUseUnguardedVMStatusWrites(t *testing.T) {
 	}
 	if strings.Contains(string(body), "UpdatePodVMStatus(ctx") {
 		t.Fatal("pod create contains an unconditional VM status write that can resurrect deleted state")
+	}
+}
+
+func TestJobRecoveryUsesOwnedHeartbeatLeases(t *testing.T) {
+	root := findRepoRoot(t)
+	read := func(relPath string) string {
+		t.Helper()
+		body, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(relPath)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(body)
+	}
+
+	mainSrc := read("cmd/provision-worker/main.go")
+	querySrc := read("internal/database/queries.go")
+	createSrc := read("internal/provisioner/create.go")
+
+	for _, required := range []string{
+		`workerID := workerHost + "-" + uuid.NewString()`,
+		"claimID := newJobClaimID(workerID)",
+		`return workerID + ":" + uuid.NewString()`,
+		"queries.RecoverStaleJobs(ctx, provisioner.JobLeaseDuration)",
+		"time.NewTicker(provisioner.JobLeaseRecoveryInterval)",
+		"jobRuns.StopAndWait()",
+	} {
+		if !strings.Contains(mainSrc, required) {
+			t.Errorf("worker lease wiring is missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		"AND claimed_by = $4",
+		"AND NOT ($2 = 'completed' AND COALESCE(payload->>'cleanup_only', 'false') = 'true')",
+		"func (q *Queries) RenewJobLease(",
+		"AND claimed_by = $5",
+		"claimed_at < now() - ($1 * interval '1 second')",
+		"claimed_by = $3",
+		"claimed_by = $4 AND status IN ('claimed', 'in_progress')",
+		"func (q *Queries) StageVMCloneDestructionHandoff(",
+		"func (q *Queries) RecordDestroyedVMCloneHandoff(",
+		`fields["destroyed_cleanup_targets"]`,
+		"status = 'pending'",
+		"WHERE id = ($1::jsonb->>'pod_vm_id')::uuid",
+		"AND vcenter_vm_id = $1::jsonb->>'vcenter_vm_id'",
+		"ErrVMCloneAlreadyDestroyed",
+		"func (q *Queries) UpdateJobRollbackSteps(",
+		"cannot update rollback steps",
+	} {
+		if !strings.Contains(querySrc, required) {
+			t.Errorf("database lease ownership is missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		"context.WithCancelCause(ctx)",
+		"maintainJobLease(",
+		"persistCleanupRetry(ctx, db, job, workerID, cleanupTarget)",
+	} {
+		if !strings.Contains(createSrc, required) {
+			t.Errorf("job execution lease is missing %q", required)
+		}
+	}
+	if strings.Contains(mainSrc, "RecoverStaleJobs(ctx)") {
+		t.Fatal("worker still contains broad owner-unaware stale-job recovery")
+	}
+
+	vcenterSrc := read("internal/vcenter/client.go")
+	for _, required := range []string{
+		"context.WithTimeout(context.WithoutCancel(ctx), cloneTaskWaitSlice)",
+		"task.WaitForResult(waitCtx, nil)",
+		"taskRef := task.Reference()",
+		"task = object.NewTask(c.client.Client, taskRef)",
+		"already exists without immutable ownership proof",
+	} {
+		if !strings.Contains(vcenterSrc, required) {
+			t.Errorf("clone task handoff is missing %q", required)
+		}
+	}
+	if strings.Contains(vcenterSrc, `c.withRetry(ctx, "clone VM"`) {
+		t.Fatal("CloneVM can retry the whole clone after a remote task was issued")
 	}
 }

@@ -51,18 +51,26 @@ those retries cannot resume pod or VM creation.
 Operators can distinguish ordinary queued work from recovery work in the job
 payload: only `pod_create` or `vm_add` jobs carrying `cleanup_only: true` remain
 claimable while provisioning claims are disabled. Clone cleanup uses the exact
-vCenter MoRef persisted for that attempt, never a VM display name. Failed
-cleanup remains pending with capped backoff independently of the original
-provisioning retry limit. Successful compensation records the parent job as
-failed with `compensated: true`; ambiguous ownership records
+vCenter MoRef persisted for that attempt, never a VM display name. If shutdown
+or lease loss occurs immediately after cloning, the worker persists and fences
+that exact cleanup target before destroying it, then records durable proof
+before exiting. Concurrent exact targets are retained and cleaned in sequence.
+Pod creation keeps exact clone cleanup intent armed until its rollback record is
+durable and the same claim finishes adoption.
+Failed cleanup remains pending with capped backoff independently of the
+original provisioning retry limit. Successful compensation records the parent
+job as failed with `compensated: true`; ambiguous ownership records
 `manual_cleanup_required: true` and requires operator resolution rather than
-deleting an uncertain VM.
+deleting or adopting an uncertain VM by name.
 
 A transient database failure while rescheduling compensation does not strand
 the job on a live worker. The worker retries the durable pending-state write
-with bounded backoff until it succeeds. On worker shutdown, startup recovery on
-the replacement process performs the handoff; Crucible does not periodically
-reset active jobs.
+with bounded backoff until it succeeds. Each worker process owns jobs with a
+unique process identity plus a per-claim fencing token and refreshes a heartbeat
+lease. Startup and periodic recovery reset only expired claims, never fresh
+work owned by another replica; ownership loss cancels execution and blocks
+stale finalization. On shutdown, unfinished claims become recoverable only
+after their conservative lease expires.
 
 Authenticated clients can check the stable read-only contract at
 `GET /api/v1/provisioning/status`:

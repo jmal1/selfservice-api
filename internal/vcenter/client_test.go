@@ -40,3 +40,15 @@ func TestDestroyVMAlreadyGoneErrorsAreRecognized(t *testing.T) {
 		}
 	}
 }
+
+func TestDuplicateCloneNameErrorsAreRecognized(t *testing.T) {
+	for _, message := range []string{
+		"ServerFaultCode: DuplicateName",
+		"duplicate name in target folder",
+		"the object already exists",
+	} {
+		if !isDuplicateNameErr(errors.New(message)) {
+			t.Fatalf("duplicate clone name error was not recognized: %q", message)
+		}
+	}
+}

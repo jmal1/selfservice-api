@@ -57,7 +57,14 @@ type fakeJobDB struct {
 	statusErr   map[string]error
 }
 
-func (f *fakeJobDB) RetryJob(_ context.Context, id uuid.UUID, nextAt time.Time, cleanupOnly bool, cleanupTarget []byte) error {
+func (f *fakeJobDB) RetryJob(
+	_ context.Context,
+	id uuid.UUID,
+	nextAt time.Time,
+	cleanupOnly bool,
+	cleanupTarget []byte,
+	_ string,
+) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	call := f.retryCalls
@@ -80,7 +87,13 @@ func (f *fakeJobDB) RetryJob(_ context.Context, id uuid.UUID, nextAt time.Time, 
 	return nil
 }
 
-func (f *fakeJobDB) UpdateJobStatus(_ context.Context, id uuid.UUID, status string, result []byte) error {
+func (f *fakeJobDB) UpdateJobStatus(
+	_ context.Context,
+	id uuid.UUID,
+	_ string,
+	status string,
+	result []byte,
+) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.statuses = append(f.statuses, statusRecord{id: id, status: status, result: result})
@@ -114,9 +127,21 @@ func testProvisioner() *Provisioner {
 
 func noPublish(_ uuid.UUID, _, _ string) {}
 
+func claimTestJob(job *models.Job) {
+	if job.ClaimedBy == nil {
+		workerID := "test-worker"
+		job.ClaimedBy = &workerID
+	}
+	if job.ClaimedAt == nil {
+		claimedAt := time.Now()
+		job.ClaimedAt = &claimedAt
+	}
+}
+
 // runLifecycle drives processJobLifecycle with a dispatch function that simply
 // returns dispatchErr, mirroring what ProcessJob does when a handler returns.
 func runLifecycle(ctx context.Context, db *fakeJobDB, m *PipelineMetrics, job *models.Job, dispatchErr error) error {
+	claimTestJob(job)
 	return processJobLifecycle(ctx, db, m, job, noPublish,
 		func(_ context.Context, _ *models.Job) error { return dispatchErr })
 }
@@ -229,6 +254,7 @@ func TestHandleJobOutcome_CompletedPodCreateCompensationDoesNotRetry(t *testing.
 		err: errors.New("reconfigure VLANs: connection refused"),
 	}
 	var published []string
+	claimTestJob(job)
 
 	if result := processJobLifecycle(
 		context.Background(),
@@ -305,6 +331,7 @@ func TestHandleJobOutcome_CleanupRescheduleRetriesUntilDurable(t *testing.T) {
 	}
 	var published []string
 	started := time.Now()
+	claimTestJob(job)
 
 	if result := processJobLifecycle(
 		context.Background(),
@@ -361,6 +388,7 @@ func TestHandleJobOutcome_CleanupRescheduleShutdownHandsOffToStartupRecovery(t *
 	}
 	var published []string
 	resultCh := make(chan error, 1)
+	claimTestJob(job)
 	go func() {
 		resultCh <- processJobLifecycle(
 			ctx,
@@ -420,6 +448,7 @@ func TestHandleJobOutcome_CompensatedStatusFailurePublishesNoSuccess(t *testing.
 	}
 	job := &models.Job{ID: uuid.New(), Type: models.JobTypePodCreate}
 	var published []string
+	claimTestJob(job)
 
 	result := processJobLifecycle(
 		context.Background(),
@@ -449,6 +478,7 @@ func TestHandleJobOutcome_CompletedStatusFailurePublishesNoSuccess(t *testing.T)
 	}
 	job := &models.Job{ID: uuid.New(), Type: models.JobTypePodDestroy}
 	var published []string
+	claimTestJob(job)
 
 	result := processJobLifecycle(
 		context.Background(),

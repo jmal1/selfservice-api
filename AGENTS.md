@@ -794,20 +794,37 @@ claimable.
 
 Compensation intent is durable. A clone's exact vCenter MoRef, pod id, and pod
 VM id are persisted on its parent job before the clone can be adopted by the VM
-row. Cleanup never resolves a VM by its mutable display name. If ownership is
-lost or cleanup fails, the parent job remains `cleanup_only` and retries with
-capped backoff independently of its original provisioning retry budget. It
-cannot resume cloning, power-on, or snapshots. A cleanup-only `pod_create` may
-move a `provisioning` pod to `error` only when that exact staged target belongs
-to a VM in the job; marker-only, mismatched, active, pending, and unknown states
-fail closed.
+row. That post-clone handoff ignores worker cancellation. If its lease was
+already lost, it first persists cleanup-only intent and fences the claim, then
+synchronously destroys only that exact MoRef and persists append-only
+destruction proof before returning; graceful shutdown waits for the handoff.
+Concurrent exact targets are retained and cleaned in sequence, never
+overwritten. Cleanup never resolves or adopts a VM by its mutable display name.
+For pod creation, rollback identity is persisted before clone adoption and the
+cleanup marker is disarmed only by the same fenced claim afterward.
+If ownership is lost or cleanup fails, the parent job remains `cleanup_only`
+and retries with capped backoff independently of its original provisioning
+retry budget. It cannot resume cloning, power-on, or snapshots. A cleanup-only
+`pod_create` may move a `provisioning` pod to `error` only when an exact staged
+target belongs to a VM in the job; marker-only, mismatched, active, pending, and
+unknown states fail closed.
 
 If the database write that returns cleanup work from `in_progress` to `pending`
 fails, the live worker does not abandon or terminalize it. It retries that
 idempotent write in-process with a 10-second per-write deadline and exponential
 backoff from 1 to 30 seconds until persistence succeeds or the worker shuts
-down. Shutdown leaves the row for the existing startup recovery pass; there is
-no periodic reset that could steal a legitimately long-running job.
+down.
+
+Every worker process uses a unique `hostname-UUID` identity and every claim adds
+a second UUID fencing token. Active jobs renew `claimed_at` every 30 seconds and
+use a conservative 15-minute lease.
+Startup and the one-minute recovery pass reset only claims expired according to
+the PostgreSQL clock; they never broadly reset another replica's fresh work.
+Loss of ownership or lease freshness cancels execution. In-progress, retry,
+terminal-status, cleanup-target staging, and clone-adoption writes all verify
+the same claim owner, so a superseded worker cannot finalize or attach a clone.
+Shutdown leaves the claim to expire for the replacement worker instead of
+stealing it immediately.
 
 Completed compensation finalizes the parent job as `failed` with
 `compensated: true` and publishes a `compensated` event; it is never reported
