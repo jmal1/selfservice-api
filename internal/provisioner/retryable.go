@@ -14,8 +14,10 @@
 //     rejection ("virtual disk is either corrupted or not a supported
 //     format") that was misdiagnosed three times as a CloneSpec bug.
 //     Evidence from the live system (2026-08-03):
-//       • job d62777e7 cloned student-ubuntu-2404 at 20:36:11 → FAILED
-//       • job a3ba9028, same source + params, at 20:37:19 → SUCCEEDED
+//
+//   - job d62777e7 cloned student-ubuntu-2404 at 20:36:11 → FAILED
+//
+//   - job a3ba9028, same source + params, at 20:37:19 → SUCCEEDED
 //     68 seconds apart, identical spec.  The fault is environmental and
 //     transient; a retry is the correct fix.
 package provisioner
@@ -34,6 +36,7 @@ const (
 	RetryReasonConnection     = "connection"
 	RetryReasonTimeout        = "timeout"
 	RetryReasonUnavailable    = "unavailable"
+	RetryReasonCleanup        = "cleanup"
 )
 
 // deterministicPhrases are substrings that identify errors that will never
@@ -85,6 +88,11 @@ func ClassifyError(err error, jobType string) (retryable bool, reason string) {
 		if strings.Contains(s, phrase) {
 			return false, ""
 		}
+	}
+	if strings.Contains(s, "stale VM clone") ||
+		strings.Contains(s, "stale pod_create cleanup incomplete") ||
+		strings.Contains(s, "persisted cleanup incomplete") {
+		return true, RetryReasonCleanup
 	}
 
 	// -----------------------------------------------------------------------

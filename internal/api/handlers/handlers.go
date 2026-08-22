@@ -80,6 +80,10 @@ type Handler struct {
 	// the vCenter client in WithPreflightVCenter when it supports name
 	// resolution; nil in tests that inject a resolver-less fake.
 	vcResolver templates.VMNameResolver
+
+	provisioningConfigured bool
+	provisioningEnabled    bool
+	provisioningMetrics    provisioningAdmissionMetrics
 }
 
 type imageUploadMetrics interface {
@@ -125,6 +129,15 @@ type VCenterConsole interface {
 // NewHandler creates a new Handler.
 func NewHandler(db *database.Queries, events *events.Client, vc VCenterConsole, logger *slog.Logger, allowedOrigins []string) *Handler {
 	return &Handler{db: db, events: events, vc: vc, logger: logger, allowedOrigins: allowedOrigins}
+}
+
+// WithProvisioningAdmission configures the API maintenance gate. When this
+// option is not called, admission remains enabled for backward compatibility.
+func (h *Handler) WithProvisioningAdmission(enabled bool, metrics provisioningAdmissionMetrics) *Handler {
+	h.provisioningConfigured = true
+	h.provisioningEnabled = enabled
+	h.provisioningMetrics = metrics
+	return h
 }
 
 // WithVCenterFolders enables the admin folder-enumeration endpoint by wiring
@@ -359,6 +372,10 @@ func (h *Handler) GetPod(w http.ResponseWriter, r *http.Request) {
 
 // CreatePod creates the pod + VMs in the DB, then queues a provisioning job.
 func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
+	if h.rejectProvisioning(w, r, provisioningRoutePodCreate) {
+		return
+	}
+
 	var req models.CreatePodRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondError(w, r, http.StatusBadRequest, "invalid request body")
@@ -863,6 +880,10 @@ func (h *Handler) DeleteVM(w http.ResponseWriter, r *http.Request) {
 
 // AddVM queues a job to add a VM to an existing pod.
 func (h *Handler) AddVM(w http.ResponseWriter, r *http.Request) {
+	if h.rejectProvisioning(w, r, provisioningRouteVMAdd) {
+		return
+	}
+
 	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
 	if err != nil {
 		respondError(w, r, http.StatusBadRequest, "invalid pod id")

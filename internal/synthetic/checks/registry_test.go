@@ -119,6 +119,22 @@ func TestPodsList_FailsOnObjectResponse(t *testing.T) {
 	}
 }
 
+func TestTemplateVisibilityMaintenanceModeRemainsReadOnly(t *testing.T) {
+	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
+		"/api/v1/templates": func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				t.Fatalf("maintenance visibility check used mutating method %s", r.Method)
+			}
+			w.Write([]byte(`[]`))
+		},
+	})
+	check := TemplateVisibilityEnforced(TemplateVisibilityConfig{ProvisioningEnabled: false})
+	status, err := check.Run(context.Background(), synthetic.NewClient(srv.URL, ""))
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("status=%d err=%v", status, err)
+	}
+}
+
 func TestAdminListUsers403_PassesOn403(t *testing.T) {
 	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
 		"/api/v1/admin/users": func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(403) },
@@ -241,6 +257,7 @@ func TestAll_StableNames(t *testing.T) {
 	wantNames := map[string]bool{
 		"healthz":                      true,
 		"auth_me":                      true,
+		"provisioning_status":          true,
 		"pods_list":                    true,
 		"admin_list_users_403":         true,
 		"admin_run_detail_403":         true,
@@ -278,6 +295,15 @@ func TestAll_HasFriendlyMetadata(t *testing.T) {
 		}
 		if len(c.Title()) > 60 {
 			t.Errorf("check %q Title() = %q is too long (>60 chars; keep it pill-sized)", c.Name(), c.Title())
+		}
+	}
+}
+
+func TestReadOnly_OmitsMutatingRBACProbes(t *testing.T) {
+	for _, check := range ReadOnly() {
+		switch check.Name() {
+		case "image_upload_rbac", "template_pin_rbac":
+			t.Errorf("read-only maintenance registry includes mutating check %q", check.Name())
 		}
 	}
 }

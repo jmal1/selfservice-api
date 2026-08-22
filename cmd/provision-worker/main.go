@@ -532,6 +532,7 @@ func main() {
 		"worker_id", workerID,
 		"vcenter", cfg.VCenter.URL,
 		"opnsense", cfg.OPNsense.BaseURL,
+		"provisioning_claims_enabled", cfg.Provisioning.WorkerClaimsEnabled,
 	)
 
 	// Recover any jobs that were abandoned by a previous worker instance
@@ -548,7 +549,7 @@ func main() {
 	// Subscribe to job notifications from NATS
 	_, err = natsClient.SubscribeJobCreated(func(jobID string, jobType string) {
 		logger.Info("received job notification", "job_id", jobID, "type", jobType)
-		processJobs(ctx, queries, prov, workerID, logger)
+		processJobs(ctx, queries, prov, workerID, cfg.Provisioning.WorkerClaimsEnabled, logger)
 	})
 	if err != nil {
 		logger.Error("NATS subscription failed", "error", err)
@@ -663,7 +664,7 @@ func main() {
 	}
 
 	// Immediately process any pending/recovered jobs
-	go processJobs(ctx, queries, prov, workerID, logger)
+	go processJobs(ctx, queries, prov, workerID, cfg.Provisioning.WorkerClaimsEnabled, logger)
 
 	go func() {
 		for {
@@ -674,7 +675,7 @@ func main() {
 			// ── Job-claim loop: NOT gated by leader election ──────────────────
 			// All replicas claim jobs via SELECT ... FOR UPDATE SKIP LOCKED.
 			case <-ticker.C:
-				processJobs(ctx, queries, prov, workerID, logger)
+				processJobs(ctx, queries, prov, workerID, cfg.Provisioning.WorkerClaimsEnabled, logger)
 
 			// ── Periodic reconcilers: ALL gated by leader election ─────────────
 			// When not leader the tick fires but the body is a cheap no-op.
@@ -871,13 +872,13 @@ func main() {
 }
 
 // processJobs claims and processes available jobs via the provisioner.
-func processJobs(ctx context.Context, queries *database.Queries, prov *provisioner.Provisioner, workerID string, logger *slog.Logger) {
+func processJobs(ctx context.Context, queries *database.Queries, prov *provisioner.Provisioner, workerID string, provisioningClaimsEnabled bool, logger *slog.Logger) {
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 
-		job, err := queries.ClaimJob(ctx, workerID)
+		job, err := queries.ClaimJob(ctx, workerID, provisioningClaimsEnabled)
 		if err != nil {
 			logger.Error("claim job failed", "error", err)
 			return

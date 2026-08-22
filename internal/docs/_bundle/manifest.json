@@ -13,8 +13,8 @@
     {
       "path": "AGENTS.md",
       "title": "AGENTS.md — Crucible AI Authoring Reference",
-      "size": 43218,
-      "sha256": "d9b10f8843e356a944680c0fd43ae3b14823555ddf9b2c1da8c8c570bcf7964d",
+      "size": 45350,
+      "sha256": "eff04f23d7c307e31d08676e2bfe6c29bd41c937f761d98ba43189aa9d793f4c",
       "is_markdown": true,
       "links_out": [
         "deploy/runner/actions.sh",
@@ -201,8 +201,8 @@
     {
       "path": "docs/instructor/troubleshooting.md",
       "title": "Troubleshooting",
-      "size": 29936,
-      "sha256": "d68bfde4b000b21dab9c38fae4ee10ece5079a44548ec296c45bb9e768d05a31",
+      "size": 31403,
+      "sha256": "ad39c94700454a10f499440d1739124596d97d9809c0ee6b8104115b68148ab5",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/actions.md",
@@ -297,8 +297,8 @@
     {
       "path": "internal/api/routes/routes.go",
       "title": "routes.go (Go)",
-      "size": 14377,
-      "sha256": "3dd32d1f0063ca27780204e663adb19fa950956cbacc99bc6db36d4f08b5984d",
+      "size": 14470,
+      "sha256": "854bd7f2255b8a231b3ed552ae5f96b1dceb5795dea026c6ed616cd6354b1270",
       "is_markdown": false,
       "from_seed": false
     },
@@ -383,5 +383,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 324247
+  "total_bytes": 327939
 }

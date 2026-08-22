@@ -753,3 +753,61 @@ Do not deploy content-filter changes, scale workers, or restore destructive
 synthetics while an infrastructure containment hold is active. Read-only policy
 inspection through `content_filter_policy` is the only non-destructive
 synthetic defined for this feature.
+
+---
+
+## 17. Provisioning maintenance operator contract
+
+Crucible has two independent, strict maintenance controls:
+
+- `PROVISIONING_ENABLED` controls API admission for new user provisioning.
+- `WORKER_PROVISIONING_CLAIMS_ENABLED` controls whether workers claim
+  `pod_create` and `vm_add` jobs.
+
+Both default to `true` for backward compatibility. If either variable is set,
+it must parse as a Go boolean; an invalid value fails process startup rather
+than silently enabling provisioning. Helm exposes these as
+`provisioning.enabled` and `provisioning.workerClaimsEnabled`.
+
+When API admission is disabled, the first instruction in each of these
+handlers rejects the request before parsing, allocation, or database access:
+
+- `POST /api/v1/pods`
+- `POST /api/v1/blueprints/{blueprintID}/deploy`
+- `POST /api/v1/pods/{podID}/vms`
+
+The response is `503 Service Unavailable`, includes `Retry-After: 300`, and
+uses the normal error envelope:
+
+```json
+{
+  "error": "Provisioning is temporarily unavailable for maintenance.",
+  "request_id": "..."
+}
+```
+
+Delete/destroy, delete-VM, power, and cleanup paths are intentionally not
+gated. When worker provisioning claims are disabled, `pod_create` and
+`vm_add` are excluded inside the atomic claim query and remain pending; destroy
+and cleanup jobs remain claimable.
+
+Authenticated clients and the non-destructive API synthetic use
+`GET /api/v1/provisioning/status`. Its complete stable response contract is:
+
+```json
+{"enabled": false, "message": "Provisioning is temporarily unavailable for maintenance."}
+```
+
+or:
+
+```json
+{"enabled": true, "message": "Provisioning is available."}
+```
+
+`SYNTHETIC_PROVISIONING_EXPECTED_ENABLED` declares which state the monitor
+expects. When it is `false`, the main synthetic registry runs only read-only
+checks; POST-based RBAC probes and pod lifecycle creation are omitted. The
+separate janitor remains permitted because it only exercises the preserved
+delete/cleanup path. Admission observability is published through
+`crucible_provisioning_admission_enabled` and the bounded-route counter
+`crucible_provisioning_admission_rejected_total{route=...}`.

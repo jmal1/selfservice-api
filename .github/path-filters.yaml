@@ -28,6 +28,7 @@ shared:
   - 'internal/database/**'
   - 'internal/models/**'
   - 'internal/nats/**'
+  - 'internal/provisioning/**'
 
 api-gateway:
   - 'cmd/api-gateway/**'

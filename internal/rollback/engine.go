@@ -1,6 +1,7 @@
 package rollback
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -59,6 +60,13 @@ func (e *Engine) Record(ctx context.Context, name string, data any) error {
 	}
 
 	step := Step{Name: name, Data: raw}
+	for _, existing := range e.steps {
+		if existing.Name == name && bytes.Equal(existing.Data, step.Data) {
+			e.logger.Info("identical rollback step already recorded",
+				"job_id", e.jobID, "step", name)
+			return nil
+		}
+	}
 	e.steps = append(e.steps, step)
 
 	if e.persister != nil {
@@ -76,6 +84,7 @@ func (e *Engine) Record(ctx context.Context, name string, data any) error {
 // Returns a slice of errors (one per failed undo). Empty slice = full success.
 func (e *Engine) Rollback(ctx context.Context) []error {
 	var errs []error
+	var failed []Step
 
 	// Process steps in reverse order
 	reversed := make([]Step, len(e.steps))
@@ -86,6 +95,8 @@ func (e *Engine) Rollback(ctx context.Context) []error {
 		undoFn, ok := e.undoFuncs[step.Name]
 		if !ok {
 			e.logger.Warn("no undo function registered", "step", step.Name, "job_id", e.jobID)
+			errs = append(errs, fmt.Errorf("rollback %s: no undo function registered", step.Name))
+			failed = append(failed, step)
 			continue
 		}
 
@@ -93,9 +104,18 @@ func (e *Engine) Rollback(ctx context.Context) []error {
 		if err := undoFn(ctx, step.Data); err != nil {
 			e.logger.Error("rollback step failed", "step", step.Name, "job_id", e.jobID, "error", err)
 			errs = append(errs, fmt.Errorf("rollback %s: %w", step.Name, err))
+			failed = append(failed, step)
 			// Continue rolling back remaining steps even if one fails
 		} else {
 			e.logger.Info("rollback step succeeded", "step", step.Name, "job_id", e.jobID)
+		}
+	}
+
+	slices.Reverse(failed)
+	e.steps = failed
+	if e.persister != nil {
+		if err := e.persister.SaveRollbackSteps(ctx, e.jobID, e.steps); err != nil {
+			errs = append(errs, fmt.Errorf("persist remaining rollback steps: %w", err))
 		}
 	}
 

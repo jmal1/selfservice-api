@@ -923,27 +923,39 @@ func (q *Queries) CreateTemplateRevalidateJobIfAbsent(
 	return &job, true, nil
 }
 
+const claimJobSQL = `
+	UPDATE jobs SET
+		status = 'claimed',
+		claimed_by = $1,
+		claimed_at = now()
+	WHERE id = (
+		SELECT id FROM jobs
+		WHERE status = 'pending'
+		  AND type <> ALL($2)
+		  AND (next_attempt_at IS NULL OR next_attempt_at <= now())
+		ORDER BY created_at ASC
+		FOR UPDATE SKIP LOCKED
+		LIMIT 1
+	)
+	RETURNING id, type, payload, status, claimed_by, claimed_at,
+	          retry_count, max_retries, next_attempt_at, rollback_steps, created_at
+`
+
+func blockedJobTypesForClaim(provisioningClaimsEnabled bool) []string {
+	if provisioningClaimsEnabled {
+		return []string{}
+	}
+	return []string{models.JobTypePodCreate, models.JobTypeVMAdd}
+}
+
 // ClaimJob atomically claims the next pending job for a worker.
 // Jobs whose next_attempt_at is in the future are skipped (they are
-// sleeping between retry attempts).
-func (q *Queries) ClaimJob(ctx context.Context, workerID string) (*models.Job, error) {
+// sleeping between retry attempts). When provisioning claims are disabled,
+// pod_create and vm_add are excluded inside the selecting transaction and
+// remain pending; cleanup and every other job type stay claimable.
+func (q *Queries) ClaimJob(ctx context.Context, workerID string, provisioningClaimsEnabled bool) (*models.Job, error) {
 	var j models.Job
-	err := q.pool.QueryRow(ctx, `
-		UPDATE jobs SET
-			status = 'claimed',
-			claimed_by = $1,
-			claimed_at = now()
-		WHERE id = (
-			SELECT id FROM jobs
-			WHERE status = 'pending'
-			  AND (next_attempt_at IS NULL OR next_attempt_at <= now())
-			ORDER BY created_at ASC
-			FOR UPDATE SKIP LOCKED
-			LIMIT 1
-		)
-		RETURNING id, type, payload, status, claimed_by, claimed_at,
-		          retry_count, max_retries, next_attempt_at, rollback_steps, created_at
-	`, workerID).Scan(
+	err := q.pool.QueryRow(ctx, claimJobSQL, workerID, blockedJobTypesForClaim(provisioningClaimsEnabled)).Scan(
 		&j.ID, &j.Type, &j.Payload, &j.Status, &j.ClaimedBy, &j.ClaimedAt,
 		&j.RetryCount, &j.MaxRetries, &j.NextAttemptAt, &j.RollbackSteps, &j.CreatedAt,
 	)
@@ -1287,10 +1299,62 @@ func (q *Queries) UpdatePodVM(ctx context.Context, id uuid.UUID, vcenterVMID, vc
 	return err
 }
 
+// UpdatePodVMFrom updates vCenter details only while a VM remains in one of
+// the allowed source states. Terminal delete/error intent therefore wins over
+// a stale or concurrently finishing add job.
+func (q *Queries) UpdatePodVMFrom(ctx context.Context, id uuid.UUID, fromStatuses []string, vcenterVMID, vcenterVMName, status string) (bool, error) {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE pod_vms SET vcenter_vm_id = $1, vcenter_vm_name = $2, status = $3
+		WHERE id = $4 AND status = ANY($5)
+	`, vcenterVMID, vcenterVMName, status, id, fromStatuses)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// SetPodVMVCenterReference records a clone without changing lifecycle state.
+// Cleanup paths use this after losing a status race so the external resource
+// remains durably discoverable even when the row is already terminal.
+func (q *Queries) SetPodVMVCenterReference(ctx context.Context, id uuid.UUID, vcenterVMID, vcenterVMName string) (bool, error) {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE pod_vms SET vcenter_vm_id = $2, vcenter_vm_name = $3
+		WHERE id = $1
+		  AND status IN ('deleted', 'error')
+		  AND (vcenter_vm_id IS NULL OR vcenter_vm_id = '' OR vcenter_vm_id = $2)
+	`, id, vcenterVMID, vcenterVMName)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// ClearPodVMVCenterReference clears exactly the clone reference that was
+// destroyed, preserving a newer reference if another operation won the race.
+func (q *Queries) ClearPodVMVCenterReference(ctx context.Context, id uuid.UUID, vcenterVMID string) (bool, error) {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE pod_vms SET vcenter_vm_id = NULL, vcenter_vm_name = NULL, ip_address = NULL
+		WHERE id = $1 AND vcenter_vm_id = $2
+	`, id, vcenterVMID)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // UpdatePodVMStatus updates a pod VM's status.
 func (q *Queries) UpdatePodVMStatus(ctx context.Context, id uuid.UUID, status string) error {
 	_, err := q.pool.Exec(ctx, `UPDATE pod_vms SET status = $1 WHERE id = $2`, status, id)
 	return err
+}
+
+// UpdatePodVMStatusFrom transitions a pod VM only from an allowed source state.
+func (q *Queries) UpdatePodVMStatusFrom(ctx context.Context, id uuid.UUID, fromStatuses []string, status string) (bool, error) {
+	tag, err := q.pool.Exec(ctx, `UPDATE pod_vms SET status = $1 WHERE id = $2 AND status = ANY($3)`, status, id, fromStatuses)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 // UpdatePodVMIP sets the IP address on a pod VM.

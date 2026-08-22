@@ -95,6 +95,15 @@ func main() {
 
 	// Create handlers and router
 	handler := handlers.NewHandler(queries, natsClient, vcClient, logger, cfg.Server.AllowedOrigins)
+	admissionMetrics := handlers.NewProvisioningAdmissionMetrics(
+		os.Getenv("PROVISIONING_PUSHGATEWAY_URL"),
+		os.Getenv("PROVISIONING_PUSHGATEWAY_JOB"),
+		map[string]string{"layer": "api"},
+		cfg.Provisioning.Enabled,
+	)
+	handler.WithProvisioningAdmission(cfg.Provisioning.Enabled, admissionMetrics)
+	go admissionMetrics.RunPusher(ctx, 30*time.Second, logger)
+	logger.Info("provisioning admission configured", "enabled", cfg.Provisioning.Enabled)
 	if vc, ok := vcClient.(*vcenter.Client); ok && vc != nil && cfg.VCenter.TemplatesFolder != "" {
 		handler.WithVCenterFolders(vc, cfg.VCenter.TemplatesFolder)
 		logger.Info("vCenter folder enumeration enabled", "folder", cfg.VCenter.TemplatesFolder)

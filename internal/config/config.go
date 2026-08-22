@@ -10,14 +10,23 @@ import (
 
 // Config holds all application configuration.
 type Config struct {
-	Server      ServerConfig
-	Database    DatabaseConfig
-	OIDC        OIDCConfig
-	NATS        NATSConfig
-	Vault       VaultConfig
-	VCenter     VCenterConfig
-	OPNsense    OPNsenseConfig
-	ObjectStore ObjectStoreConfig
+	Server       ServerConfig
+	Database     DatabaseConfig
+	OIDC         OIDCConfig
+	NATS         NATSConfig
+	Vault        VaultConfig
+	VCenter      VCenterConfig
+	OPNsense     OPNsenseConfig
+	ObjectStore  ObjectStoreConfig
+	Provisioning ProvisioningConfig
+}
+
+// ProvisioningConfig holds the two independent maintenance controls. Enabled
+// governs API admission; WorkerClaimsEnabled governs whether workers may claim
+// pod_create and vm_add jobs. Both default to true for backward compatibility.
+type ProvisioningConfig struct {
+	Enabled             bool
+	WorkerClaimsEnabled bool
 }
 
 // ObjectStoreConfig holds the S3/MinIO settings used to stage browser-uploaded
@@ -128,6 +137,15 @@ type OPNsenseConfig struct {
 // Load reads configuration from environment variables.
 // In production, these are injected by Vault sidecar or K8s secrets.
 func Load() (*Config, error) {
+	provisioningEnabled, err := getEnvBoolStrict("PROVISIONING_ENABLED", true)
+	if err != nil {
+		return nil, err
+	}
+	workerClaimsEnabled, err := getEnvBoolStrict("WORKER_PROVISIONING_CLAIMS_ENABLED", true)
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
 		Server: ServerConfig{
 			Host:           getEnv("SERVER_HOST", "0.0.0.0"),
@@ -191,6 +209,10 @@ func Load() (*Config, error) {
 			Prefix:    getEnv("OBJECTSTORE_PREFIX", "crucible"),
 			UseSSL:    getEnvBool("OBJECTSTORE_USE_SSL", true),
 		},
+		Provisioning: ProvisioningConfig{
+			Enabled:             provisioningEnabled,
+			WorkerClaimsEnabled: workerClaimsEnabled,
+		},
 	}
 
 	return cfg, nil
@@ -220,6 +242,18 @@ func getEnvBool(key string, fallback bool) bool {
 		}
 	}
 	return fallback
+}
+
+func getEnvBoolStrict(key string, fallback bool) (bool, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(v) == "" {
+		return fallback, nil
+	}
+	b, err := strconv.ParseBool(strings.TrimSpace(v))
+	if err != nil {
+		return false, fmt.Errorf("invalid %s=%q: must be a boolean: %w", key, v, err)
+	}
+	return b, nil
 }
 
 func getEnvDuration(key string, fallback time.Duration) time.Duration {

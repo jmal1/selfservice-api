@@ -21,6 +21,57 @@ If you need an audit trail, ask a platform admin.
 
 ---
 
+## "Provisioning is temporarily unavailable for maintenance"
+
+Crucible can intentionally pause **new** pod and VM provisioning while
+operators perform infrastructure maintenance. During that window, these
+requests return `503 Service Unavailable`:
+
+- `POST /api/v1/pods`
+- `POST /api/v1/blueprints/{blueprintID}/deploy`
+- `POST /api/v1/pods/{podID}/vms`
+
+The response uses the normal JSON error envelope and includes
+`Retry-After: 300`:
+
+```json
+{
+  "error": "Provisioning is temporarily unavailable for maintenance.",
+  "request_id": "..."
+}
+```
+
+This is a platform-wide maintenance state, not a problem with your template,
+blueprint, quota, or request body. Wait for the maintenance window to end
+before retrying. Deleting pods or VMs, power operations, and platform cleanup
+remain available so existing environments can be made safe.
+
+Authenticated clients can check the stable read-only contract at
+`GET /api/v1/provisioning/status`:
+
+```json
+{
+  "enabled": false,
+  "message": "Provisioning is temporarily unavailable for maintenance."
+}
+```
+
+When provisioning is available, the same endpoint returns:
+
+```json
+{
+  "enabled": true,
+  "message": "Provisioning is available."
+}
+```
+
+The API synthetic monitor expects this state through
+`SYNTHETIC_PROVISIONING_EXPECTED_ENABLED`. While disabled, its normal check set
+is read-only; the separately scheduled synthetic janitor may still delete old
+synthetic pods because cleanup remains intentionally available.
+
+---
+
 ## "My workflow always passes — even on a fresh, untouched pod"
 
 This is the worst kind of bug because students think they've succeeded.

@@ -37,6 +37,11 @@ var requiredWiring = map[string][]struct {
 	"cmd/api-gateway/main.go": {
 		{"WithImageStore", "without it every /admin/images route answers 503 and image upload is dead in prod"},
 		{"WithVCenterISOs", "without it the template wizard's ISO picker is permanently empty"},
+		{"WithProvisioningAdmission", "without it PROVISIONING_ENABLED is parsed but new pod and VM requests remain admitted during maintenance"},
+		{"NewProvisioningAdmissionMetrics", "without it maintenance state and rejection counters are absent from Pushgateway"},
+	},
+	"internal/api/routes/routes.go": {
+		{"r.Use(h.ProvisioningAdmission)", "the admission gate must run after authentication but before AuditRequests can touch the database"},
 	},
 	"cmd/crucible-engine/main.go": {
 		{"NewRunnerMetrics", "without it e.metrics stays nil and every runner metric call is a silent no-op"},
@@ -78,6 +83,7 @@ func TestCmdMains_WireOptionalDependencies(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read %s: %v", relPath, err)
 			}
+
 			src := string(data)
 
 			for _, req := range required {
@@ -92,6 +98,20 @@ func TestCmdMains_WireOptionalDependencies(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestProvisioningAdmissionPrecedesDatabaseTouchingAudit(t *testing.T) {
+	root := findRepoRoot(t)
+	body, err := os.ReadFile(filepath.Join(root, "internal", "api", "routes", "routes.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(body)
+	admission := strings.Index(src, "r.Use(h.ProvisioningAdmission)")
+	audit := strings.Index(src, "r.Use(middleware.AuditRequests(db))")
+	if admission < 0 || audit < 0 || admission > audit {
+		t.Fatal("provisioning admission must be registered before database-touching request auditing")
 	}
 }
 
@@ -124,6 +144,7 @@ func TestCreatePod_ActiveTransitionIsGuarded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read %s: %v", relPath, err)
 	}
+
 	src := string(data)
 
 	const guarded = `UpdatePodStatusFrom(ctx, pod.ID, []string{"provisioning"}, "active", "")`
@@ -147,5 +168,53 @@ func TestCreatePod_ActiveTransitionIsGuarded(t *testing.T) {
 				"in \"provisioning\".",
 			relPath, unguarded,
 		)
+	}
+}
+
+func TestProvisioningJobEntryTransitionsAreGuarded(t *testing.T) {
+	root := findRepoRoot(t)
+	files := map[string][]string{
+		"internal/provisioner/create.go": {
+			"UpdatePodStatusFrom(",
+			"UpdatePodVMStatusFrom(",
+			"UpdatePodVMFrom(",
+			"models.PodStatusPending",
+			"models.PodStatusProvisioning",
+			"stale pod create job skipped",
+			"stopPodCreateIfStale",
+			"rb.Rollback(ctx)",
+			"cleanupStaleVMClone",
+		},
+		"internal/provisioner/vm_ops.go": {
+			"UpdatePodVMStatusFrom(",
+			"UpdatePodVMFrom(",
+			"stale vm_add job skipped",
+			"VCenterVMID string",
+			"CleanupOnly bool",
+			"models.JobTypeVMDestroy",
+		},
+	}
+	for relPath, fragments := range files {
+		body, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(relPath)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, fragment := range fragments {
+			if !strings.Contains(string(body), fragment) {
+				t.Errorf("%s is missing %q; a stale provisioning job could overwrite terminal cleanup state", relPath, fragment)
+			}
+		}
+
+	}
+}
+
+func TestCreatePodDoesNotUseUnguardedVMStatusWrites(t *testing.T) {
+	root := findRepoRoot(t)
+	body, err := os.ReadFile(filepath.Join(root, "internal", "provisioner", "create.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "UpdatePodVMStatus(ctx") {
+		t.Fatal("pod create contains an unconditional VM status write that can resurrect deleted state")
 	}
 }

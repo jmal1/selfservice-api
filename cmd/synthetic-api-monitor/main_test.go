@@ -89,6 +89,7 @@ func TestResolvePushLayer_RunnerModeCannotClobberTheApiGrouping(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
+
 		if got == mainLayer {
 			t.Fatalf("runner mode defaulted to the main grouping %q; its single-check "+
 				"push would delete every other api-layer series", mainLayer)
@@ -138,6 +139,32 @@ func TestResolvePushLayer_RunnerModeCannotClobberTheApiGrouping(t *testing.T) {
 			t.Errorf("resolvePushLayer(false, \"janitor\") = %q, want %q", got, "janitor")
 		}
 	})
+}
+
+func TestStrictEnvBool(t *testing.T) {
+	tests := []struct {
+		name     string
+		value    string
+		fallback bool
+		want     bool
+		wantErr  bool
+	}{
+		{"unset uses default true", "", true, true, false},
+		{"explicit false", "false", true, false, false},
+		{"explicit true", "true", false, true, false},
+		{"invalid fails", "disabled", true, false, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := strictEnvBool(func(string) string { return tc.value }, envProvisioningExpected, tc.fallback)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error = %v, wantErr %t", err, tc.wantErr)
+			}
+			if !tc.wantErr && got != tc.want {
+				t.Errorf("got = %t, want %t", got, tc.want)
+			}
+		})
+	}
 }
 
 // TestResolveRunnerConfig_MissingEnvWarnsButNeverFails is the T1-5 regression
@@ -668,10 +695,10 @@ func parseDurField(t *testing.T, s, field string) time.Duration {
 // giving 2×(180s+90s)+30s+60s = 630s = 10m30s > 10m schedule ✗.
 func TestPodLifecycleRetry_WorstCaseDerivedFromHelmValues(t *testing.T) {
 	const (
-		valuesBase           = "../../deploy/helm/selfservice/values.yaml"
-		valuesProd           = "../../deploy/helm/selfservice/values.prod.yaml"
-		cronJob              = 10 * time.Minute
-		defaultDeadlineHard  = 900 * time.Second // template default when not set
+		valuesBase          = "../../deploy/helm/selfservice/values.yaml"
+		valuesProd          = "../../deploy/helm/selfservice/values.prod.yaml"
+		cronJob             = 10 * time.Minute
+		defaultDeadlineHard = 900 * time.Second // template default when not set
 	)
 
 	base := loadHelmValues(t, valuesBase)

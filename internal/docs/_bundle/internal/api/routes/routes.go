@@ -85,7 +85,10 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 		// API v1 (authenticated)
 		r.Route("/api/v1", func(r chi.Router) {
 			r.Use(middleware.Auth(authProvider))
+			r.Use(h.ProvisioningAdmission)
 			r.Use(middleware.AuditRequests(db))
+
+			r.Get("/provisioning/status", h.GetProvisioningStatus)
 
 			// Pods
 			r.Route("/pods", func(r chi.Router) {

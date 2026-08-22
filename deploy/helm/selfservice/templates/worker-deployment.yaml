@@ -54,6 +54,8 @@ spec:
                   key: password
             - name: NATS_URL
               value: {{ .Values.natsURL | quote }}
+            - name: WORKER_PROVISIONING_CLAIMS_ENABLED
+              value: {{ .Values.provisioning.workerClaimsEnabled | quote }}
             # vCenter configuration
             - name: VCENTER_URL
               valueFrom:

@@ -48,6 +48,8 @@ spec:
                   value: {{ .Values.synthetic.role | quote }}
                 - name: SYNTHETIC_CHECK_TIMEOUT
                   value: {{ .Values.synthetic.checkTimeout | quote }}
+                - name: SYNTHETIC_PROVISIONING_EXPECTED_ENABLED
+                  value: {{ .Values.synthetic.provisioningExpectedEnabled | quote }}
                 - name: SYNTHETIC_USER_ID
                   valueFrom:
                     secretKeyRef:

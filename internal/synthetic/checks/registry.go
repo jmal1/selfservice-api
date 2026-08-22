@@ -312,82 +312,90 @@ var TemplatePinRBAC = synthetic.CheckFunc{
 	},
 }
 
-// TemplateVisibilityEnforced asserts that instructor_only templates are hidden
-// from students: they don't appear in the list and students cannot use them in
-// pod creation. This is critical: visibility=instructor_only is the boundary
-// between staged templates (not yet ready for student access) and public ones.
-// A regression that leaks instructor_only templates would expose unfinished
-// content to students.
-var TemplateVisibilityEnforced = synthetic.CheckFunc{
-	NameVal:        "template_visibility_enforced",
-	TitleVal:       "Template Visibility: Students Cannot See instructor_only",
-	DescriptionVal: "Lists templates as a student and asserts no instructor_only templates are present. Then attempts to create a pod with a known instructor_only template UUID and requires 403. Guards template staging isolation.",
-	SeverityVal:    synthetic.SeverityCritical,
-	RunFn: func(ctx context.Context, c *synthetic.Client) (int, error) {
-		// 1. List templates as student and verify no instructor_only templates leak
-		resp, err := c.Do(ctx, http.MethodGet, "/api/v1/templates", nil)
-		if err != nil {
-			return 0, err
-		}
-		defer resp.Body.Close()
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		if resp.StatusCode != http.StatusOK {
-			return resp.StatusCode, fmt.Errorf("list templates returned %d: %s", resp.StatusCode, snippet(body))
-		}
-		var templates []struct {
-			ID         string `json:"id"`
-			Name       string `json:"name"`
-			Visibility string `json:"visibility"`
-		}
-		if err := json.Unmarshal(body, &templates); err != nil {
-			return resp.StatusCode, fmt.Errorf("list templates body not valid JSON: %w", err)
-		}
-		for _, t := range templates {
-			if t.Visibility == "instructor_only" {
-				return resp.StatusCode, fmt.Errorf("template %q (%s) with visibility=instructor_only appeared in student template list (should be hidden)", t.Name, t.ID)
-			}
-		}
+// TemplateVisibilityConfig keeps this check read-only during planned
+// provisioning maintenance.
+type TemplateVisibilityConfig struct {
+	ProvisioningEnabled bool
+}
 
-		// 2. Attempt pod creation with a known fixture instructor_only template.
-		// The fixture "synthetic-visibility-test" is created in the seed with
-		// visibility=instructor_only. This UUID matches the seeded fixture.
-		// If the fixture does not exist, the pod creation will fail with 400
-		// "template not found", which is acceptable degradation if seeding fails.
-		const fixtureTemplateID = "00000000-0000-0000-0000-000000000001"
-		createReq := struct {
-			Name string `json:"name"`
-			VMs  []struct {
-				TemplateID  string `json:"template_id"`
-				DisplayName string `json:"display_name"`
-			} `json:"vms"`
-		}{
-			Name: "test-pod",
-			VMs: []struct {
-				TemplateID  string `json:"template_id"`
-				DisplayName string `json:"display_name"`
+// TemplateVisibilityEnforced always verifies the student-visible template
+// list. Its pod-create assertion runs only while provisioning is expected to be
+// enabled; maintenance admission itself is covered by provisioning_status.
+func TemplateVisibilityEnforced(cfg TemplateVisibilityConfig) synthetic.Check {
+	return synthetic.CheckFunc{
+		NameVal:        "template_visibility_enforced",
+		TitleVal:       "Template Visibility: Students Cannot See instructor_only",
+		DescriptionVal: "Lists templates as a student and asserts no instructor_only templates are present. When provisioning is enabled, also attempts a pod create with a known instructor_only template and requires rejection.",
+		SeverityVal:    synthetic.SeverityCritical,
+		RunFn: func(ctx context.Context, c *synthetic.Client) (int, error) {
+			// 1. List templates as student and verify no instructor_only templates leak
+			resp, err := c.Do(ctx, http.MethodGet, "/api/v1/templates", nil)
+			if err != nil {
+				return 0, err
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			if resp.StatusCode != http.StatusOK {
+				return resp.StatusCode, fmt.Errorf("list templates returned %d: %s", resp.StatusCode, snippet(body))
+			}
+			var templates []struct {
+				ID         string `json:"id"`
+				Name       string `json:"name"`
+				Visibility string `json:"visibility"`
+			}
+			if err := json.Unmarshal(body, &templates); err != nil {
+				return resp.StatusCode, fmt.Errorf("list templates body not valid JSON: %w", err)
+			}
+			for _, t := range templates {
+				if t.Visibility == "instructor_only" {
+					return resp.StatusCode, fmt.Errorf("template %q (%s) with visibility=instructor_only appeared in student template list (should be hidden)", t.Name, t.ID)
+				}
+			}
+			if !cfg.ProvisioningEnabled {
+				return resp.StatusCode, nil
+			}
+
+			// 2. Attempt pod creation with a known fixture instructor_only template.
+			// The fixture "synthetic-visibility-test" is created in the seed with
+			// visibility=instructor_only. This UUID matches the seeded fixture.
+			// If the fixture does not exist, the pod creation will fail with 400
+			// "template not found", which is acceptable degradation if seeding fails.
+			const fixtureTemplateID = "00000000-0000-0000-0000-000000000001"
+			createReq := struct {
+				Name string `json:"name"`
+				VMs  []struct {
+					TemplateID  string `json:"template_id"`
+					DisplayName string `json:"display_name"`
+				} `json:"vms"`
 			}{
-				{TemplateID: fixtureTemplateID, DisplayName: "test-vm"},
-			},
-		}
-		reqBody, _ := json.Marshal(createReq)
-		resp, err = c.Do(ctx, http.MethodPost, "/api/v1/pods", strings.NewReader(string(reqBody)))
-		if err != nil {
-			return 0, err
-		}
-		defer resp.Body.Close()
-		_, _ = io.Copy(io.Discard, resp.Body)
-		// Student attempting to use instructor_only template must get 403.
-		// 400 ("template not found") is acceptable if the fixture doesn't exist.
-		if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusBadRequest {
-			return resp.StatusCode, fmt.Errorf("pod create with instructor_only template returned %d, want 403 or 400", resp.StatusCode)
-		}
-		if resp.StatusCode == http.StatusForbidden {
-			// Ideal case: the fixture exists and we got the right error.
-			return resp.StatusCode, nil
-		}
-		// Fallback: 400 because fixture doesn't exist, which is acceptable.
-		return http.StatusOK, nil
-	},
+				Name: "test-pod",
+				VMs: []struct {
+					TemplateID  string `json:"template_id"`
+					DisplayName string `json:"display_name"`
+				}{
+					{TemplateID: fixtureTemplateID, DisplayName: "test-vm"},
+				},
+			}
+			reqBody, _ := json.Marshal(createReq)
+			resp, err = c.Do(ctx, http.MethodPost, "/api/v1/pods", strings.NewReader(string(reqBody)))
+			if err != nil {
+				return 0, err
+			}
+			defer resp.Body.Close()
+			_, _ = io.Copy(io.Discard, resp.Body)
+			// Student attempting to use instructor_only template must get 403.
+			// 400 ("template not found") is acceptable if the fixture doesn't exist.
+			if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusBadRequest {
+				return resp.StatusCode, fmt.Errorf("pod create with instructor_only template returned %d, want 403 or 400", resp.StatusCode)
+			}
+			if resp.StatusCode == http.StatusForbidden {
+				// Ideal case: the fixture exists and we got the right error.
+				return resp.StatusCode, nil
+			}
+			// Fallback: 400 because fixture doesn't exist, which is acceptable.
+			return http.StatusOK, nil
+		},
+	}
 }
 
 // All returns the canonical list of synthetic checks the monitor runs each
@@ -397,17 +405,39 @@ func All() []synthetic.Check {
 	return []synthetic.Check{
 		Healthz,
 		AuthMe,
+		ProvisioningStatus(ProvisioningStatusConfig{ExpectedEnabled: true}),
 		PodsList,
 		AdminListUsers403,
 		AdminRunDetail403,
 		AdminAudit403,
-		TemplateVisibilityEnforced,
+		TemplateVisibilityEnforced(TemplateVisibilityConfig{ProvisioningEnabled: true}),
 		PodTestingDashboard404,
 		WikiIndexRBAC,
 		StudentGuideIndex,
 		ImageUploadRBAC,
 		TemplateHealthStatusRBAC,
 		TemplatePinRBAC,
+		ContentFilterPolicy(ContentFilterPolicyConfig{}),
+	}
+}
+
+// ReadOnly returns the main monitor checks that cannot mutate API state. It is
+// used while provisioning maintenance is expected so containment monitoring
+// cannot accidentally create resources if an RBAC guard regresses.
+func ReadOnly() []synthetic.Check {
+	return []synthetic.Check{
+		Healthz,
+		AuthMe,
+		ProvisioningStatus(ProvisioningStatusConfig{ExpectedEnabled: false}),
+		PodsList,
+		AdminListUsers403,
+		AdminRunDetail403,
+		AdminAudit403,
+		TemplateVisibilityEnforced(TemplateVisibilityConfig{ProvisioningEnabled: false}),
+		PodTestingDashboard404,
+		WikiIndexRBAC,
+		StudentGuideIndex,
+		TemplateHealthStatusRBAC,
 		ContentFilterPolicy(ContentFilterPolicyConfig{}),
 	}
 }
