@@ -124,19 +124,19 @@ func TestChartProvisioningDefaultsRemainCompatible(t *testing.T) {
 	}
 }
 
-func TestProductionProvisioningContainmentRemainsClosed(t *testing.T) {
+func TestProductionProvisioningReopensConservatively(t *testing.T) {
 	values := loadChartValues(t, "values.prod.yaml")
-	if values.ReplicaCount.Worker != 0 {
-		t.Errorf("production worker replicas = %d, want 0 during incident containment", values.ReplicaCount.Worker)
+	if values.ReplicaCount.Worker != 1 {
+		t.Errorf("production worker replicas = %d, want exactly 1 during initial reopening", values.ReplicaCount.Worker)
 	}
-	if values.Provisioning.Enabled || values.Provisioning.WorkerClaimsEnabled {
-		t.Fatalf("production provisioning controls = %+v, want both false", values.Provisioning)
+	if !values.Provisioning.Enabled || !values.Provisioning.WorkerClaimsEnabled {
+		t.Fatalf("production provisioning controls = %+v, want admission and worker claims enabled", values.Provisioning)
 	}
-	if values.Synthetic.ProvisioningExpectedEnabled {
-		t.Fatal("production synthetic must expect provisioning disabled")
+	if !values.Synthetic.ProvisioningExpectedEnabled {
+		t.Fatal("production synthetic must expect provisioning enabled")
 	}
 	if values.Synthetic.Lifecycle.Enabled || values.Synthetic.Runner.Enabled || values.Synthetic.Janitor.Enabled {
-		t.Fatal("production lifecycle, runner, and destructive janitor synthetics must remain disabled during containment")
+		t.Fatal("production lifecycle, runner, and destructive janitor synthetics must remain disabled during initial reopening")
 	}
 	if values.VCenter.Hosts != "esxi1.lab.jmal.io" {
 		t.Fatalf("production VCENTER_HOSTS = %q, want ESXi1 only", values.VCenter.Hosts)
@@ -150,13 +150,13 @@ func TestProductionProvisioningContainmentRemainsClosed(t *testing.T) {
 		values.Worker.TemplateHealth.Enabled ||
 		values.Worker.IdleEvaluator.Enabled ||
 		!values.Worker.IdleEvaluator.DryRun {
-		t.Fatalf("production worker background mutation controls are not contained: %+v", values.Worker)
+		t.Fatalf("production worker background mutation controls are not conservatively disabled: %+v", values.Worker)
 	}
 	for path, want := range map[string]string{
-		"replicaCount.worker":                   "0",
-		"provisioning.enabled":                  "false",
-		"provisioning.workerClaimsEnabled":      "false",
-		"synthetic.provisioningExpectedEnabled": "false",
+		"replicaCount.worker":                   "1",
+		"provisioning.enabled":                  "true",
+		"provisioning.workerClaimsEnabled":      "true",
+		"synthetic.provisioningExpectedEnabled": "true",
 		"synthetic.lifecycle.enabled":           "false",
 		"synthetic.janitor.enabled":             "false",
 		"synthetic.runner.enabled":              "false",
