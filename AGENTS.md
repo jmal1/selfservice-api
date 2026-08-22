@@ -802,6 +802,13 @@ move a `provisioning` pod to `error` only when that exact staged target belongs
 to a VM in the job; marker-only, mismatched, active, pending, and unknown states
 fail closed.
 
+If the database write that returns cleanup work from `in_progress` to `pending`
+fails, the live worker does not abandon or terminalize it. It retries that
+idempotent write in-process with a 10-second per-write deadline and exponential
+backoff from 1 to 30 seconds until persistence succeeds or the worker shuts
+down. Shutdown leaves the row for the existing startup recovery pass; there is
+no periodic reset that could steal a legitimately long-running job.
+
 Completed compensation finalizes the parent job as `failed` with
 `compensated: true` and publishes a `compensated` event; it is never reported
 as successful provisioning. Missing or ambiguous immutable ownership proof

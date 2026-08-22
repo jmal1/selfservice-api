@@ -51,6 +51,12 @@ type jobStatusUpdater interface {
 	RetryJob(ctx context.Context, id uuid.UUID, nextAt time.Time, cleanupOnly bool, cleanupTarget []byte) error
 }
 
+const (
+	cleanupRescheduleWriteTimeout = 10 * time.Second
+	cleanupRescheduleBackoffBase  = time.Second
+	cleanupRescheduleBackoffMax   = 30 * time.Second
+)
+
 var _ pipelineMetricsSink = (*PipelineMetrics)(nil)
 var _ jobStatusUpdater = (*database.Queries)(nil)
 
@@ -185,6 +191,54 @@ func isTemplateJobType(jobType string) bool {
 	}
 }
 
+func cleanupRescheduleBackoff(failures int) time.Duration {
+	delay := cleanupRescheduleBackoffBase
+	for i := 1; i < failures && delay < cleanupRescheduleBackoffMax; i++ {
+		if delay > cleanupRescheduleBackoffMax/2 {
+			return cleanupRescheduleBackoffMax
+		}
+		delay *= 2
+	}
+	if delay > cleanupRescheduleBackoffMax {
+		return cleanupRescheduleBackoffMax
+	}
+	return delay
+}
+
+func persistCleanupRetry(
+	ctx context.Context,
+	db jobStatusUpdater,
+	job *models.Job,
+	cleanupTarget []byte,
+) (time.Time, error) {
+	failures := 0
+	for {
+		if failures > 0 {
+			timer := time.NewTimer(cleanupRescheduleBackoff(failures))
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return time.Time{}, fmt.Errorf("worker stopped before cleanup retry was persisted: %w", ctx.Err())
+			case <-timer.C:
+			}
+		}
+
+		nextAt := time.Now().Add(RetryBackoff(job.RetryCount))
+		writeCtx, cancel := context.WithTimeout(ctx, cleanupRescheduleWriteTimeout)
+		err := db.RetryJob(writeCtx, job.ID, nextAt, true, cleanupTarget)
+		cancel()
+		if err == nil {
+			return nextAt, nil
+		}
+		failures++
+	}
+}
+
 func processJobLifecycle(
 	ctx context.Context,
 	db jobStatusUpdater,
@@ -227,8 +281,17 @@ func processJobLifecycle(
 		reason = RetryReasonCleanup
 	}
 	if retryable && (cleanupOnly || job.RetryCount < job.MaxRetries) {
-		nextAt := time.Now().Add(RetryBackoff(job.RetryCount))
-		schedErr := db.RetryJob(ctx, job.ID, nextAt, cleanupOnly, compensationRetryTarget(err))
+		var (
+			nextAt   time.Time
+			schedErr error
+		)
+		cleanupTarget := compensationRetryTarget(err)
+		if cleanupOnly {
+			nextAt, schedErr = persistCleanupRetry(ctx, db, job, cleanupTarget)
+		} else {
+			nextAt = time.Now().Add(RetryBackoff(job.RetryCount))
+			schedErr = db.RetryJob(ctx, job.ID, nextAt, false, cleanupTarget)
+		}
 		if schedErr == nil {
 			if pipeline != nil {
 				pipeline.RecordJobRetry(job.Type, reason)
@@ -249,9 +312,8 @@ func processJobLifecycle(
 			return nil // rescheduled; not a failure from the caller's perspective
 		}
 		if cleanupOnly {
-			// Do not terminalize compensation when the queue update itself
-			// fails. RecoverStaleJobs will return this cleanup-marked job to
-			// pending after worker restart.
+			// Shutdown is the only exit from durable cleanup rescheduling.
+			// Startup recovery hands this in-progress row to the next worker.
 			return fmt.Errorf("reschedule durable cleanup: %w", schedErr)
 		}
 		// RetryJob itself failed (DB problem) — fall through to terminal failure.

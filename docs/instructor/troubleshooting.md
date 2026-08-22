@@ -58,6 +58,12 @@ failed with `compensated: true`; ambiguous ownership records
 `manual_cleanup_required: true` and requires operator resolution rather than
 deleting an uncertain VM.
 
+A transient database failure while rescheduling compensation does not strand
+the job on a live worker. The worker retries the durable pending-state write
+with bounded backoff until it succeeds. On worker shutdown, startup recovery on
+the replacement process performs the handoff; Crucible does not periodically
+reset active jobs.
+
 Authenticated clients can check the stable read-only contract at
 `GET /api/v1/provisioning/status`:
 

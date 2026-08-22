@@ -1076,33 +1076,49 @@ func (q *Queries) BeginPodCreateCleanup(
 // pod_create or vm_add retry as compensation-only so maintenance workers may
 // claim it without reopening forward provisioning.
 //
-// Called by the worker when ProcessJob returns a retryable error and
-// retry_count < max_retries.
+// Called by the worker when ProcessJob returns a retryable error. Ordinary jobs
+// stop at max_retries; cleanup-only jobs use an independent durable lifecycle.
+// The pending-state branch makes a repeated cleanup write idempotent when the
+// first statement committed but its client observed an ambiguous error.
 const retryJobSQL = `
-	UPDATE jobs SET
-		status          = 'pending',
-		retry_count     = retry_count + 1,
-		claimed_by      = NULL,
-		claimed_at      = NULL,
-		started_at      = NULL,
-		completed_at    = NULL,
-		next_attempt_at = $2,
-		payload         = CASE
-			WHEN $3 AND $4::jsonb IS NOT NULL THEN jsonb_set(
-				jsonb_set(
-					payload - 'cleanup_completed',
-					'{cleanup_only}',
-					'true'::jsonb,
+	WITH updated AS (
+		UPDATE jobs SET
+			status          = 'pending',
+			retry_count     = retry_count + 1,
+			claimed_by      = NULL,
+			claimed_at      = NULL,
+			started_at      = NULL,
+			completed_at    = NULL,
+			next_attempt_at = $2,
+			payload         = CASE
+				WHEN $3 AND $4::jsonb IS NOT NULL THEN jsonb_set(
+					jsonb_set(
+						payload - 'cleanup_completed',
+						'{cleanup_only}',
+						'true'::jsonb,
+						true
+					),
+					'{cleanup_target}',
+					$4::jsonb,
 					true
-				),
-				'{cleanup_target}',
-				$4::jsonb,
-				true
-			)
-			WHEN $3 THEN jsonb_set(payload, '{cleanup_only}', 'true'::jsonb, true)
-			ELSE payload
-		END
-	WHERE id = $1
+				)
+				WHEN $3 THEN jsonb_set(payload, '{cleanup_only}', 'true'::jsonb, true)
+				ELSE payload
+			END
+		WHERE id = $1
+		  AND status IN ('claimed', 'in_progress')
+		RETURNING 1
+	)
+	SELECT
+		EXISTS (SELECT 1 FROM updated),
+		EXISTS (
+			SELECT 1 FROM jobs
+			WHERE id = $1
+			  AND status = 'pending'
+			  AND $3
+			  AND payload->>'cleanup_only' = 'true'
+			  AND ($4::jsonb IS NULL OR payload->'cleanup_target' = $4::jsonb)
+		)
 `
 
 func (q *Queries) RetryJob(
@@ -1112,12 +1128,16 @@ func (q *Queries) RetryJob(
 	cleanupOnly bool,
 	cleanupTarget []byte,
 ) error {
-	tag, err := q.pool.Exec(ctx, retryJobSQL, id, nextAt, cleanupOnly, cleanupTarget)
+	var updated, alreadyScheduled bool
+	err := q.pool.QueryRow(ctx, retryJobSQL, id, nextAt, cleanupOnly, cleanupTarget).Scan(
+		&updated,
+		&alreadyScheduled,
+	)
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() != 1 {
-		return fmt.Errorf("job %s retry scheduling affected %d rows", id, tag.RowsAffected())
+	if !updated && !alreadyScheduled {
+		return fmt.Errorf("job %s is not owned for retry scheduling", id)
 	}
 	return nil
 }

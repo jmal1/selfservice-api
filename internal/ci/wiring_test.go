@@ -389,7 +389,7 @@ func TestVMCloneCompensationUsesOnlyDurableExactTargets(t *testing.T) {
 		"func (q *Queries) CompleteVMCloneCleanup(",
 		"vcenter_vm_id = $2\n\t\t    OR (vcenter_vm_id IS NULL AND status IN ('pending', 'cloning', 'configuring'))",
 		"func (q *Queries) MarkJobCompensationCompleted(",
-		"if tag.RowsAffected() != 1 {\n\t\treturn fmt.Errorf(\"job %s retry scheduling affected %d rows\"",
+		"if !updated && !alreadyScheduled {\n\t\treturn fmt.Errorf(\"job %s is not owned for retry scheduling\"",
 		"if tag.RowsAffected() != 1 {\n\t\treturn fmt.Errorf(\"job %s status update affected %d rows\"",
 	} {
 		if !strings.Contains(querySrc, required) {

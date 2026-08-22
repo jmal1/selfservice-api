@@ -47,19 +47,33 @@ type retryRecord struct {
 }
 
 type fakeJobDB struct {
-	mu        sync.Mutex
-	statuses  []statusRecord
-	retried   []retryRecord
-	retryErr  error // if set, RetryJob returns this
-	statusErr map[string]error
+	mu          sync.Mutex
+	statuses    []statusRecord
+	retried     []retryRecord
+	retryErr    error
+	retryErrs   []error
+	retryCalls  int
+	retrySignal chan struct{}
+	statusErr   map[string]error
 }
 
 func (f *fakeJobDB) RetryJob(_ context.Context, id uuid.UUID, nextAt time.Time, cleanupOnly bool, cleanupTarget []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	call := f.retryCalls
+	f.retryCalls++
+	if f.retrySignal != nil {
+		select {
+		case f.retrySignal <- struct{}{}:
+		default:
+		}
+	}
+	if call < len(f.retryErrs) && f.retryErrs[call] != nil {
+		return f.retryErrs[call]
+	}
 	if f.retryErr != nil {
 		return f.retryErr
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.retried = append(f.retried, retryRecord{
 		id: id, nextAt: nextAt, cleanupOnly: cleanupOnly, cleanupTarget: cleanupTarget,
 	})
@@ -270,27 +284,131 @@ func TestHandleJobOutcome_CleanupIgnoresExhaustedOriginalRetryBudget(t *testing.
 	}
 }
 
-func TestHandleJobOutcome_CleanupRescheduleFailureIsNotTerminal(t *testing.T) {
-	db := &fakeJobDB{retryErr: errors.New("database unavailable")}
+func TestHandleJobOutcome_CleanupRescheduleRetriesUntilDurable(t *testing.T) {
+	target := &VMCloneCleanupTarget{
+		PodID:       uuid.NewString(),
+		PodVMID:     uuid.NewString(),
+		VCenterVMID: "vm-4242",
+	}
+	db := &fakeJobDB{
+		retryErrs: []error{errors.New("database unavailable"), nil},
+	}
 	job := &models.Job{
 		ID:         uuid.New(),
 		Type:       models.JobTypeVMAdd,
-		Payload:    []byte(`{"cleanup_only":true}`),
 		RetryCount: 20,
 		MaxRetries: 3,
 	}
+	dispatchErr := &compensationRetryError{
+		err:    errors.New("destroy exact stale VM: connection refused"),
+		target: target,
+	}
+	var published []string
+	started := time.Now()
 
-	if result := runLifecycle(
+	if result := processJobLifecycle(
 		context.Background(),
 		db,
 		NewPipelineMetrics("", "", nil),
 		job,
-		errors.New("destroy exact stale VM: connection refused"),
-	); result == nil {
-		t.Fatal("reschedule failure returned nil")
+		func(_ uuid.UUID, step, _ string) { published = append(published, step) },
+		func(context.Context, *models.Job) error { return dispatchErr },
+	); result != nil {
+		t.Fatalf("cleanup reschedule returned %v, want nil after transient DB recovery", result)
+	}
+	if elapsed := time.Since(started); elapsed < cleanupRescheduleBackoffBase {
+		t.Fatalf("cleanup reschedule retried after %s, want at least %s backoff",
+			elapsed, cleanupRescheduleBackoffBase)
+	}
+	if db.retryCalls != 2 {
+		t.Fatalf("RetryJob calls = %d, want 2", db.retryCalls)
+	}
+	if len(db.retried) != 1 || !db.retried[0].cleanupOnly {
+		t.Fatalf("durable cleanup retries = %+v, want one successful cleanup-only write", db.retried)
+	}
+	var gotTarget VMCloneCleanupTarget
+	if err := json.Unmarshal(db.retried[0].cleanupTarget, &gotTarget); err != nil {
+		t.Fatalf("cleanup target is invalid JSON: %v", err)
+	}
+	if gotTarget != *target {
+		t.Fatalf("cleanup target = %+v, want %+v", gotTarget, *target)
 	}
 	if got := db.statusesWithStatus(models.JobStatusFailed); len(got) != 0 {
-		t.Fatal("cleanup was terminalized after its reschedule write failed")
+		t.Fatal("cleanup was terminalized while its durable retry write recovered")
+	}
+	for _, event := range published {
+		if event == "completed" || event == "compensated" || event == "failed" {
+			t.Fatalf("published terminal event %q while cleanup rescheduling recovered", event)
+		}
+	}
+	if published[len(published)-1] != "retry_scheduled" {
+		t.Fatalf("final event = %q, want retry_scheduled", published[len(published)-1])
+	}
+}
+
+func TestHandleJobOutcome_CleanupRescheduleShutdownHandsOffToStartupRecovery(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	db := &fakeJobDB{
+		retryErr:    errors.New("database unavailable"),
+		retrySignal: make(chan struct{}, 1),
+	}
+	job := &models.Job{
+		ID:         uuid.New(),
+		Type:       models.JobTypePodCreate,
+		Payload:    []byte(`{"cleanup_only":true}`),
+		RetryCount: 20,
+		MaxRetries: 3,
+	}
+	var published []string
+	resultCh := make(chan error, 1)
+	go func() {
+		resultCh <- processJobLifecycle(
+			ctx,
+			db,
+			NewPipelineMetrics("", "", nil),
+			job,
+			func(_ uuid.UUID, step, _ string) { published = append(published, step) },
+			func(context.Context, *models.Job) error {
+				return errors.New("destroy exact stale VM: connection refused")
+			},
+		)
+	}()
+
+	select {
+	case <-db.retrySignal:
+	case <-time.After(time.Second):
+		t.Fatal("RetryJob was not attempted")
+	}
+	cancel()
+
+	select {
+	case result := <-resultCh:
+		if !errors.Is(result, context.Canceled) {
+			t.Fatalf("shutdown result = %v, want context.Canceled", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cleanup reschedule did not stop promptly on shutdown")
+	}
+	if got := db.statusesWithStatus(models.JobStatusFailed); len(got) != 0 {
+		t.Fatal("shutdown terminalized cleanup instead of leaving startup recovery handoff")
+	}
+	if len(db.retried) != 0 {
+		t.Fatal("failed cleanup reschedule unexpectedly recorded a durable retry")
+	}
+	for _, event := range published {
+		if event == "completed" || event == "compensated" || event == "failed" {
+			t.Fatalf("published terminal event %q during cleanup reschedule shutdown", event)
+		}
+	}
+}
+
+func TestCleanupRescheduleBackoffIsBounded(t *testing.T) {
+	for _, failures := range []int{1, 2, 6, 63, 1_000_000} {
+		delay := cleanupRescheduleBackoff(failures)
+		if delay < cleanupRescheduleBackoffBase || delay > cleanupRescheduleBackoffMax {
+			t.Fatalf("cleanupRescheduleBackoff(%d) = %s, want [%s,%s]",
+				failures, delay, cleanupRescheduleBackoffBase, cleanupRescheduleBackoffMax)
+		}
 	}
 }
 

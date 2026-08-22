@@ -64,10 +64,15 @@ func TestClaimJobMaintenancePolicySabotageIsDetected(t *testing.T) {
 func TestRetryJobSQLPersistsCleanupOnlyMarker(t *testing.T) {
 	body := strings.ToUpper(retryJobSQL)
 	for _, fragment := range []string{
+		"WITH UPDATED AS",
+		"STATUS IN ('CLAIMED', 'IN_PROGRESS')",
 		"WHEN $3 AND $4::JSONB IS NOT NULL THEN JSONB_SET(",
 		"'{CLEANUP_TARGET}'",
 		"WHEN $3 THEN JSONB_SET(PAYLOAD, '{CLEANUP_ONLY}', 'TRUE'::JSONB, TRUE)",
 		"ELSE PAYLOAD",
+		"STATUS = 'PENDING'",
+		"PAYLOAD->>'CLEANUP_ONLY' = 'TRUE'",
+		"PAYLOAD->'CLEANUP_TARGET' = $4::JSONB",
 	} {
 		if !strings.Contains(body, fragment) {
 			t.Errorf("retryJobSQL missing %q", fragment)
