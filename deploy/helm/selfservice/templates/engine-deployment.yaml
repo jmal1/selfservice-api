@@ -46,6 +46,32 @@ spec:
             # NATS
             - name: NATS_URL
               value: {{ .Values.natsURL | quote }}
+            # vCenter host allowlist for vmware_tools workflows
+            - name: VCENTER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.vcenter }}
+                  key: vcenter-url
+            - name: VCENTER_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.vcenter }}
+                  key: vcenter-user
+            - name: VCENTER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.vcenter }}
+                  key: vcenter-password
+            - name: VCENTER_DATACENTER
+              value: {{ .Values.vcenter.datacenter | quote }}
+            - name: VCENTER_DATASTORE
+              value: {{ .Values.vcenter.datastore | quote }}
+            - name: VCENTER_RESOURCE_POOLS
+              value: {{ .Values.vcenter.resourcePools | quote }}
+            - name: VCENTER_HOSTS
+              value: {{ .Values.vcenter.hosts | quote }}
+            - name: VCENTER_INSECURE
+              value: {{ .Values.vcenter.insecure | quote }}
             # Runner provisioner
             - name: ENGINE_NAMESPACE
               valueFrom:

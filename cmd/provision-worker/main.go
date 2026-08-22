@@ -95,6 +95,18 @@ func main() {
 		os.Exit(1)
 	}
 	defer vcClient.Disconnect(ctx)
+	resolvedHosts, err := vcClient.ResolveProvisioningHosts(ctx)
+	if err != nil {
+		logger.Error("VCENTER_HOSTS failed strict inventory resolution", "error", err)
+		os.Exit(1)
+	}
+	for _, host := range resolvedHosts {
+		logger.Info("provisioning host allowlisted",
+			"host", host.Name,
+			"inventory_path", host.InventoryPath,
+			"moref", host.MoRef,
+			"compute_moref", host.ComputeMoRef)
+	}
 
 	// Initialize OPNsense clients
 	opnCfg := opnsense.Config{
@@ -175,8 +187,9 @@ func main() {
 		if err != nil {
 			logger.Error("object store init failed; image_import disabled", "error", err)
 		} else {
-			// Imported OVAs land in the first configured Student-VMs pool;
-			// empty lets vCenter pick the datacenter default.
+			// Imported OVAs land in the first configured Student-VMs pool.
+			// An empty explicit value still uses the canonical configured-pool
+			// resolver; vCenter default placement is never allowed.
 			ovaPool := ""
 			if len(cfg.VCenter.ResourcePools) > 0 {
 				ovaPool = cfg.VCenter.ResourcePools[0]
@@ -455,6 +468,10 @@ func main() {
 	if v := os.Getenv("WORKER_L1_VALIDATION_ENABLED"); v != "" {
 		l1ValidationEnabled = strings.EqualFold(v, "true")
 	}
+	l1ValidationEnabled = cloneSchedulerEnabled(
+		cfg.Provisioning.WorkerClaimsEnabled,
+		l1ValidationEnabled,
+	)
 	l1ValidationInterval := envDuration(logger, "WORKER_L1_VALIDATION_INTERVAL", 168*time.Hour)
 	l1ValidationSchedulerInterval := envDuration(logger, "WORKER_L1_VALIDATION_SCHEDULER_INTERVAL", 5*time.Minute)
 	l1ValidationCfg := provisioner.L1TrustValidationReconcilerConfig{
@@ -499,6 +516,10 @@ func main() {
 	//   WORKER_TEMPLATE_HEALTH_INTERVAL              — default 12h
 	//   WORKER_TEMPLATE_HEALTH_DEEP_TIMEOUT          — default 10m
 	healthReconcilerEnabled := strings.EqualFold(os.Getenv("WORKER_TEMPLATE_HEALTH_ENABLED"), "true")
+	healthReconcilerEnabled = cloneSchedulerEnabled(
+		cfg.Provisioning.WorkerClaimsEnabled,
+		healthReconcilerEnabled,
+	)
 	healthReconcilerInterval := envDuration(logger, "WORKER_TEMPLATE_HEALTH_INTERVAL", 12*time.Hour)
 	healthReconcilerDeepTimeout := envDuration(logger, "WORKER_TEMPLATE_HEALTH_DEEP_TIMEOUT", 10*time.Minute)
 	healthConfirmationBackoff := envDuration(logger, "WORKER_TEMPLATE_HEALTH_CONFIRMATION_BACKOFF", 5*time.Minute)
@@ -964,6 +985,10 @@ func closeBeforeDeadline(resource closer, timeout time.Duration) bool {
 	case <-timer.C:
 		return false
 	}
+}
+
+func cloneSchedulerEnabled(provisioningClaimsEnabled, configured bool) bool {
+	return provisioningClaimsEnabled && configured
 }
 
 // processJobs claims and processes available jobs via the provisioner.

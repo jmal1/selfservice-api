@@ -43,11 +43,11 @@ type fakeVCenter struct {
 	tasks      map[string][]types.TaskInfo
 	taskErrors map[string]error
 	// keyed by "folderPath/vmName"
-	vmInFolder map[string]bool
+	vmInFolder  map[string]bool
 	vmFolderErr map[string]error
 	// keyed by "datastoreName/filePath"
-	dsFiles    map[string]bool
-	dsFileErr  map[string]error
+	dsFiles   map[string]bool
+	dsFileErr map[string]error
 	// keyed by host moref
 	portGroups    map[string][]string
 	portGroupErrs map[string]error
@@ -60,6 +60,8 @@ type fakeVCenter struct {
 	// keyed by host moref → all cluster host morefs
 	clusterHosts    map[string][]string
 	clusterHostErrs map[string]error
+	eligibleHosts   []string
+	eligibleErr     error
 }
 
 func newFake() *fakeVCenter {
@@ -82,6 +84,7 @@ func newFake() *fakeVCenter {
 		dsHostErrs:      make(map[string]error),
 		clusterHosts:    make(map[string][]string),
 		clusterHostErrs: make(map[string]error),
+		eligibleHosts:   []string{"host-1"},
 	}
 }
 
@@ -152,6 +155,14 @@ func (f *fakeVCenter) ClusterHostMorefs(_ context.Context, hostMoref string) ([]
 	}
 	return []string{hostMoref}, nil // default: standalone, just itself
 }
+func (f *fakeVCenter) EligiblePlacementHostMorefs(
+	_ context.Context,
+	_, _, _ string,
+	_ int32,
+	_ int64,
+) ([]string, error) {
+	return f.eligibleHosts, f.eligibleErr
+}
 
 // helpers for building fakeVCenter state
 
@@ -214,7 +225,11 @@ func datastoreWithFreeSpace(freeGiB int64) *mo.Datastore {
 func TestPF01_Pass(t *testing.T) {
 	f := newFake()
 	f.vmProps["vm-1"] = vmWithHost("host-1")
-	p := preflight.Params{SourceMoref: "vm-1", SourceType: models.TemplateSourceCloneVCenter}
+	p := preflight.Params{
+		SourceMoref:                 "vm-1",
+		SourceType:                  models.TemplateSourceCloneVCenter,
+		ConfiguredResourcePoolPaths: []string{"Intel-Cluster/Resources/Student-VMs"},
+	}
 	r := preflight.RunAll(context.Background(), f, p)
 	pf01 := findResult(t, r, "PF-01")
 	if !pf01.OK {
@@ -259,7 +274,7 @@ func TestPF02_Pass(t *testing.T) {
 func TestPF02_Fail_NoPoolInCluster(t *testing.T) {
 	f := newFake()
 	f.vmProps["vm-1"] = vmWithHost("host-1")
-	f.clusterNames["host-1"] = "Intel-Cluster"
+	f.eligibleErr = errors.New("configured pool belongs to AMD-Cluster, source belongs to Intel-Cluster")
 	p := preflight.Params{
 		SourceMoref:                 "vm-1",
 		SourceType:                  models.TemplateSourceCloneVCenter,
@@ -295,8 +310,7 @@ func TestPF03_Pass(t *testing.T) {
 func TestPF03_Fail_DatastoreNotOnAllHosts(t *testing.T) {
 	f := newFake()
 	f.vmProps["vm-1"] = vmWithHost("host-1")
-	f.clusterHosts["host-1"] = []string{"host-1", "host-2", "host-3"}
-	f.dsHosts["NAS-vmstore"] = []string{"host-1", "host-2"} // host-3 is missing
+	f.eligibleErr = errors.New("allowlisted host host-1 has no datastore mount")
 	p := preflight.Params{
 		SourceMoref:   "vm-1",
 		DatastoreName: "NAS-vmstore",
@@ -305,7 +319,7 @@ func TestPF03_Fail_DatastoreNotOnAllHosts(t *testing.T) {
 	r := preflight.RunAll(context.Background(), f, p)
 	pf03 := findResult(t, r, "PF-03")
 	if pf03.OK {
-		t.Fatal("PF-03 should fail when datastore is not mounted on all cluster hosts")
+		t.Fatal("PF-03 should fail when no allowlisted host has the datastore")
 	}
 }
 
@@ -330,7 +344,7 @@ func TestPF04_Pass(t *testing.T) {
 // Negative control: datastore has less than 1.2× provisioned.
 func TestPF04_Fail_InsufficientSpace(t *testing.T) {
 	f := newFake()
-	f.vmProps["vm-1"] = vmWithHost("host-1") // 25 GiB provisioned; need ≥ 30 GiB
+	f.vmProps["vm-1"] = vmWithHost("host-1")             // 25 GiB provisioned; need ≥ 30 GiB
 	f.dsInfo["NAS-vmstore"] = datastoreWithFreeSpace(10) // only 10 GiB free
 	p := preflight.Params{
 		SourceMoref:   "vm-1",
@@ -448,7 +462,11 @@ func TestPF06_Warn_WhenTaskListUnreadable(t *testing.T) {
 	f.taskErrors = map[string]error{
 		"vm-1": errors.New("read task infos: NoPermission"),
 	}
-	p := preflight.Params{SourceMoref: "vm-1", SourceType: models.TemplateSourceCloneVCenter}
+	p := preflight.Params{
+		SourceMoref:                 "vm-1",
+		SourceType:                  models.TemplateSourceCloneVCenter,
+		ConfiguredResourcePoolPaths: []string{"Intel-Cluster/Resources/Student-VMs"},
+	}
 	r := preflight.RunAll(context.Background(), f, p)
 	pf06 := findResult(t, r, "PF-06")
 	if pf06.OK {
@@ -518,7 +536,11 @@ func TestPF07_PoweredOff_NotInstalled_Warn(t *testing.T) {
 	vm.Guest.ToolsRunningStatus = string(types.VirtualMachineToolsRunningStatusGuestToolsNotRunning)
 	vm.Guest.ToolsVersionStatus2 = "" // never reported
 	f.vmProps["vm-off-notools"] = vm
-	p := preflight.Params{SourceMoref: "vm-off-notools", SourceType: models.TemplateSourceCloneVCenter}
+	p := preflight.Params{
+		SourceMoref:                 "vm-off-notools",
+		SourceType:                  models.TemplateSourceCloneVCenter,
+		ConfiguredResourcePoolPaths: []string{"Intel-Cluster/Resources/Student-VMs"},
+	}
 	r := preflight.RunAll(context.Background(), f, p)
 	pf07 := findResult(t, r, "PF-07")
 	if pf07.OK {
@@ -685,8 +707,8 @@ func TestPF11_Pass(t *testing.T) {
 	if !pf11.OK {
 		t.Fatalf("PF-11 should pass when port group is on all hosts; got Detail=%q", pf11.Detail)
 	}
-	if pf11.Severity != "warn" {
-		t.Errorf("PF-11 severity = %q; want warn", pf11.Severity)
+	if pf11.Severity != "block" {
+		t.Errorf("PF-11 severity = %q; want block", pf11.Severity)
 	}
 }
 
@@ -694,9 +716,7 @@ func TestPF11_Pass(t *testing.T) {
 func TestPF11_Fail_PortGroupMissingOnHost(t *testing.T) {
 	f := newFake()
 	f.vmProps["vm-1"] = vmWithHost("host-1")
-	f.clusterHosts["host-1"] = []string{"host-1", "host-2"}
-	f.portGroups["host-1"] = []string{"PG-VM-Lab"}
-	f.portGroups["host-2"] = []string{"VM Network"} // PG-VM-Lab missing on host-2
+	f.eligibleErr = errors.New("allowlisted host host-1 is missing standard port group PG-VM-Lab")
 	p := preflight.Params{
 		SourceMoref:      "vm-1",
 		SourceType:       models.TemplateSourceCloneVCenter,
@@ -705,7 +725,7 @@ func TestPF11_Fail_PortGroupMissingOnHost(t *testing.T) {
 	r := preflight.RunAll(context.Background(), f, p)
 	pf11 := findResult(t, r, "PF-11")
 	if pf11.OK {
-		t.Fatal("PF-11 should fail when port group is missing on a cluster host")
+		t.Fatal("PF-11 should fail when no allowlisted host has the port group")
 	}
 }
 

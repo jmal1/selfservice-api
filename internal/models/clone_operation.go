@@ -17,6 +17,9 @@ type VMCloneOperation struct {
 	PodVMID     string    `json:"pod_vm_id"`
 	TargetName  string    `json:"target_name"`
 	SourceRef   string    `json:"source_ref"`
+	HostMoref   string    `json:"host_moref"`
+	HostName    string    `json:"host_name"`
+	PoolMoref   string    `json:"pool_moref"`
 	TaskRef     string    `json:"task_ref,omitempty"`
 	Phase       string    `json:"phase"`
 	PreparedAt  time.Time `json:"prepared_at"`

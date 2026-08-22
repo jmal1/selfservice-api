@@ -190,12 +190,8 @@ func (c *Client) HostPortGroupNames(ctx context.Context, hostMoref string) ([]st
 	return names, nil
 }
 
-// ClusterNameForHost returns the name of the compute resource (cluster or
-// standalone ComputeResource) that the given ESXi host belongs to. This is
-// used by PF-02 to determine whether any of the configured resource pool
-// paths belong to the source VM's cluster (by checking
-// strings.Contains(poolPath, clusterName), matching the logic in
-// selectBestPoolInSourceCluster in client.go).
+// ClusterNameForHost returns the host's compute-resource name for read-only
+// diagnostics. Placement authorization belongs exclusively to ResolvePlacement.
 func (c *Client) ClusterNameForHost(ctx context.Context, hostMoref string) (string, error) {
 	if err := c.ensureConnected(ctx); err != nil {
 		return "", err

@@ -135,6 +135,26 @@ type fakeCloneOperationClient struct {
 	cancelOnStart context.CancelFunc
 }
 
+func (f *fakeCloneOperationClient) ResolveClonePlacement(
+	_ context.Context,
+	params vcenter.CloneVMParams,
+) (vcenter.CloneVMParams, error) {
+	if params.HostMoRef == "" {
+		params.HostMoRef = "host-1"
+	}
+	if params.HostName == "" {
+		params.HostName = "ESXi1"
+	}
+	if params.ResourcePoolMoRef == "" {
+		params.ResourcePoolMoRef = "resgroup-1"
+	}
+	return params, nil
+}
+
+func (f *fakeCloneOperationClient) ValidateVMPlacement(_ context.Context, _, _ string) error {
+	return nil
+}
+
 func (f *fakeCloneOperationClient) StartCloneVMOperation(
 	ctx context.Context,
 	_ vcenter.CloneVMParams,
@@ -182,6 +202,46 @@ func TestPreSubmissionFailureDoesNotArmCleanup(t *testing.T) {
 	}
 }
 
+func TestLegacyCloneOperationWithoutPlacementRequiresManualCleanup(t *testing.T) {
+	jobID, workerID, podID, podVMID, params := cloneOperationFixture()
+	store := &fakeCloneOperationStore{
+		operation: &models.VMCloneOperation{
+			OperationID: uuid.NewString(),
+			PodID:       podID.String(),
+			PodVMID:     podVMID.String(),
+			TargetName:  params.VMName,
+			SourceRef:   params.TemplateName,
+			Phase:       models.VMCloneOperationSubmitting,
+			PreparedAt:  time.Now(),
+		},
+	}
+	client := &fakeCloneOperationClient{store: store}
+
+	_, err := executeDurableVMClone(
+		context.Background(),
+		store,
+		client,
+		jobID,
+		workerID,
+		podID,
+		podVMID,
+		params,
+	)
+	var manualErr *manualCleanupRequiredError
+	if !errors.As(err, &manualErr) {
+		t.Fatalf("legacy clone operation error = %v, want manual cleanup", err)
+	}
+	if client.startCalls != 0 || client.waitCalls != 0 || client.findCalls != 0 || client.configCalls != 0 {
+		t.Fatalf(
+			"legacy clone operation issued vCenter work: start=%d wait=%d find=%d configure=%d",
+			client.startCalls,
+			client.waitCalls,
+			client.findCalls,
+			client.configCalls,
+		)
+	}
+}
+
 func (f *fakeCloneOperationClient) WaitCloneVMTask(_ context.Context, taskRef string) (string, error) {
 	f.waitCalls++
 	if f.store != nil && !f.store.taskPersisted(taskRef) {
@@ -216,11 +276,14 @@ func (f *fakeCloneOperationClient) ConfigureClonedVM(
 
 func cloneOperationFixture() (uuid.UUID, string, uuid.UUID, uuid.UUID, vcenter.CloneVMParams) {
 	return uuid.New(), "worker-a:claim-a", uuid.New(), uuid.New(), vcenter.CloneVMParams{
-		TemplateName: "vm-100",
-		VMName:       "pod-target",
-		VCPUs:        2,
-		RAMmb:        4096,
-		Network:      "Pod-VLAN123",
+		TemplateName:      "vm-100",
+		VMName:            "pod-target",
+		VCPUs:             2,
+		RAMmb:             4096,
+		Network:           "Pod-VLAN123",
+		HostMoRef:         "host-1",
+		HostName:          "ESXi1",
+		ResourcePoolMoRef: "resgroup-1",
 	}
 }
 
@@ -350,6 +413,9 @@ func TestRecoveredCleanupResumesPersistedTaskWithoutForwardCalls(t *testing.T) {
 			PodVMID:     podVMID.String(),
 			TargetName:  params.VMName,
 			SourceRef:   params.TemplateName,
+			HostMoref:   params.HostMoRef,
+			HostName:    params.HostName,
+			PoolMoref:   params.ResourcePoolMoRef,
 			TaskRef:     "task-existing",
 			Phase:       models.VMCloneOperationSubmitted,
 			PreparedAt:  time.Now(),
@@ -471,6 +537,9 @@ func TestUnresolvedSubmissionEscalatesWithoutDuplicateClone(t *testing.T) {
 			PodVMID:     podVMID.String(),
 			TargetName:  params.VMName,
 			SourceRef:   params.TemplateName,
+			HostMoref:   params.HostMoRef,
+			HostName:    params.HostName,
+			PoolMoref:   params.ResourcePoolMoRef,
 			Phase:       models.VMCloneOperationSubmitting,
 			PreparedAt:  time.Now().Add(-cloneSubmissionReconcileDeadline),
 		},

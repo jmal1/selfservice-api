@@ -507,17 +507,13 @@ func (p *Provisioner) newPodCreateRollbackEngine(job *models.Job, vmSpecs []VMSp
 		return p.opn.ApplyFirewall(ctx)
 	})
 	rb.RegisterUndo("portgroup_create", func(ctx context.Context, data json.RawMessage) error {
-		var d struct {
-			Name        string `json:"name"`
-			Preexisting string `json:"preexisting"`
-		}
-		if err := json.Unmarshal(data, &d); err != nil {
+		var receipt vcenter.PortGroupReceipt
+		if err := json.Unmarshal(data, &receipt); err != nil {
 			return err
 		}
-		if d.Preexisting == "true" {
-			return nil
-		}
-		return p.vc.DeletePortGroupOnAllHosts(ctx, d.Name)
+		return p.db.WithVCenterPortGroupMutationLock(ctx, func(lockCtx context.Context) error {
+			return p.vc.DeletePortGroupMutation(lockCtx, receipt)
+		})
 	})
 	for i := range vmSpecs {
 		stepName := fmt.Sprintf("vm_clone_%d", i)
@@ -1166,21 +1162,22 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		return p.failPodCreateWithCleanup(ctx, job, payload, rb, "ensure firewall rule", fmt.Errorf("ensure firewall rule: %w", err))
 	}
 
-	// --- Step 5: Create port groups on all ESXi hosts ---
-	p.publishProgress(job.ID, "portgroup_create", fmt.Sprintf("Creating port group %s on all hosts", pgName))
+	// --- Step 5: Create port groups on allowlisted ESXi hosts ---
+	p.publishProgress(job.ID, "portgroup_create", fmt.Sprintf("Creating port group %s on allowlisted hosts", pgName))
 
-	if err := p.vc.CreatePortGroupOnAllHosts(ctx, pgName, vlanTag); err != nil {
+	err = p.db.WithVCenterPortGroupMutationLock(ctx, func(lockCtx context.Context) error {
+		receipt, planErr := p.vc.PlanPortGroupMutation(lockCtx, pgName, vlanTag)
+		if planErr != nil {
+			return fmt.Errorf("plan port group mutation: %w", planErr)
+		}
+		// Persist exact per-host ownership before the first AddPortGroup call.
+		if recordErr := rb.Record(lockCtx, "portgroup_create", receipt); recordErr != nil {
+			return fmt.Errorf("persist port group receipt: %w", recordErr)
+		}
+		return p.vc.ApplyPortGroupMutation(lockCtx, receipt)
+	})
+	if err != nil {
 		return p.failPodCreateWithCleanup(ctx, job, payload, rb, "create port groups", fmt.Errorf("create port groups: %w", err))
-	}
-
-	// Port groups are always idempotent (already-exists is ignored), so treat as preexisting
-	// if the VLAN was preexisting (they go together)
-	pgPreexStr := "false"
-	if vlanPreexisting {
-		pgPreexStr = "true"
-	}
-	if err := rb.Record(ctx, "portgroup_create", map[string]string{"name": pgName, "preexisting": pgPreexStr}); err != nil {
-		return err
 	}
 	if stopped, err := p.stopPodCreateIfStale(ctx, job, pod.ID, payload.VMs, rb, "portgroup_create"); err != nil {
 		return err
@@ -1251,6 +1248,20 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		var moref string
 		if podVMRow != nil && podVMRow.VCenterVMID != nil && *podVMRow.VCenterVMID != "" {
 			moref = *podVMRow.VCenterVMID
+			if placementErr := p.vc.ValidateVMPlacement(ctx, moref, ""); placementErr != nil {
+				return p.failPodCreateWithCleanup(
+					ctx,
+					job,
+					payload,
+					rb,
+					"resume placement validation",
+					&manualCleanupRequiredError{err: fmt.Errorf(
+						"refuse to resume persisted VM %s on an invalid host: %w",
+						moref,
+						placementErr,
+					)},
+				)
+			}
 			p.logger.Info("resuming pod create — VM already cloned",
 				"vm", vmSpec.VMName, "moref", moref, "pod_vm_id", vmSpec.PodVMID)
 		} else {
@@ -1447,6 +1458,20 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 				)
 				continue
 			}
+			if placementErr := p.vc.ValidateVMPlacement(ctx, *podVM.VCenterVMID, ""); placementErr != nil {
+				return p.failPodCreateWithCleanup(
+					ctx,
+					job,
+					payload,
+					rb,
+					"power-on placement validation",
+					&manualCleanupRequiredError{err: fmt.Errorf(
+						"refuse to reuse persisted VM %s on an invalid host: %w",
+						*podVM.VCenterVMID,
+						placementErr,
+					)},
+				)
+			}
 			if podVM.Status == models.VMStatusRunning {
 				groupPoweredOn = append(groupPoweredOn, vmPowerInfo{index: i, vmSpec: vmSpec, moref: *podVM.VCenterVMID})
 				continue
@@ -1484,6 +1509,16 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 			}
 
 			if err := p.vc.PowerOnVM(ctx, *podVM.VCenterVMID); err != nil {
+				if errors.Is(err, vcenter.ErrHostNotAllowed) {
+					return p.failPodCreateWithCleanup(
+						ctx,
+						job,
+						payload,
+						rb,
+						"power-on host validation",
+						&manualCleanupRequiredError{err: err},
+					)
+				}
 				p.logger.Error("failed to power on VM", "vm", vmSpec.VMName, "error", err)
 				_, _ = p.db.UpdatePodVMStatusFrom(
 					ctx,

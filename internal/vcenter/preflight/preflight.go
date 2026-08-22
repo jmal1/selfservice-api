@@ -142,6 +142,16 @@ type PreflightVCenter interface {
 	// that contains the given host moref. Returns only the host itself for
 	// standalone (non-clustered) hosts.
 	ClusterHostMorefs(ctx context.Context, hostMoref string) ([]string, error)
+
+	// EligiblePlacementHostMorefs evaluates the same strict allowlist, pool,
+	// datastore, network, host-health, and capacity constraints used at the VM
+	// creation boundary. A successful result contains only allowlisted hosts.
+	EligiblePlacementHostMorefs(
+		ctx context.Context,
+		sourceMoref, datastore, network string,
+		vcpus int32,
+		ramMB int64,
+	) ([]string, error)
 }
 
 // RunAll executes all 11 preflight checks and returns their results in
@@ -251,11 +261,9 @@ func pf01SourceResolves(ctx context.Context, vc PreflightVCenter, p Params) Resu
 		Detail: fmt.Sprintf("moref %q resolves to a live VM", p.SourceMoref)}
 }
 
-// pf02ClusterHasResourcePool checks that the source VM's cluster contains at
-// least one of the configured resource pools. selectBestPoolInSourceCluster
-// (in vcenter/client.go) uses strings.Contains(poolPath, clusterName) to pick
-// a pool; this check replicates that logic pre-flight so the error is shown
-// before a job is enqueued.
+// pf02ClusterHasResourcePool asks the canonical placement resolver to prove
+// that an allowlisted host and configured pool are compatible with the source.
+// It must not reproduce pool-selection logic or authorize a default pool.
 //
 // Catches: source VM placed in a cluster with no Crucible-managed pool.
 // Does NOT catch: intermittent clone faults.
@@ -267,106 +275,68 @@ func pf02ClusterHasResourcePool(ctx context.Context, vc PreflightVCenter, p Para
 	if r, cascade := cascadeIfSourceUnresolved(id, sev, p); cascade {
 		return r
 	}
-	vm, err := vc.FetchVMProps(ctx, p.SourceMoref)
-	if err != nil {
-		return Result{ID: id, Severity: sev, OK: false,
-			Detail: fmt.Sprintf("cannot read source VM properties: %v", err),
-			Fix:    "Fix PF-01 first."}
-	}
-	if vm.Runtime.Host == nil {
-		return Result{ID: id, Severity: sev, OK: false,
-			Detail: "source VM has no host assignment (may be powered off and unregistered)",
-			Fix:    "Power on the source VM at least once so vCenter assigns it to a host."}
-	}
-	clusterName, err := vc.ClusterNameForHost(ctx, vm.Runtime.Host.Value)
-	if err != nil {
-		return Result{ID: id, Severity: sev, OK: false,
-			Detail: fmt.Sprintf("cannot determine source cluster for host %q: %v", vm.Runtime.Host.Value, err),
-			Fix:    "Check vCenter connectivity."}
-	}
 	if len(p.ConfiguredResourcePoolPaths) == 0 {
-		// No configured pools at all — Crucible will fall back to
-		// DefaultResourcePool which fails on multi-cluster setups.
-		if clusterName != "" {
-			return Result{ID: id, Severity: sev, OK: false,
-				Detail: fmt.Sprintf("no resource pool paths are configured (source cluster: %q)", clusterName),
-				Fix:    "Set VCENTER_RESOURCE_POOLS in the Crucible configuration to at least one pool path within the source cluster."}
-		}
-		return Result{ID: id, Severity: sev, OK: true,
-			Detail: "no configured pools; single-host fallback will be used"}
-	}
-	var matched []string
-	for _, poolPath := range p.ConfiguredResourcePoolPaths {
-		if strings.Contains(poolPath, clusterName) {
-			matched = append(matched, poolPath)
-		}
-	}
-	if len(matched) == 0 {
 		return Result{ID: id, Severity: sev, OK: false,
-			Detail: fmt.Sprintf("none of the configured resource pools (%v) are in source cluster %q",
-				p.ConfiguredResourcePoolPaths, clusterName),
-			Fix: "Move the source VM to a cluster that has a configured pool, or add a pool from this cluster to VCENTER_RESOURCE_POOLS."}
+			Detail: "no resource pool paths are configured; unpinned/default placement is prohibited",
+			Fix:    "Set VCENTER_RESOURCE_POOLS to at least one pool path compatible with the source cluster and VCENTER_HOSTS."}
+	}
+	hosts, err := vc.EligiblePlacementHostMorefs(
+		ctx,
+		p.SourceMoref,
+		p.DatastoreName,
+		p.StagingPortGroup,
+		1,
+		512,
+	)
+	if err != nil || len(hosts) == 0 {
+		detail := "the placement resolver returned no compatible allowlisted host"
+		if err != nil {
+			detail = fmt.Sprintf("configured pools cannot form an eligible placement with VCENTER_HOSTS: %v", err)
+		}
+		return Result{ID: id, Severity: sev, OK: false,
+			Detail: detail,
+			Fix:    "Use a configured pool in the source cluster that contains an allowed, healthy host with the required datastore and network."}
 	}
 	return Result{ID: id, Severity: sev, OK: true,
-		Detail: fmt.Sprintf("source cluster %q has %d matching configured pool(s): %v",
-			clusterName, len(matched), matched)}
+		Detail: fmt.Sprintf("configured resource pool placement is eligible on allowlisted host(s): %v", hosts)}
 }
 
-// pf03DatastoreMountedOnCluster checks that the target datastore is
-// accessible on every host in the source VM's cluster.
+// pf03DatastoreMountedOnCluster checks that at least one canonical allowlisted
+// placement candidate satisfies the configured pool, datastore, network,
+// health, and capacity constraints.
 //
 // Catches: NFS mount dropped from one cluster, datastore name wrong.
 func pf03DatastoreMountedOnCluster(ctx context.Context, vc PreflightVCenter, p Params) Result {
 	id, sev := "PF-03", "block"
-	if p.SourceType == models.TemplateSourceISO {
-		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: no source moref (ISO source)"}
-	}
 	if p.DatastoreName == "" {
-		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: target datastore not configured"}
+		return Result{ID: id, Severity: sev, OK: true,
+			Detail: "skipped: this template does not require a target datastore"}
 	}
-	if r, cascade := cascadeIfSourceUnresolved(id, sev, p); cascade {
-		return r
-	}
-	vm, err := vc.FetchVMProps(ctx, p.SourceMoref)
-	if err != nil {
-		return Result{ID: id, Severity: sev, OK: false,
-			Detail: fmt.Sprintf("cannot read source VM properties: %v", err), Fix: "Fix PF-01 first."}
-	}
-	if vm.Runtime.Host == nil {
-		return Result{ID: id, Severity: sev, OK: false,
-			Detail: "source VM has no host", Fix: "Fix PF-02 first."}
-	}
-	clusterHosts, err := vc.ClusterHostMorefs(ctx, vm.Runtime.Host.Value)
-	if err != nil {
-		return Result{ID: id, Severity: sev, OK: false,
-			Detail: fmt.Sprintf("enumerate cluster hosts: %v", err),
-			Fix:    "Check vCenter connectivity."}
-	}
-	dsHosts, err := vc.DatastoreHostMorefs(ctx, p.DatastoreName)
-	if err != nil {
-		return Result{ID: id, Severity: sev, OK: false,
-			Detail: fmt.Sprintf("datastore %q not found or not accessible: %v", p.DatastoreName, err),
-			Fix:    fmt.Sprintf("Verify datastore %q exists and is mounted on vCenter hosts.", p.DatastoreName)}
-	}
-	dsHostSet := make(map[string]bool, len(dsHosts))
-	for _, h := range dsHosts {
-		dsHostSet[h] = true
-	}
-	var missing []string
-	for _, h := range clusterHosts {
-		if !dsHostSet[h] {
-			missing = append(missing, h)
+	if p.SourceType != models.TemplateSourceISO {
+		if r, cascade := cascadeIfSourceUnresolved(id, sev, p); cascade {
+			return r
 		}
 	}
-	if len(missing) > 0 {
+	hosts, err := vc.EligiblePlacementHostMorefs(
+		ctx,
+		p.SourceMoref,
+		p.DatastoreName,
+		p.StagingPortGroup,
+		1,
+		512,
+	)
+	if err != nil {
 		return Result{ID: id, Severity: sev, OK: false,
-			Detail: fmt.Sprintf("datastore %q is not mounted on %d cluster host(s): %v",
-				p.DatastoreName, len(missing), missing),
-			Fix: fmt.Sprintf("Mount datastore %q on all cluster hosts, or change the target datastore in Crucible config.", p.DatastoreName)}
+			Detail: fmt.Sprintf("no allowlisted host satisfies placement requirements: %v", err),
+			Fix:    "Verify VCENTER_HOSTS, VCENTER_RESOURCE_POOLS, datastore mounts, host connection/maintenance state, capacity, and the staging port group."}
+	}
+	if len(hosts) == 0 {
+		return Result{ID: id, Severity: sev, OK: false,
+			Detail: "the placement resolver returned no allowlisted host",
+			Fix:    "Verify VCENTER_HOSTS and the configured placement requirements."}
 	}
 	return Result{ID: id, Severity: sev, OK: true,
-		Detail: fmt.Sprintf("datastore %q is accessible on all %d cluster host(s)",
-			p.DatastoreName, len(clusterHosts))}
+		Detail: fmt.Sprintf("placement requirements are satisfied by allowlisted host(s): %v", hosts)}
 }
 
 // pf04DatastoreFreeSpace checks that the target datastore has at least
@@ -700,71 +670,36 @@ func pf10ISOExists(ctx context.Context, vc PreflightVCenter, p Params) Result {
 		Detail: fmt.Sprintf("ISO %q found in datastore %q", filePath, dsName)}
 }
 
-// pf11PortGroupOnAllHosts checks that the staging port group is present on
-// every host in the source VM's cluster.
-//
-// Severity: warn (not block). vCenter will pick a host that has the port
-// group during placement; if coverage is partial the clone may still succeed.
-// The check surfaces gaps proactively so they can be fixed before they cause
-// a placement failure at an inconvenient time.
-//
-// Limitation: only standard vSwitch port groups are checked. If the staging
-// port group is a DVS (Distributed Virtual Switch) port group, this check
-// will incorrectly report it as missing. DVS port groups are accessible to
-// all hosts connected to the DVS by design; their absence here is a known
-// false positive for DVS environments.
+// pf11PortGroupOnAllHosts blocks unless the shared resolver can select an
+// allowlisted host with the required standard portgroup and all other
+// placement constraints.
 func pf11PortGroupOnAllHosts(ctx context.Context, vc PreflightVCenter, p Params) Result {
-	id, sev := "PF-11", "warn"
-	if p.SourceType == models.TemplateSourceISO {
-		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: no source moref (ISO source)"}
-	}
+	id, sev := "PF-11", "block"
 	if p.StagingPortGroup == "" {
-		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: no staging port group configured"}
+		return Result{ID: id, Severity: sev, OK: true,
+			Detail: "skipped: this template does not require a staging port group"}
 	}
-	if r, cascade := cascadeIfSourceUnresolved(id, sev, p); cascade {
-		return r
+	if p.SourceType != models.TemplateSourceISO {
+		if r, cascade := cascadeIfSourceUnresolved(id, sev, p); cascade {
+			return r
+		}
 	}
-	vm, err := vc.FetchVMProps(ctx, p.SourceMoref)
+	hosts, err := vc.EligiblePlacementHostMorefs(
+		ctx,
+		p.SourceMoref,
+		p.DatastoreName,
+		p.StagingPortGroup,
+		1,
+		512,
+	)
 	if err != nil {
 		return Result{ID: id, Severity: sev, OK: false,
-			Detail: fmt.Sprintf("cannot read source VM properties: %v", err), Fix: "Fix PF-01 first."}
-	}
-	if vm.Runtime.Host == nil {
-		return Result{ID: id, Severity: sev, OK: true, Detail: "skipped: source VM has no host"}
-	}
-	clusterHosts, err := vc.ClusterHostMorefs(ctx, vm.Runtime.Host.Value)
-	if err != nil {
-		return Result{ID: id, Severity: sev, OK: false,
-			Detail: fmt.Sprintf("enumerate cluster hosts: %v", err),
-			Fix:    "Check vCenter connectivity."}
-	}
-	var missing []string
-	for _, host := range clusterHosts {
-		pgs, pgErr := vc.HostPortGroupNames(ctx, host)
-		if pgErr != nil {
-			missing = append(missing, fmt.Sprintf("%s (error reading portgroups: %v)", host, pgErr))
-			continue
-		}
-		found := false
-		for _, pg := range pgs {
-			if pg == p.StagingPortGroup {
-				found = true
-				break
-			}
-		}
-		if !found {
-			missing = append(missing, host)
-		}
-	}
-	if len(missing) > 0 {
-		return Result{ID: id, Severity: sev, OK: false,
-			Detail: fmt.Sprintf("staging port group %q is missing on %d host(s): %v (note: DVS port groups are not checked — false positive possible)",
-				p.StagingPortGroup, len(missing), missing),
-			Fix: fmt.Sprintf("Add standard port group %q to all cluster hosts, or verify the staging_network is a DVS port group (in which case this warning is a false positive).", p.StagingPortGroup)}
+			Detail: fmt.Sprintf("no allowlisted host can use standard port group %q: %v", p.StagingPortGroup, err),
+			Fix:    fmt.Sprintf("Create standard port group %q on an allowlisted host and verify its pool/datastore/health requirements.", p.StagingPortGroup)}
 	}
 	return Result{ID: id, Severity: sev, OK: true,
-		Detail: fmt.Sprintf("staging port group %q present on all %d cluster host(s) (standard switch check only)",
-			p.StagingPortGroup, len(clusterHosts))}
+		Detail: fmt.Sprintf("standard port group %q is available on eligible allowlisted host(s): %v",
+			p.StagingPortGroup, hosts)}
 }
 
 // parseDatastorePath is a local copy of vcenter.ParseDatastorePath to avoid

@@ -61,6 +61,9 @@ func (c *Client) ImportOVA(ctx context.Context, p OVAImportParams) (string, erro
 	if p.Datastore == "" {
 		return "", fmt.Errorf("ImportOVA: datastore is required")
 	}
+	if err := c.ensureConnected(ctx); err != nil {
+		return "", err
+	}
 
 	tr := tar.NewReader(p.Reader)
 
@@ -84,19 +87,17 @@ func (c *Client) ImportOVA(ctx context.Context, p OVAImportParams) (string, erro
 		return "", fmt.Errorf("parse OVF descriptor: %w", err)
 	}
 
-	ds, err := c.finder.Datastore(ctx, p.Datastore)
-	if err != nil {
-		return "", fmt.Errorf("find datastore %q: %w", p.Datastore, err)
+	placementRequest := PlacementRequest{
+		ResourcePoolPath: p.ResourcePool,
+		DatastoreName:    p.Datastore,
+		NetworkName:      p.Network,
 	}
-
-	// An imported OVA has no source VM either, so it hits the same
-	// multi-cluster placement trap as a blank ISO shell. Size hints come from
-	// the OVF's own resource section when present; they only steer the
-	// RAM-weighted choice between pools, so 0 is safe.
-	pool, err := c.resolvePlacementPool(ctx, p.ResourcePool, 0, 0)
+	placement, err := c.ResolvePlacement(ctx, placementRequest)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("select OVA placement: %w", err)
 	}
+	ds := placement.Datastore
+	pool := placement.Pool
 
 	var folder *object.Folder
 	if p.FolderPath != "" {
@@ -135,7 +136,12 @@ func (c *Client) ImportOVA(ctx context.Context, p OVAImportParams) (string, erro
 		return "", fmt.Errorf("OVF import spec rejected: %s", spec.Error[0].LocalizedMessage)
 	}
 
-	lease, err := pool.ImportVApp(ctx, spec.ImportSpec, folder, nil)
+	placementRequest.PinnedHostMoRef = placement.Identity.MoRef
+	placementRequest.PinnedPoolMoRef = placement.PoolMoRef
+	if _, err := c.ResolvePlacement(ctx, placementRequest); err != nil {
+		return "", fmt.Errorf("revalidate OVA placement immediately before import: %w", err)
+	}
+	lease, err := pool.ImportVApp(ctx, spec.ImportSpec, folder, placement.Host)
 	if err != nil {
 		return "", fmt.Errorf("import vApp: %w", err)
 	}
@@ -206,21 +212,23 @@ func (c *Client) ImportOVA(ctx context.Context, p OVAImportParams) (string, erro
 	if err := lease.Complete(ctx); err != nil {
 		return abort(fmt.Errorf("complete NFC lease: %w", err))
 	}
+	if err := c.ValidateVMPlacement(ctx, moref, placement.Identity.MoRef); err != nil {
+		return "", fmt.Errorf("OVA imported on invalid host: %w", err)
+	}
 
 	return moref, nil
 }
 
 // ovfNetworkMapping maps every network declared in the OVF descriptor onto the
-// single target network name. If the descriptor declares no networks the
-// mapping is empty and vSphere picks a default.
+// single target network name. An appliance with no NIC needs no mapping;
+// otherwise the target standard portgroup is mandatory and already validated
+// by ResolvePlacement.
 func (c *Client) ovfNetworkMapping(ctx context.Context, env *ovf.Envelope, network string) ([]types.OvfNetworkMapping, error) {
 	if env == nil || env.Network == nil || len(env.Network.Networks) == 0 {
 		return nil, nil
 	}
 	if network == "" {
-		// Descriptor needs a network but the caller gave none; let vSphere
-		// choose defaults rather than failing the whole import.
-		return nil, nil
+		return nil, errors.New("OVA declares a network but no target standard portgroup was provided")
 	}
 
 	net, err := c.finder.Network(ctx, network)

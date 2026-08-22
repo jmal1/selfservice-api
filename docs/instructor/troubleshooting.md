@@ -49,12 +49,13 @@ continues compensation-only retries for cleanup that began before maintenance;
 those retries cannot resume pod or VM creation.
 
 Operators can distinguish ordinary queued work from recovery work in the job
-payload: `pod_create`, `vm_add`, `template_verify`, and `template_revalidate`
-jobs are withheld while provisioning claims are disabled unless they carry
-`cleanup_only: true`. Before submitting a clone, the worker persists a
-per-attempt operation UUID and embeds that UUID, the source template identity,
-and the pod VM identity (or job/template scope for a smoke clone) in the clone's
-vCenter `extraConfig`. The returned task MoRef is persisted before waiting. A
+payload. Pod/VM creation, template staging/generalization/verification/health,
+and image-import jobs are withheld while provisioning claims are disabled
+unless they carry `cleanup_only: true`. Before submitting a clone, the worker
+persists a per-attempt operation UUID, the selected host and pool identities,
+and embeds those identities with the source template and pod VM identity (or
+job/template scope for a smoke clone) in vCenter `extraConfig`. The returned
+task MoRef is persisted before waiting. A
 replacement worker resumes that exact task, or reconciles a lost SOAP response
 by the complete marker and target name; it never submits a second clone or
 adopts a same-name VM without matching ownership proof. The exact resulting VM
@@ -89,6 +90,46 @@ rollback. The handoff appends the exact receipt, fences the current generation
 into cleanup-only work, and leaves destructive compensation to the next owner.
 Worker shutdown, including scheduler and database-pool closure, is bounded at
 two minutes, with 150 seconds of pod termination grace for that handoff.
+
+### "No eligible allowlisted vCenter placement"
+
+This message is a safety block, not a transient DRS hint. `VCENTER_HOSTS` is the
+only host allowlist for both VM placement and standard-vSwitch portgroup
+changes. A candidate must also be connected, outside maintenance mode, in the
+configured/source-compatible resource pool, able to access the datastore, have
+the required standard portgroup, and satisfy the VM's capacity requirements.
+PF-03 and PF-11 use this same resolver, so a failed preflight cannot be
+overridden by cluster-wide availability elsewhere.
+
+Do not add another host or broaden `VCENTER_HOSTS` merely to clear the error.
+Check the named host's connection and maintenance state, resource-pool
+membership, datastore mount, standard portgroup, and available capacity. During
+an isolated-host canary, keep API admission and worker provisioning claims off,
+keep worker replicas at zero until the approved step, and keep lifecycle,
+runner, template-health, L1, and other destructive synthetics/schedulers off.
+
+Host pinning controls creation but cannot prevent a later DRS or manual vMotion.
+A vCenter administrator must install and verify a VM-host affinity/must-run rule
+or equivalent host exclusion before the canary. For the ESXi2 containment
+canary, `VCENTER_HOSTS` must contain ESXi1 only, the resource pool must be the
+compatible Intel pool, and the external rule must keep Crucible and temporary
+VMs off ESXi2. Leave the pending production pod/job untouched until a human
+approves the canary.
+
+### "Durable port group ownership cannot be proven"
+
+Destroy never guesses which host portgroups a pod owns. A missing, malformed,
+legacy receipt without immutable host identities, or receipt naming a host
+outside the current `VCENTER_HOSTS` allowlist makes the destroy job report
+`manual_cleanup_required`. The pod remains `destroy_failed`, and its
+VLAN/interface allocation remains reserved so the VLAN cannot be reused while a
+portgroup may still exist.
+
+Do not widen `VCENTER_HOSTS` or infer ownership from OPNsense VLAN state to clear
+this condition. An operator must inspect the historical job and vCenter state,
+then either backfill an exact per-host receipt with reliable ownership evidence
+or complete the cleanup manually. A transient `RemovePortGroup` failure follows
+the same resource-retention rule but remains retryable.
 
 Authenticated clients can check the stable read-only contract at
 `GET /api/v1/provisioning/status`:

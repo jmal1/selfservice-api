@@ -937,9 +937,27 @@ const claimJobSQL = `
 		WHERE status = 'pending'
 		  AND (
 		    $2
-		    OR type NOT IN ('pod_create', 'vm_add', 'template_verify', 'template_revalidate')
+		    OR type NOT IN (
+		      'pod_create',
+		      'vm_add',
+		      'template_provision',
+		      'template_generalize',
+		      'template_verify',
+		      'template_revalidate',
+		      'template_health_confirm',
+		      'image_import'
+		    )
 		    OR (
-		      type IN ('pod_create', 'vm_add', 'template_verify', 'template_revalidate')
+		      type IN (
+		        'pod_create',
+		        'vm_add',
+		        'template_provision',
+		        'template_generalize',
+		        'template_verify',
+		        'template_revalidate',
+		        'template_health_confirm',
+		        'image_import'
+		      )
 		      AND payload->>'cleanup_only' = 'true'
 		    )
 		  )
@@ -955,10 +973,10 @@ const claimJobSQL = `
 // ClaimJob atomically claims the next pending job for a worker.
 // Jobs whose next_attempt_at is in the future are skipped (they are
 // sleeping between retry attempts). When provisioning claims are disabled,
-// ordinary pod_create, vm_add, template_verify, and template_revalidate jobs are
-// excluded inside the selecting transaction and remain pending. Any of those
-// types carrying cleanup_only=true is still claimable, as are cleanup and every
-// other non-provisioning job type.
+// ordinary VM-creation, template-staging/validation, and image-import jobs are
+// excluded inside the selecting transaction and remain pending. Any withheld
+// type carrying cleanup_only=true is still claimable, as are cleanup and other
+// non-provisioning job types.
 func (q *Queries) ClaimJob(ctx context.Context, workerID string, provisioningClaimsEnabled bool) (*models.Job, error) {
 	var j models.Job
 	err := q.pool.QueryRow(ctx, claimJobSQL, workerID, provisioningClaimsEnabled).Scan(
@@ -1417,13 +1435,23 @@ func (q *Queries) UpdatePodStatusFrom(ctx context.Context, id uuid.UUID, fromSta
 	return tag.RowsAffected() > 0, nil
 }
 
-// ListDestroyFailedPods returns pods stuck in "destroy_failed" status.
-func (q *Queries) ListDestroyFailedPods(ctx context.Context) ([]models.Pod, error) {
-	rows, err := q.pool.Query(ctx, `
-		SELECT id, owner_id, name, status, error_message, expires_at, created_at, updated_at, salt, vlan_id, subnet
-		FROM pods WHERE status = 'destroy_failed'
-		ORDER BY updated_at ASC
-	`)
+const listRetryableDestroyFailedPodsSQL = `
+	SELECT id, owner_id, name, status, error_message, expires_at, created_at, updated_at, salt, vlan_id, subnet
+	FROM pods
+	WHERE status = 'destroy_failed'
+	  AND LEFT(COALESCE(error_message, ''), LENGTH($1)) <> $1
+	ORDER BY updated_at ASC
+`
+
+// ListRetryableDestroyFailedPods returns retryable pods stuck in "destroy_failed"
+// status. Ownership-ambiguous failures require human resolution and must not
+// flap through "destroying" on every automated sweep.
+func (q *Queries) ListRetryableDestroyFailedPods(ctx context.Context) ([]models.Pod, error) {
+	rows, err := q.pool.Query(
+		ctx,
+		listRetryableDestroyFailedPodsSQL,
+		models.PodErrorManualCleanupRequiredPrefix,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -1439,6 +1467,21 @@ func (q *Queries) ListDestroyFailedPods(ctx context.Context) ([]models.Pod, erro
 		pods = append(pods, p)
 	}
 	return pods, rows.Err()
+}
+
+// CountDestroyFailedPods returns every pod in destroy_failed status, including
+// ownership-ambiguous pods that are intentionally excluded from automated
+// retries but must remain visible to alerting.
+func (q *Queries) CountDestroyFailedPods(ctx context.Context) (int, error) {
+	var count int
+	if err := q.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM pods
+		WHERE status = 'destroy_failed'
+	`).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count destroy_failed pods: %w", err)
+	}
+	return count, nil
 }
 
 // --- Pod VMs ---

@@ -59,10 +59,12 @@ func TestInventoryTransportFailureRemainsRetryableLookupError(t *testing.T) {
 
 func TestOperationMarkerRequiresExactSourceAndPodVM(t *testing.T) {
 	params := CloneVMParams{
-		OperationID:  "operation-1",
-		PodVMID:      "pod-vm-1",
-		VMName:       "target",
-		TemplateName: "vm-source",
+		OperationID:       "operation-1",
+		PodVMID:           "pod-vm-1",
+		VMName:            "target",
+		TemplateName:      "vm-source",
+		HostMoRef:         "host-1",
+		ResourcePoolMoRef: "resgroup-1",
 	}
 	markerParams := params
 	reader := vmInventoryReader{
@@ -74,8 +76,11 @@ func TestOperationMarkerRequiresExactSourceAndPodVM(t *testing.T) {
 					&types.OptionValue{Key: CloneOperationIDKey, Value: markerParams.OperationID},
 					&types.OptionValue{Key: CloneOperationSourceKey, Value: markerParams.TemplateName},
 					&types.OptionValue{Key: CloneOperationPodVMKey, Value: markerParams.PodVMID},
+					&types.OptionValue{Key: CloneOperationHostKey, Value: markerParams.HostMoRef},
+					&types.OptionValue{Key: CloneOperationPoolKey, Value: markerParams.ResourcePoolMoRef},
 				},
 			}
+			dst.Runtime.Host = &types.ManagedObjectReference{Type: "HostSystem", Value: markerParams.HostMoRef}
 			return nil
 		},
 	}

@@ -109,7 +109,8 @@ type HealthCheckCloneParams struct {
 // HealthCheckCloneResult holds the outcome of a deep health check clone.
 type HealthCheckCloneResult struct {
 	// MoRef is the managed-object reference of the cloned VM. Used for cleanup.
-	MoRef string
+	MoRef     string
+	HostMoRef string
 }
 
 // CloneForHealthCheck creates a disposable clone of a template VM for the
@@ -153,38 +154,10 @@ func (c *Client) cloneForHealthCheckInner(ctx context.Context, params HealthChec
 		return nil, fmt.Errorf("find folder %q: %w", folderPath, err)
 	}
 
-	// Idempotency: reuse if a VM with this name already exists.
-	if existing, lookupErr := c.findVMInFolder(ctx, folder, params.CloneName); lookupErr == nil && existing != "" {
-		c.logger.Info("health-check clone already exists, reusing for cleanup",
-			"name", params.CloneName, "moref", existing)
-		return &HealthCheckCloneResult{MoRef: existing}, nil
+	var sourceProps mo.VirtualMachine
+	if err := source.Properties(ctx, source.Reference(), []string{"runtime.host"}, &sourceProps); err != nil {
+		return nil, fmt.Errorf("read health-check source host: %w", err)
 	}
-
-	// Find resource pool.
-	poolPath := params.ResourcePool
-	if poolPath == "" && len(c.config.ResourcePools) > 0 {
-		poolPath = c.config.ResourcePools[0]
-	}
-	pool, err := c.finder.ResourcePool(ctx, poolPath)
-	if err != nil {
-		return nil, fmt.Errorf("find resource pool %q: %w", poolPath, err)
-	}
-	poolRef := pool.Reference()
-
-	// Find datastore.
-	dsName := params.Datastore
-	if dsName == "" {
-		dsName = c.config.Datastore
-	}
-	ds, err := c.finder.Datastore(ctx, dsName)
-	if err != nil {
-		return nil, fmt.Errorf("find datastore %q: %w", dsName, err)
-	}
-	dsRef := ds.Reference()
-
-	// Build a minimal full clone spec (no linked clone — health checks
-	// should exercise the real disk path, and we don't want to create
-	// snapshot chains on templates that don't already have them).
 	vcpus := params.VCPUs
 	if vcpus == 0 {
 		vcpus = 1
@@ -193,11 +166,49 @@ func (c *Client) cloneForHealthCheckInner(ctx context.Context, params HealthChec
 	if rammb == 0 {
 		rammb = 512
 	}
+	dsName := params.Datastore
+	if dsName == "" {
+		dsName = c.config.Datastore
+	}
+	placementRequest := PlacementRequest{
+		SourceHost:        sourceProps.Runtime.Host,
+		RequireSourceHost: true,
+		ResourcePoolPath:  params.ResourcePool,
+		DatastoreName:     dsName,
+		NetworkName:       params.Network,
+		VCPUs:             vcpus,
+		RAMMB:             rammb,
+	}
+	placement, err := c.ResolvePlacement(ctx, placementRequest)
+	if err != nil {
+		return nil, fmt.Errorf("select health-check placement: %w", err)
+	}
 
+	// Idempotency: reuse if a VM with this name already exists.
+	if existing, lookupErr := c.findVMInFolderStrict(ctx, folder, params.CloneName); lookupErr != nil {
+		return nil, fmt.Errorf("check existing health-check clone %q: %w", params.CloneName, lookupErr)
+	} else if existing != "" {
+		if err := c.ValidateVMPlacement(ctx, existing, ""); err != nil {
+			return nil, fmt.Errorf("refuse to reuse health-check clone %s: %w", existing, err)
+		}
+		c.logger.Info("health-check clone already exists, reusing for cleanup",
+			"name", params.CloneName, "moref", existing)
+		return &HealthCheckCloneResult{MoRef: existing}, nil
+	}
+
+	pool := placement.Pool
+	poolRef := pool.Reference()
+	dsRef := placement.Datastore.Reference()
+	hostRef := placement.Host.Reference()
+
+	// Build a minimal full clone spec (no linked clone — health checks
+	// should exercise the real disk path, and we don't want to create
+	// snapshot chains on templates that don't already have them).
 	cloneSpec := types.VirtualMachineCloneSpec{
 		Location: types.VirtualMachineRelocateSpec{
 			Pool:      &poolRef,
 			Datastore: &dsRef,
+			Host:      &hostRef,
 		},
 		Config: &types.VirtualMachineConfigSpec{
 			NumCPUs:  vcpus,
@@ -234,8 +245,14 @@ func (c *Client) cloneForHealthCheckInner(ctx context.Context, params HealthChec
 
 	c.logger.Info("starting health-check clone",
 		"source", params.SourceRef, "name", params.CloneName,
-		"folder", folderPath, "pool", poolPath)
+		"folder", folderPath, "pool", placement.PoolPath,
+		"host", placement.Identity.Name, "host_moref", placement.Identity.MoRef)
 
+	placementRequest.PinnedHostMoRef = placement.Identity.MoRef
+	placementRequest.PinnedPoolMoRef = placement.PoolMoRef
+	if _, err := c.ResolvePlacement(ctx, placementRequest); err != nil {
+		return nil, fmt.Errorf("revalidate health-check placement immediately before clone: %w", err)
+	}
 	task, err := source.Clone(ctx, folder, params.CloneName, cloneSpec)
 	if err != nil {
 		return nil, fmt.Errorf("start health-check clone: %w", err)
@@ -246,8 +263,11 @@ func (c *Client) cloneForHealthCheckInner(ctx context.Context, params HealthChec
 	}
 
 	vmRef := info.Result.(types.ManagedObjectReference)
+	if err := c.ValidateVMPlacement(ctx, vmRef.Value, placement.Identity.MoRef); err != nil {
+		return nil, fmt.Errorf("health-check clone completed on invalid host: %w", err)
+	}
 	c.logger.Info("health-check clone created", "name", params.CloneName, "moref", vmRef.Value)
-	return &HealthCheckCloneResult{MoRef: vmRef.Value}, nil
+	return &HealthCheckCloneResult{MoRef: vmRef.Value, HostMoRef: placement.Identity.MoRef}, nil
 }
 
 // containsAny reports whether s contains any of the substrings.

@@ -72,6 +72,14 @@ func (s *stubPreflightVC) DatastoreHostMorefs(ctx context.Context, ds string) ([
 func (s *stubPreflightVC) ClusterHostMorefs(_ context.Context, moref string) ([]string, error) {
 	return []string{moref}, nil
 }
+func (s *stubPreflightVC) EligiblePlacementHostMorefs(
+	_ context.Context,
+	_, _, _ string,
+	_ int32,
+	_ int64,
+) ([]string, error) {
+	return []string{"host-1"}, nil
+}
 
 // blockingStubVC returns an error for FetchVMProps so PF-01 blocks.
 func blockingStubVC() *stubPreflightVC {

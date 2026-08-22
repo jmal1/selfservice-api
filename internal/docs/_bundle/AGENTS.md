@@ -762,7 +762,9 @@ Crucible has two independent, strict maintenance controls:
 
 - `PROVISIONING_ENABLED` controls API admission for new user provisioning.
 - `WORKER_PROVISIONING_CLAIMS_ENABLED` controls whether workers claim
-  `pod_create`, `vm_add`, `template_verify`, and `template_revalidate` jobs.
+  clone-, create-, staging-, and import-capable jobs: `pod_create`, `vm_add`,
+  `template_provision`, `template_generalize`, `template_verify`,
+  `template_revalidate`, `template_health_confirm`, and `image_import`.
 
 Both default to `true` for backward compatibility. If either variable is set,
 it must parse as a Go boolean; an invalid value fails process startup rather
@@ -787,18 +789,54 @@ uses the normal error envelope:
 ```
 
 Delete/destroy, delete-VM, power, and cleanup paths are intentionally not
-gated. When worker provisioning claims are disabled, ordinary `pod_create`,
-`vm_add`, `template_verify`, and `template_revalidate` jobs are excluded inside
-the atomic claim query and remain pending; destroy jobs and any withheld type
-marked `cleanup_only` remain claimable.
+gated. When worker provisioning claims are disabled, ordinary clone-, create-,
+template-staging/validation, and image-import jobs are excluded inside the
+atomic claim query and remain pending; destroy jobs and any withheld type marked
+`cleanup_only` remain claimable.
+
+`VCENTER_HOSTS` is the single canonical allowlist for both VM placement and
+standard-vSwitch portgroup mutation. Worker startup resolves every configured
+entry against the configured datacenter and fails if the list is empty, has
+duplicates, is missing from inventory, is ambiguous, or resolves without a
+complete immutable host/compute-resource identity. The resolved host names,
+inventory paths, and MoRefs are logged and frozen for the process lifetime.
+There is no second placement-host setting.
+
+Every clone, blank-VM create, and OVA import carries an explicit allowed
+`HostSystem` plus a compatible configured resource pool. The shared placement
+resolver requires the destination host to be connected, outside maintenance
+mode, in the selected pool/source compute resource, able to access the target
+datastore, and equipped with the required standard portgroup and capacity. It
+does not fall back to `DefaultResourcePool` or unpinned DRS. Template staging,
+publish/L1 smoke clones, deep template-health clones, pod creation, and add-VM
+all use the same resolver. An existing, resumed, or recovered VM on a host
+outside the current allowlist is never reused, powered on, reconfigured, or
+destroyed automatically.
+
+Standard portgroup creation records one durable per-host receipt before the
+first vCenter mutation. Each entry contains immutable host identity and whether
+the portgroup already existed. A partial failure removes only portgroups newly
+created by that receipt, in reverse order. Rollback and destroy never infer
+ownership from OPNsense VLAN state and never delete preexisting portgroups. A
+missing, malformed, legacy receipt without immutable host identities, or
+historical receipt naming a host outside the current allowlist fails closed for
+manual escalation. The destroy job reports `manual_cleanup_required`, the pod
+remains `destroy_failed`, and its VLAN/interface allocation remains reserved;
+operators must inspect or backfill exact ownership rather than broaden the
+allowlist. All AddPortGroup/RemovePortGroup sections, including compensation,
+hold the stable PostgreSQL session advisory lock on one acquired connection; no
+database transaction is held across vCenter calls. A transient deletion failure
+also leaves the pod `destroy_failed` and retains its VLAN/interface allocation
+for a safe retry.
 
 Compensation intent is durable before clone submission. The fenced job first
-persists a per-attempt operation UUID, pod id, pod VM id, target name, and
-source template identity. Immediately before `CloneVM_Task`, it atomically arms
-`cleanup_only` and embeds the operation UUID, source identity, and pod VM id in
-the clone's vCenter `extraConfig`. If vCenter accepts the request but the SOAP
-response is lost, recovery searches the target folder by that complete marker;
-a same-name VM without the marker is ambiguous and is never adopted or deleted.
+persists a per-attempt operation UUID, pod id, pod VM id, target name, source
+template identity, selected host name/MoRef, and resource-pool MoRef. Immediately
+before `CloneVM_Task`, it atomically arms `cleanup_only` and embeds the operation
+UUID, source identity, pod VM id, host MoRef, and pool MoRef in the clone's
+vCenter `extraConfig`. If vCenter accepts the request but the SOAP response is
+lost, recovery searches the target folder by that complete marker; a same-name
+VM without the marker is ambiguous and is never adopted or deleted.
 Once vCenter returns a task MoRef, the worker persists it before waiting.
 Successors resume that exact task and never submit a second clone for an armed
 operation. Template verification and revalidation smoke clones use this same
@@ -851,6 +889,25 @@ Completed compensation finalizes the parent job as `failed` with
 as successful provisioning. Missing or ambiguous immutable ownership proof
 finalizes with `manual_cleanup_required: true` instead of risking deletion of
 an unrelated VM. No production worker scale-up is implied by this contract.
+
+### Host-isolated canary prerequisite
+
+During ESXi host containment, production must keep API admission disabled,
+worker provisioning claims disabled, worker replicas at zero, destructive
+synthetics disabled, and all clone-capable schedulers disabled until an operator
+opens the canary. The canary configuration must set `VCENTER_HOSTS` to
+`esxi1.lab.jmal.io` only and `VCENTER_RESOURCE_POOLS` to the compatible Intel
+pool only. The pool restriction is defense in depth, not the host-isolation
+boundary.
+
+Explicit placement controls initial creation only. It cannot stop DRS or an
+operator from moving a VM later. Before any canary worker is started, a vCenter
+administrator must create and verify an external DRS VM-host affinity/must-run
+rule (or equivalent host exclusion) that keeps all Crucible-created and
+temporary VMs off ESXi2, and must verify that no automated vMotion policy can
+move them there. Do not claim code-only isolation. Do not widen `VCENTER_HOSTS`
+to work around a placement diagnostic. Keep the pending production pod/job
+untouched until the canary is explicitly approved.
 
 Authenticated clients and the non-destructive API synthetic use
 `GET /api/v1/provisioning/status`. Its complete stable response contract is:

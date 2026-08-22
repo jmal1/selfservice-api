@@ -99,6 +99,12 @@ spec:
                   key: vcenter-password
             - name: VCENTER_DATACENTER
               value: {{ .Values.vcenter.datacenter | quote }}
+            - name: VCENTER_DATASTORE
+              value: {{ .Values.vcenter.datastore | quote }}
+            - name: VCENTER_RESOURCE_POOLS
+              value: {{ .Values.vcenter.resourcePools | quote }}
+            - name: VCENTER_HOSTS
+              value: {{ .Values.vcenter.hosts | quote }}
             - name: VCENTER_INSECURE
               value: {{ .Values.vcenter.insecure | quote }}
             {{- if .Values.vcenter.templatesFolder }}

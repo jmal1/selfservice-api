@@ -27,6 +27,9 @@ func (c *Client) SuspendVM(ctx context.Context, moref string) error {
 	if err := c.ensureConnected(ctx); err != nil {
 		return err
 	}
+	if err := c.validateVMForMutation(ctx, moref, "", false); err != nil {
+		return err
+	}
 
 	return c.withRetry(ctx, "suspend VM", func() error {
 		vm := object.NewVirtualMachine(c.client.Client,

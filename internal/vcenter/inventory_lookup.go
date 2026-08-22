@@ -81,7 +81,7 @@ func findVMOperationInInventory(
 	var matching string
 	for _, reader := range readers {
 		var props mo.VirtualMachine
-		err := reader.read(ctx, []string{"name", "config.extraConfig"}, &props)
+		err := reader.read(ctx, []string{"name", "config.extraConfig", "runtime.host"}, &props)
 		if err != nil {
 			if isManagedObjectNotFound(err) {
 				continue
@@ -94,12 +94,23 @@ func findVMOperationInInventory(
 		if props.Config == nil ||
 			optionValueString(props.Config.ExtraConfig, CloneOperationIDKey) != params.OperationID ||
 			optionValueString(props.Config.ExtraConfig, CloneOperationSourceKey) != params.TemplateName ||
-			optionValueString(props.Config.ExtraConfig, CloneOperationPodVMKey) != params.PodVMID {
+			optionValueString(props.Config.ExtraConfig, CloneOperationPodVMKey) != params.PodVMID ||
+			optionValueString(props.Config.ExtraConfig, CloneOperationHostKey) != params.HostMoRef ||
+			optionValueString(props.Config.ExtraConfig, CloneOperationPoolKey) != params.ResourcePoolMoRef {
 			return "", fmt.Errorf(
 				"%w: clone target %q exists without operation marker %s",
 				ErrAmbiguousVMOwnership,
 				params.VMName,
 				params.OperationID,
+			)
+		}
+		if props.Runtime.Host == nil || props.Runtime.Host.Value != params.HostMoRef {
+			return "", fmt.Errorf(
+				"%w: clone target %q is on host %v, expected %s",
+				ErrHostNotAllowed,
+				params.VMName,
+				props.Runtime.Host,
+				params.HostMoRef,
 			)
 		}
 		if matching != "" && matching != reader.moref {
@@ -118,8 +129,9 @@ func findVMOperationInInventory(
 // creation-time marker plus target/source scope. A same-name VM without the
 // matching marker is never adopted.
 func (c *Client) FindVMByCloneOperation(ctx context.Context, params CloneVMParams) (string, error) {
-	if params.OperationID == "" || params.PodVMID == "" || params.VMName == "" || params.TemplateName == "" {
-		return "", errors.New("clone reconciliation requires operation, pod VM, target, and source identities")
+	if params.OperationID == "" || params.PodVMID == "" || params.VMName == "" ||
+		params.TemplateName == "" || params.HostMoRef == "" || params.ResourcePoolMoRef == "" {
+		return "", errors.New("clone reconciliation requires operation, pod VM, target, source, host, and pool identities")
 	}
 	if err := c.ensureConnected(ctx); err != nil {
 		return "", err

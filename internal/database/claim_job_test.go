@@ -18,13 +18,25 @@ func validateMaintenanceClaimSQL(query string) error {
 	for _, fragment := range []string{
 		"WHERE STATUS = 'PENDING'",
 		"$2",
-		"TYPE NOT IN ('POD_CREATE', 'VM_ADD', 'TEMPLATE_VERIFY', 'TEMPLATE_REVALIDATE')",
-		"TYPE IN ('POD_CREATE', 'VM_ADD', 'TEMPLATE_VERIFY', 'TEMPLATE_REVALIDATE')",
 		"PAYLOAD->>'CLEANUP_ONLY' = 'TRUE'",
 		"FOR UPDATE SKIP LOCKED",
 	} {
 		if !strings.Contains(sql, fragment) {
 			return fmt.Errorf("missing %q", fragment)
+		}
+	}
+	for _, jobType := range []string{
+		"POD_CREATE",
+		"VM_ADD",
+		"TEMPLATE_PROVISION",
+		"TEMPLATE_GENERALIZE",
+		"TEMPLATE_VERIFY",
+		"TEMPLATE_REVALIDATE",
+		"TEMPLATE_HEALTH_CONFIRM",
+		"IMAGE_IMPORT",
+	} {
+		if strings.Count(sql, "'"+jobType+"'") != 2 {
+			return fmt.Errorf("withheld job type %s must appear in both claim predicates", jobType)
 		}
 	}
 	return nil
@@ -40,26 +52,38 @@ func TestClaimJobMaintenancePolicySabotageIsDetected(t *testing.T) {
 	sabotages := map[string]string{
 		"ordinary pod create allowed": strings.Replace(
 			claimJobSQL,
-			"type NOT IN ('pod_create', 'vm_add', 'template_verify', 'template_revalidate')",
-			"type <> 'vm_add'",
+			"'pod_create',",
+			"",
 			1,
 		),
 		"cleanup retry blocked": strings.Replace(
 			claimJobSQL,
-			"type IN ('pod_create', 'vm_add', 'template_verify', 'template_revalidate')",
-			"type IN ('pod_create', 'vm_add')",
+			"'pod_create',",
+			"",
+			2,
+		),
+		"template staging allowed": strings.Replace(
+			claimJobSQL,
+			"'template_provision',",
+			"",
+			1,
+		),
+		"image import allowed": strings.Replace(
+			claimJobSQL,
+			"'image_import'",
+			"'safe_job'",
 			1,
 		),
 		"all vm add allowed": strings.Replace(
 			claimJobSQL,
-			"type NOT IN ('pod_create', 'vm_add', 'template_verify', 'template_revalidate')",
-			"type <> 'pod_create'",
+			"'vm_add',",
+			"",
 			1,
 		),
 		"smoke clone allowed": strings.Replace(
 			claimJobSQL,
-			"type NOT IN ('pod_create', 'vm_add', 'template_verify', 'template_revalidate')",
-			"type NOT IN ('pod_create', 'vm_add')",
+			"'template_revalidate',",
+			"",
 			1,
 		),
 	}

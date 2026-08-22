@@ -612,9 +612,26 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) error {
 		_ = p.db.UpdatePodVMCredentials(ctx, podVMID, genUser, password)
 	}
 
+	if err := p.vc.ValidateVMPlacement(ctx, moref, ""); err != nil {
+		_, _ = p.db.UpdatePodVMStatusFrom(
+			ctx,
+			podVMID,
+			[]string{models.VMStatusCloning, models.VMStatusConfiguring},
+			models.VMStatusError,
+		)
+		return &manualCleanupRequiredError{err: fmt.Errorf(
+			"refuse to resume persisted VM %s on an invalid host: %w",
+			moref,
+			err,
+		)}
+	}
+
 	// Step 2: Power on
 	p.publishProgress(job.ID, "vm_poweron", fmt.Sprintf("Powering on %s", payload.VMName))
 	if err := p.vc.PowerOnVM(ctx, moref); err != nil {
+		if errors.Is(err, vcenter.ErrHostNotAllowed) {
+			return &manualCleanupRequiredError{err: err}
+		}
 		jobErr := fmt.Errorf("power on VM: %w", err)
 		p.recordVMAddFailure(ctx, job, podVMID, jobErr)
 		return jobErr

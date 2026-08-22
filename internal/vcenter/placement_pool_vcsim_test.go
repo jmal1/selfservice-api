@@ -1,15 +1,7 @@
 package vcenter
 
-// vcsim coverage for resolvePlacementPool — the placement fallback used by the
-// two paths that have no source VM to inherit from: CreateBlankVM (ISO
-// templates) and ImportOVA.
-//
-// These tests exist because the original fallback went straight to
-// finder.DefaultResourcePool, and no production caller sets ResourcePool. On a
-// datacenter with more than one compute resource that call cannot choose, and
-// the first real ISO template build failed with "default resource pool
-// resolves to multiple instances, please specify" — an error naming no config
-// key and no caller.
+// vcsim coverage for strict placement used by paths with no source VM to
+// inherit from, including blank ISO templates and OVA imports.
 //
 // vcsim's VPX model gives us exactly that shape for free: a standalone host
 // (DC0_H0/Resources) alongside a cluster (DC0_C0/Resources), so the ambiguity
@@ -59,69 +51,12 @@ func TestDefaultResourcePool_IsAmbiguous(t *testing.T) {
 	})
 }
 
-func TestResolvePlacementPool_FallsBackToConfiguredPools(t *testing.T) {
-	withSimulator(t, func(ctx context.Context, c *Client, vimc *vim25.Client) {
-		// Exactly the production shape: nothing passes a pool, the deployment
-		// configures them.
-		c.config.ResourcePools = []string{simResourcePool}
-
-		pool, err := c.resolvePlacementPool(ctx, "", 2, 2048)
-		if err != nil {
-			t.Fatalf("resolvePlacementPool with configured pools: %v", err)
-		}
-
-		want, err := c.finder.ResourcePool(ctx, simResourcePool)
-		if err != nil {
-			t.Fatalf("find %s: %v", simResourcePool, err)
-		}
-		if pool.Reference() != want.Reference() {
-			t.Fatalf("placed in %v, want the configured pool %v", pool.Reference(), want.Reference())
-		}
-	})
-}
-
-func TestResolvePlacementPool_ExplicitPathWins(t *testing.T) {
-	withSimulator(t, func(ctx context.Context, c *Client, vimc *vim25.Client) {
-		// A bogus configured pool proves the explicit path is not merely
-		// agreeing with the fallback by coincidence.
-		c.config.ResourcePools = []string{"/DC0/host/does-not-exist/Resources"}
-
-		pool, err := c.resolvePlacementPool(ctx, simResourcePool, 2, 2048)
-		if err != nil {
-			t.Fatalf("resolvePlacementPool with explicit path: %v", err)
-		}
-		want, err := c.finder.ResourcePool(ctx, simResourcePool)
-		if err != nil {
-			t.Fatalf("find %s: %v", simResourcePool, err)
-		}
-		if pool.Reference() != want.Reference() {
-			t.Fatalf("explicit path ignored: got %v, want %v", pool.Reference(), want.Reference())
-		}
-	})
-}
-
-// TestResolvePlacementPool_ErrorNamesTheConfigKey guards the diagnosability of
-// the failure, not just the failure. The message this replaced said only
-// "specify ResourcePool", which is not a thing an operator can set anywhere.
-func TestResolvePlacementPool_ErrorNamesTheConfigKey(t *testing.T) {
-	withSimulator(t, func(ctx context.Context, c *Client, vimc *vim25.Client) {
-		c.config.ResourcePools = nil
-
-		_, err := c.resolvePlacementPool(ctx, "", 2, 2048)
-		if err == nil {
-			t.Fatal("expected an error with no explicit pool and none configured")
-		}
-		if !strings.Contains(err.Error(), "VCENTER_RESOURCE_POOLS") {
-			t.Fatalf("error must name the config key an operator can actually set; got: %v", err)
-		}
-	})
-}
-
-// TestCreateBlankVM_NoResourcePoolUsesConfigured is the end-to-end version:
-// the exact call the ISO template flow makes, which failed in production.
+// TestCreateBlankVM_NoResourcePoolUsesConfigured is the end-to-end version for
+// the exact call the ISO template flow makes.
 func TestCreateBlankVM_NoResourcePoolUsesConfigured(t *testing.T) {
 	withSimulator(t, func(ctx context.Context, c *Client, vimc *vim25.Client) {
 		c.config.ResourcePools = []string{simResourcePool}
+		c.config.Datastore = simDatastore
 
 		p := baseBlankVMParams("iso-shell-no-pool")
 		p.ResourcePool = "" // no production caller sets this

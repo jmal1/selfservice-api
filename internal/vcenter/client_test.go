@@ -55,9 +55,11 @@ func TestDuplicateCloneNameErrorsAreRecognized(t *testing.T) {
 
 func TestCloneOperationExtraConfigCarriesCompleteIdentity(t *testing.T) {
 	params := CloneVMParams{
-		OperationID:  "operation-1",
-		PodVMID:      "pod-vm-1",
-		TemplateName: "vm-source",
+		OperationID:       "operation-1",
+		PodVMID:           "pod-vm-1",
+		TemplateName:      "vm-source",
+		HostMoRef:         "host-1",
+		ResourcePoolMoRef: "resgroup-1",
 	}
 	values, err := cloneOperationExtraConfig(params)
 	if err != nil {
@@ -67,6 +69,8 @@ func TestCloneOperationExtraConfigCarriesCompleteIdentity(t *testing.T) {
 		CloneOperationIDKey:     params.OperationID,
 		CloneOperationSourceKey: params.TemplateName,
 		CloneOperationPodVMKey:  params.PodVMID,
+		CloneOperationHostKey:   params.HostMoRef,
+		CloneOperationPoolKey:   params.ResourcePoolMoRef,
 	} {
 		if got := optionValueString(values, key); got != want {
 			t.Errorf("%s = %q, want %q", key, got, want)

@@ -41,6 +41,7 @@ type cloneOperationStore interface {
 }
 
 type cloneOperationClient interface {
+	ResolveClonePlacement(ctx context.Context, params vcenter.CloneVMParams) (vcenter.CloneVMParams, error)
 	StartCloneVMOperation(
 		ctx context.Context,
 		params vcenter.CloneVMParams,
@@ -48,6 +49,7 @@ type cloneOperationClient interface {
 	) (string, error)
 	WaitCloneVMTask(ctx context.Context, taskRef string) (string, error)
 	FindVMByCloneOperation(ctx context.Context, params vcenter.CloneVMParams) (string, error)
+	ValidateVMPlacement(ctx context.Context, vmMoref, expectedHostMoref string) error
 	ConfigureClonedVM(ctx context.Context, moref string, params vcenter.CloneVMParams) error
 }
 
@@ -56,6 +58,9 @@ func cloneOperationParams(op *models.VMCloneOperation, params vcenter.CloneVMPar
 	params.PodVMID = op.PodVMID
 	params.TemplateName = op.SourceRef
 	params.VMName = op.TargetName
+	params.HostMoRef = op.HostMoref
+	params.HostName = op.HostName
+	params.ResourcePoolMoRef = op.PoolMoref
 	return params
 }
 
@@ -104,18 +109,31 @@ func executeDurableVMClone(
 	podID, podVMID uuid.UUID,
 	params vcenter.CloneVMParams,
 ) (string, error) {
+	resolvedParams, err := client.ResolveClonePlacement(ctx, params)
+	if err != nil {
+		return "", fmt.Errorf("resolve durable clone placement: %w", err)
+	}
+	params = resolvedParams
 	candidate := models.VMCloneOperation{
 		OperationID: uuid.NewString(),
 		PodID:       podID.String(),
 		PodVMID:     podVMID.String(),
 		TargetName:  params.VMName,
 		SourceRef:   params.TemplateName,
+		HostMoref:   params.HostMoRef,
+		HostName:    params.HostName,
+		PoolMoref:   params.ResourcePoolMoRef,
 		Phase:       models.VMCloneOperationPrepared,
 		PreparedAt:  time.Now().UTC(),
 	}
 	op, err := store.PrepareVMCloneOperation(ctx, jobID, workerID, candidate)
 	if err != nil {
 		return "", fmt.Errorf("prepare durable clone operation: %w", err)
+	}
+	if op == nil || op.HostMoref == "" || op.HostName == "" || op.PoolMoref == "" {
+		return "", &manualCleanupRequiredError{err: errors.New(
+			"persisted clone operation is missing immutable host placement; automatic recovery is unsafe",
+		)}
 	}
 	params = cloneOperationParams(op, params)
 
@@ -184,6 +202,13 @@ func executeDurableVMClone(
 					op.OperationID,
 				), nil)
 			}
+			if err := client.ValidateVMPlacement(ctx, moref, params.HostMoRef); err != nil {
+				return "", &manualCleanupRequiredError{err: fmt.Errorf(
+					"recovered clone %s violates persisted host placement: %w",
+					moref,
+					err,
+				)}
+			}
 			return stageAndConfigureClone(ctx, store, client, jobID, workerID, podID, podVMID, moref, params)
 		}
 		taskRef = op.TaskRef
@@ -207,6 +232,13 @@ func executeDurableVMClone(
 			taskRef,
 			err,
 		), nil)
+	}
+	if err := client.ValidateVMPlacement(ctx, moref, params.HostMoRef); err != nil {
+		return "", &manualCleanupRequiredError{err: fmt.Errorf(
+			"clone task %s completed on an invalid host: %w",
+			taskRef,
+			err,
+		)}
 	}
 	return stageAndConfigureClone(ctx, store, client, jobID, workerID, podID, podVMID, moref, params)
 }
@@ -279,6 +311,12 @@ func reconcileCloneOperationTargetForCleanup(
 		}
 		return nil, nil
 	}
+	if op.HostMoref == "" || op.HostName == "" || op.PoolMoref == "" {
+		return nil, &manualCleanupRequiredError{err: fmt.Errorf(
+			"clone operation %s has no persisted host placement; automatic recovery is unsafe",
+			op.OperationID,
+		)}
+	}
 	params := cloneOperationParams(op, vcenter.CloneVMParams{})
 	var (
 		moref   string
@@ -322,6 +360,14 @@ func reconcileCloneOperationTargetForCleanup(
 			"clone operation %s is still unresolved; retaining cleanup intent",
 			op.OperationID,
 		), nil)
+	}
+	if err := client.ValidateVMPlacement(ctx, moref, op.HostMoref); err != nil {
+		return nil, &manualCleanupRequiredError{err: fmt.Errorf(
+			"clone operation %s resolved to VM %s on a disallowed host: %w",
+			op.OperationID,
+			moref,
+			err,
+		)}
 	}
 	target := &VMCloneCleanupTarget{
 		PodID:       op.PodID,

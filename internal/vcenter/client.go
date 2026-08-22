@@ -28,6 +28,8 @@ const (
 	CloneOperationIDKey     = "guestinfo.crucible.clone_operation_id"
 	CloneOperationSourceKey = "guestinfo.crucible.clone_source_ref"
 	CloneOperationPodVMKey  = "guestinfo.crucible.clone_pod_vm_id"
+	CloneOperationHostKey   = "guestinfo.crucible.clone_host_moref"
+	CloneOperationPoolKey   = "guestinfo.crucible.clone_pool_moref"
 )
 
 var ErrAmbiguousVMOwnership = errors.New("VM ownership cannot be proven")
@@ -40,10 +42,15 @@ func cloneOperationExtraConfig(params CloneVMParams) ([]types.BaseOptionValue, e
 	if params.PodVMID == "" {
 		return nil, errors.New("clone operation requires pod VM identity")
 	}
+	if params.HostMoRef == "" || params.ResourcePoolMoRef == "" {
+		return nil, errors.New("clone operation requires explicit host and resource pool identities")
+	}
 	return []types.BaseOptionValue{
 		&types.OptionValue{Key: CloneOperationIDKey, Value: params.OperationID},
 		&types.OptionValue{Key: CloneOperationSourceKey, Value: params.TemplateName},
 		&types.OptionValue{Key: CloneOperationPodVMKey, Value: params.PodVMID},
+		&types.OptionValue{Key: CloneOperationHostKey, Value: params.HostMoRef},
+		&types.OptionValue{Key: CloneOperationPoolKey, Value: params.ResourcePoolMoRef},
 	}, nil
 }
 
@@ -63,18 +70,20 @@ type Config struct {
 	// this when the caller does not name a folder.
 	TemplateFolder string
 	ResourcePools  []string // e.g., ["AMD-Cluster/Resources/Student-VMs", "Intel-Cluster/Resources/Student-VMs"]
-	Hosts          []string // ESXi hosts for port group operations
+	Hosts          []string // canonical ESXi allowlist for placement and standard-switch mutation
 	Insecure       bool     // skip TLS verification
 }
 
 // Client wraps govmomi for self-service provisioning operations.
 type Client struct {
-	config     Config
-	client     *govmomi.Client
-	finder     *find.Finder
-	datacenter *object.Datacenter
-	mu         sync.Mutex
-	logger     *slog.Logger
+	config       Config
+	client       *govmomi.Client
+	finder       *find.Finder
+	datacenter   *object.Datacenter
+	mu           sync.Mutex
+	hostMu       sync.RWMutex
+	allowedHosts []HostIdentity
+	logger       *slog.Logger
 }
 
 // New creates a vCenter client (does not connect yet).
@@ -191,15 +200,18 @@ type CloneVMParams struct {
 	// (templates.vcenter_vm_id); legacy templates registered by name
 	// persist the inventory name (templates.vcenter_template).
 	// resolveSourceVM in cloneVMInner detects which form was passed.
-	TemplateName string
-	VMName       string
-	VCPUs        int32
-	RAMmb        int64
-	Network      string // port group name
-	OSType       string // "linux" or "windows"
-	Password     string // generated password for cloud-init
-	OperationID  string // durable provisioning-attempt identity
-	PodVMID      string // immutable database VM identity
+	TemplateName      string
+	VMName            string
+	VCPUs             int32
+	RAMmb             int64
+	Network           string // port group name
+	OSType            string // "linux" or "windows"
+	Password          string // generated password for cloud-init
+	OperationID       string // durable provisioning-attempt identity
+	PodVMID           string // immutable database VM identity
+	HostMoRef         string // immutable allowlisted destination host
+	HostName          string // diagnostic name corresponding to HostMoRef
+	ResourcePoolMoRef string // resource pool selected with HostMoRef
 }
 
 // StartCloneVMOperation runs all read-only clone preparation before invoking
@@ -211,6 +223,9 @@ func (c *Client) StartCloneVMOperation(
 ) (string, error) {
 	if err := c.ensureConnected(ctx); err != nil {
 		return "", err
+	}
+	if params.HostMoRef == "" || params.ResourcePoolMoRef == "" {
+		return "", errors.New("clone placement must be resolved and persisted before submission")
 	}
 	return c.startCloneVMInner(ctx, params, arm)
 }
@@ -301,19 +316,25 @@ func (c *Client) startCloneVMInner(
 		)
 	}
 
-	// Select best resource pool based on available resources, but
-	// constrained to the template's cluster.
-	pool, err := c.selectBestPoolInSourceCluster(ctx, tmplProps.Runtime.Host, params.VCPUs, params.RAMmb)
+	// Re-resolve the pinned pair immediately before submission. This is a
+	// validation pass, not a new placement decision: both immutable MoRefs came
+	// from the durable clone operation.
+	placement, err := c.ResolvePlacement(ctx, PlacementRequest{
+		SourceHost:        tmplProps.Runtime.Host,
+		RequireSourceHost: true,
+		DatastoreName:     c.config.Datastore,
+		NetworkName:       params.Network,
+		VCPUs:             params.VCPUs,
+		RAMMB:             params.RAMmb,
+		PinnedHostMoRef:   params.HostMoRef,
+		PinnedPoolMoRef:   params.ResourcePoolMoRef,
+	})
 	if err != nil {
-		return "", fmt.Errorf("select resource pool: %w", err)
+		return "", fmt.Errorf("validate persisted clone placement: %w", err)
 	}
-
-	// Find datastore
-	ds, err := c.finder.Datastore(ctx, c.config.Datastore)
-	if err != nil {
-		return "", fmt.Errorf("find datastore %s: %w", c.config.Datastore, err)
-	}
-	dsRef := ds.Reference()
+	pool := placement.Pool
+	dsRef := placement.Datastore.Reference()
+	hostRef := placement.Host.Reference()
 
 	// Build clone spec — use linked clones for fast provisioning.
 	// Linked clones create a thin delta disk referencing the template's snapshot,
@@ -323,6 +344,7 @@ func (c *Client) startCloneVMInner(
 		Location: types.VirtualMachineRelocateSpec{
 			Pool:      &poolRef,
 			Datastore: &dsRef,
+			Host:      &hostRef,
 		},
 		PowerOn:  false,
 		Template: false,
@@ -354,6 +376,8 @@ func (c *Client) startCloneVMInner(
 		"vcpus", params.VCPUs,
 		"ram_mb", params.RAMmb,
 		"network", params.Network,
+		"host", placement.Identity.Name,
+		"host_moref", placement.Identity.MoRef,
 	)
 
 	if arm != nil {
@@ -434,6 +458,9 @@ func (c *Client) ConfigureClonedVM(ctx context.Context, moref string, params Clo
 	if err := c.ensureConnected(ctx); err != nil {
 		return err
 	}
+	if err := c.ValidateVMPlacement(ctx, moref, params.HostMoRef); err != nil {
+		return fmt.Errorf("refuse to configure clone on invalid host: %w", err)
+	}
 	vmRef := types.ManagedObjectReference{Type: "VirtualMachine", Value: moref}
 	clonedVM := object.NewVirtualMachine(c.client.Client, vmRef)
 	configSpec := types.VirtualMachineConfigSpec{
@@ -497,6 +524,9 @@ func (c *Client) ensureTemplateSnapshot(ctx context.Context, template *object.Vi
 	}
 
 	// Create a snapshot for linked cloning (no memory, no quiesce — template is powered off)
+	if err := c.validateVMForMutation(ctx, template.Reference().Value, "", false); err != nil {
+		return nil, fmt.Errorf("linked-clone snapshot creation prohibited: %w", err)
+	}
 	c.logger.Info("creating linked-clone base snapshot", "template", name)
 	task, err := template.CreateSnapshot(ctx, "linked-clone-base", "Auto-created for linked clone provisioning", false, false)
 	if err != nil {
@@ -516,6 +546,9 @@ func (c *Client) ensureTemplateSnapshot(ctx context.Context, template *object.Vi
 // Idempotent: returns nil if the VM was already deleted.
 func (c *Client) DestroyVM(ctx context.Context, moref string) error {
 	if err := c.ensureConnected(ctx); err != nil {
+		return err
+	}
+	if err := c.validateVMForMutation(ctx, moref, "", true); err != nil {
 		return err
 	}
 
@@ -584,6 +617,9 @@ const (
 // short on a busy NAS or wasted on every fast case.
 func (c *Client) PowerOnVM(ctx context.Context, moref string) error {
 	if err := c.ensureConnected(ctx); err != nil {
+		return err
+	}
+	if err := c.validateVMForMutation(ctx, moref, "", false); err != nil {
 		return err
 	}
 
@@ -668,6 +704,9 @@ func (c *Client) PowerOffVM(ctx context.Context, moref string) error {
 	if err := c.ensureConnected(ctx); err != nil {
 		return err
 	}
+	if err := c.validateVMForMutation(ctx, moref, "", true); err != nil {
+		return err
+	}
 
 	return c.withRetry(ctx, "power off VM", func() error {
 		vm := object.NewVirtualMachine(c.client.Client,
@@ -695,6 +734,9 @@ func (c *Client) RestartVM(ctx context.Context, moref string) error {
 	if err := c.ensureConnected(ctx); err != nil {
 		return err
 	}
+	if err := c.validateVMForMutation(ctx, moref, "", false); err != nil {
+		return err
+	}
 
 	return c.withRetry(ctx, "restart VM", func() error {
 		vm := object.NewVirtualMachine(c.client.Client,
@@ -706,6 +748,9 @@ func (c *Client) RestartVM(ctx context.Context, moref string) error {
 // ResetVM performs a hard reset (power cycle) on a VM.
 func (c *Client) ResetVM(ctx context.Context, moref string) error {
 	if err := c.ensureConnected(ctx); err != nil {
+		return err
+	}
+	if err := c.validateVMForMutation(ctx, moref, "", false); err != nil {
 		return err
 	}
 
@@ -724,6 +769,9 @@ func (c *Client) ResetVM(ctx context.Context, moref string) error {
 func (c *Client) WaitForIP(ctx context.Context, moref string, timeout time.Duration) (string, error) {
 	if err := c.ensureConnected(ctx); err != nil {
 		return "", err
+	}
+	if err := c.ValidateVMPlacement(ctx, moref, ""); err != nil {
+		return "", fmt.Errorf("refuse to wait for IP on invalid host: %w", err)
 	}
 
 	var ip string
@@ -896,6 +944,9 @@ func (c *Client) CreateVMSnapshot(ctx context.Context, moref, name, description 
 	if err := c.ensureConnected(ctx); err != nil {
 		return "", err
 	}
+	if err := c.validateVMForMutation(ctx, moref, "", false); err != nil {
+		return "", err
+	}
 
 	var snapMoref string
 	err := c.withRetry(ctx, "create snapshot", func() error {
@@ -930,6 +981,9 @@ func (c *Client) CreateVMSnapshot(ctx context.Context, moref, name, description 
 // RevertToSnapshot reverts a VM to the specified snapshot.
 func (c *Client) RevertToSnapshot(ctx context.Context, vmMoref, snapshotMoref string) error {
 	if err := c.ensureConnected(ctx); err != nil {
+		return err
+	}
+	if err := c.validateVMForMutation(ctx, vmMoref, "", false); err != nil {
 		return err
 	}
 
@@ -1048,6 +1102,9 @@ func (c *Client) RemoveVMSnapshot(ctx context.Context, vmMoref, snapshotMoref st
 	if err := c.ensureConnected(ctx); err != nil {
 		return err
 	}
+	if err := c.validateVMForMutation(ctx, vmMoref, "", false); err != nil {
+		return err
+	}
 
 	return c.withRetry(ctx, "remove snapshot", func() error {
 		vm := object.NewVirtualMachine(c.client.Client,
@@ -1066,308 +1123,6 @@ func (c *Client) RemoveVMSnapshot(ctx context.Context, vmMoref, snapshotMoref st
 		c.logger.Info("removed VM snapshot", "vm", vmMoref, "snapshot", snapshotMoref)
 		return nil
 	})
-}
-
-// ---------- Resource Pool Selection ----------
-
-// selectBestPool queries all configured resource pools and returns the one
-// with the most available memory, weighted by the requested VM size.
-func (c *Client) selectBestPool(ctx context.Context, vcpus int32, ramMB int64) (*object.ResourcePool, error) {
-	if len(c.config.ResourcePools) == 0 {
-		return nil, fmt.Errorf("no resource pools configured")
-	}
-
-	// If only one pool, use it directly
-	if len(c.config.ResourcePools) == 1 {
-		pool, err := c.finder.ResourcePool(ctx, c.config.ResourcePools[0])
-		if err != nil {
-			return nil, fmt.Errorf("find resource pool %s: %w", c.config.ResourcePools[0], err)
-		}
-		return pool, nil
-	}
-
-	type candidate struct {
-		pool      *object.ResourcePool
-		name      string
-		freeMemMB int64
-	}
-
-	var best *candidate
-	for _, poolPath := range c.config.ResourcePools {
-		pool, err := c.finder.ResourcePool(ctx, poolPath)
-		if err != nil {
-			c.logger.Warn("resource pool not found, skipping", "pool", poolPath, "error", err)
-			continue
-		}
-
-		var props mo.ResourcePool
-		err = pool.Properties(ctx, pool.Reference(), []string{"runtime.memory"}, &props)
-		if err != nil {
-			c.logger.Warn("failed to get pool stats, skipping", "pool", poolPath, "error", err)
-			continue
-		}
-
-		// Calculate free memory: reservationUsed tracks actual consumption
-		overallUsage := props.Runtime.Memory.OverallUsage
-		maxUsage := props.Runtime.Memory.MaxUsage
-		freeMem := (maxUsage - overallUsage) / (1024 * 1024) // bytes → MB
-
-		c.logger.Info("resource pool stats",
-			"pool", poolPath,
-			"free_mb", freeMem,
-			"used_mb", overallUsage/(1024*1024),
-			"max_mb", maxUsage/(1024*1024),
-		)
-
-		if best == nil || freeMem > best.freeMemMB {
-			best = &candidate{pool: pool, name: poolPath, freeMemMB: freeMem}
-		}
-	}
-
-	if best == nil {
-		return nil, fmt.Errorf("no available resource pools found")
-	}
-
-	// Check if the best pool has enough memory for the requested VM
-	if best.freeMemMB < ramMB {
-		c.logger.Warn("best pool has less free memory than requested",
-			"pool", best.name, "free_mb", best.freeMemMB, "requested_mb", ramMB)
-	}
-
-	c.logger.Info("selected resource pool", "pool", best.name, "free_mb", best.freeMemMB)
-	return best.pool, nil
-}
-
-// resolvePlacementPool picks the resource pool for a VM that has no source VM
-// to inherit placement from — a blank ISO shell or an imported OVA.
-//
-// The explicit path is honoured first, then the pools this deployment is
-// actually configured with, and only then vSphere's notion of a "default"
-// pool. That last fallback used to be the only one, and it is a trap: with
-// more than one cluster in the datacenter, DefaultResourcePool cannot choose
-// and fails with "default resource pool resolves to multiple instances,
-// please specify" — an error that names no config key and no caller. No
-// production caller sets ResourcePool (nothing builds a
-// TemplateProvisionPayload with a pool), so every ISO template build on a
-// multi-cluster vCenter failed there, which is exactly how this was found.
-//
-// Going through selectBestPool also means a template shell lands via the same
-// RAM-weighted placement as every pod VM, rather than wherever vSphere would
-// have guessed.
-func (c *Client) resolvePlacementPool(ctx context.Context, explicitPath string, vcpus int32, ramMB int64) (*object.ResourcePool, error) {
-	if explicitPath != "" {
-		pool, err := c.finder.ResourcePool(ctx, explicitPath)
-		if err != nil {
-			return nil, fmt.Errorf("find resource pool %q: %w", explicitPath, err)
-		}
-		return pool, nil
-	}
-
-	if len(c.config.ResourcePools) > 0 {
-		pool, err := c.selectBestPool(ctx, vcpus, ramMB)
-		if err == nil {
-			return pool, nil
-		}
-		// Configured but unusable (renamed, or vCenter refused the stats
-		// lookup). Say so, then still try the default so a half-broken
-		// config degrades instead of hard-failing.
-		c.logger.Warn("configured resource pools unusable, falling back to datacenter default",
-			"pools", c.config.ResourcePools, "error", err)
-	}
-
-	pool, err := c.finder.DefaultResourcePool(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("resolve resource pool (set the params' ResourcePool or vcenter VCENTER_RESOURCE_POOLS config; the datacenter default is ambiguous with multiple clusters): %w", err)
-	}
-	return pool, nil
-}
-
-// selectBestPoolInSourceCluster is the same RAM-based selection as
-// selectBestPool but constrained to resource pools that live in the
-// same cluster as the source host. Used by template clones because
-// vCenter rejects cross-cluster clones with a misleading "virtual
-// disk is either corrupted or not a supported format" error when CPU
-// vendor differs (Intel ↔ AMD) or when guest cpuid masks were set on
-// the source.
-//
-// If sourceHost is nil (shouldn't happen for a real running source,
-// but possible for synthetic tests), falls back to the unconstrained
-// selectBestPool.
-func (c *Client) selectBestPoolInSourceCluster(ctx context.Context, sourceHost *types.ManagedObjectReference, vcpus int32, ramMB int64) (*object.ResourcePool, error) {
-	if sourceHost == nil {
-		c.logger.Warn("source host unknown, falling back to unconstrained pool selection")
-		return c.selectBestPool(ctx, vcpus, ramMB)
-	}
-
-	// Walk Host → ComputeResource (or ClusterComputeResource) parent.
-	// The parent's resource pool path is the prefix any same-cluster
-	// pool will share.
-	var hostProps mo.HostSystem
-	hostObj := object.NewHostSystem(c.client.Client, *sourceHost)
-	if err := hostObj.Properties(ctx, hostObj.Reference(), []string{"parent"}, &hostProps); err != nil {
-		return nil, fmt.Errorf("read source host parent: %w", err)
-	}
-	if hostProps.Parent == nil {
-		return nil, fmt.Errorf("source host %s has no parent compute resource", sourceHost.Value)
-	}
-
-	var cr mo.ComputeResource
-	crObj := object.NewComputeResource(c.client.Client, *hostProps.Parent)
-	if err := crObj.Properties(ctx, crObj.Reference(), []string{"name", "resourcePool"}, &cr); err != nil {
-		return nil, fmt.Errorf("read source cluster: %w", err)
-	}
-	clusterName := cr.Name
-	c.logger.Info("source cluster identified",
-		"host", sourceHost.Value,
-		"cluster", clusterName)
-
-	// Filter configured pools to those in the source cluster. Pool paths
-	// look like "/JMAL-Datacenter/host/Intel-Cluster/Resources/Student-VMs",
-	// so we match by the "/<clusterName>/" segment.
-	wanted := "/" + clusterName + "/"
-	var candidates []string
-	for _, poolPath := range c.config.ResourcePools {
-		if strings.Contains(poolPath, wanted) {
-			candidates = append(candidates, poolPath)
-		}
-	}
-	if len(candidates) == 0 {
-		return nil, fmt.Errorf("no configured resource pools in source cluster %q (configured pools: %v)", clusterName, c.config.ResourcePools)
-	}
-
-	if len(candidates) == 1 {
-		pool, err := c.finder.ResourcePool(ctx, candidates[0])
-		if err != nil {
-			return nil, fmt.Errorf("find resource pool %s: %w", candidates[0], err)
-		}
-		c.logger.Info("selected resource pool (single in source cluster)", "pool", candidates[0])
-		return pool, nil
-	}
-
-	// Multiple candidates: pick the one with most free memory, same as
-	// selectBestPool's policy.
-	type candidate struct {
-		pool      *object.ResourcePool
-		name      string
-		freeMemMB int64
-	}
-	var best *candidate
-	for _, poolPath := range candidates {
-		pool, err := c.finder.ResourcePool(ctx, poolPath)
-		if err != nil {
-			c.logger.Warn("resource pool not found, skipping", "pool", poolPath, "error", err)
-			continue
-		}
-		var props mo.ResourcePool
-		if err := pool.Properties(ctx, pool.Reference(), []string{"runtime.memory"}, &props); err != nil {
-			c.logger.Warn("failed to get pool stats, skipping", "pool", poolPath, "error", err)
-			continue
-		}
-		freeMem := (props.Runtime.Memory.MaxUsage - props.Runtime.Memory.OverallUsage) / (1024 * 1024)
-		c.logger.Info("resource pool stats (source-cluster constrained)",
-			"pool", poolPath,
-			"free_mb", freeMem)
-		if best == nil || freeMem > best.freeMemMB {
-			best = &candidate{pool: pool, name: poolPath, freeMemMB: freeMem}
-		}
-	}
-	if best == nil {
-		return nil, fmt.Errorf("no available resource pools in source cluster %q", clusterName)
-	}
-	if best.freeMemMB < ramMB {
-		c.logger.Warn("best same-cluster pool has less free memory than requested",
-			"pool", best.name, "free_mb", best.freeMemMB, "requested_mb", ramMB)
-	}
-	c.logger.Info("selected resource pool", "pool", best.name, "free_mb", best.freeMemMB, "constrained_to_cluster", clusterName)
-	return best.pool, nil
-}
-
-// ---------- Port Group Operations ----------
-
-// CreatePortGroupOnAllHosts creates a standard vSwitch port group on every configured ESXi host.
-func (c *Client) CreatePortGroupOnAllHosts(ctx context.Context, pgName string, vlanID int) error {
-	if err := c.ensureConnected(ctx); err != nil {
-		return err
-	}
-
-	return c.withRetry(ctx, "create port groups", func() error {
-		for _, hostName := range c.config.Hosts {
-			if err := c.createPortGroup(ctx, hostName, pgName, vlanID); err != nil {
-				return fmt.Errorf("create port group on %s: %w", hostName, err)
-			}
-		}
-		c.logger.Info("port group created on all hosts", "name", pgName, "vlan_id", vlanID, "hosts", len(c.config.Hosts))
-		return nil
-	})
-}
-
-// DeletePortGroupOnAllHosts removes a port group from every configured ESXi host.
-func (c *Client) DeletePortGroupOnAllHosts(ctx context.Context, pgName string) error {
-	if err := c.ensureConnected(ctx); err != nil {
-		return err
-	}
-
-	return c.withRetry(ctx, "delete port groups", func() error {
-		var lastErr error
-		for _, hostName := range c.config.Hosts {
-			if err := c.deletePortGroup(ctx, hostName, pgName); err != nil {
-				c.logger.Warn("failed to delete port group", "host", hostName, "pg", pgName, "error", err)
-				lastErr = err
-			}
-		}
-		return lastErr
-	})
-}
-
-func (c *Client) createPortGroup(ctx context.Context, hostName, pgName string, vlanID int) error {
-	host, err := c.finder.HostSystem(ctx, hostName)
-	if err != nil {
-		return fmt.Errorf("find host %s: %w", hostName, err)
-	}
-
-	ns, err := host.ConfigManager().NetworkSystem(ctx)
-	if err != nil {
-		return fmt.Errorf("get network system: %w", err)
-	}
-
-	spec := types.HostPortGroupSpec{
-		Name:        pgName,
-		VlanId:      int32(vlanID),
-		VswitchName: "vSwitch0",
-		Policy:      types.HostNetworkPolicy{},
-	}
-
-	if err := ns.AddPortGroup(ctx, spec); err != nil {
-		// Idempotency: if the port group already exists, treat as success
-		if strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "AlreadyExists") {
-			c.logger.Info("port group already exists", "host", hostName, "name", pgName)
-			return nil
-		}
-		return err
-	}
-	return nil
-}
-
-func (c *Client) deletePortGroup(ctx context.Context, hostName, pgName string) error {
-	host, err := c.finder.HostSystem(ctx, hostName)
-	if err != nil {
-		return fmt.Errorf("find host %s: %w", hostName, err)
-	}
-
-	ns, err := host.ConfigManager().NetworkSystem(ctx)
-	if err != nil {
-		return fmt.Errorf("get network system: %w", err)
-	}
-
-	if err := ns.RemovePortGroup(ctx, pgName); err != nil {
-		// Idempotent: port group already removed
-		if isResourceNotFoundErr(err) {
-			c.logger.Info("port group already removed", "host", hostName, "name", pgName)
-			return nil
-		}
-		return err
-	}
-	return nil
 }
 
 // FindTemplate looks up a VM template by name in the datacenter.

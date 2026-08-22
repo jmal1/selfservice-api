@@ -145,6 +145,13 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	vcenterHosts, err := getEnvListStrict(
+		"VCENTER_HOSTS",
+		"esxi1.lab.jmal.io,esxi2.lab.jmal.io,nuc1.lab.jmal.io,nuc2.lab.jmal.io,nuc3.lab.jmal.io",
+	)
+	if err != nil {
+		return nil, err
+	}
 
 	cfg := &Config{
 		Server: ServerConfig{
@@ -188,7 +195,7 @@ func Load() (*Config, error) {
 			VMFolder:             getEnv("VCENTER_VM_FOLDER", "Student-VMs"),
 			TemplatesFolder:      getEnv("VCENTER_TEMPLATES_FOLDER", "/JMAL-Datacenter/vm/Templates"),
 			ResourcePools:        splitEnv("VCENTER_RESOURCE_POOLS", "/JMAL-Datacenter/host/Intel-Cluster/Resources/Student-VMs,/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs"),
-			Hosts:                splitEnv("VCENTER_HOSTS", "esxi1.lab.jmal.io,esxi2.lab.jmal.io,nuc1.lab.jmal.io,nuc2.lab.jmal.io,nuc3.lab.jmal.io"),
+			Hosts:                vcenterHosts,
 			Insecure:             getEnvBool("VCENTER_INSECURE", true),
 			HealthPushgatewayURL: getEnv("VCENTER_HEALTH_PUSHGATEWAY_URL", ""),
 			HealthCheckInterval:  getEnvDuration("VCENTER_HEALTH_INTERVAL", 5*time.Minute),
@@ -280,4 +287,31 @@ func splitEnv(key, fallback string) []string {
 		}
 	}
 	return result
+}
+
+func getEnvListStrict(key, fallback string) ([]string, error) {
+	raw, ok := os.LookupEnv(key)
+	if !ok {
+		raw = fallback
+	}
+	if strings.TrimSpace(raw) == "" {
+		return nil, fmt.Errorf("%s must contain at least one value", key)
+	}
+
+	parts := strings.Split(raw, ",")
+	result := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for i, part := range parts {
+		value := strings.TrimSpace(part)
+		if value == "" {
+			return nil, fmt.Errorf("%s contains an empty value at position %d", key, i+1)
+		}
+		canonical := strings.ToLower(value)
+		if _, exists := seen[canonical]; exists {
+			return nil, fmt.Errorf("%s contains duplicate value %q", key, value)
+		}
+		seen[canonical] = struct{}{}
+		result = append(result, value)
+	}
+	return result, nil
 }

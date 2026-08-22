@@ -13,7 +13,7 @@ import (
 	"github.com/jmal1/selfservice-api/internal/models"
 )
 
-func validateVMCloneOperation(op models.VMCloneOperation) error {
+func validateVMCloneOperationScope(op models.VMCloneOperation) error {
 	if _, err := uuid.Parse(op.OperationID); err != nil {
 		return fmt.Errorf("invalid clone operation_id: %w", err)
 	}
@@ -33,6 +33,16 @@ func validateVMCloneOperation(op models.VMCloneOperation) error {
 	case models.VMCloneOperationPrepared, models.VMCloneOperationSubmitting, models.VMCloneOperationSubmitted:
 	default:
 		return fmt.Errorf("invalid clone operation phase %q", op.Phase)
+	}
+	return nil
+}
+
+func validateVMCloneOperation(op models.VMCloneOperation) error {
+	if err := validateVMCloneOperationScope(op); err != nil {
+		return err
+	}
+	if op.HostMoref == "" || op.HostName == "" || op.PoolMoref == "" {
+		return errors.New("clone operation host_moref, host_name, and pool_moref are required")
 	}
 	return nil
 }
@@ -133,7 +143,11 @@ func (q *Queries) PrepareVMCloneOperation(
 		if err := json.Unmarshal(raw, &existing); err != nil {
 			return nil, fmt.Errorf("decode existing clone operation: %w", err)
 		}
-		if err := validateVMCloneOperation(existing); err != nil {
+		// Operations written before host pinning intentionally pass scope
+		// validation here. The provisioner recognizes their missing placement
+		// identity and escalates them to manual cleanup without issuing any
+		// vCenter request.
+		if err := validateVMCloneOperationScope(existing); err != nil {
 			return nil, fmt.Errorf("validate existing clone operation: %w", err)
 		}
 		if !sameVMCloneOperationScope(existing, candidate) {

@@ -20,9 +20,15 @@ provisioning:
   enabled: false
   workerClaimsEnabled: false
 
-# Synthetic monitoring: provisioning checks remain read-only during
-# containment. The janitor stays enabled because delete/cleanup is explicitly
-# preserved; lifecycle and runner creation checks remain disabled.
+vcenter:
+  # Canary placement and standard-vSwitch mutation are restricted to ESXi1.
+  # The Intel pool is a compatibility constraint, not a substitute for the
+  # host allowlist. Keep the external DRS VM-host affinity rule in force.
+  hosts: "esxi1.lab.jmal.io"
+  resourcePools: "/JMAL-Datacenter/host/Intel-Cluster/Resources/Student-VMs"
+
+# Synthetic monitoring remains non-destructive during containment. Lifecycle,
+# janitor, and runner creation checks stay disabled.
 synthetic:
   provisioningExpectedEnabled: false
   lifecycle:
@@ -36,7 +42,7 @@ synthetic:
     maxAttempts: 2
     retryBackoff: 30s
   janitor:
-    enabled: true
+    enabled: false
   # Hourly end-to-end proof of the Kali runner path (Multus NAD, CNI dhcp lease,
   # pod-VLAN L3 reachability, nmap). Chart defaults already match prod: it clones
   # the synthetic-noop template and runs the version-controlled playlist seeded by
@@ -56,15 +62,22 @@ worker:
   # Poll persisted L1 validation due state every 5m. Any template older than
   # seven days is enqueued immediately after startup or leader failover.
   l1Validation:
-    enabled: true
+    enabled: false
     validationInterval: "168h"
     schedulerInterval: "5m"
   templateHealth:
-    enabled: true
+    enabled: false
     interval: "12h"
     deepTimeout: "10m"
     confirmationBackoff: "5m"
     confirmationReconcileInterval: "1m"
+  orphanReconciler:
+    enabled: false
+  networkReconciler:
+    enabled: false
+  idleEvaluator:
+    enabled: false
+    dryRun: true
 
 # Bitnami postgresql subchart image overrides.
 # We pin tag explicitly to avoid surprise major upgrades on chart upgrade.
