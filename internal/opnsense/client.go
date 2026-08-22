@@ -478,7 +478,7 @@ func (c *Client) DeleteFirewallRule(ctx context.Context, uuid string) error {
 	if err != nil {
 		return fmt.Errorf("delete firewall rule %s: %w", uuid, err)
 	}
-	if err := validateModelMutation(resp, false, "deleted"); err != nil {
+	if err := validateModelMutation(resp, false, "deleted", "not found"); err != nil {
 		return fmt.Errorf("delete firewall rule %s: %w", uuid, err)
 	}
 	return nil

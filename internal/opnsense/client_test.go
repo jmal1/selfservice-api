@@ -226,6 +226,93 @@ func TestFirewallMutations_RejectHTTP200ModelAndServiceFailures(t *testing.T) {
 	}
 }
 
+func TestFirewallMutations_AcceptWhitespacePaddedSuccessAndAbsentDelete(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/firewall/filter/delRule/deleted":
+			_, _ = io.WriteString(w, `{"result":" DELETED\n","status":" OK\t"}`)
+		case "/firewall/filter/delRule/absent":
+			_, _ = io.WriteString(w, `{"result":"\nnot found "}`)
+		case "/firewall/filter/apply":
+			_, _ = io.WriteString(w, `{"status":"OK\n\n"}`)
+		default:
+			http.Error(w, "unexpected path", http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(Config{BaseURL: srv.URL}, discardLogger())
+	if err := c.DeleteFirewallRule(context.Background(), "deleted"); err != nil {
+		t.Fatalf("DeleteFirewallRule deleted: %v", err)
+	}
+	if err := c.DeleteFirewallRule(context.Background(), "absent"); err != nil {
+		t.Fatalf("DeleteFirewallRule absent: %v", err)
+	}
+	if err := c.ApplyFirewall(context.Background()); err != nil {
+		t.Fatalf("ApplyFirewall: %v", err)
+	}
+}
+
+func TestMutationValidators_RejectMalformedValidationAndErrorResponses(t *testing.T) {
+	tests := []struct {
+		name     string
+		validate func([]byte) error
+		body     string
+	}{
+		{
+			name: "model malformed",
+			validate: func(body []byte) error {
+				return validateModelMutation(body, false, "deleted")
+			},
+			body: `{"result":`,
+		},
+		{
+			name: "model validation",
+			validate: func(body []byte) error {
+				return validateModelMutation(body, false, "deleted")
+			},
+			body: `{"result":" deleted ","validations":{"rule":"still referenced"}}`,
+		},
+		{
+			name: "model error result",
+			validate: func(body []byte) error {
+				return validateModelMutation(body, false, "deleted")
+			},
+			body: `{"result":" failed "}`,
+		},
+		{
+			name: "model error status",
+			validate: func(body []byte) error {
+				return validateModelMutation(body, false, "deleted")
+			},
+			body: `{"result":" deleted ","status":" failed "}`,
+		},
+		{
+			name:     "service malformed",
+			validate: validateServiceMutation,
+			body:     `{"status":`,
+		},
+		{
+			name:     "service validation",
+			validate: validateServiceMutation,
+			body:     `{"status":" OK\n","validations":{"service":"apply failed"}}`,
+		},
+		{
+			name:     "service error status",
+			validate: validateServiceMutation,
+			body:     `{"status":" failed "}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.validate([]byte(tt.body)); err == nil {
+				t.Fatal("validation unexpectedly succeeded")
+			}
+		})
+	}
+}
+
 func TestGetFirewallRules_RejectsMalformedOrTruncatedInventory(t *testing.T) {
 	for _, body := range []string{
 		`{"not_filter":{}}`,
