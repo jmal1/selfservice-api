@@ -141,8 +141,8 @@ func TestProductionProvisioningContainmentRemainsClosed(t *testing.T) {
 	if values.VCenter.Hosts != "esxi1.lab.jmal.io" {
 		t.Fatalf("production VCENTER_HOSTS = %q, want ESXi1 only", values.VCenter.Hosts)
 	}
-	if values.VCenter.ResourcePools != "/JMAL-Datacenter/host/Intel-Cluster/Resources/Student-VMs" {
-		t.Fatalf("production resource pools = %q, want compatible Intel pool only", values.VCenter.ResourcePools)
+	if values.VCenter.ResourcePools != "/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs" {
+		t.Fatalf("production resource pools = %q, want ESXi1-compatible AMD pool only", values.VCenter.ResourcePools)
 	}
 	if values.Worker.OrphanReconciler.Enabled ||
 		values.Worker.NetworkReconciler.Enabled ||
@@ -161,7 +161,7 @@ func TestProductionProvisioningContainmentRemainsClosed(t *testing.T) {
 		"synthetic.janitor.enabled":             "false",
 		"synthetic.runner.enabled":              "false",
 		"vcenter.hosts":                         "esxi1.lab.jmal.io",
-		"vcenter.resourcePools":                 "/JMAL-Datacenter/host/Intel-Cluster/Resources/Student-VMs",
+		"vcenter.resourcePools":                 "/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs",
 		"worker.orphanReconciler.enabled":       "false",
 		"worker.networkReconciler.enabled":      "false",
 		"worker.l1Validation.enabled":           "false",
