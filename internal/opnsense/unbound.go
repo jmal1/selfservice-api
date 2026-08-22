@@ -342,9 +342,10 @@ func validateModelMutation(body []byte, requireUUID bool, acceptedResults ...str
 	if requireUUID && strings.TrimSpace(result.UUID) == "" {
 		return fmt.Errorf("OPNsense mutation response omitted uuid")
 	}
+	mutationResult := strings.TrimSpace(result.Result)
 	accepted := false
 	for _, expected := range acceptedResults {
-		if strings.EqualFold(result.Result, expected) {
+		if strings.EqualFold(mutationResult, expected) {
 			accepted = true
 			break
 		}
@@ -352,7 +353,8 @@ func validateModelMutation(body []byte, requireUUID bool, acceptedResults ...str
 	if !accepted {
 		return fmt.Errorf("OPNsense mutation result %q, want one of %v", result.Result, acceptedResults)
 	}
-	if result.Status != "" && !strings.EqualFold(result.Status, "ok") {
+	status := strings.TrimSpace(result.Status)
+	if status != "" && !strings.EqualFold(status, "ok") {
 		return fmt.Errorf("OPNsense mutation status %q", result.Status)
 	}
 	return nil
@@ -369,7 +371,7 @@ func validateServiceMutation(body []byte) error {
 	if len(result.Validations) > 0 {
 		return fmt.Errorf("OPNsense service validation failed: %v", result.Validations)
 	}
-	if !strings.EqualFold(result.Status, "ok") {
+	if !strings.EqualFold(strings.TrimSpace(result.Status), "ok") {
 		return fmt.Errorf("OPNsense service status %q", result.Status)
 	}
 	return nil
