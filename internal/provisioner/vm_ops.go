@@ -525,6 +525,37 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) error {
 	if tmplErr == nil {
 		osType = tmpl.OSType
 	}
+	if tmplErr != nil {
+		return fmt.Errorf("get template for VM placement: %w", tmplErr)
+	}
+	rawReceipt, err := p.db.GetPodPortGroupReceipt(ctx, podID)
+	if err != nil {
+		return fmt.Errorf("load pod port group receipt for VM placement: %w", err)
+	}
+	var receipt vcenter.PortGroupReceipt
+	if err := json.Unmarshal(rawReceipt, &receipt); err != nil {
+		return fmt.Errorf("parse pod port group receipt for VM placement: %w", err)
+	}
+	if receipt.Name != pgName || receipt.VLANID != int(pod.VLANID) || len(receipt.Hosts) == 0 {
+		return &manualCleanupRequiredError{err: fmt.Errorf(
+			"pod port group receipt is incomplete or mismatched for %s",
+			pgName,
+		)}
+	}
+	targetHosts := make([]string, 0, len(receipt.Hosts))
+	for _, host := range receipt.Hosts {
+		targetHosts = append(targetHosts, host.HostMoRef)
+	}
+	placements, err := p.prepareVMPlacementPlan(ctx, job, []vmPlacementSpec{{
+		PodVMID:   podVMID,
+		SourceRef: payload.TemplateName,
+		VCPUs:     int32(podVM.VCPUs),
+		RAMMB:     int64(podVM.RAMMB),
+	}}, pgName, false, targetHosts)
+	if err != nil {
+		return fmt.Errorf("plan added VM placement: %w", err)
+	}
+	placement := placements[0]
 	if osType == "linux" || osType == "windows" {
 		password = generatePassword(12)
 	}
@@ -539,7 +570,7 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) error {
 		p.publishProgress(job.ID, "vm_clone", fmt.Sprintf("Cloning %s from %s", payload.VMName, payload.TemplateName))
 
 		var err error
-		moref, err = executeDurableVMClone(ctx, p.db, p.vc, job.ID, workerID, podID, podVMID, vcenter.CloneVMParams{
+		cloneParams := cloneParamsFromPlacement(vcenter.CloneVMParams{
 			TemplateName: payload.TemplateName,
 			VMName:       payload.VMName,
 			VCPUs:        int32(podVM.VCPUs),
@@ -547,7 +578,17 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) error {
 			Network:      pgName,
 			OSType:       osType,
 			Password:     password,
-		})
+		}, placement)
+		moref, err = executeDurableVMClone(
+			ctx,
+			p.db,
+			p.vc,
+			job.ID,
+			workerID,
+			podID,
+			podVMID,
+			cloneParams,
+		)
 		if err != nil {
 			jobErr := fmt.Errorf("clone VM: %w", err)
 			if moref != "" {
@@ -612,7 +653,7 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) error {
 		_ = p.db.UpdatePodVMCredentials(ctx, podVMID, genUser, password)
 	}
 
-	if err := p.vc.ValidateVMPlacement(ctx, moref, ""); err != nil {
+	if err := p.ensurePersistedVMPlacement(ctx, moref, placement); err != nil {
 		_, _ = p.db.UpdatePodVMStatusFrom(
 			ctx,
 			podVMID,

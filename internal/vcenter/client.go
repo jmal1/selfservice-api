@@ -25,11 +25,15 @@ const (
 	cloneTaskWaitSlice          = 2 * time.Minute
 	cloneTaskOperationalTimeout = 15 * time.Minute
 
-	CloneOperationIDKey     = "guestinfo.crucible.clone_operation_id"
-	CloneOperationSourceKey = "guestinfo.crucible.clone_source_ref"
-	CloneOperationPodVMKey  = "guestinfo.crucible.clone_pod_vm_id"
-	CloneOperationHostKey   = "guestinfo.crucible.clone_host_moref"
-	CloneOperationPoolKey   = "guestinfo.crucible.clone_pool_moref"
+	CloneOperationIDKey          = "guestinfo.crucible.clone_operation_id"
+	CloneOperationSourceKey      = "guestinfo.crucible.clone_source_ref"
+	CloneOperationPodVMKey       = "guestinfo.crucible.clone_pod_vm_id"
+	CloneOperationHostKey        = "guestinfo.crucible.clone_host_moref"
+	CloneOperationPoolKey        = "guestinfo.crucible.clone_pool_moref"
+	CloneOperationComputeTypeKey = "guestinfo.crucible.clone_compute_type"
+	CloneOperationComputeKey     = "guestinfo.crucible.clone_compute_moref"
+	CloneOperationReplicaKey     = "guestinfo.crucible.clone_source_replica_id"
+	CloneOperationTemplateKey    = "guestinfo.crucible.logical_template_id"
 )
 
 var ErrAmbiguousVMOwnership = errors.New("VM ownership cannot be proven")
@@ -42,8 +46,10 @@ func cloneOperationExtraConfig(params CloneVMParams) ([]types.BaseOptionValue, e
 	if params.PodVMID == "" {
 		return nil, errors.New("clone operation requires pod VM identity")
 	}
-	if params.HostMoRef == "" || params.ResourcePoolMoRef == "" {
-		return nil, errors.New("clone operation requires explicit host and resource pool identities")
+	if params.LogicalTemplateID == "" ||
+		params.ComputeResourceType == "" || params.ComputeResourceMoRef == "" ||
+		params.HostMoRef == "" || params.ResourcePoolMoRef == "" {
+		return nil, errors.New("clone operation requires complete template, compute, host, and resource pool identities")
 	}
 	return []types.BaseOptionValue{
 		&types.OptionValue{Key: CloneOperationIDKey, Value: params.OperationID},
@@ -51,6 +57,10 @@ func cloneOperationExtraConfig(params CloneVMParams) ([]types.BaseOptionValue, e
 		&types.OptionValue{Key: CloneOperationPodVMKey, Value: params.PodVMID},
 		&types.OptionValue{Key: CloneOperationHostKey, Value: params.HostMoRef},
 		&types.OptionValue{Key: CloneOperationPoolKey, Value: params.ResourcePoolMoRef},
+		&types.OptionValue{Key: CloneOperationComputeTypeKey, Value: params.ComputeResourceType},
+		&types.OptionValue{Key: CloneOperationComputeKey, Value: params.ComputeResourceMoRef},
+		&types.OptionValue{Key: CloneOperationReplicaKey, Value: params.SourceReplicaID},
+		&types.OptionValue{Key: CloneOperationTemplateKey, Value: params.LogicalTemplateID},
 	}, nil
 }
 
@@ -68,10 +78,11 @@ type Config struct {
 	// orphan reconciler scans, so a long-lived template shell parked there
 	// would be reported as an orphan forever. CreateBlankVM falls back to
 	// this when the caller does not name a folder.
-	TemplateFolder string
-	ResourcePools  []string // e.g., ["AMD-Cluster/Resources/Student-VMs", "Intel-Cluster/Resources/Student-VMs"]
-	Hosts          []string // canonical ESXi allowlist for placement and standard-switch mutation
-	Insecure       bool     // skip TLS verification
+	TemplateFolder       string
+	ResourcePools        []string // e.g., ["AMD-Cluster/Resources/Student-VMs", "Intel-Cluster/Resources/Student-VMs"]
+	Hosts                []string // canonical ESXi allowlist for placement and standard-switch mutation
+	HostReservedMemoryMB map[string]int64
+	Insecure             bool // skip TLS verification
 }
 
 // Client wraps govmomi for self-service provisioning operations.
@@ -200,18 +211,37 @@ type CloneVMParams struct {
 	// (templates.vcenter_vm_id); legacy templates registered by name
 	// persist the inventory name (templates.vcenter_template).
 	// resolveSourceVM in cloneVMInner detects which form was passed.
-	TemplateName      string
-	VMName            string
-	VCPUs             int32
-	RAMmb             int64
-	Network           string // port group name
-	OSType            string // "linux" or "windows"
-	Password          string // generated password for cloud-init
-	OperationID       string // durable provisioning-attempt identity
-	PodVMID           string // immutable database VM identity
-	HostMoRef         string // immutable allowlisted destination host
-	HostName          string // diagnostic name corresponding to HostMoRef
-	ResourcePoolMoRef string // resource pool selected with HostMoRef
+	TemplateName          string
+	LogicalTemplateID     string
+	SourceReplicaID       string
+	ComputeResourceType   string
+	ComputeResourceMoRef  string
+	VMName                string
+	VCPUs                 int32
+	RAMmb                 int64
+	Network               string // port group name
+	OSType                string // "linux" or "windows"
+	Password              string // generated password for cloud-init
+	OperationID           string // durable provisioning-attempt identity
+	PodVMID               string // immutable database VM identity
+	HostMoRef             string // immutable allowlisted destination host
+	HostName              string // diagnostic name corresponding to HostMoRef
+	ResourcePoolMoRef     string // resource pool selected with HostMoRef
+	DRSControl            string
+	ObservedFreeMemoryMB  int64
+	ReservedMemoryMB      int64
+	AllowMissingNetwork   bool
+	PlannedMemoryMBByHost map[string]int64
+	TargetHostMoRefs      []string
+	SourceCandidates      []CloneSource
+}
+
+// CloneSource is one validated source VM candidate for a logical template.
+type CloneSource struct {
+	ReplicaID            string
+	Ref                  string
+	ComputeResourceType  string
+	ComputeResourceMoRef string
 }
 
 // StartCloneVMOperation runs all read-only clone preparation before invoking
@@ -224,7 +254,9 @@ func (c *Client) StartCloneVMOperation(
 	if err := c.ensureConnected(ctx); err != nil {
 		return "", err
 	}
-	if params.HostMoRef == "" || params.ResourcePoolMoRef == "" {
+	if params.HostMoRef == "" || params.ResourcePoolMoRef == "" ||
+		params.ComputeResourceType == "" || params.ComputeResourceMoRef == "" ||
+		params.DRSControl == "" {
 		return "", errors.New("clone placement must be resolved and persisted before submission")
 	}
 	return c.startCloneVMInner(ctx, params, arm)
@@ -320,14 +352,16 @@ func (c *Client) startCloneVMInner(
 	// validation pass, not a new placement decision: both immutable MoRefs came
 	// from the durable clone operation.
 	placement, err := c.ResolvePlacement(ctx, PlacementRequest{
-		SourceHost:        tmplProps.Runtime.Host,
-		RequireSourceHost: true,
-		DatastoreName:     c.config.Datastore,
-		NetworkName:       params.Network,
-		VCPUs:             params.VCPUs,
-		RAMMB:             params.RAMmb,
-		PinnedHostMoRef:   params.HostMoRef,
-		PinnedPoolMoRef:   params.ResourcePoolMoRef,
+		SourceHost:           tmplProps.Runtime.Host,
+		RequireSourceHost:    true,
+		DatastoreName:        c.config.Datastore,
+		NetworkName:          params.Network,
+		VCPUs:                params.VCPUs,
+		RAMMB:                params.RAMmb,
+		PinnedHostMoRef:      params.HostMoRef,
+		PinnedPoolMoRef:      params.ResourcePoolMoRef,
+		ExpectedComputeType:  params.ComputeResourceType,
+		ExpectedComputeMoRef: params.ComputeResourceMoRef,
 	})
 	if err != nil {
 		return "", fmt.Errorf("validate persisted clone placement: %w", err)
@@ -461,6 +495,16 @@ func (c *Client) ConfigureClonedVM(ctx context.Context, moref string, params Clo
 	if err := c.ValidateVMPlacement(ctx, moref, params.HostMoRef); err != nil {
 		return fmt.Errorf("refuse to configure clone on invalid host: %w", err)
 	}
+	if err := c.EnsureVMPlacementControl(
+		ctx,
+		moref,
+		params.HostMoRef,
+		params.ComputeResourceType,
+		params.ComputeResourceMoRef,
+		params.DRSControl,
+	); err != nil {
+		return err
+	}
 	vmRef := types.ManagedObjectReference{Type: "VirtualMachine", Value: moref}
 	clonedVM := object.NewVirtualMachine(c.client.Client, vmRef)
 	configSpec := types.VirtualMachineConfigSpec{
@@ -503,6 +547,16 @@ func (c *Client) ConfigureClonedVM(ctx context.Context, moref string, params Clo
 	}
 	if err := reconfigTask.Wait(ctx); err != nil {
 		return fmt.Errorf("reconfigure task: %w", err)
+	}
+	if err := c.ValidateVMPlacementControl(
+		ctx,
+		moref,
+		params.HostMoRef,
+		params.ComputeResourceType,
+		params.ComputeResourceMoRef,
+		params.DRSControl,
+	); err != nil {
+		return err
 	}
 
 	c.logger.Info("VM reconfigured", "name", params.VMName, "vcpus", params.VCPUs, "ram_mb", params.RAMmb)
@@ -1198,4 +1252,10 @@ func isResourceNotFoundErr(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "could not be found") ||
 		strings.Contains(msg, "NotFound")
+}
+
+// IsVMNotFoundError reports whether vSphere says the referenced VM no longer
+// exists. Power-off uses this to preserve its idempotent delete-tolerant path.
+func IsVMNotFoundError(err error) bool {
+	return err != nil && (isAlreadyDeletedErr(err) || isResourceNotFoundErr(err))
 }

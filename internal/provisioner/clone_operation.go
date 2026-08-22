@@ -56,11 +56,16 @@ type cloneOperationClient interface {
 func cloneOperationParams(op *models.VMCloneOperation, params vcenter.CloneVMParams) vcenter.CloneVMParams {
 	params.OperationID = op.OperationID
 	params.PodVMID = op.PodVMID
+	params.LogicalTemplateID = op.LogicalTemplateID
 	params.TemplateName = op.SourceRef
+	params.SourceReplicaID = op.SourceReplicaID
+	params.ComputeResourceType = op.ComputeResourceType
+	params.ComputeResourceMoRef = op.ComputeResourceMoref
 	params.VMName = op.TargetName
 	params.HostMoRef = op.HostMoref
 	params.HostName = op.HostName
 	params.ResourcePoolMoRef = op.PoolMoref
+	params.DRSControl = op.DRSControl
 	return params
 }
 
@@ -109,28 +114,39 @@ func executeDurableVMClone(
 	podID, podVMID uuid.UUID,
 	params vcenter.CloneVMParams,
 ) (string, error) {
+	if _, err := uuid.Parse(params.LogicalTemplateID); err != nil {
+		return "", fmt.Errorf("durable clone requires a logical template ID: %w", err)
+	}
 	resolvedParams, err := client.ResolveClonePlacement(ctx, params)
 	if err != nil {
 		return "", fmt.Errorf("resolve durable clone placement: %w", err)
 	}
 	params = resolvedParams
 	candidate := models.VMCloneOperation{
-		OperationID: uuid.NewString(),
-		PodID:       podID.String(),
-		PodVMID:     podVMID.String(),
-		TargetName:  params.VMName,
-		SourceRef:   params.TemplateName,
-		HostMoref:   params.HostMoRef,
-		HostName:    params.HostName,
-		PoolMoref:   params.ResourcePoolMoRef,
-		Phase:       models.VMCloneOperationPrepared,
-		PreparedAt:  time.Now().UTC(),
+		OperationID:          uuid.NewString(),
+		PodID:                podID.String(),
+		PodVMID:              podVMID.String(),
+		LogicalTemplateID:    params.LogicalTemplateID,
+		TargetName:           params.VMName,
+		SourceReplicaID:      params.SourceReplicaID,
+		SourceRef:            params.TemplateName,
+		ComputeResourceType:  params.ComputeResourceType,
+		ComputeResourceMoref: params.ComputeResourceMoRef,
+		HostMoref:            params.HostMoRef,
+		HostName:             params.HostName,
+		PoolMoref:            params.ResourcePoolMoRef,
+		DRSControl:           params.DRSControl,
+		Phase:                models.VMCloneOperationPrepared,
+		PreparedAt:           time.Now().UTC(),
 	}
 	op, err := store.PrepareVMCloneOperation(ctx, jobID, workerID, candidate)
 	if err != nil {
 		return "", fmt.Errorf("prepare durable clone operation: %w", err)
 	}
-	if op == nil || op.HostMoref == "" || op.HostName == "" || op.PoolMoref == "" {
+	if op == nil || op.LogicalTemplateID == "" ||
+		op.ComputeResourceType == "" || op.ComputeResourceMoref == "" ||
+		op.HostMoref == "" || op.HostName == "" || op.PoolMoref == "" ||
+		op.DRSControl == "" {
 		return "", &manualCleanupRequiredError{err: errors.New(
 			"persisted clone operation is missing immutable host placement; automatic recovery is unsafe",
 		)}
@@ -311,7 +327,10 @@ func reconcileCloneOperationTargetForCleanup(
 		}
 		return nil, nil
 	}
-	if op.HostMoref == "" || op.HostName == "" || op.PoolMoref == "" {
+	if op.LogicalTemplateID == "" ||
+		op.ComputeResourceType == "" || op.ComputeResourceMoref == "" ||
+		op.HostMoref == "" || op.HostName == "" || op.PoolMoref == "" ||
+		op.DRSControl == "" {
 		return nil, &manualCleanupRequiredError{err: fmt.Errorf(
 			"clone operation %s has no persisted host placement; automatic recovery is unsafe",
 			op.OperationID,

@@ -70,6 +70,8 @@ spec:
               value: {{ .Values.vcenter.resourcePools | quote }}
             - name: VCENTER_HOSTS
               value: {{ .Values.vcenter.hosts | quote }}
+            - name: VCENTER_PLACEMENT_RESERVED_MEMORY_MB
+              value: {{ .Values.vcenter.placementReservedMemoryMB | quote }}
             - name: VCENTER_INSECURE
               value: {{ .Values.vcenter.insecure | quote }}
             # Runner provisioner

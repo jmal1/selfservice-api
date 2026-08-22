@@ -55,22 +55,30 @@ func TestDuplicateCloneNameErrorsAreRecognized(t *testing.T) {
 
 func TestCloneOperationExtraConfigCarriesCompleteIdentity(t *testing.T) {
 	params := CloneVMParams{
-		OperationID:       "operation-1",
-		PodVMID:           "pod-vm-1",
-		TemplateName:      "vm-source",
-		HostMoRef:         "host-1",
-		ResourcePoolMoRef: "resgroup-1",
+		OperationID:          "operation-1",
+		PodVMID:              "pod-vm-1",
+		LogicalTemplateID:    "template-1",
+		TemplateName:         "vm-source",
+		SourceReplicaID:      "replica-1",
+		ComputeResourceType:  "ClusterComputeResource",
+		ComputeResourceMoRef: "domain-c1",
+		HostMoRef:            "host-1",
+		ResourcePoolMoRef:    "resgroup-1",
 	}
 	values, err := cloneOperationExtraConfig(params)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for key, want := range map[string]string{
-		CloneOperationIDKey:     params.OperationID,
-		CloneOperationSourceKey: params.TemplateName,
-		CloneOperationPodVMKey:  params.PodVMID,
-		CloneOperationHostKey:   params.HostMoRef,
-		CloneOperationPoolKey:   params.ResourcePoolMoRef,
+		CloneOperationIDKey:          params.OperationID,
+		CloneOperationSourceKey:      params.TemplateName,
+		CloneOperationPodVMKey:       params.PodVMID,
+		CloneOperationHostKey:        params.HostMoRef,
+		CloneOperationPoolKey:        params.ResourcePoolMoRef,
+		CloneOperationComputeTypeKey: params.ComputeResourceType,
+		CloneOperationComputeKey:     params.ComputeResourceMoRef,
+		CloneOperationReplicaKey:     params.SourceReplicaID,
+		CloneOperationTemplateKey:    params.LogicalTemplateID,
 	} {
 		if got := optionValueString(values, key); got != want {
 			t.Errorf("%s = %q, want %q", key, got, want)

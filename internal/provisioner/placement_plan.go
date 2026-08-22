@@ -1,0 +1,387 @@
+package provisioner
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sort"
+
+	"github.com/google/uuid"
+	"github.com/jmal1/selfservice-api/internal/models"
+	"github.com/jmal1/selfservice-api/internal/rollback"
+	"github.com/jmal1/selfservice-api/internal/vcenter"
+)
+
+type vmPlacementSpec struct {
+	PodVMID   uuid.UUID
+	SourceRef string
+	VCPUs     int32
+	RAMMB     int64
+}
+
+type placementMetricsSink interface {
+	RecordVMPlacement(host, compute, source string)
+	SetVMPlacementHeadroom(host string, megabytes int64)
+	RecordVMPlacementDrift(kind string)
+	RecordVMPlacementRejection(reason string)
+}
+
+func (p *Provisioner) prepareVMPlacementPlan(
+	ctx context.Context,
+	job *models.Job,
+	specs []vmPlacementSpec,
+	network string,
+	allowMissingNetwork bool,
+	targetHostMoRefs []string,
+) ([]models.VMPlacement, error) {
+	workerID, _, err := claimedJobLease(job)
+	if err != nil {
+		return nil, err
+	}
+	podVMIDs := make([]uuid.UUID, 0, len(specs))
+	for _, spec := range specs {
+		podVMIDs = append(podVMIDs, spec.PodVMID)
+	}
+	existing, err := p.db.LoadVMPlacementPlan(ctx, job.ID, workerID, podVMIDs)
+	if err != nil {
+		return nil, fmt.Errorf("load durable VM placement plan: %w", err)
+	}
+	if len(existing) > 0 {
+		if err := p.ensureExistingVMPlacements(ctx, existing); err != nil {
+			return nil, err
+		}
+		return existing, nil
+	}
+
+	plannedMemory := make(map[string]int64)
+	headroomByHost := make(map[string]int64)
+	candidates := make([]models.VMPlacement, 0, len(specs))
+	for _, spec := range specs {
+		podVM, err := p.db.GetPodVM(ctx, spec.PodVMID)
+		if err != nil {
+			return nil, fmt.Errorf("load pod VM %s for placement: %w", spec.PodVMID, err)
+		}
+		template, err := p.db.GetTemplateByID(ctx, podVM.TemplateID)
+		if err != nil {
+			return nil, fmt.Errorf("load template %s for placement: %w", podVM.TemplateID, err)
+		}
+		replicas, err := p.db.ListTemplateSourceReplicas(ctx, template.ID)
+		if err != nil {
+			return nil, err
+		}
+
+		sourceRef := spec.SourceRef
+		if sourceRef == "" {
+			sourceRef = template.VCenterRef()
+		}
+		var sourceCandidates []vcenter.CloneSource
+		replicaModeEnabled := len(replicas) > 0
+		if len(replicas) == 0 {
+			replicaModeEnabled, err = p.db.TemplateSourceReplicaModeEnabled(ctx, template.ID)
+			if err != nil {
+				return nil, err
+			}
+			if replicaModeEnabled {
+				return nil, fmt.Errorf(
+					"template %s has source-replica mode enabled but no replicas are configured",
+					template.ID,
+				)
+			}
+			sourceCandidates = []vcenter.CloneSource{{Ref: sourceRef}}
+		} else {
+			for _, replica := range replicas {
+				if replica.Status != models.TemplateSourceReplicaReady {
+					continue
+				}
+				sourceCandidates = append(sourceCandidates, vcenter.CloneSource{
+					ReplicaID:            replica.ID.String(),
+					Ref:                  replica.SourceVMMoref,
+					ComputeResourceType:  replica.ComputeResourceType,
+					ComputeResourceMoRef: replica.ComputeResourceMoref,
+				})
+			}
+			if len(sourceCandidates) == 0 {
+				return nil, fmt.Errorf(
+					"template %s has source replicas configured but none are ready",
+					template.ID,
+				)
+			}
+		}
+
+		resolveParams := vcenter.CloneVMParams{
+			LogicalTemplateID:     template.ID.String(),
+			TemplateName:          sourceRef,
+			VCPUs:                 spec.VCPUs,
+			RAMmb:                 spec.RAMMB,
+			Network:               network,
+			AllowMissingNetwork:   allowMissingNetwork,
+			PlannedMemoryMBByHost: plannedMemory,
+			TargetHostMoRefs:      targetHostMoRefs,
+			SourceCandidates:      sourceCandidates,
+		}
+		existingVMMoref := ""
+		if podVM.VCenterVMID != nil {
+			existingVMMoref = *podVM.VCenterVMID
+		}
+		var resolved vcenter.CloneVMParams
+		if existingVMMoref != "" {
+			if replicaModeEnabled {
+				return nil, fmt.Errorf(
+					"pod VM %s predates durable placement but template %s has source-replica mode enabled; source identity cannot be reconstructed safely",
+					spec.PodVMID,
+					template.ID,
+				)
+			}
+			resolved, err = p.vc.ResolveExistingClonePlacement(ctx, existingVMMoref, resolveParams)
+		} else {
+			resolved, err = p.vc.ResolveClonePlacement(ctx, resolveParams)
+		}
+		if err != nil {
+			if errors.Is(err, vcenter.ErrReservedHeadroom) {
+				if metrics, ok := p.pipeline.(placementMetricsSink); ok {
+					metrics.RecordVMPlacementRejection("reserved_headroom")
+				}
+			}
+			return nil, fmt.Errorf("resolve placement for pod VM %s: %w", spec.PodVMID, err)
+		}
+		var sourceReplicaID *uuid.UUID
+		if resolved.SourceReplicaID != "" {
+			parsed, err := uuid.Parse(resolved.SourceReplicaID)
+			if err != nil {
+				return nil, fmt.Errorf("resolved source replica has invalid ID %q: %w", resolved.SourceReplicaID, err)
+			}
+			sourceReplicaID = &parsed
+		}
+		candidates = append(candidates, models.VMPlacement{
+			PodVMID:              spec.PodVMID,
+			JobID:                job.ID,
+			TemplateID:           template.ID,
+			SourceReplicaID:      sourceReplicaID,
+			SourceRef:            resolved.TemplateName,
+			ComputeResourceType:  resolved.ComputeResourceType,
+			ComputeResourceMoref: resolved.ComputeResourceMoRef,
+			ResourcePoolMoref:    resolved.ResourcePoolMoRef,
+			HostMoref:            resolved.HostMoRef,
+			HostName:             resolved.HostName,
+			DRSControl:           resolved.DRSControl,
+			ObservedFreeMemoryMB: resolved.ObservedFreeMemoryMB,
+			ReservedMemoryMB:     resolved.ReservedMemoryMB,
+		})
+		if existingVMMoref == "" {
+			plannedMemory[resolved.HostMoRef] += spec.RAMMB
+		}
+		headroomByHost[resolved.HostMoRef] = resolved.ObservedFreeMemoryMB -
+			plannedMemory[resolved.HostMoRef] - resolved.ReservedMemoryMB
+	}
+
+	persisted, err := p.db.PrepareVMPlacementPlan(ctx, job.ID, workerID, candidates)
+	if err != nil {
+		return nil, fmt.Errorf("persist durable VM placement plan: %w", err)
+	}
+	if err := p.ensureExistingVMPlacements(ctx, persisted); err != nil {
+		return nil, err
+	}
+	if metrics, ok := p.pipeline.(placementMetricsSink); ok {
+		for _, placement := range persisted {
+			source := "legacy"
+			if placement.SourceReplicaID != nil {
+				source = placement.SourceReplicaID.String()
+			}
+			metrics.RecordVMPlacement(
+				placement.HostName,
+				placement.ComputeResourceMoref,
+				source,
+			)
+		}
+		for host, headroom := range headroomByHost {
+			metrics.SetVMPlacementHeadroom(host, headroom)
+		}
+	}
+	return persisted, nil
+}
+
+func (p *Provisioner) ensureExistingVMPlacements(
+	ctx context.Context,
+	placements []models.VMPlacement,
+) error {
+	for _, placement := range placements {
+		podVM, err := p.db.GetPodVM(ctx, placement.PodVMID)
+		if err != nil {
+			return fmt.Errorf("load pod VM %s for placement enforcement: %w", placement.PodVMID, err)
+		}
+		if podVM.VCenterVMID == nil || *podVM.VCenterVMID == "" {
+			continue
+		}
+		if err := p.ensurePersistedVMPlacement(ctx, *podVM.VCenterVMID, placement); err != nil {
+			return fmt.Errorf(
+				"enforce placement for existing pod VM %s: %w",
+				placement.PodVMID,
+				err,
+			)
+		}
+	}
+	return nil
+}
+
+func placementPlanByPodVM(placements []models.VMPlacement) map[uuid.UUID]models.VMPlacement {
+	byVM := make(map[uuid.UUID]models.VMPlacement, len(placements))
+	for _, placement := range placements {
+		byVM[placement.PodVMID] = placement
+	}
+	return byVM
+}
+
+func selectedPlacementHosts(placements []models.VMPlacement) []string {
+	unique := make(map[string]struct{}, len(placements))
+	for _, placement := range placements {
+		unique[placement.HostMoref] = struct{}{}
+	}
+	hosts := make([]string, 0, len(unique))
+	for host := range unique {
+		hosts = append(hosts, host)
+	}
+	sort.Strings(hosts)
+	return hosts
+}
+
+func cloneParamsFromPlacement(params vcenter.CloneVMParams, placement models.VMPlacement) vcenter.CloneVMParams {
+	params.LogicalTemplateID = placement.TemplateID.String()
+	params.TemplateName = placement.SourceRef
+	if placement.SourceReplicaID != nil {
+		params.SourceReplicaID = placement.SourceReplicaID.String()
+	}
+	params.ComputeResourceType = placement.ComputeResourceType
+	params.ComputeResourceMoRef = placement.ComputeResourceMoref
+	params.ResourcePoolMoRef = placement.ResourcePoolMoref
+	params.HostMoRef = placement.HostMoref
+	params.HostName = placement.HostName
+	params.DRSControl = placement.DRSControl
+	params.ObservedFreeMemoryMB = placement.ObservedFreeMemoryMB
+	params.ReservedMemoryMB = placement.ReservedMemoryMB
+	return params
+}
+
+func (p *Provisioner) validatePersistedVMPlacement(
+	ctx context.Context,
+	podVMID uuid.UUID,
+	vmMoref string,
+) error {
+	placement, err := p.db.GetVMPlacement(ctx, podVMID)
+	if err != nil {
+		return fmt.Errorf("load durable VM placement: %w", err)
+	}
+	if placement == nil {
+		return p.vc.ValidateVMPlacement(ctx, vmMoref, "")
+	}
+	err = p.vc.ValidateVMPlacementControl(
+		ctx,
+		vmMoref,
+		placement.HostMoref,
+		placement.ComputeResourceType,
+		placement.ComputeResourceMoref,
+		placement.DRSControl,
+	)
+	if err != nil {
+		p.recordVMPlacementDrift(err)
+	}
+	return err
+}
+
+func (p *Provisioner) ensurePersistedVMPlacement(
+	ctx context.Context,
+	vmMoref string,
+	placement models.VMPlacement,
+) error {
+	err := p.vc.ValidateVMPlacementControl(
+		ctx,
+		vmMoref,
+		placement.HostMoref,
+		placement.ComputeResourceType,
+		placement.ComputeResourceMoref,
+		placement.DRSControl,
+	)
+	if err == nil {
+		return nil
+	}
+	p.recordVMPlacementDrift(err)
+	if !errors.Is(err, vcenter.ErrDRSControlDrift) {
+		return err
+	}
+	return p.vc.EnsureVMPlacementControl(
+		ctx,
+		vmMoref,
+		placement.HostMoref,
+		placement.ComputeResourceType,
+		placement.ComputeResourceMoref,
+		placement.DRSControl,
+	)
+}
+
+func (p *Provisioner) recordVMPlacementDrift(err error) {
+	if metrics, ok := p.pipeline.(placementMetricsSink); ok {
+		var kind string
+		switch {
+		case errors.Is(err, vcenter.ErrDRSControlDrift):
+			kind = "drs"
+		case errors.Is(err, vcenter.ErrPlacementDrift):
+			kind = "host"
+		default:
+			return
+		}
+		metrics.RecordVMPlacementDrift(kind)
+	}
+}
+
+func existingPortGroupReceipt(
+	rb *rollback.Engine,
+	pgName string,
+	vlanID int,
+	selectedHosts []string,
+) (*vcenter.PortGroupReceipt, error) {
+	selected := make(map[string]struct{}, len(selectedHosts))
+	for _, host := range selectedHosts {
+		selected[host] = struct{}{}
+	}
+	var found *vcenter.PortGroupReceipt
+	for _, step := range rb.Steps() {
+		if step.Name != "portgroup_create" {
+			continue
+		}
+		var receipt vcenter.PortGroupReceipt
+		if err := json.Unmarshal(step.Data, &receipt); err != nil {
+			return nil, fmt.Errorf("decode persisted port group receipt: %w", err)
+		}
+		if found != nil {
+			continue
+		}
+		found = &receipt
+	}
+	if found == nil {
+		return nil, nil
+	}
+	if found.Name != pgName || found.VLANID != vlanID {
+		return nil, fmt.Errorf(
+			"persisted port group receipt is for %s VLAN %d, expected %s VLAN %d",
+			found.Name,
+			found.VLANID,
+			pgName,
+			vlanID,
+		)
+	}
+	for _, host := range found.Hosts {
+		delete(selected, host.HostMoRef)
+	}
+	if len(selected) > 0 {
+		missing := make([]string, 0, len(selected))
+		for host := range selected {
+			missing = append(missing, host)
+		}
+		sort.Strings(missing)
+		return nil, fmt.Errorf(
+			"persisted port group receipt does not cover selected hosts: %v",
+			missing,
+		)
+	}
+	return found, nil
+}

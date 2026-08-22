@@ -106,15 +106,16 @@ func main() {
 	// still work, vmware_tools ones will surface a clean per-workflow error.
 	if cfg.VCenter.URL != "" {
 		vcClient := vcenter.New(vcenter.Config{
-			URL:           cfg.VCenter.URL,
-			User:          cfg.VCenter.User,
-			Password:      cfg.VCenter.Password,
-			Datacenter:    cfg.VCenter.Datacenter,
-			Datastore:     cfg.VCenter.Datastore,
-			VMFolder:      cfg.VCenter.VMFolder,
-			ResourcePools: cfg.VCenter.ResourcePools,
-			Hosts:         cfg.VCenter.Hosts,
-			Insecure:      cfg.VCenter.Insecure,
+			URL:                  cfg.VCenter.URL,
+			User:                 cfg.VCenter.User,
+			Password:             cfg.VCenter.Password,
+			Datacenter:           cfg.VCenter.Datacenter,
+			Datastore:            cfg.VCenter.Datastore,
+			VMFolder:             cfg.VCenter.VMFolder,
+			ResourcePools:        cfg.VCenter.ResourcePools,
+			Hosts:                cfg.VCenter.Hosts,
+			HostReservedMemoryMB: cfg.VCenter.HostReservedMemoryMB,
+			Insecure:             cfg.VCenter.Insecure,
 		}, logger)
 		if err := vcClient.Connect(ctx); err != nil {
 			logger.Warn("vCenter connection failed; vmware_tools workflows will be rejected",

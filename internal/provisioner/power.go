@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jmal1/selfservice-api/internal/models"
+	"github.com/jmal1/selfservice-api/internal/vcenter"
 )
 
 // PowerVMPayload is the expected shape of job.Payload for vm_start/stop/restart.
@@ -37,6 +38,15 @@ func (p *Provisioner) PowerVM(ctx context.Context, job *models.Job, action strin
 		return fmt.Errorf("VM %q has no vCenter reference", podVM.DisplayName)
 	}
 	moref := *podVM.VCenterVMID
+	if err := p.validatePersistedVMPlacement(ctx, podVMID, moref); err != nil &&
+		!ignoreMissingVMPlacementForPowerOff(action, err) {
+		return &manualCleanupRequiredError{err: fmt.Errorf(
+			"refuse %s for VM %s after placement drift: %w",
+			action,
+			podVMID,
+			err,
+		)}
+	}
 
 	p.publishProgress(job.ID, action, fmt.Sprintf("Performing %s on %s", action, podVM.DisplayName))
 
@@ -76,6 +86,10 @@ func (p *Provisioner) PowerVM(ctx context.Context, job *models.Job, action strin
 
 	p.logger.Info("VM power operation completed", "job_id", job.ID, "vm_name", podVM.DisplayName, "vm_id", podVMID, "action", action, "moref", moref)
 	return nil
+}
+
+func ignoreMissingVMPlacementForPowerOff(action string, err error) bool {
+	return action == "stop" && vcenter.IsVMNotFoundError(err)
 }
 
 // parseUUID is a helper to parse a string UUID.

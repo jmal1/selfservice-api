@@ -1149,13 +1149,14 @@ func (p *Provisioner) runSmokeCheck(
 		job.ID,
 		tmpl.ID,
 		vcenter.CloneVMParams{
-			TemplateName: vmMoref,
-			VMName:       smokeName,
-			VCPUs:        vcpus,
-			RAMmb:        ram,
-			Network:      network,
-			OSType:       osType,
-			Password:     smokePassword,
+			LogicalTemplateID: tmpl.ID.String(),
+			TemplateName:      vmMoref,
+			VMName:            smokeName,
+			VCPUs:             vcpus,
+			RAMmb:             ram,
+			Network:           network,
+			OSType:            osType,
+			Password:          smokePassword,
 		},
 	)
 	if err != nil {

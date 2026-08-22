@@ -96,7 +96,11 @@ func findVMOperationInInventory(
 			optionValueString(props.Config.ExtraConfig, CloneOperationSourceKey) != params.TemplateName ||
 			optionValueString(props.Config.ExtraConfig, CloneOperationPodVMKey) != params.PodVMID ||
 			optionValueString(props.Config.ExtraConfig, CloneOperationHostKey) != params.HostMoRef ||
-			optionValueString(props.Config.ExtraConfig, CloneOperationPoolKey) != params.ResourcePoolMoRef {
+			optionValueString(props.Config.ExtraConfig, CloneOperationPoolKey) != params.ResourcePoolMoRef ||
+			optionValueString(props.Config.ExtraConfig, CloneOperationComputeTypeKey) != params.ComputeResourceType ||
+			optionValueString(props.Config.ExtraConfig, CloneOperationComputeKey) != params.ComputeResourceMoRef ||
+			optionValueString(props.Config.ExtraConfig, CloneOperationReplicaKey) != params.SourceReplicaID ||
+			optionValueString(props.Config.ExtraConfig, CloneOperationTemplateKey) != params.LogicalTemplateID {
 			return "", fmt.Errorf(
 				"%w: clone target %q exists without operation marker %s",
 				ErrAmbiguousVMOwnership,
@@ -130,8 +134,10 @@ func findVMOperationInInventory(
 // matching marker is never adopted.
 func (c *Client) FindVMByCloneOperation(ctx context.Context, params CloneVMParams) (string, error) {
 	if params.OperationID == "" || params.PodVMID == "" || params.VMName == "" ||
-		params.TemplateName == "" || params.HostMoRef == "" || params.ResourcePoolMoRef == "" {
-		return "", errors.New("clone reconciliation requires operation, pod VM, target, source, host, and pool identities")
+		params.LogicalTemplateID == "" || params.TemplateName == "" ||
+		params.ComputeResourceType == "" || params.ComputeResourceMoRef == "" ||
+		params.HostMoRef == "" || params.ResourcePoolMoRef == "" {
+		return "", errors.New("clone reconciliation requires operation, pod VM, template, source, compute, host, and pool identities")
 	}
 	if err := c.ensureConnected(ctx); err != nil {
 		return "", err

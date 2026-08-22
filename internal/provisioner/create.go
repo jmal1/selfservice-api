@@ -1162,19 +1162,51 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		return p.failPodCreateWithCleanup(ctx, job, payload, rb, "ensure firewall rule", fmt.Errorf("ensure firewall rule: %w", err))
 	}
 
-	// --- Step 5: Create port groups on allowlisted ESXi hosts ---
-	p.publishProgress(job.ID, "portgroup_create", fmt.Sprintf("Creating port group %s on allowlisted hosts", pgName))
+	// Resolve and persist the complete source/compute/pool/host plan before the
+	// first standard-switch mutation.
+	placementSpecs := make([]vmPlacementSpec, 0, len(payload.VMs))
+	for _, vmSpec := range payload.VMs {
+		placementSpecs = append(placementSpecs, vmPlacementSpec{
+			PodVMID:   vmSpec.PodVMID,
+			SourceRef: vmSpec.TemplateName,
+			VCPUs:     vmSpec.VCPUs,
+			RAMMB:     vmSpec.RAMMB,
+		})
+	}
+	placements, err := p.prepareVMPlacementPlan(ctx, job, placementSpecs, pgName, true, nil)
+	if err != nil {
+		return p.failPodCreateWithCleanup(
+			ctx,
+			job,
+			payload,
+			rb,
+			"placement planning",
+			fmt.Errorf("plan VM placements: %w", err),
+		)
+	}
+	placementsByVM := placementPlanByPodVM(placements)
+	targetHosts := selectedPlacementHosts(placements)
+
+	// --- Step 5: Create port groups only on selected ESXi hosts ---
+	p.publishProgress(job.ID, "portgroup_create", fmt.Sprintf("Creating port group %s on selected hosts", pgName))
 
 	err = p.db.WithVCenterPortGroupMutationLock(ctx, func(lockCtx context.Context) error {
-		receipt, planErr := p.vc.PlanPortGroupMutation(lockCtx, pgName, vlanTag)
-		if planErr != nil {
-			return fmt.Errorf("plan port group mutation: %w", planErr)
+		receipt, receiptErr := existingPortGroupReceipt(rb, pgName, vlanTag, targetHosts)
+		if receiptErr != nil {
+			return receiptErr
 		}
-		// Persist exact per-host ownership before the first AddPortGroup call.
-		if recordErr := rb.Record(lockCtx, "portgroup_create", receipt); recordErr != nil {
-			return fmt.Errorf("persist port group receipt: %w", recordErr)
+		if receipt == nil {
+			planned, planErr := p.vc.PlanPortGroupMutationForHosts(lockCtx, pgName, vlanTag, targetHosts)
+			if planErr != nil {
+				return fmt.Errorf("plan port group mutation: %w", planErr)
+			}
+			receipt = &planned
+			// Persist exact per-host ownership before the first AddPortGroup call.
+			if recordErr := rb.Record(lockCtx, "portgroup_create", planned); recordErr != nil {
+				return fmt.Errorf("persist port group receipt: %w", recordErr)
+			}
 		}
-		return p.vc.ApplyPortGroupMutation(lockCtx, receipt)
+		return p.vc.ApplyPortGroupMutation(lockCtx, *receipt)
 	})
 	if err != nil {
 		return p.failPodCreateWithCleanup(ctx, job, payload, rb, "create port groups", fmt.Errorf("create port groups: %w", err))
@@ -1190,6 +1222,17 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 	for i, vmSpec := range payload.VMs {
 		stepName := fmt.Sprintf("vm_clone_%d", i)
 		p.publishProgress(job.ID, stepName, fmt.Sprintf("Cloning VM %s from %s", vmSpec.VMName, vmSpec.TemplateName))
+		placement, ok := placementsByVM[vmSpec.PodVMID]
+		if !ok {
+			return p.failPodCreateWithCleanup(
+				ctx,
+				job,
+				payload,
+				rb,
+				"placement lookup",
+				fmt.Errorf("durable placement is missing for pod VM %s", vmSpec.PodVMID),
+			)
+		}
 
 		// Load the template once so we can branch on kind + reuse default
 		// credentials for the no-customize / registered-existing paths. We
@@ -1248,7 +1291,7 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		var moref string
 		if podVMRow != nil && podVMRow.VCenterVMID != nil && *podVMRow.VCenterVMID != "" {
 			moref = *podVMRow.VCenterVMID
-			if placementErr := p.vc.ValidateVMPlacement(ctx, moref, ""); placementErr != nil {
+			if placementErr := p.ensurePersistedVMPlacement(ctx, moref, placement); placementErr != nil {
 				return p.failPodCreateWithCleanup(
 					ctx,
 					job,
@@ -1294,7 +1337,7 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 			}
 
 			var cloneErr error
-			moref, cloneErr = executeDurableVMClone(ctx, p.db, p.vc, job.ID, workerID, pod.ID, vmSpec.PodVMID, vcenter.CloneVMParams{
+			cloneParams := cloneParamsFromPlacement(vcenter.CloneVMParams{
 				TemplateName: vmSpec.TemplateName,
 				VMName:       vmSpec.VMName,
 				VCPUs:        vmSpec.VCPUs,
@@ -1302,7 +1345,17 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 				Network:      pgName,
 				OSType:       osType,
 				Password:     generatedPassword,
-			})
+			}, placement)
+			moref, cloneErr = executeDurableVMClone(
+				ctx,
+				p.db,
+				p.vc,
+				job.ID,
+				workerID,
+				pod.ID,
+				vmSpec.PodVMID,
+				cloneParams,
+			)
 			if cloneErr != nil {
 				p.logger.Error("failed to clone VM", "vm", vmSpec.VMName, "error", cloneErr)
 				if moref != "" {
@@ -1458,7 +1511,25 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 				)
 				continue
 			}
-			if placementErr := p.vc.ValidateVMPlacement(ctx, *podVM.VCenterVMID, ""); placementErr != nil {
+			placement, ok := placementsByVM[vmSpec.PodVMID]
+			if !ok {
+				return p.failPodCreateWithCleanup(
+					ctx,
+					job,
+					payload,
+					rb,
+					"power-on placement lookup",
+					fmt.Errorf("durable placement is missing for pod VM %s", vmSpec.PodVMID),
+				)
+			}
+			if placementErr := p.vc.ValidateVMPlacementControl(
+				ctx,
+				*podVM.VCenterVMID,
+				placement.HostMoref,
+				placement.ComputeResourceType,
+				placement.ComputeResourceMoref,
+				placement.DRSControl,
+			); placementErr != nil {
 				return p.failPodCreateWithCleanup(
 					ctx,
 					job,

@@ -76,6 +76,7 @@ func TestVCenterHostsRejectsEmptyAndDuplicateEntries(t *testing.T) {
 
 func TestVCenterHostsParsesCanonicalAllowlist(t *testing.T) {
 	t.Setenv("VCENTER_HOSTS", " esxi1.lab.jmal.io , nuc1.lab.jmal.io ")
+	t.Setenv("VCENTER_PLACEMENT_RESERVED_MEMORY_MB", "ESXI1.lab.jmal.io=8192,nuc1.lab.jmal.io=4096")
 
 	cfg, err := Load()
 	if err != nil {
@@ -89,5 +90,33 @@ func TestVCenterHostsParsesCanonicalAllowlist(t *testing.T) {
 		if cfg.VCenter.Hosts[i] != want[i] {
 			t.Fatalf("hosts = %v, want %v", cfg.VCenter.Hosts, want)
 		}
+		if got := cfg.VCenter.HostReservedMemoryMB["esxi1.lab.jmal.io"]; got != 8192 {
+			t.Fatalf("ESXi1 reserved memory = %d, want 8192", got)
+		}
+		if got := cfg.VCenter.HostReservedMemoryMB["nuc1.lab.jmal.io"]; got != 4096 {
+			t.Fatalf("nuc1 reserved memory = %d, want 4096", got)
+		}
+	}
+}
+
+func TestVCenterPlacementReserveRejectsInvalidEntries(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+	}{
+		{name: "unknown host", value: "esxi2.lab.jmal.io=4096"},
+		{name: "negative reserve", value: "esxi1.lab.jmal.io=-1"},
+		{name: "not integer", value: "esxi1.lab.jmal.io=many"},
+		{name: "duplicate host", value: "esxi1.lab.jmal.io=1,ESXI1.lab.jmal.io=2"},
+		{name: "malformed", value: "esxi1.lab.jmal.io"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("VCENTER_HOSTS", "esxi1.lab.jmal.io")
+			t.Setenv("VCENTER_PLACEMENT_RESERVED_MEMORY_MB", tc.value)
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), "VCENTER_PLACEMENT_RESERVED_MEMORY_MB") {
+				t.Fatalf("Load() error = %v, want reserve configuration error", err)
+			}
+		})
 	}
 }

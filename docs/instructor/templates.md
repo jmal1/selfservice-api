@@ -226,6 +226,46 @@ standard portgroup. A **No eligible allowlisted vCenter placement** error is an
 operator safety block; do not change the template or broaden the host list to
 work around it. See [Troubleshooting](troubleshooting.md#no-eligible-allowlisted-vcenter-placement).
 
+### Source replicas for multiple compute clusters
+
+A logical template needs one real, validated source VM in every compute cluster
+where it may be cloned. An administrator registers a source replica by immutable
+vCenter identity:
+
+```http
+POST /api/v1/admin/templates/{templateID}/source-replicas
+Content-Type: application/json
+
+{"source_ref":"vm-123"}
+```
+
+Use `GET /api/v1/admin/templates/{templateID}/source-replicas` to inspect
+`replica_mode` and the `replicas` array, and
+`DELETE /api/v1/admin/templates/{templateID}/source-replicas/{replicaID}` to
+remove an unused one. Registration verifies the source VM and its current
+compute resource live in vCenter. The database migration does not invent
+replicas for another cluster.
+
+A template keeps using its existing source for backward compatibility only
+until the first replica is registered. Registration durably enables
+source-replica mode; deleting every replica does not restore the legacy
+fallback. An enabled template with no `ready` replica fails closed until a
+replacement is registered. Provisioning requires the source, resource pool, and
+selected host to belong to the same compute resource. Each pod's complete
+placement is stored before host networking changes begin, and retries reuse
+that exact source, pool, and host.
+
+For clustered destinations, Crucible disables automatic DRS movement for each
+created VM and detects later host, compute, or DRS-control drift before forward
+power and snapshot operations. Standard-switch portgroups are created only on
+the union of hosts selected for that pod. Adding a VM is limited to hosts already
+covered by the pod's durable portgroup receipt.
+
+> [!note] The periodic template-health and L1 views are still logical-template
+> views in this foundation. Registration and placement validate each replica
+> live, but the UI does not yet show an independently confirmed health history
+> per replica.
+
 As soon as state flips to `configuring`, the **Open Build Console**
 button appears.
 

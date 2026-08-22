@@ -113,7 +113,10 @@ type VCenterConfig struct {
 	TemplatesFolder string
 	ResourcePools   []string
 	Hosts           []string
-	Insecure        bool
+	// HostReservedMemoryMB maps each configured VCENTER_HOSTS entry to the
+	// minimum free memory that must remain after placing a new VM.
+	HostReservedMemoryMB map[string]int64
+	Insecure             bool
 
 	// HealthPushgatewayURL enables the in-process vCenter credentials
 	// health probe (see internal/vsphere/health). When set, the api-gateway
@@ -148,6 +151,13 @@ func Load() (*Config, error) {
 	vcenterHosts, err := getEnvListStrict(
 		"VCENTER_HOSTS",
 		"esxi1.lab.jmal.io,esxi2.lab.jmal.io,nuc1.lab.jmal.io,nuc2.lab.jmal.io,nuc3.lab.jmal.io",
+	)
+	if err != nil {
+		return nil, err
+	}
+	hostReservedMemoryMB, err := getEnvHostInt64MapStrict(
+		"VCENTER_PLACEMENT_RESERVED_MEMORY_MB",
+		vcenterHosts,
 	)
 	if err != nil {
 		return nil, err
@@ -196,6 +206,7 @@ func Load() (*Config, error) {
 			TemplatesFolder:      getEnv("VCENTER_TEMPLATES_FOLDER", "/JMAL-Datacenter/vm/Templates"),
 			ResourcePools:        splitEnv("VCENTER_RESOURCE_POOLS", "/JMAL-Datacenter/host/Intel-Cluster/Resources/Student-VMs,/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs"),
 			Hosts:                vcenterHosts,
+			HostReservedMemoryMB: hostReservedMemoryMB,
 			Insecure:             getEnvBool("VCENTER_INSECURE", true),
 			HealthPushgatewayURL: getEnv("VCENTER_HEALTH_PUSHGATEWAY_URL", ""),
 			HealthCheckInterval:  getEnvDuration("VCENTER_HEALTH_INTERVAL", 5*time.Minute),
@@ -223,6 +234,38 @@ func Load() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func getEnvHostInt64MapStrict(key string, allowedHosts []string) (map[string]int64, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return map[string]int64{}, nil
+	}
+	allowed := make(map[string]string, len(allowedHosts))
+	for _, host := range allowedHosts {
+		allowed[strings.ToLower(host)] = host
+	}
+	result := make(map[string]int64)
+	for _, entry := range strings.Split(raw, ",") {
+		parts := strings.SplitN(strings.TrimSpace(entry), "=", 2)
+		if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+			return nil, fmt.Errorf("invalid %s entry %q: expected host=megabytes", key, entry)
+		}
+		hostKey := strings.ToLower(strings.TrimSpace(parts[0]))
+		host, ok := allowed[hostKey]
+		if !ok {
+			return nil, fmt.Errorf("invalid %s entry %q: host is not in VCENTER_HOSTS", key, entry)
+		}
+		if _, duplicate := result[host]; duplicate {
+			return nil, fmt.Errorf("invalid %s: duplicate host %q", key, host)
+		}
+		value, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
+		if err != nil || value < 0 {
+			return nil, fmt.Errorf("invalid %s entry %q: megabytes must be a non-negative integer", key, entry)
+		}
+		result[host] = value
+	}
+	return result, nil
 }
 
 func getEnv(key, fallback string) string {

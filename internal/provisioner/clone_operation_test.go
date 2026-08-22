@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -148,6 +149,15 @@ func (f *fakeCloneOperationClient) ResolveClonePlacement(
 	if params.ResourcePoolMoRef == "" {
 		params.ResourcePoolMoRef = "resgroup-1"
 	}
+	if params.ComputeResourceType == "" {
+		params.ComputeResourceType = "ClusterComputeResource"
+	}
+	if params.ComputeResourceMoRef == "" {
+		params.ComputeResourceMoRef = "domain-c1"
+	}
+	if params.DRSControl == "" {
+		params.DRSControl = models.VMPlacementDRSDisabled
+	}
 	return params, nil
 }
 
@@ -199,6 +209,30 @@ func TestPreSubmissionFailureDoesNotArmCleanup(t *testing.T) {
 	}
 	if client.startCalls != 0 || store.target != nil {
 		t.Fatalf("pre-submission failure crossed external boundary: starts=%d target=%+v", client.startCalls, store.target)
+	}
+}
+
+func TestDurableCloneRejectsMissingLogicalTemplateIDBeforePlacement(t *testing.T) {
+	jobID, workerID, podID, podVMID, params := cloneOperationFixture()
+	params.LogicalTemplateID = ""
+	store := &fakeCloneOperationStore{}
+	client := &fakeCloneOperationClient{}
+
+	_, err := executeDurableVMClone(
+		context.Background(),
+		store,
+		client,
+		jobID,
+		workerID,
+		podID,
+		podVMID,
+		params,
+	)
+	if err == nil || !strings.Contains(err.Error(), "logical template ID") {
+		t.Fatalf("missing logical template ID error = %v", err)
+	}
+	if store.operation != nil || client.startCalls != 0 {
+		t.Fatalf("missing logical template ID crossed durable boundary: operation=%+v starts=%d", store.operation, client.startCalls)
 	}
 }
 
@@ -276,14 +310,18 @@ func (f *fakeCloneOperationClient) ConfigureClonedVM(
 
 func cloneOperationFixture() (uuid.UUID, string, uuid.UUID, uuid.UUID, vcenter.CloneVMParams) {
 	return uuid.New(), "worker-a:claim-a", uuid.New(), uuid.New(), vcenter.CloneVMParams{
-		TemplateName:      "vm-100",
-		VMName:            "pod-target",
-		VCPUs:             2,
-		RAMmb:             4096,
-		Network:           "Pod-VLAN123",
-		HostMoRef:         "host-1",
-		HostName:          "ESXi1",
-		ResourcePoolMoRef: "resgroup-1",
+		LogicalTemplateID:    uuid.NewString(),
+		TemplateName:         "vm-100",
+		VMName:               "pod-target",
+		VCPUs:                2,
+		RAMmb:                4096,
+		Network:              "Pod-VLAN123",
+		ComputeResourceType:  "ClusterComputeResource",
+		ComputeResourceMoRef: "domain-c1",
+		HostMoRef:            "host-1",
+		HostName:             "ESXi1",
+		ResourcePoolMoRef:    "resgroup-1",
+		DRSControl:           models.VMPlacementDRSDisabled,
 	}
 }
 
@@ -408,17 +446,21 @@ func TestRecoveredCleanupResumesPersistedTaskWithoutForwardCalls(t *testing.T) {
 	jobID, workerID, podID, podVMID, params := cloneOperationFixture()
 	store := &fakeCloneOperationStore{
 		operation: &models.VMCloneOperation{
-			OperationID: uuid.NewString(),
-			PodID:       podID.String(),
-			PodVMID:     podVMID.String(),
-			TargetName:  params.VMName,
-			SourceRef:   params.TemplateName,
-			HostMoref:   params.HostMoRef,
-			HostName:    params.HostName,
-			PoolMoref:   params.ResourcePoolMoRef,
-			TaskRef:     "task-existing",
-			Phase:       models.VMCloneOperationSubmitted,
-			PreparedAt:  time.Now(),
+			OperationID:          uuid.NewString(),
+			PodID:                podID.String(),
+			PodVMID:              podVMID.String(),
+			LogicalTemplateID:    params.LogicalTemplateID,
+			TargetName:           params.VMName,
+			SourceRef:            params.TemplateName,
+			ComputeResourceType:  params.ComputeResourceType,
+			ComputeResourceMoref: params.ComputeResourceMoRef,
+			HostMoref:            params.HostMoRef,
+			HostName:             params.HostName,
+			PoolMoref:            params.ResourcePoolMoRef,
+			DRSControl:           params.DRSControl,
+			TaskRef:              "task-existing",
+			Phase:                models.VMCloneOperationSubmitted,
+			PreparedAt:           time.Now(),
 		},
 	}
 	client := &fakeCloneOperationClient{
@@ -532,16 +574,20 @@ func TestUnresolvedSubmissionEscalatesWithoutDuplicateClone(t *testing.T) {
 	jobID, workerID, podID, podVMID, params := cloneOperationFixture()
 	store := &fakeCloneOperationStore{
 		operation: &models.VMCloneOperation{
-			OperationID: uuid.NewString(),
-			PodID:       podID.String(),
-			PodVMID:     podVMID.String(),
-			TargetName:  params.VMName,
-			SourceRef:   params.TemplateName,
-			HostMoref:   params.HostMoRef,
-			HostName:    params.HostName,
-			PoolMoref:   params.ResourcePoolMoRef,
-			Phase:       models.VMCloneOperationSubmitting,
-			PreparedAt:  time.Now().Add(-cloneSubmissionReconcileDeadline),
+			OperationID:          uuid.NewString(),
+			PodID:                podID.String(),
+			PodVMID:              podVMID.String(),
+			LogicalTemplateID:    params.LogicalTemplateID,
+			TargetName:           params.VMName,
+			SourceRef:            params.TemplateName,
+			ComputeResourceType:  params.ComputeResourceType,
+			ComputeResourceMoref: params.ComputeResourceMoRef,
+			HostMoref:            params.HostMoRef,
+			HostName:             params.HostName,
+			PoolMoref:            params.ResourcePoolMoRef,
+			DRSControl:           params.DRSControl,
+			Phase:                models.VMCloneOperationSubmitting,
+			PreparedAt:           time.Now().Add(-cloneSubmissionReconcileDeadline),
 		},
 	}
 	client := &fakeCloneOperationClient{}
