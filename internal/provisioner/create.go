@@ -654,9 +654,17 @@ func (e *podCreateCleanupRetryError) Unwrap() error {
 }
 
 func newPodCreateCleanupRetryError(stage string, cleanupErrs []error) error {
-	return &podCreateCleanupRetryError{
-		err: fmt.Errorf("stale pod_create cleanup incomplete after %s: %v", stage, cleanupErrs),
+	joined := errors.Join(cleanupErrs...)
+	if joined == nil {
+		joined = errors.New("cleanup failed without a reported cause")
 	}
+	return &podCreateCleanupRetryError{
+		err: fmt.Errorf("stale pod_create cleanup incomplete after %s: %w", stage, joined),
+	}
+}
+
+func combineProvisioningAndCleanupErrors(cause, cleanupErr error) error {
+	return fmt.Errorf("%w; cleanup: %w", cause, cleanupErr)
 }
 
 func isPodCreateCleanupRetry(err error) bool {
@@ -830,15 +838,16 @@ func (p *Provisioner) failPodCreateWithCleanup(
 		true,
 	)
 	if cleanupErr != nil {
+		combinedErr := combineProvisioningAndCleanupErrors(cause, cleanupErr)
 		if target := compensationRetryTarget(cause); target != nil {
 			var cleanupTarget VMCloneCleanupTarget
 			_ = json.Unmarshal(target, &cleanupTarget)
 			return &compensationRetryError{
-				err:    fmt.Errorf("%v; cleanup: %w", cause, cleanupErr),
+				err:    combinedErr,
 				target: &cleanupTarget,
 			}
 		}
-		return fmt.Errorf("%v; cleanup: %w", cause, cleanupErr)
+		return combinedErr
 	}
 	if isCompensationRetry(cause) {
 		return cause

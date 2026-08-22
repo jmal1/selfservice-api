@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -194,7 +195,7 @@ func TestHandleJobOutcome_PodCreateCleanupRetryIsDurablyMarked(t *testing.T) {
 	job := &models.Job{
 		ID:         uuid.New(),
 		Type:       models.JobTypePodCreate,
-		RetryCount: 0,
+		RetryCount: 3,
 		MaxRetries: 3,
 	}
 	cleanupErr := newPodCreateCleanupRetryError(
@@ -213,6 +214,174 @@ func TestHandleJobOutcome_PodCreateCleanupRetryIsDurablyMarked(t *testing.T) {
 	}
 	if got := m.jobRetries[models.JobTypePodCreate+"|"+RetryReasonCleanup]; got != 1 {
 		t.Fatalf("cleanup retry metric = %v, want 1", got)
+	}
+}
+
+func TestHandleJobOutcome_ManualCleanupSurvivesCleanupAggregation(t *testing.T) {
+	target := &VMCloneCleanupTarget{
+		PodID:       uuid.NewString(),
+		PodVMID:     uuid.NewString(),
+		VCenterVMID: "vm-42",
+	}
+	newManualErr := func() error {
+		return &manualCleanupRequiredError{
+			err: errors.New("immutable clone ownership is ambiguous"),
+		}
+	}
+	tests := []struct {
+		name    string
+		jobType string
+		err     error
+	}{
+		{
+			name:    "pod cleanup aggregate",
+			jobType: models.JobTypePodCreate,
+			err: newPodCreateCleanupRetryError(
+				"clone reconciliation",
+				[]error{errors.New("transient rollback failure"), newManualErr()},
+			),
+		},
+		{
+			name:    "pod failure and cleanup aggregate",
+			jobType: models.JobTypePodCreate,
+			err: combineProvisioningAndCleanupErrors(
+				newManualErr(),
+				newPodCreateCleanupRetryError(
+					"rollback",
+					[]error{errors.New("transient rollback failure")},
+				),
+			),
+		},
+		{
+			name:    "vm add cleanup wrapper",
+			jobType: models.JobTypeVMAdd,
+			err: &compensationRetryError{
+				err: fmt.Errorf("clean exact clone: %w", newManualErr()),
+			},
+		},
+		{
+			name:    "template smoke cleanup aggregate",
+			jobType: models.JobTypeTemplateVerify,
+			err: cloneRecoveryError(
+				fmt.Errorf(
+					"cleanup smoke clone: %w",
+					errors.Join(errors.New("transient destroy failure"), newManualErr()),
+				),
+				target,
+			),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := &fakeJobDB{}
+			job := &models.Job{
+				ID:         uuid.New(),
+				Type:       tt.jobType,
+				Payload:    []byte(`{"cleanup_only":true}`),
+				RetryCount: 3,
+				MaxRetries: 3,
+			}
+			var published []string
+			claimTestJob(job)
+
+			result := processJobLifecycle(
+				context.Background(),
+				db,
+				NewPipelineMetrics("", "", nil),
+				job,
+				func(_ uuid.UUID, step, _ string) { published = append(published, step) },
+				func(context.Context, *models.Job) error { return tt.err },
+			)
+			if result == nil {
+				t.Fatal("manual cleanup error returned nil")
+			}
+			if !isManualCleanupRequired(result) {
+				t.Fatalf("result = %v, want manual cleanup classification", result)
+			}
+			if db.retryCalls != 0 || len(db.retried) != 0 {
+				t.Fatalf("RetryJob calls = %d, records = %d; want none", db.retryCalls, len(db.retried))
+			}
+			failed := db.statusesWithStatus(models.JobStatusFailed)
+			if len(failed) != 1 {
+				t.Fatalf("failed status updates = %d, want 1", len(failed))
+			}
+			if !strings.Contains(string(failed[0].result), `"manual_cleanup_required":true`) {
+				t.Fatalf("failed result does not report manual cleanup: %s", failed[0].result)
+			}
+			if got := published[len(published)-1]; got != "manual_cleanup_required" {
+				t.Fatalf("final event = %q, want manual_cleanup_required", got)
+			}
+		})
+	}
+}
+
+func TestHandleJobOutcome_TransientCleanupRemainsRetryableAfterBudgetExhaustion(t *testing.T) {
+	target := &VMCloneCleanupTarget{
+		PodID:       uuid.NewString(),
+		PodVMID:     uuid.NewString(),
+		VCenterVMID: "vm-42",
+	}
+	tests := []struct {
+		name    string
+		jobType string
+		err     error
+	}{
+		{
+			name:    "pod cleanup aggregate",
+			jobType: models.JobTypePodCreate,
+			err: newPodCreateCleanupRetryError(
+				"rollback",
+				[]error{errors.New("vCenter connection refused")},
+			),
+		},
+		{
+			name:    "vm add cleanup wrapper",
+			jobType: models.JobTypeVMAdd,
+			err: &compensationRetryError{
+				err: errors.New("destroy exact clone: vCenter connection refused"),
+			},
+		},
+		{
+			name:    "template smoke cleanup wrapper",
+			jobType: models.JobTypeTemplateVerify,
+			err: cloneRecoveryError(
+				errors.New("destroy smoke clone: vCenter connection refused"),
+				target,
+			),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := &fakeJobDB{}
+			job := &models.Job{
+				ID:         uuid.New(),
+				Type:       tt.jobType,
+				Payload:    []byte(`{"cleanup_only":true}`),
+				RetryCount: 3,
+				MaxRetries: 3,
+			}
+
+			if result := runLifecycle(
+				context.Background(),
+				db,
+				NewPipelineMetrics("", "", nil),
+				job,
+				tt.err,
+			); result != nil {
+				t.Fatalf("transient cleanup returned %v, want durable retry", result)
+			}
+			if db.retryCalls != 1 || len(db.retried) != 1 {
+				t.Fatalf("RetryJob calls = %d, records = %d; want one", db.retryCalls, len(db.retried))
+			}
+			if !db.retried[0].cleanupOnly {
+				t.Fatal("transient cleanup retry was not marked cleanup-only")
+			}
+			if got := db.statusesWithStatus(models.JobStatusFailed); len(got) != 0 {
+				t.Fatal("transient cleanup was terminalized after exhausting the original retry budget")
+			}
+		})
 	}
 }
 
