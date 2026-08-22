@@ -48,7 +48,7 @@ type pipelineMetricsSink interface {
 // tests inject a lightweight stub.
 type jobStatusUpdater interface {
 	UpdateJobStatus(ctx context.Context, id uuid.UUID, status string, result []byte) error
-	RetryJob(ctx context.Context, id uuid.UUID, nextAt time.Time, cleanupOnly bool) error
+	RetryJob(ctx context.Context, id uuid.UUID, nextAt time.Time, cleanupOnly bool, cleanupTarget []byte) error
 }
 
 var _ pipelineMetricsSink = (*PipelineMetrics)(nil)
@@ -210,7 +210,9 @@ func processJobLifecycle(
 	err := dispatch(ctx, job)
 	if err == nil {
 		result, _ := json.Marshal(map[string]string{"message": "completed successfully"})
-		_ = db.UpdateJobStatus(ctx, job.ID, models.JobStatusCompleted, result)
+		if statusErr := db.UpdateJobStatus(ctx, job.ID, models.JobStatusCompleted, result); statusErr != nil {
+			return fmt.Errorf("persist completed job status: %w", statusErr)
+		}
 		if publish != nil {
 			publish(job.ID, "completed", "Job completed successfully")
 		}
@@ -219,27 +221,44 @@ func processJobLifecycle(
 
 	// Error path: retry if possible, otherwise fail terminally.
 	retryable, reason := ClassifyError(err, job.Type)
-	if retryable && job.RetryCount < job.MaxRetries {
+	cleanupOnly := jobPayloadCleanupOnly(job) || isCompensationRetry(err)
+	if cleanupOnly && !isCompensatedJobError(err) && !isManualCleanupRequired(err) {
+		retryable = true
+		reason = RetryReasonCleanup
+	}
+	if retryable && (cleanupOnly || job.RetryCount < job.MaxRetries) {
 		nextAt := time.Now().Add(RetryBackoff(job.RetryCount))
-		cleanupOnly := job.Type == models.JobTypePodCreate && isPodCreateCleanupRetry(err)
-		if schedErr := db.RetryJob(ctx, job.ID, nextAt, cleanupOnly); schedErr == nil {
+		schedErr := db.RetryJob(ctx, job.ID, nextAt, cleanupOnly, compensationRetryTarget(err))
+		if schedErr == nil {
 			if pipeline != nil {
 				pipeline.RecordJobRetry(job.Type, reason)
 			}
 			if publish != nil {
-				publish(job.ID, "retry_scheduled", fmt.Sprintf(
+				message := fmt.Sprintf(
 					"Retry %d/%d scheduled for %s (reason: %s)",
-					job.RetryCount+1, job.MaxRetries,
-					nextAt.Format(time.RFC3339), reason,
-				))
+					job.RetryCount+1, job.MaxRetries, nextAt.Format(time.RFC3339), reason,
+				)
+				if cleanupOnly {
+					message = fmt.Sprintf(
+						"Cleanup retry %d scheduled for %s; it will remain pending until resolved",
+						job.RetryCount+1, nextAt.Format(time.RFC3339),
+					)
+				}
+				publish(job.ID, "retry_scheduled", message)
 			}
 			return nil // rescheduled; not a failure from the caller's perspective
+		}
+		if cleanupOnly {
+			// Do not terminalize compensation when the queue update itself
+			// fails. RecoverStaleJobs will return this cleanup-marked job to
+			// pending after worker restart.
+			return fmt.Errorf("reschedule durable cleanup: %w", schedErr)
 		}
 		// RetryJob itself failed (DB problem) — fall through to terminal failure.
 	}
 
 	// Terminal failure.
-	if retryable && job.RetryCount >= job.MaxRetries {
+	if retryable && !cleanupOnly && job.RetryCount >= job.MaxRetries {
 		if pipeline != nil {
 			pipeline.RecordJobRetryExhausted(job.Type)
 		}
@@ -247,21 +266,33 @@ func processJobLifecycle(
 
 	friendly := FriendlyError(err, job.RetryCount, job.MaxRetries)
 	type jobResult struct {
-		Error    string `json:"error"`
-		RawError string `json:"raw_error,omitempty"`
-		Attempts int    `json:"attempts"`
+		Error                 string `json:"error"`
+		RawError              string `json:"raw_error,omitempty"`
+		Attempts              int    `json:"attempts"`
+		Compensated           bool   `json:"compensated,omitempty"`
+		ManualCleanupRequired bool   `json:"manual_cleanup_required,omitempty"`
 	}
 	jr := jobResult{
-		Error:    friendly,
-		Attempts: job.RetryCount + 1,
+		Error:                 friendly,
+		Attempts:              job.RetryCount + 1,
+		Compensated:           isCompensatedJobError(err),
+		ManualCleanupRequired: isManualCleanupRequired(err),
 	}
 	if friendly != err.Error() {
 		jr.RawError = err.Error()
 	}
 	result, _ := json.Marshal(jr)
-	_ = db.UpdateJobStatus(ctx, job.ID, models.JobStatusFailed, result)
+	if statusErr := db.UpdateJobStatus(ctx, job.ID, models.JobStatusFailed, result); statusErr != nil {
+		return fmt.Errorf("persist terminal job status: %w", statusErr)
+	}
 	if publish != nil {
-		publish(job.ID, "failed", friendly)
+		event := "failed"
+		if jr.Compensated {
+			event = "compensated"
+		} else if jr.ManualCleanupRequired {
+			event = "manual_cleanup_required"
+		}
+		publish(job.ID, event, friendly)
 	}
 	return err
 }
@@ -392,7 +423,7 @@ func (p *Provisioner) newPodCreateRollbackEngine(job *models.Job, vmSpecs []VMSp
 				return err
 			}
 			_ = p.vc.PowerOffVM(ctx, d.Moref)
-			if err := p.vc.DestroyVM(ctx, d.Moref); err != nil && !vcenterObjectNotFound(err) {
+			if err := p.vc.DestroyVM(ctx, d.Moref); err != nil {
 				return err
 			}
 			if _, err := p.db.ClearPodVMVCenterReference(ctx, podVMID, d.Moref); err != nil {
@@ -428,9 +459,11 @@ func (d *dbPersister) SaveRollbackSteps(ctx context.Context, jobID uuid.UUID, st
 
 // CreatePodPayload is the expected shape of job.Payload for pod_create.
 type CreatePodPayload struct {
-	PodID       uuid.UUID `json:"pod_id"`
-	VMs         []VMSpec  `json:"vms"`
-	CleanupOnly bool      `json:"cleanup_only,omitempty"`
+	PodID         uuid.UUID             `json:"pod_id"`
+	VMs           []VMSpec              `json:"vms"`
+	CleanupOnly   bool                  `json:"cleanup_only,omitempty"`
+	CleanupTarget *VMCloneCleanupTarget `json:"cleanup_target,omitempty"`
+	CleanupDone   bool                  `json:"cleanup_completed,omitempty"`
 }
 
 // VMSpec describes a VM to create within a pod.
@@ -456,15 +489,40 @@ type podCreateCleanupRetryError struct {
 	err error
 }
 
-type podCreateCompensatedError struct {
+type compensatedJobError struct {
 	err error
 }
 
-func (e *podCreateCompensatedError) Error() string {
+type compensationRetryError struct {
+	err    error
+	target *VMCloneCleanupTarget
+}
+
+type manualCleanupRequiredError struct {
+	err error
+}
+
+func (e *compensatedJobError) Error() string {
 	return e.err.Error()
 }
 
-func (e *podCreateCompensatedError) Unwrap() error {
+func (e *compensatedJobError) Unwrap() error {
+	return e.err
+}
+
+func (e *compensationRetryError) Error() string {
+	return e.err.Error()
+}
+
+func (e *compensationRetryError) Unwrap() error {
+	return e.err
+}
+
+func (e *manualCleanupRequiredError) Error() string {
+	return e.err.Error()
+}
+
+func (e *manualCleanupRequiredError) Unwrap() error {
 	return e.err
 }
 
@@ -487,6 +545,59 @@ func isPodCreateCleanupRetry(err error) bool {
 	return errors.As(err, &cleanupErr)
 }
 
+func isCompensationRetry(err error) bool {
+	var retryErr *compensationRetryError
+	return errors.As(err, &retryErr) || isPodCreateCleanupRetry(err)
+}
+
+func compensationRetryTarget(err error) []byte {
+	var retryErr *compensationRetryError
+	if !errors.As(err, &retryErr) || retryErr.target == nil {
+		return nil
+	}
+	target, marshalErr := json.Marshal(retryErr.target)
+	if marshalErr != nil {
+		return nil
+	}
+	return target
+}
+
+func isCompensatedJobError(err error) bool {
+	var compensatedErr *compensatedJobError
+	return errors.As(err, &compensatedErr)
+}
+
+func isManualCleanupRequired(err error) bool {
+	var manualErr *manualCleanupRequiredError
+	return errors.As(err, &manualErr)
+}
+
+func newPodCreateCompensatedError(stage string) error {
+	return &compensatedJobError{
+		err: fmt.Errorf("pod provisioning failed; compensation completed after %s", stage),
+	}
+}
+
+func jobPayloadCleanupOnly(job *models.Job) bool {
+	var payload struct {
+		CleanupOnly bool `json:"cleanup_only"`
+	}
+	return json.Unmarshal(job.Payload, &payload) == nil && payload.CleanupOnly
+}
+
+func podCreateCleanupOwnsStagedClone(payload CreatePodPayload) bool {
+	podID, podVMID, err := validateVMCloneCleanupTarget(payload.CleanupTarget)
+	if err != nil || podID != payload.PodID {
+		return false
+	}
+	for _, vmSpec := range payload.VMs {
+		if vmSpec.PodVMID == podVMID {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *Provisioner) cleanupPodCreateResources(
 	ctx context.Context,
 	jobID uuid.UUID,
@@ -506,10 +617,19 @@ func (p *Provisioner) cleanupPodCreateResources(
 		allowProvisioningTransition,
 	)
 	if err != nil {
-		return fmt.Errorf("prepare pod_create cleanup after %s: %w", stage, err)
+		if errors.Is(err, database.ErrUnsafePodCreateCleanupState) {
+			return &manualCleanupRequiredError{err: err}
+		}
+		return &compensationRetryError{
+			err: fmt.Errorf("prepare pod_create cleanup after %s: %w", stage, err),
+		}
 	}
 
-	cleanupErrs := append([]error(nil), rb.Rollback(cleanupCtx)...)
+	var cleanupErrs []error
+	if err := p.cleanupStagedVMClone(cleanupCtx, jobID); err != nil {
+		cleanupErrs = append(cleanupErrs, err)
+	}
+	cleanupErrs = append(cleanupErrs, rb.Rollback(cleanupCtx)...)
 	if status == models.PodStatusDestroying ||
 		status == models.PodStatusDestroyFailed ||
 		status == models.PodStatusDestroyed {
@@ -543,6 +663,12 @@ func (p *Provisioner) cleanupPodCreateResources(
 	if len(cleanupErrs) > 0 {
 		return newPodCreateCleanupRetryError(stage, cleanupErrs)
 	}
+	if err := p.db.MarkJobCompensationCompleted(cleanupCtx, jobID); err != nil {
+		return newPodCreateCleanupRetryError(
+			stage,
+			[]error{fmt.Errorf("record completed compensation: %w", err)},
+		)
+	}
 	return nil
 }
 
@@ -564,9 +690,38 @@ func (p *Provisioner) failPodCreateWithCleanup(
 		true,
 	)
 	if cleanupErr != nil {
+		if target := compensationRetryTarget(cause); target != nil {
+			var cleanupTarget VMCloneCleanupTarget
+			_ = json.Unmarshal(target, &cleanupTarget)
+			return &compensationRetryError{
+				err:    fmt.Errorf("%v; cleanup: %w", cause, cleanupErr),
+				target: &cleanupTarget,
+			}
+		}
 		return fmt.Errorf("%v; cleanup: %w", cause, cleanupErr)
 	}
-	return &podCreateCompensatedError{err: cause}
+	if isCompensationRetry(cause) {
+		return cause
+	}
+	if isManualCleanupRequired(cause) {
+		return cause
+	}
+	return &compensatedJobError{err: cause}
+}
+
+func (p *Provisioner) failPodCreateForStaleVM(
+	ctx context.Context,
+	job *models.Job,
+	payload CreatePodPayload,
+	rb *rollback.Engine,
+	podID, podVMID uuid.UUID,
+	moref, stage string,
+) error {
+	cause := error(fmt.Errorf("pod_create lost VM ownership during %s", stage))
+	if err := p.stageVMCloneCleanup(ctx, job.ID, podID, podVMID, moref); err != nil {
+		cause = err
+	}
+	return p.failPodCreateWithCleanup(ctx, job.ID, payload, rb, stage, cause)
 }
 
 func (p *Provisioner) runPodCreateCleanup(
@@ -575,15 +730,24 @@ func (p *Provisioner) runPodCreateCleanup(
 	payload CreatePodPayload,
 	rb *rollback.Engine,
 ) error {
-	return p.cleanupPodCreateResources(
+	allowProvisioningTransition := podCreateCleanupOwnsStagedClone(payload)
+	if payload.CleanupTarget != nil && !allowProvisioningTransition {
+		return &manualCleanupRequiredError{
+			err: errors.New("cleanup-only pod_create has an invalid or mismatched exact clone target"),
+		}
+	}
+	if err := p.cleanupPodCreateResources(
 		ctx,
 		jobID,
 		payload.PodID,
 		payload.VMs,
 		rb,
 		"cleanup-only retry",
-		false,
-	)
+		allowProvisioningTransition,
+	); err != nil {
+		return err
+	}
+	return newPodCreateCompensatedError("cleanup-only retry")
 }
 
 func (p *Provisioner) stopPodCreateIfStale(
@@ -599,7 +763,11 @@ func (p *Provisioner) stopPodCreateIfStale(
 		return true, fmt.Errorf("recheck pod state after %s: %w", stage, err)
 	}
 	if pod == nil {
-		return true, p.cleanupPodCreateResources(ctx, jobID, podID, vmSpecs, rb, stage, false)
+		cleanupErr := p.cleanupPodCreateResources(ctx, jobID, podID, vmSpecs, rb, stage, false)
+		if cleanupErr != nil {
+			return true, cleanupErr
+		}
+		return true, newPodCreateCompensatedError(stage)
 	}
 	if pod.Status == models.PodStatusProvisioning {
 		return false, nil
@@ -610,7 +778,11 @@ func (p *Provisioner) stopPodCreateIfStale(
 		return true, nil
 	}
 
-	return true, p.cleanupPodCreateResources(ctx, jobID, podID, vmSpecs, rb, stage, false)
+	cleanupErr := p.cleanupPodCreateResources(ctx, jobID, podID, vmSpecs, rb, stage, false)
+	if cleanupErr != nil {
+		return true, cleanupErr
+	}
+	return true, newPodCreateCompensatedError(stage)
 }
 
 // generatePassword creates a random password with uppercase, lowercase, digits, and a special char.
@@ -667,7 +839,7 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		return fmt.Errorf("get pod: %w", err)
 	}
 	if pod == nil {
-		return p.cleanupPodCreateResources(
+		cleanupErr := p.cleanupPodCreateResources(
 			ctx,
 			job.ID,
 			payload.PodID,
@@ -676,6 +848,10 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 			"initial pod lookup",
 			false,
 		)
+		if cleanupErr != nil {
+			return cleanupErr
+		}
+		return newPodCreateCompensatedError("initial pod lookup")
 	}
 
 	// --- Step 1: Update pod status to provisioning ---
@@ -875,12 +1051,9 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 			if podVMRow.VCenterVMID != nil {
 				moref = *podVMRow.VCenterVMID
 			}
-			if cleanupErr := p.cleanupStaleVMClone(ctx, pod.ID, vmSpec.PodVMID, vmSpec.VMName, moref); cleanupErr != nil {
-				return cleanupErr
-			}
-			p.logger.Warn("skipping stale pod-create VM in terminal state",
-				"pod_id", pod.ID, "pod_vm_id", vmSpec.PodVMID, "vm_status", podVMRow.Status)
-			continue
+			return p.failPodCreateForStaleVM(
+				ctx, job, payload, rb, pod.ID, vmSpec.PodVMID, moref, "pre-clone terminal-state check",
+			)
 		}
 		if t, tmplErr := p.db.GetTemplateByID(ctx, podVMRow.TemplateID); tmplErr == nil {
 			tmpl = t
@@ -942,9 +1115,9 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 					currentMoref = *current.VCenterVMID
 				}
 				if current.Status == models.VMStatusDeleted || current.Status == models.VMStatusError {
-					if cleanupErr := p.cleanupStaleVMClone(ctx, pod.ID, vmSpec.PodVMID, vmSpec.VMName, currentMoref); cleanupErr != nil {
-						return cleanupErr
-					}
+					return p.failPodCreateForStaleVM(
+						ctx, job, payload, rb, pod.ID, vmSpec.PodVMID, currentMoref, "clone-state claim",
+					)
 				}
 				p.logger.Warn("skipping pod-create VM after losing provisioning state",
 					"pod_id", pod.ID, "pod_vm_id", vmSpec.PodVMID, "vm_status", current.Status)
@@ -971,12 +1144,18 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 				)
 				continue // Skip this VM, try the rest
 			}
+			if err := p.stageVMCloneCleanup(ctx, job.ID, pod.ID, vmSpec.PodVMID, moref); err != nil {
+				return p.failPodCreateWithCleanup(
+					ctx, job.ID, payload, rb, "stage cloned VM cleanup", err,
+				)
+			}
 
 			// Persist the clone only while this job still owns the VM row. A
 			// concurrent delete wins; its clone is removed or handed to a
-			// durable vm_destroy cleanup job.
-			applied, updateErr = p.db.UpdatePodVMFrom(
+			// durable cleanup-only retry.
+			applied, updateErr = p.db.AdoptPodVMClone(
 				ctx,
+				job.ID,
 				vmSpec.PodVMID,
 				[]string{models.VMStatusCloning},
 				moref,
@@ -984,27 +1163,14 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 				"cloned",
 			)
 			if updateErr != nil {
-				if current, lookupErr := p.db.GetPodVM(ctx, vmSpec.PodVMID); lookupErr == nil &&
-					podVMHasLiveClone(current, moref) {
-					applied = true
-				} else {
-					if cleanupErr := p.cleanupStaleVMClone(ctx, pod.ID, vmSpec.PodVMID, vmSpec.VMName, moref); cleanupErr != nil {
-						return fmt.Errorf("record cloned VM: %v; cleanup: %w", updateErr, cleanupErr)
-					}
-					return fmt.Errorf("record cloned VM after compensating cleanup: %w", updateErr)
+				return &compensationRetryError{
+					err: fmt.Errorf("resolve atomically staged pod clone adoption for %s: %w", moref, updateErr),
 				}
 			}
 			if !applied {
-				current, lookupErr := p.db.GetPodVM(ctx, vmSpec.PodVMID)
-				if lookupErr == nil && podVMHasLiveClone(current, moref) {
-					applied = true
-				}
-			}
-			if !applied {
-				if cleanupErr := p.cleanupStaleVMClone(ctx, pod.ID, vmSpec.PodVMID, vmSpec.VMName, moref); cleanupErr != nil {
-					return cleanupErr
-				}
-				continue
+				return p.failPodCreateForStaleVM(
+					ctx, job, payload, rb, pod.ID, vmSpec.PodVMID, moref, "clone adoption",
+				)
 			}
 		}
 
@@ -1083,10 +1249,9 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 				continue
 			}
 			if podVM.Status == models.VMStatusDeleted || podVM.Status == models.VMStatusError {
-				if cleanupErr := p.cleanupStaleVMClone(ctx, pod.ID, vmSpec.PodVMID, vmSpec.VMName, *podVM.VCenterVMID); cleanupErr != nil {
-					return cleanupErr
-				}
-				continue
+				return p.failPodCreateForStaleVM(
+					ctx, job, payload, rb, pod.ID, vmSpec.PodVMID, *podVM.VCenterVMID, "power-on preflight",
+				)
 			}
 			applied, err = p.db.UpdatePodVMStatusFrom(
 				ctx,
@@ -1108,9 +1273,9 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 					continue
 				}
 				if current.Status == models.VMStatusDeleted || current.Status == models.VMStatusError {
-					if cleanupErr := p.cleanupStaleVMClone(ctx, pod.ID, vmSpec.PodVMID, vmSpec.VMName, *podVM.VCenterVMID); cleanupErr != nil {
-						return cleanupErr
-					}
+					return p.failPodCreateForStaleVM(
+						ctx, job, payload, rb, pod.ID, vmSpec.PodVMID, *podVM.VCenterVMID, "power-on state claim",
+					)
 				}
 				continue
 			}
@@ -1136,10 +1301,9 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 				return fmt.Errorf("mark pod VM %s running: %w", vmSpec.PodVMID, err)
 			}
 			if !applied {
-				if cleanupErr := p.cleanupStaleVMClone(ctx, pod.ID, vmSpec.PodVMID, vmSpec.VMName, *podVM.VCenterVMID); cleanupErr != nil {
-					return cleanupErr
-				}
-				continue
+				return p.failPodCreateForStaleVM(
+					ctx, job, payload, rb, pod.ID, vmSpec.PodVMID, *podVM.VCenterVMID, "mark running",
+				)
 			}
 			groupPoweredOn = append(groupPoweredOn, vmPowerInfo{index: i, vmSpec: vmSpec, moref: *podVM.VCenterVMID})
 		}

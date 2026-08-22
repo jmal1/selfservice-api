@@ -787,14 +787,26 @@ uses the normal error envelope:
 ```
 
 Delete/destroy, delete-VM, power, and cleanup paths are intentionally not
-gated. When worker provisioning claims are disabled, ordinary `pod_create`
-jobs and every `vm_add` job are excluded inside the atomic claim query and
-remain pending; destroy and cleanup jobs remain claimable. If rollback of an
-already-started `pod_create` is incomplete, its retry is atomically marked
-`cleanup_only` in the job payload and remains claimable. That retry only replays
-persisted compensation steps and refuses to run while the pod is pending,
-provisioning, active, or in an unknown state; it cannot resume forward
-provisioning.
+gated. When worker provisioning claims are disabled, ordinary `pod_create` and
+`vm_add` jobs are excluded inside the atomic claim query and remain pending;
+destroy jobs and either provisioning type marked `cleanup_only` remain
+claimable.
+
+Compensation intent is durable. A clone's exact vCenter MoRef, pod id, and pod
+VM id are persisted on its parent job before the clone can be adopted by the VM
+row. Cleanup never resolves a VM by its mutable display name. If ownership is
+lost or cleanup fails, the parent job remains `cleanup_only` and retries with
+capped backoff independently of its original provisioning retry budget. It
+cannot resume cloning, power-on, or snapshots. A cleanup-only `pod_create` may
+move a `provisioning` pod to `error` only when that exact staged target belongs
+to a VM in the job; marker-only, mismatched, active, pending, and unknown states
+fail closed.
+
+Completed compensation finalizes the parent job as `failed` with
+`compensated: true` and publishes a `compensated` event; it is never reported
+as successful provisioning. Missing or ambiguous immutable ownership proof
+finalizes with `manual_cleanup_required: true` instead of risking deletion of
+an unrelated VM. No production worker scale-up is implied by this contract.
 
 Authenticated clients and the non-destructive API synthetic use
 `GET /api/v1/provisioning/status`. Its complete stable response contract is:

@@ -177,22 +177,22 @@ func TestProvisioningJobEntryTransitionsAreGuarded(t *testing.T) {
 		"internal/provisioner/create.go": {
 			"UpdatePodStatusFrom(",
 			"UpdatePodVMStatusFrom(",
-			"UpdatePodVMFrom(",
+			"AdoptPodVMClone(",
 			"models.PodStatusPending",
 			"models.PodStatusProvisioning",
 			"stale pod create job skipped",
 			"stopPodCreateIfStale",
 			"BeginPodCreateCleanup(",
 			"rb.Rollback(cleanupCtx)",
-			"cleanupStaleVMClone",
+			"failPodCreateForStaleVM",
 		},
 		"internal/provisioner/vm_ops.go": {
 			"UpdatePodVMStatusFrom(",
-			"UpdatePodVMFrom(",
+			"AdoptPodVMClone(",
 			"stale vm_add job skipped",
 			"VCenterVMID string",
 			"CleanupOnly bool",
-			"models.JobTypeVMDestroy",
+			"stageVMCloneCleanup",
 		},
 	}
 
@@ -280,8 +280,8 @@ func TestCleanupOnlyPodCreateCannotReachForwardProvisioning(t *testing.T) {
 	if !strings.Contains(failCleanupBody, "\n\t\ttrue,\n") {
 		t.Fatal("forward pod-create failure must atomically relinquish provisioning before cleanup")
 	}
-	if !strings.Contains(cleanupBody, "\n\t\tfalse,\n") {
-		t.Fatal("cleanup-only retry must not transition a provisioning pod")
+	if !strings.Contains(cleanupBody, "podCreateCleanupOwnsStagedClone(payload)") {
+		t.Fatal("cleanup-only retry may transition provisioning only with an exact staged clone target")
 	}
 
 	queryBody, err := os.ReadFile(filepath.Join(root, "internal", "database", "queries.go"))
@@ -304,6 +304,110 @@ func TestCleanupOnlyPodCreateCannotReachForwardProvisioning(t *testing.T) {
 	} {
 		if !strings.Contains(beginBody, required) {
 			t.Errorf("atomic cleanup transition is missing %q", required)
+		}
+	}
+}
+
+func TestVMCloneCompensationUsesOnlyDurableExactTargets(t *testing.T) {
+	root := findRepoRoot(t)
+	read := func(relPath string) string {
+		t.Helper()
+		body, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(relPath)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(body)
+	}
+
+	createSrc := read("internal/provisioner/create.go")
+	vmOpsSrc := read("internal/provisioner/vm_ops.go")
+	querySrc := read("internal/database/queries.go")
+
+	if strings.Contains(vmOpsSrc, "ResolveVMByName(") {
+		t.Fatal("stale-clone compensation must never resolve a mutable VM name")
+	}
+	for relPath, src := range map[string]string{
+		"internal/provisioner/create.go": createSrc,
+		"internal/provisioner/vm_ops.go": vmOpsSrc,
+	} {
+		clone := strings.Index(src, "p.vc.CloneVM(")
+		if clone < 0 {
+			t.Errorf("%s has no CloneVM call", relPath)
+			continue
+		}
+		stage := strings.Index(src[clone:], "p.stageVMCloneCleanup(")
+		adopt := strings.Index(src[clone:], "p.db.AdoptPodVMClone(")
+		if stage < 0 || adopt < 0 || stage > adopt {
+			t.Errorf("%s must durably stage the returned MoRef before adoption", relPath)
+		}
+	}
+	if strings.Contains(createSrc, "cleanupStaleVMClone(") ||
+		strings.Contains(vmOpsSrc, "cleanupStaleVMClone(") {
+		t.Fatal("legacy stale-clone cleanup bypasses the durable exact-target lifecycle")
+	}
+	if got := strings.Count(createSrc, "failPodCreateForStaleVM("); got != 7 {
+		t.Fatalf("pod_create stale-clone compensation sites = %d, want 6 calls plus helper", got)
+	}
+	if got := strings.Count(vmOpsSrc, "failVMAddWithCleanup("); got != 5 {
+		t.Fatalf("vm_add stale-clone compensation sites = %d, want 4 calls plus helper", got)
+	}
+
+	addStart := strings.Index(vmOpsSrc, "func (p *Provisioner) AddVM(")
+	if addStart < 0 {
+		t.Fatal("AddVM function not found")
+	}
+	cleanupBranch := strings.Index(vmOpsSrc[addStart:], "if payload.CleanupOnly {")
+	forwardStart := strings.Index(vmOpsSrc[addStart:], "pod, err := p.db.GetPodByID")
+	if cleanupBranch < 0 || forwardStart < 0 || cleanupBranch > forwardStart {
+		t.Fatal("vm_add cleanup-only dispatch must precede all forward provisioning")
+	}
+	runCleanupStart := strings.Index(vmOpsSrc, "func (p *Provisioner) runVMAddCleanup(")
+	if runCleanupStart < 0 {
+		t.Fatal("runVMAddCleanup function not found")
+	}
+	runCleanupEnd := strings.Index(vmOpsSrc[runCleanupStart+1:], "\nfunc ")
+	if runCleanupEnd < 0 {
+		t.Fatal("could not isolate runVMAddCleanup")
+	}
+	runCleanupBody := vmOpsSrc[runCleanupStart : runCleanupStart+1+runCleanupEnd]
+	for _, forbidden := range []string{
+		"CloneVM(",
+		"PowerOnVM(",
+		"CreateVMSnapshot(",
+		"ResolveVMByName(",
+	} {
+		if strings.Contains(runCleanupBody, forbidden) {
+			t.Errorf("vm_add cleanup-only execution contains forward/unsafe call %q", forbidden)
+		}
+	}
+
+	for _, required := range []string{
+		"func (q *Queries) StageVMCloneCleanup(",
+		"'{cleanup_target}'",
+		"func (q *Queries) AdoptPodVMClone(",
+		"payload - 'cleanup_target' - 'cleanup_only'",
+		"func (q *Queries) CompleteVMCloneCleanup(",
+		"vcenter_vm_id = $2\n\t\t    OR (vcenter_vm_id IS NULL AND status IN ('pending', 'cloning', 'configuring'))",
+		"func (q *Queries) MarkJobCompensationCompleted(",
+		"if tag.RowsAffected() != 1 {\n\t\treturn fmt.Errorf(\"job %s retry scheduling affected %d rows\"",
+		"if tag.RowsAffected() != 1 {\n\t\treturn fmt.Errorf(\"job %s status update affected %d rows\"",
+	} {
+		if !strings.Contains(querySrc, required) {
+			t.Errorf("database compensation lifecycle is missing %q", required)
+		}
+	}
+	if strings.Contains(querySrc, "func (q *Queries) SetPodVMVCenterReference(") {
+		t.Fatal("legacy clone-reference persistence can bypass the staged cleanup transaction")
+	}
+	for _, required := range []string{
+		"return true, newPodCreateCompensatedError(stage)",
+		"return newPodCreateCompensatedError(\"initial pod lookup\")",
+		"return &compensationRetryError{\n\t\t\terr: fmt.Errorf(\"prepare pod_create cleanup",
+		"return &manualCleanupRequiredError{\n\t\t\terr: errors.New(\"cleanup-only vm_add lacks durable completion proof",
+		"return newVMAddCompensatedError(fmt.Sprintf(\"pod entered %s\", pod.Status))",
+	} {
+		if !strings.Contains(createSrc+vmOpsSrc, required) {
+			t.Errorf("compensation terminal/retry semantics are missing %q", required)
 		}
 	}
 }

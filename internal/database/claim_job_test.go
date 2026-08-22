@@ -14,7 +14,7 @@ func validateMaintenanceClaimSQL(query string) error {
 		"WHERE STATUS = 'PENDING'",
 		"$2",
 		"TYPE NOT IN ('POD_CREATE', 'VM_ADD')",
-		"TYPE = 'POD_CREATE' AND PAYLOAD->>'CLEANUP_ONLY' = 'TRUE'",
+		"TYPE IN ('POD_CREATE', 'VM_ADD') AND PAYLOAD->>'CLEANUP_ONLY' = 'TRUE'",
 		"FOR UPDATE SKIP LOCKED",
 	} {
 		if !strings.Contains(sql, fragment) {
@@ -40,7 +40,7 @@ func TestClaimJobMaintenancePolicySabotageIsDetected(t *testing.T) {
 		),
 		"cleanup retry blocked": strings.Replace(
 			claimJobSQL,
-			"OR (type = 'pod_create' AND payload->>'cleanup_only' = 'true')",
+			"OR (type IN ('pod_create', 'vm_add') AND payload->>'cleanup_only' = 'true')",
 			"",
 			1,
 		),
@@ -64,6 +64,8 @@ func TestClaimJobMaintenancePolicySabotageIsDetected(t *testing.T) {
 func TestRetryJobSQLPersistsCleanupOnlyMarker(t *testing.T) {
 	body := strings.ToUpper(retryJobSQL)
 	for _, fragment := range []string{
+		"WHEN $3 AND $4::JSONB IS NOT NULL THEN JSONB_SET(",
+		"'{CLEANUP_TARGET}'",
 		"WHEN $3 THEN JSONB_SET(PAYLOAD, '{CLEANUP_ONLY}', 'TRUE'::JSONB, TRUE)",
 		"ELSE PAYLOAD",
 	} {

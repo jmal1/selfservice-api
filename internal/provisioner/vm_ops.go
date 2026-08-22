@@ -3,8 +3,8 @@ package provisioner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,6 +20,32 @@ type DestroyVMPayload struct {
 	PodVMID     string `json:"pod_vm_id"`
 	VCenterVMID string `json:"vcenter_vm_id,omitempty"`
 	CleanupOnly bool   `json:"cleanup_only,omitempty"`
+}
+
+// VMCloneCleanupTarget identifies one external clone by immutable vCenter
+// MoRef. It is staged on the parent provisioning job before database adoption.
+type VMCloneCleanupTarget struct {
+	PodID       string `json:"pod_id"`
+	PodVMID     string `json:"pod_vm_id"`
+	VCenterVMID string `json:"vcenter_vm_id"`
+}
+
+func validateVMCloneCleanupTarget(target *VMCloneCleanupTarget) (uuid.UUID, uuid.UUID, error) {
+	if target == nil {
+		return uuid.Nil, uuid.Nil, errors.New("cleanup target is missing")
+	}
+	podID, err := parseUUID(target.PodID)
+	if err != nil {
+		return uuid.Nil, uuid.Nil, fmt.Errorf("invalid cleanup pod_id: %w", err)
+	}
+	podVMID, err := parseUUID(target.PodVMID)
+	if err != nil {
+		return uuid.Nil, uuid.Nil, fmt.Errorf("invalid cleanup pod_vm_id: %w", err)
+	}
+	if target.VCenterVMID == "" {
+		return uuid.Nil, uuid.Nil, errors.New("cleanup target has no exact vCenter MoRef")
+	}
+	return podID, podVMID, nil
 }
 
 // DestroyVM destroys a single VM and auto-cleans up the pod if empty.
@@ -42,6 +68,11 @@ func (p *Provisioner) DestroyVM(ctx context.Context, job *models.Job) error {
 	if err != nil && payload.VCenterVMID == "" {
 		return fmt.Errorf("get pod VM: %w", err)
 	}
+	if payload.CleanupOnly && payload.VCenterVMID == "" {
+		return &manualCleanupRequiredError{
+			err: fmt.Errorf("cleanup-only vm_destroy for VM %s has no exact vCenter MoRef; manual cleanup required", podVMID),
+		}
+	}
 
 	// Power off VM if it has a vCenter reference
 	moref := payload.VCenterVMID
@@ -57,9 +88,7 @@ func (p *Provisioner) DestroyVM(ctx context.Context, job *models.Job) error {
 
 		p.publishProgress(job.ID, "vm_destroy", "Destroying VM in vCenter")
 		if err := p.vc.DestroyVM(ctx, moref); err != nil {
-			if !vcenterObjectNotFound(err) {
-				return fmt.Errorf("destroy VM %s: %w", moref, err)
-			}
+			return fmt.Errorf("destroy VM %s: %w", moref, err)
 		}
 	}
 
@@ -114,11 +143,14 @@ func (p *Provisioner) DestroyVM(ctx context.Context, job *models.Job) error {
 
 // AddVMPayload is the expected shape of job.Payload for vm_add.
 type AddVMPayload struct {
-	PodID        string `json:"pod_id"`
-	PodVMID      string `json:"pod_vm_id"`
-	TemplateName string `json:"template_name"`
-	VMName       string `json:"vm_name"`
-	DisplayName  string `json:"display_name"`
+	PodID         string                `json:"pod_id"`
+	PodVMID       string                `json:"pod_vm_id"`
+	TemplateName  string                `json:"template_name"`
+	VMName        string                `json:"vm_name"`
+	DisplayName   string                `json:"display_name"`
+	CleanupOnly   bool                  `json:"cleanup_only,omitempty"`
+	CleanupTarget *VMCloneCleanupTarget `json:"cleanup_target,omitempty"`
+	CleanupDone   bool                  `json:"cleanup_completed,omitempty"`
 }
 
 func shouldMarkVMAddError(job *models.Job, jobErr error) bool {
@@ -138,69 +170,160 @@ func podVMHasLiveClone(vm *models.PodVM, moref string) bool {
 	}
 }
 
-func vcenterObjectNotFound(err error) bool {
-	return err != nil && strings.Contains(strings.ToLower(err.Error()), "not found")
-}
-
-func staleVMCloneCleanupPayload(podID, podVMID uuid.UUID, moref string) ([]byte, error) {
-	return json.Marshal(DestroyVMPayload{
+func (p *Provisioner) stageVMCloneCleanup(
+	ctx context.Context,
+	jobID uuid.UUID,
+	podID, podVMID uuid.UUID,
+	moref string,
+) error {
+	if moref == "" {
+		return &manualCleanupRequiredError{
+			err: fmt.Errorf(
+				"cannot safely clean stale VM %s for pod %s without an exact vCenter MoRef; manual cleanup required",
+				podVMID,
+				podID,
+			),
+		}
+	}
+	target, err := json.Marshal(VMCloneCleanupTarget{
 		PodID:       podID.String(),
 		PodVMID:     podVMID.String(),
 		VCenterVMID: moref,
-		CleanupOnly: true,
 	})
+	if err != nil {
+		return &manualCleanupRequiredError{
+			err: fmt.Errorf("marshal exact VM cleanup target %s: %w", moref, err),
+		}
+	}
+	if err := p.db.StageVMCloneCleanup(ctx, jobID, target); err != nil {
+		return &compensationRetryError{
+			err: fmt.Errorf("persist exact VM cleanup target %s: %w", moref, err),
+			target: &VMCloneCleanupTarget{
+				PodID:       podID.String(),
+				PodVMID:     podVMID.String(),
+				VCenterVMID: moref,
+			},
+		}
+	}
+	return nil
 }
 
-// cleanupStaleVMClone removes a clone after its provisioning job loses
-// ownership of the pod_vms row. If immediate cleanup fails, it persists an
-// independently claimable vm_destroy job carrying the exact MoRef.
-func (p *Provisioner) cleanupStaleVMClone(
-	ctx context.Context,
-	podID, podVMID uuid.UUID,
-	vmName, moref string,
-) error {
-	if moref == "" {
-		resolved, err := p.vc.ResolveVMByName(ctx, vmName)
-		if err != nil {
-			if vcenterObjectNotFound(err) {
-				return nil
-			}
-			return fmt.Errorf("resolve stale VM clone for cleanup: %w", err)
-		}
-		moref = resolved
+func (p *Provisioner) cleanupStagedVMClone(ctx context.Context, jobID uuid.UUID) error {
+	job, err := p.db.GetJob(ctx, jobID)
+	if err != nil {
+		return &compensationRetryError{err: fmt.Errorf("load staged VM cleanup target: %w", err)}
 	}
-
-	recorded, recordErr := p.db.SetPodVMVCenterReference(ctx, podVMID, moref, vmName)
-	if recordErr != nil {
-		p.logger.Warn("failed to persist stale VM clone reference before cleanup",
-			"pod_id", podID, "pod_vm_id", podVMID, "moref", moref, "error", recordErr)
-	}
-
-	_ = p.vc.PowerOffVM(ctx, moref)
-	destroyErr := p.vc.DestroyVM(ctx, moref)
-	if destroyErr == nil || vcenterObjectNotFound(destroyErr) {
-		if recorded {
-			if _, err := p.db.ClearPodVMVCenterReference(ctx, podVMID, moref); err != nil {
-				return fmt.Errorf("clear stale VM clone reference after cleanup: %w", err)
-			}
+	if job == nil {
+		return &manualCleanupRequiredError{
+			err: fmt.Errorf("cleanup job %s disappeared; manual cleanup required", jobID),
 		}
+	}
+	var payload struct {
+		CleanupTarget *VMCloneCleanupTarget `json:"cleanup_target"`
+	}
+	if err := json.Unmarshal(job.Payload, &payload); err != nil {
+		return &compensationRetryError{err: fmt.Errorf("parse staged VM cleanup target: %w", err)}
+	}
+	if payload.CleanupTarget == nil {
 		return nil
 	}
-
-	payload, err := staleVMCloneCleanupPayload(podID, podVMID, moref)
+	target := payload.CleanupTarget
+	_, podVMID, err := validateVMCloneCleanupTarget(target)
 	if err != nil {
-		return fmt.Errorf("marshal stale VM cleanup job: %w", err)
+		return &manualCleanupRequiredError{
+			err: fmt.Errorf("staged VM cleanup target is invalid: %v; manual cleanup required", err),
+		}
 	}
-	cleanupJob, queueErr := p.db.CreateJob(ctx, models.JobTypeVMDestroy, payload)
-	if queueErr != nil {
-		return fmt.Errorf("stale VM clone cleanup failed: destroy %s: %v; queue durable cleanup: %w", moref, destroyErr, queueErr)
+
+	_ = p.vc.PowerOffVM(ctx, target.VCenterVMID)
+	if err := p.vc.DestroyVM(ctx, target.VCenterVMID); err != nil {
+		return &compensationRetryError{
+			err: fmt.Errorf("destroy exact stale VM %s: %w", target.VCenterVMID, err),
+		}
 	}
-	if p.nats != nil {
-		_ = p.nats.PublishJobCreated(cleanupJob.ID, cleanupJob.Type)
+	if err := p.db.CompleteVMCloneCleanup(ctx, jobID, podVMID, target.VCenterVMID); err != nil {
+		return &compensationRetryError{
+			err: fmt.Errorf("complete exact stale VM cleanup %s: %w", target.VCenterVMID, err),
+		}
 	}
-	p.logger.Warn("queued durable cleanup for stale VM clone",
-		"pod_id", podID, "pod_vm_id", podVMID, "moref", moref, "job_id", cleanupJob.ID, "destroy_error", destroyErr)
+	p.logger.Info("exact stale VM clone cleanup completed",
+		"job_id", jobID, "pod_vm_id", podVMID, "moref", target.VCenterVMID)
 	return nil
+}
+
+func (p *Provisioner) jobCompensationCompleted(ctx context.Context, jobID uuid.UUID) (bool, error) {
+	job, err := p.db.GetJob(ctx, jobID)
+	if err != nil {
+		return false, err
+	}
+	if job == nil {
+		return false, fmt.Errorf("cleanup job %s disappeared", jobID)
+	}
+	var payload struct {
+		CleanupDone bool `json:"cleanup_completed"`
+	}
+	if err := json.Unmarshal(job.Payload, &payload); err != nil {
+		return false, err
+	}
+	return payload.CleanupDone, nil
+}
+
+func (p *Provisioner) failVMAddWithCleanup(
+	ctx context.Context,
+	job *models.Job,
+	podID, podVMID uuid.UUID,
+	moref, reason string,
+) error {
+	_, _ = p.db.UpdatePodVMStatusFrom(
+		ctx,
+		podVMID,
+		[]string{models.VMStatusPending, models.VMStatusCloning, models.VMStatusConfiguring},
+		models.VMStatusError,
+	)
+	if err := p.stageVMCloneCleanup(ctx, job.ID, podID, podVMID, moref); err != nil {
+		return err
+	}
+	if err := p.cleanupStagedVMClone(ctx, job.ID); err != nil {
+		return err
+	}
+	completed, err := p.jobCompensationCompleted(ctx, job.ID)
+	if err != nil {
+		return &compensationRetryError{
+			err: fmt.Errorf("verify completed vm_add compensation: %w", err),
+		}
+	}
+	if !completed {
+		return &compensationRetryError{
+			err: errors.New("vm_add cleanup lacks durable completion proof; manual resolution may be required"),
+		}
+	}
+	return &compensatedJobError{err: fmt.Errorf("vm_add failed and exact clone cleanup completed: %s", reason)}
+}
+
+func newVMAddCompensatedError(reason string) error {
+	return &compensatedJobError{
+		err: fmt.Errorf("vm_add stopped before cloning; no external resource required cleanup: %s", reason),
+	}
+}
+
+func (p *Provisioner) runVMAddCleanup(ctx context.Context, job *models.Job) error {
+	if err := p.cleanupStagedVMClone(ctx, job.ID); err != nil {
+		return err
+	}
+	completed, err := p.jobCompensationCompleted(ctx, job.ID)
+	if err != nil {
+		return &compensationRetryError{
+			err: fmt.Errorf("verify cleanup-only vm_add completion: %w", err),
+		}
+	}
+	if !completed {
+		return &manualCleanupRequiredError{
+			err: errors.New("cleanup-only vm_add lacks durable completion proof; manual resolution may be required"),
+		}
+	}
+	return &compensatedJobError{
+		err: errors.New("vm_add failed; compensation completed"),
+	}
 }
 
 func (p *Provisioner) recordVMAddFailure(ctx context.Context, job *models.Job, podVMID uuid.UUID, jobErr error) {
@@ -220,6 +343,9 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) error {
 	var payload AddVMPayload
 	if err := json.Unmarshal(job.Payload, &payload); err != nil {
 		return fmt.Errorf("parse vm_add payload: %w", err)
+	}
+	if payload.CleanupOnly {
+		return p.runVMAddCleanup(ctx, job)
 	}
 
 	podID, err := parseUUID(payload.PodID)
@@ -242,11 +368,18 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) error {
 	}
 	if pod.Status != models.PodStatusActive {
 		if podVM.VCenterVMID != nil && *podVM.VCenterVMID != "" {
-			return p.cleanupStaleVMClone(ctx, podID, podVMID, payload.VMName, *podVM.VCenterVMID)
+			return p.failVMAddWithCleanup(
+				ctx,
+				job,
+				podID,
+				podVMID,
+				*podVM.VCenterVMID,
+				fmt.Sprintf("pod entered %s", pod.Status),
+			)
 		}
 		p.logger.Warn("stale vm_add job skipped because pod is not active",
 			"pod_id", podID, "pod_status", pod.Status, "pod_vm_id", podVMID, "job_id", job.ID)
-		return nil
+		return newVMAddCompensatedError(fmt.Sprintf("pod entered %s", pod.Status))
 	}
 	applied, err := p.db.UpdatePodVMStatusFrom(
 		ctx,
@@ -267,7 +400,17 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) error {
 			currentMoref = *current.VCenterVMID
 		}
 		if current.Status == models.VMStatusDeleted || current.Status == models.VMStatusError {
-			return p.cleanupStaleVMClone(ctx, podID, podVMID, payload.VMName, currentMoref)
+			if currentMoref == "" {
+				return newVMAddCompensatedError(fmt.Sprintf("VM entered %s", current.Status))
+			}
+			return p.failVMAddWithCleanup(
+				ctx,
+				job,
+				podID,
+				podVMID,
+				currentMoref,
+				fmt.Sprintf("VM entered %s", current.Status),
+			)
 		}
 		p.logger.Warn("stale vm_add job skipped because VM is no longer provisionable",
 			"pod_id", podID, "pod_vm_id", podVMID, "vm_status", podVM.Status, "job_id", job.ID)
@@ -311,9 +454,13 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) error {
 			p.recordVMAddFailure(ctx, job, podVMID, jobErr)
 			return jobErr
 		}
+		if err := p.stageVMCloneCleanup(ctx, job.ID, podID, podVMID, moref); err != nil {
+			return err
+		}
 
-		applied, err = p.db.UpdatePodVMFrom(
+		applied, err = p.db.AdoptPodVMClone(
 			ctx,
+			job.ID,
 			podVMID,
 			[]string{models.VMStatusCloning},
 			moref,
@@ -321,36 +468,21 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) error {
 			models.VMStatusConfiguring,
 		)
 		if err != nil {
-			if current, lookupErr := p.db.GetPodVM(ctx, podVMID); lookupErr == nil &&
-				podVMHasLiveClone(current, moref) {
-				if current.Status == models.VMStatusRunning {
-					return nil
-				}
-				applied = true
-			} else {
-				if cleanupErr := p.cleanupStaleVMClone(ctx, podID, podVMID, payload.VMName, moref); cleanupErr != nil {
-					jobErr := fmt.Errorf("vm_add clone persistence cleanup failed: record cloned VM: %v; cleanup clone: %w", err, cleanupErr)
-					p.recordVMAddFailure(ctx, job, podVMID, jobErr)
-					return jobErr
-				}
-				jobErr := fmt.Errorf("record cloned VM after compensating cleanup: %w", err)
-				p.recordVMAddFailure(ctx, job, podVMID, jobErr)
-				return jobErr
-			}
-		}
-		if !applied {
-			current, lookupErr := p.db.GetPodVM(ctx, podVMID)
-			if lookupErr == nil && podVMHasLiveClone(current, moref) {
-				if current.Status == models.VMStatusRunning {
-					return nil
-				}
-				applied = true
+			return &compensationRetryError{
+				err: fmt.Errorf("resolve atomically staged clone adoption for %s: %w", moref, err),
 			}
 		}
 		if !applied {
 			p.logger.Warn("vm_add lost its provisioning state after clone; removing stale clone",
 				"pod_id", podID, "pod_vm_id", podVMID, "moref", moref)
-			return p.cleanupStaleVMClone(ctx, podID, podVMID, payload.VMName, moref)
+			return p.failVMAddWithCleanup(
+				ctx,
+				job,
+				podID,
+				podVMID,
+				moref,
+				"lost VM lifecycle ownership after clone",
+			)
 		}
 
 		// Store generated credentials
@@ -394,7 +526,14 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) error {
 		}
 		p.logger.Warn("vm_add finished after VM entered a terminal state; not marking it running",
 			"pod_id", podID, "pod_vm_id", podVMID, "job_id", job.ID)
-		return p.cleanupStaleVMClone(ctx, podID, podVMID, payload.VMName, moref)
+		return p.failVMAddWithCleanup(
+			ctx,
+			job,
+			podID,
+			podVMID,
+			moref,
+			"lost VM lifecycle ownership after power-on",
+		)
 	}
 
 	// Take initial snapshot for restore-to-original (non-fatal if fails)

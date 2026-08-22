@@ -44,6 +44,7 @@ var ErrImageUploadStale = errors.New("image upload is not in the expected state"
 
 var ErrTemplateNotFound = errors.New("template not found")
 var ErrBlueprintNotFound = errors.New("blueprint not found")
+var ErrUnsafePodCreateCleanupState = errors.New("pod state is unsafe for pod-create cleanup")
 
 // TemplatePinOrderClause is the canonical ordering for template lists (migration 000030).
 // Pinned items appear first (ordered by pin_order, then pinned_at), then unpinned items (by name).
@@ -934,7 +935,7 @@ const claimJobSQL = `
 		  AND (
 		    $2
 		    OR type NOT IN ('pod_create', 'vm_add')
-		    OR (type = 'pod_create' AND payload->>'cleanup_only' = 'true')
+		    OR (type IN ('pod_create', 'vm_add') AND payload->>'cleanup_only' = 'true')
 		  )
 		  AND (next_attempt_at IS NULL OR next_attempt_at <= now())
 		ORDER BY created_at ASC
@@ -948,9 +949,9 @@ const claimJobSQL = `
 // ClaimJob atomically claims the next pending job for a worker.
 // Jobs whose next_attempt_at is in the future are skipped (they are
 // sleeping between retry attempts). When provisioning claims are disabled,
-// ordinary pod_create and every vm_add are excluded inside the selecting
-// transaction and remain pending. A pod_create carrying cleanup_only=true is
-// still claimable, as are cleanup and every other non-provisioning job type.
+// ordinary pod_create and vm_add are excluded inside the selecting transaction
+// and remain pending. Either type carrying cleanup_only=true is still claimable,
+// as are cleanup and every other non-provisioning job type.
 func (q *Queries) ClaimJob(ctx context.Context, workerID string, provisioningClaimsEnabled bool) (*models.Job, error) {
 	var j models.Job
 	err := q.pool.QueryRow(ctx, claimJobSQL, workerID, provisioningClaimsEnabled).Scan(
@@ -965,13 +966,19 @@ func (q *Queries) ClaimJob(ctx context.Context, workerID string, provisioningCla
 
 // UpdateJobStatus updates a job's status and optional result.
 func (q *Queries) UpdateJobStatus(ctx context.Context, id uuid.UUID, status string, result []byte) error {
-	_, err := q.pool.Exec(ctx, `
+	tag, err := q.pool.Exec(ctx, `
 		UPDATE jobs SET status = $2, result = $3,
 			started_at = CASE WHEN $2 = 'in_progress' AND started_at IS NULL THEN now() ELSE started_at END,
 			completed_at = CASE WHEN $2 IN ('completed', 'failed', 'rollback') THEN now() ELSE completed_at END
 		WHERE id = $1
 	`, id, status, result)
-	return err
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("job %s status update affected %d rows", id, tag.RowsAffected())
+	}
+	return nil
 }
 
 // UpdateJobRollbackSteps updates the rollback steps for a job.
@@ -1041,7 +1048,12 @@ func (q *Queries) BeginPodCreateCleanup(
 	case podCreateCleanupStatusSafe(status):
 		// Terminal/error states are safe for persisted compensation.
 	default:
-		return "", false, fmt.Errorf("cleanup-only pod_create refused for pod %s in unsafe status %q", podID, status)
+		return "", false, fmt.Errorf(
+			"%w: cleanup-only pod_create refused for pod %s in status %q",
+			ErrUnsafePodCreateCleanupState,
+			podID,
+			status,
+		)
 	}
 
 	tag, err := tx.Exec(ctx, markPodCreateCleanupOnlySQL, jobID)
@@ -1061,8 +1073,8 @@ func (q *Queries) BeginPodCreateCleanup(
 // attempt. retry_count is incremented; claimed_by, claimed_at, started_at, and
 // completed_at are cleared; next_attempt_at is set to nextAt so ClaimJob
 // ignores the row until the delay expires. cleanupOnly permanently marks a
-// pod_create retry as compensation-only so maintenance workers may claim it
-// without reopening forward provisioning.
+// pod_create or vm_add retry as compensation-only so maintenance workers may
+// claim it without reopening forward provisioning.
 //
 // Called by the worker when ProcessJob returns a retryable error and
 // retry_count < max_retries.
@@ -1076,15 +1088,38 @@ const retryJobSQL = `
 		completed_at    = NULL,
 		next_attempt_at = $2,
 		payload         = CASE
+			WHEN $3 AND $4::jsonb IS NOT NULL THEN jsonb_set(
+				jsonb_set(
+					payload - 'cleanup_completed',
+					'{cleanup_only}',
+					'true'::jsonb,
+					true
+				),
+				'{cleanup_target}',
+				$4::jsonb,
+				true
+			)
 			WHEN $3 THEN jsonb_set(payload, '{cleanup_only}', 'true'::jsonb, true)
 			ELSE payload
 		END
 	WHERE id = $1
 `
 
-func (q *Queries) RetryJob(ctx context.Context, id uuid.UUID, nextAt time.Time, cleanupOnly bool) error {
-	_, err := q.pool.Exec(ctx, retryJobSQL, id, nextAt, cleanupOnly)
-	return err
+func (q *Queries) RetryJob(
+	ctx context.Context,
+	id uuid.UUID,
+	nextAt time.Time,
+	cleanupOnly bool,
+	cleanupTarget []byte,
+) error {
+	tag, err := q.pool.Exec(ctx, retryJobSQL, id, nextAt, cleanupOnly, cleanupTarget)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("job %s retry scheduling affected %d rows", id, tag.RowsAffected())
+	}
+	return nil
 }
 
 // CountRetryPendingJobs returns the number of jobs currently sleeping
@@ -1396,20 +1431,208 @@ func (q *Queries) UpdatePodVMFrom(ctx context.Context, id uuid.UUID, fromStatuse
 	return tag.RowsAffected() > 0, nil
 }
 
-// SetPodVMVCenterReference records a clone without changing lifecycle state.
-// Cleanup paths use this after losing a status race so the external resource
-// remains durably discoverable even when the row is already terminal.
-func (q *Queries) SetPodVMVCenterReference(ctx context.Context, id uuid.UUID, vcenterVMID, vcenterVMName string) (bool, error) {
+// StageVMCloneCleanup durably records the exact clone owned by a provisioning
+// attempt before that attempt tries to attach the clone to pod_vms. A recovered
+// job therefore enters compensation instead of cloning or resolving by name.
+func (q *Queries) StageVMCloneCleanup(ctx context.Context, jobID uuid.UUID, target []byte) error {
 	tag, err := q.pool.Exec(ctx, `
-		UPDATE pod_vms SET vcenter_vm_id = $2, vcenter_vm_name = $3
+		UPDATE jobs
+		SET payload = jsonb_set(
+			jsonb_set(payload - 'cleanup_completed', '{cleanup_only}', 'true'::jsonb, true),
+			'{cleanup_target}',
+			$2::jsonb,
+			true
+		)
 		WHERE id = $1
-		  AND status IN ('deleted', 'error')
-		  AND (vcenter_vm_id IS NULL OR vcenter_vm_id = '' OR vcenter_vm_id = $2)
-	`, id, vcenterVMID, vcenterVMName)
+		  AND type IN ('pod_create', 'vm_add')
+		  AND status IN ('claimed', 'in_progress')
+	`, jobID, target)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("job %s could not stage VM clone cleanup", jobID)
+	}
+	return nil
+}
+
+// AdoptPodVMClone atomically attaches a staged clone to pod_vms and disarms its
+// cleanup intent. If the guarded lifecycle update loses, the exact cleanup
+// target remains durable on the job.
+func (q *Queries) AdoptPodVMClone(
+	ctx context.Context,
+	jobID uuid.UUID,
+	podVMID uuid.UUID,
+	fromStatuses []string,
+	vcenterVMID, vcenterVMName, status string,
+) (bool, error) {
+	tx, err := q.pool.Begin(ctx)
 	if err != nil {
 		return false, err
 	}
-	return tag.RowsAffected() > 0, nil
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var staged bool
+	err = tx.QueryRow(ctx, `
+		SELECT COALESCE(
+			payload->'cleanup_target'->>'pod_vm_id' = $2
+			AND payload->'cleanup_target'->>'vcenter_vm_id' = $3,
+			false
+		)
+		FROM jobs
+		WHERE id = $1
+		FOR UPDATE
+	`, jobID, podVMID.String(), vcenterVMID).Scan(&staged)
+	if err != nil {
+		return false, fmt.Errorf("lock staged clone cleanup: %w", err)
+	}
+	if !staged {
+		return false, fmt.Errorf("job %s has no exact staged cleanup target for VM %s (%s)", jobID, podVMID, vcenterVMID)
+	}
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE pod_vms
+		SET vcenter_vm_id = $1, vcenter_vm_name = $2, status = $3
+		WHERE id = $4 AND status = ANY($5)
+	`, vcenterVMID, vcenterVMName, status, podVMID, fromStatuses)
+	if err != nil {
+		return false, err
+	}
+	applied := tag.RowsAffected() == 1
+	if applied {
+		tag, err = tx.Exec(ctx, `
+			UPDATE jobs
+			SET payload = payload - 'cleanup_target' - 'cleanup_only' - 'cleanup_completed'
+			WHERE id = $1
+			  AND payload->'cleanup_target'->>'pod_vm_id' = $2
+			  AND payload->'cleanup_target'->>'vcenter_vm_id' = $3
+		`, jobID, podVMID.String(), vcenterVMID)
+		if err != nil {
+			return false, fmt.Errorf("disarm adopted clone cleanup: %w", err)
+		}
+		if tag.RowsAffected() != 1 {
+			return false, fmt.Errorf("job %s lost its staged cleanup target before adoption", jobID)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		var owned, cleanupStaged bool
+		resolveErr := q.pool.QueryRow(ctx, `
+			SELECT
+				EXISTS (
+					SELECT 1 FROM pod_vms
+					WHERE id = $1 AND vcenter_vm_id = $2 AND status = $3
+				),
+				EXISTS (
+					SELECT 1 FROM jobs
+					WHERE id = $4
+					  AND payload->'cleanup_target'->>'pod_vm_id' = $5
+					  AND payload->'cleanup_target'->>'vcenter_vm_id' = $2
+				)
+		`, podVMID, vcenterVMID, status, jobID, podVMID.String()).Scan(&owned, &cleanupStaged)
+		if resolveErr == nil {
+			if owned && !cleanupStaged {
+				return true, nil
+			}
+			if !owned && cleanupStaged {
+				return false, nil
+			}
+		}
+		return false, fmt.Errorf("commit clone adoption: %w", err)
+	}
+	return applied, nil
+}
+
+// CompleteVMCloneCleanup clears only the exact destroyed reference and removes
+// the staged target. cleanup_only remains set so a recovered parent job can
+// finalize with compensated-failure semantics instead of resuming provisioning.
+func (q *Queries) CompleteVMCloneCleanup(
+	ctx context.Context,
+	jobID uuid.UUID,
+	podVMID uuid.UUID,
+	vcenterVMID string,
+) error {
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var staged bool
+	err = tx.QueryRow(ctx, `
+		SELECT COALESCE(
+			payload->'cleanup_target'->>'pod_vm_id' = $2
+			AND payload->'cleanup_target'->>'vcenter_vm_id' = $3,
+			false
+		)
+		FROM jobs
+		WHERE id = $1
+		FOR UPDATE
+	`, jobID, podVMID.String(), vcenterVMID).Scan(&staged)
+	if err != nil {
+		return fmt.Errorf("lock completed clone cleanup: %w", err)
+	}
+	if !staged {
+		return fmt.Errorf("job %s has no exact cleanup target for VM %s (%s)", jobID, podVMID, vcenterVMID)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE pod_vms
+		SET vcenter_vm_id = CASE WHEN vcenter_vm_id = $2 THEN NULL ELSE vcenter_vm_id END,
+		    vcenter_vm_name = CASE WHEN vcenter_vm_id = $2 THEN NULL ELSE vcenter_vm_name END,
+		    ip_address = CASE WHEN vcenter_vm_id = $2 THEN NULL ELSE ip_address END,
+		    status = CASE
+		        WHEN status IN ('pending', 'cloning', 'configuring')
+		          AND (vcenter_vm_id = $2 OR vcenter_vm_id IS NULL)
+		        THEN 'error'
+		        ELSE status
+		    END
+		WHERE id = $1
+		  AND (
+		    vcenter_vm_id = $2
+		    OR (vcenter_vm_id IS NULL AND status IN ('pending', 'cloning', 'configuring'))
+		  )
+	`, podVMID, vcenterVMID); err != nil {
+		return fmt.Errorf("clear exact stale VM reference: %w", err)
+	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE jobs
+		SET payload = jsonb_set(
+			payload - 'cleanup_target',
+			'{cleanup_completed}',
+			'true'::jsonb,
+			true
+		)
+		WHERE id = $1
+		  AND payload->'cleanup_target'->>'pod_vm_id' = $2
+		  AND payload->'cleanup_target'->>'vcenter_vm_id' = $3
+	`, jobID, podVMID.String(), vcenterVMID)
+	if err != nil {
+		return fmt.Errorf("complete staged clone cleanup: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("job %s lost cleanup target while completing VM %s", jobID, podVMID)
+	}
+	return tx.Commit(ctx)
+}
+
+// MarkJobCompensationCompleted records durable proof that all compensation for
+// a cleanup-only parent job finished. It deliberately leaves cleanup_only set
+// so crash recovery finalizes the job as compensated instead of provisioning.
+func (q *Queries) MarkJobCompensationCompleted(ctx context.Context, jobID uuid.UUID) error {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE jobs
+		SET payload = jsonb_set(payload, '{cleanup_completed}', 'true'::jsonb, true)
+		WHERE id = $1
+		  AND payload->>'cleanup_only' = 'true'
+		  AND NOT (payload ? 'cleanup_target')
+	`, jobID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("job %s could not record completed compensation", jobID)
+	}
+	return nil
 }
 
 // ClearPodVMVCenterReference clears exactly the clone reference that was

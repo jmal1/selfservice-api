@@ -21,12 +21,12 @@ import (
 
 // Config holds vCenter connection settings.
 type Config struct {
-	URL           string // e.g., "https://vcenter.lab.jmal.io/sdk"
-	User          string // e.g., "selfservice-svc@vsphere.local"
-	Password      string
-	Datacenter    string   // e.g., "JMAL-Datacenter"
-	Datastore     string   // e.g., "NAS-vmstore"
-	VMFolder      string   // e.g., "Student-VMs"
+	URL        string // e.g., "https://vcenter.lab.jmal.io/sdk"
+	User       string // e.g., "selfservice-svc@vsphere.local"
+	Password   string
+	Datacenter string // e.g., "JMAL-Datacenter"
+	Datastore  string // e.g., "NAS-vmstore"
+	VMFolder   string // e.g., "Student-VMs"
 	// TemplateFolder is where template *build* VMs live, e.g.
 	// "/JMAL-Datacenter/vm/templates". It is deliberately separate from
 	// VMFolder: VMFolder holds ephemeral student pod VMs and is what the
@@ -35,8 +35,8 @@ type Config struct {
 	// this when the caller does not name a folder.
 	TemplateFolder string
 	ResourcePools  []string // e.g., ["AMD-Cluster/Resources/Student-VMs", "Intel-Cluster/Resources/Student-VMs"]
-	Hosts         []string // ESXi hosts for port group operations
-	Insecure      bool     // skip TLS verification
+	Hosts          []string // ESXi hosts for port group operations
+	Insecure       bool     // skip TLS verification
 }
 
 // Client wraps govmomi for self-service provisioning operations.
@@ -433,14 +433,14 @@ func (c *Client) DestroyVM(ctx context.Context, moref string) error {
 		// Destroy — treat "already deleted" as success
 		destroyTask, err := vm.Destroy(ctx)
 		if err != nil {
-			if isAlreadyDeletedErr(err) {
+			if isAlreadyDeletedErr(err) || isResourceNotFoundErr(err) {
 				c.logger.Info("VM already deleted", "moref", moref)
 				return nil
 			}
 			return fmt.Errorf("destroy VM %s: %w", moref, err)
 		}
 		if err := destroyTask.Wait(ctx); err != nil {
-			if isAlreadyDeletedErr(err) {
+			if isAlreadyDeletedErr(err) || isResourceNotFoundErr(err) {
 				c.logger.Info("VM already deleted", "moref", moref)
 				return nil
 			}
@@ -562,7 +562,6 @@ func isDiskNotReadyErr(err error) bool {
 		strings.Contains(msg, "Cannot open the disk") ||
 		strings.Contains(msg, "larger than real size")
 }
-
 
 // PowerOffVM powers off a VM.
 // Idempotent: returns nil if the VM was already deleted.
@@ -1285,8 +1284,6 @@ func (c *Client) FindTemplate(ctx context.Context, name string) (*object.Virtual
 	})
 	return result, err
 }
-
-
 
 // Ping verifies vCenter connectivity.
 func (c *Client) Ping(ctx context.Context) error {

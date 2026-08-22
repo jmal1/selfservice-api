@@ -115,7 +115,7 @@ func (f *fakeJobStatusDB) UpdateJobStatus(_ context.Context, _ uuid.UUID, status
 }
 
 // RetryJob stub — satisfies jobStatusUpdater; not asserted in these tests.
-func (f *fakeJobStatusDB) RetryJob(_ context.Context, _ uuid.UUID, _ time.Time, _ bool) error {
+func (f *fakeJobStatusDB) RetryJob(_ context.Context, _ uuid.UUID, _ time.Time, _ bool, _ []byte) error {
 	return nil
 }
 

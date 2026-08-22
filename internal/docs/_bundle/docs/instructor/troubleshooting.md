@@ -48,6 +48,16 @@ remain available so existing environments can be made safe. The worker also
 continues compensation-only retries for cleanup that began before maintenance;
 those retries cannot resume pod or VM creation.
 
+Operators can distinguish ordinary queued work from recovery work in the job
+payload: only `pod_create` or `vm_add` jobs carrying `cleanup_only: true` remain
+claimable while provisioning claims are disabled. Clone cleanup uses the exact
+vCenter MoRef persisted for that attempt, never a VM display name. Failed
+cleanup remains pending with capped backoff independently of the original
+provisioning retry limit. Successful compensation records the parent job as
+failed with `compensated: true`; ambiguous ownership records
+`manual_cleanup_required: true` and requires operator resolution rather than
+deleting an uncertain VM.
+
 Authenticated clients can check the stable read-only contract at
 `GET /api/v1/provisioning/status`:
 

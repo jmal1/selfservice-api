@@ -29,29 +29,128 @@ func TestShouldMarkVMAddErrorMarksDeterministicFailure(t *testing.T) {
 	}
 }
 
-func TestStaleVMCloneCleanupPayloadCarriesDurableReference(t *testing.T) {
+func TestVMCloneCleanupTargetCarriesDurableReference(t *testing.T) {
 	podID := uuid.New()
 	podVMID := uuid.New()
-	body, err := staleVMCloneCleanupPayload(podID, podVMID, "vm-4242")
+	body, err := json.Marshal(VMCloneCleanupTarget{
+		PodID:       podID.String(),
+		PodVMID:     podVMID.String(),
+		VCenterVMID: "vm-4242",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	var got DestroyVMPayload
+	var got VMCloneCleanupTarget
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatal(err)
 	}
 	if got.PodID != podID.String() || got.PodVMID != podVMID.String() ||
-		got.VCenterVMID != "vm-4242" || !got.CleanupOnly {
-		t.Fatalf("cleanup payload = %+v, want exact pod, VM, MoRef, and cleanup-only intent", got)
+		got.VCenterVMID != "vm-4242" {
+		t.Fatalf("cleanup target = %+v, want exact pod, VM, and MoRef", got)
+	}
+	if _, _, err := validateVMCloneCleanupTarget(&got); err != nil {
+		t.Fatalf("valid exact target was rejected: %v", err)
 	}
 }
 
-func TestVCenterObjectNotFoundIsIdempotentCleanup(t *testing.T) {
-	if !vcenterObjectNotFound(errors.New(`find VM "gone": object not found`)) {
-		t.Fatal("vCenter not-found cleanup must be treated as already complete")
+func TestVMCloneCleanupTargetRequiresExactMoRef(t *testing.T) {
+	_, _, err := validateVMCloneCleanupTarget(&VMCloneCleanupTarget{
+		PodID:   uuid.NewString(),
+		PodVMID: uuid.NewString(),
+	})
+	if err == nil {
+		t.Fatal("cleanup target without an exact MoRef was accepted")
 	}
-	if vcenterObjectNotFound(errors.New("connection refused")) {
-		t.Fatal("transport failure must not be treated as completed cleanup")
+	if retryable, _ := ClassifyError(
+		&manualCleanupRequiredError{err: err},
+		models.JobTypeVMAdd,
+	); retryable {
+		t.Fatal("unsafe name-only cleanup was made retryable")
+	}
+}
+
+func TestAddVMPayloadCleanupOnlyRoundTrip(t *testing.T) {
+	want := AddVMPayload{
+		PodID:       uuid.NewString(),
+		PodVMID:     uuid.NewString(),
+		CleanupOnly: true,
+		CleanupTarget: &VMCloneCleanupTarget{
+			PodID:       uuid.NewString(),
+			PodVMID:     uuid.NewString(),
+			VCenterVMID: "vm-4242",
+		},
+	}
+	data, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got AddVMPayload
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.CleanupOnly || got.CleanupTarget == nil ||
+		got.CleanupTarget.VCenterVMID != want.CleanupTarget.VCenterVMID {
+		t.Fatalf("cleanup payload = %+v, want %+v", got, want)
+	}
+}
+
+func TestPodCreateCleanupProvisioningTransitionRequiresOwnedExactTarget(t *testing.T) {
+	podID := uuid.New()
+	podVMID := uuid.New()
+	base := CreatePodPayload{
+		PodID: podID,
+		VMs:   []VMSpec{{PodVMID: podVMID}},
+	}
+	tests := []struct {
+		name   string
+		target *VMCloneCleanupTarget
+		want   bool
+	}{
+		{name: "marker only", want: false},
+		{
+			name: "exact target",
+			target: &VMCloneCleanupTarget{
+				PodID:       podID.String(),
+				PodVMID:     podVMID.String(),
+				VCenterVMID: "vm-4242",
+			},
+			want: true,
+		},
+		{
+			name: "different pod",
+			target: &VMCloneCleanupTarget{
+				PodID:       uuid.NewString(),
+				PodVMID:     podVMID.String(),
+				VCenterVMID: "vm-4242",
+			},
+			want: false,
+		},
+		{
+			name: "different VM",
+			target: &VMCloneCleanupTarget{
+				PodID:       podID.String(),
+				PodVMID:     uuid.NewString(),
+				VCenterVMID: "vm-4242",
+			},
+			want: false,
+		},
+		{
+			name: "missing MoRef",
+			target: &VMCloneCleanupTarget{
+				PodID:   podID.String(),
+				PodVMID: podVMID.String(),
+			},
+			want: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := base
+			payload.CleanupTarget = tc.target
+			if got := podCreateCleanupOwnsStagedClone(payload); got != tc.want {
+				t.Fatalf("podCreateCleanupOwnsStagedClone() = %t, want %t", got, tc.want)
+			}
+		})
 	}
 }
 

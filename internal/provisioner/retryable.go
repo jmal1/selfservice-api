@@ -82,9 +82,17 @@ func ClassifyError(err error, jobType string) (retryable bool, reason string) {
 	if err == nil {
 		return false, ""
 	}
-	var compensatedErr *podCreateCompensatedError
+	var compensatedErr *compensatedJobError
 	if errors.As(err, &compensatedErr) {
 		return false, ""
+	}
+	var manualErr *manualCleanupRequiredError
+	if errors.As(err, &manualErr) {
+		return false, ""
+	}
+	var compensationErr *compensationRetryError
+	if errors.As(err, &compensationErr) {
+		return true, RetryReasonCleanup
 	}
 	if isPodCreateCleanupRetry(err) {
 		if jobType == "pod_create" {
@@ -187,9 +195,13 @@ const (
 // and is capped at retryBackoffMax, then a uniform jitter of up to 25%
 // of the computed delay is added to spread load.
 func RetryBackoff(retryCount int) time.Duration {
-	delay := retryBackoffBase * (1 << uint(retryCount))
-	if delay > retryBackoffMax {
-		delay = retryBackoffMax
+	delay := retryBackoffBase
+	for i := 0; i < retryCount && delay < retryBackoffMax; i++ {
+		if delay > retryBackoffMax/2 {
+			delay = retryBackoffMax
+			break
+		}
+		delay *= 2
 	}
 	// Jitter: up to 25% of delay.
 	jitterBound := int64(delay / 4)
