@@ -11,27 +11,27 @@
 #   - Vault path: secret/selfservice/<secret-name>
 
 replicaCount:
-  # Incident containment: production workers remain stopped until host-pinned
-  # placement and vSwitch serialization ship in the follow-up layer.
-  worker: 0
+  # Reopen provisioning with one worker after the ESXi1 canary validated
+  # host-pinned placement, durable receipts, and exact-MoRef cleanup.
+  worker: 1
 
 provisioning:
-  # Keep API admission and worker provisioning claims explicitly closed.
-  enabled: false
-  workerClaimsEnabled: false
+  # Admit provisioning and allow the single worker to claim provisioning jobs.
+  enabled: true
+  workerClaimsEnabled: true
 
 vcenter:
-  # Canary placement and standard-vSwitch mutation are restricted to ESXi1.
+  # Production placement and standard-vSwitch mutation remain restricted to ESXi1.
   # The AMD pool is the resource-pool compatibility constraint for ESXi1, not
   # a substitute for the host allowlist. Keep the external DRS VM-host affinity
   # rule in force.
   hosts: "esxi1.lab.jmal.io"
   resourcePools: "/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs"
 
-# Synthetic monitoring remains non-destructive during containment. Lifecycle,
-# janitor, and runner creation checks stay disabled.
+# Synthetic monitoring remains non-destructive during the initial reopening.
+# Lifecycle, janitor, and runner creation checks stay disabled.
 synthetic:
-  provisioningExpectedEnabled: false
+  provisioningExpectedEnabled: true
   lifecycle:
     enabled: false
     template: synthetic-noop
@@ -54,11 +54,11 @@ synthetic:
     # 2700s (45 min) gives 270s margin and fits the hourly schedule.
     activeDeadlineSeconds: 2700
 
-# Template health checks (roadmap J-2). Enabled in prod: structural checks run
-# against every student-visible template every 12h, plus one rotating deep
-# clone-boot-destroy check. Leader-gated, so exactly one of the 4 worker
-# replicas executes it. A first deep failure schedules a separate durable
-# confirmation, so a transient NFS blip cannot page confirmed health.
+# Template health checks (roadmap J-2) remain disabled during the initial
+# reopening. When enabled later, structural checks and the rotating deep
+# clone-boot-destroy check are leader-gated. A first deep failure schedules a
+# separate durable confirmation, so a transient NFS blip cannot page confirmed
+# health.
 worker:
   # Poll persisted L1 validation due state every 5m. Any template older than
   # seven days is enqueued immediately after startup or leader failover.
