@@ -16,42 +16,65 @@ var (
 	ErrHostNotAllowed        = errors.New("vCenter host is outside VCENTER_HOSTS")
 	ErrAmbiguousHostIdentity = errors.New("vCenter host identity is ambiguous")
 	ErrPlacementUnavailable  = errors.New("no eligible allowlisted vCenter placement")
+	ErrReservedHeadroom      = errors.New("vCenter host reserved headroom would be violated")
 )
 
 // HostIdentity is the immutable inventory identity resolved from one
 // VCENTER_HOSTS entry at process startup.
 type HostIdentity struct {
-	Name          string `json:"name"`
-	InventoryPath string `json:"inventory_path"`
-	MoRef         string `json:"moref"`
-	ComputeMoRef  string `json:"compute_moref"`
+	Name             string `json:"name"`
+	InventoryPath    string `json:"inventory_path"`
+	MoRef            string `json:"moref"`
+	ComputeType      string `json:"compute_type"`
+	ComputeMoRef     string `json:"compute_moref"`
+	ReservedMemoryMB int64  `json:"reserved_memory_mb"`
 }
 
 // PlacementRequest describes the constraints shared by every VM creation path.
 // PinnedHostMoRef and PinnedPoolMoRef are populated when resuming a durable
 // clone operation and prohibit selecting a different destination.
 type PlacementRequest struct {
-	SourceHost        *types.ManagedObjectReference
-	RequireSourceHost bool
-	ResourcePoolPath  string
-	DatastoreName     string
-	NetworkName       string
-	VCPUs             int32
-	RAMMB             int64
-	PinnedHostMoRef   string
-	PinnedPoolMoRef   string
+	SourceHost            *types.ManagedObjectReference
+	RequireSourceHost     bool
+	ResourcePoolPath      string
+	DatastoreName         string
+	NetworkName           string
+	VCPUs                 int32
+	RAMMB                 int64
+	PinnedHostMoRef       string
+	PinnedPoolMoRef       string
+	ExpectedComputeType   string
+	ExpectedComputeMoRef  string
+	AllowMissingNetwork   bool
+	SkipCapacityChecks    bool
+	PlannedMemoryMBByHost map[string]int64
+	TargetHostMoRefs      []string
 }
 
 // Placement is a fully resolved, explicitly pinned vCenter destination.
 type Placement struct {
-	Host       *object.HostSystem
-	Pool       *object.ResourcePool
-	Datastore  *object.Datastore
-	Identity   HostIdentity
-	PoolMoRef  string
-	PoolPath   string
-	FreeHostMB int64
-	FreePoolMB int64
+	Host             *object.HostSystem
+	Pool             *object.ResourcePool
+	Datastore        *object.Datastore
+	Identity         HostIdentity
+	PoolMoRef        string
+	PoolPath         string
+	ComputeType      string
+	ComputeMoRef     string
+	FreeHostMB       int64
+	FreePoolMB       int64
+	ReservedMemoryMB int64
+}
+
+// TemplateSourceIdentity is the immutable inventory identity stored for one
+// logical template's source replica.
+type TemplateSourceIdentity struct {
+	SourceVMMoref        string
+	HostMoref            string
+	HostName             string
+	ComputeResourceType  string
+	ComputeResourceMoref string
+	ComputeResourcePath  string
 }
 
 type placementCandidate struct {
@@ -123,6 +146,7 @@ func (c *Client) ResolveProvisioningHosts(ctx context.Context) ([]HostIdentity, 
 			Name:          props.Name,
 			InventoryPath: host.InventoryPath,
 			MoRef:         host.Reference().Value,
+			ComputeType:   props.Parent.Type,
 			ComputeMoRef:  props.Parent.Value,
 		})
 	}
@@ -130,6 +154,9 @@ func (c *Client) ResolveProvisioningHosts(ctx context.Context) ([]HostIdentity, 
 	resolved, err := resolveHostIdentities(c.config.Hosts, inventory)
 	if err != nil {
 		return nil, err
+	}
+	for i := range resolved {
+		resolved[i].ReservedMemoryMB = c.config.HostReservedMemoryMB[c.config.Hosts[i]]
 	}
 
 	c.hostMu.Lock()
@@ -192,6 +219,59 @@ func (c *Client) allowedHostByMoRef(moref string) (HostIdentity, error) {
 		}
 	}
 	return HostIdentity{}, fmt.Errorf("%w: %s", ErrHostNotAllowed, moref)
+}
+
+// ResolveTemplateSourceIdentity verifies that ref names a real VM on a
+// currently allowlisted host and returns its immutable compute-resource
+// identity. Registration stores this result rather than a mutable inventory
+// name.
+func (c *Client) ResolveTemplateSourceIdentity(
+	ctx context.Context,
+	ref string,
+) (*TemplateSourceIdentity, error) {
+	if err := c.ensureConnected(ctx); err != nil {
+		return nil, err
+	}
+	vm, err := c.resolveSourceVM(ctx, ref)
+	if err != nil {
+		return nil, fmt.Errorf("resolve template source %q: %w", ref, err)
+	}
+	var vmProps mo.VirtualMachine
+	if err := vm.Properties(ctx, vm.Reference(), []string{"runtime.host"}, &vmProps); err != nil {
+		return nil, fmt.Errorf("read template source %s host: %w", vm.Reference().Value, err)
+	}
+	if vmProps.Runtime.Host == nil {
+		return nil, fmt.Errorf("%w: template source %s has no runtime host", ErrPlacementUnavailable, vm.Reference().Value)
+	}
+	hostIdentity, err := c.allowedHostByMoRef(vmProps.Runtime.Host.Value)
+	if err != nil {
+		return nil, fmt.Errorf("%w: template source host %s", ErrPlacementUnavailable, err)
+	}
+	computeRef := types.ManagedObjectReference{
+		Type:  hostIdentity.ComputeType,
+		Value: hostIdentity.ComputeMoRef,
+	}
+	compute, err := c.finder.ObjectReference(ctx, computeRef)
+	if err != nil {
+		return nil, fmt.Errorf("resolve source compute resource %s: %w", computeRef.Value, err)
+	}
+	computePath := ""
+	switch typed := compute.(type) {
+	case *object.ClusterComputeResource:
+		computePath = typed.InventoryPath
+	case *object.ComputeResource:
+		computePath = typed.InventoryPath
+	default:
+		return nil, fmt.Errorf("source compute resource %s resolved as %T", computeRef.Value, compute)
+	}
+	return &TemplateSourceIdentity{
+		SourceVMMoref:        vm.Reference().Value,
+		HostMoref:            hostIdentity.MoRef,
+		HostName:             hostIdentity.Name,
+		ComputeResourceType:  hostIdentity.ComputeType,
+		ComputeResourceMoref: hostIdentity.ComputeMoRef,
+		ComputeResourcePath:  computePath,
+	}, nil
 }
 
 func mountAccessible(mount types.HostMountInfo, datastoreAccessible bool) bool {
@@ -274,6 +354,13 @@ func (c *Client) ResolvePlacement(ctx context.Context, request PlacementRequest)
 	if err != nil {
 		return nil, err
 	}
+	targetHosts := make(map[string]struct{}, len(request.TargetHostMoRefs))
+	for _, moref := range request.TargetHostMoRefs {
+		if _, err := c.allowedHostByMoRef(moref); err != nil {
+			return nil, fmt.Errorf("%w: requested target host %s", ErrPlacementUnavailable, moref)
+		}
+		targetHosts[moref] = struct{}{}
+	}
 	if request.DatastoreName == "" {
 		request.DatastoreName = c.config.Datastore
 	}
@@ -298,6 +385,7 @@ func (c *Client) ResolvePlacement(ctx context.Context, request PlacementRequest)
 	}
 
 	sourceCompute := ""
+	sourceComputeType := ""
 	if request.RequireSourceHost && request.SourceHost == nil {
 		return nil, fmt.Errorf(
 			"%w: source VM has no runtime host assignment; source compute-resource compatibility cannot be proven",
@@ -321,6 +409,19 @@ func (c *Client) ResolvePlacement(ctx context.Context, request PlacementRequest)
 			return nil, fmt.Errorf("source host %s has no parent compute resource", request.SourceHost.Value)
 		}
 		sourceCompute = sourceProps.Parent.Value
+		sourceComputeType = sourceProps.Parent.Type
+	}
+	if request.ExpectedComputeMoRef != "" &&
+		(sourceCompute != request.ExpectedComputeMoRef ||
+			(request.ExpectedComputeType != "" && sourceComputeType != request.ExpectedComputeType)) {
+		return nil, fmt.Errorf(
+			"%w: source compute resource is %s/%s, expected %s/%s",
+			ErrPlacementUnavailable,
+			sourceComputeType,
+			sourceCompute,
+			request.ExpectedComputeType,
+			request.ExpectedComputeMoRef,
+		)
 	}
 
 	pools, err := c.configuredPools(ctx, request.ResourcePoolPath, request.PinnedPoolMoRef)
@@ -330,13 +431,16 @@ func (c *Client) ResolvePlacement(ctx context.Context, request PlacementRequest)
 
 	var candidates []placementCandidate
 	var diagnostics []string
+	headroomRejected := false
 	for _, pool := range pools {
 		var poolProps mo.ResourcePool
 		if err := pool.Properties(ctx, pool.Reference(), []string{"name", "owner", "runtime.memory"}, &poolProps); err != nil {
 			diagnostics = append(diagnostics, fmt.Sprintf("pool %s unreadable: %v", pool.InventoryPath, err))
 			continue
 		}
-		if sourceCompute != "" && poolProps.Owner.Value != sourceCompute {
+		if sourceCompute != "" &&
+			(poolProps.Owner.Value != sourceCompute ||
+				(sourceComputeType != "" && poolProps.Owner.Type != sourceComputeType)) {
 			diagnostics = append(diagnostics, fmt.Sprintf(
 				"pool %s belongs to compute resource %s, not source compute resource %s",
 				pool.InventoryPath,
@@ -351,18 +455,27 @@ func (c *Client) ResolvePlacement(ctx context.Context, request PlacementRequest)
 			if request.PinnedHostMoRef != "" && identity.MoRef != request.PinnedHostMoRef {
 				continue
 			}
+			if len(targetHosts) > 0 {
+				if _, selected := targetHosts[identity.MoRef]; !selected {
+					continue
+				}
+			}
 			candidate := placementCandidate{
 				placement: Placement{
-					Host:       object.NewHostSystem(c.client.Client, types.ManagedObjectReference{Type: "HostSystem", Value: identity.MoRef}),
-					Pool:       pool,
-					Datastore:  datastore,
-					Identity:   identity,
-					PoolMoRef:  pool.Reference().Value,
-					PoolPath:   pool.InventoryPath,
-					FreePoolMB: freePoolMB,
+					Host:             object.NewHostSystem(c.client.Client, types.ManagedObjectReference{Type: "HostSystem", Value: identity.MoRef}),
+					Pool:             pool,
+					Datastore:        datastore,
+					Identity:         identity,
+					PoolMoRef:        pool.Reference().Value,
+					PoolPath:         pool.InventoryPath,
+					ComputeType:      poolProps.Owner.Type,
+					ComputeMoRef:     poolProps.Owner.Value,
+					FreePoolMB:       freePoolMB,
+					ReservedMemoryMB: identity.ReservedMemoryMB,
 				},
 			}
-			if identity.ComputeMoRef != poolProps.Owner.Value {
+			if identity.ComputeMoRef != poolProps.Owner.Value ||
+				(identity.ComputeType != "" && identity.ComputeType != poolProps.Owner.Type) {
 				candidate.reasons = append(candidate.reasons, fmt.Sprintf("not a member of pool compute resource %s", poolProps.Owner.Value))
 			}
 			mount, mounted := datastoreHosts[identity.MoRef]
@@ -385,10 +498,11 @@ func (c *Client) ResolvePlacement(ctx context.Context, request PlacementRequest)
 				if hostProps.Runtime.InMaintenanceMode {
 					candidate.reasons = append(candidate.reasons, "host is in maintenance mode")
 				}
-				if !hasStandardPortGroup(&hostProps, request.NetworkName) {
+				if !request.AllowMissingNetwork && !hasStandardPortGroup(&hostProps, request.NetworkName) {
 					candidate.reasons = append(candidate.reasons, fmt.Sprintf("standard port group %q is missing", request.NetworkName))
 				}
-				if request.VCPUs > 0 && hostProps.Summary.Hardware != nil &&
+				if !request.SkipCapacityChecks &&
+					request.VCPUs > 0 && hostProps.Summary.Hardware != nil &&
 					hostProps.Summary.Hardware.NumCpuCores > 0 &&
 					int32(hostProps.Summary.Hardware.NumCpuCores) < request.VCPUs {
 					candidate.reasons = append(candidate.reasons, fmt.Sprintf(
@@ -398,13 +512,19 @@ func (c *Client) ResolvePlacement(ctx context.Context, request PlacementRequest)
 					))
 				}
 				candidate.placement.FreeHostMB = hostFreeMemoryMB(&hostProps)
-				if request.RAMMB > 0 && candidate.placement.FreeHostMB > 0 &&
-					candidate.placement.FreeHostMB < request.RAMMB {
-					candidate.reasons = append(candidate.reasons, fmt.Sprintf(
-						"host has %d MB free, needs %d MB",
-						candidate.placement.FreeHostMB,
-						request.RAMMB,
-					))
+				if !request.SkipCapacityChecks {
+					plannedMemoryMB := request.PlannedMemoryMBByHost[identity.MoRef]
+					requiredFreeMB := request.RAMMB + identity.ReservedMemoryMB + plannedMemoryMB
+					if requiredFreeMB > 0 && candidate.placement.FreeHostMB < requiredFreeMB {
+						headroomRejected = true
+						candidate.reasons = append(candidate.reasons, fmt.Sprintf(
+							"host has %d MB free, needs %d MB plus %d MB planned and %d MB reserved headroom",
+							candidate.placement.FreeHostMB,
+							request.RAMMB,
+							plannedMemoryMB,
+							identity.ReservedMemoryMB,
+						))
+					}
 				}
 			}
 			if len(candidate.reasons) == 0 {
@@ -430,14 +550,26 @@ func (c *Client) ResolvePlacement(ctx context.Context, request PlacementRequest)
 		if len(diagnostics) == 0 {
 			diagnostics = append(diagnostics, "no configured pool belongs to an allowlisted host")
 		}
+		if headroomRejected {
+			return nil, fmt.Errorf(
+				"%w: %w: %s",
+				ErrPlacementUnavailable,
+				ErrReservedHeadroom,
+				strings.Join(diagnostics, "; "),
+			)
+		}
 		return nil, fmt.Errorf("%w: %s", ErrPlacementUnavailable, strings.Join(diagnostics, "; "))
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
 		if candidates[i].placement.FreePoolMB != candidates[j].placement.FreePoolMB {
 			return candidates[i].placement.FreePoolMB > candidates[j].placement.FreePoolMB
 		}
-		if candidates[i].placement.FreeHostMB != candidates[j].placement.FreeHostMB {
-			return candidates[i].placement.FreeHostMB > candidates[j].placement.FreeHostMB
+		iAvailable := candidates[i].placement.FreeHostMB -
+			request.PlannedMemoryMBByHost[candidates[i].placement.Identity.MoRef]
+		jAvailable := candidates[j].placement.FreeHostMB -
+			request.PlannedMemoryMBByHost[candidates[j].placement.Identity.MoRef]
+		if iAvailable != jAvailable {
+			return iAvailable > jAvailable
 		}
 		if candidates[i].placement.Identity.Name != candidates[j].placement.Identity.Name {
 			return candidates[i].placement.Identity.Name < candidates[j].placement.Identity.Name
@@ -450,6 +582,10 @@ func (c *Client) ResolvePlacement(ctx context.Context, request PlacementRequest)
 		"host_moref", selected.Identity.MoRef,
 		"pool", selected.PoolPath,
 		"pool_moref", selected.PoolMoRef,
+		"compute_type", selected.ComputeType,
+		"compute_moref", selected.ComputeMoRef,
+		"free_memory_mb", selected.FreeHostMB,
+		"reserved_memory_mb", selected.ReservedMemoryMB,
 		"datastore", request.DatastoreName,
 		"network", request.NetworkName)
 	return &selected, nil
@@ -458,38 +594,151 @@ func (c *Client) ResolvePlacement(ctx context.Context, request PlacementRequest)
 // ResolveClonePlacement selects and records the destination before durable
 // clone intent is persisted.
 func (c *Client) ResolveClonePlacement(ctx context.Context, params CloneVMParams) (CloneVMParams, error) {
-	source, err := c.resolveSourceVM(ctx, params.TemplateName)
-	if err != nil {
-		return CloneVMParams{}, fmt.Errorf("resolve clone source %s: %w", params.TemplateName, err)
-	}
-	var sourceProps mo.VirtualMachine
-	if err := source.Properties(ctx, source.Reference(), []string{"runtime.host"}, &sourceProps); err != nil {
-		return CloneVMParams{}, fmt.Errorf("read clone source host: %w", err)
-	}
-	placement, err := c.ResolvePlacement(ctx, PlacementRequest{
-		SourceHost:        sourceProps.Runtime.Host,
-		RequireSourceHost: true,
-		DatastoreName:     c.config.Datastore,
-		NetworkName:       params.Network,
-		VCPUs:             params.VCPUs,
-		RAMMB:             params.RAMmb,
-		PinnedHostMoRef:   params.HostMoRef,
-		PinnedPoolMoRef:   params.ResourcePoolMoRef,
-	})
-	if err != nil {
+	return c.resolveClonePlacement(ctx, params, false)
+}
+
+// ResolveExistingClonePlacement reconstructs immutable placement for a clone
+// adopted before vm_placements existed. Capacity is not charged again because
+// the VM is already resident on the observed host.
+func (c *Client) ResolveExistingClonePlacement(
+	ctx context.Context,
+	vmMoref string,
+	params CloneVMParams,
+) (CloneVMParams, error) {
+	if err := c.ensureConnected(ctx); err != nil {
 		return CloneVMParams{}, err
 	}
-	params.HostMoRef = placement.Identity.MoRef
-	params.HostName = placement.Identity.Name
-	params.ResourcePoolMoRef = placement.PoolMoRef
-	return params, nil
+	vm := object.NewVirtualMachine(c.client.Client, types.ManagedObjectReference{
+		Type:  "VirtualMachine",
+		Value: vmMoref,
+	})
+	var props mo.VirtualMachine
+	if err := vm.Properties(ctx, vm.Reference(), []string{"runtime.host", "resourcePool"}, &props); err != nil {
+		return CloneVMParams{}, fmt.Errorf("read existing VM %s placement: %w", vmMoref, err)
+	}
+	if props.Runtime.Host == nil || props.Runtime.Host.Value == "" || props.ResourcePool == nil {
+		return CloneVMParams{}, fmt.Errorf(
+			"%w: existing VM %s has incomplete host or resource-pool placement",
+			ErrPlacementUnavailable,
+			vmMoref,
+		)
+	}
+	params.HostMoRef = props.Runtime.Host.Value
+	params.ResourcePoolMoRef = props.ResourcePool.Value
+	return c.resolveClonePlacement(ctx, params, true)
+}
+
+func (c *Client) resolveClonePlacement(
+	ctx context.Context,
+	params CloneVMParams,
+	skipCapacityChecks bool,
+) (CloneVMParams, error) {
+	sources := params.SourceCandidates
+	if len(sources) == 0 {
+		sources = []CloneSource{{
+			ReplicaID:            params.SourceReplicaID,
+			Ref:                  params.TemplateName,
+			ComputeResourceType:  params.ComputeResourceType,
+			ComputeResourceMoRef: params.ComputeResourceMoRef,
+		}}
+	}
+	type resolvedClonePlacement struct {
+		params    CloneVMParams
+		placement *Placement
+	}
+	var (
+		resolved         []resolvedClonePlacement
+		diagnostics      []string
+		headroomRejected bool
+	)
+	for _, candidate := range sources {
+		source, err := c.resolveSourceVM(ctx, candidate.Ref)
+		if err != nil {
+			diagnostics = append(diagnostics, fmt.Sprintf("source %s: %v", candidate.Ref, err))
+			continue
+		}
+		var sourceProps mo.VirtualMachine
+		if err := source.Properties(ctx, source.Reference(), []string{"runtime.host"}, &sourceProps); err != nil {
+			diagnostics = append(diagnostics, fmt.Sprintf("source %s host: %v", candidate.Ref, err))
+			continue
+		}
+		placement, err := c.ResolvePlacement(ctx, PlacementRequest{
+			SourceHost:            sourceProps.Runtime.Host,
+			RequireSourceHost:     true,
+			DatastoreName:         c.config.Datastore,
+			NetworkName:           params.Network,
+			VCPUs:                 params.VCPUs,
+			RAMMB:                 params.RAMmb,
+			PinnedHostMoRef:       params.HostMoRef,
+			PinnedPoolMoRef:       params.ResourcePoolMoRef,
+			ExpectedComputeType:   candidate.ComputeResourceType,
+			ExpectedComputeMoRef:  candidate.ComputeResourceMoRef,
+			AllowMissingNetwork:   params.AllowMissingNetwork,
+			SkipCapacityChecks:    skipCapacityChecks,
+			PlannedMemoryMBByHost: params.PlannedMemoryMBByHost,
+			TargetHostMoRefs:      params.TargetHostMoRefs,
+		})
+		if err != nil {
+			if errors.Is(err, ErrReservedHeadroom) {
+				headroomRejected = true
+			}
+			diagnostics = append(diagnostics, fmt.Sprintf("source %s: %v", candidate.Ref, err))
+			continue
+		}
+		selected := params
+		selected.TemplateName = candidate.Ref
+		selected.SourceReplicaID = candidate.ReplicaID
+		selected.ComputeResourceType = placement.ComputeType
+		selected.ComputeResourceMoRef = placement.ComputeMoRef
+		selected.HostMoRef = placement.Identity.MoRef
+		selected.HostName = placement.Identity.Name
+		selected.ResourcePoolMoRef = placement.PoolMoRef
+		if placement.ComputeType == "ClusterComputeResource" {
+			selected.DRSControl = "disabled"
+		} else {
+			selected.DRSControl = "standalone"
+		}
+		selected.ObservedFreeMemoryMB = placement.FreeHostMB
+		selected.ReservedMemoryMB = placement.ReservedMemoryMB
+		selected.PlannedMemoryMBByHost = nil
+		selected.TargetHostMoRefs = nil
+		selected.SourceCandidates = nil
+		resolved = append(resolved, resolvedClonePlacement{params: selected, placement: placement})
+	}
+	if len(resolved) == 0 {
+		if len(diagnostics) == 0 {
+			diagnostics = append(diagnostics, "no source candidates were provided")
+		}
+		if headroomRejected {
+			return CloneVMParams{}, fmt.Errorf(
+				"%w: %w: %s",
+				ErrPlacementUnavailable,
+				ErrReservedHeadroom,
+				strings.Join(diagnostics, "; "),
+			)
+		}
+		return CloneVMParams{}, fmt.Errorf("%w: %s", ErrPlacementUnavailable, strings.Join(diagnostics, "; "))
+	}
+	sort.SliceStable(resolved, func(i, j int) bool {
+		if resolved[i].placement.FreePoolMB != resolved[j].placement.FreePoolMB {
+			return resolved[i].placement.FreePoolMB > resolved[j].placement.FreePoolMB
+		}
+		if resolved[i].placement.FreeHostMB != resolved[j].placement.FreeHostMB {
+			return resolved[i].placement.FreeHostMB > resolved[j].placement.FreeHostMB
+		}
+		if resolved[i].params.HostName != resolved[j].params.HostName {
+			return resolved[i].params.HostName < resolved[j].params.HostName
+		}
+		return resolved[i].params.TemplateName < resolved[j].params.TemplateName
+	})
+	return resolved[0].params, nil
 }
 
 // ValidateVMPlacement rejects an existing or recovered VM that is not on the
 // expected immutable host, or whose host is no longer allowlisted.
 func (c *Client) ValidateVMPlacement(ctx context.Context, vmMoref, expectedHostMoRef string) error {
 	if err := c.ensureConnected(ctx); err != nil {
-		return err
+		return fmt.Errorf("%w: connect to vCenter: %w", ErrPlacementValidationUnavailable, err)
 	}
 	vm := object.NewVirtualMachine(c.client.Client, types.ManagedObjectReference{
 		Type:  "VirtualMachine",
@@ -497,18 +746,30 @@ func (c *Client) ValidateVMPlacement(ctx context.Context, vmMoref, expectedHostM
 	})
 	var props mo.VirtualMachine
 	if err := vm.Properties(ctx, vm.Reference(), []string{"runtime.host"}, &props); err != nil {
-		return fmt.Errorf("read VM %s placement: %w", vmMoref, err)
+		return fmt.Errorf("%w: read VM %s placement: %w", ErrPlacementValidationUnavailable, vmMoref, err)
 	}
 	if props.Runtime.Host == nil || props.Runtime.Host.Value == "" {
-		return fmt.Errorf("%w: VM %s has no runtime host assignment", ErrHostNotAllowed, vmMoref)
+		return newPlacementDrift(
+			PlacementDriftHost,
+			ErrHostNotAllowed,
+			"VM %s has no runtime host assignment",
+			vmMoref,
+		)
 	}
 	if _, err := c.allowedHostByMoRef(props.Runtime.Host.Value); err != nil {
-		return fmt.Errorf("%w: VM %s is on %s", err, vmMoref, props.Runtime.Host.Value)
+		return newPlacementDrift(
+			PlacementDriftHost,
+			err,
+			"VM %s is on %s",
+			vmMoref,
+			props.Runtime.Host.Value,
+		)
 	}
 	if expectedHostMoRef != "" && props.Runtime.Host.Value != expectedHostMoRef {
-		return fmt.Errorf(
-			"%w: VM %s is on %s, expected persisted host %s",
+		return newPlacementDrift(
+			PlacementDriftHost,
 			ErrHostNotAllowed,
+			"VM %s is on %s, expected persisted host %s",
 			vmMoref,
 			props.Runtime.Host.Value,
 			expectedHostMoRef,

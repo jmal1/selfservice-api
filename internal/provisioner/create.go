@@ -297,7 +297,7 @@ func processJobLifecycle(
 		publish(job.ID, "started", "Job processing started")
 	}
 
-	err = dispatch(ctx, job)
+	err = classifyPlacementValidationFailure(dispatch(ctx, job))
 	if err == nil {
 		result, _ := json.Marshal(map[string]string{"message": "completed successfully"})
 		if statusErr := db.UpdateJobStatus(ctx, job.ID, workerID, models.JobStatusCompleted, result); statusErr != nil {
@@ -431,7 +431,11 @@ func (p *Provisioner) newRollbackEngine(job *models.Job) (*rollback.Engine, erro
 	return rollback.New(job.ID, &dbPersister{db: p.db, workerID: workerID}, p.logger), nil
 }
 
-func (p *Provisioner) newPodCreateRollbackEngine(job *models.Job, vmSpecs []VMSpec) (*rollback.Engine, error) {
+func (p *Provisioner) newPodCreateRollbackEngine(
+	job *models.Job,
+	podID uuid.UUID,
+	vmSpecs []VMSpec,
+) (*rollback.Engine, error) {
 	rb, err := p.newRollbackEngine(job)
 	if err != nil {
 		return nil, err
@@ -519,15 +523,31 @@ func (p *Provisioner) newPodCreateRollbackEngine(job *models.Job, vmSpecs []VMSp
 		stepName := fmt.Sprintf("vm_clone_%d", i)
 		podVMID := vmSpecs[i].PodVMID
 		rb.RegisterUndo(stepName, func(ctx context.Context, data json.RawMessage) error {
-			var d struct{ Moref string }
-			if err := json.Unmarshal(data, &d); err != nil {
+			var target VMCloneCleanupTarget
+			if err := json.Unmarshal(data, &target); err != nil {
 				return err
 			}
-			_ = p.vc.PowerOffVM(ctx, d.Moref)
-			if err := p.vc.DestroyVM(ctx, d.Moref); err != nil {
+			if target.VCenterVMID == "" {
+				var legacy struct {
+					Moref string `json:"moref"`
+				}
+				if err := json.Unmarshal(data, &legacy); err != nil {
+					return err
+				}
+				target = VMCloneCleanupTarget{
+					PodID:       podID.String(),
+					PodVMID:     podVMID.String(),
+					VCenterVMID: legacy.Moref,
+				}
+			}
+			resolved, err := p.resolvePodCloneCleanupIdentity(ctx, podID, podVMID, &target)
+			if err != nil {
 				return err
 			}
-			if _, err := p.db.ClearPodVMVCenterReference(ctx, podVMID, d.Moref); err != nil {
+			if err := p.destroyExactCloneTarget(ctx, resolved); err != nil {
+				return err
+			}
+			if _, err := p.db.ClearPodVMVCenterReference(ctx, podVMID, resolved.VCenterVMID); err != nil {
 				return err
 			}
 			return nil
@@ -737,6 +757,63 @@ func podCreateCleanupOwnsStagedClone(payload CreatePodPayload) bool {
 	return false
 }
 
+func podVMSpecIDs(vmSpecs []VMSpec) []uuid.UUID {
+	ids := make([]uuid.UUID, 0, len(vmSpecs))
+	for _, vmSpec := range vmSpecs {
+		ids = append(ids, vmSpec.PodVMID)
+	}
+	return ids
+}
+
+func (p *Provisioner) releaseVMPlacementCapacity(
+	ctx context.Context,
+	job *models.Job,
+	podVMIDs []uuid.UUID,
+) error {
+	workerID, _, err := claimedJobLease(job)
+	if err != nil {
+		return err
+	}
+	persisted := make([]uuid.UUID, 0, len(podVMIDs))
+	for _, podVMID := range podVMIDs {
+		placement, loadErr := p.db.GetVMPlacement(ctx, podVMID)
+		if loadErr != nil {
+			return fmt.Errorf(
+				"%w: load VM placement %s before capacity release: %w",
+				errVMPlacementCapacityRelease,
+				podVMID,
+				loadErr,
+			)
+		}
+		if placement == nil {
+			continue
+		}
+		if placement.JobID != job.ID {
+			return &manualCleanupRequiredError{err: fmt.Errorf(
+				"VM placement %s belongs to job %s, not %s",
+				podVMID,
+				placement.JobID,
+				job.ID,
+			)}
+		}
+		persisted = append(persisted, podVMID)
+	}
+	if len(persisted) == 0 {
+		return nil
+	}
+	if len(persisted) != len(podVMIDs) {
+		return &manualCleanupRequiredError{err: fmt.Errorf(
+			"refuse partial VM placement capacity release: found %d of %d placements",
+			len(persisted),
+			len(podVMIDs),
+		)}
+	}
+	if err := p.db.ReleaseVMPlacementCapacity(ctx, job.ID, workerID, persisted); err != nil {
+		return fmt.Errorf("%w: %w", errVMPlacementCapacityRelease, err)
+	}
+	return nil
+}
+
 func (p *Provisioner) cleanupPodCreateResources(
 	ctx context.Context,
 	job *models.Job,
@@ -774,30 +851,6 @@ func (p *Provisioner) cleanupPodCreateResources(
 		cleanupErrs = append(cleanupErrs, err)
 	}
 	cleanupErrs = append(cleanupErrs, rb.Rollback(cleanupCtx)...)
-	if status == models.PodStatusDestroying ||
-		status == models.PodStatusDestroyFailed ||
-		status == models.PodStatusDestroyed {
-		for _, vmSpec := range vmSpecs {
-			if _, updateErr := p.db.UpdatePodVMStatusFrom(
-				cleanupCtx,
-				vmSpec.PodVMID,
-				[]string{
-					models.VMStatusPending,
-					models.VMStatusCloning,
-					models.VMStatusConfiguring,
-					models.VMStatusRunning,
-					"cloned",
-					"failed",
-				},
-				models.VMStatusDeleted,
-			); updateErr != nil {
-				p.logger.Warn("failed to preserve deleted VM status while stopping stale pod create",
-					"pod_id", podID, "pod_vm_id", vmSpec.PodVMID, "error", updateErr)
-				cleanupErrs = append(cleanupErrs, fmt.Errorf("mark VM %s deleted: %w", vmSpec.PodVMID, updateErr))
-			}
-		}
-	}
-
 	statusForLog := status
 	if !podExists {
 		statusForLog = "missing"
@@ -806,6 +859,38 @@ func (p *Provisioner) cleanupPodCreateResources(
 		"pod_id", podID, "status", statusForLog, "stage", stage, "rollback_errors", cleanupErrs)
 	if len(cleanupErrs) > 0 {
 		return newPodCreateCleanupRetryError(stage, cleanupErrs)
+	}
+	if err := p.releaseVMPlacementCapacity(cleanupCtx, job, podVMSpecIDs(vmSpecs)); err != nil {
+		return newPodCreateCleanupRetryError(
+			stage,
+			[]error{fmt.Errorf("release compensated VM capacity: %w", err)},
+		)
+	}
+	terminalVMStatus := models.VMStatusError
+	if status == models.PodStatusDestroying ||
+		status == models.PodStatusDestroyFailed ||
+		status == models.PodStatusDestroyed {
+		terminalVMStatus = models.VMStatusDeleted
+	}
+	for _, vmSpec := range vmSpecs {
+		if _, updateErr := p.db.UpdatePodVMStatusFrom(
+			cleanupCtx,
+			vmSpec.PodVMID,
+			[]string{
+				models.VMStatusPending,
+				models.VMStatusCloning,
+				models.VMStatusConfiguring,
+				models.VMStatusRunning,
+				"cloned",
+				"failed",
+			},
+			terminalVMStatus,
+		); updateErr != nil {
+			return newPodCreateCleanupRetryError(
+				stage,
+				[]error{fmt.Errorf("mark compensated VM %s %s: %w", vmSpec.PodVMID, terminalVMStatus, updateErr)},
+			)
+		}
 	}
 	if err := p.db.MarkJobCompensationCompleted(cleanupCtx, job.ID, workerID); err != nil {
 		return newPodCreateCleanupRetryError(
@@ -865,6 +950,31 @@ func (p *Provisioner) failPodCreateForStaleVM(
 	cause := error(fmt.Errorf("pod_create lost VM ownership during %s", stage))
 	if err := p.stageVMCloneCleanup(ctx, job, podID, podVMID, moref); err != nil {
 		cause = err
+	}
+	return p.failPodCreateWithCleanup(ctx, job, payload, rb, stage, cause)
+}
+
+func (p *Provisioner) failPodCreateAfterCloneError(
+	ctx context.Context,
+	job *models.Job,
+	payload CreatePodPayload,
+	rb *rollback.Engine,
+	podID, podVMID uuid.UUID,
+	moref, stage string,
+	cause error,
+) error {
+	if moref != "" {
+		if err := p.stageVMCloneCleanup(ctx, job, podID, podVMID, moref); err != nil {
+			if !isCompensatedJobError(err) {
+				if isManualCleanupRequired(err) || isCompensationRetry(err) {
+					cause = err
+				} else {
+					cause = &compensationRetryError{
+						err: fmt.Errorf("%v; stage exact clone %s for cleanup: %w", cause, moref, err),
+					}
+				}
+			}
+		}
 	}
 	return p.failPodCreateWithCleanup(ctx, job, payload, rb, stage, cause)
 }
@@ -970,7 +1080,7 @@ func generatePassword(length int) string {
 }
 
 // CreatePod executes the full pod creation workflow with rollback.
-func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
+func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr error) {
 	var payload CreatePodPayload
 	if err := json.Unmarshal(job.Payload, &payload); err != nil {
 		return fmt.Errorf("parse pod_create payload: %w", err)
@@ -979,11 +1089,18 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 	if err != nil {
 		return err
 	}
-	rb, err := p.newPodCreateRollbackEngine(job, payload.VMs)
+	clonePreamblePending := payload.CloneOperation != nil
+	defer func() {
+		if clonePreamblePending {
+			retErr = persistedClonePreambleFailure(job, payload.CloneOperation, retErr)
+		}
+	}()
+	rb, err := p.newPodCreateRollbackEngine(job, payload.PodID, payload.VMs)
 	if err != nil {
 		return err
 	}
 	if payload.CleanupOnly {
+		clonePreamblePending = false
 		return p.runPodCreateCleanup(ctx, job, payload, rb)
 	}
 
@@ -1021,6 +1138,19 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		return fmt.Errorf("update pod status: %w", err)
 	}
 	if !applied {
+		if pod.Status == models.PodStatusActive {
+			if payload.CloneOperation != nil {
+				return persistedClonePreambleFailure(
+					job,
+					payload.CloneOperation,
+					errors.New("pod became active before its persisted clone operation was reconciled"),
+				)
+			}
+			if err := p.releaseVMPlacementCapacity(ctx, job, podVMSpecIDs(payload.VMs)); err != nil {
+				return fmt.Errorf("release already-active pod VM capacity reservations: %w", err)
+			}
+			return nil
+		}
 		p.logger.Warn("stale pod create job skipped because pod is no longer provisionable",
 			"pod_id", pod.ID, "status", pod.Status, "job_id", job.ID)
 		_, cleanupErr := p.stopPodCreateIfStale(ctx, job, pod.ID, payload.VMs, rb, "job_start")
@@ -1162,19 +1292,53 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		return p.failPodCreateWithCleanup(ctx, job, payload, rb, "ensure firewall rule", fmt.Errorf("ensure firewall rule: %w", err))
 	}
 
-	// --- Step 5: Create port groups on allowlisted ESXi hosts ---
-	p.publishProgress(job.ID, "portgroup_create", fmt.Sprintf("Creating port group %s on allowlisted hosts", pgName))
+	// Resolve and persist the complete source/compute/pool/host plan before the
+	// first standard-switch mutation.
+	placementSpecs := make([]vmPlacementSpec, 0, len(payload.VMs))
+	for _, vmSpec := range payload.VMs {
+		placementSpecs = append(placementSpecs, vmPlacementSpec{
+			PodVMID:   vmSpec.PodVMID,
+			SourceRef: vmSpec.TemplateName,
+		})
+	}
+	placements, err := p.prepareVMPlacementPlan(ctx, job, placementSpecs, pgName, true, nil)
+	if err != nil {
+		planningErr := fmt.Errorf("plan VM placements: %w", err)
+		if jobRetryAvailable(job, planningErr) {
+			return planningErr
+		}
+		return p.failPodCreateWithCleanup(
+			ctx,
+			job,
+			payload,
+			rb,
+			"placement planning",
+			planningErr,
+		)
+	}
+	placementsByVM := placementPlanByPodVM(placements)
+	targetHosts := selectedPlacementHosts(placements)
+
+	// --- Step 5: Create port groups only on selected ESXi hosts ---
+	p.publishProgress(job.ID, "portgroup_create", fmt.Sprintf("Creating port group %s on selected hosts", pgName))
 
 	err = p.db.WithVCenterPortGroupMutationLock(ctx, func(lockCtx context.Context) error {
-		receipt, planErr := p.vc.PlanPortGroupMutation(lockCtx, pgName, vlanTag)
-		if planErr != nil {
-			return fmt.Errorf("plan port group mutation: %w", planErr)
+		receipt, receiptErr := existingPortGroupReceipt(rb, pgName, vlanTag, targetHosts)
+		if receiptErr != nil {
+			return receiptErr
 		}
-		// Persist exact per-host ownership before the first AddPortGroup call.
-		if recordErr := rb.Record(lockCtx, "portgroup_create", receipt); recordErr != nil {
-			return fmt.Errorf("persist port group receipt: %w", recordErr)
+		if receipt == nil {
+			planned, planErr := p.vc.PlanPortGroupMutationForHosts(lockCtx, pgName, vlanTag, targetHosts)
+			if planErr != nil {
+				return fmt.Errorf("plan port group mutation: %w", planErr)
+			}
+			receipt = &planned
+			// Persist exact per-host ownership before the first AddPortGroup call.
+			if recordErr := rb.Record(lockCtx, "portgroup_create", planned); recordErr != nil {
+				return fmt.Errorf("persist port group receipt: %w", recordErr)
+			}
 		}
-		return p.vc.ApplyPortGroupMutation(lockCtx, receipt)
+		return p.vc.ApplyPortGroupMutation(lockCtx, *receipt)
 	})
 	if err != nil {
 		return p.failPodCreateWithCleanup(ctx, job, payload, rb, "create port groups", fmt.Errorf("create port groups: %w", err))
@@ -1190,6 +1354,17 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 	for i, vmSpec := range payload.VMs {
 		stepName := fmt.Sprintf("vm_clone_%d", i)
 		p.publishProgress(job.ID, stepName, fmt.Sprintf("Cloning VM %s from %s", vmSpec.VMName, vmSpec.TemplateName))
+		placement, ok := placementsByVM[vmSpec.PodVMID]
+		if !ok {
+			return p.failPodCreateWithCleanup(
+				ctx,
+				job,
+				payload,
+				rb,
+				"placement lookup",
+				fmt.Errorf("durable placement is missing for pod VM %s", vmSpec.PodVMID),
+			)
+		}
 
 		// Load the template once so we can branch on kind + reuse default
 		// credentials for the no-customize / registered-existing paths. We
@@ -1201,13 +1376,22 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		if err != nil {
 			return fmt.Errorf("get pod VM %s before clone: %w", vmSpec.PodVMID, err)
 		}
+		resumeCloneOperation := payload.CloneOperation != nil &&
+			payload.CloneOperation.PodVMID == vmSpec.PodVMID.String()
+		existingVMMoref := ""
+		if podVMRow.VCenterVMID != nil {
+			existingVMMoref = *podVMRow.VCenterVMID
+		}
 		if podVMRow.Status == models.VMStatusDeleted || podVMRow.Status == models.VMStatusError {
-			moref := ""
-			if podVMRow.VCenterVMID != nil {
-				moref = *podVMRow.VCenterVMID
-			}
 			return p.failPodCreateForStaleVM(
-				ctx, job, payload, rb, pod.ID, vmSpec.PodVMID, moref, "pre-clone terminal-state check",
+				ctx,
+				job,
+				payload,
+				rb,
+				pod.ID,
+				vmSpec.PodVMID,
+				existingVMMoref,
+				"pre-clone terminal-state check",
 			)
 		}
 		if t, tmplErr := p.db.GetTemplateByID(ctx, podVMRow.TemplateID); tmplErr == nil {
@@ -1246,20 +1430,24 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		// marks the pod failed. Reuse the existing clone instead. Mirrors
 		// AddVM's resume path in vm_ops.go.
 		var moref string
-		if podVMRow != nil && podVMRow.VCenterVMID != nil && *podVMRow.VCenterVMID != "" {
-			moref = *podVMRow.VCenterVMID
-			if placementErr := p.vc.ValidateVMPlacement(ctx, moref, ""); placementErr != nil {
+		if existingVMMoref != "" && !resumeCloneOperation {
+			moref = existingVMMoref
+			if placementErr := p.verifyPersistedVMPlacement(ctx, moref, placement); placementErr != nil {
+				classifiedErr := classifyPlacementValidationFailure(fmt.Errorf(
+					"refuse to resume persisted VM %s after placement validation failed: %w",
+					moref,
+					placementErr,
+				))
+				if jobRetryAvailable(job, classifiedErr) {
+					return classifiedErr
+				}
 				return p.failPodCreateWithCleanup(
 					ctx,
 					job,
 					payload,
 					rb,
 					"resume placement validation",
-					&manualCleanupRequiredError{err: fmt.Errorf(
-						"refuse to resume persisted VM %s on an invalid host: %w",
-						moref,
-						placementErr,
-					)},
+					classifiedErr,
 				)
 			}
 			p.logger.Info("resuming pod create — VM already cloned",
@@ -1288,71 +1476,86 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 						ctx, job, payload, rb, pod.ID, vmSpec.PodVMID, currentMoref, "clone-state claim",
 					)
 				}
+				if resumeCloneOperation {
+					return p.failPodCreateWithCleanup(
+						ctx,
+						job,
+						payload,
+						rb,
+						"persisted clone state reconciliation",
+						fmt.Errorf(
+							"VM %s entered state %s before clone operation %s could resume",
+							vmSpec.PodVMID,
+							current.Status,
+							payload.CloneOperation.OperationID,
+						),
+					)
+				}
 				p.logger.Warn("skipping pod-create VM after losing provisioning state",
 					"pod_id", pod.ID, "pod_vm_id", vmSpec.PodVMID, "vm_status", current.Status)
 				continue
 			}
 
 			var cloneErr error
-			moref, cloneErr = executeDurableVMClone(ctx, p.db, p.vc, job.ID, workerID, pod.ID, vmSpec.PodVMID, vcenter.CloneVMParams{
+			cloneParams := cloneParamsFromPlacement(vcenter.CloneVMParams{
 				TemplateName: vmSpec.TemplateName,
 				VMName:       vmSpec.VMName,
-				VCPUs:        vmSpec.VCPUs,
-				RAMmb:        vmSpec.RAMMB,
+				VCPUs:        int32(podVMRow.VCPUs),
+				RAMmb:        int64(podVMRow.RAMMB),
 				Network:      pgName,
 				OSType:       osType,
 				Password:     generatedPassword,
-			})
+			}, placement)
+			moref, cloneErr = executeDurableVMClone(
+				ctx,
+				p.db,
+				p.vc,
+				job.ID,
+				workerID,
+				pod.ID,
+				vmSpec.PodVMID,
+				cloneParams,
+			)
 			if cloneErr != nil {
 				p.logger.Error("failed to clone VM", "vm", vmSpec.VMName, "error", cloneErr)
-				if moref != "" {
-					return p.failPodCreateForStaleVM(
-						ctx,
-						job,
-						payload,
-						rb,
-						pod.ID,
-						vmSpec.PodVMID,
-						moref,
-						"clone post-processing",
-					)
+				cloneErr = classifyCloneOperationFailure(cloneErr)
+				if cloneForwardRetryAvailable(job, cloneErr) {
+					return cloneErr
 				}
-				if isCompensationRetry(cloneErr) {
-					return p.failPodCreateWithCleanup(
-						ctx,
-						job,
-						payload,
-						rb,
-						"clone operation recovery",
-						cloneErr,
-					)
-				}
-				if errors.Is(cloneErr, vcenter.ErrAmbiguousVMOwnership) {
-					return p.failPodCreateWithCleanup(
-						ctx,
-						job,
-						payload,
-						rb,
-						"clone ownership validation",
-						&manualCleanupRequiredError{err: cloneErr},
-					)
-				}
-				_, _ = p.db.UpdatePodVMStatusFrom(
+				return p.failPodCreateAfterCloneError(
 					ctx,
+					job,
+					payload,
+					rb,
+					pod.ID,
 					vmSpec.PodVMID,
-					[]string{models.VMStatusCloning},
-					models.VMStatusError,
+					moref,
+					"clone operation recovery",
+					cloneErr,
 				)
-				continue // Skip this VM, try the rest
 			}
-			if err := rb.Record(ctx, stepName, map[string]string{"moref": moref}); err != nil {
+			if existingVMMoref != "" && existingVMMoref != moref {
+				return p.failPodCreateWithCleanup(
+					ctx,
+					job,
+					payload,
+					rb,
+					"persisted clone reference reconciliation",
+					fmt.Errorf(
+						"refuse to overwrite existing pod VM reference %s with resumed clone %s",
+						existingVMMoref,
+						moref,
+					),
+				)
+			}
+			if resumeCloneOperation {
+				clonePreamblePending = false
+			}
+			cleanupTarget := cloneCleanupTargetFromPlacement(pod.ID, moref, placement)
+			if err := rb.Record(ctx, stepName, cleanupTarget); err != nil {
 				return &compensationRetryError{
-					err: fmt.Errorf("persist rollback for cloned VM %s: %w", moref, err),
-					target: &VMCloneCleanupTarget{
-						PodID:       pod.ID.String(),
-						PodVMID:     vmSpec.PodVMID.String(),
-						VCenterVMID: moref,
-					},
+					err:    fmt.Errorf("persist rollback for cloned VM %s: %w", moref, err),
+					target: cleanupTarget,
 				}
 			}
 
@@ -1380,13 +1583,10 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 				)
 			}
 			if err := p.db.DisarmVMCloneCleanup(ctx, job.ID, workerID, vmSpec.PodVMID, moref); err != nil {
+				cleanupTarget := cloneCleanupTargetFromPlacement(pod.ID, moref, placement)
 				return &compensationRetryError{
-					err: fmt.Errorf("disarm adopted clone %s: %w", moref, err),
-					target: &VMCloneCleanupTarget{
-						PodID:       pod.ID.String(),
-						PodVMID:     vmSpec.PodVMID.String(),
-						VCenterVMID: moref,
-					},
+					err:    fmt.Errorf("disarm adopted clone %s: %w", moref, err),
+					target: cleanupTarget,
 				}
 			}
 		}
@@ -1458,18 +1658,41 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 				)
 				continue
 			}
-			if placementErr := p.vc.ValidateVMPlacement(ctx, *podVM.VCenterVMID, ""); placementErr != nil {
+			placement, ok := placementsByVM[vmSpec.PodVMID]
+			if !ok {
+				return p.failPodCreateWithCleanup(
+					ctx,
+					job,
+					payload,
+					rb,
+					"power-on placement lookup",
+					fmt.Errorf("durable placement is missing for pod VM %s", vmSpec.PodVMID),
+				)
+			}
+			if placementErr := p.vc.ValidateVMPlacementControl(
+				ctx,
+				*podVM.VCenterVMID,
+				placement.HostMoref,
+				placement.ComputeResourceType,
+				placement.ComputeResourceMoref,
+				placement.DRSControl,
+			); placementErr != nil {
+				p.recordVMPlacementDrift(placementErr)
+				classifiedErr := classifyPlacementValidationFailure(fmt.Errorf(
+					"refuse to reuse persisted VM %s after placement validation failed: %w",
+					*podVM.VCenterVMID,
+					placementErr,
+				))
+				if jobRetryAvailable(job, classifiedErr) {
+					return classifiedErr
+				}
 				return p.failPodCreateWithCleanup(
 					ctx,
 					job,
 					payload,
 					rb,
 					"power-on placement validation",
-					&manualCleanupRequiredError{err: fmt.Errorf(
-						"refuse to reuse persisted VM %s on an invalid host: %w",
-						*podVM.VCenterVMID,
-						placementErr,
-					)},
+					classifiedErr,
 				)
 			}
 			if podVM.Status == models.VMStatusRunning {
@@ -1509,24 +1732,22 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 			}
 
 			if err := p.vc.PowerOnVM(ctx, *podVM.VCenterVMID); err != nil {
-				if errors.Is(err, vcenter.ErrHostNotAllowed) {
-					return p.failPodCreateWithCleanup(
-						ctx,
-						job,
-						payload,
-						rb,
-						"power-on host validation",
-						&manualCleanupRequiredError{err: err},
-					)
+				classifiedErr := classifyPlacementValidationFailure(fmt.Errorf(
+					"power on persisted VM %s: %w",
+					*podVM.VCenterVMID,
+					err,
+				))
+				if jobRetryAvailable(job, classifiedErr) {
+					return classifiedErr
 				}
-				p.logger.Error("failed to power on VM", "vm", vmSpec.VMName, "error", err)
-				_, _ = p.db.UpdatePodVMStatusFrom(
+				return p.failPodCreateWithCleanup(
 					ctx,
-					vmSpec.PodVMID,
-					[]string{models.VMStatusConfiguring},
-					models.VMStatusError,
+					job,
+					payload,
+					rb,
+					"power-on VM",
+					classifiedErr,
 				)
-				continue
 			}
 
 			applied, err = p.db.UpdatePodVMStatusFrom(
@@ -1608,6 +1829,9 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 	if !applied {
 		_, stopErr := p.stopPodCreateIfStale(ctx, job, pod.ID, payload.VMs, rb, "activate")
 		return stopErr
+	}
+	if err := p.releaseVMPlacementCapacity(ctx, job, podVMSpecIDs(payload.VMs)); err != nil {
+		return fmt.Errorf("release running pod VM capacity reservations: %w", err)
 	}
 
 	p.logger.Info("pod created successfully", "pod_id", pod.ID, "vlan", vlanTag)

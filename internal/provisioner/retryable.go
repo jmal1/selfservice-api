@@ -29,6 +29,9 @@ import (
 	"math/big"
 	"strings"
 	"time"
+
+	"github.com/jmal1/selfservice-api/internal/models"
+	"github.com/jmal1/selfservice-api/internal/vcenter"
 )
 
 // Retry reason labels used in the crucible_job_retries_total metric.
@@ -39,6 +42,13 @@ const (
 	RetryReasonUnavailable    = "unavailable"
 	RetryReasonCleanup        = "cleanup"
 )
+
+var errVMPlacementCapacityRelease = errors.New("VM placement capacity release unavailable")
+
+func jobRetryAvailable(job *models.Job, jobErr error) bool {
+	retryable, _ := ClassifyError(jobErr, job.Type)
+	return retryable && job.RetryCount < job.MaxRetries
+}
 
 // deterministicPhrases are substrings that identify errors that will never
 // succeed on retry.  Each entry corresponds to a real production failure.
@@ -107,6 +117,12 @@ func ClassifyError(err error, jobType string) (retryable bool, reason string) {
 		if strings.Contains(s, phrase) {
 			return false, ""
 		}
+	}
+	if errors.Is(err, vcenter.ErrPlacementValidationUnavailable) {
+		return true, RetryReasonUnavailable
+	}
+	if errors.Is(err, errVMPlacementCapacityRelease) {
+		return true, RetryReasonUnavailable
 	}
 	if strings.Contains(s, "stale VM clone") {
 		return true, RetryReasonCleanup

@@ -1184,7 +1184,7 @@ const retryJobSQL = `
 					true
 				)
 				WHEN $3 THEN jsonb_set(payload, '{cleanup_only}', 'true'::jsonb, true)
-				ELSE payload
+				ELSE payload - 'cleanup_only' - 'cleanup_completed'
 			END
 		WHERE id = $1
 		  AND claimed_by = $5
@@ -1587,7 +1587,11 @@ func (q *Queries) StageVMCloneCleanup(
 		  AND status IN ('claimed', 'in_progress')
 		  AND NOT (
 		    COALESCE(payload->'destroyed_cleanup_targets', '[]'::jsonb)
-		      @> jsonb_build_array($2::jsonb)
+		      @> jsonb_build_array(jsonb_build_object(
+		        'pod_id', $2::jsonb->>'pod_id',
+		        'pod_vm_id', $2::jsonb->>'pod_vm_id',
+		        'vcenter_vm_id', $2::jsonb->>'vcenter_vm_id'
+		      ))
 		  )
 	`, jobID, target, workerID)
 	if err != nil {
@@ -1597,7 +1601,11 @@ func (q *Queries) StageVMCloneCleanup(
 		var destroyed bool
 		if err := q.pool.QueryRow(ctx, `
 			SELECT COALESCE(payload->'destroyed_cleanup_targets', '[]'::jsonb)
-				@> jsonb_build_array($2::jsonb)
+				@> jsonb_build_array(jsonb_build_object(
+				  'pod_id', $2::jsonb->>'pod_id',
+				  'pod_vm_id', $2::jsonb->>'pod_vm_id',
+				  'vcenter_vm_id', $2::jsonb->>'vcenter_vm_id'
+				))
 			FROM jobs
 			WHERE id = $1
 		`, jobID, target).Scan(&destroyed); err == nil && destroyed {
@@ -1881,7 +1889,9 @@ func (q *Queries) AdoptPodVMClone(
 	tag, err := tx.Exec(ctx, `
 		UPDATE pod_vms
 		SET vcenter_vm_id = $1, vcenter_vm_name = $2, status = $3
-		WHERE id = $4 AND status = ANY($5)
+		WHERE id = $4
+		  AND status = ANY($5)
+		  AND (vcenter_vm_id IS NULL OR vcenter_vm_id = $1)
 	`, vcenterVMID, vcenterVMName, status, podVMID, fromStatuses)
 	if err != nil {
 		return false, err

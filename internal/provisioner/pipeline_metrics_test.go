@@ -21,6 +21,10 @@ func TestPipelineMetrics_SerializeShape(t *testing.T) {
 	m.RecordTemplateJob("template_provision", 30*time.Second)
 	m.SetTemplateStates(map[string]int{"active": 5, "error": 1})
 	m.SetTemplatesStuck(1)
+	m.RecordVMPlacement("esxi1", "domain-c1", "replica-1")
+	m.SetVMPlacementHeadroom("esxi1", 8192)
+	m.RecordVMPlacementDrift("drs")
+	m.RecordVMPlacementRejection("reserved_headroom")
 
 	out := string(m.serialize())
 
@@ -39,6 +43,10 @@ func TestPipelineMetrics_SerializeShape(t *testing.T) {
 		`crucible_template_state{state="active"} 5`,
 		`crucible_template_state{state="error"} 1`,
 		`crucible_template_stuck 1`,
+		`crucible_vm_placement_total{host="esxi1",compute="domain-c1",source="replica-1"} 1`,
+		`crucible_vm_placement_headroom_megabytes{host="esxi1"} 8192`,
+		`crucible_vm_placement_drift_total{kind="drs"} 1`,
+		`crucible_vm_placement_rejections_total{reason="reserved_headroom"} 1`,
 		"# TYPE crucible_image_upload_total counter",
 		"# TYPE crucible_template_state gauge",
 	}

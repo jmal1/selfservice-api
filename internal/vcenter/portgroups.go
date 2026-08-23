@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/vmware/govmomi/object"
@@ -36,6 +37,18 @@ func (c *Client) PlanPortGroupMutation(
 	pgName string,
 	vlanID int,
 ) (PortGroupReceipt, error) {
+	return c.PlanPortGroupMutationForHosts(ctx, pgName, vlanID, nil)
+}
+
+// PlanPortGroupMutationForHosts records switch state only for hosts selected by
+// the durable VM placement plan. A nil target list preserves the legacy
+// all-allowlisted-host behavior for existing callers.
+func (c *Client) PlanPortGroupMutationForHosts(
+	ctx context.Context,
+	pgName string,
+	vlanID int,
+	targetHostMoRefs []string,
+) (PortGroupReceipt, error) {
 	if err := c.ensureConnected(ctx); err != nil {
 		return PortGroupReceipt{}, err
 	}
@@ -47,8 +60,21 @@ func (c *Client) PlanPortGroupMutation(
 		return PortGroupReceipt{}, err
 	}
 
+	targets := make(map[string]struct{}, len(targetHostMoRefs))
+	for _, moref := range targetHostMoRefs {
+		if strings.TrimSpace(moref) == "" {
+			return PortGroupReceipt{}, fmt.Errorf("%w: target host MoRef is empty", ErrInvalidPortGroupReceipt)
+		}
+		targets[moref] = struct{}{}
+	}
 	receipt := PortGroupReceipt{Name: pgName, VLANID: vlanID}
 	for _, identity := range allowed {
+		if len(targets) > 0 {
+			if _, selected := targets[identity.MoRef]; !selected {
+				continue
+			}
+			delete(targets, identity.MoRef)
+		}
 		portGroup, found, err := c.findPortGroupOnHost(ctx, identity, pgName)
 		if err != nil {
 			return PortGroupReceipt{}, err
@@ -69,6 +95,21 @@ func (c *Client) PlanPortGroupMutation(
 			ComputeMoRef: identity.ComputeMoRef,
 			Preexisting:  found,
 		})
+	}
+	if len(targets) > 0 {
+		missing := make([]string, 0, len(targets))
+		for moref := range targets {
+			missing = append(missing, moref)
+		}
+		sort.Strings(missing)
+		return PortGroupReceipt{}, fmt.Errorf(
+			"%w: selected hosts are outside VCENTER_HOSTS: %s",
+			ErrHostNotAllowed,
+			strings.Join(missing, ", "),
+		)
+	}
+	if len(receipt.Hosts) == 0 {
+		return PortGroupReceipt{}, fmt.Errorf("%w: no target hosts selected", ErrInvalidPortGroupReceipt)
 	}
 	return receipt, nil
 }

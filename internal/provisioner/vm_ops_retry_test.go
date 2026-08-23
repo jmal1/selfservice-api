@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/models"
 	"github.com/jmal1/selfservice-api/internal/rollback"
+	"github.com/jmal1/selfservice-api/internal/vcenter"
 )
 
 type fakeCloneHandoffStore struct {
@@ -21,6 +23,21 @@ type fakeCloneHandoffStore struct {
 	destructionStageCalls int
 	destructionTargets    [][]byte
 	proofTargets          [][]byte
+}
+
+func TestShouldCompensateVMAddFailureProtectsRunningVM(t *testing.T) {
+	job := &models.Job{Type: models.JobTypeVMAdd, RetryCount: 3, MaxRetries: 3}
+	releaseErr := fmt.Errorf("%w: deadlock detected", errVMPlacementCapacityRelease)
+	if shouldCompensateVMAddFailure(job, releaseErr, true) {
+		t.Fatal("capacity-release failure would destroy a persisted running VM")
+	}
+	if !shouldCompensateVMAddFailure(job, errors.New("deterministic configuration failure"), false) {
+		t.Fatal("terminal pre-running failure would skip exact clone compensation")
+	}
+	job.RetryCount = 0
+	if shouldCompensateVMAddFailure(job, releaseErr, false) {
+		t.Fatal("retryable pre-running failure would compensate before retries were exhausted")
+	}
 }
 
 func (f *fakeCloneHandoffStore) StageVMCloneDestructionHandoff(
@@ -70,26 +87,6 @@ func (f *fakeCloneHandoffStore) RecordDestroyedVMCloneHandoff(
 	return nil
 }
 
-func TestShouldMarkVMAddErrorPreservesRetryableState(t *testing.T) {
-	transient := errors.New("clone VM: The virtual disk is either corrupted or not a supported format")
-	job := &models.Job{Type: models.JobTypeVMAdd, RetryCount: 0, MaxRetries: 3}
-	if shouldMarkVMAddError(job, transient) {
-		t.Fatal("retryable vm_add failure would be marked error before its retry")
-	}
-
-	job.RetryCount = job.MaxRetries
-	if !shouldMarkVMAddError(job, transient) {
-		t.Fatal("exhausted vm_add failure did not become terminal")
-	}
-}
-
-func TestShouldMarkVMAddErrorMarksDeterministicFailure(t *testing.T) {
-	job := &models.Job{Type: models.JobTypeVMAdd, RetryCount: 0, MaxRetries: 3}
-	if !shouldMarkVMAddError(job, errors.New("clone VM: template_id not found")) {
-		t.Fatal("deterministic vm_add failure did not become terminal")
-	}
-}
-
 func TestVMCloneCleanupTargetCarriesDurableReference(t *testing.T) {
 	podID := uuid.New()
 	podVMID := uuid.New()
@@ -127,6 +124,57 @@ func TestVMCloneCleanupTargetRequiresExactMoRef(t *testing.T) {
 		models.JobTypeVMAdd,
 	); retryable {
 		t.Fatal("unsafe name-only cleanup was made retryable")
+	}
+}
+
+func fullCleanupTargetFixture() *VMCloneCleanupTarget {
+	return &VMCloneCleanupTarget{
+		PodID:                uuid.NewString(),
+		PodVMID:              uuid.NewString(),
+		VCenterVMID:          "vm-4242",
+		LogicalTemplateID:    uuid.NewString(),
+		SourceReplicaID:      uuid.NewString(),
+		SourceRef:            "vm-source-amd",
+		ComputeResourceType:  "ClusterComputeResource",
+		ComputeResourceMoref: "domain-c1",
+		ResourcePoolMoref:    "resgroup-1",
+		HostMoref:            "host-1",
+		DRSControl:           vcenter.DRSControlDisabled,
+	}
+}
+
+func TestMergeCloneCleanupIdentityRejectsPersistedIdentitySabotage(t *testing.T) {
+	expected := fullCleanupTargetFixture()
+	legacy := &VMCloneCleanupTarget{
+		PodID:       expected.PodID,
+		PodVMID:     expected.PodVMID,
+		VCenterVMID: expected.VCenterVMID,
+	}
+	resolved, err := mergeCloneCleanupIdentity(legacy, expected)
+	if err != nil {
+		t.Fatalf("safe legacy cleanup target did not resolve through persisted identity: %v", err)
+	}
+	if resolved.HostMoref != expected.HostMoref ||
+		resolved.ComputeResourceMoref != expected.ComputeResourceMoref ||
+		resolved.ResourcePoolMoref != expected.ResourcePoolMoref ||
+		resolved.SourceRef != expected.SourceRef {
+		t.Fatalf("resolved legacy cleanup identity = %+v, want %+v", resolved, expected)
+	}
+
+	sabotages := map[string]func(*VMCloneCleanupTarget){
+		"source":  func(target *VMCloneCleanupTarget) { target.SourceRef = "vm-source-intel" },
+		"compute": func(target *VMCloneCleanupTarget) { target.ComputeResourceMoref = "domain-c2" },
+		"pool":    func(target *VMCloneCleanupTarget) { target.ResourcePoolMoref = "resgroup-2" },
+		"host":    func(target *VMCloneCleanupTarget) { target.HostMoref = "host-2" },
+	}
+	for name, sabotage := range sabotages {
+		t.Run(name, func(t *testing.T) {
+			actual := *expected
+			sabotage(&actual)
+			if _, err := mergeCloneCleanupIdentity(&actual, expected); err == nil {
+				t.Fatalf("sabotaged %s identity was accepted: %+v", name, actual)
+			}
+		})
 	}
 }
 

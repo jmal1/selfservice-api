@@ -35,6 +35,13 @@ func (p *Provisioner) SnapshotVM(ctx context.Context, job *models.Job) error {
 	if podVM.VCenterVMID == nil {
 		return fmt.Errorf("VM %q has no vCenter reference", podVM.DisplayName)
 	}
+	if err := p.validatePersistedVMPlacement(ctx, podVMID, *podVM.VCenterVMID); err != nil {
+		return fmt.Errorf(
+			"refuse snapshot for VM %s after placement validation failed: %w",
+			podVMID,
+			err,
+		)
+	}
 
 	p.publishProgress(job.ID, "snapshot_create", fmt.Sprintf("Creating snapshot %q for %s", payload.Name, podVM.DisplayName))
 
@@ -89,6 +96,13 @@ func (p *Provisioner) RevertVM(ctx context.Context, job *models.Job) error {
 	}
 	if podVM.VCenterVMID == nil {
 		return fmt.Errorf("VM %q has no vCenter reference", podVM.DisplayName)
+	}
+	if err := p.validatePersistedVMPlacement(ctx, podVMID, *podVM.VCenterVMID); err != nil {
+		return fmt.Errorf(
+			"refuse snapshot revert for VM %s after placement validation failed: %w",
+			podVMID,
+			err,
+		)
 	}
 
 	snap, err := p.db.GetVMSnapshot(ctx, snapID)
@@ -148,6 +162,13 @@ func (p *Provisioner) DeleteSnapshot(ctx context.Context, job *models.Job) error
 	}
 	if podVM.VCenterVMID == nil {
 		return fmt.Errorf("VM %q has no vCenter reference", podVM.DisplayName)
+	}
+	if err := p.validatePersistedVMPlacement(ctx, snap.PodVMID, *podVM.VCenterVMID); err != nil {
+		return fmt.Errorf(
+			"refuse snapshot deletion for VM %s after placement validation failed: %w",
+			snap.PodVMID,
+			err,
+		)
 	}
 
 	p.publishProgress(job.ID, "snapshot_delete", fmt.Sprintf("Deleting snapshot %q from %s", snap.Name, podVM.DisplayName))

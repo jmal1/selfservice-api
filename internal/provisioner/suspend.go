@@ -41,6 +41,13 @@ func (p *Provisioner) SuspendVM(ctx context.Context, job *models.Job) error {
 		return fmt.Errorf("VM %q has no vCenter reference", podVM.DisplayName)
 	}
 	moref := *podVM.VCenterVMID
+	if err := p.validatePersistedVMPlacement(ctx, podVMID, moref); err != nil {
+		return fmt.Errorf(
+			"refuse suspend for VM %s after placement validation failed: %w",
+			podVMID,
+			err,
+		)
+	}
 
 	reason := payload.Reason
 	if reason == "" {

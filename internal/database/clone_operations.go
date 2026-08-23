@@ -41,8 +41,27 @@ func validateVMCloneOperation(op models.VMCloneOperation) error {
 	if err := validateVMCloneOperationScope(op); err != nil {
 		return err
 	}
-	if op.HostMoref == "" || op.HostName == "" || op.PoolMoref == "" {
-		return errors.New("clone operation host_moref, host_name, and pool_moref are required")
+	if _, err := uuid.Parse(op.LogicalTemplateID); err != nil {
+		return fmt.Errorf("invalid clone logical_template_id: %w", err)
+	}
+	if op.SourceReplicaID != "" {
+		if _, err := uuid.Parse(op.SourceReplicaID); err != nil {
+			return fmt.Errorf("invalid clone source_replica_id: %w", err)
+		}
+	}
+	if op.ComputeResourceMoref == "" ||
+		op.HostMoref == "" || op.HostName == "" || op.PoolMoref == "" {
+		return errors.New("clone operation compute_resource_moref, host_moref, host_name, and pool_moref are required")
+	}
+	switch op.ComputeResourceType {
+	case "ClusterComputeResource", "ComputeResource":
+	default:
+		return fmt.Errorf("clone operation has invalid compute_resource_type %q", op.ComputeResourceType)
+	}
+	switch op.DRSControl {
+	case models.VMPlacementDRSDisabled, models.VMPlacementStandalone:
+	default:
+		return fmt.Errorf("clone operation has invalid drs_control %q", op.DRSControl)
 	}
 	return nil
 }
@@ -51,7 +70,15 @@ func sameVMCloneOperationScope(a, b models.VMCloneOperation) bool {
 	return a.PodID == b.PodID &&
 		a.PodVMID == b.PodVMID &&
 		a.TargetName == b.TargetName &&
-		a.SourceRef == b.SourceRef
+		a.SourceRef == b.SourceRef &&
+		(a.LogicalTemplateID == "" || a.LogicalTemplateID == b.LogicalTemplateID)
+}
+
+func sameVMCloneOperationTarget(a, b models.VMCloneOperation) bool {
+	return a.PodID == b.PodID &&
+		a.PodVMID == b.PodVMID &&
+		a.TargetName == b.TargetName &&
+		(a.LogicalTemplateID == "" || a.LogicalTemplateID == b.LogicalTemplateID)
 }
 
 func decodeJobPayloadFields(payload []byte) (map[string]json.RawMessage, error) {
@@ -90,6 +117,53 @@ func appendRollbackReceipt(rollbackSteps, step []byte) ([]byte, bool, error) {
 	steps = append(steps, append(json.RawMessage(nil), step...))
 	updated, err := json.Marshal(steps)
 	return updated, false, err
+}
+
+// GetVMCloneOperation returns the exact persisted operation owned by the
+// current claim. A valid operation is authoritative on retry; callers must not
+// re-resolve source placement before resuming it.
+func (q *Queries) GetVMCloneOperation(
+	ctx context.Context,
+	jobID uuid.UUID,
+	workerID string,
+) (*models.VMCloneOperation, error) {
+	var payload []byte
+	err := q.pool.QueryRow(ctx, `
+		SELECT payload
+		FROM jobs
+		WHERE id = $1
+		  AND claimed_by = $2
+		  AND type IN ('pod_create', 'vm_add', 'template_verify', 'template_revalidate')
+		  AND status IN ('claimed', 'in_progress')
+	`, jobID, workerID).Scan(&payload)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("%w: job %s cannot load clone operation for %s", ErrJobLeaseLost, jobID, workerID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load clone operation job: %w", err)
+	}
+	fields, err := decodeJobPayloadFields(payload)
+	if err != nil {
+		return nil, fmt.Errorf("decode clone operation payload: %w", err)
+	}
+	raw := fields["clone_operation"]
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var op models.VMCloneOperation
+	if err := json.Unmarshal(raw, &op); err != nil {
+		return nil, fmt.Errorf("decode existing clone operation: %w", err)
+	}
+	if err := validateVMCloneOperationScope(op); err != nil {
+		return nil, fmt.Errorf("validate existing clone operation: %w", err)
+	}
+	if err := validateVMCloneOperation(op); err != nil {
+		if op.Phase == models.VMCloneOperationPrepared {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("validate resumable clone operation: %w", err)
+	}
+	return &op, nil
 }
 
 // PrepareVMCloneOperation persists an operation identity before any vCenter
@@ -143,12 +217,35 @@ func (q *Queries) PrepareVMCloneOperation(
 		if err := json.Unmarshal(raw, &existing); err != nil {
 			return nil, fmt.Errorf("decode existing clone operation: %w", err)
 		}
-		// Operations written before host pinning intentionally pass scope
-		// validation here. The provisioner recognizes their missing placement
-		// identity and escalates them to manual cleanup without issuing any
-		// vCenter request.
 		if err := validateVMCloneOperationScope(existing); err != nil {
 			return nil, fmt.Errorf("validate existing clone operation: %w", err)
+		}
+		if validateVMCloneOperation(existing) != nil &&
+			existing.Phase == models.VMCloneOperationPrepared {
+			if !sameVMCloneOperationTarget(existing, candidate) {
+				return nil, fmt.Errorf(
+					"job %s already owns unresolved clone operation %s for VM %s",
+					jobID,
+					existing.OperationID,
+					existing.PodVMID,
+				)
+			}
+			raw, err := json.Marshal(candidate)
+			if err != nil {
+				return nil, err
+			}
+			fields["clone_operation"] = raw
+			updated, err := encodeJobPayloadFields(fields)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := tx.Exec(ctx, `UPDATE jobs SET payload = $2 WHERE id = $1`, jobID, updated); err != nil {
+				return nil, fmt.Errorf("replace unsubmitted legacy clone operation: %w", err)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return nil, fmt.Errorf("commit replacement clone operation: %w", err)
+			}
+			return &candidate, nil
 		}
 		if !sameVMCloneOperationScope(existing, candidate) {
 			return nil, fmt.Errorf(

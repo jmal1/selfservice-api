@@ -988,8 +988,9 @@ func (p *Provisioner) finalizeGeneralizedTemplate(ctx context.Context, job *mode
 // minimal — the worker reads OS/network/spec/assign_ip straight off the
 // template row so the payload can't drift from the source of truth.
 type TemplateVerifyPayload struct {
-	TemplateID uuid.UUID `json:"template_id"`
-	VMMoref    string    `json:"vm_moref"` // source: the template's base-image VM
+	TemplateID     uuid.UUID                `json:"template_id"`
+	VMMoref        string                   `json:"vm_moref"` // source: the template's base-image VM
+	CloneOperation *models.VMCloneOperation `json:"clone_operation,omitempty"`
 }
 
 // runSmokeCheck is the shared smoke-test core reused by both VerifyTemplate
@@ -1000,6 +1001,60 @@ type TemplateVerifyPayload struct {
 // destroyed on return, on every path. publish is called with (slug, message)
 // progress pairs; pass nil to suppress events. Returns nil on success or a
 // descriptive error identifying which check failed.
+func resolveStandaloneCloneCleanupIdentity(
+	target *VMCloneCleanupTarget,
+	op *models.VMCloneOperation,
+	moref string,
+) (*VMCloneCleanupTarget, error) {
+	if target == nil && op != nil {
+		target = cloneCleanupTargetFromOperation(op, moref)
+	}
+	if target == nil {
+		return nil, errors.New("standalone clone cleanup has no exact target")
+	}
+	if moref != "" && target.VCenterVMID != moref {
+		return nil, fmt.Errorf(
+			"standalone cleanup target VM %q does not match exact clone %q",
+			target.VCenterVMID,
+			moref,
+		)
+	}
+	if op != nil {
+		expected := cloneCleanupTargetFromOperation(op, target.VCenterVMID)
+		return mergeCloneCleanupIdentity(target, expected)
+	}
+	if err := validateVMCloneCleanupIdentity(target); err != nil {
+		return nil, err
+	}
+	return target, nil
+}
+
+func (p *Provisioner) loadStandaloneCloneCleanupIdentity(
+	ctx context.Context,
+	jobID uuid.UUID,
+	moref string,
+) (*VMCloneCleanupTarget, error) {
+	current, err := p.db.GetJob(ctx, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("load standalone clone cleanup identity: %w", err)
+	}
+	if current == nil {
+		return nil, fmt.Errorf("standalone clone cleanup job %s disappeared", jobID)
+	}
+	var recovery struct {
+		CleanupTarget  *VMCloneCleanupTarget    `json:"cleanup_target"`
+		CloneOperation *models.VMCloneOperation `json:"clone_operation"`
+	}
+	if err := json.Unmarshal(current.Payload, &recovery); err != nil {
+		return nil, fmt.Errorf("parse standalone clone cleanup identity: %w", err)
+	}
+	return resolveStandaloneCloneCleanupIdentity(
+		recovery.CleanupTarget,
+		recovery.CloneOperation,
+		moref,
+	)
+}
+
 func (p *Provisioner) runSmokeCheck(
 	ctx context.Context,
 	job *models.Job,
@@ -1051,6 +1106,17 @@ func (p *Provisioner) runSmokeCheck(
 				"interrupted smoke-clone operation completed without a created VM",
 			)}
 		}
+		target, err = resolveStandaloneCloneCleanupIdentity(
+			target,
+			recovery.CloneOperation,
+			target.VCenterVMID,
+		)
+		if err != nil {
+			return &manualCleanupRequiredError{err: fmt.Errorf(
+				"smoke-clone cleanup identity is incomplete or inconsistent: %w",
+				err,
+			)}
+		}
 		if target.PodID != job.ID.String() || target.PodVMID != tmpl.ID.String() {
 			return &manualCleanupRequiredError{err: fmt.Errorf(
 				"smoke-clone cleanup target does not match job %s and template %s",
@@ -1064,7 +1130,10 @@ func (p *Provisioner) runSmokeCheck(
 		}
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), smokeCloneCleanupTimeout)
 		defer cancel()
-		if err := p.vc.DestroyVM(cleanupCtx, target.VCenterVMID); err != nil {
+		if err := p.destroyExactCloneTarget(cleanupCtx, target); err != nil {
+			if isManualCleanupRequired(err) {
+				return err
+			}
 			return cloneRecoveryError(fmt.Errorf("destroy recovered smoke clone %s: %w", target.VCenterVMID, err), target)
 		}
 		if err := p.db.FinishStandaloneVMCloneCleanup(
@@ -1101,17 +1170,28 @@ func (p *Provisioner) runSmokeCheck(
 		if cloneMoref == "" {
 			return
 		}
-		target := &VMCloneCleanupTarget{
-			PodID:       job.ID.String(),
-			PodVMID:     tmpl.ID.String(),
-			VCenterVMID: cloneMoref,
+		if isCloneForwardRetry(resultErr) &&
+			cloneForwardRetryAvailable(job, resultErr) {
+			return
 		}
-		rawTarget, marshalErr := json.Marshal(target)
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), smokeCloneCleanupTimeout)
 		defer cancel()
-		cleanupErr := marshalErr
+		target, cleanupErr := p.loadStandaloneCloneCleanupIdentity(cleanupCtx, job.ID, cloneMoref)
+		var rawTarget []byte
 		if cleanupErr == nil {
-			cleanupErr = p.vc.DestroyVM(cleanupCtx, cloneMoref)
+			if target.PodID != job.ID.String() || target.PodVMID != tmpl.ID.String() {
+				cleanupErr = &manualCleanupRequiredError{err: fmt.Errorf(
+					"smoke-clone cleanup identity does not match job %s and template %s",
+					job.ID,
+					tmpl.ID,
+				)}
+			}
+		}
+		if cleanupErr == nil {
+			rawTarget, cleanupErr = json.Marshal(target)
+		}
+		if cleanupErr == nil {
+			cleanupErr = p.destroyExactCloneTarget(cleanupCtx, target)
 		}
 		if cleanupErr == nil {
 			cleanupErr = p.db.FinishStandaloneVMCloneCleanup(
@@ -1125,6 +1205,10 @@ func (p *Provisioner) runSmokeCheck(
 		if cleanupErr != nil {
 			if resultErr != nil {
 				cleanupErr = errors.Join(resultErr, cleanupErr)
+			}
+			if isManualCleanupRequired(cleanupErr) {
+				resultErr = &manualCleanupRequiredError{err: cleanupErr}
+				return
 			}
 			resultErr = cloneRecoveryError(
 				fmt.Errorf("cleanup smoke clone %s: %w", cloneMoref, cleanupErr),
@@ -1149,17 +1233,28 @@ func (p *Provisioner) runSmokeCheck(
 		job.ID,
 		tmpl.ID,
 		vcenter.CloneVMParams{
-			TemplateName: vmMoref,
-			VMName:       smokeName,
-			VCPUs:        vcpus,
-			RAMmb:        ram,
-			Network:      network,
-			OSType:       osType,
-			Password:     smokePassword,
+			LogicalTemplateID: tmpl.ID.String(),
+			TemplateName:      vmMoref,
+			VMName:            smokeName,
+			VCPUs:             vcpus,
+			RAMmb:             ram,
+			Network:           network,
+			OSType:            osType,
+			Password:          smokePassword,
 		},
 	)
 	if err != nil {
-		return fmt.Errorf("smoke clone failed (template may be unclonable): %w", err)
+		cloneErr := classifyCloneOperationFailure(fmt.Errorf(
+			"smoke clone failed (template may be unclonable): %w",
+			err,
+		))
+		if cloneForwardRetryAvailable(job, cloneErr) {
+			return cloneErr
+		}
+		if recovery.CloneOperation != nil {
+			return persistedClonePreambleFailure(job, recovery.CloneOperation, cloneErr)
+		}
+		return cloneForwardFailureToCompensation(cloneErr)
 	}
 
 	// Step 2: power on.
@@ -1256,6 +1351,19 @@ func (p *Provisioner) VerifyTemplate(ctx context.Context, job *models.Job) (err 
 	if payload.TemplateID == uuid.Nil {
 		return fmt.Errorf("template_id is required")
 	}
+	if payload.CloneOperation != nil {
+		if payload.CloneOperation.LogicalTemplateID != payload.TemplateID.String() {
+			return &manualCleanupRequiredError{err: errors.New(
+				"template_verify clone operation does not match the payload template",
+			)}
+		}
+		if payload.CloneOperation.SourceRef == "" {
+			return &manualCleanupRequiredError{err: errors.New(
+				"template_verify clone operation has no persisted source reference",
+			)}
+		}
+		payload.VMMoref = payload.CloneOperation.SourceRef
+	}
 	if payload.VMMoref == "" {
 		return fmt.Errorf("vm_moref is required")
 	}
@@ -1272,6 +1380,12 @@ func (p *Provisioner) VerifyTemplate(ctx context.Context, job *models.Job) (err 
 		}
 		return p.verifyFailedToReady(ctx, payload.TemplateID, checkErr)
 	}
+	clonePreamblePending := payload.CloneOperation != nil
+	defer func() {
+		if clonePreamblePending {
+			err = persistedClonePreambleFailure(job, payload.CloneOperation, err)
+		}
+	}()
 
 	tmpl, err := p.db.GetTemplateByID(ctx, payload.TemplateID)
 	if err != nil {
@@ -1287,9 +1401,13 @@ func (p *Provisioner) VerifyTemplate(ctx context.Context, job *models.Job) (err 
 
 	// Run the smoke check. On failure, move the template back to 'ready' so
 	// the instructor can fix the image and re-publish.
+	clonePreamblePending = false
 	if checkErr := p.runSmokeCheck(ctx, job, tmpl, payload.VMMoref, func(slug, msg string) {
 		p.publishProgress(job.ID, slug, msg)
 	}); checkErr != nil {
+		if cloneForwardRetryAvailable(job, checkErr) {
+			return checkErr
+		}
 		return p.verifyFailedToReady(ctx, tmpl.ID, checkErr)
 	}
 
@@ -1312,7 +1430,8 @@ func (p *Provisioner) VerifyTemplate(ctx context.Context, job *models.Job) (err 
 // Manual L1 templates may enqueue this without a VM moref; RevalidateL1Template
 // resolves template.VCenterTemplate by name at run time when needed.
 type TemplateRevalidatePayload struct {
-	TemplateID uuid.UUID `json:"template_id"`
+	TemplateID     uuid.UUID                `json:"template_id"`
+	CloneOperation *models.VMCloneOperation `json:"clone_operation,omitempty"`
 	// VMMoref is the base-image VM's MoRef when already known. When empty,
 	// the job resolves the template's vcenter_template name at run time.
 	VMMoref string `json:"vm_moref"`
@@ -1424,7 +1543,7 @@ func revalidateL1TemplateJob(
 	job *models.Job,
 	publish func(step, message string),
 	runSmokeCheck revalidateL1TemplateSmokeCheck,
-) error {
+) (retErr error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -1439,6 +1558,25 @@ func revalidateL1TemplateJob(
 	if payload.TemplateID == uuid.Nil {
 		return fmt.Errorf("template_id is required")
 	}
+	if payload.CloneOperation != nil {
+		if payload.CloneOperation.LogicalTemplateID != payload.TemplateID.String() {
+			return &manualCleanupRequiredError{err: errors.New(
+				"template_revalidate clone operation does not match the payload template",
+			)}
+		}
+		if payload.CloneOperation.SourceRef == "" {
+			return &manualCleanupRequiredError{err: errors.New(
+				"template_revalidate clone operation has no persisted source reference",
+			)}
+		}
+		payload.VMMoref = payload.CloneOperation.SourceRef
+	}
+	clonePreamblePending := payload.CloneOperation != nil
+	defer func() {
+		if clonePreamblePending {
+			retErr = persistedClonePreambleFailure(job, payload.CloneOperation, retErr)
+		}
+	}()
 
 	tmpl, err := db.GetTemplateByID(ctx, payload.TemplateID)
 	if err != nil {
@@ -1466,7 +1604,11 @@ func revalidateL1TemplateJob(
 			"template_id", tmpl.ID, "name", tmpl.Name, "vcenter_template", sourceVM, "vm_moref", vmMoref)
 	}
 
+	clonePreamblePending = false
 	checkErr := runSmokeCheck(ctx, tmpl, vmMoref, publish)
+	if isCloneForwardRetry(checkErr) {
+		return checkErr
+	}
 
 	revalidateL1TemplateCore(ctx, db, pipeline, logger, tmpl, checkErr)
 	return checkErr

@@ -261,10 +261,23 @@ func TestCleanupOnlyPodCreateCannotReachForwardProvisioning(t *testing.T) {
 	if commonCleanupStart < 0 {
 		t.Fatal("cleanupPodCreateResources function not found")
 	}
-	marker := strings.Index(src[commonCleanupStart:], "BeginPodCreateCleanup(")
-	rollback := strings.Index(src[commonCleanupStart:], "rb.Rollback(cleanupCtx)")
+	commonCleanupEnd := strings.Index(src[commonCleanupStart+1:], "\nfunc ")
+	if commonCleanupEnd < 0 {
+		t.Fatal("could not isolate cleanupPodCreateResources")
+	}
+	commonCleanupBody := src[commonCleanupStart : commonCleanupStart+1+commonCleanupEnd]
+	marker := strings.Index(commonCleanupBody, "BeginPodCreateCleanup(")
+	rollback := strings.Index(commonCleanupBody, "rb.Rollback(cleanupCtx)")
 	if marker < 0 || rollback < 0 || marker > rollback {
 		t.Fatal("cleanup-only state must be committed before rollback starts")
+	}
+	cleanupSucceeded := strings.Index(commonCleanupBody, "if len(cleanupErrs) > 0 {")
+	releaseCapacity := strings.Index(commonCleanupBody, "p.releaseVMPlacementCapacity(")
+	markVMTerminal := strings.Index(commonCleanupBody, "p.db.UpdatePodVMStatusFrom(")
+	if cleanupSucceeded < rollback ||
+		releaseCapacity < cleanupSucceeded ||
+		markVMTerminal < releaseCapacity {
+		t.Fatal("pod-create compensation must finish exact cleanup and release capacity before terminal VM states")
 	}
 
 	failCleanupStart := strings.Index(src, "func (p *Provisioner) failPodCreateWithCleanup(")
@@ -348,25 +361,34 @@ func TestVMCloneCompensationUsesOnlyDurableExactTargets(t *testing.T) {
 			}
 		}
 	}
-	prepare := strings.Index(cloneOperationSrc, "store.PrepareVMCloneOperation(")
-	submit := strings.Index(cloneOperationSrc, "client.StartCloneVMOperation(")
-	persistTask := strings.Index(cloneOperationSrc, "store.PersistVMCloneTask(")
-	waitTask := strings.Index(cloneOperationSrc, "client.WaitCloneVMTask(")
-	stage := strings.Index(cloneOperationSrc, "store.StageVMCloneCleanup(")
-	configure := strings.Index(cloneOperationSrc, "client.ConfigureClonedVM(")
-	if prepare < 0 || submit < prepare || persistTask < submit || waitTask < persistTask ||
+	executeStart := strings.Index(cloneOperationSrc, "func executeDurableVMClone(")
+	if executeStart < 0 {
+		t.Fatal("durable clone execution function is missing")
+	}
+	executeSrc := cloneOperationSrc[executeStart:]
+	loadOperation := strings.Index(executeSrc, "store.GetVMCloneOperation(")
+	freshOperation := strings.Index(executeSrc, "if op == nil {")
+	resolvePlacement := strings.Index(executeSrc, "client.ResolveClonePlacement(")
+	prepare := strings.Index(executeSrc, "store.PrepareVMCloneOperation(")
+	submit := strings.Index(executeSrc, "client.StartCloneVMOperation(")
+	persistTask := strings.Index(executeSrc, "store.PersistVMCloneTask(")
+	waitTask := strings.Index(executeSrc, "client.WaitCloneVMTask(")
+	stage := strings.Index(executeSrc, "store.StageVMCloneCleanup(")
+	configure := strings.Index(executeSrc, "client.ConfigureClonedVM(")
+	if loadOperation < 0 || freshOperation < loadOperation || resolvePlacement < freshOperation ||
+		prepare < resolvePlacement || submit < prepare || persistTask < submit || waitTask < persistTask ||
 		stage < waitTask || configure < stage {
-		t.Fatal("durable clone order must be prepare, arm/submit, persist task, wait, stage exact MoRef, configure")
+		t.Fatal("durable clone order must be load existing, resolve/prepare only if new, submit, persist task, wait, stage exact MoRef, configure")
 	}
 	if strings.Contains(createSrc, "cleanupStaleVMClone(") ||
 		strings.Contains(vmOpsSrc, "cleanupStaleVMClone(") {
 		t.Fatal("legacy stale-clone cleanup bypasses the durable exact-target lifecycle")
 	}
-	if got := strings.Count(createSrc, "failPodCreateForStaleVM("); got != 8 {
-		t.Fatalf("pod_create stale-clone compensation sites = %d, want 7 calls plus helper", got)
+	if got := strings.Count(createSrc, "failPodCreateForStaleVM("); got != 7 {
+		t.Fatalf("pod_create stale-clone compensation sites = %d, want 6 calls plus helper", got)
 	}
-	if got := strings.Count(vmOpsSrc, "failVMAddWithCleanup("); got != 6 {
-		t.Fatalf("vm_add stale-clone compensation sites = %d, want 5 calls plus helper", got)
+	if got := strings.Count(vmOpsSrc, "failVMAddWithCleanup("); got != 12 {
+		t.Fatalf("vm_add stale-clone compensation sites = %d, want 11 calls plus helper", got)
 	}
 
 	addStart := strings.Index(vmOpsSrc, "func (p *Provisioner) AddVM(")
@@ -400,15 +422,31 @@ func TestVMCloneCompensationUsesOnlyDurableExactTargets(t *testing.T) {
 			t.Errorf("vm_add cleanup-only execution contains forward/unsafe call %q", forbidden)
 		}
 	}
-	if !strings.Contains(runCleanupBody, "p.db.UpdatePodVMStatusFrom(") ||
-		!strings.Contains(runCleanupBody, "models.VMStatusError") {
-		t.Fatal("vm_add cleanup does not move a resourceless VM out of provisioning state")
+	if !strings.Contains(runCleanupBody, "p.finalizeVMAddCompensation(") {
+		t.Fatal("vm_add cleanup does not finalize capacity and VM state after exact cleanup")
+	}
+	finalizeStart := strings.Index(vmOpsSrc, "func (p *Provisioner) finalizeVMAddCompensation(")
+	if finalizeStart < 0 {
+		t.Fatal("vm_add compensation finalizer not found")
+	}
+	finalizeEnd := strings.Index(vmOpsSrc[finalizeStart+1:], "\nfunc ")
+	if finalizeEnd < 0 {
+		t.Fatal("could not isolate vm_add compensation finalizer")
+	}
+	finalizeBody := vmOpsSrc[finalizeStart : finalizeStart+1+finalizeEnd]
+	releaseCapacity := strings.Index(finalizeBody, "p.releaseVMPlacementCapacity(")
+	markError := strings.Index(finalizeBody, "p.db.UpdatePodVMStatusFrom(")
+	if releaseCapacity < 0 || markError < releaseCapacity ||
+		!strings.Contains(finalizeBody, "models.VMStatusError") {
+		t.Fatal("vm_add compensation must release capacity before exposing terminal VM state")
 	}
 
 	for _, required := range []string{
+		"func (q *Queries) GetVMCloneOperation(",
 		"func (q *Queries) StageVMCloneCleanup(",
 		"'{cleanup_target}'",
 		"func (q *Queries) AdoptPodVMClone(",
+		"(vcenter_vm_id IS NULL OR vcenter_vm_id = $1)",
 		"func (q *Queries) DisarmVMCloneCleanup(",
 		"payload - 'cleanup_target' - 'cleanup_only'",
 		"func (q *Queries) CompleteVMCloneCleanup(",
@@ -428,8 +466,9 @@ func TestVMCloneCompensationUsesOnlyDurableExactTargets(t *testing.T) {
 		"return true, newPodCreateCompensatedError(stage)",
 		"return newPodCreateCompensatedError(\"initial pod lookup\")",
 		"return &compensationRetryError{\n\t\t\terr: fmt.Errorf(\"prepare pod_create cleanup",
-		"return &manualCleanupRequiredError{\n\t\t\terr: errors.New(\"cleanup-only vm_add lacks durable completion proof",
-		"return newVMAddCompensatedError(fmt.Sprintf(\"pod entered %s\", pod.Status))",
+		"p.finalizeVMAddCompensation(ctx, job, podVMID, true)",
+		"return p.completeVMAddWithoutClone(",
+		"return newVMAddCompensatedError(reason)",
 	} {
 		if !strings.Contains(createSrc+vmOpsSrc, required) {
 			t.Errorf("compensation terminal/retry semantics are missing %q", required)
@@ -492,6 +531,9 @@ func TestJobRecoveryUsesOwnedHeartbeatLeases(t *testing.T) {
 		"claimed_by = $3",
 		"claimed_by = $4 AND status IN ('claimed', 'in_progress')",
 		`fields["destroyed_cleanup_targets"]`,
+		"'pod_id', $2::jsonb->>'pod_id'",
+		"'pod_vm_id', $2::jsonb->>'pod_vm_id'",
+		"'vcenter_vm_id', $2::jsonb->>'vcenter_vm_id'",
 		"status = 'pending'",
 		"ErrVMCloneAlreadyDestroyed",
 		"func (q *Queries) UpdateJobRollbackSteps(",

@@ -19,6 +19,11 @@ var (
 )
 
 type cloneOperationStore interface {
+	GetVMCloneOperation(
+		ctx context.Context,
+		jobID uuid.UUID,
+		workerID string,
+	) (*models.VMCloneOperation, error)
 	PrepareVMCloneOperation(
 		ctx context.Context,
 		jobID uuid.UUID,
@@ -56,11 +61,16 @@ type cloneOperationClient interface {
 func cloneOperationParams(op *models.VMCloneOperation, params vcenter.CloneVMParams) vcenter.CloneVMParams {
 	params.OperationID = op.OperationID
 	params.PodVMID = op.PodVMID
+	params.LogicalTemplateID = op.LogicalTemplateID
 	params.TemplateName = op.SourceRef
+	params.SourceReplicaID = op.SourceReplicaID
+	params.ComputeResourceType = op.ComputeResourceType
+	params.ComputeResourceMoRef = op.ComputeResourceMoref
 	params.VMName = op.TargetName
 	params.HostMoRef = op.HostMoref
 	params.HostName = op.HostName
 	params.ResourcePoolMoRef = op.PoolMoref
+	params.DRSControl = op.DRSControl
 	return params
 }
 
@@ -100,6 +110,73 @@ func cloneRecoveryError(err error, target *VMCloneCleanupTarget) error {
 	return &compensationRetryError{err: err, target: target}
 }
 
+type cloneForwardRetryError struct {
+	err    error
+	target *VMCloneCleanupTarget
+}
+
+func (e *cloneForwardRetryError) Error() string {
+	return e.err.Error()
+}
+
+func (e *cloneForwardRetryError) Unwrap() error {
+	return e.err
+}
+
+func newCloneForwardRetryError(err error, target *VMCloneCleanupTarget) error {
+	return &cloneForwardRetryError{err: err, target: target}
+}
+
+func isCloneForwardRetry(err error) bool {
+	var retryErr *cloneForwardRetryError
+	return errors.As(err, &retryErr)
+}
+
+func cloneForwardRetryAvailable(job *models.Job, err error) bool {
+	return !isCompensationRetry(err) &&
+		!isManualCleanupRequired(err) &&
+		jobRetryAvailable(job, err)
+}
+
+func cloneForwardFailureToCompensation(err error) error {
+	var retryErr *cloneForwardRetryError
+	if !errors.As(err, &retryErr) {
+		return err
+	}
+	return cloneRecoveryError(err, retryErr.target)
+}
+
+func persistedClonePreambleFailure(
+	job *models.Job,
+	op *models.VMCloneOperation,
+	err error,
+) error {
+	if op == nil {
+		return err
+	}
+	if err == nil {
+		err = errors.New("handler exited before reconciling its persisted clone operation")
+	}
+	if isCompensationRetry(err) || isManualCleanupRequired(err) {
+		return err
+	}
+	classified := classifyCloneOperationFailure(err)
+	if cloneForwardRetryAvailable(job, classified) {
+		return classified
+	}
+	if isManualCleanupRequired(classified) || isCompensationRetry(classified) {
+		return classified
+	}
+	if isCloneForwardRetry(classified) {
+		return cloneForwardFailureToCompensation(classified)
+	}
+	return cloneRecoveryError(fmt.Errorf(
+		"persisted clone operation %s requires exact compensation after preamble failure: %w",
+		op.OperationID,
+		classified,
+	), nil)
+}
+
 func executeDurableVMClone(
 	ctx context.Context,
 	store cloneOperationStore,
@@ -109,28 +186,54 @@ func executeDurableVMClone(
 	podID, podVMID uuid.UUID,
 	params vcenter.CloneVMParams,
 ) (string, error) {
-	resolvedParams, err := client.ResolveClonePlacement(ctx, params)
+	if _, err := uuid.Parse(params.LogicalTemplateID); err != nil {
+		return "", fmt.Errorf("durable clone requires a logical template ID: %w", err)
+	}
+	op, err := store.GetVMCloneOperation(ctx, jobID, workerID)
 	if err != nil {
-		return "", fmt.Errorf("resolve durable clone placement: %w", err)
+		return "", fmt.Errorf("load durable clone operation: %w", err)
 	}
-	params = resolvedParams
-	candidate := models.VMCloneOperation{
-		OperationID: uuid.NewString(),
-		PodID:       podID.String(),
-		PodVMID:     podVMID.String(),
-		TargetName:  params.VMName,
-		SourceRef:   params.TemplateName,
-		HostMoref:   params.HostMoRef,
-		HostName:    params.HostName,
-		PoolMoref:   params.ResourcePoolMoRef,
-		Phase:       models.VMCloneOperationPrepared,
-		PreparedAt:  time.Now().UTC(),
+	if op == nil {
+		resolvedParams, resolveErr := client.ResolveClonePlacement(ctx, params)
+		if resolveErr != nil {
+			return "", fmt.Errorf("resolve durable clone placement: %w", resolveErr)
+		}
+		params = resolvedParams
+		candidate := models.VMCloneOperation{
+			OperationID:          uuid.NewString(),
+			PodID:                podID.String(),
+			PodVMID:              podVMID.String(),
+			LogicalTemplateID:    params.LogicalTemplateID,
+			TargetName:           params.VMName,
+			SourceReplicaID:      params.SourceReplicaID,
+			SourceRef:            params.TemplateName,
+			ComputeResourceType:  params.ComputeResourceType,
+			ComputeResourceMoref: params.ComputeResourceMoRef,
+			HostMoref:            params.HostMoRef,
+			HostName:             params.HostName,
+			PoolMoref:            params.ResourcePoolMoRef,
+			DRSControl:           params.DRSControl,
+			Phase:                models.VMCloneOperationPrepared,
+			PreparedAt:           time.Now().UTC(),
+		}
+		op, err = store.PrepareVMCloneOperation(ctx, jobID, workerID, candidate)
+		if err != nil {
+			return "", fmt.Errorf("prepare durable clone operation: %w", err)
+		}
 	}
-	op, err := store.PrepareVMCloneOperation(ctx, jobID, workerID, candidate)
-	if err != nil {
-		return "", fmt.Errorf("prepare durable clone operation: %w", err)
+	if op == nil ||
+		op.PodID != podID.String() ||
+		op.PodVMID != podVMID.String() ||
+		op.LogicalTemplateID != params.LogicalTemplateID ||
+		op.TargetName != params.VMName {
+		return "", &manualCleanupRequiredError{err: errors.New(
+			"persisted clone operation does not match the requested logical VM scope",
+		)}
 	}
-	if op == nil || op.HostMoref == "" || op.HostName == "" || op.PoolMoref == "" {
+	if op.LogicalTemplateID == "" ||
+		op.ComputeResourceType == "" || op.ComputeResourceMoref == "" ||
+		op.HostMoref == "" || op.HostName == "" || op.PoolMoref == "" ||
+		op.DRSControl == "" {
 		return "", &manualCleanupRequiredError{err: errors.New(
 			"persisted clone operation is missing immutable host placement; automatic recovery is unsafe",
 		)}
@@ -190,24 +293,30 @@ func executeDurableVMClone(
 				if errors.Is(reconcileErr, vcenter.ErrAmbiguousVMOwnership) {
 					return "", &manualCleanupRequiredError{err: reconcileErr}
 				}
-				return "", cloneRecoveryError(fmt.Errorf(
+				target := cloneCleanupTarget(podID, podVMID, moref, params)
+				if target != nil {
+					if err := stageCloneCleanupTarget(ctx, store, jobID, workerID, target); err != nil {
+						if isManualCleanupRequired(err) {
+							return moref, err
+						}
+						return moref, cloneRecoveryError(err, target)
+					}
+				}
+				classifiedErr := classifyPlacementValidationFailure(reconcileErr)
+				if isManualCleanupRequired(classifiedErr) {
+					return moref, classifiedErr
+				}
+				return moref, cloneRecoveryError(fmt.Errorf(
 					"reconcile ambiguous clone operation %s: %w",
 					op.OperationID,
-					reconcileErr,
-				), nil)
+					classifiedErr,
+				), target)
 			}
 			if moref == "" {
 				return "", cloneRecoveryError(fmt.Errorf(
 					"clone operation %s remains unresolved; no duplicate clone was submitted",
 					op.OperationID,
 				), nil)
-			}
-			if err := client.ValidateVMPlacement(ctx, moref, params.HostMoRef); err != nil {
-				return "", &manualCleanupRequiredError{err: fmt.Errorf(
-					"recovered clone %s violates persisted host placement: %w",
-					moref,
-					err,
-				)}
 			}
 			return stageAndConfigureClone(ctx, store, client, jobID, workerID, podID, podVMID, moref, params)
 		}
@@ -226,21 +335,70 @@ func executeDurableVMClone(
 
 	moref, err := client.WaitCloneVMTask(ctx, taskRef)
 	if err != nil {
-		return "", cloneRecoveryError(fmt.Errorf(
+		if errors.Is(err, vcenter.ErrCloneTaskFailed) {
+			return "", cloneRecoveryError(fmt.Errorf(
+				"durable clone operation %s task %s failed terminally: %w",
+				op.OperationID,
+				taskRef,
+				err,
+			), nil)
+		}
+		return "", newCloneForwardRetryError(fmt.Errorf(
 			"wait for durable clone operation %s task %s: %w",
 			op.OperationID,
 			taskRef,
 			err,
 		), nil)
 	}
-	if err := client.ValidateVMPlacement(ctx, moref, params.HostMoRef); err != nil {
-		return "", &manualCleanupRequiredError{err: fmt.Errorf(
-			"clone task %s completed on an invalid host: %w",
-			taskRef,
+	return stageAndConfigureClone(ctx, store, client, jobID, workerID, podID, podVMID, moref, params)
+}
+
+func cloneCleanupTarget(
+	podID, podVMID uuid.UUID,
+	moref string,
+	params vcenter.CloneVMParams,
+) *VMCloneCleanupTarget {
+	if moref == "" {
+		return nil
+	}
+	return &VMCloneCleanupTarget{
+		PodID:                podID.String(),
+		PodVMID:              podVMID.String(),
+		VCenterVMID:          moref,
+		LogicalTemplateID:    params.LogicalTemplateID,
+		SourceReplicaID:      params.SourceReplicaID,
+		SourceRef:            params.TemplateName,
+		ComputeResourceType:  params.ComputeResourceType,
+		ComputeResourceMoref: params.ComputeResourceMoRef,
+		ResourcePoolMoref:    params.ResourcePoolMoRef,
+		HostMoref:            params.HostMoRef,
+		DRSControl:           params.DRSControl,
+	}
+}
+
+func stageCloneCleanupTarget(
+	ctx context.Context,
+	store cloneOperationStore,
+	jobID uuid.UUID,
+	workerID string,
+	target *VMCloneCleanupTarget,
+) error {
+	if err := validateVMCloneCleanupIdentity(target); err != nil {
+		return &manualCleanupRequiredError{err: fmt.Errorf(
+			"clone cleanup target has incomplete immutable placement: %w",
 			err,
 		)}
 	}
-	return stageAndConfigureClone(ctx, store, client, jobID, workerID, podID, podVMID, moref, params)
+	raw, err := json.Marshal(target)
+	if err != nil {
+		return fmt.Errorf("marshal clone cleanup target: %w", err)
+	}
+	if err := persistCloneOperationWrite(ctx, func(writeCtx context.Context) error {
+		return store.StageVMCloneCleanup(writeCtx, jobID, workerID, raw)
+	}); err != nil {
+		return fmt.Errorf("stage exact clone %s: %w", target.VCenterVMID, err)
+	}
+	return nil
 }
 
 func stageAndConfigureClone(
@@ -253,22 +411,34 @@ func stageAndConfigureClone(
 	moref string,
 	params vcenter.CloneVMParams,
 ) (string, error) {
-	target := &VMCloneCleanupTarget{
-		PodID:       podID.String(),
-		PodVMID:     podVMID.String(),
-		VCenterVMID: moref,
+	target := cloneCleanupTarget(podID, podVMID, moref, params)
+	if err := stageCloneCleanupTarget(ctx, store, jobID, workerID, target); err != nil {
+		if isManualCleanupRequired(err) {
+			return moref, err
+		}
+		return moref, cloneRecoveryError(err, target)
 	}
-	raw, err := json.Marshal(target)
-	if err != nil {
-		return moref, cloneRecoveryError(fmt.Errorf("marshal clone cleanup target: %w", err), target)
-	}
-	if err := persistCloneOperationWrite(ctx, func(writeCtx context.Context) error {
-		return store.StageVMCloneCleanup(writeCtx, jobID, workerID, raw)
-	}); err != nil {
-		return moref, cloneRecoveryError(fmt.Errorf("stage exact clone %s: %w", moref, err), target)
+	if err := client.ValidateVMPlacement(ctx, moref, params.HostMoRef); err != nil {
+		validationErr := classifyPlacementValidationFailure(fmt.Errorf(
+			"clone %s placement validation failed: %w",
+			moref,
+			err,
+		))
+		if isManualCleanupRequired(validationErr) {
+			return moref, validationErr
+		}
+		return moref, newCloneForwardRetryError(validationErr, target)
 	}
 	if err := client.ConfigureClonedVM(ctx, moref, params); err != nil {
-		return moref, cloneRecoveryError(fmt.Errorf("configure exact clone %s: %w", moref, err), target)
+		classifiedErr := classifyPlacementValidationFailure(fmt.Errorf(
+			"configure exact clone %s: %w",
+			moref,
+			err,
+		))
+		if isManualCleanupRequired(classifiedErr) {
+			return moref, classifiedErr
+		}
+		return moref, newCloneForwardRetryError(classifiedErr, target)
 	}
 	return moref, nil
 }
@@ -311,7 +481,10 @@ func reconcileCloneOperationTargetForCleanup(
 		}
 		return nil, nil
 	}
-	if op.HostMoref == "" || op.HostName == "" || op.PoolMoref == "" {
+	if op.LogicalTemplateID == "" ||
+		op.ComputeResourceType == "" || op.ComputeResourceMoref == "" ||
+		op.HostMoref == "" || op.HostName == "" || op.PoolMoref == "" ||
+		op.DRSControl == "" {
 		return nil, &manualCleanupRequiredError{err: fmt.Errorf(
 			"clone operation %s has no persisted host placement; automatic recovery is unsafe",
 			op.OperationID,
@@ -327,13 +500,30 @@ func reconcileCloneOperationTargetForCleanup(
 	}
 	if moref == "" {
 		found, err := client.FindVMByCloneOperation(ctx, params)
+		moref = found
 		if err != nil {
 			if errors.Is(err, vcenter.ErrAmbiguousVMOwnership) {
 				return nil, &manualCleanupRequiredError{err: err}
 			}
-			return nil, cloneRecoveryError(fmt.Errorf("reconcile clone operation %s: %w", op.OperationID, err), nil)
+			target := cloneCleanupTargetFromOperation(op, moref)
+			if target != nil {
+				if stageErr := stageCloneCleanupTarget(ctx, store, jobID, workerID, target); stageErr != nil {
+					if isManualCleanupRequired(stageErr) {
+						return target, stageErr
+					}
+					return target, cloneRecoveryError(stageErr, target)
+				}
+			}
+			classifiedErr := classifyPlacementValidationFailure(err)
+			if isManualCleanupRequired(classifiedErr) {
+				return target, classifiedErr
+			}
+			return target, cloneRecoveryError(fmt.Errorf(
+				"reconcile clone operation %s: %w",
+				op.OperationID,
+				classifiedErr,
+			), target)
 		}
-		moref = found
 	}
 	if moref == "" {
 		if errors.Is(waitErr, vcenter.ErrCloneTaskFailed) {
@@ -361,25 +551,24 @@ func reconcileCloneOperationTargetForCleanup(
 			op.OperationID,
 		), nil)
 	}
+	target := cloneCleanupTargetFromOperation(op, moref)
+	if err := stageCloneCleanupTarget(ctx, store, jobID, workerID, target); err != nil {
+		if isManualCleanupRequired(err) {
+			return target, err
+		}
+		return target, cloneRecoveryError(err, target)
+	}
 	if err := client.ValidateVMPlacement(ctx, moref, op.HostMoref); err != nil {
-		return nil, &manualCleanupRequiredError{err: fmt.Errorf(
-			"clone operation %s resolved to VM %s on a disallowed host: %w",
+		classifiedErr := classifyPlacementValidationFailure(fmt.Errorf(
+			"clone operation %s resolved to VM %s whose placement validation failed: %w",
 			op.OperationID,
 			moref,
 			err,
-		)}
-	}
-	target := &VMCloneCleanupTarget{
-		PodID:       op.PodID,
-		PodVMID:     op.PodVMID,
-		VCenterVMID: moref,
-	}
-	raw, err := json.Marshal(target)
-	if err != nil {
-		return nil, cloneRecoveryError(err, target)
-	}
-	if err := store.StageVMCloneCleanup(ctx, jobID, workerID, raw); err != nil {
-		return nil, cloneRecoveryError(fmt.Errorf("stage reconciled clone %s: %w", moref, err), target)
+		))
+		if isManualCleanupRequired(classifiedErr) {
+			return target, classifiedErr
+		}
+		return target, cloneRecoveryError(classifiedErr, target)
 	}
 	return target, nil
 }

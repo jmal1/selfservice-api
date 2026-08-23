@@ -80,6 +80,7 @@ func TestPortGroupPartialCreateCompensatesOnlyCreatedHosts(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+
 		original := c.client.RoundTripper
 		recorder := &portGroupMutationRecorder{
 			next:            original,
@@ -101,6 +102,47 @@ func TestPortGroupPartialCreateCompensatesOnlyCreatedHosts(t *testing.T) {
 			} else if found {
 				t.Fatalf("partial portgroup create leaked onto %s", host.Name)
 			}
+		}
+	})
+}
+
+func TestPortGroupMutationTouchesOnlySelectedTargetHosts(t *testing.T) {
+	withSimulator(t, func(ctx context.Context, c *Client, _ *vim25.Client) {
+		host1, host2 := twoHostsInResourcePool(t, ctx, c, simResourcePool)
+		setAllowedHosts(c, host1, host2)
+		ns2 := networkSystemMoref(t, ctx, c, host2)
+
+		receipt, err := c.PlanPortGroupMutationForHosts(
+			ctx,
+			"Pod-VLAN405",
+			405,
+			[]string{host2.MoRef},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(receipt.Hosts) != 1 || receipt.Hosts[0].HostMoRef != host2.MoRef {
+			t.Fatalf("receipt hosts = %+v, want only %s", receipt.Hosts, host2.MoRef)
+		}
+
+		original := c.client.RoundTripper
+		recorder := &portGroupMutationRecorder{next: original}
+		c.client.RoundTripper = recorder
+		defer func() { c.client.RoundTripper = original }()
+
+		if err := c.ApplyPortGroupMutation(ctx, receipt); err != nil {
+			t.Fatal(err)
+		}
+		if got := recorder.snapshot(); !reflect.DeepEqual(got, []string{"add:" + ns2}) {
+			t.Fatalf("portgroup operations = %v, want target host only", got)
+		}
+		if _, found, err := c.findPortGroupOnHost(ctx, host1, receipt.Name); err != nil {
+			t.Fatal(err)
+		} else if found {
+			t.Fatalf("portgroup %s was created on unselected host %s", receipt.Name, host1.Name)
+		}
+		if err := c.DeletePortGroupMutation(ctx, receipt); err != nil {
+			t.Fatal(err)
 		}
 	})
 }

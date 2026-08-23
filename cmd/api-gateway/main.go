@@ -79,16 +79,17 @@ func main() {
 	var vcClient handlers.VCenterConsole
 	if cfg.VCenter.URL != "" && cfg.VCenter.User != "" {
 		vc := vcenter.New(vcenter.Config{
-			URL:            cfg.VCenter.URL,
-			User:           cfg.VCenter.User,
-			Password:       cfg.VCenter.Password,
-			Datacenter:     cfg.VCenter.Datacenter,
-			Datastore:      cfg.VCenter.Datastore,
-			VMFolder:       cfg.VCenter.VMFolder,
-			TemplateFolder: cfg.VCenter.TemplatesFolder,
-			ResourcePools:  cfg.VCenter.ResourcePools,
-			Hosts:          cfg.VCenter.Hosts,
-			Insecure:       cfg.VCenter.Insecure,
+			URL:                  cfg.VCenter.URL,
+			User:                 cfg.VCenter.User,
+			Password:             cfg.VCenter.Password,
+			Datacenter:           cfg.VCenter.Datacenter,
+			Datastore:            cfg.VCenter.Datastore,
+			VMFolder:             cfg.VCenter.VMFolder,
+			TemplateFolder:       cfg.VCenter.TemplatesFolder,
+			ResourcePools:        cfg.VCenter.ResourcePools,
+			Hosts:                cfg.VCenter.Hosts,
+			HostReservedMemoryMB: cfg.VCenter.HostReservedMemoryMB,
+			Insecure:             cfg.VCenter.Insecure,
 		}, logger)
 		if err := vc.Connect(ctx); err != nil {
 			logger.Warn("vCenter connection failed — console access disabled", "error", err)

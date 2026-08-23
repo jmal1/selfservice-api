@@ -449,6 +449,10 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 		if vm.RAMMB != nil {
 			ramMB = *vm.RAMMB
 		}
+		if err := validateProvisioningRAM(ramMB); err != nil {
+			respondError(w, r, http.StatusBadRequest, err.Error())
+			return
+		}
 		diskGB := found.DefaultDiskGB
 		if vm.DiskGB != nil {
 			diskGB = *vm.DiskGB
@@ -960,6 +964,10 @@ func (h *Handler) AddVM(w http.ResponseWriter, r *http.Request) {
 	ram := found.DefaultRAMMB
 	if req.RAMMB != nil {
 		ram = *req.RAMMB
+	}
+	if err := validateProvisioningRAM(ram); err != nil {
+		respondError(w, r, http.StatusBadRequest, err.Error())
+		return
 	}
 	diskGB := found.DefaultDiskGB
 	if req.DiskGB != nil {

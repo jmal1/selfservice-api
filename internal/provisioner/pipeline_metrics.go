@@ -1,4 +1,4 @@
-﻿// Metrics for the template + image pipeline. Mirrors the design of
+// Metrics for the template + image pipeline. Mirrors the design of
 // DestroyFailedPusher and OrphanCountPusher: no prometheus client
 // dependency, hand-serialized text exposition, pushed to Pushgateway,
 // and a no-op when BaseURL is empty so the worker still does its job in
@@ -76,15 +76,20 @@ type PipelineMetrics struct {
 	templateStuckCollected bool
 
 	// Job retry metrics (migration 000026).
-	jobRetries                map[string]float64 // type|reason
-	jobRetryExhausted         map[string]float64 // type
-	jobRetryPending           float64            // gauge: jobs sleeping between retries
-	jobRetryPendingCollected  bool               // true once SetJobRetryPending has run
+	jobRetries               map[string]float64 // type|reason
+	jobRetryExhausted        map[string]float64 // type
+	jobRetryPending          float64            // gauge: jobs sleeping between retries
+	jobRetryPendingCollected bool               // true once SetJobRetryPending has run
 
 	// L1 trust-tier revalidation metrics (migration 000027).
 	templateValidation             map[string]float64 // template_id|result — counter
 	templateLastValidated          map[string]float64 // template_id — gauge (unix seconds)
 	templateLastValidatedCollected bool               // true once SetTemplateLastValidated has run
+
+	vmPlacementTotal      map[string]float64 // host|compute|source
+	vmPlacementHeadroomMB map[string]float64 // host
+	vmPlacementDrift      map[string]float64 // kind
+	vmPlacementRejections map[string]float64 // reason
 }
 
 // NewPipelineMetrics returns an initialized collector. baseURL may be
@@ -95,23 +100,27 @@ func NewPipelineMetrics(baseURL, job string, grouping map[string]string) *Pipeli
 		job = "crucible_pipeline"
 	}
 	return &PipelineMetrics{
-		BaseURL:             baseURL,
-		Job:                 job,
-		GroupingLabels:      grouping,
-		imageUploadTotal:    map[string]float64{},
-		imageImportTotal:    map[string]float64{},
-		imageImportDurSum:   map[string]float64{},
-		imageImportDurCount: map[string]float64{},
-		imageImportBytes:    map[string]float64{},
-		templateTransitions: map[string]float64{},
-		templateVerify:      map[string]float64{},
-		templateJobDurSum:   map[string]float64{},
-		templateJobDurCount: map[string]float64{},
-		templateStates:      map[string]float64{},
-		jobRetries:          map[string]float64{},
-		jobRetryExhausted:   map[string]float64{},
-		templateValidation:  map[string]float64{},
+		BaseURL:               baseURL,
+		Job:                   job,
+		GroupingLabels:        grouping,
+		imageUploadTotal:      map[string]float64{},
+		imageImportTotal:      map[string]float64{},
+		imageImportDurSum:     map[string]float64{},
+		imageImportDurCount:   map[string]float64{},
+		imageImportBytes:      map[string]float64{},
+		templateTransitions:   map[string]float64{},
+		templateVerify:        map[string]float64{},
+		templateJobDurSum:     map[string]float64{},
+		templateJobDurCount:   map[string]float64{},
+		templateStates:        map[string]float64{},
+		jobRetries:            map[string]float64{},
+		jobRetryExhausted:     map[string]float64{},
+		templateValidation:    map[string]float64{},
 		templateLastValidated: map[string]float64{},
+		vmPlacementTotal:      map[string]float64{},
+		vmPlacementHeadroomMB: map[string]float64{},
+		vmPlacementDrift:      map[string]float64{},
+		vmPlacementRejections: map[string]float64{},
 	}
 }
 
@@ -241,6 +250,30 @@ func (m *PipelineMetrics) SetTemplateLastValidated(templateID string, unixSec fl
 	m.templateLastValidatedCollected = true
 }
 
+func (m *PipelineMetrics) RecordVMPlacement(host, compute, source string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.vmPlacementTotal[host+"|"+compute+"|"+source]++
+}
+
+func (m *PipelineMetrics) SetVMPlacementHeadroom(host string, megabytes int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.vmPlacementHeadroomMB[host] = float64(megabytes)
+}
+
+func (m *PipelineMetrics) RecordVMPlacementDrift(kind string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.vmPlacementDrift[kind]++
+}
+
+func (m *PipelineMetrics) RecordVMPlacementRejection(reason string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.vmPlacementRejections[reason]++
+}
+
 // Push serializes the current values and POSTs them. No-op when BaseURL
 // is empty.
 func (m *PipelineMetrics) Push(ctx context.Context) error {
@@ -358,6 +391,19 @@ func (m *PipelineMetrics) serialize() []byte {
 			"template_id", m.templateLastValidated)
 	}
 
+	writeCounter3(&b, "crucible_vm_placement_total",
+		"Durable VM placements by target host, compute resource, and source replica.",
+		"host", "compute", "source", m.vmPlacementTotal)
+	writeGauge1(&b, "crucible_vm_placement_headroom_megabytes",
+		"Free host memory remaining after planned VM memory and configured reserve.",
+		"host", m.vmPlacementHeadroomMB)
+	writeCounter1(&b, "crucible_vm_placement_drift_total",
+		"Detected immutable placement or DRS-control drift.",
+		"kind", m.vmPlacementDrift)
+	writeCounter1(&b, "crucible_vm_placement_rejections_total",
+		"Rejected VM placements by reason.",
+		"reason", m.vmPlacementRejections)
+
 	b.WriteString("# HELP crucible_pipeline_run_timestamp_seconds Unix time of the latest pipeline metrics push.\n")
 	b.WriteString("# TYPE crucible_pipeline_run_timestamp_seconds gauge\n")
 	fmt.Fprintf(&b, "crucible_pipeline_run_timestamp_seconds %d\n", time.Now().Unix())
@@ -374,6 +420,10 @@ func writeCounter1(b *bytes.Buffer, name, help, label string, vals map[string]fl
 // writeCounter2 emits a counter family whose map keys are "a|b".
 func writeCounter2(b *bytes.Buffer, name, help, l1, l2 string, vals map[string]float64) {
 	writeFamily(b, name, help, "counter", []string{l1, l2}, vals)
+}
+
+func writeCounter3(b *bytes.Buffer, name, help, l1, l2, l3 string, vals map[string]float64) {
+	writeFamily(b, name, help, "counter", []string{l1, l2, l3}, vals)
 }
 
 func writeGauge1(b *bytes.Buffer, name, help, label string, vals map[string]float64) {

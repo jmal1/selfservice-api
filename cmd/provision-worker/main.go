@@ -84,10 +84,11 @@ func main() {
 		// holds ephemeral student pod VMs and is what the orphan reconciler
 		// scans. Without this the ISO path resolved an empty folder path and
 		// failed before creating anything.
-		TemplateFolder: cfg.VCenter.TemplatesFolder,
-		ResourcePools:  cfg.VCenter.ResourcePools,
-		Hosts:          cfg.VCenter.Hosts,
-		Insecure:       cfg.VCenter.Insecure,
+		TemplateFolder:       cfg.VCenter.TemplatesFolder,
+		ResourcePools:        cfg.VCenter.ResourcePools,
+		Hosts:                cfg.VCenter.Hosts,
+		HostReservedMemoryMB: cfg.VCenter.HostReservedMemoryMB,
+		Insecure:             cfg.VCenter.Insecure,
 	}, logger)
 
 	if err := vcClient.Connect(ctx); err != nil {

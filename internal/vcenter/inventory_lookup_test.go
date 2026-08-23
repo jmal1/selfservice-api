@@ -67,6 +67,7 @@ func TestOperationMarkerRequiresExactSourceAndPodVM(t *testing.T) {
 		ResourcePoolMoRef: "resgroup-1",
 	}
 	markerParams := params
+	runtimeHost := markerParams.HostMoRef
 	reader := vmInventoryReader{
 		moref: "vm-42",
 		read: func(_ context.Context, _ []string, dst *mo.VirtualMachine) error {
@@ -80,7 +81,7 @@ func TestOperationMarkerRequiresExactSourceAndPodVM(t *testing.T) {
 					&types.OptionValue{Key: CloneOperationPoolKey, Value: markerParams.ResourcePoolMoRef},
 				},
 			}
-			dst.Runtime.Host = &types.ManagedObjectReference{Type: "HostSystem", Value: markerParams.HostMoRef}
+			dst.Runtime.Host = &types.ManagedObjectReference{Type: "HostSystem", Value: runtimeHost}
 			return nil
 		},
 	}
@@ -92,5 +93,16 @@ func TestOperationMarkerRequiresExactSourceAndPodVM(t *testing.T) {
 	params.PodVMID = "different"
 	if _, err := findVMOperationInInventory(context.Background(), []vmInventoryReader{reader}, params); !errors.Is(err, ErrAmbiguousVMOwnership) {
 		t.Fatalf("mismatched immutable marker error = %v", err)
+	}
+
+	params.PodVMID = markerParams.PodVMID
+	runtimeHost = "host-2"
+	_, err = findVMOperationInInventory(context.Background(), []vmInventoryReader{reader}, params)
+	var drift *PlacementDriftError
+	if !errors.As(err, &drift) || drift.Kind != PlacementDriftHost {
+		t.Fatalf("wrong-host clone marker error = %#v, want typed host drift", err)
+	}
+	if !errors.Is(err, ErrPlacementDrift) || !errors.Is(err, ErrHostNotAllowed) {
+		t.Fatalf("wrong-host clone marker error = %v, want placement drift and host-not-allowed", err)
 	}
 }

@@ -28,6 +28,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jmal1/selfservice-api/internal/models"
+	"github.com/jmal1/selfservice-api/internal/vcenter"
 )
 
 // --------------------------------------------------------------------------
@@ -161,6 +162,7 @@ func TestHandleJobOutcome_RetryableReturnsPending(t *testing.T) {
 		RetryCount: 0,
 		MaxRetries: 3,
 	}
+
 	retryableErr := errors.New("clone source VM: wait clone task: The virtual disk is either corrupted or not a supported format.")
 
 	result := runLifecycle(context.Background(), db, m, job, retryableErr)
@@ -187,6 +189,81 @@ func TestHandleJobOutcome_RetryableReturnsPending(t *testing.T) {
 	if m.jobRetries[key] == 0 {
 		t.Errorf("crucible_job_retries_total[%s] not incremented", key)
 	}
+}
+
+func TestHandleJobOutcome_NormalizesTypedPlacementFailures(t *testing.T) {
+	t.Run("operational failure retries", func(t *testing.T) {
+		db := &fakeJobDB{}
+		metrics := NewPipelineMetrics("", "", nil)
+		job := &models.Job{
+			ID:         uuid.New(),
+			Type:       models.JobTypeVMSuspend,
+			RetryCount: 0,
+			MaxRetries: 3,
+		}
+		err := fmt.Errorf("read VM placement: %w", context.DeadlineExceeded)
+
+		if result := runLifecycle(context.Background(), db, metrics, job, err); result != nil {
+			t.Fatalf("operational placement failure result = %v, want scheduled retry", result)
+		}
+		if len(db.retried) != 1 || db.retried[0].cleanupOnly {
+			t.Fatalf("operational placement retries = %+v, want one ordinary retry", db.retried)
+		}
+	})
+
+	t.Run("proven drift requires manual cleanup", func(t *testing.T) {
+		db := &fakeJobDB{}
+		metrics := NewPipelineMetrics("", "", nil)
+		job := &models.Job{
+			ID:         uuid.New(),
+			Type:       models.JobTypeVMSuspend,
+			RetryCount: 0,
+			MaxRetries: 3,
+		}
+		err := &vcenter.PlacementDriftError{
+			Kind:   vcenter.PlacementDriftHost,
+			Detail: "VM moved from its persisted host",
+		}
+
+		result := runLifecycle(context.Background(), db, metrics, job, err)
+		if !isManualCleanupRequired(result) {
+			t.Fatalf("proven placement drift result = %v, want manual cleanup", result)
+		}
+		if len(db.retried) != 0 {
+			t.Fatalf("proven drift scheduled retries: %+v", db.retried)
+		}
+		failed := db.statusesWithStatus(models.JobStatusFailed)
+		if len(failed) != 1 {
+			t.Fatalf("failed status count = %d, want 1", len(failed))
+		}
+		if !strings.Contains(string(failed[0].result), `"manual_cleanup_required":true`) {
+			t.Fatalf("proven drift failed result = %s, want manual cleanup marker", failed[0].result)
+		}
+	})
+
+	t.Run("cleanup retry outranks contained drift", func(t *testing.T) {
+		db := &fakeJobDB{}
+		metrics := NewPipelineMetrics("", "", nil)
+		job := &models.Job{
+			ID:         uuid.New(),
+			Type:       models.JobTypeVMAdd,
+			RetryCount: 3,
+			MaxRetries: 3,
+		}
+		err := &compensationRetryError{
+			err: &vcenter.PlacementDriftError{
+				Kind:   vcenter.PlacementDriftHost,
+				Detail: "exact cleanup target moved",
+			},
+		}
+
+		if result := runLifecycle(context.Background(), db, metrics, job, err); result != nil {
+			t.Fatalf("cleanup drift result = %v, want durable cleanup retry", result)
+		}
+		if len(db.retried) != 1 || !db.retried[0].cleanupOnly {
+			t.Fatalf("cleanup drift retries = %+v, want one cleanup-only retry", db.retried)
+		}
+	})
 }
 
 func TestHandleJobOutcome_PodCreateCleanupRetryIsDurablyMarked(t *testing.T) {

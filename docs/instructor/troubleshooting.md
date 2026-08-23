@@ -63,6 +63,10 @@ MoRef is then staged before any reconfiguration. Cleanup never resolves a VM by
 display name and never resumes forward configuration, power-on, or snapshots.
 
 Clone task waits have a 15-minute operational deadline. An armed submission
+whose persisted task wait or post-clone placement/configuration step fails
+transiently resumes that same task or exact clone within the job's forward retry
+budget; it never submits another clone. Exhaustion or a proven terminal
+condition switches the operation to cleanup-only compensation. An armed submission
 with no task reference and no discoverable marked VM remains cleanup-only for
 30 minutes, then surfaces `manual_cleanup_required` for operator resolution
 rather than retrying or cloning indefinitely. Pod creation keeps exact clone
@@ -98,23 +102,70 @@ only host allowlist for both VM placement and standard-vSwitch portgroup
 changes. A candidate must also be connected, outside maintenance mode, in the
 configured/source-compatible resource pool, able to access the datastore, have
 the required standard portgroup, and satisfy the VM's capacity requirements.
+For templates with source replicas, the source VM, resource pool, and target
+host must have the same immutable compute-resource identity. Once a template has
+ever had a replica registered, an unavailable, unhealthy, or deleted replica
+never falls back to the legacy source. Check the `replica_mode` field as well as
+the `replicas` array; `replica_mode: true` with no `ready` entries intentionally
+blocks provisioning until a replacement source is registered.
+
+An in-flight legacy job that already adopted a clone before the placement
+migration reconstructs the VM's exact live host, configured resource pool, and
+compute identity, then installs the per-VM DRS override before continuing. This
+does not guess a new destination or charge the already-resident VM against
+headroom again. If source-replica mode was enabled before that reconstruction,
+the job fails closed because the original replica identity cannot be proven.
+
 PF-03 and PF-11 use this same resolver, so a failed preflight cannot be
 overridden by cluster-wide availability elsewhere.
 
 Do not add another host or broaden `VCENTER_HOSTS` merely to clear the error.
 Check the named host's connection and maintenance state, resource-pool
-membership, datastore mount, standard portgroup, and available capacity. During
-an isolated-host canary, keep API admission and worker provisioning claims off,
-keep worker replicas at zero until the approved step, and keep lifecycle,
-runner, template-health, L1, and other destructive synthetics/schedulers off.
+membership, datastore mount, standard portgroup, and available capacity. Check
+`GET /api/v1/admin/templates/{templateID}/source-replicas` for a `ready` source
+in the intended compute resource. A diagnostic mentioning reserved headroom
+means the host would fall below
+`VCENTER_PLACEMENT_RESERVED_MEMORY_MB` after the new VM and the other VMs in the
+same pod plan. Durable reservations from other unreleased placement plans are
+included under a per-host PostgreSQL admission lock, so concurrent workers
+cannot overbook the reserve. Reservations are released explicitly only after a
+VM is running or exact compensation proves no VM remains. A terminal or
+`manual_cleanup_required` job can therefore continue reserving capacity by
+design; resolve its exact cleanup state rather than editing the job status. Do
+not reduce the reserve without an explicit capacity review.
+During an isolated-host canary, keep API admission and worker provisioning
+claims off, keep worker replicas at zero until the approved step, and keep
+lifecycle, runner, template-health, L1, and other destructive
+synthetics/schedulers off.
 
-Host pinning controls creation but cannot prevent a later DRS or manual vMotion.
-A vCenter administrator must install and verify a VM-host affinity/must-run rule
-or equivalent host exclusion before the canary. For the ESXi2 containment
-canary, `VCENTER_HOSTS` must contain ESXi1 only, the resource pool must be the
-compatible Intel pool, and the external rule must keep Crucible and temporary
-VMs off ESXi2. Leave the pending production pod/job untouched until a human
-approves the canary.
+Crucible installs a per-VM DRS-disabled override and checks the persisted host,
+compute resource, and override before later forward operations. A missing
+override, enabled override, or moved VM is placement drift and the operation
+fails closed. Inspect `crucible_vm_placement_drift_total{kind=...}` and the
+worker error; restore the exact placement/control only after confirming the VM
+identity. A timeout, connection error, or failed vCenter property read is not
+proof of drift and remains eligible for normal job retry instead of being
+terminalized as manual cleanup. Destructive clone cleanup also compares the
+live resource pool and durable source, replica, template, pod-VM, compute, pool,
+and host markers. A pre-configuration clone may lack its DRS override, so exact
+cleanup installs and verifies the missing control before deletion; an enabled
+override remains confirmed drift. VM rows remain non-terminal until exact
+cleanup succeeds, preserving the identity needed for safe retries. Manual vMotion and the
+clone-to-override interval still require an
+external VM-host affinity/must-run rule or equivalent host exclusion during a
+containment canary. For the ESXi2 canary, `VCENTER_HOSTS` must contain ESXi1
+only, the resource pool must be the compatible AMD pool, and the external rule
+must keep Crucible and temporary VMs off ESXi2. Leave the pending production
+pod/job untouched until a human approves the canary.
+
+Placement diagnostics are exported as:
+
+| Metric | Meaning |
+|--------|---------|
+| `crucible_vm_placement_total{host,compute,source}` | Durable placement decisions by exact target and source replica (`source="legacy"` for zero-row compatibility). |
+| `crucible_vm_placement_headroom_megabytes{host}` | Free memory remaining after the pod plan and configured reserve. |
+| `crucible_vm_placement_rejections_total{reason}` | Failed placement decisions, including `reserved_headroom`. |
+| `crucible_vm_placement_drift_total{kind}` | Refused operations after `host`, `compute`, or `drs` drift. |
 
 ### "Durable port group ownership cannot be proven"
 

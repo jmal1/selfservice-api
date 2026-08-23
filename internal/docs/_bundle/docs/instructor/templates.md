@@ -226,6 +226,59 @@ standard portgroup. A **No eligible allowlisted vCenter placement** error is an
 operator safety block; do not change the template or broaden the host list to
 work around it. See [Troubleshooting](troubleshooting.md#no-eligible-allowlisted-vcenter-placement).
 
+### Source replicas for multiple compute clusters
+
+A logical template needs one real, validated source VM in every compute cluster
+where it may be cloned. An administrator registers a source replica by immutable
+vCenter identity:
+
+```http
+POST /api/v1/admin/templates/{templateID}/source-replicas
+Content-Type: application/json
+
+{"source_ref":"vm-123"}
+```
+
+Use `GET /api/v1/admin/templates/{templateID}/source-replicas` to inspect
+`replica_mode` and the `replicas` array, and
+`DELETE /api/v1/admin/templates/{templateID}/source-replicas/{replicaID}` to
+remove an unused one. Registration verifies the source VM and its current
+compute resource live in vCenter. The database migration does not invent
+replicas for another cluster.
+
+A template keeps using its existing source for backward compatibility only
+until the first replica is registered. Registration durably enables
+source-replica mode; deleting every replica does not restore the legacy
+fallback. An enabled template with no `ready` replica fails closed until a
+replacement is registered. Provisioning requires the source, resource pool, and
+selected host to belong to the same compute resource. Each pod's complete
+placement is stored before host networking changes begin, and retries reuse
+that exact source, pool, and host. Host headroom admission also includes durable
+RAM reservations from other unreleased placement plans under a per-host
+PostgreSQL lock, so concurrent workers cannot each spend the same free memory.
+A reservation is released only after its VM is running or exact cleanup proves
+that no VM remains; a failed/manual-cleanup job does not release capacity by
+status alone. An already-resident VM is not charged twice during legacy
+recovery.
+
+For clustered destinations, Crucible disables automatic DRS movement for each
+created VM and detects later host, compute, or DRS-control drift before forward
+power and snapshot operations. Standard-switch portgroups are created only on
+the union of hosts selected for that pod. Adding a VM is limited to hosts already
+covered by the pod's durable portgroup receipt. A confirmed identity/control
+mismatch requires manual cleanup; a timeout, connection failure, or unreadable
+vCenter property remains an operational error eligible for normal retry.
+Cleanup also rechecks the live resource pool and the durable source, replica,
+template, pod-VM, compute, pool, and host clone markers before deletion. If a
+clone failed before its first configuration installed the DRS override, cleanup
+installs and verifies that control before deletion; an enabled override remains
+drift and fails closed.
+
+> [!note] The periodic template-health and L1 views are still logical-template
+> views in this foundation. Registration and placement validate each replica
+> live, but the UI does not yet show an independently confirmed health history
+> per replica.
+
 As soon as state flips to `configuring`, the **Open Build Console**
 button appears.
 
