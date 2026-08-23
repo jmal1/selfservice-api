@@ -291,6 +291,324 @@ func TestPlacementRecoveryWiringRejectsGuardSabotage(t *testing.T) {
 	}
 }
 
+type cloneForwardRetryWiring struct {
+	clone    string
+	cloneDB  string
+	create   string
+	vmOps    string
+	template string
+	retrySQL string
+}
+
+func validateCloneForwardRetryWiring(src cloneForwardRetryWiring) error {
+	required := map[string][]string{
+		"clone operation": {
+			"errors.Is(err, vcenter.ErrCloneTaskFailed)",
+			`return "", newCloneForwardRetryError(fmt.Errorf(`,
+			"return moref, newCloneForwardRetryError(validationErr, target)",
+			"return moref, newCloneForwardRetryError(classifiedErr, target)",
+			"func cloneForwardFailureToCompensation(err error) error",
+			"store.GetVMCloneOperation(ctx, jobID, workerID)",
+			"func persistedClonePreambleFailure(",
+		},
+		"clone operation DB": {
+			"func (q *Queries) GetVMCloneOperation(",
+			"AND claimed_by = $2",
+			"validateVMCloneOperation(op)",
+		},
+		"pod create": {
+			"if cloneForwardRetryAvailable(job, cloneErr) {",
+			"return p.failPodCreateAfterCloneError(",
+			"clonePreamblePending := payload.CloneOperation != nil",
+			"retErr = persistedClonePreambleFailure(job, payload.CloneOperation, retErr)",
+			"resumeCloneOperation := payload.CloneOperation != nil &&",
+			"if existingVMMoref != \"\" && !resumeCloneOperation {",
+			"pod became active before its persisted clone operation was reconciled",
+			"refuse to overwrite existing pod VM reference %s with resumed clone %s",
+			"persisted clone state reconciliation",
+		},
+		"VM add": {
+			"if cloneForwardRetryAvailable(job, jobErr) {",
+			"if isCloneForwardRetry(jobErr) {",
+			"return cloneForwardFailureToCompensation(jobErr)",
+			"clonePreamblePending := payload.CloneOperation != nil",
+			"retErr = persistedClonePreambleFailure(job, payload.CloneOperation, retErr)",
+			"payload.CloneOperation == nil",
+			"pod entered %s before persisted clone reconciliation",
+			"refuse to overwrite existing added VM reference %s with resumed clone %s",
+		},
+		"template smoke": {
+			"isCloneForwardRetry(resultErr) &&",
+			"cloneForwardRetryAvailable(job, resultErr) {",
+			"if cloneForwardRetryAvailable(job, cloneErr) {",
+			"return cloneForwardFailureToCompensation(cloneErr)",
+			"if cloneForwardRetryAvailable(job, checkErr) {",
+			"if isCloneForwardRetry(checkErr) {",
+			"retErr = persistedClonePreambleFailure(job, payload.CloneOperation, retErr)",
+			"err = persistedClonePreambleFailure(job, payload.CloneOperation, err)",
+		},
+		"retry SQL": {
+			"ELSE payload - 'cleanup_only' - 'cleanup_completed'",
+			"AND (vcenter_vm_id IS NULL OR vcenter_vm_id = $1)",
+		},
+	}
+	bodies := map[string]string{
+		"clone operation":    src.clone,
+		"clone operation DB": src.cloneDB,
+		"pod create":         src.create,
+		"VM add":             src.vmOps,
+		"template smoke":     src.template,
+		"retry SQL":          src.retrySQL,
+	}
+	for component, fragments := range required {
+		for _, fragment := range fragments {
+			if !strings.Contains(bodies[component], fragment) {
+				return fmt.Errorf("%s is missing clone forward-retry guard %q", component, fragment)
+			}
+		}
+	}
+	executeStart := strings.Index(src.clone, "func executeDurableVMClone(")
+	executeEnd := strings.Index(src.clone, "func cloneCleanupTarget(")
+	if executeStart < 0 || executeEnd <= executeStart {
+		return errors.New("durable clone execution body is missing")
+	}
+	executeBody := src.clone[executeStart:executeEnd]
+	load := strings.Index(executeBody, "store.GetVMCloneOperation(ctx, jobID, workerID)")
+	freshOnly := strings.Index(executeBody, "if op == nil {")
+	resolve := strings.Index(executeBody, "client.ResolveClonePlacement(ctx, params)")
+	if load < 0 || freshOnly < 0 || resolve < 0 ||
+		load > freshOnly || freshOnly > resolve {
+		return errors.New("persisted clone operation must load before fresh placement resolution")
+	}
+	revalidateStart := strings.Index(src.template, "func revalidateL1TemplateJob(")
+	revalidateEnd := strings.Index(src.template, "func (p *Provisioner) RevalidateL1Template(")
+	if revalidateStart < 0 || revalidateEnd <= revalidateStart {
+		return errors.New("template revalidation body is missing")
+	}
+	revalidateBody := src.template[revalidateStart:revalidateEnd]
+	forwardReturn := strings.Index(revalidateBody, "if isCloneForwardRetry(checkErr) {")
+	recordOutcome := strings.Index(revalidateBody, "revalidateL1TemplateCore(")
+	if forwardReturn < 0 || recordOutcome < 0 || forwardReturn > recordOutcome {
+		return errors.New("template revalidation records an outcome before returning clone forward retry")
+	}
+	if strings.Count(src.template, "payload.VMMoref = payload.CloneOperation.SourceRef") < 2 {
+		return errors.New("template verify and revalidate do not both reuse the persisted source")
+	}
+	return nil
+}
+
+func TestCloneForwardRetryWiringRejectsGuardSabotage(t *testing.T) {
+	t.Parallel()
+	read := func(path string) string {
+		t.Helper()
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(body)
+	}
+	src := cloneForwardRetryWiring{
+		clone:    read("clone_operation.go"),
+		cloneDB:  read("../database/clone_operations.go"),
+		create:   read("create.go"),
+		vmOps:    read("vm_ops.go"),
+		template: read("template_jobs.go"),
+		retrySQL: read("../database/queries.go"),
+	}
+	if err := validateCloneForwardRetryWiring(src); err != nil {
+		t.Fatal(err)
+	}
+
+	sabotages := map[string]cloneForwardRetryWiring{}
+	sabotaged := src
+	sabotaged.clone = strings.Replace(
+		src.clone,
+		`return "", newCloneForwardRetryError(fmt.Errorf(`,
+		`return "", cloneRecoveryError(fmt.Errorf(`,
+		1,
+	)
+	sabotages["task-wait"] = sabotaged
+	sabotaged = src
+	sabotaged.clone = strings.Replace(
+		src.clone,
+		"errors.Is(err, vcenter.ErrCloneTaskFailed)",
+		"false",
+		1,
+	)
+	sabotages["terminal-task"] = sabotaged
+	sabotaged = src
+	sabotaged.clone = strings.Replace(
+		src.clone,
+		"return moref, newCloneForwardRetryError(validationErr, target)",
+		"return moref, cloneRecoveryError(validationErr, target)",
+		1,
+	)
+	sabotages["post-clone-validation"] = sabotaged
+	sabotaged = src
+	sabotaged.clone = strings.Replace(
+		src.clone,
+		"return moref, newCloneForwardRetryError(classifiedErr, target)",
+		"return moref, cloneRecoveryError(classifiedErr, target)",
+		1,
+	)
+	sabotages["post-clone-configuration"] = sabotaged
+	sabotaged = src
+	sabotaged.create = strings.Replace(
+		src.create,
+		"if cloneForwardRetryAvailable(job, cloneErr) {",
+		"if false {",
+		1,
+	)
+	sabotages["pod-create-budget"] = sabotaged
+	sabotaged = src
+	sabotaged.vmOps = strings.Replace(
+		src.vmOps,
+		"return cloneForwardFailureToCompensation(jobErr)",
+		"return jobErr",
+		1,
+	)
+	sabotages["vm-add-exhaustion"] = sabotaged
+	sabotaged = src
+	sabotaged.template = strings.Replace(
+		src.template,
+		"isCloneForwardRetry(resultErr) &&",
+		"false &&",
+		1,
+	)
+	sabotages["smoke-defer"] = sabotaged
+	sabotaged = src
+	sabotaged.template = strings.Replace(
+		src.template,
+		"return cloneForwardFailureToCompensation(cloneErr)",
+		"return cloneErr",
+		1,
+	)
+	sabotages["smoke-exhaustion"] = sabotaged
+	sabotaged = src
+	sabotaged.template = strings.Replace(
+		src.template,
+		"if cloneForwardRetryAvailable(job, checkErr) {",
+		"if false {",
+		1,
+	)
+	sabotages["template-verify-state"] = sabotaged
+	sabotaged = src
+	sabotaged.retrySQL = strings.Replace(
+		src.retrySQL,
+		"ELSE payload - 'cleanup_only' - 'cleanup_completed'",
+		"ELSE payload",
+		1,
+	)
+	sabotages["forward-marker"] = sabotaged
+	sabotaged = src
+	sabotaged.clone = strings.Replace(
+		src.clone,
+		"store.GetVMCloneOperation(ctx, jobID, workerID)",
+		"store.RemovedVMCloneOperation(ctx, jobID, workerID)",
+		1,
+	)
+	sabotages["resume-before-resolve"] = sabotaged
+	sabotaged = src
+	executeStart := strings.Index(src.clone, "func executeDurableVMClone(")
+	if executeStart < 0 {
+		t.Fatal("durable clone execution body is missing")
+	}
+	sabotaged.clone = src.clone[:executeStart] + strings.Replace(
+		src.clone[executeStart:],
+		"if op == nil {",
+		"if true {",
+		1,
+	)
+	sabotages["fresh-resolution-guard"] = sabotaged
+	sabotaged = src
+	sabotaged.cloneDB = strings.Replace(
+		src.cloneDB,
+		"func (q *Queries) GetVMCloneOperation(",
+		"func (q *Queries) RemovedVMCloneOperation(",
+		1,
+	)
+	sabotages["claimed-operation-load"] = sabotaged
+	sabotaged = src
+	sabotaged.create = strings.Replace(
+		src.create,
+		"retErr = persistedClonePreambleFailure(job, payload.CloneOperation, retErr)",
+		"retErr = retErr",
+		1,
+	)
+	sabotages["pod-create-preamble"] = sabotaged
+	sabotaged = src
+	sabotaged.vmOps = strings.Replace(
+		src.vmOps,
+		"retErr = persistedClonePreambleFailure(job, payload.CloneOperation, retErr)",
+		"retErr = retErr",
+		1,
+	)
+	sabotages["vm-add-preamble"] = sabotaged
+	sabotaged = src
+	sabotaged.template = strings.Replace(
+		src.template,
+		"if isCloneForwardRetry(checkErr) {",
+		"if false {",
+		1,
+	)
+	sabotages["revalidation-outcome"] = sabotaged
+	sabotaged = src
+	sabotaged.template = strings.ReplaceAll(
+		src.template,
+		"payload.VMMoref = payload.CloneOperation.SourceRef",
+		"payload.VMMoref = payload.VMMoref",
+	)
+	sabotages["persisted-template-source"] = sabotaged
+	sabotaged = src
+	sabotaged.create = strings.Replace(
+		src.create,
+		"pod became active before its persisted clone operation was reconciled",
+		"pod became active and clone operation was ignored",
+		1,
+	)
+	sabotages["pod-create-active-persisted-op"] = sabotaged
+	sabotaged = src
+	sabotaged.vmOps = strings.Replace(
+		src.vmOps,
+		"pod entered %s before persisted clone reconciliation",
+		"pod entered %s and clone operation was ignored",
+		1,
+	)
+	sabotages["vm-add-nonactive-persisted-op"] = sabotaged
+	sabotaged = src
+	sabotaged.create = strings.Replace(
+		src.create,
+		"refuse to overwrite existing pod VM reference %s with resumed clone %s",
+		"overwrite existing pod VM reference %s with resumed clone %s",
+		1,
+	)
+	sabotages["pod-create-reference-mismatch"] = sabotaged
+	sabotaged = src
+	sabotaged.vmOps = strings.Replace(
+		src.vmOps,
+		"refuse to overwrite existing added VM reference %s with resumed clone %s",
+		"overwrite existing added VM reference %s with resumed clone %s",
+		1,
+	)
+	sabotages["vm-add-reference-mismatch"] = sabotaged
+	sabotaged = src
+	sabotaged.retrySQL = strings.Replace(
+		src.retrySQL,
+		"AND (vcenter_vm_id IS NULL OR vcenter_vm_id = $1)",
+		"AND true",
+		1,
+	)
+	sabotages["atomic-clone-adoption-reference"] = sabotaged
+
+	for name, candidate := range sabotages {
+		t.Run(name, func(t *testing.T) {
+			if err := validateCloneForwardRetryWiring(candidate); err == nil {
+				t.Fatal("sabotaged clone forward-retry wiring unexpectedly passed")
+			}
+		})
+	}
+}
+
 func TestSelectedPlacementHostsReturnsSortedUnion(t *testing.T) {
 	placements := []models.VMPlacement{
 		{HostMoref: "host-3"},

@@ -1080,7 +1080,7 @@ func generatePassword(length int) string {
 }
 
 // CreatePod executes the full pod creation workflow with rollback.
-func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
+func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr error) {
 	var payload CreatePodPayload
 	if err := json.Unmarshal(job.Payload, &payload); err != nil {
 		return fmt.Errorf("parse pod_create payload: %w", err)
@@ -1089,11 +1089,18 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 	if err != nil {
 		return err
 	}
+	clonePreamblePending := payload.CloneOperation != nil
+	defer func() {
+		if clonePreamblePending {
+			retErr = persistedClonePreambleFailure(job, payload.CloneOperation, retErr)
+		}
+	}()
 	rb, err := p.newPodCreateRollbackEngine(job, payload.PodID, payload.VMs)
 	if err != nil {
 		return err
 	}
 	if payload.CleanupOnly {
+		clonePreamblePending = false
 		return p.runPodCreateCleanup(ctx, job, payload, rb)
 	}
 
@@ -1132,6 +1139,13 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 	}
 	if !applied {
 		if pod.Status == models.PodStatusActive {
+			if payload.CloneOperation != nil {
+				return persistedClonePreambleFailure(
+					job,
+					payload.CloneOperation,
+					errors.New("pod became active before its persisted clone operation was reconciled"),
+				)
+			}
 			if err := p.releaseVMPlacementCapacity(ctx, job, podVMSpecIDs(payload.VMs)); err != nil {
 				return fmt.Errorf("release already-active pod VM capacity reservations: %w", err)
 			}
@@ -1362,13 +1376,22 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		if err != nil {
 			return fmt.Errorf("get pod VM %s before clone: %w", vmSpec.PodVMID, err)
 		}
+		resumeCloneOperation := payload.CloneOperation != nil &&
+			payload.CloneOperation.PodVMID == vmSpec.PodVMID.String()
+		existingVMMoref := ""
+		if podVMRow.VCenterVMID != nil {
+			existingVMMoref = *podVMRow.VCenterVMID
+		}
 		if podVMRow.Status == models.VMStatusDeleted || podVMRow.Status == models.VMStatusError {
-			moref := ""
-			if podVMRow.VCenterVMID != nil {
-				moref = *podVMRow.VCenterVMID
-			}
 			return p.failPodCreateForStaleVM(
-				ctx, job, payload, rb, pod.ID, vmSpec.PodVMID, moref, "pre-clone terminal-state check",
+				ctx,
+				job,
+				payload,
+				rb,
+				pod.ID,
+				vmSpec.PodVMID,
+				existingVMMoref,
+				"pre-clone terminal-state check",
 			)
 		}
 		if t, tmplErr := p.db.GetTemplateByID(ctx, podVMRow.TemplateID); tmplErr == nil {
@@ -1407,8 +1430,8 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 		// marks the pod failed. Reuse the existing clone instead. Mirrors
 		// AddVM's resume path in vm_ops.go.
 		var moref string
-		if podVMRow != nil && podVMRow.VCenterVMID != nil && *podVMRow.VCenterVMID != "" {
-			moref = *podVMRow.VCenterVMID
+		if existingVMMoref != "" && !resumeCloneOperation {
+			moref = existingVMMoref
 			if placementErr := p.verifyPersistedVMPlacement(ctx, moref, placement); placementErr != nil {
 				classifiedErr := classifyPlacementValidationFailure(fmt.Errorf(
 					"refuse to resume persisted VM %s after placement validation failed: %w",
@@ -1453,6 +1476,21 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 						ctx, job, payload, rb, pod.ID, vmSpec.PodVMID, currentMoref, "clone-state claim",
 					)
 				}
+				if resumeCloneOperation {
+					return p.failPodCreateWithCleanup(
+						ctx,
+						job,
+						payload,
+						rb,
+						"persisted clone state reconciliation",
+						fmt.Errorf(
+							"VM %s entered state %s before clone operation %s could resume",
+							vmSpec.PodVMID,
+							current.Status,
+							payload.CloneOperation.OperationID,
+						),
+					)
+				}
 				p.logger.Warn("skipping pod-create VM after losing provisioning state",
 					"pod_id", pod.ID, "pod_vm_id", vmSpec.PodVMID, "vm_status", current.Status)
 				continue
@@ -1481,8 +1519,7 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 			if cloneErr != nil {
 				p.logger.Error("failed to clone VM", "vm", vmSpec.VMName, "error", cloneErr)
 				cloneErr = classifyCloneOperationFailure(cloneErr)
-				if jobRetryAvailable(job, cloneErr) &&
-					!isCompensationRetry(cloneErr) {
+				if cloneForwardRetryAvailable(job, cloneErr) {
 					return cloneErr
 				}
 				return p.failPodCreateAfterCloneError(
@@ -1496,6 +1533,23 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) error {
 					"clone operation recovery",
 					cloneErr,
 				)
+			}
+			if existingVMMoref != "" && existingVMMoref != moref {
+				return p.failPodCreateWithCleanup(
+					ctx,
+					job,
+					payload,
+					rb,
+					"persisted clone reference reconciliation",
+					fmt.Errorf(
+						"refuse to overwrite existing pod VM reference %s with resumed clone %s",
+						existingVMMoref,
+						moref,
+					),
+				)
+			}
+			if resumeCloneOperation {
+				clonePreamblePending = false
 			}
 			cleanupTarget := cloneCleanupTargetFromPlacement(pod.ID, moref, placement)
 			if err := rb.Record(ctx, stepName, cleanupTarget); err != nil {

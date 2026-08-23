@@ -913,8 +913,12 @@ VM without the marker is ambiguous and is never adopted or deleted.
 Once vCenter returns a task MoRef, the worker persists it before waiting.
 Successors resume that exact task and never submit a second clone for an armed
 operation. Template verification and revalidation smoke clones use this same
-protocol; their job and template ids provide the immutable operation scope, and
-an interrupted smoke check is cleanup-only before it can be claimed again.
+protocol; their job and template ids provide the immutable operation scope.
+Transient task waits and post-clone placement/configuration failures consume the
+normal forward retry budget by resuming that exact persisted task or clone. A
+forward retry clears only the cleanup dispatch marker and retains the operation,
+task, exact target, source, compute, pool, and host identities. Exhaustion or a
+proven terminal condition moves the operation to cleanup-only compensation.
 
 Clone task waits have a 15-minute operational deadline and honor lease loss.
 Task or marker recovery stages the exact VM MoRef before any mutable

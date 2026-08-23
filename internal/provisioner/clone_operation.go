@@ -19,6 +19,11 @@ var (
 )
 
 type cloneOperationStore interface {
+	GetVMCloneOperation(
+		ctx context.Context,
+		jobID uuid.UUID,
+		workerID string,
+	) (*models.VMCloneOperation, error)
 	PrepareVMCloneOperation(
 		ctx context.Context,
 		jobID uuid.UUID,
@@ -105,6 +110,73 @@ func cloneRecoveryError(err error, target *VMCloneCleanupTarget) error {
 	return &compensationRetryError{err: err, target: target}
 }
 
+type cloneForwardRetryError struct {
+	err    error
+	target *VMCloneCleanupTarget
+}
+
+func (e *cloneForwardRetryError) Error() string {
+	return e.err.Error()
+}
+
+func (e *cloneForwardRetryError) Unwrap() error {
+	return e.err
+}
+
+func newCloneForwardRetryError(err error, target *VMCloneCleanupTarget) error {
+	return &cloneForwardRetryError{err: err, target: target}
+}
+
+func isCloneForwardRetry(err error) bool {
+	var retryErr *cloneForwardRetryError
+	return errors.As(err, &retryErr)
+}
+
+func cloneForwardRetryAvailable(job *models.Job, err error) bool {
+	return !isCompensationRetry(err) &&
+		!isManualCleanupRequired(err) &&
+		jobRetryAvailable(job, err)
+}
+
+func cloneForwardFailureToCompensation(err error) error {
+	var retryErr *cloneForwardRetryError
+	if !errors.As(err, &retryErr) {
+		return err
+	}
+	return cloneRecoveryError(err, retryErr.target)
+}
+
+func persistedClonePreambleFailure(
+	job *models.Job,
+	op *models.VMCloneOperation,
+	err error,
+) error {
+	if op == nil {
+		return err
+	}
+	if err == nil {
+		err = errors.New("handler exited before reconciling its persisted clone operation")
+	}
+	if isCompensationRetry(err) || isManualCleanupRequired(err) {
+		return err
+	}
+	classified := classifyCloneOperationFailure(err)
+	if cloneForwardRetryAvailable(job, classified) {
+		return classified
+	}
+	if isManualCleanupRequired(classified) || isCompensationRetry(classified) {
+		return classified
+	}
+	if isCloneForwardRetry(classified) {
+		return cloneForwardFailureToCompensation(classified)
+	}
+	return cloneRecoveryError(fmt.Errorf(
+		"persisted clone operation %s requires exact compensation after preamble failure: %w",
+		op.OperationID,
+		classified,
+	), nil)
+}
+
 func executeDurableVMClone(
 	ctx context.Context,
 	store cloneOperationStore,
@@ -117,33 +189,48 @@ func executeDurableVMClone(
 	if _, err := uuid.Parse(params.LogicalTemplateID); err != nil {
 		return "", fmt.Errorf("durable clone requires a logical template ID: %w", err)
 	}
-	resolvedParams, err := client.ResolveClonePlacement(ctx, params)
+	op, err := store.GetVMCloneOperation(ctx, jobID, workerID)
 	if err != nil {
-		return "", fmt.Errorf("resolve durable clone placement: %w", err)
+		return "", fmt.Errorf("load durable clone operation: %w", err)
 	}
-	params = resolvedParams
-	candidate := models.VMCloneOperation{
-		OperationID:          uuid.NewString(),
-		PodID:                podID.String(),
-		PodVMID:              podVMID.String(),
-		LogicalTemplateID:    params.LogicalTemplateID,
-		TargetName:           params.VMName,
-		SourceReplicaID:      params.SourceReplicaID,
-		SourceRef:            params.TemplateName,
-		ComputeResourceType:  params.ComputeResourceType,
-		ComputeResourceMoref: params.ComputeResourceMoRef,
-		HostMoref:            params.HostMoRef,
-		HostName:             params.HostName,
-		PoolMoref:            params.ResourcePoolMoRef,
-		DRSControl:           params.DRSControl,
-		Phase:                models.VMCloneOperationPrepared,
-		PreparedAt:           time.Now().UTC(),
+	if op == nil {
+		resolvedParams, resolveErr := client.ResolveClonePlacement(ctx, params)
+		if resolveErr != nil {
+			return "", fmt.Errorf("resolve durable clone placement: %w", resolveErr)
+		}
+		params = resolvedParams
+		candidate := models.VMCloneOperation{
+			OperationID:          uuid.NewString(),
+			PodID:                podID.String(),
+			PodVMID:              podVMID.String(),
+			LogicalTemplateID:    params.LogicalTemplateID,
+			TargetName:           params.VMName,
+			SourceReplicaID:      params.SourceReplicaID,
+			SourceRef:            params.TemplateName,
+			ComputeResourceType:  params.ComputeResourceType,
+			ComputeResourceMoref: params.ComputeResourceMoRef,
+			HostMoref:            params.HostMoRef,
+			HostName:             params.HostName,
+			PoolMoref:            params.ResourcePoolMoRef,
+			DRSControl:           params.DRSControl,
+			Phase:                models.VMCloneOperationPrepared,
+			PreparedAt:           time.Now().UTC(),
+		}
+		op, err = store.PrepareVMCloneOperation(ctx, jobID, workerID, candidate)
+		if err != nil {
+			return "", fmt.Errorf("prepare durable clone operation: %w", err)
+		}
 	}
-	op, err := store.PrepareVMCloneOperation(ctx, jobID, workerID, candidate)
-	if err != nil {
-		return "", fmt.Errorf("prepare durable clone operation: %w", err)
+	if op == nil ||
+		op.PodID != podID.String() ||
+		op.PodVMID != podVMID.String() ||
+		op.LogicalTemplateID != params.LogicalTemplateID ||
+		op.TargetName != params.VMName {
+		return "", &manualCleanupRequiredError{err: errors.New(
+			"persisted clone operation does not match the requested logical VM scope",
+		)}
 	}
-	if op == nil || op.LogicalTemplateID == "" ||
+	if op.LogicalTemplateID == "" ||
 		op.ComputeResourceType == "" || op.ComputeResourceMoref == "" ||
 		op.HostMoref == "" || op.HostName == "" || op.PoolMoref == "" ||
 		op.DRSControl == "" {
@@ -248,7 +335,15 @@ func executeDurableVMClone(
 
 	moref, err := client.WaitCloneVMTask(ctx, taskRef)
 	if err != nil {
-		return "", cloneRecoveryError(fmt.Errorf(
+		if errors.Is(err, vcenter.ErrCloneTaskFailed) {
+			return "", cloneRecoveryError(fmt.Errorf(
+				"durable clone operation %s task %s failed terminally: %w",
+				op.OperationID,
+				taskRef,
+				err,
+			), nil)
+		}
+		return "", newCloneForwardRetryError(fmt.Errorf(
 			"wait for durable clone operation %s task %s: %w",
 			op.OperationID,
 			taskRef,
@@ -332,7 +427,7 @@ func stageAndConfigureClone(
 		if isManualCleanupRequired(validationErr) {
 			return moref, validationErr
 		}
-		return moref, cloneRecoveryError(validationErr, target)
+		return moref, newCloneForwardRetryError(validationErr, target)
 	}
 	if err := client.ConfigureClonedVM(ctx, moref, params); err != nil {
 		classifiedErr := classifyPlacementValidationFailure(fmt.Errorf(
@@ -343,7 +438,7 @@ func stageAndConfigureClone(
 		if isManualCleanupRequired(classifiedErr) {
 			return moref, classifiedErr
 		}
-		return moref, cloneRecoveryError(classifiedErr, target)
+		return moref, newCloneForwardRetryError(classifiedErr, target)
 	}
 	return moref, nil
 }

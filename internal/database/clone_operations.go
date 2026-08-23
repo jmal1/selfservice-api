@@ -119,6 +119,53 @@ func appendRollbackReceipt(rollbackSteps, step []byte) ([]byte, bool, error) {
 	return updated, false, err
 }
 
+// GetVMCloneOperation returns the exact persisted operation owned by the
+// current claim. A valid operation is authoritative on retry; callers must not
+// re-resolve source placement before resuming it.
+func (q *Queries) GetVMCloneOperation(
+	ctx context.Context,
+	jobID uuid.UUID,
+	workerID string,
+) (*models.VMCloneOperation, error) {
+	var payload []byte
+	err := q.pool.QueryRow(ctx, `
+		SELECT payload
+		FROM jobs
+		WHERE id = $1
+		  AND claimed_by = $2
+		  AND type IN ('pod_create', 'vm_add', 'template_verify', 'template_revalidate')
+		  AND status IN ('claimed', 'in_progress')
+	`, jobID, workerID).Scan(&payload)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("%w: job %s cannot load clone operation for %s", ErrJobLeaseLost, jobID, workerID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load clone operation job: %w", err)
+	}
+	fields, err := decodeJobPayloadFields(payload)
+	if err != nil {
+		return nil, fmt.Errorf("decode clone operation payload: %w", err)
+	}
+	raw := fields["clone_operation"]
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var op models.VMCloneOperation
+	if err := json.Unmarshal(raw, &op); err != nil {
+		return nil, fmt.Errorf("decode existing clone operation: %w", err)
+	}
+	if err := validateVMCloneOperationScope(op); err != nil {
+		return nil, fmt.Errorf("validate existing clone operation: %w", err)
+	}
+	if err := validateVMCloneOperation(op); err != nil {
+		if op.Phase == models.VMCloneOperationPrepared {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("validate resumable clone operation: %w", err)
+	}
+	return &op, nil
+}
+
 // PrepareVMCloneOperation persists an operation identity before any vCenter
 // clone request can be submitted. A recovered claim reuses an existing
 // operation for the same immutable source/target scope.

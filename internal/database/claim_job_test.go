@@ -97,22 +97,48 @@ func TestClaimJobMaintenancePolicySabotageIsDetected(t *testing.T) {
 	}
 }
 
-func TestRetryJobSQLPersistsCleanupOnlyMarker(t *testing.T) {
-	body := strings.ToUpper(retryJobSQL)
+func validateRetryJobSQL(query string) error {
+	body := strings.ToUpper(query)
 	for _, fragment := range []string{
 		"WITH UPDATED AS",
 		"STATUS IN ('CLAIMED', 'IN_PROGRESS')",
 		"WHEN $3 AND $4::JSONB IS NOT NULL THEN JSONB_SET(",
 		"'{CLEANUP_TARGET}'",
 		"WHEN $3 THEN JSONB_SET(PAYLOAD, '{CLEANUP_ONLY}', 'TRUE'::JSONB, TRUE)",
-		"ELSE PAYLOAD",
+		"ELSE PAYLOAD - 'CLEANUP_ONLY' - 'CLEANUP_COMPLETED'",
 		"STATUS = 'PENDING'",
 		"PAYLOAD->>'CLEANUP_ONLY' = 'TRUE'",
 		"PAYLOAD->'CLEANUP_TARGET' = $4::JSONB",
 	} {
 		if !strings.Contains(body, fragment) {
-			t.Errorf("retryJobSQL missing %q", fragment)
+			return fmt.Errorf("retryJobSQL missing %q", fragment)
 		}
+	}
+	return nil
+}
+
+func TestRetryJobSQLSeparatesForwardAndCleanupRetries(t *testing.T) {
+	if err := validateRetryJobSQL(retryJobSQL); err != nil {
+		t.Fatal(err)
+	}
+	sabotages := map[string]string{
+		"cleanup-marker": strings.ReplaceAll(
+			retryJobSQL,
+			"WHEN $3 THEN jsonb_set(payload, '{cleanup_only}', 'true'::jsonb, true)",
+			"WHEN $3 THEN payload",
+		),
+		"forward-marker-clear": strings.ReplaceAll(
+			retryJobSQL,
+			"ELSE payload - 'cleanup_only' - 'cleanup_completed'",
+			"ELSE payload",
+		),
+	}
+	for name, sabotaged := range sabotages {
+		t.Run(name, func(t *testing.T) {
+			if err := validateRetryJobSQL(sabotaged); err == nil {
+				t.Fatal("sabotaged retry SQL unexpectedly passed validation")
+			}
+		})
 	}
 }
 

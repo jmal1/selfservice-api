@@ -304,11 +304,11 @@ func TestPollGuestCredentials_HonorsContextCancel(t *testing.T) {
 // --------------------------------------------------------------------------
 
 type fakeResolveVC struct {
-	db            *fakeRevalidateDB
-	resolveCalls  int
-	resolveName   string
-	resolveRet    string
-	resolveErr    error
+	db              *fakeRevalidateDB
+	resolveCalls    int
+	resolveName     string
+	resolveRet      string
+	resolveErr      error
 	sawTemplateLoad bool
 }
 
@@ -328,17 +328,17 @@ func (f *fakeResolveVC) ResolveVMByName(_ context.Context, name string) (string,
 
 func TestRevalidateL1Template_LateResolutionAndFastPath(t *testing.T) {
 	tests := []struct {
-		name            string
-		templateName    string
-		sourceName      string
-		payloadMoref    string
-		resolveRet      string
-		resolveErr      error
+		name             string
+		templateName     string
+		sourceName       string
+		payloadMoref     string
+		resolveRet       string
+		resolveErr       error
 		wantResolveCalls int
-		wantResolveName string
-		wantSmokeCalls  int
-		wantSmokeMoref  string
-		wantErrContains []string
+		wantResolveName  string
+		wantSmokeCalls   int
+		wantSmokeMoref   string
+		wantErrContains  []string
 	}{
 		{
 			name:             "resolve by source VM name when payload omits moref",
@@ -451,6 +451,122 @@ func TestRevalidateL1Template_LateResolutionAndFastPath(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRevalidateL1Template_ForwardCloneRetryDoesNotRecordValidationOutcome(t *testing.T) {
+	id := uuid.New()
+	tmpl := makeL1Template(id, nil)
+	db := &fakeRevalidateDB{tmpl: &tmpl, isActive: true}
+	vc := &fakeResolveVC{resolveErr: errors.New("renamed source no longer resolves")}
+	pipeline := NewPipelineMetrics("", "", nil)
+	payload, err := json.Marshal(TemplateRevalidatePayload{
+		TemplateID: id,
+		VMMoref:    "vm-renamed-source",
+		CloneOperation: &models.VMCloneOperation{
+			OperationID:       uuid.NewString(),
+			LogicalTemplateID: id.String(),
+			SourceRef:         "vm-exact-persisted-source",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	job := &models.Job{
+		ID:         uuid.New(),
+		Type:       models.JobTypeTemplateRevalidate,
+		Payload:    payload,
+		RetryCount: 0,
+		MaxRetries: 2,
+	}
+	forwardErr := newCloneForwardRetryError(context.DeadlineExceeded, nil)
+	var smokeMoref string
+
+	err = revalidateL1TemplateJob(
+		context.Background(),
+		db,
+		vc,
+		pipeline,
+		discardLogger(),
+		job,
+		func(string, string) {},
+		func(_ context.Context, _ *models.Template, vmMoref string, _ func(string, string)) error {
+			smokeMoref = vmMoref
+			return forwardErr
+		},
+	)
+	if !isCloneForwardRetry(err) {
+		t.Fatalf("error = %v, want clone forward retry", err)
+	}
+	if db.validationResult != "" || !db.validationAt.IsZero() {
+		t.Fatalf(
+			"forward retry persisted validation result=%q at=%v",
+			db.validationResult,
+			db.validationAt,
+		)
+	}
+	if vc.resolveCalls != 0 || smokeMoref != "vm-exact-persisted-source" {
+		t.Fatalf(
+			"resume resolved mutable source: resolve calls=%d smoke source=%q",
+			vc.resolveCalls,
+			smokeMoref,
+		)
+	}
+	metrics := string(pipeline.serialize())
+	for _, line := range strings.Split(metrics, "\n") {
+		if strings.HasPrefix(line, "crucible_template_validation_total{") ||
+			strings.HasPrefix(line, "crucible_template_last_validated_timestamp_seconds{") {
+			t.Fatalf("forward retry emitted validation outcome metric %q", line)
+		}
+	}
+}
+
+func TestRevalidateL1Template_MissingTemplateCompensatesPersistedClone(t *testing.T) {
+	id := uuid.New()
+	db := &fakeRevalidateDB{}
+	payload, err := json.Marshal(TemplateRevalidatePayload{
+		TemplateID: id,
+		CloneOperation: &models.VMCloneOperation{
+			OperationID:       uuid.NewString(),
+			LogicalTemplateID: id.String(),
+			SourceRef:         "vm-exact-persisted-source",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	job := &models.Job{
+		ID:         uuid.New(),
+		Type:       models.JobTypeTemplateRevalidate,
+		Payload:    payload,
+		MaxRetries: 2,
+	}
+
+	err = revalidateL1TemplateJob(
+		context.Background(),
+		db,
+		&fakeResolveVC{},
+		NewPipelineMetrics("", "", nil),
+		discardLogger(),
+		job,
+		func(string, string) {},
+		func(context.Context, *models.Template, string, func(string, string)) error {
+			t.Fatal("smoke check ran after template preamble failed")
+			return nil
+		},
+	)
+	if !isCompensationRetry(err) {
+		t.Fatalf("missing template abandoned persisted clone: %T %v", err, err)
+	}
+	if isCompensatedJobError(err) {
+		t.Fatal("missing template was incorrectly finalized without exact clone cleanup")
+	}
+	if db.validationResult != "" || !db.validationAt.IsZero() {
+		t.Fatalf(
+			"preamble compensation persisted validation result=%q at=%v",
+			db.validationResult,
+			db.validationAt,
+		)
 	}
 }
 

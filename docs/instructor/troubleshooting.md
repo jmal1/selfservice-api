@@ -63,6 +63,10 @@ MoRef is then staged before any reconfiguration. Cleanup never resolves a VM by
 display name and never resumes forward configuration, power-on, or snapshots.
 
 Clone task waits have a 15-minute operational deadline. An armed submission
+whose persisted task wait or post-clone placement/configuration step fails
+transiently resumes that same task or exact clone within the job's forward retry
+budget; it never submits another clone. Exhaustion or a proven terminal
+condition switches the operation to cleanup-only compensation. An armed submission
 with no task reference and no discoverable marked VM remains cleanup-only for
 30 minutes, then surfaces `manual_cleanup_required` for operator resolution
 rather than retrying or cloning indefinitely. Pod creation keeps exact clone

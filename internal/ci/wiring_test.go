@@ -361,15 +361,24 @@ func TestVMCloneCompensationUsesOnlyDurableExactTargets(t *testing.T) {
 			}
 		}
 	}
-	prepare := strings.Index(cloneOperationSrc, "store.PrepareVMCloneOperation(")
-	submit := strings.Index(cloneOperationSrc, "client.StartCloneVMOperation(")
-	persistTask := strings.Index(cloneOperationSrc, "store.PersistVMCloneTask(")
-	waitTask := strings.Index(cloneOperationSrc, "client.WaitCloneVMTask(")
-	stage := strings.Index(cloneOperationSrc, "store.StageVMCloneCleanup(")
-	configure := strings.Index(cloneOperationSrc, "client.ConfigureClonedVM(")
-	if prepare < 0 || submit < prepare || persistTask < submit || waitTask < persistTask ||
+	executeStart := strings.Index(cloneOperationSrc, "func executeDurableVMClone(")
+	if executeStart < 0 {
+		t.Fatal("durable clone execution function is missing")
+	}
+	executeSrc := cloneOperationSrc[executeStart:]
+	loadOperation := strings.Index(executeSrc, "store.GetVMCloneOperation(")
+	freshOperation := strings.Index(executeSrc, "if op == nil {")
+	resolvePlacement := strings.Index(executeSrc, "client.ResolveClonePlacement(")
+	prepare := strings.Index(executeSrc, "store.PrepareVMCloneOperation(")
+	submit := strings.Index(executeSrc, "client.StartCloneVMOperation(")
+	persistTask := strings.Index(executeSrc, "store.PersistVMCloneTask(")
+	waitTask := strings.Index(executeSrc, "client.WaitCloneVMTask(")
+	stage := strings.Index(executeSrc, "store.StageVMCloneCleanup(")
+	configure := strings.Index(executeSrc, "client.ConfigureClonedVM(")
+	if loadOperation < 0 || freshOperation < loadOperation || resolvePlacement < freshOperation ||
+		prepare < resolvePlacement || submit < prepare || persistTask < submit || waitTask < persistTask ||
 		stage < waitTask || configure < stage {
-		t.Fatal("durable clone order must be prepare, arm/submit, persist task, wait, stage exact MoRef, configure")
+		t.Fatal("durable clone order must be load existing, resolve/prepare only if new, submit, persist task, wait, stage exact MoRef, configure")
 	}
 	if strings.Contains(createSrc, "cleanupStaleVMClone(") ||
 		strings.Contains(vmOpsSrc, "cleanupStaleVMClone(") {
@@ -378,8 +387,8 @@ func TestVMCloneCompensationUsesOnlyDurableExactTargets(t *testing.T) {
 	if got := strings.Count(createSrc, "failPodCreateForStaleVM("); got != 7 {
 		t.Fatalf("pod_create stale-clone compensation sites = %d, want 6 calls plus helper", got)
 	}
-	if got := strings.Count(vmOpsSrc, "failVMAddWithCleanup("); got != 11 {
-		t.Fatalf("vm_add stale-clone compensation sites = %d, want 10 calls plus helper", got)
+	if got := strings.Count(vmOpsSrc, "failVMAddWithCleanup("); got != 12 {
+		t.Fatalf("vm_add stale-clone compensation sites = %d, want 11 calls plus helper", got)
 	}
 
 	addStart := strings.Index(vmOpsSrc, "func (p *Provisioner) AddVM(")
@@ -433,9 +442,11 @@ func TestVMCloneCompensationUsesOnlyDurableExactTargets(t *testing.T) {
 	}
 
 	for _, required := range []string{
+		"func (q *Queries) GetVMCloneOperation(",
 		"func (q *Queries) StageVMCloneCleanup(",
 		"'{cleanup_target}'",
 		"func (q *Queries) AdoptPodVMClone(",
+		"(vcenter_vm_id IS NULL OR vcenter_vm_id = $1)",
 		"func (q *Queries) DisarmVMCloneCleanup(",
 		"payload - 'cleanup_target' - 'cleanup_only'",
 		"func (q *Queries) CompleteVMCloneCleanup(",

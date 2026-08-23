@@ -708,22 +708,13 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) (retErr error)
 	if err != nil {
 		return fmt.Errorf("invalid pod_vm_id: %w", err)
 	}
-
-	pod, err := p.db.GetPodByID(ctx, podID)
-	if err != nil {
-		return fmt.Errorf("get pod: %w", err)
-	}
-
-	podVM, err := p.db.GetPodVM(ctx, podVMID)
-	if err != nil {
-		return fmt.Errorf("get pod VM: %w", err)
-	}
 	moref := ""
-	if podVM.VCenterVMID != nil {
-		moref = *podVM.VCenterVMID
-	}
-	vmRunningPersisted := podVM.Status == models.VMStatusRunning
+	vmRunningPersisted := false
+	clonePreamblePending := payload.CloneOperation != nil
 	defer func() {
+		if clonePreamblePending {
+			retErr = persistedClonePreambleFailure(job, payload.CloneOperation, retErr)
+		}
 		if !shouldCompensateVMAddFailure(job, retErr, vmRunningPersisted) {
 			return
 		}
@@ -737,6 +728,20 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) (retErr error)
 		}
 		retErr = &compensatedJobError{err: retErr}
 	}()
+
+	pod, err := p.db.GetPodByID(ctx, podID)
+	if err != nil {
+		return fmt.Errorf("get pod: %w", err)
+	}
+
+	podVM, err := p.db.GetPodVM(ctx, podVMID)
+	if err != nil {
+		return fmt.Errorf("get pod VM: %w", err)
+	}
+	if podVM.VCenterVMID != nil {
+		moref = *podVM.VCenterVMID
+	}
+	vmRunningPersisted = podVM.Status == models.VMStatusRunning
 	if pod.Status != models.PodStatusActive {
 		if podVM.VCenterVMID != nil && *podVM.VCenterVMID != "" {
 			return p.failVMAddWithCleanup(
@@ -750,6 +755,13 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) (retErr error)
 		}
 		p.logger.Warn("stale vm_add job skipped because pod is not active",
 			"pod_id", podID, "pod_status", pod.Status, "pod_vm_id", podVMID, "job_id", job.ID)
+		if payload.CloneOperation != nil {
+			return persistedClonePreambleFailure(
+				job,
+				payload.CloneOperation,
+				fmt.Errorf("pod entered %s before persisted clone reconciliation", pod.Status),
+			)
+		}
 		return p.completeVMAddWithoutClone(
 			ctx,
 			job,
@@ -777,6 +789,13 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) (retErr error)
 		}
 		if current.Status == models.VMStatusDeleted || current.Status == models.VMStatusError {
 			if currentMoref == "" {
+				if payload.CloneOperation != nil {
+					return persistedClonePreambleFailure(
+						job,
+						payload.CloneOperation,
+						fmt.Errorf("VM entered %s before persisted clone reconciliation", current.Status),
+					)
+				}
 				return p.completeVMAddWithoutClone(
 					ctx,
 					job,
@@ -794,6 +813,17 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) (retErr error)
 			)
 		}
 		if current.Status == models.VMStatusRunning && currentMoref != "" {
+			if payload.CloneOperation != nil {
+				return persistedClonePreambleFailure(
+					job,
+					payload.CloneOperation,
+					fmt.Errorf(
+						"VM %s is running while clone operation %s remains persisted",
+						podVMID,
+						payload.CloneOperation.OperationID,
+					),
+				)
+			}
 			vmRunningPersisted = true
 			if err := p.releaseVMPlacementCapacity(ctx, job, []uuid.UUID{podVMID}); err != nil {
 				return fmt.Errorf("release running added VM capacity reservation: %w", err)
@@ -802,6 +832,16 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) (retErr error)
 		}
 		p.logger.Warn("stale vm_add job skipped because VM is no longer provisionable",
 			"pod_id", podID, "pod_vm_id", podVMID, "vm_status", podVM.Status, "job_id", job.ID)
+		if payload.CloneOperation != nil {
+			return persistedClonePreambleFailure(
+				job,
+				payload.CloneOperation,
+				fmt.Errorf(
+					"VM entered non-provisionable state %s before persisted clone reconciliation",
+					current.Status,
+				),
+			)
+		}
 		return nil
 	}
 
@@ -856,6 +896,9 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) (retErr error)
 			)
 		}
 		if podVM.VCenterVMID == nil || *podVM.VCenterVMID == "" {
+			if payload.CloneOperation != nil {
+				return persistedClonePreambleFailure(job, payload.CloneOperation, jobErr)
+			}
 			return p.completeVMAddWithoutClone(ctx, job, podVMID, jobErr.Error())
 		}
 		return jobErr
@@ -866,7 +909,8 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) (retErr error)
 	}
 
 	// Resume support: skip clone if VM was already cloned (e.g., job retry after worker restart)
-	if podVM.VCenterVMID != nil && *podVM.VCenterVMID != "" {
+	if podVM.VCenterVMID != nil && *podVM.VCenterVMID != "" &&
+		payload.CloneOperation == nil {
 		moref = *podVM.VCenterVMID
 		p.logger.Info("resuming VM add — already cloned", "vm", payload.VMName, "moref", moref)
 	} else {
@@ -874,6 +918,7 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) (retErr error)
 		p.publishProgress(job.ID, "vm_clone", fmt.Sprintf("Cloning %s from %s", payload.VMName, payload.TemplateName))
 
 		var err error
+		existingVMMoref := moref
 		cloneParams := cloneParamsFromPlacement(vcenter.CloneVMParams{
 			TemplateName: payload.TemplateName,
 			VMName:       payload.VMName,
@@ -895,6 +940,9 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) (retErr error)
 		)
 		if err != nil {
 			jobErr := classifyCloneOperationFailure(fmt.Errorf("clone VM: %w", err))
+			if cloneForwardRetryAvailable(job, jobErr) {
+				return jobErr
+			}
 			if isManualCleanupRequired(jobErr) || isCompensationRetry(jobErr) {
 				if moref == "" {
 					return jobErr
@@ -918,8 +966,29 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) (retErr error)
 					jobErr,
 				)
 			}
+			if isCloneForwardRetry(jobErr) {
+				return cloneForwardFailureToCompensation(jobErr)
+			}
+			if payload.CloneOperation != nil {
+				return persistedClonePreambleFailure(job, payload.CloneOperation, jobErr)
+			}
 			return p.completeVMAddWithoutClone(ctx, job, podVMID, jobErr.Error())
 		}
+		if existingVMMoref != "" && existingVMMoref != moref {
+			return p.failVMAddWithCleanup(
+				ctx,
+				job,
+				podID,
+				podVMID,
+				moref,
+				fmt.Errorf(
+					"refuse to overwrite existing added VM reference %s with resumed clone %s",
+					existingVMMoref,
+					moref,
+				),
+			)
+		}
+		clonePreamblePending = false
 		applied, err = p.db.AdoptPodVMClone(
 			ctx,
 			job.ID,

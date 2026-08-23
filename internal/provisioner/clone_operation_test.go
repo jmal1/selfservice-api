@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -22,6 +23,23 @@ type fakeCloneOperationStore struct {
 	persistErr   error
 	persistCalls int
 	abandonCalls int
+	loadCalls    int
+}
+
+func (f *fakeCloneOperationStore) GetVMCloneOperation(
+	_ context.Context,
+	_ uuid.UUID,
+	_ string,
+) (*models.VMCloneOperation, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.loadCalls++
+	f.events = append(f.events, "load")
+	if f.operation == nil {
+		return nil, nil
+	}
+	copy := *f.operation
+	return &copy, nil
 }
 
 func (f *fakeCloneOperationStore) PrepareVMCloneOperation(
@@ -130,9 +148,15 @@ type fakeCloneOperationClient struct {
 	findMoref     string
 	findErr       error
 	validateErr   error
+	validateErrs  []error
+	configErrs    []error
+	configParams  []vcenter.CloneVMParams
+	resolveErr    error
+	resolveCalls  int
 	startCalls    int
 	waitCalls     int
 	findCalls     int
+	validateCalls int
 	configCalls   int
 	cancelOnStart context.CancelFunc
 }
@@ -141,6 +165,10 @@ func (f *fakeCloneOperationClient) ResolveClonePlacement(
 	_ context.Context,
 	params vcenter.CloneVMParams,
 ) (vcenter.CloneVMParams, error) {
+	f.resolveCalls++
+	if f.resolveErr != nil {
+		return vcenter.CloneVMParams{}, f.resolveErr
+	}
 	if params.HostMoRef == "" {
 		params.HostMoRef = "host-1"
 	}
@@ -163,6 +191,12 @@ func (f *fakeCloneOperationClient) ResolveClonePlacement(
 }
 
 func (f *fakeCloneOperationClient) ValidateVMPlacement(_ context.Context, _, _ string) error {
+	f.validateCalls++
+	if len(f.validateErrs) > 0 {
+		err := f.validateErrs[0]
+		f.validateErrs = f.validateErrs[1:]
+		return err
+	}
 	return f.validateErr
 }
 
@@ -303,9 +337,15 @@ func (f *fakeCloneOperationClient) FindVMByCloneOperation(
 func (f *fakeCloneOperationClient) ConfigureClonedVM(
 	_ context.Context,
 	_ string,
-	_ vcenter.CloneVMParams,
+	params vcenter.CloneVMParams,
 ) error {
 	f.configCalls++
+	f.configParams = append(f.configParams, params)
+	if len(f.configErrs) > 0 {
+		err := f.configErrs[0]
+		f.configErrs = f.configErrs[1:]
+		return err
+	}
 	return nil
 }
 
@@ -354,8 +394,122 @@ func TestDurableClonePersistsTaskBeforeWait(t *testing.T) {
 	if client.startCalls != 1 || client.waitCalls != 1 || client.configCalls != 1 {
 		t.Fatalf("calls start=%d wait=%d configure=%d", client.startCalls, client.waitCalls, client.configCalls)
 	}
+	if store.loadCalls != 1 || client.resolveCalls != 1 {
+		t.Fatalf("fresh clone loads=%d resolves=%d, want one of each", store.loadCalls, client.resolveCalls)
+	}
 	if store.target == nil || store.target.VCenterVMID != "vm-42" {
 		t.Fatalf("exact clone target was not staged: %+v", store.target)
+	}
+}
+
+func TestDurableCloneResumeSkipsFreshPlacementResolution(t *testing.T) {
+	jobID, workerID, podID, podVMID, params := cloneOperationFixture()
+	sourceReplicaID := uuid.NewString()
+	store := &fakeCloneOperationStore{
+		operation: &models.VMCloneOperation{
+			OperationID:          uuid.NewString(),
+			PodID:                podID.String(),
+			PodVMID:              podVMID.String(),
+			LogicalTemplateID:    params.LogicalTemplateID,
+			TargetName:           params.VMName,
+			SourceReplicaID:      sourceReplicaID,
+			SourceRef:            "vm-original-source",
+			ComputeResourceType:  params.ComputeResourceType,
+			ComputeResourceMoref: params.ComputeResourceMoRef,
+			HostMoref:            params.HostMoRef,
+			HostName:             params.HostName,
+			PoolMoref:            params.ResourcePoolMoRef,
+			DRSControl:           params.DRSControl,
+			TaskRef:              "task-resume",
+			Phase:                models.VMCloneOperationSubmitted,
+			PreparedAt:           time.Now(),
+		},
+	}
+	client := &fakeCloneOperationClient{
+		store:      store,
+		resolveErr: errors.New("source was renamed and host capacity changed"),
+		waitMoref:  "vm-resume",
+	}
+	retryParams := params
+	retryParams.TemplateName = "vm-renamed-source"
+	retryParams.SourceReplicaID = uuid.NewString()
+	retryParams.ComputeResourceMoRef = "domain-sabotaged"
+	retryParams.HostMoRef = "host-sabotaged"
+	retryParams.ResourcePoolMoRef = "resgroup-sabotaged"
+	retryParams.ObservedFreeMemoryMB = 1
+
+	moref, err := executeDurableVMClone(
+		context.Background(),
+		store,
+		client,
+		jobID,
+		workerID,
+		podID,
+		podVMID,
+		retryParams,
+	)
+	if err != nil {
+		t.Fatalf("resume exact clone after mutable placement drift: %v", err)
+	}
+	if moref != "vm-resume" {
+		t.Fatalf("resumed moref = %q, want vm-resume", moref)
+	}
+	if client.resolveCalls != 0 || client.startCalls != 0 ||
+		client.waitCalls != 1 || client.configCalls != 1 {
+		t.Fatalf(
+			"resolve=%d start=%d wait=%d configure=%d",
+			client.resolveCalls,
+			client.startCalls,
+			client.waitCalls,
+			client.configCalls,
+		)
+	}
+	got := client.configParams[0]
+	if got.TemplateName != "vm-original-source" ||
+		got.SourceReplicaID != sourceReplicaID ||
+		got.ComputeResourceMoRef != params.ComputeResourceMoRef ||
+		got.HostMoRef != params.HostMoRef ||
+		got.ResourcePoolMoRef != params.ResourcePoolMoRef {
+		t.Fatalf("resume used mutable placement instead of persisted identity: %+v", got)
+	}
+}
+
+func TestPersistedClonePreambleFailurePreservesRetryThenRequiresCompensation(t *testing.T) {
+	op := &models.VMCloneOperation{OperationID: uuid.NewString()}
+	job := &models.Job{
+		Type:       models.JobTypeVMAdd,
+		RetryCount: 0,
+		MaxRetries: 2,
+	}
+	transient := persistedClonePreambleFailure(
+		job,
+		op,
+		fmt.Errorf("reload pod before resume: %w", context.DeadlineExceeded),
+	)
+	if !jobRetryAvailable(job, transient) || isCompensationRetry(transient) {
+		t.Fatalf("transient preamble failure lost forward retry: %T %v", transient, transient)
+	}
+
+	job.RetryCount = job.MaxRetries
+	exhausted := persistedClonePreambleFailure(
+		job,
+		op,
+		fmt.Errorf("reload pod before resume: %w", context.DeadlineExceeded),
+	)
+	if !isCompensationRetry(exhausted) {
+		t.Fatalf("exhausted preamble failure did not enter exact compensation: %T %v", exhausted, exhausted)
+	}
+
+	terminal := persistedClonePreambleFailure(
+		&models.Job{Type: models.JobTypeVMAdd, MaxRetries: 2},
+		op,
+		errors.New("pod entered destroyed"),
+	)
+	if !isCompensationRetry(terminal) {
+		t.Fatalf("terminal preamble exit did not enter exact compensation: %T %v", terminal, terminal)
+	}
+	if isCompensatedJobError(terminal) {
+		t.Fatal("persisted operation was incorrectly finalized as no-clone compensation")
 	}
 }
 
@@ -597,7 +751,7 @@ func TestRecoveredCleanupResumesPersistedTaskWithoutForwardCalls(t *testing.T) {
 	}
 }
 
-func TestCloneTaskTimeoutRemainsResumable(t *testing.T) {
+func TestCloneTaskWaitTransientResumesPersistedTaskForward(t *testing.T) {
 	jobID, workerID, podID, podVMID, params := cloneOperationFixture()
 	store := &fakeCloneOperationStore{}
 	client := &fakeCloneOperationClient{
@@ -606,6 +760,7 @@ func TestCloneTaskTimeoutRemainsResumable(t *testing.T) {
 		waitMoref: "vm-eventual",
 		waitErrs:  []error{context.DeadlineExceeded, nil},
 	}
+	job := &models.Job{Type: models.JobTypePodCreate, RetryCount: 0, MaxRetries: 3}
 
 	if _, err := executeDurableVMClone(
 		context.Background(),
@@ -616,25 +771,181 @@ func TestCloneTaskTimeoutRemainsResumable(t *testing.T) {
 		podID,
 		podVMID,
 		params,
-	); !isCompensationRetry(err) {
-		t.Fatalf("timeout error = %v, want compensation retry", err)
+	); !isCloneForwardRetry(err) || isCompensationRetry(err) ||
+		!cloneForwardRetryAvailable(job, err) {
+		t.Fatalf("timeout error = %v, want available forward retry", err)
 	}
-	err := reconcileCloneOperationForCleanup(
+	if store.operation == nil ||
+		store.operation.Phase != models.VMCloneOperationSubmitted ||
+		store.operation.TaskRef != "task-timeout" {
+		t.Fatalf("transient wait lost persisted task identity: %+v", store.operation)
+	}
+
+	retryParams := params
+	retryParams.HostMoRef = "host-sabotaged"
+	retryParams.ResourcePoolMoRef = "resgroup-sabotaged"
+	moref, err := executeDurableVMClone(
 		context.Background(),
 		store,
 		client,
 		jobID,
 		workerID,
-		store.operation,
+		podID,
+		podVMID,
+		retryParams,
 	)
 	if err != nil {
-		t.Fatalf("resumed cleanup: %v", err)
+		t.Fatalf("resume persisted task forward: %v", err)
 	}
-	if client.startCalls != 1 || client.waitCalls != 2 || client.configCalls != 0 {
+	if moref != "vm-eventual" {
+		t.Fatalf("resumed task moref = %q, want vm-eventual", moref)
+	}
+	if client.startCalls != 1 || client.waitCalls != 2 || client.configCalls != 1 {
 		t.Fatalf("start=%d wait=%d configure=%d", client.startCalls, client.waitCalls, client.configCalls)
 	}
 	if store.target == nil || store.target.VCenterVMID != "vm-eventual" {
-		t.Fatalf("eventual cleanup target = %+v", store.target)
+		t.Fatalf("eventual exact target = %+v", store.target)
+	}
+	if got := client.configParams[0]; got.HostMoRef != params.HostMoRef ||
+		got.ResourcePoolMoRef != params.ResourcePoolMoRef {
+		t.Fatalf("resumed task used mutable retry placement: %+v", got)
+	}
+}
+
+func TestClonePlacementValidationTransientResumesExactCloneForward(t *testing.T) {
+	jobID, workerID, podID, podVMID, params := cloneOperationFixture()
+	store := &fakeCloneOperationStore{}
+	client := &fakeCloneOperationClient{
+		store:        store,
+		taskRef:      "task-validation",
+		waitMoref:    "vm-validation",
+		validateErrs: []error{context.DeadlineExceeded, nil},
+	}
+	job := &models.Job{Type: models.JobTypePodCreate, RetryCount: 0, MaxRetries: 3}
+
+	moref, err := executeDurableVMClone(
+		context.Background(), store, client, jobID, workerID, podID, podVMID, params,
+	)
+	if moref != "vm-validation" || !isCloneForwardRetry(err) ||
+		isCompensationRetry(err) || !cloneForwardRetryAvailable(job, err) {
+		t.Fatalf("placement validation transient = (%q, %v), want exact forward retry", moref, err)
+	}
+	if store.target == nil || store.target.VCenterVMID != moref {
+		t.Fatalf("placement validation transient lost staged exact target: %+v", store.target)
+	}
+
+	retryParams := params
+	retryParams.HostMoRef = "host-sabotaged"
+	retryParams.ResourcePoolMoRef = "resgroup-sabotaged"
+	moref, err = executeDurableVMClone(
+		context.Background(), store, client, jobID, workerID, podID, podVMID, retryParams,
+	)
+	if err != nil || moref != "vm-validation" {
+		t.Fatalf("resume exact clone validation = (%q, %v)", moref, err)
+	}
+	if client.startCalls != 1 || client.waitCalls != 2 ||
+		client.validateCalls != 2 || client.configCalls != 1 {
+		t.Fatalf(
+			"start=%d wait=%d validate=%d configure=%d",
+			client.startCalls,
+			client.waitCalls,
+			client.validateCalls,
+			client.configCalls,
+		)
+	}
+	if got := client.configParams[0]; got.HostMoRef != params.HostMoRef ||
+		got.ResourcePoolMoRef != params.ResourcePoolMoRef {
+		t.Fatalf("resumed validation used mutable retry placement: %+v", got)
+	}
+}
+
+func TestCloneConfigurationTransientResumesExactCloneForward(t *testing.T) {
+	jobID, workerID, podID, podVMID, params := cloneOperationFixture()
+	store := &fakeCloneOperationStore{}
+	client := &fakeCloneOperationClient{
+		store:      store,
+		taskRef:    "task-configure",
+		waitMoref:  "vm-configure",
+		configErrs: []error{context.DeadlineExceeded, nil},
+	}
+	job := &models.Job{Type: models.JobTypeVMAdd, RetryCount: 0, MaxRetries: 3}
+
+	moref, err := executeDurableVMClone(
+		context.Background(), store, client, jobID, workerID, podID, podVMID, params,
+	)
+	if moref != "vm-configure" || !isCloneForwardRetry(err) ||
+		isCompensationRetry(err) || !cloneForwardRetryAvailable(job, err) {
+		t.Fatalf("configuration transient = (%q, %v), want exact forward retry", moref, err)
+	}
+
+	retryParams := params
+	retryParams.HostMoRef = "host-sabotaged"
+	retryParams.ResourcePoolMoRef = "resgroup-sabotaged"
+	moref, err = executeDurableVMClone(
+		context.Background(), store, client, jobID, workerID, podID, podVMID, retryParams,
+	)
+	if err != nil || moref != "vm-configure" {
+		t.Fatalf("resume exact clone configuration = (%q, %v)", moref, err)
+	}
+	if client.startCalls != 1 || client.waitCalls != 2 || client.configCalls != 2 {
+		t.Fatalf("start=%d wait=%d configure=%d", client.startCalls, client.waitCalls, client.configCalls)
+	}
+	for _, got := range client.configParams {
+		if got.HostMoRef != params.HostMoRef ||
+			got.ResourcePoolMoRef != params.ResourcePoolMoRef {
+			t.Fatalf("resumed configuration used mutable retry placement: %+v", got)
+		}
+	}
+}
+
+func TestCloneForwardRetryExhaustionRequiresCompensation(t *testing.T) {
+	_, _, podID, podVMID, params := cloneOperationFixture()
+	target := cloneCleanupTarget(podID, podVMID, "vm-exhausted", params)
+	forwardErr := newCloneForwardRetryError(context.DeadlineExceeded, target)
+	job := &models.Job{
+		Type:       models.JobTypePodCreate,
+		RetryCount: 3,
+		MaxRetries: 3,
+	}
+	if cloneForwardRetryAvailable(job, forwardErr) {
+		t.Fatal("exhausted clone failure retained a forward retry")
+	}
+	compensationErr := cloneForwardFailureToCompensation(forwardErr)
+	if !isCompensationRetry(compensationErr) {
+		t.Fatalf("exhausted clone error = %v, want compensation", compensationErr)
+	}
+	var retryErr *compensationRetryError
+	if !errors.As(compensationErr, &retryErr) || retryErr.target != target {
+		t.Fatalf("exhausted clone compensation lost exact target: %#v", compensationErr)
+	}
+}
+
+func TestCloneTerminalTaskFailureRequiresCompensation(t *testing.T) {
+	jobID, workerID, podID, podVMID, params := cloneOperationFixture()
+	store := &fakeCloneOperationStore{}
+	client := &fakeCloneOperationClient{
+		store:   store,
+		taskRef: "task-terminal",
+		waitErrs: []error{fmt.Errorf(
+			"%w: The virtual disk is either corrupted or not a supported format",
+			vcenter.ErrCloneTaskFailed,
+		)},
+	}
+
+	_, err := executeDurableVMClone(
+		context.Background(), store, client, jobID, workerID, podID, podVMID, params,
+	)
+	if !isCompensationRetry(err) {
+		t.Fatalf("terminal task error = %v, want compensation", err)
+	}
+	if isCloneForwardRetry(err) {
+		t.Fatalf("terminal task error = %v, must not resume failed task", err)
+	}
+	if retryable, _ := ClassifyError(err, models.JobTypePodCreate); !retryable {
+		t.Fatalf("terminal task compensation must remain durably retryable: %v", err)
+	}
+	if client.startCalls != 1 || client.waitCalls != 1 || client.configCalls != 0 {
+		t.Fatalf("start=%d wait=%d configure=%d", client.startCalls, client.waitCalls, client.configCalls)
 	}
 }
 

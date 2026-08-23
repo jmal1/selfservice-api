@@ -123,6 +123,187 @@ func placementCandidate(
 	}
 }
 
+func TestRetryJobPostgresForwardRetryPreservesExactCloneIdentity(t *testing.T) {
+	fixture := newPlacementPostgresFixture(t, 1)
+	ctx := context.Background()
+	operationID := uuid.NewString()
+	operation := models.VMCloneOperation{
+		OperationID:          operationID,
+		PodID:                fixture.podID.String(),
+		PodVMID:              fixture.podVMIDs[0].String(),
+		LogicalTemplateID:    fixture.templateID.String(),
+		TargetName:           "student-vm",
+		SourceRef:            "vm-source",
+		ComputeResourceType:  "ClusterComputeResource",
+		ComputeResourceMoref: "domain-c1",
+		HostMoref:            "host-1",
+		HostName:             "esxi1.example.invalid",
+		PoolMoref:            "resgroup-1",
+		DRSControl:           models.VMPlacementDRSDisabled,
+		TaskRef:              "task-4242",
+		Phase:                models.VMCloneOperationSubmitted,
+		PreparedAt:           time.Now().UTC(),
+	}
+	payload, err := json.Marshal(map[string]any{
+		"cleanup_only":      true,
+		"cleanup_completed": true,
+		"cleanup_target": map[string]string{
+			"pod_vm_id":     fixture.podVMIDs[0].String(),
+			"vcenter_vm_id": "vm-4242",
+			"host_moref":    "host-1",
+			"pool_moref":    "resgroup-1",
+		},
+		"clone_operation": operation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `
+		UPDATE jobs
+		SET payload = $2
+		WHERE id = $1
+	`, fixture.jobID, payload); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := fixture.queries.GetVMCloneOperation(ctx, fixture.jobID, fixture.workerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded == nil ||
+		loaded.OperationID != operationID ||
+		loaded.TaskRef != operation.TaskRef ||
+		loaded.SourceRef != operation.SourceRef ||
+		loaded.ComputeResourceMoref != operation.ComputeResourceMoref ||
+		loaded.HostMoref != operation.HostMoref ||
+		loaded.PoolMoref != operation.PoolMoref {
+		t.Fatalf("loaded clone operation changed exact identity: %+v", loaded)
+	}
+
+	if err := fixture.queries.RetryJob(
+		ctx,
+		fixture.jobID,
+		time.Now().Add(time.Minute),
+		false,
+		nil,
+		fixture.workerID,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	var (
+		status     string
+		retryCount int
+		claimedBy  *string
+		stored     []byte
+	)
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT status, retry_count, claimed_by, payload
+		FROM jobs
+		WHERE id = $1
+	`, fixture.jobID).Scan(&status, &retryCount, &claimedBy, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if status != models.JobStatusPending || retryCount != 1 || claimedBy != nil {
+		t.Fatalf(
+			"forward retry state = status:%s retry_count:%d claimed_by:%v",
+			status,
+			retryCount,
+			claimedBy,
+		)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(stored, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := fields["cleanup_only"]; exists {
+		t.Fatal("forward retry retained cleanup_only and would dispatch compensation")
+	}
+	if _, exists := fields["cleanup_completed"]; exists {
+		t.Fatal("forward retry retained stale cleanup completion")
+	}
+	var decodedOperation map[string]string
+	if err := json.Unmarshal(fields["clone_operation"], &decodedOperation); err != nil {
+		t.Fatal(err)
+	}
+	if decodedOperation["operation_id"] != operationID ||
+		decodedOperation["task_ref"] != "task-4242" ||
+		decodedOperation["host_moref"] != "host-1" ||
+		decodedOperation["pool_moref"] != "resgroup-1" {
+		t.Fatalf("forward retry changed exact clone operation: %+v", decodedOperation)
+	}
+	var target map[string]string
+	if err := json.Unmarshal(fields["cleanup_target"], &target); err != nil {
+		t.Fatal(err)
+	}
+	if target["vcenter_vm_id"] != "vm-4242" ||
+		target["host_moref"] != "host-1" ||
+		target["pool_moref"] != "resgroup-1" {
+		t.Fatalf("forward retry changed exact cleanup target: %+v", target)
+	}
+}
+
+func TestAdoptPodVMClonePostgresRefusesDifferentExistingReference(t *testing.T) {
+	fixture := newPlacementPostgresFixture(t, 1)
+	ctx := context.Background()
+	podVMID := fixture.podVMIDs[0]
+	payload, err := json.Marshal(map[string]any{
+		"cleanup_target": map[string]string{
+			"pod_id":        fixture.podID.String(),
+			"pod_vm_id":     podVMID.String(),
+			"vcenter_vm_id": "vm-resumed",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `
+		UPDATE jobs SET payload = $2 WHERE id = $1
+	`, fixture.jobID, payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `
+		UPDATE pod_vms
+		SET status = 'cloning',
+		    vcenter_vm_id = 'vm-existing',
+		    vcenter_vm_name = 'existing'
+		WHERE id = $1
+	`, podVMID); err != nil {
+		t.Fatal(err)
+	}
+
+	applied, err := fixture.queries.AdoptPodVMClone(
+		ctx,
+		fixture.jobID,
+		fixture.workerID,
+		podVMID,
+		[]string{models.VMStatusCloning},
+		"vm-resumed",
+		"resumed",
+		models.VMStatusConfiguring,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied {
+		t.Fatal("clone adoption overwrote a different existing vCenter reference")
+	}
+	var (
+		moref  *string
+		status string
+	)
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT vcenter_vm_id, status
+		FROM pod_vms
+		WHERE id = $1
+	`, podVMID).Scan(&moref, &status); err != nil {
+		t.Fatal(err)
+	}
+	if moref == nil || *moref != "vm-existing" || status != models.VMStatusCloning {
+		t.Fatalf("existing VM reference changed to moref=%v status=%s", moref, status)
+	}
+}
+
 type placementAdmissionJob struct {
 	jobID    uuid.UUID
 	workerID string
