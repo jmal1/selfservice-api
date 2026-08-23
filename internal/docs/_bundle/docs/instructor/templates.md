@@ -110,6 +110,12 @@ what this password is and is not.
 | **Clone an existing vCenter VM** | A teacher/admin points you at a specific VM or an imported OVA | Pick the VM from the dropdown |
 | **ISO install** | You're installing an OS from scratch off an installer disc | Pick your `.iso` from the dropdown |
 
+> [!warning]
+> Before you click **Provision** for an existing Windows VM or template with a
+> vTPM, verify BitLocker is fully decrypted and protection is off. Provisioning
+> replaces the source vTPM identity, so a staging clone cannot unlock a volume
+> that still depends on the source TPM.
+
 If an ISO is not in the list, upload it on the **Images** page and wait for the
 import to finish. It then appears under "Uploaded & imported ISOs." ISOs already
 on the server appear under "ISOs already on vCenter datastore." The value looks
@@ -379,6 +385,16 @@ Crucible runs the OS-appropriate cleanup (`cloud-init clean
 --logs --seed` on Linux, `sysprep /generalize` on Windows), takes the
 initial snapshot, and powers the VM down. You can leave the console
 open to watch it happen.
+
+> [!warning]
+> **If the staging Windows VM has a vTPM, BitLocker must be fully decrypted and
+> protection off before Generalize.** Crucible gives every subsequent clone a
+> replacement vTPM identity, so TPM-sealed keys from the staging source are
+> intentionally unavailable in publish-smoke, health-check, and student clones.
+> Verify `Get-BitLockerVolume` reports `VolumeStatus: FullyDecrypted` and
+> `ProtectionStatus: Off`. Crucible does not currently rekey VM configuration
+> metadata during cloning, so a clone can retain the source's vCenter
+> configuration key ID; that ID is not the vTPM identity.
 
 When state flips to `ready`, the staging VM is no longer interactive —
 the console button disappears.

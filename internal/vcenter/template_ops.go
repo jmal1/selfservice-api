@@ -222,6 +222,9 @@ func (c *Client) cloneTemplateSourceVMInner(ctx context.Context, params Template
 		PowerOn:  false, // we power on after hardware + NIC are configured
 		Template: false, // keep as regular VM so it can be edited
 	}
+	if _, err := applyVTPMClonePolicy(ctx, source, &cloneSpec); err != nil {
+		return "", err
+	}
 
 	// If the caller wants different hardware, set ConfigSpec. We do this
 	// in the clone in a single shot rather than a follow-up Reconfigure

@@ -383,6 +383,9 @@ func (c *Client) startCloneVMInner(
 		PowerOn:  false,
 		Template: false,
 	}
+	if _, err := applyVTPMClonePolicy(ctx, template, &cloneSpec); err != nil {
+		return "", err
+	}
 	if params.OperationID != "" {
 		operationConfig, err := cloneOperationExtraConfig(params)
 		if err != nil {

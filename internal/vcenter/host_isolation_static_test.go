@@ -95,6 +95,73 @@ func TestEveryVMCreationPrimitiveUsesCanonicalPlacement(t *testing.T) {
 	}
 }
 
+func TestEveryVMCloneBuilderAppliesVTPMPolicy(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fset := token.NewFileSet()
+	cloneBuilders := make(map[string]struct{})
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, entry.Name(), nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", entry.Name(), err)
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			var firstClone token.Pos
+			var policyCall token.Pos
+			ast.Inspect(fn.Body, func(node ast.Node) bool {
+				call, ok := node.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				switch target := call.Fun.(type) {
+				case *ast.SelectorExpr:
+					if target.Sel.Name == "Clone" && firstClone == token.NoPos {
+						firstClone = call.Pos()
+					}
+				case *ast.Ident:
+					if target.Name == "applyVTPMClonePolicy" && policyCall == token.NoPos {
+						policyCall = call.Pos()
+					}
+				}
+				return true
+			})
+			if firstClone == token.NoPos {
+				continue
+			}
+			cloneBuilders[fn.Name.Name] = struct{}{}
+			if policyCall == token.NoPos {
+				t.Errorf("%s submits CloneVM_Task without applyVTPMClonePolicy", fn.Name.Name)
+			} else if policyCall > firstClone {
+				t.Errorf("%s applies the vTPM policy after CloneVM_Task submission", fn.Name.Name)
+			}
+		}
+	}
+
+	got := make([]string, 0, len(cloneBuilders))
+	for name := range cloneBuilders {
+		got = append(got, name)
+	}
+	sort.Strings(got)
+	want := []string{
+		"cloneForHealthCheckInner",
+		"cloneTemplateSourceVMInner",
+		"startCloneVMInner",
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("VM clone builders = %v, want %v; update the guard when adding a clone path", got, want)
+	}
+}
+
 func isPlacementHostSelector(expr ast.Expr) bool {
 	sel, ok := expr.(*ast.SelectorExpr)
 	return ok && sel.Sel.Name == "Host"

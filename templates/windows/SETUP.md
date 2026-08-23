@@ -91,7 +91,9 @@ patches.
 
 Windows 11 with a vTPM auto-enables BitLocker on the system drive. If
 left enabled, sysprep will bake an encrypted volume into the base image
-and **every clone will fail to boot** (the keys don't survive sysprep).
+and **every clone will fail to boot**. Crucible requests a replacement vTPM
+identity for every clone of a vTPM source, so TPM-sealed source keys are
+intentionally unavailable to the destination.
 
 From an elevated PowerShell:
 
@@ -106,6 +108,11 @@ while ((Get-BitLockerVolume -MountPoint "C:").VolumeStatus -ne "FullyDecrypted")
 
 Verify with `Get-BitLockerVolume` — `VolumeStatus` should be
 `FullyDecrypted` and `ProtectionStatus` should be `Off`.
+
+The replacement vTPM is independent of vCenter VM encryption. Crucible does
+not currently rekey VM configuration metadata during cloning, so source and
+clone can report the same `config.keyId`; config-key uniqueness is not
+guaranteed.
 
 ## Step 6: Install Cloudbase-Init
 
@@ -290,4 +297,3 @@ provision + generalize + base-image snapshot works:
   intentional so first-boot RDP works before the per-clone password
   is set. Treat clones as not-network-exposed until cloudbase-init
   completes (~60 seconds after boot).
-

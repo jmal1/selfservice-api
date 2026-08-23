@@ -217,6 +217,10 @@ func (c *Client) cloneForHealthCheckInner(ctx context.Context, params HealthChec
 		PowerOn:  false,
 		Template: false,
 	}
+	sourceDevices, err := applyVTPMClonePolicy(ctx, source, &cloneSpec)
+	if err != nil {
+		return nil, err
+	}
 
 	// Attach to staging network if provided.
 	if params.Network != "" {
@@ -225,20 +229,16 @@ func (c *Client) cloneForHealthCheckInner(ctx context.Context, params HealthChec
 				DeviceName: params.Network,
 			},
 		}
-		var vmProps mo.VirtualMachine
-		if err := source.Properties(ctx, source.Reference(),
-			[]string{"config.hardware.device"}, &vmProps); err == nil && vmProps.Config != nil {
-			for _, dev := range vmProps.Config.Hardware.Device {
-				if nic, ok := dev.(types.BaseVirtualEthernetCard); ok {
-					card := nic.GetVirtualEthernetCard()
-					card.Backing = netBacking
-					cloneSpec.Config.DeviceChange = append(cloneSpec.Config.DeviceChange,
-						&types.VirtualDeviceConfigSpec{
-							Operation: types.VirtualDeviceConfigSpecOperationEdit,
-							Device:    dev,
-						})
-					break
-				}
+		for _, dev := range sourceDevices {
+			if nic, ok := dev.(types.BaseVirtualEthernetCard); ok {
+				card := nic.GetVirtualEthernetCard()
+				card.Backing = netBacking
+				cloneSpec.Config.DeviceChange = append(cloneSpec.Config.DeviceChange,
+					&types.VirtualDeviceConfigSpec{
+						Operation: types.VirtualDeviceConfigSpecOperationEdit,
+						Device:    dev,
+					})
+				break
 			}
 		}
 	}
