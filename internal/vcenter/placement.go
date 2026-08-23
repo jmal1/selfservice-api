@@ -221,10 +221,10 @@ func (c *Client) allowedHostByMoRef(moref string) (HostIdentity, error) {
 	return HostIdentity{}, fmt.Errorf("%w: %s", ErrHostNotAllowed, moref)
 }
 
-// ResolveTemplateSourceIdentity verifies that ref names a real VM on a
-// currently allowlisted host and returns its immutable compute-resource
-// identity. Registration stores this result rather than a mutable inventory
-// name.
+// ResolveTemplateSourceIdentity verifies that ref names a real VM and returns
+// its live immutable host and compute-resource identity. Source registration is
+// inventory validation, not placement admission; provisioning separately
+// enforces the frozen VCENTER_HOSTS allowlist for every target host.
 func (c *Client) ResolveTemplateSourceIdentity(
 	ctx context.Context,
 	ref string,
@@ -243,17 +243,47 @@ func (c *Client) ResolveTemplateSourceIdentity(
 	if vmProps.Runtime.Host == nil {
 		return nil, fmt.Errorf("%w: template source %s has no runtime host", ErrPlacementUnavailable, vm.Reference().Value)
 	}
-	hostIdentity, err := c.allowedHostByMoRef(vmProps.Runtime.Host.Value)
-	if err != nil {
-		return nil, fmt.Errorf("%w: template source host %s", ErrPlacementUnavailable, err)
+	if vmProps.Runtime.Host.Type != "HostSystem" || vmProps.Runtime.Host.Value == "" {
+		return nil, fmt.Errorf(
+			"%w: template source %s has invalid runtime host %s",
+			ErrPlacementUnavailable,
+			vm.Reference().Value,
+			vmProps.Runtime.Host,
+		)
 	}
-	computeRef := types.ManagedObjectReference{
-		Type:  hostIdentity.ComputeType,
-		Value: hostIdentity.ComputeMoRef,
+	host := object.NewHostSystem(c.client.Client, *vmProps.Runtime.Host)
+	var hostProps mo.HostSystem
+	if err := host.Properties(ctx, host.Reference(), []string{"name", "parent"}, &hostProps); err != nil {
+		return nil, fmt.Errorf("read template source host %s identity: %w", host.Reference().Value, err)
 	}
-	compute, err := c.finder.ObjectReference(ctx, computeRef)
+	if hostProps.Name == "" {
+		return nil, fmt.Errorf(
+			"%w: template source host %s has no inventory name",
+			ErrPlacementUnavailable,
+			host.Reference().Value,
+		)
+	}
+	if hostProps.Parent == nil || hostProps.Parent.Value == "" {
+		return nil, fmt.Errorf(
+			"%w: template source host %s has no parent compute resource",
+			ErrPlacementUnavailable,
+			host.Reference().Value,
+		)
+	}
+	switch hostProps.Parent.Type {
+	case "ClusterComputeResource", "ComputeResource":
+	default:
+		return nil, fmt.Errorf(
+			"%w: template source host %s parent %s is not a compute resource",
+			ErrPlacementUnavailable,
+			host.Reference().Value,
+			hostProps.Parent,
+		)
+	}
+
+	compute, err := c.finder.ObjectReference(ctx, *hostProps.Parent)
 	if err != nil {
-		return nil, fmt.Errorf("resolve source compute resource %s: %w", computeRef.Value, err)
+		return nil, fmt.Errorf("resolve source compute resource %s: %w", hostProps.Parent.Value, err)
 	}
 	computePath := ""
 	switch typed := compute.(type) {
@@ -262,14 +292,21 @@ func (c *Client) ResolveTemplateSourceIdentity(
 	case *object.ComputeResource:
 		computePath = typed.InventoryPath
 	default:
-		return nil, fmt.Errorf("source compute resource %s resolved as %T", computeRef.Value, compute)
+		return nil, fmt.Errorf("source compute resource %s resolved as %T", hostProps.Parent.Value, compute)
+	}
+	if computePath == "" {
+		return nil, fmt.Errorf(
+			"%w: source compute resource %s has no inventory path",
+			ErrPlacementUnavailable,
+			hostProps.Parent.Value,
+		)
 	}
 	return &TemplateSourceIdentity{
 		SourceVMMoref:        vm.Reference().Value,
-		HostMoref:            hostIdentity.MoRef,
-		HostName:             hostIdentity.Name,
-		ComputeResourceType:  hostIdentity.ComputeType,
-		ComputeResourceMoref: hostIdentity.ComputeMoRef,
+		HostMoref:            host.Reference().Value,
+		HostName:             hostProps.Name,
+		ComputeResourceType:  hostProps.Parent.Type,
+		ComputeResourceMoref: hostProps.Parent.Value,
 		ComputeResourcePath:  computePath,
 	}, nil
 }

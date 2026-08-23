@@ -48,6 +48,16 @@ import (
 // helpers work without modification.
 func withSimulator(t *testing.T, fn func(ctx context.Context, c *Client, vimc *vim25.Client)) {
 	t.Helper()
+	withSimulatorModel(t, func(ctx context.Context, c *Client, vimc *vim25.Client, _ *simulator.Model) {
+		fn(ctx, c, vimc)
+	})
+}
+
+func withSimulatorModel(
+	t *testing.T,
+	fn func(ctx context.Context, c *Client, vimc *vim25.Client, model *simulator.Model),
+) {
+	t.Helper()
 
 	model := simulator.VPX()
 	// One DC + a couple of standalone hosts + a VM is plenty for these tests
@@ -111,7 +121,7 @@ func withSimulator(t *testing.T, fn func(ctx context.Context, c *Client, vimc *v
 	}
 	t.Cleanup(func() { c.Disconnect(context.Background()) })
 
-	fn(ctx, c, gc.Client)
+	fn(ctx, c, gc.Client, model)
 }
 
 // firstVM returns the moref string of the first VM in the simulator. The
