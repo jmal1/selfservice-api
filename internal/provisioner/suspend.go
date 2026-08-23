@@ -42,11 +42,11 @@ func (p *Provisioner) SuspendVM(ctx context.Context, job *models.Job) error {
 	}
 	moref := *podVM.VCenterVMID
 	if err := p.validatePersistedVMPlacement(ctx, podVMID, moref); err != nil {
-		return &manualCleanupRequiredError{err: fmt.Errorf(
-			"refuse suspend for VM %s after placement drift: %w",
+		return fmt.Errorf(
+			"refuse suspend for VM %s after placement validation failed: %w",
 			podVMID,
 			err,
-		)}
+		)
 	}
 
 	reason := payload.Reason

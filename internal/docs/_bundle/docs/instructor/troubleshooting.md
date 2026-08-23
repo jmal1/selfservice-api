@@ -122,7 +122,13 @@ membership, datastore mount, standard portgroup, and available capacity. Check
 in the intended compute resource. A diagnostic mentioning reserved headroom
 means the host would fall below
 `VCENTER_PLACEMENT_RESERVED_MEMORY_MB` after the new VM and the other VMs in the
-same pod plan; do not reduce that reserve without an explicit capacity review.
+same pod plan. Durable reservations from other unreleased placement plans are
+included under a per-host PostgreSQL admission lock, so concurrent workers
+cannot overbook the reserve. Reservations are released explicitly only after a
+VM is running or exact compensation proves no VM remains. A terminal or
+`manual_cleanup_required` job can therefore continue reserving capacity by
+design; resolve its exact cleanup state rather than editing the job status. Do
+not reduce the reserve without an explicit capacity review.
 During an isolated-host canary, keep API admission and worker provisioning
 claims off, keep worker replicas at zero until the approved step, and keep
 lifecycle, runner, template-health, L1, and other destructive
@@ -133,7 +139,15 @@ compute resource, and override before later forward operations. A missing
 override, enabled override, or moved VM is placement drift and the operation
 fails closed. Inspect `crucible_vm_placement_drift_total{kind=...}` and the
 worker error; restore the exact placement/control only after confirming the VM
-identity. Manual vMotion and the clone-to-override interval still require an
+identity. A timeout, connection error, or failed vCenter property read is not
+proof of drift and remains eligible for normal job retry instead of being
+terminalized as manual cleanup. Destructive clone cleanup also compares the
+live resource pool and durable source, replica, template, pod-VM, compute, pool,
+and host markers. A pre-configuration clone may lack its DRS override, so exact
+cleanup installs and verifies the missing control before deletion; an enabled
+override remains confirmed drift. VM rows remain non-terminal until exact
+cleanup succeeds, preserving the identity needed for safe retries. Manual vMotion and the
+clone-to-override interval still require an
 external VM-host affinity/must-run rule or equivalent host exclusion during a
 containment canary. For the ESXi2 canary, `VCENTER_HOSTS` must contain ESXi1
 only, the resource pool must be the compatible AMD pool, and the external rule

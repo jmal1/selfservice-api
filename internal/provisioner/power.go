@@ -40,12 +40,12 @@ func (p *Provisioner) PowerVM(ctx context.Context, job *models.Job, action strin
 	moref := *podVM.VCenterVMID
 	if err := p.validatePersistedVMPlacement(ctx, podVMID, moref); err != nil &&
 		!ignoreMissingVMPlacementForPowerOff(action, err) {
-		return &manualCleanupRequiredError{err: fmt.Errorf(
-			"refuse %s for VM %s after placement drift: %w",
+		return fmt.Errorf(
+			"refuse %s for VM %s after placement validation failed: %w",
 			action,
 			podVMID,
 			err,
-		)}
+		)
 	}
 
 	p.publishProgress(job.ID, action, fmt.Sprintf("Performing %s on %s", action, podVM.DisplayName))

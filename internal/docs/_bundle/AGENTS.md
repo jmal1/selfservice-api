@@ -846,9 +846,19 @@ fabricated for an existing VM.
 `VCENTER_PLACEMENT_RESERVED_MEMORY_MB` is an optional comma-separated
 `host=megabytes` map. Every key must be in `VCENTER_HOSTS`, duplicates and
 invalid/non-negative values fail startup, and placement rejects a host when the
-requested VM plus earlier VMs in the same pod would consume its configured
-reserve. This is a minimum safety floor for critical resident workloads, not a
-quota.
+requested VM, earlier VMs in the same pod, and durable reservations from other
+unreleased placement plans would consume its configured reserve. Each
+unmaterialized VM stores its exact RAM reservation in `vm_placements`.
+Admission takes transaction-scoped PostgreSQL advisory locks for all selected
+hosts in stable order, then atomically checks every reservation that has not
+been explicitly released before committing the plan. Retries reuse the same
+rows; already-resident VMs record a zero reservation because live vCenter free
+memory already includes them. A reservation is released only after the VM is
+running or exact compensation proves no resource remains. Job terminal status
+alone never releases it, so ambiguous/manual-cleanup outcomes remain reserved.
+Database-clock release timestamps also keep a reservation visible to any
+capacity sample taken before its release. This is a minimum safety floor for
+critical resident workloads, not a quota.
 
 Standard portgroup creation is scoped to the union of hosts selected by the
 durable pod plan, not every allowlisted host. It records one durable per-host
@@ -877,7 +887,10 @@ Configuration fails closed if the control cannot be installed. Resume, power,
 snapshot, revert, and suspend paths compare the VM's live host, compute
 resource, and DRS override with `vm_placements` before forward mutation.
 Automatic or manual movement is reported as placement drift rather than silently
-changing the durable receipt. The pipeline exporter publishes
+changing the durable receipt. Only a successfully read host, compute, or DRS
+mismatch is typed as proven drift and escalated to manual cleanup. vCenter
+connection, timeout, and property-read failures retain their operational cause
+so normal retry policy remains available. The pipeline exporter publishes
 `crucible_vm_placement_total`,
 `crucible_vm_placement_headroom_megabytes`,
 `crucible_vm_placement_drift_total`, and
@@ -906,12 +919,21 @@ an interrupted smoke check is cleanup-only before it can be claimed again.
 Clone task waits have a 15-minute operational deadline and honor lease loss.
 Task or marker recovery stages the exact VM MoRef before any mutable
 reconfiguration. Cleanup never resolves a VM by display name and never performs
-forward configuration, power-on, or snapshots. An armed submission with neither
-a task nor a marked VM remains cleanup-only while reconciliation is credible;
+forward configuration, power-on, or snapshots. Before each destructive retry,
+it revalidates the VM's live resource pool plus the persisted operation, source,
+replica, logical-template, pod-VM, compute, pool, and host `extraConfig`
+markers. Any confirmed mismatch fails closed as identity drift; an operational
+property-read failure remains retryable. A pre-configuration clone can
+legitimately lack its DRS override; exact cleanup installs and verifies the
+missing override before deletion, while an existing enabled override remains
+proven drift and fails closed. An armed submission with neither a
+task nor a marked VM remains cleanup-only while reconciliation is credible;
 after 30 minutes it becomes `manual_cleanup_required` rather than retrying or
 submitting a duplicate indefinitely. For pod creation, rollback identity is
 persisted before clone adoption and the cleanup marker plus operation identity
-are disarmed only by the same fenced claim afterward.
+are disarmed only by the same fenced claim afterward. VM rows move to terminal
+`error`/`deleted` states only after exact cleanup succeeds, preventing template
+deletion from erasing unresolved cleanup identity.
 If ownership is lost or cleanup fails, the parent job remains `cleanup_only`
 and retries with capped backoff independently of its original provisioning
 retry budget. It cannot resume cloning, power-on, or snapshots. A cleanup-only

@@ -1,4 +1,4 @@
-﻿// Metrics for the template + image pipeline. Mirrors the design of
+// Metrics for the template + image pipeline. Mirrors the design of
 // DestroyFailedPusher and OrphanCountPusher: no prometheus client
 // dependency, hand-serialized text exposition, pushed to Pushgateway,
 // and a no-op when BaseURL is empty so the worker still does its job in

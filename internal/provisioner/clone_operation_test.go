@@ -129,6 +129,7 @@ type fakeCloneOperationClient struct {
 	waitMoref     string
 	findMoref     string
 	findErr       error
+	validateErr   error
 	startCalls    int
 	waitCalls     int
 	findCalls     int
@@ -162,7 +163,7 @@ func (f *fakeCloneOperationClient) ResolveClonePlacement(
 }
 
 func (f *fakeCloneOperationClient) ValidateVMPlacement(_ context.Context, _, _ string) error {
-	return nil
+	return f.validateErr
 }
 
 func (f *fakeCloneOperationClient) StartCloneVMOperation(
@@ -358,6 +359,62 @@ func TestDurableClonePersistsTaskBeforeWait(t *testing.T) {
 	}
 }
 
+func TestDurableCloneReturnsExactTargetForConfirmedPlacementDrift(t *testing.T) {
+	jobID, workerID, podID, podVMID, params := cloneOperationFixture()
+	store := &fakeCloneOperationStore{
+		operation: &models.VMCloneOperation{
+			OperationID:          uuid.NewString(),
+			PodID:                podID.String(),
+			PodVMID:              podVMID.String(),
+			LogicalTemplateID:    params.LogicalTemplateID,
+			TargetName:           params.VMName,
+			SourceRef:            params.TemplateName,
+			ComputeResourceType:  params.ComputeResourceType,
+			ComputeResourceMoref: params.ComputeResourceMoRef,
+			HostMoref:            params.HostMoRef,
+			HostName:             params.HostName,
+			PoolMoref:            params.ResourcePoolMoRef,
+			DRSControl:           params.DRSControl,
+			Phase:                models.VMCloneOperationSubmitted,
+			TaskRef:              "task-42",
+			PreparedAt:           time.Now(),
+		},
+	}
+	client := &fakeCloneOperationClient{
+		store:     store,
+		waitMoref: "vm-42",
+		validateErr: &vcenter.PlacementDriftError{
+			Kind:   vcenter.PlacementDriftHost,
+			Detail: "wrong host",
+		},
+	}
+
+	moref, err := executeDurableVMClone(
+		context.Background(),
+		store,
+		client,
+		jobID,
+		workerID,
+		podID,
+		podVMID,
+		params,
+	)
+	if moref != "vm-42" {
+		t.Fatalf("placement drift target = %q, want vm-42", moref)
+	}
+	if !isManualCleanupRequired(err) {
+		t.Fatalf("placement drift error = %v, want manual cleanup", err)
+	}
+	if store.target == nil ||
+		store.target.VCenterVMID != "vm-42" ||
+		store.target.HostMoref != params.HostMoRef ||
+		store.target.ComputeResourceMoref != params.ComputeResourceMoRef ||
+		store.target.ResourcePoolMoref != params.ResourcePoolMoRef ||
+		store.target.SourceRef != params.TemplateName {
+		t.Fatalf("placement drift did not stage complete exact cleanup identity: %+v", store.target)
+	}
+}
+
 func TestAcceptedResponseLostReconcilesMarkerWithoutSecondClone(t *testing.T) {
 	jobID, workerID, podID, podVMID, params := cloneOperationFixture()
 	store := &fakeCloneOperationStore{}
@@ -400,6 +457,59 @@ func TestAcceptedResponseLostReconcilesMarkerWithoutSecondClone(t *testing.T) {
 	}
 	if store.target == nil || store.target.VCenterVMID != "vm-accepted" {
 		t.Fatalf("marker reconciliation did not stage exact target: %+v", store.target)
+	}
+}
+
+func TestCleanupReconciliationStagesExactIdentityBeforeReturningDrift(t *testing.T) {
+	jobID, workerID, podID, podVMID, params := cloneOperationFixture()
+	op := &models.VMCloneOperation{
+		OperationID:          uuid.NewString(),
+		PodID:                podID.String(),
+		PodVMID:              podVMID.String(),
+		LogicalTemplateID:    params.LogicalTemplateID,
+		TargetName:           params.VMName,
+		SourceRef:            params.TemplateName,
+		ComputeResourceType:  params.ComputeResourceType,
+		ComputeResourceMoref: params.ComputeResourceMoRef,
+		HostMoref:            params.HostMoRef,
+		HostName:             params.HostName,
+		PoolMoref:            params.ResourcePoolMoRef,
+		DRSControl:           params.DRSControl,
+		Phase:                models.VMCloneOperationSubmitting,
+		PreparedAt:           time.Now(),
+	}
+	store := &fakeCloneOperationStore{operation: op}
+	client := &fakeCloneOperationClient{
+		findMoref: "vm-moved",
+		findErr: &vcenter.PlacementDriftError{
+			Kind:   vcenter.PlacementDriftHost,
+			Detail: "marked clone moved from its persisted host",
+		},
+	}
+
+	target, err := reconcileCloneOperationTargetForCleanup(
+		context.Background(),
+		store,
+		client,
+		jobID,
+		workerID,
+		op,
+	)
+	if !isManualCleanupRequired(err) {
+		t.Fatalf("cleanup reconciliation error = %v, want manual cleanup", err)
+	}
+	if target == nil || store.target == nil {
+		t.Fatalf("cleanup reconciliation lost exact target: returned=%+v staged=%+v", target, store.target)
+	}
+	if target.VCenterVMID != "vm-moved" ||
+		target.HostMoref != params.HostMoRef ||
+		target.ComputeResourceMoref != params.ComputeResourceMoRef ||
+		target.ResourcePoolMoref != params.ResourcePoolMoRef ||
+		target.SourceRef != params.TemplateName {
+		t.Fatalf("cleanup reconciliation target = %+v, want complete persisted identity", target)
+	}
+	if client.configCalls != 0 {
+		t.Fatalf("cleanup reconciliation made %d forward configuration calls", client.configCalls)
 	}
 }
 

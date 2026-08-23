@@ -160,6 +160,10 @@ func (h *Handler) DeployBlueprint(w http.ResponseWriter, r *http.Request) {
 		if bv.RAMMB != nil {
 			ram = *bv.RAMMB
 		}
+		if err := validateProvisioningRAM(ram); err != nil {
+			respondError(w, r, http.StatusBadRequest, err.Error())
+			return
+		}
 		disk := tmpl.DefaultDiskGB
 		if bv.DiskGB != nil {
 			disk = *bv.DiskGB

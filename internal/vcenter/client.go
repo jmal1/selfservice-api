@@ -602,11 +602,59 @@ func (c *Client) DestroyVM(ctx context.Context, moref string) error {
 	if err := c.ensureConnected(ctx); err != nil {
 		return err
 	}
-	if err := c.validateVMForMutation(ctx, moref, "", true); err != nil {
-		return err
-	}
+	return c.destroyVM(ctx, moref, func(validateCtx context.Context) error {
+		return c.validateVMForMutation(validateCtx, moref, "", true)
+	})
+}
 
+// DestroyVMWithPlacement destroys a VM only while its complete persisted
+// placement identity still matches. The validation is repeated inside every
+// retry so cleanup cannot follow a VM that moved to another host or compute
+// resource.
+func (c *Client) DestroyVMWithPlacement(
+	ctx context.Context,
+	moref, expectedHostMoref, computeType, computeMoref, control string,
+	identity VMCloneIdentity,
+) error {
+	if expectedHostMoref == "" || computeType == "" || computeMoref == "" || control == "" {
+		return newPlacementDrift(
+			PlacementDriftCompute,
+			nil,
+			"exact cleanup placement identity is incomplete for VM %s",
+			moref,
+		)
+	}
+	if err := c.ensureConnected(ctx); err != nil {
+		return fmt.Errorf("%w: connect to vCenter for exact VM cleanup: %w", ErrPlacementValidationUnavailable, err)
+	}
+	return c.destroyVM(ctx, moref, func(validateCtx context.Context) error {
+		err := c.ValidateVMPlacementCleanupControl(
+			validateCtx,
+			moref,
+			expectedHostMoref,
+			computeType,
+			computeMoref,
+			control,
+		)
+		if err != nil && (isAlreadyDeletedErr(err) || isResourceNotFoundErr(err)) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return c.ValidateVMCloneIdentity(validateCtx, moref, identity)
+	})
+}
+
+func (c *Client) destroyVM(
+	ctx context.Context,
+	moref string,
+	validate func(context.Context) error,
+) error {
 	return c.withRetry(ctx, "destroy VM", func() error {
+		if err := validate(ctx); err != nil {
+			return err
+		}
 		vm := object.NewVirtualMachine(c.client.Client,
 			types.ManagedObjectReference{Type: "VirtualMachine", Value: moref})
 

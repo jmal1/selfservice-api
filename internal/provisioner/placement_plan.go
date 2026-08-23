@@ -8,6 +8,7 @@ import (
 	"sort"
 
 	"github.com/google/uuid"
+	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/models"
 	"github.com/jmal1/selfservice-api/internal/rollback"
 	"github.com/jmal1/selfservice-api/internal/vcenter"
@@ -16,8 +17,6 @@ import (
 type vmPlacementSpec struct {
 	PodVMID   uuid.UUID
 	SourceRef string
-	VCPUs     int32
-	RAMMB     int64
 }
 
 type placementMetricsSink interface {
@@ -48,19 +47,21 @@ func (p *Provisioner) prepareVMPlacementPlan(
 		return nil, fmt.Errorf("load durable VM placement plan: %w", err)
 	}
 	if len(existing) > 0 {
-		if err := p.ensureExistingVMPlacements(ctx, existing); err != nil {
+		if err := p.enforceExistingVMPlacements(ctx, job.ID, workerID, existing); err != nil {
 			return nil, err
 		}
 		return existing, nil
 	}
 
 	plannedMemory := make(map[string]int64)
-	headroomByHost := make(map[string]int64)
 	candidates := make([]models.VMPlacement, 0, len(specs))
 	for _, spec := range specs {
 		podVM, err := p.db.GetPodVM(ctx, spec.PodVMID)
 		if err != nil {
 			return nil, fmt.Errorf("load pod VM %s for placement: %w", spec.PodVMID, err)
+		}
+		if podVM.RAMMB <= 0 {
+			return nil, fmt.Errorf("pod VM %s has invalid configured RAM %d MB", spec.PodVMID, podVM.RAMMB)
 		}
 		template, err := p.db.GetTemplateByID(ctx, podVM.TemplateID)
 		if err != nil {
@@ -112,8 +113,8 @@ func (p *Provisioner) prepareVMPlacementPlan(
 		resolveParams := vcenter.CloneVMParams{
 			LogicalTemplateID:     template.ID.String(),
 			TemplateName:          sourceRef,
-			VCPUs:                 spec.VCPUs,
-			RAMmb:                 spec.RAMMB,
+			VCPUs:                 int32(podVM.VCPUs),
+			RAMmb:                 int64(podVM.RAMMB),
 			Network:               network,
 			AllowMissingNetwork:   allowMissingNetwork,
 			PlannedMemoryMBByHost: plannedMemory,
@@ -123,6 +124,10 @@ func (p *Provisioner) prepareVMPlacementPlan(
 		existingVMMoref := ""
 		if podVM.VCenterVMID != nil {
 			existingVMMoref = *podVM.VCenterVMID
+		}
+		capacityObservedAt, err := p.db.BeginHostCapacityObservation(ctx)
+		if err != nil {
+			return nil, err
 		}
 		var resolved vcenter.CloneVMParams
 		if existingVMMoref != "" {
@@ -153,36 +158,47 @@ func (p *Provisioner) prepareVMPlacementPlan(
 			}
 			sourceReplicaID = &parsed
 		}
+		capacityReservationMB := int64(podVM.RAMMB)
+		if existingVMMoref != "" {
+			capacityReservationMB = 0
+		}
 		candidates = append(candidates, models.VMPlacement{
-			PodVMID:              spec.PodVMID,
-			JobID:                job.ID,
-			TemplateID:           template.ID,
-			SourceReplicaID:      sourceReplicaID,
-			SourceRef:            resolved.TemplateName,
-			ComputeResourceType:  resolved.ComputeResourceType,
-			ComputeResourceMoref: resolved.ComputeResourceMoRef,
-			ResourcePoolMoref:    resolved.ResourcePoolMoRef,
-			HostMoref:            resolved.HostMoRef,
-			HostName:             resolved.HostName,
-			DRSControl:           resolved.DRSControl,
-			ObservedFreeMemoryMB: resolved.ObservedFreeMemoryMB,
-			ReservedMemoryMB:     resolved.ReservedMemoryMB,
+			PodVMID:               spec.PodVMID,
+			JobID:                 job.ID,
+			TemplateID:            template.ID,
+			SourceReplicaID:       sourceReplicaID,
+			SourceRef:             resolved.TemplateName,
+			ComputeResourceType:   resolved.ComputeResourceType,
+			ComputeResourceMoref:  resolved.ComputeResourceMoRef,
+			ResourcePoolMoref:     resolved.ResourcePoolMoRef,
+			HostMoref:             resolved.HostMoRef,
+			HostName:              resolved.HostName,
+			DRSControl:            resolved.DRSControl,
+			ObservedFreeMemoryMB:  resolved.ObservedFreeMemoryMB,
+			ReservedMemoryMB:      resolved.ReservedMemoryMB,
+			CapacityReservationMB: capacityReservationMB,
+			CapacityObservedAt:    capacityObservedAt,
+			LegacyAdoptionPending: existingVMMoref != "",
 		})
 		if existingVMMoref == "" {
-			plannedMemory[resolved.HostMoRef] += spec.RAMMB
+			plannedMemory[resolved.HostMoRef] += int64(podVM.RAMMB)
 		}
-		headroomByHost[resolved.HostMoRef] = resolved.ObservedFreeMemoryMB -
-			plannedMemory[resolved.HostMoRef] - resolved.ReservedMemoryMB
 	}
 
 	persisted, err := p.db.PrepareVMPlacementPlan(ctx, job.ID, workerID, candidates)
 	if err != nil {
+		if errors.Is(err, database.ErrHostCapacityAdmission) {
+			if metrics, ok := p.pipeline.(placementMetricsSink); ok {
+				metrics.RecordVMPlacementRejection("reserved_headroom")
+			}
+		}
 		return nil, fmt.Errorf("persist durable VM placement plan: %w", err)
 	}
-	if err := p.ensureExistingVMPlacements(ctx, persisted); err != nil {
+	if err := p.enforceExistingVMPlacements(ctx, job.ID, workerID, persisted); err != nil {
 		return nil, err
 	}
 	if metrics, ok := p.pipeline.(placementMetricsSink); ok {
+		headroomByHost := make(map[string]int64)
 		for _, placement := range persisted {
 			source := "legacy"
 			if placement.SourceReplicaID != nil {
@@ -193,6 +209,10 @@ func (p *Provisioner) prepareVMPlacementPlan(
 				placement.ComputeResourceMoref,
 				source,
 			)
+			headroom, exists := headroomByHost[placement.HostMoref]
+			if !exists || placement.AdmittedHeadroomMB < headroom {
+				headroomByHost[placement.HostMoref] = placement.AdmittedHeadroomMB
+			}
 		}
 		for host, headroom := range headroomByHost {
 			metrics.SetVMPlacementHeadroom(host, headroom)
@@ -201,8 +221,10 @@ func (p *Provisioner) prepareVMPlacementPlan(
 	return persisted, nil
 }
 
-func (p *Provisioner) ensureExistingVMPlacements(
+func (p *Provisioner) enforceExistingVMPlacements(
 	ctx context.Context,
+	jobID uuid.UUID,
+	workerID string,
 	placements []models.VMPlacement,
 ) error {
 	for _, placement := range placements {
@@ -213,13 +235,58 @@ func (p *Provisioner) ensureExistingVMPlacements(
 		if podVM.VCenterVMID == nil || *podVM.VCenterVMID == "" {
 			continue
 		}
-		if err := p.ensurePersistedVMPlacement(ctx, *podVM.VCenterVMID, placement); err != nil {
-			return fmt.Errorf(
+		if placement.LegacyAdoptionPending {
+			if err := p.enforceLegacyVMPlacement(
+				ctx,
+				jobID,
+				workerID,
+				*podVM.VCenterVMID,
+				placement,
+			); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := p.verifyPersistedVMPlacement(ctx, *podVM.VCenterVMID, placement); err != nil {
+			return classifyPlacementValidationFailure(fmt.Errorf(
 				"enforce placement for existing pod VM %s: %w",
 				placement.PodVMID,
 				err,
-			)
+			))
 		}
+	}
+	return nil
+}
+
+func (p *Provisioner) enforceLegacyVMPlacement(
+	ctx context.Context,
+	jobID uuid.UUID,
+	workerID string,
+	vmMoref string,
+	placement models.VMPlacement,
+) error {
+	if err := p.vc.EnsureVMPlacementControl(
+		ctx,
+		vmMoref,
+		placement.HostMoref,
+		placement.ComputeResourceType,
+		placement.ComputeResourceMoref,
+		placement.DRSControl,
+	); err != nil {
+		p.recordVMPlacementDrift(err)
+		return classifyPlacementValidationFailure(fmt.Errorf(
+			"enforce placement for adopted pod VM %s: %w",
+			placement.PodVMID,
+			err,
+		))
+	}
+	if err := p.db.CompleteLegacyVMPlacementAdoption(
+		ctx,
+		jobID,
+		workerID,
+		placement.PodVMID,
+	); err != nil {
+		return fmt.Errorf("persist completed placement adoption for pod VM %s: %w", placement.PodVMID, err)
 	}
 	return nil
 }
@@ -272,23 +339,50 @@ func (p *Provisioner) validatePersistedVMPlacement(
 		return fmt.Errorf("load durable VM placement: %w", err)
 	}
 	if placement == nil {
-		return p.vc.ValidateVMPlacement(ctx, vmMoref, "")
+		err = p.vc.ValidateVMPlacement(ctx, vmMoref, "")
+	} else {
+		err = p.vc.ValidateVMPlacementControl(
+			ctx,
+			vmMoref,
+			placement.HostMoref,
+			placement.ComputeResourceType,
+			placement.ComputeResourceMoref,
+			placement.DRSControl,
+		)
 	}
-	err = p.vc.ValidateVMPlacementControl(
-		ctx,
-		vmMoref,
-		placement.HostMoref,
-		placement.ComputeResourceType,
-		placement.ComputeResourceMoref,
-		placement.DRSControl,
-	)
 	if err != nil {
 		p.recordVMPlacementDrift(err)
+	}
+	return classifyPlacementValidationFailure(err)
+}
+
+func classifyPlacementValidationFailure(err error) error {
+	if err == nil {
+		return nil
+	}
+	if isManualCleanupRequired(err) ||
+		isCompensationRetry(err) ||
+		isCompensatedJobError(err) {
+		return err
+	}
+	if errors.Is(err, vcenter.ErrPlacementDrift) ||
+		errors.Is(err, vcenter.ErrDRSControlDrift) {
+		return &manualCleanupRequiredError{err: err}
 	}
 	return err
 }
 
-func (p *Provisioner) ensurePersistedVMPlacement(
+func classifyCloneOperationFailure(err error) error {
+	if err == nil || isManualCleanupRequired(err) || isCompensationRetry(err) {
+		return err
+	}
+	if errors.Is(err, vcenter.ErrAmbiguousVMOwnership) {
+		return &manualCleanupRequiredError{err: err}
+	}
+	return classifyPlacementValidationFailure(err)
+}
+
+func (p *Provisioner) verifyPersistedVMPlacement(
 	ctx context.Context,
 	vmMoref string,
 	placement models.VMPlacement,
@@ -305,23 +399,16 @@ func (p *Provisioner) ensurePersistedVMPlacement(
 		return nil
 	}
 	p.recordVMPlacementDrift(err)
-	if !errors.Is(err, vcenter.ErrDRSControlDrift) {
-		return err
-	}
-	return p.vc.EnsureVMPlacementControl(
-		ctx,
-		vmMoref,
-		placement.HostMoref,
-		placement.ComputeResourceType,
-		placement.ComputeResourceMoref,
-		placement.DRSControl,
-	)
+	return classifyPlacementValidationFailure(err)
 }
 
 func (p *Provisioner) recordVMPlacementDrift(err error) {
 	if metrics, ok := p.pipeline.(placementMetricsSink); ok {
 		var kind string
+		var drift *vcenter.PlacementDriftError
 		switch {
+		case errors.As(err, &drift):
+			kind = string(drift.Kind)
 		case errors.Is(err, vcenter.ErrDRSControlDrift):
 			kind = "drs"
 		case errors.Is(err, vcenter.ErrPlacementDrift):

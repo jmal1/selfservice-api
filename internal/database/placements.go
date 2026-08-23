@@ -12,6 +12,8 @@ import (
 	"github.com/jmal1/selfservice-api/internal/models"
 )
 
+var ErrHostCapacityAdmission = errors.New("host capacity admission rejected")
+
 func scanTemplateSourceReplica(row pgx.Row, replica *models.TemplateSourceReplica) error {
 	return row.Scan(
 		&replica.ID,
@@ -178,6 +180,11 @@ func scanVMPlacement(row pgx.Row, placement *models.VMPlacement) error {
 		&placement.DRSControl,
 		&placement.ObservedFreeMemoryMB,
 		&placement.ReservedMemoryMB,
+		&placement.CapacityReservationMB,
+		&placement.CapacityObservedAt,
+		&placement.CapacityReleasedAt,
+		&placement.AdmittedHeadroomMB,
+		&placement.LegacyAdoptionPending,
 		&placement.CreatedAt,
 	)
 }
@@ -185,7 +192,8 @@ func scanVMPlacement(row pgx.Row, placement *models.VMPlacement) error {
 const vmPlacementSelectCols = `pod_vm_id, job_id, template_id, source_replica_id,
 	source_ref, compute_resource_type, compute_resource_moref, resource_pool_moref,
 	host_moref, host_name, drs_control, observed_free_memory_mb, reserved_memory_mb,
-	created_at`
+	capacity_reservation_mb, capacity_observed_at, capacity_released_at, admitted_headroom_mb,
+	legacy_adoption_pending, created_at`
 
 func queryVMPlacements(
 	ctx context.Context,
@@ -234,10 +242,25 @@ func validateVMPlacementCandidate(placement models.VMPlacement, jobID uuid.UUID)
 	default:
 		return fmt.Errorf("VM placement has invalid DRS control %q", placement.DRSControl)
 	}
-	if placement.ObservedFreeMemoryMB < 0 || placement.ReservedMemoryMB < 0 {
-		return errors.New("VM placement memory observations cannot be negative")
+	if placement.ObservedFreeMemoryMB < 0 || placement.ReservedMemoryMB < 0 ||
+		placement.CapacityReservationMB < 0 || placement.AdmittedHeadroomMB < 0 {
+		return errors.New("VM placement memory values are invalid")
+	}
+	if placement.CapacityObservedAt.IsZero() {
+		return errors.New("VM placement capacity observation time is required")
 	}
 	return nil
+}
+
+// BeginHostCapacityObservation returns a database-clock timestamp taken before
+// vCenter free-memory sampling. Admission uses it to keep terminal reservations
+// that completed after the sample from disappearing underneath a stale read.
+func (q *Queries) BeginHostCapacityObservation(ctx context.Context) (time.Time, error) {
+	var observedAt time.Time
+	if err := q.pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&observedAt); err != nil {
+		return time.Time{}, fmt.Errorf("begin host capacity observation: %w", err)
+	}
+	return observedAt, nil
 }
 
 func samePlacementScope(existing, candidate models.VMPlacement) bool {
@@ -332,77 +355,35 @@ func (q *Queries) PrepareVMPlacementPlan(
 	}
 
 	for _, placement := range candidates {
-		var templateMatches bool
-		if err := tx.QueryRow(ctx, `
-			SELECT EXISTS (
-				SELECT 1 FROM pod_vms
-				WHERE id = $1 AND template_id = $2
-			)
-		`, placement.PodVMID, placement.TemplateID).Scan(&templateMatches); err != nil {
+		if err := validateVMPlacementReferences(ctx, tx, placement); err != nil {
 			return nil, err
 		}
-		if !templateMatches {
-			return nil, fmt.Errorf(
-				"pod VM %s is not linked to template %s",
-				placement.PodVMID,
-				placement.TemplateID,
-			)
-		}
+	}
+	admittedHeadroomByHost, err := admitHostCapacity(ctx, tx, jobID, candidates)
+	if err != nil {
+		return nil, err
+	}
+	for i := range candidates {
+		candidates[i].AdmittedHeadroomMB = admittedHeadroomByHost[candidates[i].HostMoref]
+	}
 
-		if placement.SourceReplicaID != nil {
-			var replicaMatches bool
-			if err := tx.QueryRow(ctx, `
-				SELECT EXISTS (
-					SELECT 1
-					FROM template_source_replicas
-					WHERE id = $1
-					  AND template_id = $2
-					  AND source_vm_moref = $3
-					  AND compute_resource_type = $4
-					  AND compute_resource_moref = $5
-					  AND status = 'ready'
-				)
-			`, *placement.SourceReplicaID, placement.TemplateID, placement.SourceRef,
-				placement.ComputeResourceType, placement.ComputeResourceMoref).Scan(&replicaMatches); err != nil {
-				return nil, err
-			}
-			if !replicaMatches {
-				return nil, fmt.Errorf(
-					"source replica %s is not a ready immutable source for template %s",
-					*placement.SourceReplicaID,
-					placement.TemplateID,
-				)
-			}
-		} else {
-			var replicaModeEnabled bool
-			if err := tx.QueryRow(ctx, `
-				SELECT EXISTS (
-					SELECT 1 FROM template_source_replica_policies WHERE template_id = $1
-				)
-			`, placement.TemplateID).Scan(&replicaModeEnabled); err != nil {
-				return nil, err
-			}
-			if replicaModeEnabled {
-				return nil, fmt.Errorf(
-					"legacy source fallback is prohibited for template %s because source-replica mode is enabled",
-					placement.TemplateID,
-				)
-			}
-		}
-
+	for _, placement := range candidates {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO vm_placements (
 				pod_vm_id, job_id, template_id, source_replica_id, source_ref,
 				compute_resource_type, compute_resource_moref, resource_pool_moref,
 				host_moref, host_name, drs_control, observed_free_memory_mb,
-				reserved_memory_mb
+				reserved_memory_mb, capacity_reservation_mb, capacity_observed_at,
+				admitted_headroom_mb, legacy_adoption_pending
 			)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 		`, placement.PodVMID, jobID, placement.TemplateID, placement.SourceReplicaID,
 			placement.SourceRef, placement.ComputeResourceType,
 			placement.ComputeResourceMoref, placement.ResourcePoolMoref,
 			placement.HostMoref, placement.HostName, placement.DRSControl,
-			placement.ObservedFreeMemoryMB, placement.ReservedMemoryMB); err != nil {
+			placement.ObservedFreeMemoryMB, placement.ReservedMemoryMB,
+			placement.CapacityReservationMB, placement.CapacityObservedAt,
+			placement.AdmittedHeadroomMB, placement.LegacyAdoptionPending); err != nil {
 			return nil, fmt.Errorf("persist VM placement for %s: %w", placement.PodVMID, err)
 		}
 	}
@@ -418,6 +399,279 @@ func (q *Queries) PrepareVMPlacementPlan(
 		return nil, fmt.Errorf("commit VM placement plan: %w", err)
 	}
 	return persisted, nil
+}
+
+func validateVMPlacementReferences(
+	ctx context.Context,
+	tx pgx.Tx,
+	placement models.VMPlacement,
+) error {
+	var (
+		configuredMemoryMB int64
+		vcenterVMID        *string
+	)
+	if err := tx.QueryRow(ctx, `
+		SELECT ram_mb, vcenter_vm_id
+		FROM pod_vms
+		WHERE id = $1 AND template_id = $2
+	`, placement.PodVMID, placement.TemplateID).Scan(&configuredMemoryMB, &vcenterVMID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf(
+				"pod VM %s is not linked to template %s",
+				placement.PodVMID,
+				placement.TemplateID,
+			)
+		}
+		return err
+	}
+	if configuredMemoryMB <= 0 {
+		return fmt.Errorf(
+			"pod VM %s has invalid configured RAM %d MB",
+			placement.PodVMID,
+			configuredMemoryMB,
+		)
+	}
+	expectedReservationMB := configuredMemoryMB
+	residentVM := vcenterVMID != nil && *vcenterVMID != ""
+	if residentVM {
+		expectedReservationMB = 0
+	}
+	if placement.CapacityReservationMB != expectedReservationMB {
+		return fmt.Errorf(
+			"VM placement capacity reservation %d MB for pod VM %s does not match required reservation %d MB",
+			placement.CapacityReservationMB,
+			placement.PodVMID,
+			expectedReservationMB,
+		)
+	}
+	if placement.LegacyAdoptionPending != residentVM {
+		return fmt.Errorf(
+			"VM placement legacy adoption state for pod VM %s does not match resident VM state",
+			placement.PodVMID,
+		)
+	}
+
+	if placement.SourceReplicaID != nil {
+		var replicaMatches bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM template_source_replicas
+				WHERE id = $1
+				  AND template_id = $2
+				  AND source_vm_moref = $3
+				  AND compute_resource_type = $4
+				  AND compute_resource_moref = $5
+				  AND status = 'ready'
+			)
+		`, *placement.SourceReplicaID, placement.TemplateID, placement.SourceRef,
+			placement.ComputeResourceType, placement.ComputeResourceMoref).Scan(&replicaMatches); err != nil {
+			return err
+		}
+		if !replicaMatches {
+			return fmt.Errorf(
+				"source replica %s is not a ready immutable source for template %s",
+				*placement.SourceReplicaID,
+				placement.TemplateID,
+			)
+		}
+		return nil
+	}
+
+	var replicaModeEnabled bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM template_source_replica_policies WHERE template_id = $1
+		)
+	`, placement.TemplateID).Scan(&replicaModeEnabled); err != nil {
+		return err
+	}
+	if replicaModeEnabled {
+		return fmt.Errorf(
+			"legacy source fallback is prohibited for template %s because source-replica mode is enabled",
+			placement.TemplateID,
+		)
+	}
+	return nil
+}
+
+func (q *Queries) CompleteLegacyVMPlacementAdoption(
+	ctx context.Context,
+	jobID uuid.UUID,
+	workerID string,
+	podVMID uuid.UUID,
+) error {
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockPlacementJob(ctx, tx, jobID, workerID); err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE vm_placements
+		SET legacy_adoption_pending = false
+		WHERE pod_vm_id = $1
+		  AND job_id = $2
+		  AND legacy_adoption_pending = true
+	`, podVMID, jobID)
+	if err != nil {
+		return fmt.Errorf("complete legacy VM placement adoption for %s: %w", podVMID, err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf(
+			"legacy VM placement adoption for pod VM %s is not pending on job %s",
+			podVMID,
+			jobID,
+		)
+	}
+	return tx.Commit(ctx)
+}
+
+// ReleaseVMPlacementCapacity marks placements as no longer consuming host
+// admission capacity. Callers must first prove that each VM is running or that
+// exact compensation left no provisioned resource behind.
+func (q *Queries) ReleaseVMPlacementCapacity(
+	ctx context.Context,
+	jobID uuid.UUID,
+	workerID string,
+	podVMIDs []uuid.UUID,
+) error {
+	if len(podVMIDs) == 0 {
+		return errors.New("VM placement capacity release requires at least one pod VM")
+	}
+
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := lockPlacementJob(ctx, tx, jobID, workerID); err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE vm_placements
+		SET capacity_released_at = COALESCE(capacity_released_at, clock_timestamp())
+		WHERE job_id = $1
+		  AND pod_vm_id = ANY($2)
+	`, jobID, podVMIDs)
+	if err != nil {
+		return fmt.Errorf("release VM placement capacity: %w", err)
+	}
+	if tag.RowsAffected() != int64(len(podVMIDs)) {
+		return fmt.Errorf(
+			"release VM placement capacity: updated %d placements, want %d",
+			tag.RowsAffected(),
+			len(podVMIDs),
+		)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit VM placement capacity release: %w", err)
+	}
+	return nil
+}
+
+type hostCapacityAdmission struct {
+	hostName             string
+	observedFreeMemoryMB int64
+	reservedMemoryMB     int64
+	requestedMemoryMB    int64
+	observedAt           time.Time
+}
+
+func admitHostCapacity(
+	ctx context.Context,
+	tx pgx.Tx,
+	jobID uuid.UUID,
+	candidates []models.VMPlacement,
+) (map[string]int64, error) {
+	byHost := make(map[string]hostCapacityAdmission)
+	for _, placement := range candidates {
+		admission, exists := byHost[placement.HostMoref]
+		if !exists {
+			admission = hostCapacityAdmission{
+				hostName:             placement.HostName,
+				observedFreeMemoryMB: placement.ObservedFreeMemoryMB,
+				reservedMemoryMB:     placement.ReservedMemoryMB,
+				observedAt:           placement.CapacityObservedAt,
+			}
+		} else {
+			if placement.ObservedFreeMemoryMB < admission.observedFreeMemoryMB {
+				admission.observedFreeMemoryMB = placement.ObservedFreeMemoryMB
+			}
+			if placement.ReservedMemoryMB != admission.reservedMemoryMB {
+				return nil, fmt.Errorf(
+					"host %s has inconsistent reserved headroom values %d MB and %d MB",
+					placement.HostMoref,
+					admission.reservedMemoryMB,
+					placement.ReservedMemoryMB,
+				)
+			}
+			if placement.CapacityObservedAt.Before(admission.observedAt) {
+				admission.observedAt = placement.CapacityObservedAt
+			}
+		}
+		admission.requestedMemoryMB += placement.CapacityReservationMB
+		byHost[placement.HostMoref] = admission
+	}
+
+	hosts := make([]string, 0, len(byHost))
+	for host := range byHost {
+		hosts = append(hosts, host)
+	}
+	sort.Strings(hosts)
+
+	headroomByHost := make(map[string]int64, len(hosts))
+	for _, host := range hosts {
+		admission := byHost[host]
+		if admission.requestedMemoryMB == 0 {
+			headroom := admission.observedFreeMemoryMB - admission.reservedMemoryMB
+			if headroom < 0 {
+				headroom = 0
+			}
+			headroomByHost[host] = headroom
+			continue
+		}
+		if _, err := tx.Exec(
+			ctx,
+			`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+			"crucible:vm-placement-host:"+host,
+		); err != nil {
+			return nil, fmt.Errorf("lock host capacity admission for %s: %w", host, err)
+		}
+
+		var activeReservedMemoryMB int64
+		if err := tx.QueryRow(ctx, `
+			SELECT COALESCE(SUM(vp.capacity_reservation_mb), 0)
+			FROM vm_placements vp
+			WHERE vp.host_moref = $1
+			  AND vp.job_id <> $2
+			  AND vp.capacity_reservation_mb > 0
+			  AND (vp.capacity_released_at IS NULL OR vp.capacity_released_at >= $3)
+		`, host, jobID, admission.observedAt).Scan(&activeReservedMemoryMB); err != nil {
+			return nil, fmt.Errorf("read active host capacity reservations for %s: %w", host, err)
+		}
+
+		availableForRequest := admission.observedFreeMemoryMB -
+			activeReservedMemoryMB -
+			admission.reservedMemoryMB
+		if availableForRequest < admission.requestedMemoryMB {
+			return nil, fmt.Errorf(
+				"%w: host %s (%s) has %d MB observed free, %d MB active durable reservations, %d MB requested, and %d MB reserved headroom",
+				ErrHostCapacityAdmission,
+				admission.hostName,
+				host,
+				admission.observedFreeMemoryMB,
+				activeReservedMemoryMB,
+				admission.requestedMemoryMB,
+				admission.reservedMemoryMB,
+			)
+		}
+		headroomByHost[host] = availableForRequest - admission.requestedMemoryMB
+	}
+	return headroomByHost, nil
 }
 
 func lockPlacementJob(ctx context.Context, tx pgx.Tx, jobID uuid.UUID, workerID string) error {

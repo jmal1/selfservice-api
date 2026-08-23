@@ -77,8 +77,14 @@ CREATE TABLE vm_placements (
         CHECK (drs_control IN ('disabled', 'standalone')),
     observed_free_memory_mb BIGINT NOT NULL CHECK (observed_free_memory_mb >= 0),
     reserved_memory_mb BIGINT NOT NULL CHECK (reserved_memory_mb >= 0),
+    capacity_reservation_mb BIGINT NOT NULL CHECK (capacity_reservation_mb >= 0),
+    capacity_observed_at TIMESTAMPTZ NOT NULL,
+    capacity_released_at TIMESTAMPTZ,
+    admitted_headroom_mb BIGINT NOT NULL CHECK (admitted_headroom_mb >= 0),
+    legacy_adoption_pending BOOLEAN NOT NULL DEFAULT false,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (job_id, pod_vm_id)
+    UNIQUE (job_id, pod_vm_id),
+    CHECK (NOT legacy_adoption_pending OR capacity_reservation_mb = 0)
 );
 
 CREATE INDEX idx_vm_placements_job ON vm_placements (job_id);

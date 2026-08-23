@@ -1587,7 +1587,11 @@ func (q *Queries) StageVMCloneCleanup(
 		  AND status IN ('claimed', 'in_progress')
 		  AND NOT (
 		    COALESCE(payload->'destroyed_cleanup_targets', '[]'::jsonb)
-		      @> jsonb_build_array($2::jsonb)
+		      @> jsonb_build_array(jsonb_build_object(
+		        'pod_id', $2::jsonb->>'pod_id',
+		        'pod_vm_id', $2::jsonb->>'pod_vm_id',
+		        'vcenter_vm_id', $2::jsonb->>'vcenter_vm_id'
+		      ))
 		  )
 	`, jobID, target, workerID)
 	if err != nil {
@@ -1597,7 +1601,11 @@ func (q *Queries) StageVMCloneCleanup(
 		var destroyed bool
 		if err := q.pool.QueryRow(ctx, `
 			SELECT COALESCE(payload->'destroyed_cleanup_targets', '[]'::jsonb)
-				@> jsonb_build_array($2::jsonb)
+				@> jsonb_build_array(jsonb_build_object(
+				  'pod_id', $2::jsonb->>'pod_id',
+				  'pod_vm_id', $2::jsonb->>'pod_vm_id',
+				  'vcenter_vm_id', $2::jsonb->>'vcenter_vm_id'
+				))
 			FROM jobs
 			WHERE id = $1
 		`, jobID, target).Scan(&destroyed); err == nil && destroyed {

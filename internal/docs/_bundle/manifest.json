@@ -13,8 +13,8 @@
     {
       "path": "AGENTS.md",
       "title": "AGENTS.md — Crucible AI Authoring Reference",
-      "size": 57246,
-      "sha256": "3f7f62b653ec3d1985285ef66d4a90ab4af1d01577ecc246505b87629fdd8e5c",
+      "size": 58959,
+      "sha256": "4a7a4d9d8b5cf738c774733d78137ba4235795bff411b8816518929fbcf5e527",
       "is_markdown": true,
       "links_out": [
         "deploy/runner/actions.sh",
@@ -183,8 +183,8 @@
     {
       "path": "docs/instructor/templates.md",
       "title": "Building a Template",
-      "size": 48415,
-      "sha256": "a246a59819a86549acf5b53e730a230a7e5ff1ffb205a36c59f098a11e76f8bb",
+      "size": 49371,
+      "sha256": "3241b8e58202a2012192a5b1a4230b693773b7bc3969f4aa1ba9f61a6a39675d",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/glossary.md",
@@ -202,8 +202,8 @@
     {
       "path": "docs/instructor/troubleshooting.md",
       "title": "Troubleshooting",
-      "size": 39068,
-      "sha256": "af1b866ddcd7c08c132cad86eab11ca41303a386c7ce49fdf8b34f9cb44e8aa3",
+      "size": 40105,
+      "sha256": "1a9c44139ae36642028fb7a03da75df2b2c817bb26fe173374fa833a7e3cae7d",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/actions.md",
@@ -384,5 +384,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 350147
+  "total_bytes": 353853
 }

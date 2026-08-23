@@ -738,7 +738,7 @@ func (c *Client) resolveClonePlacement(
 // expected immutable host, or whose host is no longer allowlisted.
 func (c *Client) ValidateVMPlacement(ctx context.Context, vmMoref, expectedHostMoRef string) error {
 	if err := c.ensureConnected(ctx); err != nil {
-		return err
+		return fmt.Errorf("%w: connect to vCenter: %w", ErrPlacementValidationUnavailable, err)
 	}
 	vm := object.NewVirtualMachine(c.client.Client, types.ManagedObjectReference{
 		Type:  "VirtualMachine",
@@ -746,18 +746,30 @@ func (c *Client) ValidateVMPlacement(ctx context.Context, vmMoref, expectedHostM
 	})
 	var props mo.VirtualMachine
 	if err := vm.Properties(ctx, vm.Reference(), []string{"runtime.host"}, &props); err != nil {
-		return fmt.Errorf("read VM %s placement: %w", vmMoref, err)
+		return fmt.Errorf("%w: read VM %s placement: %w", ErrPlacementValidationUnavailable, vmMoref, err)
 	}
 	if props.Runtime.Host == nil || props.Runtime.Host.Value == "" {
-		return fmt.Errorf("%w: VM %s has no runtime host assignment", ErrHostNotAllowed, vmMoref)
+		return newPlacementDrift(
+			PlacementDriftHost,
+			ErrHostNotAllowed,
+			"VM %s has no runtime host assignment",
+			vmMoref,
+		)
 	}
 	if _, err := c.allowedHostByMoRef(props.Runtime.Host.Value); err != nil {
-		return fmt.Errorf("%w: VM %s is on %s", err, vmMoref, props.Runtime.Host.Value)
+		return newPlacementDrift(
+			PlacementDriftHost,
+			err,
+			"VM %s is on %s",
+			vmMoref,
+			props.Runtime.Host.Value,
+		)
 	}
 	if expectedHostMoRef != "" && props.Runtime.Host.Value != expectedHostMoRef {
-		return fmt.Errorf(
-			"%w: VM %s is on %s, expected persisted host %s",
+		return newPlacementDrift(
+			PlacementDriftHost,
 			ErrHostNotAllowed,
+			"VM %s is on %s, expected persisted host %s",
 			vmMoref,
 			props.Runtime.Host.Value,
 			expectedHostMoRef,

@@ -109,9 +109,10 @@ func findVMOperationInInventory(
 			)
 		}
 		if props.Runtime.Host == nil || props.Runtime.Host.Value != params.HostMoRef {
-			return "", fmt.Errorf(
-				"%w: clone target %q is on host %v, expected %s",
+			return reader.moref, newPlacementDrift(
+				PlacementDriftHost,
 				ErrHostNotAllowed,
+				"clone target %q is on host %v, expected %s",
 				params.VMName,
 				props.Runtime.Host,
 				params.HostMoRef,
