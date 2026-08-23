@@ -813,6 +813,19 @@ all use the same resolver. An existing, resumed, or recovered VM on a host
 outside the current allowlist is never reused, powered on, reconfigured, or
 destroyed automatically.
 
+Every production clone path inspects `config.hardware.device` on the source
+before submitting `CloneVM_Task`. If the source contains a `VirtualTPM`, the
+per-operation `VirtualMachineCloneSpec.TpmProvisionPolicy` is `replace`, so the
+destination receives a new vTPM identity and cannot access TPM-sealed secrets
+from the source. A hardware-property read failure blocks the clone; sources
+without a vTPM leave the policy unset and retain vCenter's existing behavior.
+This control does not recrypt the VM or its disks, so a destination may retain
+the source's configuration encryption key ID. Config-key uniqueness is not
+currently a Crucible invariant. Windows sources with vTPM must therefore have
+BitLocker fully decrypted and protection off before they are used as clone
+sources. If a vTPM is added to a staging VM later, decrypt it before that VM is
+sealed or generalized.
+
 Multi-cluster pod cloning uses `template_source_replicas`: one validated source
 VM per logical template and immutable compute-resource identity. Operators
 register a real source with
