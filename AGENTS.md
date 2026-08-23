@@ -820,7 +820,11 @@ register a real source with
 `{"source_ref":"vm-123"}`; list and delete use the same collection path and
 `/{replicaID}`. Registration resolves the VM, current host, compute type/MoRef,
 and inventory path live through vCenter before storing a `ready` row. The
-migration never fabricates replicas. A template retains its legacy
+source's current host does not need to be in `VCENTER_HOSTS`: registration only
+records inventory identity and does not make that host eligible for placement
+or mutation. Target eligibility remains controlled exclusively by the frozen
+`VCENTER_HOSTS` set and compatible configured resource pools. The migration
+never fabricates replicas. A template retains its legacy
 `vcenter_template` behavior only until its first replica is registered. That
 registration durably enables source-replica mode; deleting every replica does
 not restore legacy fallback and leaves provisioning blocked until a `ready`

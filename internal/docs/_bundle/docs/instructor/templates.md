@@ -246,6 +246,14 @@ remove an unused one. Registration verifies the source VM and its current
 compute resource live in vCenter. The database migration does not invent
 replicas for another cluster.
 
+The source VM's current host does not need to be in `VCENTER_HOSTS`.
+Registration is read-only inventory validation: it records the live VM, host,
+and compute-resource identity, but it does not authorize placement or mutation
+on that host. Target eligibility remains controlled exclusively by the frozen
+`VCENTER_HOSTS` allowlist and compatible configured resource pools. Registering
+a source on another cluster is therefore safe bootstrap preparation, not host
+admission.
+
 A template keeps using its existing source for backward compatibility only
 until the first replica is registered. Registration durably enables
 source-replica mode; deleting every replica does not restore the legacy
