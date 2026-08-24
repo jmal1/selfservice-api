@@ -48,12 +48,15 @@ remain available so existing environments can be made safe. The worker also
 continues compensation-only retries for cleanup that began before maintenance;
 those retries cannot resume pod or VM creation.
 
-### Rollback-safe claims containment before a phase-1 upgrade
+### Rollback-safe immutable baseline before a phase-1 upgrade
 
 A live Deployment override is not a rollback control. Helm rollback restores
 the previous revision's rendered environment, so a prior revision with
 `WORKER_PROVISIONING_CLAIMS_ENABLED=true` can briefly claim queued work even
-when the live pod was patched to `false`.
+when the live pod was patched to `false`. Likewise, a stored Helm manifest is
+not proof that applying it will avoid restarts: live
+`kubectl rollout restart` annotations may be absent from Helm, and a restart of
+a workload whose stored image is `:latest` can pull different code.
 
 Before pulling upgrade code, building or pushing images, or running a migration:
 
@@ -68,31 +71,70 @@ Before pulling upgrade code, building or pushing images, or running a migration:
      --baseline-chart-dir /path/to/safe-checkout/deploy/helm/selfservice
    ```
 
-   The command uses the release's existing values, changes
-   `provisioning.workerClaimsEnabled=false`, and pins the worker manifest to the
-   single immutable image digest reported by the running safe worker pods. It
-   rejects a supplied chart whose rendered worker Deployment differs from the
-   live Helm manifest beyond that gate and digest pin, waits for the worker
-   rollout, and verifies both Helm and Kubernetes. The baseline upgrade does
-   not use `--atomic`: a failed baseline must never roll back to the
-   claims-enabled revision. Its failure path reasserts the live claims override
-   and stops; fix the baseline error and rerun it before proceeding.
+   The command uses the release's existing values and changes
+   `provisioning.workerClaimsEnabled=false`. It inventories every image-bearing
+   Deployment, DaemonSet, StatefulSet, CronJob, and Job rendered by those
+   production values. This includes the API, worker, engine, UI, synthetic
+   monitor, runner warmer, subchart workloads, and any future rendered
+   workload. Every container and init-container is pinned to the single
+   immutable sha256 ImageID reported by its healthy live pod. The engine's
+   `RUNNER_IMAGE` is pinned to the same digest as the runner warmer. Missing
+   pods or retained CronJob evidence, mutable/non-sha256 ImageIDs, mixed
+   digests, container inventory changes, or repository mismatches stop the
+   command before Helm mutation.
+
+   Before applying, the command compares each rendered workload directly with
+   the live resource; it does not compare only stored Helm manifests and does
+   not use three-way `kubectl diff`. The candidate is submitted under a
+   temporary name with server-side dry-run defaulting, then its canonical spec
+   is compared directly with the canonical live spec. This ensures live-only
+   command, environment, volume, or security settings cannot be silently
+   preserved by apply merge semantics. Image references are normalized back to
+   the proven live declarations for this drift check. The only benign live
+   difference is
+   `kubectl.kubernetes.io/restartedAt`. Removing that annotation may restart a
+   pod, but is allowed only after every candidate pin is proven equivalent to
+   the effective live digest. Any command, environment, volume,
+   security-context, replica, service-account, or other workload drift fails
+   closed.
+
+   The baseline upgrade does not use `--atomic`: a failed baseline must never
+   roll back to the claims-enabled revision. Its failure path reasserts the
+   live claims override and stops. On success, it verifies the newest Helm
+   revision is deployed, persisted and live claims remain false, the live
+   worker count is exactly one, every declared image and effective ImageID
+   equals the persisted pin, all workload rollouts and retained jobs are
+   healthy, the synthetic monitor remains healthy, and the database migration
+   is unchanged. Fix any failure and rerun the baseline before proceeding.
 3. Re-run the read-only proof:
 
    ```bash
    ./deploy/scripts/deploy.sh --verify-rollback-containment
    ```
 
-Confirm PostgreSQL reports migration **34 clean**; stop for incident recovery
-if it is dirty or at another version. Only after that database check and both
-commands succeed may the operator update the checkout/images and run the normal
-phase-1 deployment. The normal deploy path repeats the Helm/live claims and
-digest-pin proof before `git pull`, and rejects a latest Helm revision whose
-status is not `deployed`; if any part fails, it exits before the migration or
-image upgrade. That current claims-disabled, digest-pinned revision is then the
-target used by `helm upgrade --atomic` if the upgrade fails. Do not use
-`kubectl set env` as a substitute and do not manually select an older
-claims-enabled revision for rollback.
+PostgreSQL must report migration **35 clean**. The script checks that against
+the latest migration in the hotfix checkout and proves the version and dirty
+flag are unchanged across baseline preparation. Stop for incident recovery if
+it reports another state.
+
+Only after both commands succeed may the operator update the checkout/images
+and run the normal phase-1 deployment. The normal deploy path repeats the full
+Helm/live proof before `git pull`, records the exact baseline revision and
+migration state, then repeats the proof after pull and dependency resolution.
+An intervening Helm revision is rejected, so the immutable all-workload
+baseline remains the immediately previous successful revision used by
+`helm upgrade --atomic`. If any part fails, the script exits before the
+application upgrade.
+
+Both baseline creation and the final application-upgrade check hold the
+cluster-visible ConfigMap lock
+`selfservice/selfservice-phase1-deploy-lock`. Every release mutation during
+this procedure must go through `deploy.sh`; do not run an independent
+`helm upgrade` that ignores the lock. If a terminated deploy leaves the lock
+behind, inspect its `crucible.jmal.io/holder` annotation and prove that holder
+is no longer active before deleting it. Do not use `kubectl set env` as a
+substitute and do not manually select an older or mutable revision for
+rollback.
 
 Operators can distinguish ordinary queued work from recovery work in the job
 payload. Pod/VM creation, template staging/generalization/verification/health,

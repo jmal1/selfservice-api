@@ -7,3 +7,6 @@ internal/docs/_bundle/** -text eol=lf
 # Golden-test fixtures must stay LF-only so the schema diff is
 # deterministic across Windows and Linux contributors.
 internal/docs/testdata/*.json text eol=lf
+
+# Helm post-renderers are executed directly on Linux deploy hosts.
+deploy/scripts/*.sh text eol=lf
