@@ -216,6 +216,55 @@ func TestPodPortGroupReceiptPostgresPlannedIntentCanTombstone(t *testing.T) {
 	}
 }
 
+func TestPodPortGroupReceiptPostgresLegacyBackfillCannotAdoptCurrentPortGroup(t *testing.T) {
+	fixture := newPlacementPostgresFixture(t, 1)
+	ctx := context.Background()
+	receipt := portGroupReceiptJSON(t, "Pod-VLAN3999", 3999)
+	if _, err := fixture.pool.Exec(ctx, `
+		INSERT INTO pod_portgroup_receipts (
+			pod_id,
+			create_job_id,
+			receipt,
+			state
+		)
+		VALUES ($1, $2, $3, 'legacy')
+	`, fixture.podID, fixture.jobID, receipt); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := fixture.queries.BeginPodPortGroupMutation(
+		ctx,
+		fixture.jobID,
+		fixture.workerID,
+		fixture.podID,
+		receipt,
+	); !errors.Is(err, ErrPortGroupReceiptConflict) {
+		t.Fatalf("legacy mutation intent error = %v, want ErrPortGroupReceiptConflict", err)
+	}
+	if err := fixture.queries.PersistPodPortGroupKeys(
+		ctx,
+		fixture.podID,
+		receipt,
+		map[string]string{"host-1002": "key-vim.host.PortGroup-current"},
+	); !errors.Is(err, ErrPortGroupReceiptConflict) {
+		t.Fatalf("legacy key adoption error = %v, want ErrPortGroupReceiptConflict", err)
+	}
+	if err := fixture.queries.MarkPodPortGroupRemoved(
+		ctx,
+		fixture.podID,
+		receipt,
+	); !errors.Is(err, ErrPortGroupReceiptConflict) {
+		t.Fatalf("legacy removal error = %v, want ErrPortGroupReceiptConflict", err)
+	}
+	record, err := fixture.queries.GetPodPortGroupReceipt(ctx, fixture.podID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.State != PodPortGroupReceiptLegacy || len(record.Keys) != 0 || record.RemovedAt != nil {
+		t.Fatalf("legacy receipt changed after rejected adoption: %+v", record)
+	}
+}
+
 func TestPodPortGroupReceiptPostgresConcurrentConflictFailsClosed(t *testing.T) {
 	fixture := newPlacementPostgresFixture(t, 1)
 	ctx := context.Background()

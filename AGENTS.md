@@ -962,11 +962,12 @@ immutable host/compute identity, expected VLAN, `vSwitch0`, inherited security
 policy, whether the portgroup already existed, and the stable per-host vSphere
 `HostPortGroup.Key` captured before the receipt becomes `active`. An
 `applying` receipt that is both keyless and absent is ambiguous and fails
-closed. A changed key or configuration also fails closed. A successful rollback
-records a durable `removed`
-tombstone, so a later user destroy can recognize completed cleanup without
-treating broad name absence as ownership proof. A partial failure removes only
-portgroups newly created by that receipt, in reverse order. Rollback and destroy
+closed. Receipts backfilled from pre-ledger rollback data are marked `legacy`
+and can never bind a current inventory key or authorize deletion. A changed key
+or configuration also fails closed. A successful rollback records a durable
+`removed` tombstone, so a later user destroy can recognize completed cleanup
+without treating broad name absence as ownership proof. A partial failure
+removes only portgroups newly created by that receipt, in reverse order. Rollback and destroy
 never infer ownership from OPNsense VLAN state and never delete preexisting
 portgroups. A missing, malformed, legacy receipt without immutable host
 identities, or historical receipt naming a host outside the current allowlist

@@ -7,7 +7,7 @@ CREATE TABLE pod_portgroup_receipts (
     portgroup_keys JSONB NOT NULL DEFAULT '{}'::jsonb
         CHECK (jsonb_typeof(portgroup_keys) = 'object'),
     state TEXT NOT NULL DEFAULT 'planned'
-        CHECK (state IN ('planned', 'applying', 'active', 'removed')),
+        CHECK (state IN ('legacy', 'planned', 'applying', 'active', 'removed')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     removed_at TIMESTAMPTZ,
     CHECK (
@@ -18,7 +18,7 @@ CREATE TABLE pod_portgroup_receipts (
         AND jsonb_array_length(receipt->'hosts') > 0
     ),
     CHECK (
-        (state IN ('planned', 'applying', 'active') AND removed_at IS NULL)
+        (state IN ('legacy', 'planned', 'applying', 'active') AND removed_at IS NULL)
         OR (state = 'removed' AND removed_at IS NOT NULL)
     )
 );
@@ -36,7 +36,7 @@ SELECT DISTINCT ON ((j.payload->>'pod_id')::uuid)
            '{hosts}',
            normalized.hosts
        ),
-       'applying'
+       'legacy'
 FROM jobs j
 CROSS JOIN LATERAL jsonb_array_elements(
     COALESCE(j.rollback_steps, '[]'::jsonb)

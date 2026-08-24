@@ -43,6 +43,7 @@ func validatePortGroupReceiptWiring(src portGroupReceiptWiring) error {
 		"receipt = $2::jsonb",
 		"current != key",
 		"removedAt != nil",
+		"PodPortGroupReceiptLegacy",
 		"PodPortGroupReceiptPlanned",
 		"PodPortGroupReceiptApplying",
 	} {
@@ -59,6 +60,10 @@ func validatePortGroupReceiptWiring(src portGroupReceiptWiring) error {
 		if !strings.Contains(src.destroy, fragment) {
 			return errors.New("destroy is missing exact keyed cleanup or tombstone completion")
 		}
+	}
+	if strings.Contains(src.create, "case database.PodPortGroupReceiptLegacy") ||
+		strings.Contains(src.destroy, "receiptRecord.State == database.PodPortGroupReceiptLegacy") {
+		return errors.New("legacy receipt state must not reach inventory-based key capture or deletion")
 	}
 	for _, fragment := range []string{
 		"findPortGroupOnHostByIdentity(",
@@ -125,6 +130,14 @@ func TestPortGroupReceiptWiringRejectsSabotage(t *testing.T) {
 		1,
 	)
 	sabotages["drs-preflight-before-network"] = sabotaged
+	sabotaged = src
+	sabotaged.create = strings.Replace(
+		src.create,
+		"case database.PodPortGroupReceiptApplying, database.PodPortGroupReceiptActive:",
+		"case database.PodPortGroupReceiptLegacy, database.PodPortGroupReceiptApplying, database.PodPortGroupReceiptActive:",
+		1,
+	)
+	sabotages["legacy-inventory-adoption"] = sabotaged
 
 	for name, candidate := range sabotages {
 		t.Run(name, func(t *testing.T) {

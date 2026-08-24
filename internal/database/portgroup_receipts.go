@@ -15,6 +15,7 @@ var ErrPortGroupReceiptNotFound = errors.New("durable port group receipt not fou
 var ErrPortGroupReceiptConflict = errors.New("durable port group receipt conflicts with existing ownership")
 
 const (
+	PodPortGroupReceiptLegacy   = "legacy"
 	PodPortGroupReceiptPlanned  = "planned"
 	PodPortGroupReceiptApplying = "applying"
 	PodPortGroupReceiptActive   = "active"

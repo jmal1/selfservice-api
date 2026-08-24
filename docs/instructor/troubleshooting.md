@@ -225,9 +225,11 @@ independent per-pod ledger before switch mutation and captures each exact
 `HostPortGroup.Key` before the receipt becomes active. Monotonic `planned`,
 `applying`, and `active` states prove whether mutation was authorized; a
 keyless `applying` receipt with no matching group is intentionally ambiguous.
-Successful rollback records a durable
-`removed` tombstone that survives rollback-step checkpointing and makes a later
-destroy idempotent. A changed key, name, VLAN, `vSwitch0`, or inherited security
+Pre-ledger rollback receipts are backfilled in a fail-closed `legacy` state and
+cannot adopt a current same-name portgroup as ownership proof. Successful
+rollback records a durable `removed` tombstone that survives rollback-step
+checkpointing and makes a later destroy idempotent. A changed key, name, VLAN,
+`vSwitch0`, or inherited security
 policy; a missing or malformed receipt; a legacy receipt without immutable host
 identities; or a receipt naming a host outside the current `VCENTER_HOSTS`
 allowlist makes the destroy job report
