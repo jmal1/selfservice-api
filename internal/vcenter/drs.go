@@ -4,11 +4,90 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 
+	"github.com/jmal1/selfservice-api/internal/models"
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/types"
 )
+
+const DRSPlacementPrivilege = "Host.Inventory.EditCluster"
+
+type DRSPlacementTarget struct {
+	ComputeResourceType  string
+	ComputeResourceMoref string
+}
+
+// DRSPlacementTargets extracts the unique immutable compute identities selected
+// by a durable placement plan.
+func DRSPlacementTargets(placements []models.VMPlacement) []DRSPlacementTarget {
+	unique := make(map[string]DRSPlacementTarget)
+	for _, placement := range placements {
+		key := placement.ComputeResourceType + "\x00" + placement.ComputeResourceMoref
+		unique[key] = DRSPlacementTarget{
+			ComputeResourceType:  placement.ComputeResourceType,
+			ComputeResourceMoref: placement.ComputeResourceMoref,
+		}
+	}
+	keys := make([]string, 0, len(unique))
+	for key := range unique {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	targets := make([]DRSPlacementTarget, 0, len(keys))
+	for _, key := range keys {
+		targets = append(targets, unique[key])
+	}
+	return targets
+}
+
+// ValidateDRSPlacementPrivileges proves the service account can install the
+// mandatory per-VM DRS override before any network or clone mutation.
+func (c *Client) ValidateDRSPlacementPrivileges(ctx context.Context, targets []DRSPlacementTarget) error {
+	if err := c.ensureConnected(ctx); err != nil {
+		return err
+	}
+	session, err := c.client.SessionManager.UserSession(ctx)
+	if err != nil {
+		return fmt.Errorf("load vCenter session for DRS privilege validation: %w", err)
+	}
+	if session == nil || session.Key == "" {
+		return errors.New("vCenter session has no identity for DRS privilege validation")
+	}
+	manager := object.NewAuthorizationManager(c.client.Client)
+	for _, target := range targets {
+		switch target.ComputeResourceType {
+		case "ComputeResource":
+			continue
+		case "ClusterComputeResource":
+		default:
+			return fmt.Errorf("unsupported placement compute type %q", target.ComputeResourceType)
+		}
+		entity := types.ManagedObjectReference{
+			Type:  target.ComputeResourceType,
+			Value: target.ComputeResourceMoref,
+		}
+		granted, err := manager.HasPrivilegeOnEntity(
+			ctx,
+			entity,
+			session.Key,
+			[]string{DRSPlacementPrivilege},
+		)
+		if err != nil {
+			return fmt.Errorf("validate DRS privilege on %s: %w", entity, err)
+		}
+		if len(granted) != 1 || !granted[0] {
+			return fmt.Errorf(
+				"vCenter service account lacks %s on selected cluster %s",
+				DRSPlacementPrivilege,
+				strings.TrimSpace(target.ComputeResourceMoref),
+			)
+		}
+	}
+	return nil
+}
 
 var (
 	ErrPlacementDrift                 = errors.New("VM placement drift detected")

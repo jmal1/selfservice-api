@@ -427,7 +427,7 @@ func stageAndConfigureClone(
 		if isManualCleanupRequired(validationErr) {
 			return moref, validationErr
 		}
-		return moref, newCloneForwardRetryError(validationErr, target)
+		return moref, cloneRecoveryError(validationErr, target)
 	}
 	if err := client.ConfigureClonedVM(ctx, moref, params); err != nil {
 		classifiedErr := classifyPlacementValidationFailure(fmt.Errorf(
@@ -438,7 +438,7 @@ func stageAndConfigureClone(
 		if isManualCleanupRequired(classifiedErr) {
 			return moref, classifiedErr
 		}
-		return moref, newCloneForwardRetryError(classifiedErr, target)
+		return moref, cloneRecoveryError(classifiedErr, target)
 	}
 	return moref, nil
 }

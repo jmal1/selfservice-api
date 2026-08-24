@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 
 	"github.com/google/uuid"
@@ -47,9 +48,6 @@ func (p *Provisioner) prepareVMPlacementPlan(
 		return nil, fmt.Errorf("load durable VM placement plan: %w", err)
 	}
 	if len(existing) > 0 {
-		if err := p.enforceExistingVMPlacements(ctx, job.ID, workerID, existing); err != nil {
-			return nil, err
-		}
 		return existing, nil
 	}
 
@@ -194,9 +192,6 @@ func (p *Provisioner) prepareVMPlacementPlan(
 		}
 		return nil, fmt.Errorf("persist durable VM placement plan: %w", err)
 	}
-	if err := p.enforceExistingVMPlacements(ctx, job.ID, workerID, persisted); err != nil {
-		return nil, err
-	}
 	if metrics, ok := p.pipeline.(placementMetricsSink); ok {
 		headroomByHost := make(map[string]int64)
 		for _, placement := range persisted {
@@ -310,6 +305,21 @@ func selectedPlacementHosts(placements []models.VMPlacement) []string {
 	}
 	sort.Strings(hosts)
 	return hosts
+}
+
+func validatePortGroupReceiptScope(
+	receipt vcenter.PortGroupReceipt,
+	pgName string,
+	vlanID int,
+	selectedHosts []string,
+) (*vcenter.PortGroupReceipt, error) {
+	engine := rollback.New(uuid.Nil, nil, slog.Default())
+	raw, err := json.Marshal(receipt)
+	if err != nil {
+		return nil, err
+	}
+	engine.LoadSteps([]rollback.Step{{Name: "portgroup_create", Data: raw}})
+	return existingPortGroupReceipt(engine, pgName, vlanID, selectedHosts)
 }
 
 func cloneParamsFromPlacement(params vcenter.CloneVMParams, placement models.VMPlacement) vcenter.CloneVMParams {

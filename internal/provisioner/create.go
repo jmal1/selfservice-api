@@ -515,13 +515,49 @@ func (p *Provisioner) newPodCreateRollbackEngine(
 		return p.opn.ApplyFirewall(ctx)
 	})
 	rb.RegisterUndo("portgroup_create", func(ctx context.Context, data json.RawMessage) error {
-		var receipt vcenter.PortGroupReceipt
-		if err := json.Unmarshal(data, &receipt); err != nil {
+		record, err := p.db.GetPodPortGroupReceipt(ctx, podID)
+		if err != nil {
 			return err
 		}
-		return p.db.WithVCenterPortGroupMutationLock(ctx, func(lockCtx context.Context) error {
+		var receipt vcenter.PortGroupReceipt
+		if err := json.Unmarshal(record.Receipt, &receipt); err != nil {
+			return err
+		}
+		switch record.State {
+		case database.PodPortGroupReceiptPlanned:
+			return p.db.MarkPodPortGroupRemoved(ctx, podID, record.Receipt)
+		case database.PodPortGroupReceiptRemoved:
+			return nil
+		case database.PodPortGroupReceiptApplying, database.PodPortGroupReceiptActive:
+		default:
+			return fmt.Errorf("invalid durable port group receipt state %q", record.State)
+		}
+		receipt, err = vcenter.PortGroupReceiptWithKeys(receipt, record.Keys)
+		if err != nil {
+			return err
+		}
+		keys, err := p.vc.CapturePortGroupKeys(ctx, receipt)
+		if err != nil {
+			return err
+		}
+		if err := p.db.PersistPodPortGroupKeys(ctx, podID, record.Receipt, keys); err != nil {
+			return err
+		}
+		for host, key := range record.Keys {
+			if _, exists := keys[host]; !exists {
+				keys[host] = key
+			}
+		}
+		receipt, err = vcenter.PortGroupReceiptWithKeys(receipt, keys)
+		if err != nil {
+			return err
+		}
+		if err := p.db.WithVCenterPortGroupMutationLock(ctx, func(lockCtx context.Context) error {
 			return p.vc.DeletePortGroupMutation(lockCtx, receipt)
-		})
+		}); err != nil {
+			return err
+		}
+		return p.db.MarkPodPortGroupRemoved(ctx, podID, record.Receipt)
 	})
 	for i := range vmSpecs {
 		stepName := fmt.Sprintf("vm_clone_%d", i)
@@ -1172,6 +1208,54 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr er
 		return nil
 	}
 
+	// Resolve and persist the complete source/compute/pool/host plan, then prove
+	// the service account can install the mandatory DRS control before any
+	// OPNsense, standard-switch, or clone mutation.
+	placementSpecs := make([]vmPlacementSpec, 0, len(payload.VMs))
+	for _, vmSpec := range payload.VMs {
+		placementSpecs = append(placementSpecs, vmPlacementSpec{
+			PodVMID:   vmSpec.PodVMID,
+			SourceRef: vmSpec.TemplateName,
+		})
+	}
+	placements, err := p.prepareVMPlacementPlan(ctx, job, placementSpecs, pgName, true, nil)
+	if err != nil {
+		planningErr := fmt.Errorf("plan VM placements: %w", err)
+		if jobRetryAvailable(job, planningErr) {
+			return planningErr
+		}
+		return p.failPodCreateWithCleanup(
+			ctx,
+			job,
+			payload,
+			rb,
+			"placement planning",
+			planningErr,
+		)
+	}
+	if err := p.vc.ValidateDRSPlacementPrivileges(ctx, vcenter.DRSPlacementTargets(placements)); err != nil {
+		return p.failPodCreateWithCleanup(
+			ctx,
+			job,
+			payload,
+			rb,
+			"DRS privilege preflight",
+			fmt.Errorf("validate mandatory DRS placement privileges: %w", err),
+		)
+	}
+	if err := p.enforceExistingVMPlacements(ctx, job.ID, workerID, placements); err != nil {
+		return p.failPodCreateWithCleanup(
+			ctx,
+			job,
+			payload,
+			rb,
+			"existing VM placement enforcement",
+			err,
+		)
+	}
+	placementsByVM := placementPlanByPodVM(placements)
+	targetHosts := selectedPlacementHosts(placements)
+
 	// --- Step 2: Create VLAN on OPNsense ---
 	p.publishProgress(job.ID, "vlan_create", fmt.Sprintf("Creating VLAN %d on OPNsense", vlanTag))
 
@@ -1296,53 +1380,82 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr er
 		return p.failPodCreateWithCleanup(ctx, job, payload, rb, "ensure firewall rule", fmt.Errorf("ensure firewall rule: %w", err))
 	}
 
-	// Resolve and persist the complete source/compute/pool/host plan before the
-	// first standard-switch mutation.
-	placementSpecs := make([]vmPlacementSpec, 0, len(payload.VMs))
-	for _, vmSpec := range payload.VMs {
-		placementSpecs = append(placementSpecs, vmPlacementSpec{
-			PodVMID:   vmSpec.PodVMID,
-			SourceRef: vmSpec.TemplateName,
-		})
-	}
-	placements, err := p.prepareVMPlacementPlan(ctx, job, placementSpecs, pgName, true, nil)
-	if err != nil {
-		planningErr := fmt.Errorf("plan VM placements: %w", err)
-		if jobRetryAvailable(job, planningErr) {
-			return planningErr
-		}
-		return p.failPodCreateWithCleanup(
-			ctx,
-			job,
-			payload,
-			rb,
-			"placement planning",
-			planningErr,
-		)
-	}
-	placementsByVM := placementPlanByPodVM(placements)
-	targetHosts := selectedPlacementHosts(placements)
-
 	// --- Step 5: Create port groups only on selected ESXi hosts ---
 	p.publishProgress(job.ID, "portgroup_create", fmt.Sprintf("Creating port group %s on selected hosts", pgName))
 
 	err = p.db.WithVCenterPortGroupMutationLock(ctx, func(lockCtx context.Context) error {
-		receipt, receiptErr := existingPortGroupReceipt(rb, pgName, vlanTag, targetHosts)
-		if receiptErr != nil {
-			return receiptErr
-		}
-		if receipt == nil {
+		var (
+			receipt    *vcenter.PortGroupReceipt
+			receiptRaw json.RawMessage
+		)
+		record, receiptErr := p.db.GetPodPortGroupReceipt(lockCtx, pod.ID)
+		switch {
+		case receiptErr == nil:
+			var persisted vcenter.PortGroupReceipt
+			if err := json.Unmarshal(record.Receipt, &persisted); err != nil {
+				return fmt.Errorf("decode durable pod port group receipt: %w", err)
+			}
+			if record.RemovedAt != nil {
+				return fmt.Errorf("%w: pod %s port group ownership was already removed", database.ErrPortGroupReceiptConflict, pod.ID)
+			}
+			receipt = &persisted
+			receiptWithKeys, keyErr := vcenter.PortGroupReceiptWithKeys(persisted, record.Keys)
+			if keyErr != nil {
+				return keyErr
+			}
+			receipt = &receiptWithKeys
+			receiptRaw = record.Receipt
+		case errors.Is(receiptErr, database.ErrPortGroupReceiptNotFound):
 			planned, planErr := p.vc.PlanPortGroupMutationForHosts(lockCtx, pgName, vlanTag, targetHosts)
 			if planErr != nil {
 				return fmt.Errorf("plan port group mutation: %w", planErr)
 			}
 			receipt = &planned
-			// Persist exact per-host ownership before the first AddPortGroup call.
-			if recordErr := rb.Record(lockCtx, "portgroup_create", planned); recordErr != nil {
-				return fmt.Errorf("persist port group receipt: %w", recordErr)
+			raw, marshalErr := json.Marshal(planned)
+			if marshalErr != nil {
+				return fmt.Errorf("marshal port group receipt: %w", marshalErr)
 			}
+			if persistErr := p.db.PersistPodPortGroupReceipt(
+				lockCtx,
+				job.ID,
+				workerID,
+				pod.ID,
+				raw,
+			); persistErr != nil {
+				return fmt.Errorf("persist durable pod port group receipt: %w", persistErr)
+			}
+			receiptRaw = raw
+		default:
+			return receiptErr
 		}
-		return p.vc.ApplyPortGroupMutation(lockCtx, *receipt)
+		if _, scopeErr := validatePortGroupReceiptScope(*receipt, pgName, vlanTag, targetHosts); scopeErr != nil {
+			return scopeErr
+		}
+		// The independent ledger survives rollback checkpoints; the rollback
+		// step drives compensation progress for this job.
+		if recordErr := rb.Record(lockCtx, "portgroup_create", *receipt); recordErr != nil {
+			return fmt.Errorf("persist port group rollback step: %w", recordErr)
+		}
+		if beginErr := p.db.BeginPodPortGroupMutation(
+			lockCtx,
+			job.ID,
+			workerID,
+			pod.ID,
+			receiptRaw,
+		); beginErr != nil {
+			return fmt.Errorf("persist port group mutation intent: %w", beginErr)
+		}
+		if err := p.vc.ApplyPortGroupMutation(lockCtx, *receipt); err != nil {
+			return err
+		}
+		keys, err := p.vc.CapturePortGroupKeys(lockCtx, *receipt)
+		if err != nil {
+			return fmt.Errorf("capture stable port group identities: %w", err)
+		}
+		if err := p.db.PersistPodPortGroupKeys(lockCtx, pod.ID, receiptRaw, keys); err != nil {
+			return fmt.Errorf("persist stable port group identities: %w", err)
+		}
+		return nil
 	})
 	if err != nil {
 		return p.failPodCreateWithCleanup(ctx, job, payload, rb, "create port groups", fmt.Errorf("create port groups: %w", err))
@@ -1442,14 +1555,14 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr er
 					moref,
 					placementErr,
 				))
-				if jobRetryAvailable(job, classifiedErr) {
-					return classifiedErr
-				}
-				return p.failPodCreateWithCleanup(
+				return p.failPodCreateAfterCloneError(
 					ctx,
 					job,
 					payload,
 					rb,
+					pod.ID,
+					vmSpec.PodVMID,
+					moref,
 					"resume placement validation",
 					classifiedErr,
 				)
@@ -1687,14 +1800,14 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr er
 					*podVM.VCenterVMID,
 					placementErr,
 				))
-				if jobRetryAvailable(job, classifiedErr) {
-					return classifiedErr
-				}
-				return p.failPodCreateWithCleanup(
+				return p.failPodCreateAfterCloneError(
 					ctx,
 					job,
 					payload,
 					rb,
+					pod.ID,
+					vmSpec.PodVMID,
+					*podVM.VCenterVMID,
 					"power-on placement validation",
 					classifiedErr,
 				)

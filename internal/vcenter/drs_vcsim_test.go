@@ -3,8 +3,10 @@ package vcenter
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
+	"github.com/jmal1/selfservice-api/internal/models"
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/vim25"
 	"github.com/vmware/govmomi/vim25/methods"
@@ -14,6 +16,25 @@ import (
 
 type failDRSReconfigure struct {
 	next soap.RoundTripper
+}
+
+type denyDRSPrivilege struct {
+	next soap.RoundTripper
+}
+
+func (d *denyDRSPrivilege) RoundTrip(ctx context.Context, req, res soap.HasFault) error {
+	if body, ok := req.(*methods.HasPrivilegeOnEntityBody); ok && body.Req != nil {
+		if len(body.Req.PrivId) != 1 || body.Req.PrivId[0] != DRSPlacementPrivilege {
+			return errors.New("unexpected privilege probe")
+		}
+		response, ok := res.(*methods.HasPrivilegeOnEntityBody)
+		if !ok {
+			return errors.New("unexpected privilege response type")
+		}
+		response.Res = &types.HasPrivilegeOnEntityResponse{Returnval: []bool{false}}
+		return nil
+	}
+	return d.next.RoundTrip(ctx, req, res)
 }
 
 func (f *failDRSReconfigure) RoundTrip(ctx context.Context, req, res soap.HasFault) error {
@@ -32,6 +53,36 @@ func clusterFixture(t *testing.T, ctx context.Context, c *Client) simulatorCompu
 	}
 	t.Fatal("vcsim did not provide a source VM in a cluster")
 	return simulatorComputeFixture{}
+}
+
+func TestValidateDRSPlacementPrivilegesFailsClosedOnSelectedCluster(t *testing.T) {
+	withSimulator(t, func(ctx context.Context, c *Client, _ *vim25.Client) {
+		fixture := clusterFixture(t, ctx, c)
+		original := c.client.RoundTripper
+		c.client.RoundTripper = &denyDRSPrivilege{next: original}
+		defer func() { c.client.RoundTripper = original }()
+
+		err := c.ValidateDRSPlacementPrivileges(ctx, []DRSPlacementTarget{{
+			ComputeResourceType:  fixture.computeType,
+			ComputeResourceMoref: fixture.computeMoref,
+		}})
+		if err == nil || !strings.Contains(err.Error(), DRSPlacementPrivilege) {
+			t.Fatalf("DRS privilege denial error = %v", err)
+		}
+	})
+}
+
+func TestDRSPlacementTargetsDeduplicatesAndSorts(t *testing.T) {
+	targets := DRSPlacementTargets([]models.VMPlacement{
+		{ComputeResourceType: "ClusterComputeResource", ComputeResourceMoref: "domain-c2"},
+		{ComputeResourceType: "ComputeResource", ComputeResourceMoref: "domain-c1"},
+		{ComputeResourceType: "ClusterComputeResource", ComputeResourceMoref: "domain-c2"},
+	})
+	if len(targets) != 2 ||
+		targets[0].ComputeResourceMoref != "domain-c2" ||
+		targets[1].ComputeResourceMoref != "domain-c1" {
+		t.Fatalf("DRS targets = %+v", targets)
+	}
 }
 
 func setVMDRSEnabled(

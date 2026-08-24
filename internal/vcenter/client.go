@@ -95,6 +95,8 @@ type Client struct {
 	hostMu       sync.RWMutex
 	allowedHosts []HostIdentity
 	logger       *slog.Logger
+
+	portGroupKeyOverride func(HostIdentity, types.HostPortGroup) string
 }
 
 // New creates a vCenter client (does not connect yet).

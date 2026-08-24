@@ -84,14 +84,22 @@ func newPlacementPostgresFixture(t *testing.T, vmCount int) *placementPostgresFi
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO jobs (id, type, payload, status, claimed_by, claimed_at)
-		VALUES ($1, 'pod_create', '{}', 'in_progress', $2, now())
-	`, fixture.jobID, fixture.workerID); err != nil {
+		VALUES (
+			$1,
+			'pod_create',
+			jsonb_build_object('pod_id', $3::text),
+			'in_progress',
+			$2,
+			now()
+		)
+	`, fixture.jobID, fixture.workerID, fixture.podID); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cleanupCancel()
 		_, _ = pool.Exec(cleanupCtx, `DELETE FROM vm_placements WHERE job_id = $1`, fixture.jobID)
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM pod_portgroup_receipts WHERE pod_id = $1`, fixture.podID)
 		_, _ = pool.Exec(cleanupCtx, `DELETE FROM jobs WHERE id = $1`, fixture.jobID)
 		_, _ = pool.Exec(cleanupCtx, `DELETE FROM pods WHERE id = $1`, fixture.podID)
 		_, _ = pool.Exec(cleanupCtx, `DELETE FROM templates WHERE id = $1`, fixture.templateID)

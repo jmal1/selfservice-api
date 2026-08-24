@@ -139,6 +139,7 @@ func (s *hostIsolationSaboteur) assertClean(t *testing.T) {
 
 func TestESXi1OnlyAllowlistPinsEveryCreationPrimitive(t *testing.T) {
 	withSimulator(t, func(ctx context.Context, c *Client, _ *vim25.Client) {
+		enableVCSimPortGroupKeys(c)
 		allowed, forbidden, source, allowedNetworkSystem, forbiddenVM := simulatorHostIsolationFixture(t, ctx, c)
 
 		original := c.client.RoundTripper
@@ -170,6 +171,14 @@ func TestESXi1OnlyAllowlistPinsEveryCreationPrimitive(t *testing.T) {
 			t.Fatal(err)
 		} else if found {
 			t.Fatal("port group was created on simulated ESXi2")
+		}
+		keys, err := c.CapturePortGroupKeys(ctx, receipt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		receipt, err = PortGroupReceiptWithKeys(receipt, keys)
+		if err != nil {
+			t.Fatal(err)
 		}
 		if err := c.DeletePortGroupMutation(ctx, receipt); err != nil {
 			t.Fatal(err)
