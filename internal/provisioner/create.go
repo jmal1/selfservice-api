@@ -314,7 +314,9 @@ func processJobLifecycle(
 	// Error path: retry if possible, otherwise fail terminally.
 	retryable, reason := ClassifyError(err, job.Type)
 	cleanupOnly := jobPayloadCleanupOnly(job) || isCompensationRetry(err)
-	if cleanupOnly && !isCompensatedJobError(err) && !isManualCleanupRequired(err) {
+	if cleanupOnly &&
+		!errors.Is(err, database.ErrTemplateReplicaBuildJobObsolete) &&
+		!isCompensatedJobError(err) && !isManualCleanupRequired(err) {
 		retryable = true
 		reason = RetryReasonCleanup
 	}

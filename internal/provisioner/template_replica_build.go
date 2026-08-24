@@ -28,6 +28,7 @@ type TemplateReplicaBuildPayload struct {
 	BuildID     uuid.UUID `json:"build_id"`
 	TemplateID  uuid.UUID `json:"template_id"`
 	CleanupOnly bool      `json:"cleanup_only,omitempty"`
+	RetireReady bool      `json:"retire_ready,omitempty"`
 }
 
 type templateReplicaBuildStore interface {
@@ -75,12 +76,16 @@ func replicaBuildTarget(build *models.TemplateReplicaBuild) vcenter.ReplicaBuild
 }
 
 func retainedReplicaBuildParams(build *models.TemplateReplicaBuild) vcenter.ReplicaBuildCloneParams {
+	sourceReplicaID := ""
+	if build.SourceReplicaID != nil {
+		sourceReplicaID = build.SourceReplicaID.String()
+	}
 	return vcenter.ReplicaBuildCloneParams{
 		BuildID:             build.ID.String(),
 		OperationID:         build.OperationID,
 		Kind:                vcenter.ReplicaBuildDestinationKind,
 		TemplateID:          build.TemplateID.String(),
-		SourceReplicaID:     build.SourceReplicaID.String(),
+		SourceReplicaID:     sourceReplicaID,
 		SourceVMMoref:       build.SourceVMMoref,
 		SourceSnapshotName:  build.SourceSnapshotName,
 		SourceSnapshotMoref: build.SourceSnapshotMoref,
@@ -803,12 +808,24 @@ func runTemplateReplicaBuild(
 	if payload.BuildID == uuid.Nil || payload.TemplateID == uuid.Nil {
 		return errors.New("template replica build_id and template_id are required")
 	}
+	if payload.RetireReady && !payload.CleanupOnly {
+		return errors.New("template replica retirement must be cleanup-only")
+	}
 	build, err := store.GetTemplateReplicaBuildForJob(ctx, job.ID, workerID)
 	if err != nil {
 		return err
 	}
 	if build.ID != payload.BuildID || build.TemplateID != payload.TemplateID {
 		return errors.New("template replica build payload does not match persisted operation")
+	}
+	if payload.RetireReady && build.Status == models.TemplateReplicaBuildRetired {
+		return nil
+	}
+	if build.SourceReplicaID == nil {
+		return errors.New("template replica build no longer has a source anchor identity")
+	}
+	if payload.RetireReady != (build.Status == models.TemplateReplicaBuildRetiring) {
+		return errors.New("template replica retirement payload does not match persisted operation state")
 	}
 	if payload.CleanupOnly {
 		return cleanupTemplateReplicaBuild(ctx, store, client, build, workerID)
@@ -833,7 +850,8 @@ func (p *Provisioner) BuildTemplateSourceReplica(ctx context.Context, job *model
 		metrics.RecordTemplateReplicaBuild(result, time.Since(started))
 	}
 	if err == nil || ctx.Err() != nil ||
-		errors.Is(err, database.ErrTemplateReplicaBuildLeaseLost) {
+		errors.Is(err, database.ErrTemplateReplicaBuildLeaseLost) ||
+		errors.Is(err, database.ErrTemplateReplicaBuildJobObsolete) {
 		return err
 	}
 	retryable, _ := ClassifyError(err, job.Type)
@@ -856,6 +874,10 @@ func (p *Provisioner) BuildTemplateSourceReplica(ctx context.Context, job *model
 		status = models.TemplateReplicaBuildCleanupRequired
 		phase = models.TemplateReplicaBuildPhaseCleanupRequired
 		code = "manual_cleanup_required"
+	}
+	if build.Status == models.TemplateReplicaBuildRetiring {
+		status = models.TemplateReplicaBuildRetiring
+		code = "retirement_cleanup_required"
 	}
 	if failErr := p.db.FailTemplateReplicaBuild(
 		context.WithoutCancel(ctx),

@@ -12,6 +12,8 @@ const (
 	TemplateReplicaBuildReady           = "ready"
 	TemplateReplicaBuildFailed          = "failed"
 	TemplateReplicaBuildCleanupRequired = "cleanup_required"
+	TemplateReplicaBuildRetiring        = "retiring"
+	TemplateReplicaBuildRetired         = "retired"
 
 	TemplateReplicaBuildPhasePending            = "pending"
 	TemplateReplicaBuildPhaseCloneSubmitting    = "clone_submitting"
@@ -33,7 +35,29 @@ const (
 	TemplateReplicaBuildPhaseReady              = "ready"
 	TemplateReplicaBuildPhaseFailed             = "failed"
 	TemplateReplicaBuildPhaseCleanupRequired    = "cleanup_required"
+	TemplateReplicaBuildPhaseRetired            = "retired"
 )
+
+func IsTemplateReplicaBuildForwardPhase(phase string) bool {
+	switch phase {
+	case TemplateReplicaBuildPhasePending,
+		TemplateReplicaBuildPhaseCloneSubmitting,
+		TemplateReplicaBuildPhaseCloneSubmitted,
+		TemplateReplicaBuildPhaseValidating,
+		TemplateReplicaBuildPhaseSnapshotSubmitting,
+		TemplateReplicaBuildPhaseSnapshotSubmitted,
+		TemplateReplicaBuildPhaseCanaryPrepared,
+		TemplateReplicaBuildPhaseCanarySubmitting,
+		TemplateReplicaBuildPhaseCanarySubmitted,
+		TemplateReplicaBuildPhaseCleanupPrepared,
+		TemplateReplicaBuildPhaseCleanupSubmitting,
+		TemplateReplicaBuildPhaseCleanupSubmitted,
+		TemplateReplicaBuildPhaseFinalizing:
+		return true
+	default:
+		return false
+	}
+}
 
 // TemplateReplicaBuild is the durable control-plane record for constructing
 // and accepting one retained source replica in an explicitly named vCenter
@@ -41,7 +65,7 @@ const (
 type TemplateReplicaBuild struct {
 	ID                    uuid.UUID  `json:"id" db:"id"`
 	TemplateID            uuid.UUID  `json:"template_id" db:"template_id"`
-	SourceReplicaID       uuid.UUID  `json:"source_replica_id" db:"source_replica_id"`
+	SourceReplicaID       *uuid.UUID `json:"source_replica_id,omitempty" db:"source_replica_id"`
 	ResultReplicaID       *uuid.UUID `json:"result_replica_id,omitempty" db:"result_replica_id"`
 	JobID                 *uuid.UUID `json:"job_id,omitempty" db:"job_id"`
 	IdempotencyKey        string     `json:"idempotency_key" db:"idempotency_key"`
@@ -79,8 +103,8 @@ type TemplateReplicaBuild struct {
 	LastErrorCode         string     `json:"last_error_code,omitempty" db:"last_error_code"`
 	LastError             string     `json:"last_error,omitempty" db:"last_error"`
 	StartedAt             *time.Time `json:"started_at,omitempty" db:"started_at"`
-	SubmissionStartedAt *time.Time `json:"submission_started_at,omitempty" db:"submission_started_at"`
-	CompletedAt         *time.Time `json:"completed_at,omitempty" db:"completed_at"`
+	SubmissionStartedAt   *time.Time `json:"submission_started_at,omitempty" db:"submission_started_at"`
+	CompletedAt           *time.Time `json:"completed_at,omitempty" db:"completed_at"`
 	CreatedAt             time.Time  `json:"created_at" db:"created_at"`
 	UpdatedAt             time.Time  `json:"updated_at" db:"updated_at"`
 }

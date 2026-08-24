@@ -49,7 +49,8 @@ func replicaBuildRequestMatches(
 	req createTemplateReplicaBuildRequest,
 ) bool {
 	return build != nil &&
-		build.SourceReplicaID == req.SourceReplicaID &&
+		build.SourceReplicaID != nil &&
+		*build.SourceReplicaID == req.SourceReplicaID &&
 		build.IdempotencyKey == req.IdempotencyKey &&
 		build.DestinationName == req.DestinationName &&
 		build.ComputeResourceType == req.Target.ComputeResourceType &&
@@ -169,6 +170,11 @@ func (h *Handler) AdminDeleteTemplateSourceReplica(w http.ResponseWriter, r *htt
 	}
 	deleted, err := h.db.DeleteTemplateSourceReplica(r.Context(), templateID, replicaID)
 	if err != nil {
+		if errors.Is(err, database.ErrTemplateReplicaBuildConflict) {
+			respondError(w, r, http.StatusConflict,
+				"source replica is owned by an active or retained replica build")
+			return
+		}
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23503" {
 			respondError(w, r, http.StatusConflict, "source replica is referenced by an existing VM placement")
@@ -274,7 +280,7 @@ func (h *Handler) AdminCreateTemplateReplicaBuild(w http.ResponseWriter, r *http
 	}
 	build := &models.TemplateReplicaBuild{
 		TemplateID:           templateID,
-		SourceReplicaID:      anchor.ID,
+		SourceReplicaID:      &anchor.ID,
 		IdempotencyKey:       req.IdempotencyKey,
 		OperationID:          uuid.NewString(),
 		CanaryOperationID:    uuid.NewString(),

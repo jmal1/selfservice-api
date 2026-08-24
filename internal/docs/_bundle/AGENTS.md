@@ -867,8 +867,10 @@ Clone, snapshot, and linked-clone creation are never blindly resubmitted.
 Destroy submission is the narrow exception: a successor may safely resubmit it
 only after revalidating the exact MoRef plus build, operation, and kind markers.
 Name collisions, marker mismatch, or ambiguous lineage fail closed. Operator
-recovery is limited to status, phase-aware retry, and exact cleanup; there is no
-broad delete.
+recovery is limited to status, phase-aware retry, exact cleanup, and
+operation-scoped retirement; there is no broad delete. `resume_phase` accepts
+only forward phases and cleanup failures never replace it. A second recovery
+request is rejected while the linked job remains pending or owned.
 
 The retained VM is a powered-off full clone of the ready source anchor's
 `base-image` snapshot with
@@ -895,7 +897,23 @@ persists `residue_cleaned_at` and deletes only that build's non-ready replica
 reservation. A new idempotent build can then reuse the compute; the cleaned
 operation itself cannot resume forward work. Template deletion preflights all
 active, accepted, and not-fully-cleaned build ownership before any staging-VM
-destroy. Metrics are
+destroy.
+
+The same exact-cleanup endpoint retires a successful `ready` build. Retirement
+first disables the result replica so new placement cannot select it, rejects
+every existing `vm_placements` reference or live downstream build that uses the
+result as its source anchor, and requires the original distinct source anchor
+to remain ready. It destroys only the exact result VM whose
+build/operation/kind markers match, reconciling a lost destroy response before
+safe exact resubmission. One transaction removes the result replica and records
+the build as `retired` only after vCenter absence is proven. The source anchor
+is never a retirement target, and retired history no longer restricts direct
+replica or template deletion. Template deletion and replica-build admission or
+restart share a per-template PostgreSQL advisory lock, and deletion rechecks
+build safety while holding it before any vCenter destroy. A failed downstream
+build releases its source reference only after it either never submitted a VM
+or persisted exact residue cleanup. A forward retry locks and revalidates its
+exact source as ready, so it cannot race an upstream retirement. Metrics are
 `crucible_template_replica_build_total`,
 `crucible_template_replica_build_duration_seconds_{sum,count}`,
 `crucible_template_replica_build_phase`,

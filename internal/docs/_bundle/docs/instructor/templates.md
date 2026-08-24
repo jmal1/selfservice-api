@@ -324,10 +324,31 @@ The status response exposes the durable `status`, `phase`, task MoRefs, exact VM
 MoRefs, cleanup timestamps, and `last_error_code`/`last_error`. `retry` is
 accepted only for a recoverable `failed` build and resumes its persisted phase.
 `cleanup` is accepted for a failed or `cleanup_required` build and performs
-marker- and exact-MoRef-based residue cleanup. There is intentionally no broad
-delete endpoint. Never delete a same-name VM manually until the stored markers,
-MoRefs, and task history have been compared; a collision or ambiguous lineage
-fails closed.
+marker- and exact-MoRef-based residue cleanup. It is also the supported
+retirement operation for a successful `ready` build. A second retry or cleanup
+request returns `409 Conflict` while the linked job is pending, claimed, or
+running. Cleanup failures preserve the schema-constrained forward
+`resume_phase`; cleanup-only and terminal phases cannot become retry
+checkpoints.
+
+Ready retirement first marks the result replica non-selectable, rejects every
+existing VM placement reference or non-retired downstream build that uses the
+result as its source anchor, and requires the original distinct source anchor
+to remain ready. The worker destroys only the exact result VM whose
+build/operation/kind markers match. A lost destroy response is reconciled and
+may safely resubmit only that exact destroy. Once absence is proven, one
+transaction removes the result replica and marks the build `retired`; the
+source anchor is never destroyed. Retired history no longer blocks direct
+source-replica or template deletion. Template deletion serializes with new build
+admission and restart, then rechecks build safety before destroying a vCenter
+VM. A failed downstream build releases its historical source reference only
+after it either never submitted a VM or exact residue cleanup was persisted.
+A forward retry revalidates and locks its exact ready source, so an upstream
+retirement cannot race it. There is intentionally no broad delete endpoint.
+Never delete a same-name VM manually until the stored markers, MoRefs, and task
+history have been compared; a collision or ambiguous lineage fails
+closed. During this operation the build reports `status=retiring`; completion
+reports `status=retired` and `phase=retired`.
 
 The worker persists each submission phase before calling vCenter. If a clone,
 snapshot, or cleanup response is lost, a successor reconciles the persisted task

@@ -441,6 +441,36 @@ func (q *Queries) DeleteTemplateWithHistory(ctx context.Context, id uuid.UUID) e
 	}
 	defer tx.Rollback(ctx)
 
+	var lockedID uuid.UUID
+	if err := tx.QueryRow(ctx, `
+		SELECT id
+		FROM templates
+		WHERE id = $1
+		FOR UPDATE
+	`, id).Scan(&lockedID); errors.Is(err, pgx.ErrNoRows) {
+		return tx.Commit(ctx)
+	} else if err != nil {
+		return fmt.Errorf("lock template for delete: %w", err)
+	}
+	var unsafeReplicaBuild bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM template_source_replica_builds
+			WHERE template_id = $1
+			  AND (
+				status IN ('pending', 'running', 'cleanup_required', 'ready', 'retiring')
+				OR (destination_vm_moref <> '' AND residue_cleaned_at IS NULL)
+				OR result_replica_id IS NOT NULL
+			  )
+		)
+	`, id).Scan(&unsafeReplicaBuild); err != nil {
+		return fmt.Errorf("recheck replica builds before template delete: %w", err)
+	}
+	if unsafeReplicaBuild {
+		return ErrTemplateReplicaBuildConflict
+	}
+
 	if _, err := tx.Exec(ctx, "DELETE FROM pod_vms WHERE template_id = $1", id); err != nil {
 		return fmt.Errorf("delete pod_vms history: %w", err)
 	}

@@ -221,7 +221,7 @@ func TestAdminCreateTemplateSourceReplicaPersistsResolvedIdentityAndPolicy(t *te
 		}
 		build := &models.TemplateReplicaBuild{
 			TemplateID:           templateID,
-			SourceReplicaID:      anchor.ID,
+			SourceReplicaID:      &anchor.ID,
 			IdempotencyKey:       "delete-ordering",
 			OperationID:          uuid.NewString(),
 			CanaryOperationID:    uuid.NewString(),

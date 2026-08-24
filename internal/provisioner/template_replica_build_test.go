@@ -89,11 +89,17 @@ func (f *replicaBuildStoreFake) CompleteTemplateReplicaBuildCleanup(
 	if build.ResidueCleanedAt == nil {
 		return errors.New("cleanup completion lost residue proof")
 	}
-	f.failedStatus = models.TemplateReplicaBuildFailed
-	f.failedPhase = models.TemplateReplicaBuildPhaseResidueCleaned
+	status := models.TemplateReplicaBuildFailed
+	phase := models.TemplateReplicaBuildPhaseResidueCleaned
+	if build.Status == models.TemplateReplicaBuildRetiring {
+		status = models.TemplateReplicaBuildRetired
+		phase = models.TemplateReplicaBuildPhaseRetired
+	}
+	f.failedStatus = status
+	f.failedPhase = phase
 	build.ResultReplicaID = nil
-	build.Status = models.TemplateReplicaBuildFailed
-	build.Phase = models.TemplateReplicaBuildPhaseResidueCleaned
+	build.Status = status
+	build.Phase = phase
 	return nil
 }
 
@@ -112,6 +118,8 @@ type replicaBuildClientFake struct {
 	canaryCleanupLost  bool
 	residueCleanupLost bool
 	residueGone        bool
+	residueErr         error
+	residueTarget      string
 }
 
 func (f *replicaBuildClientFake) StartReplicaBuildClone(
@@ -240,10 +248,14 @@ func (f *replicaBuildClientFake) StartReplicaBuildCanaryCleanup(
 
 func (f *replicaBuildClientFake) StartReplicaBuildResidueCleanup(
 	ctx context.Context,
-	_, _, _ string,
+	moref, _, _ string,
 	arm func(context.Context) error,
 ) (string, bool, error) {
 	f.startResidueCalls++
+	f.residueTarget = moref
+	if f.residueErr != nil {
+		return "", false, f.residueErr
+	}
 	if err := arm(ctx); err != nil {
 		return "", false, err
 	}
@@ -279,7 +291,7 @@ func newReplicaBuildFixture() (*replicaBuildStoreFake, *models.Job) {
 	build := &models.TemplateReplicaBuild{
 		ID:                   buildID,
 		TemplateID:           templateID,
-		SourceReplicaID:      sourceReplicaID,
+		SourceReplicaID:      &sourceReplicaID,
 		JobID:                &jobID,
 		OperationID:          uuid.NewString(),
 		CanaryOperationID:    uuid.NewString(),
@@ -603,5 +615,123 @@ func TestCleanupTemplateReplicaBuildResubmitsExactResidueDestroyAfterLostRPC(t *
 	}
 	if store.build.ResidueCleanedAt == nil || store.failedPhase != models.TemplateReplicaBuildPhaseResidueCleaned {
 		t.Fatalf("residue cleanup proof was not terminally persisted: %+v", store.build)
+	}
+}
+
+func TestRetireReadyTemplateReplicaBuildReconcilesDestroyResponseLoss(t *testing.T) {
+	store, _ := newReplicaBuildFixture()
+	resultID := uuid.New()
+	store.build.ResultReplicaID = &resultID
+	store.build.Status = models.TemplateReplicaBuildRetiring
+	store.build.Phase = models.TemplateReplicaBuildPhaseResiduePrepared
+	store.build.DestinationVMMoref = "vm-retained"
+	now := time.Now().UTC()
+	store.build.CleanupCompletedAt = &now
+	client := &replicaBuildClientFake{residueCleanupLost: true}
+
+	if err := cleanupTemplateReplicaBuild(
+		context.Background(),
+		store,
+		client,
+		store.build,
+		"retirement-worker-1",
+	); err == nil {
+		t.Fatal("expected accepted-response-loss error")
+	}
+	if store.build.Phase != models.TemplateReplicaBuildPhaseResidueSubmitting {
+		t.Fatalf("retirement phase after lost response=%s", store.build.Phase)
+	}
+	if err := cleanupTemplateReplicaBuild(
+		context.Background(),
+		store,
+		client,
+		store.build,
+		"retirement-worker-2",
+	); err == nil {
+		t.Fatal("expected submitted destroy reconciliation wait")
+	}
+	if store.build.Phase != models.TemplateReplicaBuildPhaseResidueSubmitted ||
+		client.startResidueCalls != 2 {
+		t.Fatalf("retirement destroy recovery calls=%d build=%+v", client.startResidueCalls, store.build)
+	}
+	if err := cleanupTemplateReplicaBuild(
+		context.Background(),
+		store,
+		client,
+		store.build,
+		"retirement-worker-3",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if store.build.Status != models.TemplateReplicaBuildRetired ||
+		store.build.Phase != models.TemplateReplicaBuildPhaseRetired ||
+		store.build.ResultReplicaID != nil {
+		t.Fatalf("ready result was not atomically retired after exact absence: %+v", store.build)
+	}
+	if client.residueTarget != "vm-retained" {
+		t.Fatalf("retirement targeted %q, want retained result VM only", client.residueTarget)
+	}
+}
+
+func TestRetireReadyTemplateReplicaBuildWrongMarkerFailsClosed(t *testing.T) {
+	store, _ := newReplicaBuildFixture()
+	resultID := uuid.New()
+	store.build.ResultReplicaID = &resultID
+	store.build.Status = models.TemplateReplicaBuildRetiring
+	store.build.Phase = models.TemplateReplicaBuildPhaseResiduePrepared
+	store.build.DestinationVMMoref = "vm-retained"
+	now := time.Now().UTC()
+	store.build.CleanupCompletedAt = &now
+	markerErr := fmt.Errorf("%w: wrong retained marker", vcenter.ErrReplicaBuildAmbiguous)
+	client := &replicaBuildClientFake{residueErr: markerErr, retainedExists: true}
+
+	err := cleanupTemplateReplicaBuild(
+		context.Background(),
+		store,
+		client,
+		store.build,
+		"retirement-worker",
+	)
+	if !errors.Is(err, vcenter.ErrReplicaBuildAmbiguous) {
+		t.Fatalf("wrong-marker retirement error=%v, want ambiguity", err)
+	}
+	if store.build.Status != models.TemplateReplicaBuildRetiring ||
+		store.build.Phase != models.TemplateReplicaBuildPhaseResiduePrepared ||
+		store.build.ResultReplicaID == nil || store.build.ResidueCleanedAt != nil {
+		t.Fatalf("wrong marker advanced retirement: %+v", store.build)
+	}
+	if client.startResidueCalls != 1 || client.residueTarget != "vm-retained" {
+		t.Fatalf("wrong-marker destroy calls=%d target=%q", client.startResidueCalls, client.residueTarget)
+	}
+}
+
+func TestRetiredTemplateReplicaBuildJobReplayIsIdempotent(t *testing.T) {
+	store, job := newReplicaBuildFixture()
+	store.build.Status = models.TemplateReplicaBuildRetired
+	store.build.Phase = models.TemplateReplicaBuildPhaseRetired
+	store.build.SourceReplicaID = nil
+	store.build.ResultReplicaID = nil
+	job.Payload = []byte(fmt.Sprintf(
+		`{"build_id":%q,"template_id":%q,"cleanup_only":true,"retire_ready":true}`,
+		store.build.ID,
+		store.build.TemplateID,
+	))
+	client := &replicaBuildClientFake{}
+
+	if err := runTemplateReplicaBuild(
+		context.Background(),
+		store,
+		client,
+		job,
+		"retirement-replay-worker",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if client.startResidueCalls != 0 || store.failedStatus != "" {
+		t.Fatalf(
+			"retired replay performed cleanup or failure mutation: destroy=%d failed=%q",
+			client.startResidueCalls,
+			store.failedStatus,
+		)
 	}
 }

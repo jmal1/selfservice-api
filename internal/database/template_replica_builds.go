@@ -13,8 +13,9 @@ import (
 )
 
 var (
-	ErrTemplateReplicaBuildConflict  = errors.New("template replica build conflicts with an existing operation")
-	ErrTemplateReplicaBuildLeaseLost = errors.New("template replica build worker lease lost")
+	ErrTemplateReplicaBuildConflict    = errors.New("template replica build conflicts with an existing operation")
+	ErrTemplateReplicaBuildLeaseLost   = errors.New("template replica build worker lease lost")
+	ErrTemplateReplicaBuildJobObsolete = errors.New("template replica build job is no longer linked to its operation")
 )
 
 func lockTemplateReplicaBuildJob(
@@ -106,7 +107,7 @@ const templateReplicaBuildColumns = `
 
 func sameTemplateReplicaBuildRequest(a, b *models.TemplateReplicaBuild) bool {
 	return a.TemplateID == b.TemplateID &&
-		a.SourceReplicaID == b.SourceReplicaID &&
+		sameUUIDPointer(a.SourceReplicaID, b.SourceReplicaID) &&
 		a.IdempotencyKey == b.IdempotencyKey &&
 		a.SourceVMMoref == b.SourceVMMoref &&
 		a.SourceSnapshotName == b.SourceSnapshotName &&
@@ -123,6 +124,13 @@ func sameTemplateReplicaBuildRequest(a, b *models.TemplateReplicaBuild) bool {
 		a.FolderMoref == b.FolderMoref &&
 		a.FolderPath == b.FolderPath &&
 		a.ProvisionDatastore == b.ProvisionDatastore
+}
+
+func sameUUIDPointer(a, b *uuid.UUID) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
 }
 
 func (q *Queries) GetTemplateReplicaBuildByIdempotencyKey(
@@ -156,7 +164,7 @@ func (q *Queries) HasUnsafeTemplateReplicaBuildForDeletion(
 			FROM template_source_replica_builds
 			WHERE template_id = $1
 			  AND (
-				status IN ('pending', 'running', 'cleanup_required', 'ready')
+				status IN ('pending', 'running', 'cleanup_required', 'ready', 'retiring')
 				OR (destination_vm_moref <> '' AND residue_cleaned_at IS NULL)
 				OR result_replica_id IS NOT NULL
 			  )
@@ -175,7 +183,8 @@ func (q *Queries) CreateTemplateReplicaBuild(
 	build *models.TemplateReplicaBuild,
 	userID uuid.UUID,
 ) (*models.TemplateReplicaBuild, bool, error) {
-	if build == nil || build.TemplateID == uuid.Nil || build.SourceReplicaID == uuid.Nil ||
+	if build == nil || build.TemplateID == uuid.Nil || build.SourceReplicaID == nil ||
+		*build.SourceReplicaID == uuid.Nil ||
 		build.IdempotencyKey == "" || build.OperationID == "" ||
 		build.CanaryOperationID == "" {
 		return nil, false, errors.New("template replica build identity is incomplete")
@@ -189,12 +198,20 @@ func (q *Queries) CreateTemplateReplicaBuild(
 	if build.Phase == "" {
 		build.Phase = models.TemplateReplicaBuildPhasePending
 	}
+	if build.ResumePhase == "" {
+		build.ResumePhase = models.TemplateReplicaBuildPhasePending
+	}
 
 	tx, err := q.pool.Begin(ctx)
 	if err != nil {
 		return nil, false, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `
+		SELECT pg_advisory_xact_lock(hashtextextended($1, 0))
+	`, templateReplicaBuildLifecycleLockKey(build.TemplateID)); err != nil {
+		return nil, false, fmt.Errorf("lock template replica build admission: %w", err)
+	}
 
 	var existing models.TemplateReplicaBuild
 	err = scanTemplateReplicaBuild(tx.QueryRow(ctx, `
@@ -221,7 +238,7 @@ func (q *Queries) CreateTemplateReplicaBuild(
 		FROM template_source_replicas
 		WHERE id = $1 AND template_id = $2
 		FOR SHARE
-	`, build.SourceReplicaID, build.TemplateID).Scan(&anchorStatus, &anchorSource); err != nil {
+	`, *build.SourceReplicaID, build.TemplateID).Scan(&anchorStatus, &anchorSource); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, false, ErrTemplateNotFound
 		}
@@ -269,7 +286,7 @@ func (q *Queries) CreateTemplateReplicaBuild(
 		)
 		ON CONFLICT (template_id, idempotency_key) DO NOTHING
 		RETURNING id
-	`, build.ID, build.TemplateID, build.SourceReplicaID, build.IdempotencyKey,
+	`, build.ID, build.TemplateID, *build.SourceReplicaID, build.IdempotencyKey,
 		build.OperationID, build.CanaryOperationID, build.SourceVMMoref,
 		build.SourceSnapshotName, build.DestinationName, build.ComputeResourceType,
 		build.ComputeResourceMoref, build.ComputeResourcePath, build.HostMoref,
@@ -363,6 +380,21 @@ func (q *Queries) GetTemplateReplicaBuildForJob(
 		  )
 	`, jobID, workerID), &build)
 	if errors.Is(err, pgx.ErrNoRows) {
+		var stillOwned bool
+		if ownershipErr := q.pool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM jobs
+				WHERE id = $1
+				  AND claimed_by = $2
+				  AND status IN ('claimed', 'in_progress')
+			)
+		`, jobID, workerID).Scan(&stillOwned); ownershipErr != nil {
+			return nil, fmt.Errorf("check obsolete template replica build job: %w", ownershipErr)
+		}
+		if stillOwned {
+			return nil, fmt.Errorf("%w: job %s", ErrTemplateReplicaBuildJobObsolete, jobID)
+		}
 		return nil, fmt.Errorf("%w: job %s", ErrTemplateReplicaBuildLeaseLost, jobID)
 	}
 	if err != nil {
@@ -492,7 +524,8 @@ func (q *Queries) FinalizeTemplateReplicaBuild(
 	build *models.TemplateReplicaBuild,
 	workerID string,
 ) error {
-	if build == nil || build.JobID == nil || build.ResultReplicaID == nil ||
+	if build == nil || build.JobID == nil || build.SourceReplicaID == nil ||
+		build.ResultReplicaID == nil ||
 		build.CleanupCompletedAt == nil || build.DestinationSnapshot == "" {
 		return errors.New("template replica build is not acceptance-complete")
 	}
@@ -511,7 +544,7 @@ func (q *Queries) FinalizeTemplateReplicaBuild(
 		FROM template_source_replicas
 		WHERE id = $1 AND template_id = $2
 		FOR SHARE
-	`, build.SourceReplicaID, build.TemplateID).Scan(&anchorStatus, &anchorRef); err != nil {
+	`, *build.SourceReplicaID, build.TemplateID).Scan(&anchorStatus, &anchorRef); err != nil {
 		return fmt.Errorf("recheck source anchor: %w", err)
 	}
 	if anchorStatus != models.TemplateSourceReplicaReady || anchorRef != build.SourceVMMoref {
@@ -578,6 +611,7 @@ func (q *Queries) FailTemplateReplicaBuild(
 		    last_validation_error = $3
 		FROM template_source_replica_builds b
 		WHERE b.id = $1 AND b.job_id = $2 AND r.id = b.result_replica_id
+		  AND b.status <> 'retiring'
 		  AND r.status <> 'ready'
 	`, build.ID, *build.JobID, message); err != nil {
 		return err
@@ -585,8 +619,19 @@ func (q *Queries) FailTemplateReplicaBuild(
 	tag, err := tx.Exec(ctx, `
 		UPDATE template_source_replica_builds
 		SET status = $2, phase = $3, last_error_code = $4,
-		    resume_phase = $7, last_error = $5, completed_at = now()
-		WHERE id = $1 AND job_id = $6 AND status <> 'ready'
+		    resume_phase = CASE
+		        WHEN status IN ('pending', 'running')
+		         AND $7 IN (
+		            'pending', 'clone_submitting', 'clone_submitted', 'validating',
+		            'snapshot_submitting', 'snapshot_submitted', 'canary_prepared',
+		            'canary_submitting', 'canary_submitted', 'cleanup_prepared',
+		            'cleanup_submitting', 'cleanup_submitted', 'finalizing'
+		         )
+		        THEN $7
+		        ELSE resume_phase
+		    END,
+		    last_error = $5, completed_at = now()
+		WHERE id = $1 AND job_id = $6 AND status NOT IN ('ready', 'retired')
 	`, build.ID, status, phase, code, message, *build.JobID, build.Phase)
 	if err != nil {
 		return err
@@ -612,20 +657,135 @@ func (q *Queries) CompleteTemplateReplicaBuildCleanup(
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `
+		SELECT pg_advisory_xact_lock(hashtextextended($1, 0))
+	`, templateReplicaBuildLifecycleLockKey(build.TemplateID)); err != nil {
+		return fmt.Errorf("lock template replica cleanup completion: %w", err)
+	}
 	if err := lockTemplateReplicaBuildJob(ctx, tx, *build.JobID, workerID); err != nil {
 		return err
 	}
 
-	var resultReplicaID *uuid.UUID
+	var (
+		resultReplicaID *uuid.UUID
+		persistedStatus string
+	)
 	if err := tx.QueryRow(ctx, `
-		SELECT result_replica_id
+		SELECT result_replica_id, status
 		FROM template_source_replica_builds
 		WHERE id = $1 AND job_id = $2
 		FOR UPDATE
-	`, build.ID, *build.JobID).Scan(&resultReplicaID); err != nil {
+	`, build.ID, *build.JobID).Scan(&resultReplicaID, &persistedStatus); err != nil {
 		return fmt.Errorf("lock replica build cleanup result: %w", err)
 	}
+	retiring := persistedStatus == models.TemplateReplicaBuildRetiring
+	if retiring && resultReplicaID == nil {
+		return fmt.Errorf("%w: retiring build has no result replica", ErrTemplateReplicaBuildConflict)
+	}
 	if resultReplicaID != nil {
+		var resultStatus string
+		if err := tx.QueryRow(ctx, `
+			SELECT status
+			FROM template_source_replicas
+			WHERE id = $1
+			  AND template_id = $2
+			  AND source_vm_moref = $3
+			  AND compute_resource_type = $4
+			  AND compute_resource_moref = $5
+			FOR UPDATE
+		`, *resultReplicaID, build.TemplateID, build.DestinationVMMoref,
+			build.ComputeResourceType, build.ComputeResourceMoref).Scan(&resultStatus); err != nil {
+			return fmt.Errorf("lock cleanup result replica: %w", err)
+		}
+		if retiring {
+			if resultStatus != models.TemplateSourceReplicaDisabled {
+				return fmt.Errorf(
+					"%w: retiring result replica %s has status %q",
+					ErrTemplateReplicaBuildConflict,
+					*resultReplicaID,
+					resultStatus,
+				)
+			}
+			if build.SourceReplicaID == nil || *build.SourceReplicaID == *resultReplicaID {
+				return fmt.Errorf("%w: retirement has no distinct source anchor", ErrTemplateReplicaBuildConflict)
+			}
+			var anchorReady bool
+			if err := tx.QueryRow(ctx, `
+				SELECT EXISTS (
+					SELECT 1
+					FROM template_source_replicas
+					WHERE id = $1
+					  AND template_id = $2
+					  AND source_vm_moref = $3
+					  AND status = 'ready'
+				)
+			`, *build.SourceReplicaID, build.TemplateID, build.SourceVMMoref).Scan(&anchorReady); err != nil {
+				return err
+			}
+			if !anchorReady {
+				return fmt.Errorf("%w: retirement would leave no compatible ready source anchor", ErrTemplateReplicaBuildConflict)
+			}
+			var referenced bool
+			if err := tx.QueryRow(ctx, `
+				SELECT EXISTS (
+					SELECT 1 FROM vm_placements WHERE source_replica_id = $1
+				)
+			`, *resultReplicaID).Scan(&referenced); err != nil {
+				return err
+			}
+			if referenced {
+				return fmt.Errorf("%w: retiring result replica is referenced by a VM placement", ErrTemplateReplicaBuildConflict)
+			}
+			var dependentBuildID uuid.UUID
+			err := tx.QueryRow(ctx, `
+				SELECT id
+				FROM template_source_replica_builds
+				WHERE id <> $1
+				  AND source_replica_id = $2
+				  AND NOT (
+					status = 'retired'
+					OR (
+						status = 'failed'
+						AND result_replica_id IS NULL
+						AND (destination_vm_moref = '' OR residue_cleaned_at IS NOT NULL)
+					)
+				  )
+				LIMIT 1
+				FOR UPDATE
+			`, build.ID, *resultReplicaID).Scan(&dependentBuildID)
+			if err == nil {
+				return fmt.Errorf(
+					"%w: retiring result replica is the source anchor for build %s",
+					ErrTemplateReplicaBuildConflict,
+					dependentBuildID,
+				)
+			}
+			if !errors.Is(err, pgx.ErrNoRows) {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `
+				UPDATE template_source_replica_builds
+				SET source_replica_id = NULL
+				WHERE id <> $1
+				  AND source_replica_id = $2
+				  AND (
+					status = 'retired'
+					OR (
+						status = 'failed'
+						AND result_replica_id IS NULL
+						AND (destination_vm_moref = '' OR residue_cleaned_at IS NOT NULL)
+					)
+				  )
+			`, build.ID, *resultReplicaID); err != nil {
+				return fmt.Errorf("release terminal downstream build source references: %w", err)
+			}
+		} else if resultStatus == models.TemplateSourceReplicaReady {
+			return fmt.Errorf(
+				"%w: non-retirement cleanup cannot remove ready result replica %s",
+				ErrTemplateReplicaBuildConflict,
+				*resultReplicaID,
+			)
+		}
 		tag, err := tx.Exec(ctx, `
 			UPDATE template_source_replica_builds
 			SET result_replica_id = NULL
@@ -644,33 +804,42 @@ func (q *Queries) CompleteTemplateReplicaBuildCleanup(
 			  AND source_vm_moref = $3
 			  AND compute_resource_type = $4
 			  AND compute_resource_moref = $5
-			  AND status <> 'ready'
+			  AND status = $6
 		`, *resultReplicaID, build.TemplateID, build.DestinationVMMoref,
-			build.ComputeResourceType, build.ComputeResourceMoref)
+			build.ComputeResourceType, build.ComputeResourceMoref, resultStatus)
 		if err != nil {
 			return err
 		}
 		if tag.RowsAffected() != 1 {
 			return fmt.Errorf(
-				"%w: cleanup result replica %s is ready or no longer matches immutable build identity",
+				"%w: cleanup result replica %s no longer matches immutable build identity",
 				ErrTemplateReplicaBuildConflict,
 				*resultReplicaID,
 			)
 		}
 	}
 
+	status := models.TemplateReplicaBuildFailed
+	phase := models.TemplateReplicaBuildPhaseResidueCleaned
+	code := "cleanup_complete"
+	if retiring {
+		status = models.TemplateReplicaBuildRetired
+		phase = models.TemplateReplicaBuildPhaseRetired
+		code = "retirement_complete"
+	}
 	tag, err := tx.Exec(ctx, `
 		UPDATE template_source_replica_builds
-		SET status = 'failed',
-		    phase = 'residue_cleaned',
-		    resume_phase = $3,
+		SET status = $3,
+		    phase = $4,
 		    result_replica_id = NULL,
-		    residue_cleaned_at = $4,
-		    last_error_code = 'cleanup_complete',
-		    last_error = $5,
+		    residue_cleaned_at = $5,
+		    last_error_code = $6,
+		    last_error = $7,
 		    completed_at = now()
-		WHERE id = $1 AND job_id = $2 AND status <> 'ready'
-	`, build.ID, *build.JobID, build.Phase, build.ResidueCleanedAt, message)
+		WHERE id = $1 AND job_id = $2
+		  AND status = $8
+	`, build.ID, *build.JobID, status, phase, build.ResidueCleanedAt,
+		code, message, persistedStatus)
 	if err != nil {
 		return err
 	}
@@ -681,9 +850,9 @@ func (q *Queries) CompleteTemplateReplicaBuildCleanup(
 		return err
 	}
 	build.ResultReplicaID = nil
-	build.Status = models.TemplateReplicaBuildFailed
-	build.Phase = models.TemplateReplicaBuildPhaseResidueCleaned
-	build.LastErrorCode = "cleanup_complete"
+	build.Status = status
+	build.Phase = phase
+	build.LastErrorCode = code
 	build.LastError = message
 	return nil
 }
@@ -698,6 +867,27 @@ func (q *Queries) RestartTemplateReplicaBuild(
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `
+		SELECT pg_advisory_xact_lock(hashtextextended($1, 0))
+	`, templateReplicaBuildLifecycleLockKey(templateID)); err != nil {
+		return nil, fmt.Errorf("lock template replica build restart: %w", err)
+	}
+	var observedJobID *uuid.UUID
+	if err := tx.QueryRow(ctx, `
+		SELECT job_id
+		FROM template_source_replica_builds
+		WHERE id = $1 AND template_id = $2
+	`, buildID, templateID).Scan(&observedJobID); err != nil {
+		return nil, err
+	}
+	var currentJobStatus string
+	if observedJobID != nil {
+		if err := tx.QueryRow(ctx, `
+			SELECT status FROM jobs WHERE id = $1 FOR UPDATE
+		`, *observedJobID).Scan(&currentJobStatus); err != nil {
+			return nil, fmt.Errorf("lock current replica build job: %w", err)
+		}
+	}
 	var build models.TemplateReplicaBuild
 	if err := scanTemplateReplicaBuild(tx.QueryRow(ctx, `
 		SELECT `+templateReplicaBuildColumns+`
@@ -707,9 +897,171 @@ func (q *Queries) RestartTemplateReplicaBuild(
 	`, buildID, templateID), &build); err != nil {
 		return nil, err
 	}
-	if build.Status != models.TemplateReplicaBuildFailed &&
-		build.Status != models.TemplateReplicaBuildCleanupRequired {
-		return nil, ErrTemplateReplicaBuildConflict
+	if !sameUUIDPointer(build.JobID, observedJobID) {
+		return nil, fmt.Errorf(
+			"%w: linked job changed during restart",
+			ErrTemplateReplicaBuildConflict,
+		)
+	}
+	if build.SourceReplicaID == nil {
+		return nil, fmt.Errorf(
+			"%w: terminal build source reference has been released",
+			ErrTemplateReplicaBuildConflict,
+		)
+	}
+	if !cleanupOnly {
+		var sourceID uuid.UUID
+		if err := tx.QueryRow(ctx, `
+			SELECT id
+			FROM template_source_replicas
+			WHERE id = $1
+			  AND template_id = $2
+			  AND source_vm_moref = $3
+			  AND status = 'ready'
+			FOR SHARE
+		`, *build.SourceReplicaID, build.TemplateID, build.SourceVMMoref).Scan(&sourceID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, fmt.Errorf(
+					"%w: source replica is no longer ready",
+					ErrTemplateReplicaBuildConflict,
+				)
+			}
+			return nil, fmt.Errorf("lock restart source replica: %w", err)
+		}
+	}
+	if build.JobID != nil {
+		switch currentJobStatus {
+		case models.JobStatusPending, models.JobStatusClaimed,
+			models.JobStatusInProgress, models.JobStatusRollback:
+			return nil, fmt.Errorf(
+				"%w: linked job %s is still %s",
+				ErrTemplateReplicaBuildConflict,
+				*build.JobID,
+				currentJobStatus,
+			)
+		}
+	}
+
+	retireReady := cleanupOnly &&
+		(build.Status == models.TemplateReplicaBuildReady ||
+			build.Status == models.TemplateReplicaBuildRetiring)
+	if retireReady {
+		if build.SourceReplicaID == nil || build.ResultReplicaID == nil ||
+			*build.SourceReplicaID == *build.ResultReplicaID ||
+			build.DestinationVMMoref == "" {
+			return nil, fmt.Errorf("%w: ready build retirement identity is incomplete", ErrTemplateReplicaBuildConflict)
+		}
+		var anchorReady bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM template_source_replicas
+				WHERE id = $1
+				  AND template_id = $2
+				  AND source_vm_moref = $3
+				  AND status = 'ready'
+			)
+		`, *build.SourceReplicaID, build.TemplateID, build.SourceVMMoref).Scan(&anchorReady); err != nil {
+			return nil, err
+		}
+		if !anchorReady {
+			return nil, fmt.Errorf(
+				"%w: retirement would leave no compatible ready source anchor",
+				ErrTemplateReplicaBuildConflict,
+			)
+		}
+		var resultStatus string
+		if err := tx.QueryRow(ctx, `
+			SELECT status
+			FROM template_source_replicas
+			WHERE id = $1
+			  AND template_id = $2
+			  AND source_vm_moref = $3
+			  AND compute_resource_type = $4
+			  AND compute_resource_moref = $5
+			FOR UPDATE
+		`, *build.ResultReplicaID, build.TemplateID, build.DestinationVMMoref,
+			build.ComputeResourceType, build.ComputeResourceMoref).Scan(&resultStatus); err != nil {
+			return nil, fmt.Errorf("lock ready retirement result: %w", err)
+		}
+		expectedResultStatus := models.TemplateSourceReplicaReady
+		if build.Status == models.TemplateReplicaBuildRetiring {
+			expectedResultStatus = models.TemplateSourceReplicaDisabled
+		}
+		if resultStatus != expectedResultStatus {
+			return nil, fmt.Errorf(
+				"%w: retirement result replica status is %q",
+				ErrTemplateReplicaBuildConflict,
+				resultStatus,
+			)
+		}
+		var referenced bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM vm_placements WHERE source_replica_id = $1
+			)
+		`, *build.ResultReplicaID).Scan(&referenced); err != nil {
+			return nil, err
+		}
+		if referenced {
+			return nil, fmt.Errorf(
+				"%w: ready result replica is referenced by a VM placement",
+				ErrTemplateReplicaBuildConflict,
+			)
+		}
+		var dependentBuildID uuid.UUID
+		err := tx.QueryRow(ctx, `
+			SELECT id
+			FROM template_source_replica_builds
+			WHERE id <> $1
+			  AND source_replica_id = $2
+			  AND NOT (
+				status = 'retired'
+				OR (
+					status = 'failed'
+					AND result_replica_id IS NULL
+					AND (destination_vm_moref = '' OR residue_cleaned_at IS NOT NULL)
+				)
+			  )
+			LIMIT 1
+			FOR UPDATE
+		`, build.ID, *build.ResultReplicaID).Scan(&dependentBuildID)
+		if err == nil {
+			return nil, fmt.Errorf(
+				"%w: ready result replica is the source anchor for build %s",
+				ErrTemplateReplicaBuildConflict,
+				dependentBuildID,
+			)
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return nil, err
+		}
+		if build.Status == models.TemplateReplicaBuildReady {
+			tag, err := tx.Exec(ctx, `
+				UPDATE template_source_replicas
+				SET status = 'disabled',
+				    last_validation_error = 'retirement requested'
+				WHERE id = $1 AND status = 'ready'
+			`, *build.ResultReplicaID)
+			if err != nil {
+				return nil, err
+			}
+			if tag.RowsAffected() != 1 {
+				return nil, ErrTemplateReplicaBuildConflict
+			}
+		}
+	} else {
+		if build.Status != models.TemplateReplicaBuildFailed &&
+			build.Status != models.TemplateReplicaBuildCleanupRequired {
+			return nil, ErrTemplateReplicaBuildConflict
+		}
+		if !models.IsTemplateReplicaBuildForwardPhase(build.ResumePhase) {
+			return nil, fmt.Errorf(
+				"%w: invalid forward resume phase %q",
+				ErrTemplateReplicaBuildConflict,
+				build.ResumePhase,
+			)
+		}
 	}
 	if !cleanupOnly && build.Status == models.TemplateReplicaBuildCleanupRequired {
 		return nil, ErrTemplateReplicaBuildConflict
@@ -724,6 +1076,7 @@ func (q *Queries) RestartTemplateReplicaBuild(
 		"build_id":     build.ID,
 		"template_id":  build.TemplateID,
 		"cleanup_only": cleanupOnly,
+		"retire_ready": retireReady,
 	})
 	if err != nil {
 		return nil, err
@@ -738,22 +1091,26 @@ func (q *Queries) RestartTemplateReplicaBuild(
 	}
 	status := models.TemplateReplicaBuildRunning
 	phase := build.ResumePhase
-	if phase == "" {
-		phase = models.TemplateReplicaBuildPhasePending
-	}
 	if cleanupOnly {
 		status = models.TemplateReplicaBuildCleanupRequired
 		phase = build.ResumePhase
-		if phase == "" {
-			phase = models.TemplateReplicaBuildPhaseResiduePrepared
-		}
+	}
+	errorCode := ""
+	if retireReady {
+		status = models.TemplateReplicaBuildRetiring
+		phase = models.TemplateReplicaBuildPhaseResiduePrepared
+		build.ResidueCleanupTaskRef = ""
+		build.ResidueCleanedAt = nil
+		errorCode = "retirement_requested"
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE template_source_replica_builds
 		SET job_id = $2, status = $3, phase = $4, completed_at = NULL,
-		    last_error_code = '', last_error = ''
+		    residue_cleanup_task_ref = $5, residue_cleaned_at = $6,
+		    last_error_code = $7, last_error = ''
 		WHERE id = $1
-	`, build.ID, jobID, status, phase); err != nil {
+	`, build.ID, jobID, status, phase, build.ResidueCleanupTaskRef,
+		build.ResidueCleanedAt, errorCode); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -763,6 +1120,8 @@ func (q *Queries) RestartTemplateReplicaBuild(
 	build.Status = status
 	build.Phase = phase
 	build.CompletedAt = nil
+	build.LastErrorCode = errorCode
+	build.LastError = ""
 	return &build, nil
 }
 
@@ -773,7 +1132,7 @@ func (q *Queries) CountTemplateReplicaBuildsByPhase(
 	rows, err := q.pool.Query(ctx, `
 		SELECT phase, COUNT(*)
 		FROM template_source_replica_builds
-		WHERE status IN ('pending', 'running', 'cleanup_required')
+		WHERE status IN ('pending', 'running', 'cleanup_required', 'retiring')
 		GROUP BY phase
 	`)
 	if err != nil {
@@ -796,7 +1155,7 @@ func (q *Queries) CountTemplateReplicaBuildsByPhase(
 	if err := q.pool.QueryRow(ctx, `
 		SELECT COUNT(*)
 		FROM template_source_replica_builds
-		WHERE status IN ('pending', 'running', 'cleanup_required')
+		WHERE status IN ('pending', 'running', 'cleanup_required', 'retiring')
 		  AND updated_at < now() - ($1 * interval '1 second')
 	`, staleAfter.Seconds()).Scan(&stuck); err != nil {
 		return nil, 0, err

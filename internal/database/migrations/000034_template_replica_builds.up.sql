@@ -3,7 +3,7 @@ BEGIN;
 CREATE TABLE template_source_replica_builds (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     template_id UUID NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
-    source_replica_id UUID NOT NULL
+    source_replica_id UUID
         REFERENCES template_source_replicas(id)
         ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
     result_replica_id UUID
@@ -31,7 +31,10 @@ CREATE TABLE template_source_replica_builds (
     folder_path TEXT NOT NULL CHECK (folder_path <> ''),
     provision_datastore TEXT NOT NULL CHECK (provision_datastore <> ''),
     status TEXT NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending', 'running', 'ready', 'failed', 'cleanup_required')),
+        CHECK (status IN (
+            'pending', 'running', 'ready', 'failed', 'cleanup_required',
+            'retiring', 'retired'
+        )),
     phase TEXT NOT NULL DEFAULT 'pending'
         CHECK (phase IN (
             'pending', 'clone_submitting', 'clone_submitted', 'validating',
@@ -39,9 +42,15 @@ CREATE TABLE template_source_replica_builds (
             'canary_submitting', 'canary_submitted', 'cleanup_prepared',
             'cleanup_submitting', 'cleanup_submitted',
             'residue_prepared', 'residue_submitting', 'residue_submitted', 'residue_cleaned',
-            'finalizing', 'ready', 'failed', 'cleanup_required'
+            'finalizing', 'ready', 'failed', 'cleanup_required', 'retired'
         )),
-    resume_phase TEXT NOT NULL DEFAULT 'pending',
+    resume_phase TEXT NOT NULL DEFAULT 'pending'
+        CHECK (resume_phase IN (
+            'pending', 'clone_submitting', 'clone_submitted', 'validating',
+            'snapshot_submitting', 'snapshot_submitted', 'canary_prepared',
+            'canary_submitting', 'canary_submitted', 'cleanup_prepared',
+            'cleanup_submitting', 'cleanup_submitted', 'finalizing'
+        )),
     clone_task_ref TEXT NOT NULL DEFAULT '',
     destination_vm_moref TEXT NOT NULL DEFAULT '',
     snapshot_task_ref TEXT NOT NULL DEFAULT '',
@@ -60,12 +69,26 @@ CREATE TABLE template_source_replica_builds (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (template_id, idempotency_key),
+    CHECK (
+        source_replica_id IS NOT NULL
+        OR status = 'retired'
+        OR (
+            status = 'failed'
+            AND result_replica_id IS NULL
+            AND (destination_vm_moref = '' OR residue_cleaned_at IS NOT NULL)
+        )
+    ),
     CHECK (status <> 'ready' OR (
         phase = 'ready'
         AND result_replica_id IS NOT NULL
         AND cleanup_completed_at IS NOT NULL
         AND destination_snapshot_moref <> ''
         AND canary_vm_moref <> ''
+    )),
+    CHECK (status <> 'retired' OR (
+        phase = 'retired'
+        AND result_replica_id IS NULL
+        AND residue_cleaned_at IS NOT NULL
     ))
 );
 
@@ -76,7 +99,7 @@ CREATE UNIQUE INDEX idx_template_replica_builds_active_compute
     ON template_source_replica_builds (
         template_id, compute_resource_type, compute_resource_moref
     )
-    WHERE status IN ('pending', 'running', 'cleanup_required');
+    WHERE status IN ('pending', 'running', 'cleanup_required', 'retiring');
 
 CREATE TRIGGER template_source_replica_builds_touch_updated_at
     BEFORE UPDATE ON template_source_replica_builds
