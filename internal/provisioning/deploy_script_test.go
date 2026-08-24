@@ -154,6 +154,176 @@ func TestDeployScriptPreparesAllWorkloadBaseline(t *testing.T) {
 	}
 }
 
+func TestDeployWorkloadCanonicalizerKubectlCompatibility(t *testing.T) {
+	jq, err := exec.LookPath("jq")
+	if err != nil {
+		t.Fatal("jq is required to test the deploy workload canonicalizer")
+	}
+
+	scriptPaths, err := filepath.Glob(filepath.Join("..", "..", "deploy", "scripts", "*.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, scriptPath := range scriptPaths {
+		script, readErr := os.ReadFile(scriptPath)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if strings.Contains(string(script), "toJson") {
+			t.Fatalf("%s still relies on kubectl's non-portable toJson template helper", scriptPath)
+		}
+	}
+	deployScript, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(deployScript), `-o json \`) {
+		t.Fatal("deploy script does not request portable JSON from kubectl")
+	}
+
+	fixture := filepath.Join(t.TempDir(), "deployment.json")
+	writeFile(t, fixture, `{
+  "apiVersion": "apps/v1",
+  "kind": "Deployment",
+  "metadata": {"name": "compatibility-fixture"},
+  "spec": {
+    "replicas": 1,
+    "template": {
+      "metadata": {"labels": {"app": "fixture"}},
+      "spec": {
+        "containers": [{"name": "fixture", "image": "example.invalid/fixture@sha256:`+testDigestA+`"}]
+      }
+    }
+  }
+}`)
+
+	filter := filepath.Join("..", "..", "deploy", "scripts", "canonicalize-workload-spec.jq")
+	input := fixture
+	if kubectl, lookErr := exec.LookPath("kubectl"); lookErr == nil {
+		kubectlOutput, kubectlErr := exec.Command(
+			kubectl,
+			"patch",
+			"--local=true",
+			"-f",
+			fixture,
+			"--type=merge",
+			"-p",
+			"{}",
+			"-o",
+			"json",
+		).CombinedOutput()
+		if kubectlErr != nil {
+			t.Fatalf("real kubectl could not emit portable JSON: %v\n%s", kubectlErr, kubectlOutput)
+		}
+		input = filepath.Join(t.TempDir(), "kubectl-output.json")
+		writeFile(t, input, string(kubectlOutput))
+	}
+
+	output, err := exec.Command(
+		jq,
+		"-cS",
+		"-e",
+		"--arg",
+		"kind",
+		"Deployment",
+		"-f",
+		filter,
+		input,
+	).CombinedOutput()
+	if err != nil {
+		t.Fatalf("portable JSON canonicalization failed: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), `"containers"`) {
+		t.Fatalf("canonical output omitted the pod spec: %s", output)
+	}
+
+	liveJob := `{
+  "kind": "Job",
+  "spec": {
+    "parallelism": 1,
+    "completions": 1,
+    "selector": {"matchLabels": {"controller-uid": "live-generated"}},
+    "template": {
+      "metadata": {
+        "labels": {
+          "app": "fixture",
+          "batch.kubernetes.io/controller-uid": "live-generated",
+          "batch.kubernetes.io/job-name": "live-name",
+          "controller-uid": "live-generated",
+          "job-name": "live-name"
+        }
+      },
+      "spec": {
+        "restartPolicy": "Never",
+        "containers": [{"name": "fixture", "image": "example.invalid/fixture@sha256:` + testDigestA + `"}]
+      }
+    }
+  }
+}`
+	desiredJob := strings.NewReplacer(
+		"live-generated", "dry-run-generated",
+		"live-name", "temporary-name",
+	).Replace(liveJob)
+	var canonicalJob []byte
+	for index, job := range []string{liveJob, desiredJob} {
+		cmd := exec.Command(
+			jq,
+			"-cS",
+			"-e",
+			"--arg",
+			"kind",
+			"Job",
+			"-f",
+			filter,
+		)
+		cmd.Stdin = strings.NewReader(job)
+		jobOutput, jobErr := cmd.CombinedOutput()
+		if jobErr != nil {
+			t.Fatalf("Job canonicalization failed: %v\n%s", jobErr, jobOutput)
+		}
+		if strings.Contains(string(jobOutput), "generated") || strings.Contains(string(jobOutput), "temporary-name") {
+			t.Fatalf("Job canonicalization retained server-generated identity: %s", jobOutput)
+		}
+		if !strings.Contains(string(jobOutput), `"labels":{"app":"fixture"}`) ||
+			!strings.Contains(string(jobOutput), `"selector":null`) {
+			t.Fatalf("Job canonicalization removed durable workload fields: %s", jobOutput)
+		}
+		if index == 0 {
+			canonicalJob = jobOutput
+		} else if string(jobOutput) != string(canonicalJob) {
+			t.Fatalf("live and dry-run Jobs did not canonicalize equally:\nlive: %s\ndry-run: %s", canonicalJob, jobOutput)
+		}
+	}
+
+	for _, invalid := range []struct {
+		kind string
+		body string
+	}{
+		{kind: "Deployment", body: `null`},
+		{kind: "Deployment", body: `{"kind":"Deployment"}`},
+		{kind: "Deployment", body: `{"kind":"Deployment","spec":null}`},
+		{kind: "Deployment", body: `{"kind":"CronJob","spec":{}}`},
+		{kind: "Job", body: `{"kind":"Job","spec":{"template":{"metadata":{},"spec":null}}}`},
+		{kind: "Job", body: `{"kind":"Job","spec":{"template":{"metadata":{"labels":[]},"spec":{}}}}`},
+	} {
+		invalidPath := filepath.Join(t.TempDir(), "invalid.json")
+		writeFile(t, invalidPath, invalid.body)
+		if badOutput, badErr := exec.Command(
+			jq,
+			"-cS",
+			"-e",
+			"--arg",
+			"kind",
+			invalid.kind,
+			"-f",
+			filter,
+			invalidPath,
+		).CombinedOutput(); badErr == nil {
+			t.Fatalf("canonicalizer accepted invalid %s resource %s: %s", invalid.kind, invalid.body, badOutput)
+		}
+	}
+}
+
 func TestDeployScriptRejectsConcurrentReleaseMutation(t *testing.T) {
 	requirePOSIXShell(t)
 	manifest := baselineManifest(true, "*", "false")
@@ -328,6 +498,19 @@ canonical_resource() {
   ' "$1"
 }
 
+json_resource() {
+  local manifest=$1
+  local resource=$2
+  local resource_file canonical kind
+  resource_file=$(mktemp)
+  extract_resource "$manifest" "$resource" > "$resource_file"
+  canonical=$(canonical_resource "$resource_file")
+  kind=${resource%%/*}
+  jq -cn --arg kind "$kind" --arg canonical "$canonical" \
+    '{apiVersion:"fixture/v1",kind:$kind,spec:{fixtureCanonical:$canonical}}'
+  rm -f "$resource_file"
+}
+
 image_for_container() {
   local container=$1
   local repository
@@ -373,18 +556,17 @@ case "$1" in
       echo "missing fake image status for: $*" >&2
       exit 92
     elif [[ "$2" == */* ]]; then
-      resource_file=$(mktemp)
-      extract_resource "$(current_manifest)" "$2" > "$resource_file"
       if [[ "$*" == *"-o yaml"* ]]; then
+        resource_file=$(mktemp)
+        extract_resource "$(current_manifest)" "$2" > "$resource_file"
         cat "$resource_file"
-      elif [[ "$*" == *"-o go-template="* ]]; then
-        canonical_resource "$resource_file"
+        rm -f "$resource_file"
+      elif [[ "$*" == *"-o json"* ]]; then
+        json_resource "$(current_manifest)" "$2"
       else
         echo "unexpected kubectl resource output: $*" >&2
-        rm -f "$resource_file"
         exit 94
       fi
-      rm -f "$resource_file"
     else
       echo "unexpected kubectl get invocation: $*" >&2
       exit 90
@@ -406,7 +588,21 @@ case "$1" in
         shift
       done
       [ -n "$manifest" ]
-      canonical_resource "$manifest"
+      resource=$(awk '
+        /^kind:[[:space:]]*/ {
+          kind = $0
+          sub(/^kind:[[:space:]]*/, "", kind)
+        }
+        /^metadata:[[:space:]]*$/ { metadata = 1 }
+        metadata && /^  name:[[:space:]]*/ {
+          name = $0
+          sub(/^  name:[[:space:]]*/, "", name)
+          print kind "/" name
+          exit
+        }
+      ' "$manifest")
+      [ -n "$resource" ]
+      json_resource "$manifest" "$resource"
     else
       [ ! -f "$FAKE_LOCK_FILE" ] || exit 1
       body=$(cat)

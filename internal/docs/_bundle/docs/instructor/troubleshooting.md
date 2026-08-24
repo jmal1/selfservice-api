@@ -63,7 +63,8 @@ Before pulling upgrade code, building or pushing images, or running a migration:
 1. Preserve a clean checkout of the chart revision currently running safely in
    production.
 2. From the hotfix checkout, create a Helm baseline revision using that safe
-   chart:
+   chart. The deploy host must have `jq`, `kubectl` configured for production,
+   and Helm 3.14+:
 
    ```bash
    ./deploy/scripts/deploy.sh \
