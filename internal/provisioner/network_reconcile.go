@@ -271,10 +271,7 @@ func reconcileNetwork(
 		if fwResult.CleanupLimited {
 			counts.FirewallCleanupLimited = 1
 		}
-		// A successful model comparison cannot prove that a previous apply
-		// reached the running packet filter. Re-apply after every complete,
-		// unambiguous inventory so transient apply failures converge.
-		if fwResult.Mutated || fwReconcileErr == nil {
+		if fwResult.Mutated {
 			needsFirewallApply = true
 		}
 		if fwReconcileErr != nil {
