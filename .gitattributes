@@ -8,5 +8,6 @@ internal/docs/_bundle/** -text eol=lf
 # deterministic across Windows and Linux contributors.
 internal/docs/testdata/*.json text eol=lf
 
-# Helm post-renderers are executed directly on Linux deploy hosts.
+# Deployment scripts and jq filters are executed directly on Linux deploy hosts.
 deploy/scripts/*.sh text eol=lf
+deploy/scripts/*.jq text eol=lf

@@ -14,6 +14,7 @@
 # Required on the deploy host:
 #   - kubectl with KUBECONFIG pointing at k3s (typically /etc/rancher/k3s/k3s.yaml)
 #   - helm 3.14+
+#   - jq
 #   - SSH key (deploy key) allowing `git pull` from the repo
 
 set -euo pipefail
@@ -58,6 +59,7 @@ if [ -z "${KUBECONFIG:-}" ]; then
 fi
 
 PIN_BASELINE_SCRIPT="$SCRIPT_DIR/pin-baseline-images.sh"
+CANONICALIZE_WORKLOAD_FILTER="$SCRIPT_DIR/canonicalize-workload-spec.jq"
 HELM_RELEASE_LOCK="$RELEASE-phase1-deploy-lock"
 HELM_RELEASE_LOCK_HELD=false
 HELM_RELEASE_LOCK_HOLDER=
@@ -993,21 +995,15 @@ set_temporary_resource_name() {
 canonical_live_workload_spec() {
   local kind=$1
   local name=$2
-  if [ "$kind" = Job ]; then
-    kubectl get "$kind/$name" -n "$NAMESPACE" -o go-template='{{toJson .spec.template.spec}}|annotations={{toJson .spec.template.metadata.annotations}}|labels={{range $key, $value := .spec.template.metadata.labels}}{{if and (ne $key "batch.kubernetes.io/controller-uid") (ne $key "batch.kubernetes.io/job-name") (ne $key "controller-uid") (ne $key "job-name")}}{{$key}}={{$value}};{{end}}{{end}}|name={{.spec.template.metadata.name}}|generateName={{.spec.template.metadata.generateName}}|finalizers={{toJson .spec.template.metadata.finalizers}}|parallelism={{.spec.parallelism}}|completions={{.spec.completions}}|activeDeadlineSeconds={{.spec.activeDeadlineSeconds}}|backoffLimit={{.spec.backoffLimit}}|backoffLimitPerIndex={{.spec.backoffLimitPerIndex}}|maxFailedIndexes={{.spec.maxFailedIndexes}}|ttlSecondsAfterFinished={{.spec.ttlSecondsAfterFinished}}|completionMode={{.spec.completionMode}}|suspend={{.spec.suspend}}|manualSelector={{.spec.manualSelector}}|selector={{if .spec.manualSelector}}{{toJson .spec.selector}}{{end}}|podFailurePolicy={{toJson .spec.podFailurePolicy}}|successPolicy={{toJson .spec.successPolicy}}|podReplacementPolicy={{.spec.podReplacementPolicy}}|managedBy={{.spec.managedBy}}'
-  else
-    kubectl get "$kind/$name" -n "$NAMESPACE" -o go-template='{{toJson .spec}}'
-  fi
+  kubectl get "$kind/$name" -n "$NAMESPACE" -o json \
+    | jq -cS -e --arg kind "$kind" -f "$CANONICALIZE_WORKLOAD_FILTER"
 }
 
 canonical_desired_workload_spec() {
   local kind=$1
   local manifest=$2
-  if [ "$kind" = Job ]; then
-    kubectl create --dry-run=server -n "$NAMESPACE" -f "$manifest" -o go-template='{{toJson .spec.template.spec}}|annotations={{toJson .spec.template.metadata.annotations}}|labels={{range $key, $value := .spec.template.metadata.labels}}{{if and (ne $key "batch.kubernetes.io/controller-uid") (ne $key "batch.kubernetes.io/job-name") (ne $key "controller-uid") (ne $key "job-name")}}{{$key}}={{$value}};{{end}}{{end}}|name={{.spec.template.metadata.name}}|generateName={{.spec.template.metadata.generateName}}|finalizers={{toJson .spec.template.metadata.finalizers}}|parallelism={{.spec.parallelism}}|completions={{.spec.completions}}|activeDeadlineSeconds={{.spec.activeDeadlineSeconds}}|backoffLimit={{.spec.backoffLimit}}|backoffLimitPerIndex={{.spec.backoffLimitPerIndex}}|maxFailedIndexes={{.spec.maxFailedIndexes}}|ttlSecondsAfterFinished={{.spec.ttlSecondsAfterFinished}}|completionMode={{.spec.completionMode}}|suspend={{.spec.suspend}}|manualSelector={{.spec.manualSelector}}|selector={{if .spec.manualSelector}}{{toJson .spec.selector}}{{end}}|podFailurePolicy={{toJson .spec.podFailurePolicy}}|successPolicy={{toJson .spec.successPolicy}}|podReplacementPolicy={{.spec.podReplacementPolicy}}|managedBy={{.spec.managedBy}}'
-  else
-    kubectl create --dry-run=server -n "$NAMESPACE" -f "$manifest" -o go-template='{{toJson .spec}}'
-  fi
+  kubectl create --dry-run=server -n "$NAMESPACE" -f "$manifest" -o json \
+    | jq -cS -e --arg kind "$kind" -f "$CANONICALIZE_WORKLOAD_FILTER"
 }
 
 verify_manifest_and_live() {
@@ -1138,6 +1134,14 @@ prepare_claims_baseline() {
   fi
   if [ ! -x "$PIN_BASELINE_SCRIPT" ]; then
     echo "ERROR: baseline post-renderer is missing or not executable at $PIN_BASELINE_SCRIPT" >&2
+    return 1
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "ERROR: jq is required to canonicalize live and server-defaulted workload specs." >&2
+    return 1
+  fi
+  if [ ! -r "$CANONICALIZE_WORKLOAD_FILTER" ]; then
+    echo "ERROR: workload canonicalization filter is missing or unreadable at $CANONICALIZE_WORKLOAD_FILTER" >&2
     return 1
   fi
 
