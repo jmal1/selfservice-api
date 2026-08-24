@@ -71,7 +71,7 @@ func (q *Queries) BeginPodPortGroupMutation(
 		SELECT j.claimed_by = $2
 		       AND j.status IN ('claimed', 'in_progress')
 		       AND j.type = 'pod_create'
-		       AND j.payload->>'pod_id' = $3,
+		       AND j.payload->>'pod_id' = $3::uuid::text,
 		       r.receipt = $4::jsonb,
 		       r.state
 		FROM jobs j
@@ -80,7 +80,7 @@ func (q *Queries) BeginPodPortGroupMutation(
 		 AND r.pod_id = $3::uuid
 		WHERE j.id = $1
 		FOR UPDATE OF j, r
-	`, jobID, workerID, podID.String(), receipt).Scan(&owned, &receiptMatches, &state); errors.Is(err, pgx.ErrNoRows) {
+	`, jobID, workerID, podID, receipt).Scan(&owned, &receiptMatches, &state); errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("%w for pod %s", ErrPortGroupReceiptNotFound, podID)
 	} else if err != nil {
 		return fmt.Errorf("lock port group mutation intent: %w", err)
