@@ -954,15 +954,24 @@ critical resident workloads, not a quota.
 
 Standard portgroup creation is scoped to the union of hosts selected by the
 durable pod plan, not every allowlisted host. It records one durable per-host
-receipt before the first vCenter mutation. Each entry contains immutable host
-identity and whether the portgroup already existed. A partial failure removes
-only portgroups newly created by that receipt, in reverse order. Rollback and
-destroy never infer ownership from OPNsense VLAN state and never delete
-preexisting portgroups. A legacy retry may contain duplicate
-`portgroup_create` steps; the first receipt remains the authoritative
-pre-mutation ownership record. A missing, malformed, legacy receipt without immutable
-host identities, or historical receipt naming a host outside the current
-allowlist fails closed for manual escalation. The destroy job reports
+receipt in `pod_portgroup_receipts` before the first vCenter mutation. The
+ledger is independent of mutable rollback checkpoints. Its monotonic
+`planned` -> `applying` -> `active` states prove whether switch mutation was
+ever authorized; the rollback step is durable before `applying`. Each entry contains
+immutable host/compute identity, expected VLAN, `vSwitch0`, inherited security
+policy, whether the portgroup already existed, and the stable per-host vSphere
+`HostPortGroup.Key` captured before the receipt becomes `active`. An
+`applying` receipt that is both keyless and absent is ambiguous and fails
+closed. Receipts backfilled from pre-ledger rollback data are marked `legacy`
+and can never bind a current inventory key or authorize deletion. A changed key
+or configuration also fails closed. A successful rollback records a durable
+`removed` tombstone, so a later user destroy can recognize completed cleanup
+without treating broad name absence as ownership proof. A partial failure
+removes only portgroups newly created by that receipt, in reverse order. Rollback and destroy
+never infer ownership from OPNsense VLAN state and never delete preexisting
+portgroups. A missing, malformed, legacy receipt without immutable host
+identities, or historical receipt naming a host outside the current allowlist
+fails closed for manual escalation. The destroy job reports
 `manual_cleanup_required`, the pod remains `destroy_failed`, and its
 VLAN/interface allocation remains reserved; operators must inspect or backfill
 exact ownership rather than broaden the allowlist. All
@@ -975,7 +984,11 @@ pod's receipt; it never expands switch ownership implicitly.
 
 Cluster placements receive a per-VM DRS override with `Enabled=false`; a
 standalone `ComputeResource` records the equivalent `standalone` control.
-Configuration fails closed if the control cannot be installed. Resume, power,
+Before any network or clone mutation, the worker performs a read-only privilege
+check for `Host.Inventory.EditCluster` on every selected
+`ClusterComputeResource`. The vCenter service account must hold that privilege
+on each selected cluster; standalone computes do not require it. Configuration
+still fails closed if the control cannot be installed. Resume, power,
 snapshot, revert, and suspend paths compare the VM's live host, compute
 resource, and DRS override with `vm_placements` before forward mutation.
 Automatic or manual movement is reported as placement drift rather than silently
@@ -1006,11 +1019,13 @@ Once vCenter returns a task MoRef, the worker persists it before waiting.
 Successors resume that exact task and never submit a second clone for an armed
 operation. Template verification and revalidation smoke clones use this same
 protocol; their job and template ids provide the immutable operation scope.
-Transient task waits and post-clone placement/configuration failures consume the
-normal forward retry budget by resuming that exact persisted task or clone. A
-forward retry clears only the cleanup dispatch marker and retains the operation,
-task, exact target, source, compute, pool, and host identities. Exhaustion or a
-proven terminal condition moves the operation to cleanup-only compensation.
+Transient task waits before clone acceptance consume the normal forward retry
+budget by resuming that exact persisted task. A forward retry clears only the
+cleanup dispatch marker and retains the operation, task, source, compute, pool,
+and host identities. Once the exact clone VM is accepted and staged, any
+placement validation or configuration failure enters cleanup-only compensation
+immediately; retries reconcile and destroy that exact VM and cannot replay
+VLAN, interface, DHCP, firewall, portgroup, or clone setup.
 
 Clone task waits have a 15-minute operational deadline and honor lease loss.
 Task or marker recovery stages the exact VM MoRef before any mutable

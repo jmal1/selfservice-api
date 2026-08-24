@@ -857,12 +857,15 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) (retErr error)
 	if tmplErr != nil {
 		return fmt.Errorf("get template for VM placement: %w", tmplErr)
 	}
-	rawReceipt, err := p.db.GetPodPortGroupReceipt(ctx, podID)
+	receiptRecord, err := p.db.GetPodPortGroupReceipt(ctx, podID)
 	if err != nil {
 		return fmt.Errorf("load pod port group receipt for VM placement: %w", err)
 	}
+	if receiptRecord.RemovedAt != nil {
+		return fmt.Errorf("pod port group receipt was already removed")
+	}
 	var receipt vcenter.PortGroupReceipt
-	if err := json.Unmarshal(rawReceipt, &receipt); err != nil {
+	if err := json.Unmarshal(receiptRecord.Receipt, &receipt); err != nil {
 		return fmt.Errorf("parse pod port group receipt for VM placement: %w", err)
 	}
 	if receipt.Name != pgName || receipt.VLANID != int(pod.VLANID) || len(receipt.Hosts) == 0 {
@@ -902,6 +905,37 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) (retErr error)
 			return p.completeVMAddWithoutClone(ctx, job, podVMID, jobErr.Error())
 		}
 		return jobErr
+	}
+	if err := p.vc.ValidateDRSPlacementPrivileges(ctx, vcenter.DRSPlacementTargets(placements)); err != nil {
+		jobErr := fmt.Errorf("validate mandatory DRS placement privileges for added VM: %w", err)
+		if podVM.VCenterVMID != nil && *podVM.VCenterVMID != "" {
+			return p.failVMAddWithCleanup(
+				ctx,
+				job,
+				podID,
+				podVMID,
+				*podVM.VCenterVMID,
+				jobErr,
+			)
+		}
+		return p.completeVMAddWithoutClone(ctx, job, podVMID, jobErr.Error())
+	}
+	if err := p.enforceExistingVMPlacements(ctx, job.ID, workerID, placements); err != nil {
+		if podVM.VCenterVMID != nil && *podVM.VCenterVMID != "" &&
+			!isManualCleanupRequired(err) {
+			return p.failVMAddWithCleanup(
+				ctx,
+				job,
+				podID,
+				podVMID,
+				*podVM.VCenterVMID,
+				err,
+			)
+		}
+		if podVM.VCenterVMID == nil || *podVM.VCenterVMID == "" {
+			return p.completeVMAddWithoutClone(ctx, job, podVMID, err.Error())
+		}
+		return err
 	}
 	placement := placements[0]
 	if osType == "linux" || osType == "windows" {

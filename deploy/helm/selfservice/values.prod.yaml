@@ -16,9 +16,10 @@ replicaCount:
   worker: 1
 
 provisioning:
-  # Admit provisioning and allow the single worker to claim provisioning jobs.
+  # Keep API admission visible but gate new provisioning claims for the first
+  # hotfix rollout. Enable claims only after migration and residue checks.
   enabled: true
-  workerClaimsEnabled: true
+  workerClaimsEnabled: false
 
 vcenter:
   # Production placement and standard-vSwitch mutation remain restricted to ESXi1.
@@ -28,6 +29,10 @@ vcenter:
   # manually move provisioning or source VMs to it.
   hosts: "esxi1.lab.jmal.io"
   resourcePools: "/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs"
+  placementReservedMemoryMB: "esxi1.lab.jmal.io=8192"
+  # k3sv01 validates the vCenter 8.0.3 certificate through the system trust
+  # chain. Keep hostname verification enabled in every production process.
+  insecure: "false"
 
 # Synthetic monitoring remains non-destructive during the initial reopening.
 # Lifecycle, janitor, and runner creation checks stay disabled.
@@ -80,6 +85,8 @@ worker:
   idleEvaluator:
     enabled: false
     dryRun: true
+  pipelineReconciler:
+    enabled: false
 
 # Bitnami postgresql subchart image overrides.
 # We pin tag explicitly to avoid surprise major upgrades on chart upgrade.

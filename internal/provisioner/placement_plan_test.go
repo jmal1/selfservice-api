@@ -184,8 +184,21 @@ func validatePlacementRecoveryWiring(createSrc, vmOpsSrc, cloneSrc string) error
 			return fmt.Errorf("pod_create recovery is missing %q", required)
 		}
 	}
-	if strings.Count(createSrc, "jobRetryAvailable(job, classifiedErr)") < 2 {
-		return errors.New("pod_create resume and power-on preflight do not both preserve operational retries")
+	if strings.Count(createSrc, "jobRetryAvailable(job, classifiedErr)") != 1 {
+		return errors.New("only post-persistence power-on may preserve an operational retry")
+	}
+	for _, stage := range []string{
+		`"resume placement validation",`,
+		`"power-on placement validation",`,
+	} {
+		stageIndex := strings.Index(createSrc, stage)
+		if stageIndex < 0 {
+			return fmt.Errorf("pod_create accepted-clone compensation is missing stage %s", stage)
+		}
+		start := max(0, stageIndex-500)
+		if !strings.Contains(createSrc[start:stageIndex], "failPodCreateAfterCloneError(") {
+			return fmt.Errorf("pod_create accepted-clone stage %s does not enter exact compensation", stage)
+		}
 	}
 	requiredVMAdd := []string{
 		"func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) (retErr error)",
@@ -305,8 +318,8 @@ func validateCloneForwardRetryWiring(src cloneForwardRetryWiring) error {
 		"clone operation": {
 			"errors.Is(err, vcenter.ErrCloneTaskFailed)",
 			`return "", newCloneForwardRetryError(fmt.Errorf(`,
-			"return moref, newCloneForwardRetryError(validationErr, target)",
-			"return moref, newCloneForwardRetryError(classifiedErr, target)",
+			"return moref, cloneRecoveryError(validationErr, target)",
+			"return moref, cloneRecoveryError(classifiedErr, target)",
 			"func cloneForwardFailureToCompensation(err error) error",
 			"store.GetVMCloneOperation(ctx, jobID, workerID)",
 			"func persistedClonePreambleFailure(",
@@ -439,16 +452,16 @@ func TestCloneForwardRetryWiringRejectsGuardSabotage(t *testing.T) {
 	sabotaged = src
 	sabotaged.clone = strings.Replace(
 		src.clone,
-		"return moref, newCloneForwardRetryError(validationErr, target)",
 		"return moref, cloneRecoveryError(validationErr, target)",
+		"return moref, newCloneForwardRetryError(validationErr, target)",
 		1,
 	)
 	sabotages["post-clone-validation"] = sabotaged
 	sabotaged = src
 	sabotaged.clone = strings.Replace(
 		src.clone,
-		"return moref, newCloneForwardRetryError(classifiedErr, target)",
 		"return moref, cloneRecoveryError(classifiedErr, target)",
+		"return moref, newCloneForwardRetryError(classifiedErr, target)",
 		1,
 	)
 	sabotages["post-clone-configuration"] = sabotaged

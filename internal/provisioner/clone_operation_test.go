@@ -812,39 +812,27 @@ func TestCloneTaskWaitTransientResumesPersistedTaskForward(t *testing.T) {
 	}
 }
 
-func TestClonePlacementValidationTransientResumesExactCloneForward(t *testing.T) {
+func TestClonePlacementValidationFailureRequiresExactCompensation(t *testing.T) {
 	jobID, workerID, podID, podVMID, params := cloneOperationFixture()
 	store := &fakeCloneOperationStore{}
 	client := &fakeCloneOperationClient{
 		store:        store,
 		taskRef:      "task-validation",
 		waitMoref:    "vm-validation",
-		validateErrs: []error{context.DeadlineExceeded, nil},
+		validateErrs: []error{context.DeadlineExceeded},
 	}
-	job := &models.Job{Type: models.JobTypePodCreate, RetryCount: 0, MaxRetries: 3}
 
 	moref, err := executeDurableVMClone(
 		context.Background(), store, client, jobID, workerID, podID, podVMID, params,
 	)
-	if moref != "vm-validation" || !isCloneForwardRetry(err) ||
-		isCompensationRetry(err) || !cloneForwardRetryAvailable(job, err) {
-		t.Fatalf("placement validation transient = (%q, %v), want exact forward retry", moref, err)
+	if moref != "vm-validation" || isCloneForwardRetry(err) || !isCompensationRetry(err) {
+		t.Fatalf("placement validation failure = (%q, %v), want exact compensation", moref, err)
 	}
 	if store.target == nil || store.target.VCenterVMID != moref {
-		t.Fatalf("placement validation transient lost staged exact target: %+v", store.target)
+		t.Fatalf("placement validation failure lost staged exact target: %+v", store.target)
 	}
-
-	retryParams := params
-	retryParams.HostMoRef = "host-sabotaged"
-	retryParams.ResourcePoolMoRef = "resgroup-sabotaged"
-	moref, err = executeDurableVMClone(
-		context.Background(), store, client, jobID, workerID, podID, podVMID, retryParams,
-	)
-	if err != nil || moref != "vm-validation" {
-		t.Fatalf("resume exact clone validation = (%q, %v)", moref, err)
-	}
-	if client.startCalls != 1 || client.waitCalls != 2 ||
-		client.validateCalls != 2 || client.configCalls != 1 {
+	if client.startCalls != 1 || client.waitCalls != 1 ||
+		client.validateCalls != 1 || client.configCalls != 0 {
 		t.Fatalf(
 			"start=%d wait=%d validate=%d configure=%d",
 			client.startCalls,
@@ -853,48 +841,33 @@ func TestClonePlacementValidationTransientResumesExactCloneForward(t *testing.T)
 			client.configCalls,
 		)
 	}
-	if got := client.configParams[0]; got.HostMoRef != params.HostMoRef ||
-		got.ResourcePoolMoRef != params.ResourcePoolMoRef {
-		t.Fatalf("resumed validation used mutable retry placement: %+v", got)
-	}
 }
 
-func TestCloneConfigurationTransientResumesExactCloneForward(t *testing.T) {
+func TestCloneConfigurationFailureRequiresExactCompensation(t *testing.T) {
 	jobID, workerID, podID, podVMID, params := cloneOperationFixture()
 	store := &fakeCloneOperationStore{}
 	client := &fakeCloneOperationClient{
 		store:      store,
 		taskRef:    "task-configure",
 		waitMoref:  "vm-configure",
-		configErrs: []error{context.DeadlineExceeded, nil},
+		configErrs: []error{context.DeadlineExceeded},
 	}
-	job := &models.Job{Type: models.JobTypeVMAdd, RetryCount: 0, MaxRetries: 3}
 
 	moref, err := executeDurableVMClone(
 		context.Background(), store, client, jobID, workerID, podID, podVMID, params,
 	)
-	if moref != "vm-configure" || !isCloneForwardRetry(err) ||
-		isCompensationRetry(err) || !cloneForwardRetryAvailable(job, err) {
-		t.Fatalf("configuration transient = (%q, %v), want exact forward retry", moref, err)
+	if moref != "vm-configure" || isCloneForwardRetry(err) || !isCompensationRetry(err) {
+		t.Fatalf("configuration failure = (%q, %v), want exact compensation", moref, err)
 	}
-
-	retryParams := params
-	retryParams.HostMoRef = "host-sabotaged"
-	retryParams.ResourcePoolMoRef = "resgroup-sabotaged"
-	moref, err = executeDurableVMClone(
-		context.Background(), store, client, jobID, workerID, podID, podVMID, retryParams,
-	)
-	if err != nil || moref != "vm-configure" {
-		t.Fatalf("resume exact clone configuration = (%q, %v)", moref, err)
+	if store.target == nil || store.target.VCenterVMID != moref {
+		t.Fatalf("configuration failure lost staged exact target: %+v", store.target)
 	}
-	if client.startCalls != 1 || client.waitCalls != 2 || client.configCalls != 2 {
+	if client.startCalls != 1 || client.waitCalls != 1 || client.configCalls != 1 {
 		t.Fatalf("start=%d wait=%d configure=%d", client.startCalls, client.waitCalls, client.configCalls)
 	}
-	for _, got := range client.configParams {
-		if got.HostMoRef != params.HostMoRef ||
-			got.ResourcePoolMoRef != params.ResourcePoolMoRef {
-			t.Fatalf("resumed configuration used mutable retry placement: %+v", got)
-		}
+	if got := client.configParams[0]; got.HostMoRef != params.HostMoRef ||
+		got.ResourcePoolMoRef != params.ResourcePoolMoRef {
+		t.Fatalf("configuration used mutable placement: %+v", got)
 	}
 }
 

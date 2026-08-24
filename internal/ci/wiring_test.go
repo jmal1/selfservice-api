@@ -388,8 +388,8 @@ func TestVMCloneCompensationUsesOnlyDurableExactTargets(t *testing.T) {
 	if got := strings.Count(createSrc, "failPodCreateForStaleVM("); got != 7 {
 		t.Fatalf("pod_create stale-clone compensation sites = %d, want 6 calls plus helper", got)
 	}
-	if got := strings.Count(vmOpsSrc, "failVMAddWithCleanup("); got != 12 {
-		t.Fatalf("vm_add stale-clone compensation sites = %d, want 11 calls plus helper", got)
+	if got := strings.Count(vmOpsSrc, "failVMAddWithCleanup("); got != 14 {
+		t.Fatalf("vm_add stale-clone compensation sites = %d, want 13 calls plus helper", got)
 	}
 
 	addStart := strings.Index(vmOpsSrc, "func (p *Provisioner) AddVM(")

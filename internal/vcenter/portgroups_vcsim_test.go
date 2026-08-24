@@ -3,6 +3,7 @@ package vcenter
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync"
@@ -23,6 +24,15 @@ type portGroupMutationRecorder struct {
 
 	mu         sync.Mutex
 	operations []string
+}
+
+func enableVCSimPortGroupKeys(c *Client) {
+	c.portGroupKeyOverride = func(identity HostIdentity, portGroup types.HostPortGroup) string {
+		if portGroup.Key != "" {
+			return portGroup.Key
+		}
+		return fmt.Sprintf("%s/vlan-%d", identity.MoRef, portGroup.Spec.VlanId)
+	}
 }
 
 func TestLegacyPortGroupReceiptIsDiagnosedBeforeMutation(t *testing.T) {
@@ -71,6 +81,7 @@ func (r *portGroupMutationRecorder) snapshot() []string {
 
 func TestPortGroupPartialCreateCompensatesOnlyCreatedHosts(t *testing.T) {
 	withSimulator(t, func(ctx context.Context, c *Client, _ *vim25.Client) {
+		enableVCSimPortGroupKeys(c)
 		host1, host2 := twoHostsInResourcePool(t, ctx, c, simResourcePool)
 		setAllowedHosts(c, host1, host2)
 		ns1 := networkSystemMoref(t, ctx, c, host1)
@@ -108,6 +119,7 @@ func TestPortGroupPartialCreateCompensatesOnlyCreatedHosts(t *testing.T) {
 
 func TestPortGroupMutationTouchesOnlySelectedTargetHosts(t *testing.T) {
 	withSimulator(t, func(ctx context.Context, c *Client, _ *vim25.Client) {
+		enableVCSimPortGroupKeys(c)
 		host1, host2 := twoHostsInResourcePool(t, ctx, c, simResourcePool)
 		setAllowedHosts(c, host1, host2)
 		ns2 := networkSystemMoref(t, ctx, c, host2)
@@ -141,8 +153,180 @@ func TestPortGroupMutationTouchesOnlySelectedTargetHosts(t *testing.T) {
 		} else if found {
 			t.Fatalf("portgroup %s was created on unselected host %s", receipt.Name, host1.Name)
 		}
+		if portGroup, found, err := c.findPortGroupOnHost(ctx, host2, receipt.Name); err != nil {
+			t.Fatal(err)
+		} else if !found || portGroup.Key == "" {
+			t.Fatalf("created portgroup identity = found:%t key:%q", found, portGroup.Key)
+		}
+		keys, err := c.CapturePortGroupKeys(ctx, receipt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		receipt, err = PortGroupReceiptWithKeys(receipt, keys)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if err := c.DeletePortGroupMutation(ctx, receipt); err != nil {
 			t.Fatal(err)
+		}
+	})
+}
+
+func TestPortGroupDeleteRejectsSameNameReplacementByStableKey(t *testing.T) {
+	withSimulator(t, func(ctx context.Context, c *Client, _ *vim25.Client) {
+		c.portGroupKeyOverride = func(HostIdentity, types.HostPortGroup) string {
+			return "key-original"
+		}
+		host1, _ := twoHostsInResourcePool(t, ctx, c, simResourcePool)
+		setAllowedHosts(c, host1)
+		receipt, err := c.PlanPortGroupMutationForHosts(
+			ctx,
+			"Pod-VLAN406",
+			406,
+			[]string{host1.MoRef},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.ApplyPortGroupMutation(ctx, receipt); err != nil {
+			t.Fatal(err)
+		}
+		keys, err := c.CapturePortGroupKeys(ctx, receipt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		receipt, err = PortGroupReceiptWithKeys(receipt, keys)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		host := object.NewHostSystem(c.client.Client, types.ManagedObjectReference{
+			Type:  "HostSystem",
+			Value: host1.MoRef,
+		})
+		networkSystem, err := host.ConfigManager().NetworkSystem(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := networkSystem.RemovePortGroup(ctx, receipt.Name); err != nil {
+			t.Fatal(err)
+		}
+		if err := networkSystem.AddPortGroup(ctx, types.HostPortGroupSpec{
+			Name:        receipt.Name,
+			VlanId:      int32(receipt.VLANID),
+			VswitchName: "vSwitch0",
+			Policy:      types.HostNetworkPolicy{},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		c.portGroupKeyOverride = func(HostIdentity, types.HostPortGroup) string {
+			return "key-replacement"
+		}
+		if err := c.DeletePortGroupMutation(ctx, receipt); !errors.Is(err, ErrInvalidPortGroupReceipt) {
+			t.Fatalf("replacement exact-key receipt error = %v, want ErrInvalidPortGroupReceipt", err)
+		}
+		if _, found, err := c.findPortGroupOnHost(ctx, host1, receipt.Name); err != nil {
+			t.Fatal(err)
+		} else if !found {
+			t.Fatal("replacement portgroup was deleted despite key mismatch")
+		}
+		if err := networkSystem.RemovePortGroup(ctx, receipt.Name); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestPortGroupDeleteRetryAcceptsKeyedAbsence(t *testing.T) {
+	withSimulator(t, func(ctx context.Context, c *Client, _ *vim25.Client) {
+		enableVCSimPortGroupKeys(c)
+		host1, _ := twoHostsInResourcePool(t, ctx, c, simResourcePool)
+		setAllowedHosts(c, host1)
+		receipt, err := c.PlanPortGroupMutationForHosts(
+			ctx,
+			"Pod-VLAN408",
+			408,
+			[]string{host1.MoRef},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.ApplyPortGroupMutation(ctx, receipt); err != nil {
+			t.Fatal(err)
+		}
+		keys, err := c.CapturePortGroupKeys(ctx, receipt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		receipt, err = PortGroupReceiptWithKeys(receipt, keys)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.DeletePortGroupMutation(ctx, receipt); err != nil {
+			t.Fatal(err)
+		}
+
+		retryKeys, err := c.CapturePortGroupKeys(ctx, receipt)
+		if err != nil {
+			t.Fatalf("capture keys after exact deletion: %v", err)
+		}
+		if len(retryKeys) != 0 {
+			t.Fatalf("keys for already absent portgroup = %v, want none", retryKeys)
+		}
+		if err := c.DeletePortGroupMutation(ctx, receipt); err != nil {
+			t.Fatalf("retry exact deletion before tombstone persistence: %v", err)
+		}
+	})
+}
+
+func TestPortGroupReceiptPreservesPreexistingGroupInVCSim(t *testing.T) {
+	withSimulator(t, func(ctx context.Context, c *Client, _ *vim25.Client) {
+		enableVCSimPortGroupKeys(c)
+		host1, _ := twoHostsInResourcePool(t, ctx, c, simResourcePool)
+		setAllowedHosts(c, host1)
+		host := object.NewHostSystem(c.client.Client, types.ManagedObjectReference{
+			Type:  "HostSystem",
+			Value: host1.MoRef,
+		})
+		networkSystem, err := host.ConfigManager().NetworkSystem(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		const name = "Pod-VLAN407"
+		if err := networkSystem.AddPortGroup(ctx, types.HostPortGroupSpec{
+			Name:        name,
+			VlanId:      407,
+			VswitchName: "vSwitch0",
+			Policy:      types.HostNetworkPolicy{},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_ = networkSystem.RemovePortGroup(context.Background(), name)
+		})
+
+		receipt, err := c.PlanPortGroupMutationForHosts(
+			ctx,
+			name,
+			407,
+			[]string{host1.MoRef},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(receipt.Hosts) != 1 || !receipt.Hosts[0].Preexisting ||
+			receipt.Hosts[0].PortGroupKey == "" {
+			t.Fatalf("preexisting receipt = %+v", receipt.Hosts)
+		}
+		if err := c.ApplyPortGroupMutation(ctx, receipt); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.DeletePortGroupMutation(ctx, receipt); err != nil {
+			t.Fatal(err)
+		}
+		if _, found, err := c.findPortGroupOnHost(ctx, host1, name); err != nil {
+			t.Fatal(err)
+		} else if !found {
+			t.Fatal("preexisting portgroup was deleted")
 		}
 	})
 }
@@ -191,6 +375,7 @@ func TestPortGroupDeleteRejectsHistoricalDisallowedHostBeforeMutation(t *testing
 				HostName:     host2.Name,
 				HostMoRef:    host2.MoRef,
 				ComputeMoRef: host2.ComputeMoRef,
+				VSwitchName:  "vSwitch0",
 			}},
 		})
 		if !errors.Is(err, ErrHostNotAllowed) {

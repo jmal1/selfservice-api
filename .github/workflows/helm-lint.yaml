@@ -50,3 +50,9 @@ jobs:
       - name: helm template (defaults + prod overrides)
         working-directory: deploy/helm/selfservice
         run: helm template selfservice . -f values.yaml -f values.prod.yaml > /dev/null
+
+      - name: helm lint and template (approved full-fleet overlay)
+        working-directory: deploy/helm/selfservice
+        run: |
+          helm lint . -f values.yaml -f values.full-fleet.yaml
+          helm template selfservice . -f values.yaml -f values.full-fleet.yaml > /dev/null
