@@ -343,13 +343,15 @@ configuration encryption key.
 
 Before sealing, Crucible verifies source snapshot identity, exact destination
 compute/pool/host/datastore/folder, powered-off state, firmware, Secure Boot,
-vTPM count, security provider, non-empty configuration key, independent disk
-backings, and absence of snapshots or attached ISOs. It then creates the
-destination `base-image` snapshot and proves that a powered-off linked clone can
-be created on the configured provisioning datastore with an exact retained
-parent backing. The canary is never booted. Its exact cleanup must finish and
-leave no marked residue before one transaction rechecks the original ready
-anchor and promotes the pending replica plus build to `ready`. This acceptance
+vTPM count, security provider and encryption-state parity, independent disk
+backings, and absence of snapshots or attached ISOs. An unencrypted source must
+remain unencrypted; an encrypted source requires a non-empty destination
+configuration key from the same provider. It then creates the destination
+`base-image` snapshot and proves that a powered-off linked clone can be created
+on the configured provisioning datastore with an exact retained parent backing.
+The canary is never booted. Its exact cleanup must finish and leave no marked
+residue before one transaction rechecks the original ready anchor and promotes
+the pending replica plus build to `ready`. This acceptance
 does not establish guest or L1 health.
 
 If acceptance never reaches `ready`, successful exact retained-VM cleanup

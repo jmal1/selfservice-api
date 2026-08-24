@@ -23,16 +23,24 @@ type clonePolicySaboteur struct {
 	mu              sync.Mutex
 	hardwareSources map[string]struct{}
 	policies        map[string]string
+	encryption      map[string]*types.CryptoKeyId
 }
 
 func (s *clonePolicySaboteur) RoundTrip(ctx context.Context, req, res soap.HasFault) error {
-	if body, ok := req.(*methods.RetrievePropertiesExBody); ok && s.injectVTPM {
-		if sourceMoref := s.requestedHardwareSource(body.Req); sourceMoref != "" {
-			if err := s.next.RoundTrip(ctx, req, res); err != nil {
+	if body, ok := req.(*methods.RetrievePropertiesExBody); ok {
+		sourceMoref := ""
+		if s.injectVTPM {
+			sourceMoref = s.requestedHardwareSource(body.Req)
+		}
+		if err := s.next.RoundTrip(ctx, req, res); err != nil {
+			return err
+		}
+		if sourceMoref != "" {
+			if err := injectVirtualTPM(res, sourceMoref); err != nil {
 				return err
 			}
-			return injectVirtualTPM(res, sourceMoref)
 		}
+		return injectConfigEncryption(res, s.encryptionSnapshot())
 	}
 
 	if body, ok := req.(*methods.CloneVM_TaskBody); ok && body.Req != nil {
@@ -90,6 +98,39 @@ func (s *clonePolicySaboteur) addHardwareSource(moref string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.hardwareSources[moref] = struct{}{}
+}
+
+func (s *clonePolicySaboteur) setEncryption(moref, key, provider string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if key == "" && provider == "" {
+		s.encryption[moref] = nil
+		return
+	}
+	keyID := &types.CryptoKeyId{KeyId: key}
+	if provider != "" {
+		keyID.ProviderId = &types.KeyProviderId{Id: provider}
+	}
+	s.encryption[moref] = keyID
+}
+
+func (s *clonePolicySaboteur) encryptionSnapshot() map[string]*types.CryptoKeyId {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	snapshot := make(map[string]*types.CryptoKeyId, len(s.encryption))
+	for moref, keyID := range s.encryption {
+		if keyID == nil {
+			snapshot[moref] = nil
+			continue
+		}
+		copyKey := *keyID
+		if keyID.ProviderId != nil {
+			copyProvider := *keyID.ProviderId
+			copyKey.ProviderId = &copyProvider
+		}
+		snapshot[moref] = &copyKey
+	}
+	return snapshot
 }
 
 func validateSubmittedReplicaBuildSpec(req *types.CloneVM_Task) error {
@@ -205,6 +246,39 @@ func injectVirtualTPM(res soap.HasFault, sourceMoref string) error {
 	return fmt.Errorf("source VM %s hardware property was not returned", sourceMoref)
 }
 
+func injectConfigEncryption(res soap.HasFault, encryption map[string]*types.CryptoKeyId) error {
+	if len(encryption) == 0 {
+		return nil
+	}
+	body, ok := res.(*methods.RetrievePropertiesExBody)
+	if !ok || body.Res == nil {
+		return fmt.Errorf("unexpected property response %T", res)
+	}
+	for objectIndex := range body.Res.Returnval.Objects {
+		object := &body.Res.Returnval.Objects[objectIndex]
+		keyID, configured := encryption[object.Obj.Value]
+		if !configured {
+			continue
+		}
+		for propertyIndex := range object.PropSet {
+			property := &object.PropSet[propertyIndex]
+			if property.Name != "config" {
+				continue
+			}
+			switch config := property.Val.(type) {
+			case types.VirtualMachineConfigInfo:
+				config.KeyId = keyID
+				property.Val = config
+			case *types.VirtualMachineConfigInfo:
+				config.KeyId = keyID
+			default:
+				return fmt.Errorf("unexpected config property type %T", property.Val)
+			}
+		}
+	}
+	return nil
+}
+
 func TestCloneBuildersApplyVTPMPolicyToSubmittedSpecs(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -274,6 +348,7 @@ func TestCloneBuildersApplyVTPMPolicyToSubmittedSpecs(t *testing.T) {
 					wantPolicy:      tt.wantPolicy,
 					hardwareSources: map[string]struct{}{source.Reference().Value: {}},
 					policies:        make(map[string]string),
+					encryption:      make(map[string]*types.CryptoKeyId),
 				}
 				c.client.RoundTripper = saboteur
 				defer func() { c.client.RoundTripper = original }()
@@ -286,20 +361,21 @@ func TestCloneBuildersApplyVTPMPolicyToSubmittedSpecs(t *testing.T) {
 				}()
 
 				replicaTarget := simulatorReplicaBuildTarget(t, ctx, c, allowed)
+				replicaParams := ReplicaBuildCloneParams{
+					BuildID:             "11111111-1111-1111-1111-111111111111",
+					OperationID:         "22222222-2222-2222-2222-222222222222",
+					Kind:                ReplicaBuildDestinationKind,
+					TemplateID:          "33333333-3333-3333-3333-333333333333",
+					SourceReplicaID:     "44444444-4444-4444-4444-444444444444",
+					SourceVMMoref:       source.Reference().Value,
+					SourceSnapshotName:  "base-image",
+					SourceSnapshotMoref: sourceSnapshot.Value,
+					DestinationName:     replicaName,
+					Target:              replicaTarget,
+				}
 				replicaTask, replicaSourceSnapshot, err := c.StartReplicaBuildClone(
 					ctx,
-					ReplicaBuildCloneParams{
-						BuildID:             "11111111-1111-1111-1111-111111111111",
-						OperationID:         "22222222-2222-2222-2222-222222222222",
-						Kind:                ReplicaBuildDestinationKind,
-						TemplateID:          "33333333-3333-3333-3333-333333333333",
-						SourceReplicaID:     "44444444-4444-4444-4444-444444444444",
-						SourceVMMoref:       source.Reference().Value,
-						SourceSnapshotName:  "base-image",
-						SourceSnapshotMoref: sourceSnapshot.Value,
-						DestinationName:     replicaName,
-						Target:              replicaTarget,
-					},
+					replicaParams,
 					func(context.Context) error { return nil },
 				)
 				if err != nil {
@@ -321,18 +397,69 @@ func TestCloneBuildersApplyVTPMPolicyToSubmittedSpecs(t *testing.T) {
 					c.client.Client,
 					types.ManagedObjectReference{Type: "VirtualMachine", Value: replicaMoref},
 				)
+				devices, err := replicaVM.Device(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var deviceChanges []types.BaseVirtualDeviceConfigSpec
+				for _, device := range devices.SelectByType((*types.VirtualCdrom)(nil)) {
+					cdrom := device.(*types.VirtualCdrom)
+					if cdrom.Connectable == nil {
+						cdrom.Connectable = &types.VirtualDeviceConnectInfo{}
+					}
+					cdrom.Connectable.Connected = false
+					cdrom.Connectable.StartConnected = false
+					deviceChanges = append(deviceChanges, &types.VirtualDeviceConfigSpec{
+						Operation: types.VirtualDeviceConfigSpecOperationEdit,
+						Device:    cdrom,
+					})
+				}
 				markerTask, err := replicaVM.Reconfigure(ctx, types.VirtualMachineConfigSpec{
 					ExtraConfig: replicaBuildExtraConfig(
 						"11111111-1111-1111-1111-111111111111",
 						"22222222-2222-2222-2222-222222222222",
 						ReplicaBuildDestinationKind,
 					),
+					DeviceChange: deviceChanges,
 				})
 				if err != nil {
 					t.Fatal(err)
 				}
 				if err := markerTask.Wait(ctx); err != nil {
 					t.Fatal(err)
+				}
+				replicaParams.DestinationVMMoref = replicaMoref
+				if !tt.injectVTPM {
+					if err := c.ValidateReplicaBuildClone(ctx, replicaParams); err != nil {
+						t.Fatalf("production validation rejected unencrypted non-vTPM clone: %v", err)
+					}
+					saboteur.setEncryption(source.Reference().Value, "source-key", "provider-1")
+					saboteur.setEncryption(replicaMoref, "destination-key", "provider-1")
+					if err := c.ValidateReplicaBuildClone(ctx, replicaParams); err != nil {
+						t.Fatalf("production validation rejected matching encrypted clone: %v", err)
+					}
+					saboteur.setEncryption(replicaMoref, "", "")
+					if err := c.ValidateReplicaBuildClone(ctx, replicaParams); err == nil ||
+						!strings.Contains(err.Error(), "empty configuration encryption key") {
+						t.Fatalf("production validation missing destination key error=%v", err)
+					}
+					saboteur.setEncryption(replicaMoref, "", "provider-1")
+					if err := c.ValidateReplicaBuildClone(ctx, replicaParams); err == nil ||
+						!strings.Contains(err.Error(), "empty configuration encryption key") {
+						t.Fatalf("production validation empty destination key error=%v", err)
+					}
+					saboteur.setEncryption(replicaMoref, "destination-key", "provider-2")
+					if err := c.ValidateReplicaBuildClone(ctx, replicaParams); err == nil ||
+						!strings.Contains(err.Error(), "security provider") {
+						t.Fatalf("production validation provider drift error=%v", err)
+					}
+					saboteur.setEncryption(source.Reference().Value, "", "")
+					saboteur.setEncryption(replicaMoref, "unexpected-key", "provider-1")
+					if err := c.ValidateReplicaBuildClone(ctx, replicaParams); err == nil ||
+						!strings.Contains(err.Error(), "unexpectedly encrypted") {
+						t.Fatalf("production validation unencrypted drift error=%v", err)
+					}
+					saboteur.setEncryption(replicaMoref, "", "")
 				}
 				replicaSnapshotTask, err := c.StartReplicaBuildSnapshot(
 					ctx,

@@ -876,10 +876,12 @@ The retained VM is a powered-off full clone of the ready source anchor's
 the shared vTPM clone policy (`replace` when the source has a vTPM). Validation
 requires exact source snapshot and destination inventory identity, powered-off
 state, no pre-seal destination snapshot, firmware/Secure Boot/vTPM-count/
-security-provider parity, a non-empty configuration key, independent persistent
-disks with no parent or source backing reuse, no connected or retained ISO, and
-distinct public EK certificate/CSR hash sets for vTPM sources. Config-key
-uniqueness is deliberately not required and the operation does not rekey.
+security-provider and encryption-state parity, independent persistent disks with
+no parent or source backing reuse, no connected or retained ISO, and distinct
+public EK certificate/CSR hash sets for vTPM sources. An unencrypted source must
+produce an unencrypted destination; an encrypted source requires a non-empty
+destination configuration key from the same provider. Config-key uniqueness is
+deliberately not required and the operation does not rekey.
 
 After creating the retained `base-image` snapshot, acceptance creates but never
 boots a linked clone on the configured provisioning datastore, verifies each

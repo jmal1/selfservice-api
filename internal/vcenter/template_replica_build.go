@@ -257,7 +257,7 @@ func (c *Client) ValidateReplicaBuildPrivileges(
 			privileges: sourcePrivileges,
 		},
 		{
-			entity: types.ManagedObjectReference{Type: "Folder", Value: target.FolderMoref},
+			entity:     types.ManagedObjectReference{Type: "Folder", Value: target.FolderMoref},
 			privileges: folderPrivileges,
 		},
 		{
@@ -708,12 +708,11 @@ func validateReplicaBuildHardware(source, destination *replicaVMFacts) error {
 	}
 	if destination.Props.Config.Firmware != source.Props.Config.Firmware ||
 		secureBoot(destination.Props.Config) != secureBoot(source.Props.Config) ||
-		len(destination.TPMs) != len(source.TPMs) ||
-		destination.Provider != source.Provider {
-		return errors.New("destination firmware, Secure Boot, vTPM, or security provider differs from source")
+		len(destination.TPMs) != len(source.TPMs) {
+		return errors.New("destination firmware, Secure Boot, or vTPM count differs from source")
 	}
-	if destination.Props.Config.KeyId == nil || destination.Props.Config.KeyId.KeyId == "" {
-		return errors.New("destination replica has an empty configuration encryption key")
+	if err := validateReplicaBuildEncryption(source, destination); err != nil {
+		return err
 	}
 	if len(source.Disks) != len(destination.Disks) {
 		return errors.New("destination disk count differs from source")
@@ -755,6 +754,47 @@ func validateReplicaBuildHardware(source, destination *replicaVMFacts) error {
 		}
 	}
 	return nil
+}
+
+func validateReplicaBuildEncryption(source, destination *replicaVMFacts) error {
+	sourceKey := strings.TrimSpace(configEncryptionKey(source.Props.Config))
+	sourceProvider := strings.TrimSpace(source.Provider)
+	destinationKey := strings.TrimSpace(configEncryptionKey(destination.Props.Config))
+	destinationProvider := strings.TrimSpace(destination.Provider)
+
+	if sourceKey == "" {
+		if sourceProvider != "" {
+			return errors.New("source replica has an encryption provider without a configuration encryption key")
+		}
+		if destinationKey != "" || destinationProvider != "" {
+			return errors.New("destination replica is unexpectedly encrypted while source is unencrypted")
+		}
+		return nil
+	}
+	if sourceProvider == "" {
+		return errors.New("encrypted source replica has no configuration encryption provider")
+	}
+	if destinationKey == "" {
+		return errors.New("encrypted destination replica has an empty configuration encryption key")
+	}
+	if destinationProvider == "" {
+		return errors.New("encrypted destination replica has no configuration encryption provider")
+	}
+	if destinationProvider != sourceProvider {
+		return fmt.Errorf(
+			"destination security provider %q differs from encrypted source provider %q",
+			destinationProvider,
+			sourceProvider,
+		)
+	}
+	return nil
+}
+
+func configEncryptionKey(config *types.VirtualMachineConfigInfo) string {
+	if config == nil || config.KeyId == nil {
+		return ""
+	}
+	return config.KeyId.KeyId
 }
 
 func (c *Client) ValidateReplicaBuildMarker(

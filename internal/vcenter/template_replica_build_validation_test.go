@@ -44,11 +44,96 @@ func replicaValidationFacts(name, diskFile string, tpmIdentity []byte) *replicaV
 	return facts
 }
 
-func TestValidateReplicaBuildHardwareNonVTPMAllowsSharedConfigKey(t *testing.T) {
+func makeReplicaValidationFactsUnencrypted(facts *replicaVMFacts) {
+	facts.Props.Config.KeyId = nil
+	facts.Provider = ""
+}
+
+func TestValidateReplicaBuildHardwareEncryptedNonVTPMAllowsSharedConfigKey(t *testing.T) {
 	source := replicaValidationFacts("source", "[source] source.vmdk", nil)
 	destination := replicaValidationFacts("destination", "[target] destination.vmdk", nil)
 	if err := validateReplicaBuildHardware(source, destination); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestValidateReplicaBuildHardwareUnencryptedNonVTPMParity(t *testing.T) {
+	source := replicaValidationFacts("source", "[source] source.vmdk", nil)
+	destination := replicaValidationFacts("destination", "[target] destination.vmdk", nil)
+	makeReplicaValidationFactsUnencrypted(source)
+	makeReplicaValidationFactsUnencrypted(destination)
+	if err := validateReplicaBuildHardware(source, destination); err != nil {
+		t.Fatalf("consistently unencrypted clone rejected: %v", err)
+	}
+	source.Props.Config.KeyId = &types.CryptoKeyId{}
+	destination.Props.Config.KeyId = &types.CryptoKeyId{}
+	if err := validateReplicaBuildHardware(source, destination); err != nil {
+		t.Fatalf("empty unencrypted key facts rejected: %v", err)
+	}
+
+	destination.Props.Config.KeyId = &types.CryptoKeyId{
+		KeyId: "unexpected-destination-key",
+		ProviderId: &types.KeyProviderId{
+			Id: "provider-2",
+		},
+	}
+	destination.Provider = "provider-2"
+	if err := validateReplicaBuildHardware(source, destination); err == nil ||
+		!strings.Contains(err.Error(), "unexpectedly encrypted") {
+		t.Fatalf("unencrypted-to-encrypted drift error=%v", err)
+	}
+}
+
+func TestValidateReplicaBuildHardwareEncryptedSourceRequiresDestinationKeyAndProvider(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*replicaVMFacts)
+		wantErr string
+	}{
+		{
+			name: "missing destination key",
+			mutate: func(destination *replicaVMFacts) {
+				destination.Props.Config.KeyId = nil
+				destination.Provider = ""
+			},
+			wantErr: "empty configuration encryption key",
+		},
+		{
+			name: "empty destination key",
+			mutate: func(destination *replicaVMFacts) {
+				destination.Props.Config.KeyId.KeyId = ""
+				destination.Props.Config.KeyId.ProviderId = nil
+				destination.Provider = ""
+			},
+			wantErr: "empty configuration encryption key",
+		},
+		{
+			name: "missing destination provider",
+			mutate: func(destination *replicaVMFacts) {
+				destination.Props.Config.KeyId.ProviderId = nil
+				destination.Provider = ""
+			},
+			wantErr: "no configuration encryption provider",
+		},
+		{
+			name: "provider drift",
+			mutate: func(destination *replicaVMFacts) {
+				destination.Props.Config.KeyId.ProviderId.Id = "provider-2"
+				destination.Provider = "provider-2"
+			},
+			wantErr: "security provider",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			source := replicaValidationFacts("source", "[source] source.vmdk", nil)
+			destination := replicaValidationFacts("destination", "[target] destination.vmdk", nil)
+			tt.mutate(destination)
+			err := validateReplicaBuildHardware(source, destination)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error=%v, want text %q", err, tt.wantErr)
+			}
+		})
 	}
 }
 
