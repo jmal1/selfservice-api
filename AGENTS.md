@@ -776,15 +776,36 @@ already render `provisioning.workerClaimsEnabled=false` before any migration or
 image upgrade begins. A live `kubectl set env` override is not sufficient:
 Helm rollback restores the prior rendered manifest and would erase that
 override. First use `deploy/scripts/deploy.sh --prepare-claims-baseline` with
-the exact currently deployed safe chart checkout. The script pins the baseline
-worker manifest to the one immutable digest reported by the running safe pods;
-it never rolls a failed baseline back to the claims-enabled revision. Then run
-`--verify-rollback-containment`. The deploy path performs the same preflight
-before pulling new code, so its atomic rollback target is durably
-claims-disabled and digest-pinned. Do not build, push, migrate, or upgrade
-phase-1 images until the baseline revision and live worker both pass that
-proof. The database must independently be at migration 34 clean; stop rather
-than deploying if it is dirty or already reports a different version.
+the exact currently deployed safe chart checkout. The script inventories every
+rendered Deployment, DaemonSet, StatefulSet, CronJob, and Job container plus
+the engine's dynamic `RUNNER_IMAGE`; it pins each one to the immutable sha256
+ImageID reported by the corresponding healthy live pod. Missing, mutable,
+mixed, or mismatched image evidence fails closed.
+
+Stored Helm-manifest equality is not a no-restart proof. The baseline command
+compares each safe-chart workload directly with its live resource. It permits
+only the intentional claims setting, digest pinning, and removal of
+`kubectl.kubernetes.io/restartedAt`; that annotation may restart a workload
+only after every rendered image is proven digest-equivalent to the running
+image. The candidate is server-defaulted with a dry-run create, then its
+canonical spec is compared directly with the canonical live spec. It does not
+use three-way `kubectl diff`, which can preserve live-only fields. Command,
+environment, volume, security-context, replica, service-account, or other
+workload drift blocks the baseline. The command never rolls a failed baseline
+back to a claims-enabled revision.
+
+Then run `--verify-rollback-containment`. It requires the latest revision to be
+deployed, claims to remain false, exactly one worker, every live declared image
+and ImageID to equal the persisted pin, all rollouts and retained CronJob/Job
+evidence to be healthy, and PostgreSQL to be migration 35 clean. Baseline
+preparation proves the migration did not change. The normal deploy repeats the
+proof before pulling and immediately before `helm upgrade --atomic`, rejecting
+an intervening Helm revision so this immutable baseline is the immediately
+previous successful rollback target. Baseline and application mutations hold
+the cluster-visible `configmap/selfservice-phase1-deploy-lock`; every release
+mutation must use this script and honor that lock. Remove a stale lock only
+after proving its recorded holder is no longer active. Do not build, push,
+migrate, or upgrade phase-1 images until those proofs pass.
 
 When API admission is disabled, the first instruction in each of these
 handlers rejects the request before parsing, allocation, or database access:
