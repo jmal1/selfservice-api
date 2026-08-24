@@ -167,6 +167,32 @@ Placement diagnostics are exported as:
 | `crucible_vm_placement_rejections_total{reason}` | Failed placement decisions, including `reserved_headroom`. |
 | `crucible_vm_placement_drift_total{kind}` | Refused operations after `host`, `compute`, or `drs` drift. |
 
+### "Template replica build is stuck or requires cleanup"
+
+Read the durable operation first:
+
+```http
+GET /api/v1/admin/templates/{templateID}/source-replica-builds/{buildID}
+```
+
+Correlate `phase`, task MoRefs, exact VM MoRefs, `last_error_code`, and
+`last_error` with vCenter task history and the current worker claim. A timeout
+after a `*_submitting` phase is not proof of failure: the worker searches for
+the exact build/operation/kind marker before deciding whether a task was
+accepted. Do not enqueue a new idempotency key or clone by hand while that
+lineage is unresolved.
+
+Use `/retry` only for `status=failed`; it resumes the stored `resume_phase`.
+Use `/cleanup` for failed or `cleanup_required` operations only after confirming
+the stored ownership. Cleanup verifies the exact MoRef and all operation markers
+before deletion. A same-name VM, missing marker, duplicate marker, or property
+read failure must be escalated rather than deleted. `ready` is impossible until
+the linked-clone canary cleanup timestamp is persisted and no marked canary
+residue remains.
+
+See [Durable retained replica builds](templates.md#durable-retained-replica-builds)
+for API payloads, privilege requirements, metrics, and alert rules.
+
 ### "Durable port group ownership cannot be proven"
 
 Destroy never guesses which host portgroups a pod owns. A missing, malformed,

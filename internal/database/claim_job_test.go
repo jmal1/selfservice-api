@@ -33,6 +33,7 @@ func validateMaintenanceClaimSQL(query string) error {
 		"TEMPLATE_VERIFY",
 		"TEMPLATE_REVALIDATE",
 		"TEMPLATE_HEALTH_CONFIRM",
+		"TEMPLATE_REPLICA_BUILD",
 		"IMAGE_IMPORT",
 	} {
 		if strings.Count(sql, "'"+jobType+"'") != 2 {
@@ -143,14 +144,19 @@ func TestRetryJobSQLSeparatesForwardAndCleanupRetries(t *testing.T) {
 }
 
 func TestCompletedJobStatusAllowsPayloadWithoutCleanupMarker(t *testing.T) {
-	const required = "COALESCE(payload->>'cleanup_only', 'false') = 'true'"
+	required := []string{
+		"COALESCE(payload->>'cleanup_only', 'false') = 'true'",
+		"type <> 'template_replica_build'",
+	}
 	body, err := os.ReadFile("queries.go")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if !strings.Contains(string(body), required) {
-		t.Fatalf("normal job completion is not null-safe; missing %q", required)
+	for _, fragment := range required {
+		if !strings.Contains(string(body), fragment) {
+			t.Fatalf("normal job completion guard is incomplete; missing %q", fragment)
+		}
 	}
 }
 

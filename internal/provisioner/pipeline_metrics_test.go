@@ -25,6 +25,10 @@ func TestPipelineMetrics_SerializeShape(t *testing.T) {
 	m.SetVMPlacementHeadroom("esxi1", 8192)
 	m.RecordVMPlacementDrift("drs")
 	m.RecordVMPlacementRejection("reserved_headroom")
+	m.RecordTemplateReplicaBuild(MetricResultSuccess, 2*time.Minute)
+	m.RecordTemplateReplicaBuild(MetricResultError, 30*time.Second)
+	m.SetTemplateReplicaBuildPhases(map[string]int{"validating": 1, "cleanup_submitted": 2})
+	m.SetTemplateReplicaBuildsStuck(1)
 
 	out := string(m.serialize())
 
@@ -47,6 +51,14 @@ func TestPipelineMetrics_SerializeShape(t *testing.T) {
 		`crucible_vm_placement_headroom_megabytes{host="esxi1"} 8192`,
 		`crucible_vm_placement_drift_total{kind="drs"} 1`,
 		`crucible_vm_placement_rejections_total{reason="reserved_headroom"} 1`,
+		`crucible_template_replica_build_total{result="success"} 1`,
+		`crucible_template_replica_build_total{result="error"} 1`,
+		`crucible_template_replica_build_duration_seconds_sum{result="success"} 120`,
+		`crucible_template_replica_build_phase{phase="validating"} 1`,
+		`crucible_template_replica_build_phase{phase="cleanup_submitted"} 2`,
+		`crucible_template_replica_build_stuck 1`,
+		"crucible_template_replica_build_last_success_timestamp_seconds ",
+		"crucible_template_replica_build_last_failure_timestamp_seconds ",
 		"# TYPE crucible_image_upload_total counter",
 		"# TYPE crucible_template_state gauge",
 	}

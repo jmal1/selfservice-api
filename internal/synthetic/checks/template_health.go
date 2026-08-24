@@ -46,15 +46,46 @@ var TemplateHealthStatusRBAC = synthetic.CheckFunc{
 			return resp.StatusCode, nil
 		case http.StatusOK:
 			return resp.StatusCode, fmt.Errorf(
-				"student-role user was ALLOWED to read template health status (status 200) — "+
+				"student-role user was ALLOWED to read template health status (status 200) — " +
 					"the /admin/templates RBAC gate is open; a student can now read which templates are unhealthy")
 		case http.StatusNotFound:
 			return resp.StatusCode, fmt.Errorf(
-				"GET /api/v1/admin/templates/health returned 404 — the route is missing, "+
+				"GET /api/v1/admin/templates/health returned 404 — the route is missing, " +
 					"so this check is no longer proving anything about RBAC")
 		default:
 			return resp.StatusCode, fmt.Errorf(
 				"GET /api/v1/admin/templates/health returned %d as a student, want 403", resp.StatusCode)
 		}
+	},
+}
+
+// TemplateReplicaBuildStatusRBAC guards the read-only recovery/status surface.
+// The fixed nonexistent UUIDs ensure an open route returns 404, which is a
+// failure: authorization must reject the student before handler lookup.
+var TemplateReplicaBuildStatusRBAC = synthetic.CheckFunc{
+	NameVal:        "template_replica_build_status_rbac",
+	TitleVal:       "RBAC: Student Cannot Read Replica Builds",
+	DescriptionVal: "Calls the retained template replica-build status endpoint as a student-role user and requires 403.",
+	SeverityVal:    synthetic.SeverityCritical,
+	RunFn: func(ctx context.Context, c *synthetic.Client) (int, error) {
+		const path = "/api/v1/admin/templates/00000000-0000-0000-0000-000000000001/" +
+			"source-replica-builds/00000000-0000-0000-0000-000000000002"
+		resp, err := c.Do(ctx, http.MethodGet, path, nil)
+		if err != nil {
+			return 0, err
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		if resp.StatusCode == http.StatusForbidden {
+			return resp.StatusCode, nil
+		}
+		if resp.StatusCode == http.StatusNotFound {
+			return resp.StatusCode, fmt.Errorf(
+				"replica build status returned 404 to a student; the route exists but its instructor RBAC gate is not proven")
+		}
+		return resp.StatusCode, fmt.Errorf(
+			"replica build status returned %d to a student, want 403",
+			resp.StatusCode,
+		)
 	},
 }

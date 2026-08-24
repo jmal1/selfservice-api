@@ -13,8 +13,8 @@
     {
       "path": "AGENTS.md",
       "title": "AGENTS.md — Crucible AI Authoring Reference",
-      "size": 60453,
-      "sha256": "77f30d052924cd828c72bba7dbc8de0c3573c0d7ac95c83ec7b4d0d6067cab5f",
+      "size": 63599,
+      "sha256": "cdcb5f3d14af43432273958479e6f6ea038402e89ba480016fba65942b6cdb3f",
       "is_markdown": true,
       "links_out": [
         "deploy/runner/actions.sh",
@@ -183,8 +183,8 @@
     {
       "path": "docs/instructor/templates.md",
       "title": "Building a Template",
-      "size": 50745,
-      "sha256": "b1963b6b9ad8f7f3f3d09aefe938d19c6c5e7fc681c3bf80547d486a06033644",
+      "size": 58088,
+      "sha256": "3c0385d4b707468eae19fa4e225d3e265e1d0c6f21816281c5e3199e7b7328d6",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/glossary.md",
@@ -202,8 +202,8 @@
     {
       "path": "docs/instructor/troubleshooting.md",
       "title": "Troubleshooting",
-      "size": 40416,
-      "sha256": "6e7331b8e371285a2c6f4322e9fb93f772f18d926a5aaf39bb56d0d1bb807683",
+      "size": 41642,
+      "sha256": "f215ec8fe9ca5d2b442b02c70d48caa8c4563ff26b509baac21da5be46c5917b",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/actions.md",
@@ -211,6 +211,7 @@
         "docs/instructor/runner-environment.md",
         "docs/instructor/runner-environment.md",
         "docs/instructor/runner-environment.md",
+        "docs/instructor/templates.md",
         "docs/instructor/templates.md",
         "docs/instructor/templates.md",
         "docs/instructor/workflows.md"
@@ -298,8 +299,8 @@
     {
       "path": "internal/api/routes/routes.go",
       "title": "routes.go (Go)",
-      "size": 14722,
-      "sha256": "57d4122f312c71f5b159d8f2a9c9ae3a356666cc9c555321f6d3f3119c9a6bab",
+      "size": 15102,
+      "sha256": "b1e18bbd83c67d3042cf08c7c147d4418679409c41bfbd214281396d903c2239",
       "is_markdown": false,
       "from_seed": false
     },
@@ -384,5 +385,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 357032
+  "total_bytes": 369127
 }

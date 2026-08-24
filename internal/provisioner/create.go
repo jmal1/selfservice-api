@@ -198,6 +198,8 @@ func (p *Provisioner) ProcessJob(ctx context.Context, job *models.Job) error {
 			return p.RevalidateL1Template(ctx, job)
 		case models.JobTypeTemplateHealthConfirm:
 			return p.ConfirmTemplateHealth(ctx, job)
+		case models.JobTypeTemplateReplicaBuild:
+			return p.BuildTemplateSourceReplica(ctx, job)
 		case models.JobTypeImageImport:
 			return p.ImportImage(ctx, job)
 		case models.JobTypeVMSuspend:
@@ -215,7 +217,7 @@ func isTemplateJobType(jobType string) bool {
 	switch jobType {
 	case models.JobTypeTemplateProvision, models.JobTypeTemplateGeneralize,
 		models.JobTypeTemplateVerify, models.JobTypeTemplateRevalidate,
-		models.JobTypeTemplateHealthConfirm:
+		models.JobTypeTemplateHealthConfirm, models.JobTypeTemplateReplicaBuild:
 		return true
 	default:
 		return false

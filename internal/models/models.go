@@ -549,6 +549,9 @@ const (
 	// separately observed deep failure. Its delayed jobs are durable and
 	// idempotent across worker restart and leader failover.
 	JobTypeTemplateHealthConfirm = "template_health_confirm"
+	// JobTypeTemplateReplicaBuild constructs and acceptance-checks one retained
+	// compute-scoped source replica without changing provisioning allowlists.
+	JobTypeTemplateReplicaBuild = "template_replica_build"
 
 	// JobTypeImageImport streams a staged ISO/OVA out of MinIO and into
 	// vCenter — ISOs are uploaded to the NAS-BackupsAndISOS datastore,

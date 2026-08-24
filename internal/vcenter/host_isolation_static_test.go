@@ -50,7 +50,7 @@ func TestEveryVMCreationPrimitiveUsesCanonicalPlacement(t *testing.T) {
 						return true
 					}
 					switch sel.Sel.Name {
-					case "ResolvePlacement":
+					case "ResolvePlacement", "ResolveReplicaBuildTarget":
 						hasResolver = true
 					case "DefaultResourcePool":
 						t.Errorf("%s calls DefaultResourcePool; unpinned fallback is prohibited", fn.Name.Name)
@@ -85,6 +85,8 @@ func TestEveryVMCreationPrimitiveUsesCanonicalPlacement(t *testing.T) {
 	sort.Strings(got)
 	want := []string{
 		"ImportOVA",
+		"StartReplicaBuildCanary",
+		"StartReplicaBuildClone",
 		"cloneForHealthCheckInner",
 		"cloneTemplateSourceVMInner",
 		"createBlankVMInner",
@@ -153,6 +155,8 @@ func TestEveryVMCloneBuilderAppliesVTPMPolicy(t *testing.T) {
 	}
 	sort.Strings(got)
 	want := []string{
+		"StartReplicaBuildCanary",
+		"StartReplicaBuildClone",
 		"cloneForHealthCheckInner",
 		"cloneTemplateSourceVMInner",
 		"startCloneVMInner",

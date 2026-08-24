@@ -61,6 +61,27 @@ func (q *Queries) ListTemplateSourceReplicas(
 	return replicas, rows.Err()
 }
 
+func (q *Queries) GetTemplateSourceReplica(
+	ctx context.Context,
+	templateID, replicaID uuid.UUID,
+) (*models.TemplateSourceReplica, error) {
+	var replica models.TemplateSourceReplica
+	err := scanTemplateSourceReplica(q.pool.QueryRow(ctx, `
+		SELECT id, template_id, source_vm_moref, compute_resource_type,
+		       compute_resource_moref, compute_resource_path, status,
+		       last_validated_at, last_validation_error, created_at, updated_at
+		FROM template_source_replicas
+		WHERE id = $1 AND template_id = $2
+	`, replicaID, templateID), &replica)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get template source replica: %w", err)
+	}
+	return &replica, nil
+}
+
 func (q *Queries) CreateTemplateSourceReplica(
 	ctx context.Context,
 	replica *models.TemplateSourceReplica,

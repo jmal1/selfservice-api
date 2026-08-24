@@ -784,6 +784,12 @@ func main() {
 				}); err != nil {
 					logger.Error("template reconcile failed", "error", err)
 				}
+				if err := prov.ReconcileTemplateReplicaBuildMetrics(
+					ctx,
+					templateReconcilerStaleThreshold,
+				); err != nil {
+					logger.Error("template replica build reconcile failed", "error", err)
+				}
 			case <-retryPendingTickerC:
 				if !elec.IsLeader() {
 					continue

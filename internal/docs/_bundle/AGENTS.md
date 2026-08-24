@@ -846,6 +846,54 @@ empty enabled configuration is visible. The resolver never
 crosses compute resources: source replica, target resource pool, and exact
 target host must share the same immutable compute identity.
 
+Retained source replicas for a new compute resource are built through
+`POST /api/v1/admin/templates/{templateID}/source-replica-builds`, not a
+one-shot govmomi helper. The instructor-gated request identifies a ready source
+replica, an idempotency key, destination name, and exact compute/host/pool/
+datastore/folder MoRefs plus matching paths/names. Build-target validation is
+intentionally independent of `VCENTER_HOSTS`, so a host outside the allowlist
+can receive this one retained build without becoming eligible for pod,
+template-staging, health, or any other normal placement. The service account is
+preflighted for the entity-scoped clone/create/delete/snapshot/advanced-config/
+pool/datastore privileges, including clone permission inherited by retained
+destinations, and `Cryptographer.Clone` only for vTPM sources. TLS
+uses the existing strict vCenter client; no build setting may weaken it.
+
+`template_source_replica_builds` and its job form a durable, claim-fenced state
+machine. Immutable inputs and a prepared/submitting phase are committed before
+each vCenter call. Clone, snapshot, linked-clone canary, canary cleanup, and
+residue-cleanup task MoRefs are reconciled after timeout, restart, or failover;
+an armed operation is never blindly resubmitted. Objects are adopted or deleted
+only by exact MoRef plus the build, operation, and kind markers. Name collisions,
+marker mismatch, or ambiguous lineage fail closed. Operator recovery is limited
+to status, phase-aware retry, and exact cleanup; there is no broad delete.
+
+The retained VM is a powered-off full clone of the ready source anchor's
+`base-image` snapshot with
+`moveAllDiskBackingsAndDisallowSharing`, the exact requested destination, and
+the shared vTPM clone policy (`replace` when the source has a vTPM). Validation
+requires exact source snapshot and destination inventory identity, powered-off
+state, no pre-seal destination snapshot, firmware/Secure Boot/vTPM-count/
+security-provider parity, a non-empty configuration key, independent persistent
+disks with no parent or source backing reuse, no connected or retained ISO, and
+distinct public EK certificate/CSR hash sets for vTPM sources. Config-key
+uniqueness is deliberately not required and the operation does not rekey.
+
+After creating the retained `base-image` snapshot, acceptance creates but never
+boots a linked clone on the configured provisioning datastore, verifies each
+disk has an exact parent in the retained backing chain, and exactly destroys and
+reconciles the marked canary. The destination replica remains `pending` or
+`unhealthy` until cleanup is proven absent. One final transaction rechecks the
+compatible ready source anchor and then promotes the destination replica and
+build together. This proves cloneability only; it does not claim guest/L1
+health. Metrics are
+`crucible_template_replica_build_total`,
+`crucible_template_replica_build_duration_seconds_{sum,count}`,
+`crucible_template_replica_build_phase`,
+`crucible_template_replica_build_stuck`, and the last-success/failure
+timestamps. The alert/runbook contract is in
+`docs/instructor/templates.md#durable-retained-replica-builds`.
+
 For a pod create, the worker resolves every VM's complete source/compute/pool/
 host plan and commits the complete set to `vm_placements` before the first
 standard-switch mutation. A partial durable plan fails closed. Retries reuse

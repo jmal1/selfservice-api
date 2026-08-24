@@ -945,6 +945,7 @@ const claimJobSQL = `
 		      'template_verify',
 		      'template_revalidate',
 		      'template_health_confirm',
+		      'template_replica_build',
 		      'image_import'
 		    )
 		    OR (
@@ -956,6 +957,7 @@ const claimJobSQL = `
 		        'template_verify',
 		        'template_revalidate',
 		        'template_health_confirm',
+		        'template_replica_build',
 		        'image_import'
 		      )
 		      AND payload->>'cleanup_only' = 'true'
@@ -1004,7 +1006,11 @@ func (q *Queries) UpdateJobStatus(
 			claimed_at = CASE WHEN $2 = 'in_progress' THEN now() ELSE claimed_at END
 		WHERE id = $1
 		  AND claimed_by = $4
-		  AND NOT ($2 = 'completed' AND COALESCE(payload->>'cleanup_only', 'false') = 'true')
+		  AND NOT (
+			$2 = 'completed'
+			AND COALESCE(payload->>'cleanup_only', 'false') = 'true'
+			AND type <> 'template_replica_build'
+		  )
 		  AND (
 		    ($2 = 'in_progress' AND status = 'claimed')
 		    OR ($2 IN ('completed', 'failed', 'rollback') AND status = 'in_progress')
