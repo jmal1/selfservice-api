@@ -62,11 +62,12 @@ adopts a same-name VM without matching ownership proof. The exact resulting VM
 MoRef is then staged before any reconfiguration. Cleanup never resolves a VM by
 display name and never resumes forward configuration, power-on, or snapshots.
 
-Clone task waits have a 15-minute operational deadline. An armed submission
-whose persisted task wait or post-clone placement/configuration step fails
-transiently resumes that same task or exact clone within the job's forward retry
-budget; it never submits another clone. Exhaustion or a proven terminal
-condition switches the operation to cleanup-only compensation. An armed submission
+Clone task waits have a 15-minute operational deadline. A transient persisted
+task wait before clone acceptance resumes that same task within the job's
+forward retry budget; it never submits another clone. Once the exact VM is
+accepted and staged, placement validation or configuration failure switches
+immediately to cleanup-only compensation. Recovery destroys the exact marked VM
+and cannot replay VLAN, interface, DHCP, firewall, portgroup, or clone setup. An armed submission
 with no task reference and no discoverable marked VM remains cleanup-only for
 30 minutes, then surfaces `manual_cleanup_required` for operator resolution
 rather than retrying or cloning indefinitely. Pod creation keeps exact clone
@@ -143,7 +144,11 @@ compute resource, and override before later forward operations. A missing
 override, enabled override, or moved VM is placement drift and the operation
 fails closed. Inspect `crucible_vm_placement_drift_total{kind=...}` and the
 worker error; restore the exact placement/control only after confirming the VM
-identity. A timeout, connection error, or failed vCenter property read is not
+identity. Before networking or cloning, the worker checks
+`Host.Inventory.EditCluster` on every selected `ClusterComputeResource`.
+Grant this privilege to the Crucible service account on the selected cluster
+with the narrowest practical scope; do not remove the DRS override to bypass a
+permission failure. A timeout, connection error, or failed vCenter property read is not
 proof of drift and remains eligible for normal job retry instead of being
 terminalized as manual cleanup. Destructive clone cleanup also compares the
 live resource pool and durable source, replica, template, pod-VM, compute, pool,
@@ -215,9 +220,17 @@ for API payloads, privilege requirements, metrics, and alert rules.
 
 ### "Durable port group ownership cannot be proven"
 
-Destroy never guesses which host portgroups a pod owns. A missing, malformed,
-legacy receipt without immutable host identities, or receipt naming a host
-outside the current `VCENTER_HOSTS` allowlist makes the destroy job report
+Destroy never guesses which host portgroups a pod owns. The worker persists an
+independent per-pod ledger before switch mutation and captures each exact
+`HostPortGroup.Key` before the receipt becomes active. Monotonic `planned`,
+`applying`, and `active` states prove whether mutation was authorized; a
+keyless `applying` receipt with no matching group is intentionally ambiguous.
+Successful rollback records a durable
+`removed` tombstone that survives rollback-step checkpointing and makes a later
+destroy idempotent. A changed key, name, VLAN, `vSwitch0`, or inherited security
+policy; a missing or malformed receipt; a legacy receipt without immutable host
+identities; or a receipt naming a host outside the current `VCENTER_HOSTS`
+allowlist makes the destroy job report
 `manual_cleanup_required`. The pod remains `destroy_failed`, and its
 VLAN/interface allocation remains reserved so the VLAN cannot be reused while a
 portgroup may still exist.
