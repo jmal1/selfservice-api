@@ -167,6 +167,52 @@ Placement diagnostics are exported as:
 | `crucible_vm_placement_rejections_total{reason}` | Failed placement decisions, including `reserved_headroom`. |
 | `crucible_vm_placement_drift_total{kind}` | Refused operations after `host`, `compute`, or `drs` drift. |
 
+### "Template replica build is stuck or requires cleanup"
+
+Read the durable operation first:
+
+```http
+GET /api/v1/admin/templates/{templateID}/source-replica-builds/{buildID}
+```
+
+Correlate `phase`, task MoRefs, exact VM MoRefs, `last_error_code`, and
+`last_error` with vCenter task history and the current worker claim. A timeout
+after a `*_submitting` phase is not proof of failure: the worker searches for
+the exact build/operation/kind marker before deciding whether a task was
+accepted. Do not enqueue a new idempotency key or clone by hand while that
+lineage is unresolved.
+
+Use `/retry` only for `status=failed`; it resumes the stored forward-only
+`resume_phase`. Cleanup failures do not replace that checkpoint. Use `/cleanup`
+for failed or `cleanup_required` operations only after confirming the stored
+ownership. The same endpoint retires a `ready` build: it rejects placement
+references and non-retired downstream builds that use the result as an anchor,
+requires the distinct source anchor to remain ready, disables the result replica
+for new placement, and destroys only the marker-owned result VM. The source
+anchor is never destroyed. A duplicate recovery request returns `409` while the
+linked job remains active. Template deletion also returns `409` if a build is
+admitted or restarted before the deletion lock is acquired; neither operation
+can race the subsequent vCenter destroy. Fully cleaned failed downstream builds
+release historical anchor references automatically; an uncleaned build remains
+a hard conflict. Forward retry returns `409` if its exact source anchor is no
+longer ready.
+
+Cleanup verifies the exact MoRef and all operation markers before deletion. If a
+destroy response is lost, a successor revalidates that exact identity and may
+safely resubmit only the destroy; clone, snapshot, and linked-clone creation
+remain never-resubmit operations. A same-name VM, missing marker, duplicate
+marker, or property read failure must be escalated rather than
+deleted. `ready` is impossible until the linked-clone canary cleanup timestamp is
+persisted and no marked canary residue remains.
+
+After exact retained cleanup, the build reloads with `phase=residue_cleaned`,
+`residue_cleaned_at` set, and no result-replica reservation. Start a new build
+with a new idempotency key to retry that compute. Do not edit replica rows
+manually.
+
+See [Durable retained replica builds](templates.md#durable-retained-replica-builds)
+for API payloads, privilege requirements, metrics, and alert rules.
+
 ### "Durable port group ownership cannot be proven"
 
 Destroy never guesses which host portgroups a pod owns. A missing, malformed,

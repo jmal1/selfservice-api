@@ -61,6 +61,27 @@ func (q *Queries) ListTemplateSourceReplicas(
 	return replicas, rows.Err()
 }
 
+func (q *Queries) GetTemplateSourceReplica(
+	ctx context.Context,
+	templateID, replicaID uuid.UUID,
+) (*models.TemplateSourceReplica, error) {
+	var replica models.TemplateSourceReplica
+	err := scanTemplateSourceReplica(q.pool.QueryRow(ctx, `
+		SELECT id, template_id, source_vm_moref, compute_resource_type,
+		       compute_resource_moref, compute_resource_path, status,
+		       last_validated_at, last_validation_error, created_at, updated_at
+		FROM template_source_replicas
+		WHERE id = $1 AND template_id = $2
+	`, replicaID, templateID), &replica)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get template source replica: %w", err)
+	}
+	return &replica, nil
+}
+
 func (q *Queries) CreateTemplateSourceReplica(
 	ctx context.Context,
 	replica *models.TemplateSourceReplica,
@@ -129,12 +150,72 @@ func (q *Queries) DeleteTemplateSourceReplica(
 	ctx context.Context,
 	templateID, replicaID uuid.UUID,
 ) (bool, error) {
-	tag, err := q.pool.Exec(ctx, `
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var unsafeBuildID uuid.UUID
+	err = tx.QueryRow(ctx, `
+		SELECT id
+		FROM template_source_replica_builds
+		WHERE (source_replica_id = $1 OR result_replica_id = $1)
+		  AND NOT (
+			status = 'retired'
+			OR (
+				status = 'failed'
+				AND result_replica_id IS NULL
+				AND (destination_vm_moref = '' OR residue_cleaned_at IS NOT NULL)
+			)
+		  )
+		LIMIT 1
+		FOR UPDATE
+	`, replicaID).Scan(&unsafeBuildID)
+	if err == nil {
+		return false, fmt.Errorf(
+			"%w: source replica is owned by build %s",
+			ErrTemplateReplicaBuildConflict,
+			unsafeBuildID,
+		)
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return false, fmt.Errorf("check source replica build ownership: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE template_source_replica_builds
+		SET source_replica_id = NULL
+		WHERE source_replica_id = $1
+		  AND (
+			status = 'retired'
+			OR (
+				status = 'failed'
+				AND result_replica_id IS NULL
+				AND (destination_vm_moref = '' OR residue_cleaned_at IS NOT NULL)
+			)
+		  )
+	`, replicaID); err != nil {
+		return false, fmt.Errorf("release terminal build source reference: %w", err)
+	}
+	var lockedID uuid.UUID
+	if err := tx.QueryRow(ctx, `
+		SELECT id
+		FROM template_source_replicas
+		WHERE id = $1 AND template_id = $2
+		FOR UPDATE
+	`, replicaID, templateID).Scan(&lockedID); errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	} else if err != nil {
+		return false, fmt.Errorf("lock template source replica for delete: %w", err)
+	}
+	tag, err := tx.Exec(ctx, `
 		DELETE FROM template_source_replicas
 		WHERE id = $1 AND template_id = $2
 	`, replicaID, templateID)
 	if err != nil {
 		return false, fmt.Errorf("delete template source replica: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
 	}
 	return tag.RowsAffected() == 1, nil
 }
@@ -452,28 +533,28 @@ func validateVMPlacementReferences(
 	}
 
 	if placement.SourceReplicaID != nil {
-		var replicaMatches bool
-		if err := tx.QueryRow(ctx, `
-			SELECT EXISTS (
-				SELECT 1
-				FROM template_source_replicas
-				WHERE id = $1
-				  AND template_id = $2
-				  AND source_vm_moref = $3
-				  AND compute_resource_type = $4
-				  AND compute_resource_moref = $5
-				  AND status = 'ready'
-			)
+		var replicaID uuid.UUID
+		err := tx.QueryRow(ctx, `
+			SELECT id
+			FROM template_source_replicas
+			WHERE id = $1
+			  AND template_id = $2
+			  AND source_vm_moref = $3
+			  AND compute_resource_type = $4
+			  AND compute_resource_moref = $5
+			  AND status = 'ready'
+			FOR KEY SHARE
 		`, *placement.SourceReplicaID, placement.TemplateID, placement.SourceRef,
-			placement.ComputeResourceType, placement.ComputeResourceMoref).Scan(&replicaMatches); err != nil {
-			return err
-		}
-		if !replicaMatches {
+			placement.ComputeResourceType, placement.ComputeResourceMoref).Scan(&replicaID)
+		if errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf(
 				"source replica %s is not a ready immutable source for template %s",
 				*placement.SourceReplicaID,
 				placement.TemplateID,
 			)
+		}
+		if err != nil {
+			return err
 		}
 		return nil
 	}

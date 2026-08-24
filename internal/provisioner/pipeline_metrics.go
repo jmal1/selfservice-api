@@ -90,6 +90,15 @@ type PipelineMetrics struct {
 	vmPlacementHeadroomMB map[string]float64 // host
 	vmPlacementDrift      map[string]float64 // kind
 	vmPlacementRejections map[string]float64 // reason
+
+	templateReplicaBuildTotal       map[string]float64 // result
+	templateReplicaBuildDurSum      map[string]float64 // result
+	templateReplicaBuildDurCount    map[string]float64 // result
+	templateReplicaBuildPhases      map[string]float64 // phase
+	templateReplicaBuildLastSuccess float64
+	templateReplicaBuildLastFailure float64
+	templateReplicaBuildsStuck      float64
+	templateReplicaBuildsCollected  bool
 }
 
 // NewPipelineMetrics returns an initialized collector. baseURL may be
@@ -100,27 +109,31 @@ func NewPipelineMetrics(baseURL, job string, grouping map[string]string) *Pipeli
 		job = "crucible_pipeline"
 	}
 	return &PipelineMetrics{
-		BaseURL:               baseURL,
-		Job:                   job,
-		GroupingLabels:        grouping,
-		imageUploadTotal:      map[string]float64{},
-		imageImportTotal:      map[string]float64{},
-		imageImportDurSum:     map[string]float64{},
-		imageImportDurCount:   map[string]float64{},
-		imageImportBytes:      map[string]float64{},
-		templateTransitions:   map[string]float64{},
-		templateVerify:        map[string]float64{},
-		templateJobDurSum:     map[string]float64{},
-		templateJobDurCount:   map[string]float64{},
-		templateStates:        map[string]float64{},
-		jobRetries:            map[string]float64{},
-		jobRetryExhausted:     map[string]float64{},
-		templateValidation:    map[string]float64{},
-		templateLastValidated: map[string]float64{},
-		vmPlacementTotal:      map[string]float64{},
-		vmPlacementHeadroomMB: map[string]float64{},
-		vmPlacementDrift:      map[string]float64{},
-		vmPlacementRejections: map[string]float64{},
+		BaseURL:                      baseURL,
+		Job:                          job,
+		GroupingLabels:               grouping,
+		imageUploadTotal:             map[string]float64{},
+		imageImportTotal:             map[string]float64{},
+		imageImportDurSum:            map[string]float64{},
+		imageImportDurCount:          map[string]float64{},
+		imageImportBytes:             map[string]float64{},
+		templateTransitions:          map[string]float64{},
+		templateVerify:               map[string]float64{},
+		templateJobDurSum:            map[string]float64{},
+		templateJobDurCount:          map[string]float64{},
+		templateStates:               map[string]float64{},
+		jobRetries:                   map[string]float64{},
+		jobRetryExhausted:            map[string]float64{},
+		templateValidation:           map[string]float64{},
+		templateLastValidated:        map[string]float64{},
+		vmPlacementTotal:             map[string]float64{},
+		vmPlacementHeadroomMB:        map[string]float64{},
+		vmPlacementDrift:             map[string]float64{},
+		vmPlacementRejections:        map[string]float64{},
+		templateReplicaBuildTotal:    map[string]float64{},
+		templateReplicaBuildDurSum:   map[string]float64{},
+		templateReplicaBuildDurCount: map[string]float64{},
+		templateReplicaBuildPhases:   map[string]float64{},
 	}
 }
 
@@ -254,6 +267,37 @@ func (m *PipelineMetrics) RecordVMPlacement(host, compute, source string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.vmPlacementTotal[host+"|"+compute+"|"+source]++
+}
+
+func (m *PipelineMetrics) RecordTemplateReplicaBuild(result string, d time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.templateReplicaBuildTotal[result]++
+	m.templateReplicaBuildDurSum[result] += d.Seconds()
+	m.templateReplicaBuildDurCount[result]++
+	now := float64(time.Now().Unix())
+	if result == MetricResultSuccess {
+		m.templateReplicaBuildLastSuccess = now
+	} else {
+		m.templateReplicaBuildLastFailure = now
+	}
+}
+
+func (m *PipelineMetrics) SetTemplateReplicaBuildPhases(counts map[string]int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.templateReplicaBuildPhases = make(map[string]float64, len(counts))
+	for phase, count := range counts {
+		m.templateReplicaBuildPhases[phase] = float64(count)
+	}
+	m.templateReplicaBuildsCollected = true
+}
+
+func (m *PipelineMetrics) SetTemplateReplicaBuildsStuck(count int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.templateReplicaBuildsStuck = float64(count)
+	m.templateReplicaBuildsCollected = true
 }
 
 func (m *PipelineMetrics) SetVMPlacementHeadroom(host string, megabytes int64) {
@@ -403,6 +447,30 @@ func (m *PipelineMetrics) serialize() []byte {
 	writeCounter1(&b, "crucible_vm_placement_rejections_total",
 		"Rejected VM placements by reason.",
 		"reason", m.vmPlacementRejections)
+
+	writeCounter1(&b, "crucible_template_replica_build_total",
+		"Retained template source replica build outcomes.",
+		"result", m.templateReplicaBuildTotal)
+	writeCounter1(&b, "crucible_template_replica_build_duration_seconds_sum",
+		"Cumulative wall-clock seconds spent in retained replica builds.",
+		"result", m.templateReplicaBuildDurSum)
+	writeCounter1(&b, "crucible_template_replica_build_duration_seconds_count",
+		"Completed retained replica builds by result.",
+		"result", m.templateReplicaBuildDurCount)
+	if m.templateReplicaBuildsCollected {
+		writeGauge1(&b, "crucible_template_replica_build_phase",
+			"Current retained replica build operations by durable phase.",
+			"phase", m.templateReplicaBuildPhases)
+		b.WriteString("# HELP crucible_template_replica_build_stuck Retained replica build operations with no durable phase update past the staleness threshold.\n")
+		b.WriteString("# TYPE crucible_template_replica_build_stuck gauge\n")
+		fmt.Fprintf(&b, "crucible_template_replica_build_stuck %g\n", m.templateReplicaBuildsStuck)
+	}
+	b.WriteString("# HELP crucible_template_replica_build_last_success_timestamp_seconds Unix time of the latest successful retained replica build.\n")
+	b.WriteString("# TYPE crucible_template_replica_build_last_success_timestamp_seconds gauge\n")
+	fmt.Fprintf(&b, "crucible_template_replica_build_last_success_timestamp_seconds %g\n", m.templateReplicaBuildLastSuccess)
+	b.WriteString("# HELP crucible_template_replica_build_last_failure_timestamp_seconds Unix time of the latest failed retained replica build attempt.\n")
+	b.WriteString("# TYPE crucible_template_replica_build_last_failure_timestamp_seconds gauge\n")
+	fmt.Fprintf(&b, "crucible_template_replica_build_last_failure_timestamp_seconds %g\n", m.templateReplicaBuildLastFailure)
 
 	b.WriteString("# HELP crucible_pipeline_run_timestamp_seconds Unix time of the latest pipeline metrics push.\n")
 	b.WriteString("# TYPE crucible_pipeline_run_timestamp_seconds gauge\n")

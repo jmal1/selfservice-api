@@ -138,7 +138,7 @@ func ClassifyError(err error, jobType string) (retryable bool, reason string) {
 	// -----------------------------------------------------------------------
 	if strings.Contains(s, "virtual disk is either corrupted or not a supported format") {
 		switch jobType {
-		case "template_provision", "pod_create", "vm_add":
+		case "template_provision", "template_replica_build", "pod_create", "vm_add":
 			return true, RetryReasonTransientClone
 		}
 		// Not from a clone job — don't assume it's transient.

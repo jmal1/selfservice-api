@@ -1509,6 +1509,17 @@ func (h *Handler) AdminDeleteTemplate(w http.ResponseWriter, r *http.Request) {
 		respondError(w, r, http.StatusBadRequest, "invalid template id")
 		return
 	}
+	unsafeReplicaBuild, err := h.db.HasUnsafeTemplateReplicaBuildForDeletion(r.Context(), templateID)
+	if err != nil {
+		h.logger.Error("delete template: check unsafe replica builds failed", "error", err, "template_id", templateID)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if unsafeReplicaBuild {
+		respondError(w, r, http.StatusConflict,
+			"template has an active, accepted, or not-fully-cleaned source replica build")
+		return
+	}
 
 	tmpl, err := h.db.GetTemplateByID(r.Context(), templateID)
 	if err != nil {
@@ -1552,36 +1563,63 @@ func (h *Handler) AdminDeleteTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if tmpl.VCenterVMID != "" {
-		if h.vc == nil {
-			// Production always wires vc; this branch protects test/dev
-			// configs from silently orphaning VMs.
-			h.logger.Warn("template delete: vCenter client not configured, leaving VM in place",
-				"template_id", tmpl.ID, "moref", tmpl.VCenterVMID)
-		} else {
-			if err := h.vc.DestroyVM(r.Context(), tmpl.VCenterVMID); err != nil {
-				h.logger.Error("template delete: destroy staging VM failed",
-					"template_id", tmpl.ID, "moref", tmpl.VCenterVMID, "error", err)
-				audit.Log(r.Context(), h.db, "template.delete_failed",
-					audit.Resource("template", tmpl.ID),
-					audit.IP(r.RemoteAddr),
-					audit.Detail("moref", tmpl.VCenterVMID),
-					audit.Detail("error", err.Error()),
-				)
-				// 502: an upstream system (vCenter) failed. The DB row
-				// is preserved so the operator can retry.
-				respondError(w, r, http.StatusBadGateway, "failed to destroy staging VM in vCenter: "+err.Error())
-				return
+	var (
+		destroyErr error
+		destroyed  bool
+	)
+	err = h.db.WithTemplateReplicaBuildLifecycleLock(
+		r.Context(),
+		templateID,
+		func(lockCtx context.Context) error {
+			unsafe, err := h.db.HasUnsafeTemplateReplicaBuildForDeletion(lockCtx, templateID)
+			if err != nil {
+				return err
 			}
-			h.logger.Info("template delete: destroyed staging VM",
-				"template_id", tmpl.ID, "moref", tmpl.VCenterVMID)
-		}
+			if unsafe {
+				return database.ErrTemplateReplicaBuildConflict
+			}
+			if tmpl.VCenterVMID != "" {
+				if h.vc == nil {
+					// Production always wires vc; this branch protects test/dev
+					// configs from silently orphaning VMs.
+					h.logger.Warn("template delete: vCenter client not configured, leaving VM in place",
+						"template_id", tmpl.ID, "moref", tmpl.VCenterVMID)
+				} else {
+					if err := h.vc.DestroyVM(lockCtx, tmpl.VCenterVMID); err != nil {
+						destroyErr = err
+						return err
+					}
+					destroyed = true
+				}
+			}
+			return h.db.DeleteTemplateWithHistory(lockCtx, templateID)
+		},
+	)
+	if errors.Is(err, database.ErrTemplateReplicaBuildConflict) {
+		respondError(w, r, http.StatusConflict,
+			"template has an active, accepted, or not-fully-cleaned source replica build")
+		return
 	}
-
-	if err := h.db.DeleteTemplateWithHistory(r.Context(), templateID); err != nil {
+	if destroyErr != nil {
+		h.logger.Error("template delete: destroy staging VM failed",
+			"template_id", tmpl.ID, "moref", tmpl.VCenterVMID, "error", destroyErr)
+		audit.Log(r.Context(), h.db, "template.delete_failed",
+			audit.Resource("template", tmpl.ID),
+			audit.IP(r.RemoteAddr),
+			audit.Detail("moref", tmpl.VCenterVMID),
+			audit.Detail("error", destroyErr.Error()),
+		)
+		respondError(w, r, http.StatusBadGateway, "failed to destroy staging VM in vCenter: "+destroyErr.Error())
+		return
+	}
+	if err != nil {
 		h.logger.Error("delete template failed", "error", err, "template_id", templateID)
 		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
+	}
+	if destroyed {
+		h.logger.Info("template delete: destroyed staging VM",
+			"template_id", tmpl.ID, "moref", tmpl.VCenterVMID)
 	}
 
 	audit.Log(r.Context(), h.db, "template.delete",

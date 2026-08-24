@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/models"
 	"github.com/jmal1/selfservice-api/internal/vcenter"
 )
@@ -188,6 +189,33 @@ func TestHandleJobOutcome_RetryableReturnsPending(t *testing.T) {
 	key := "template_provision|" + RetryReasonTransientClone
 	if m.jobRetries[key] == 0 {
 		t.Errorf("crucible_job_retries_total[%s] not incremented", key)
+	}
+}
+
+func TestHandleJobOutcome_ObsoleteReplicaCleanupTerminatesWithoutRetry(t *testing.T) {
+	db := &fakeJobDB{}
+	job := &models.Job{
+		ID:         uuid.New(),
+		Type:       models.JobTypeTemplateReplicaBuild,
+		Payload:    []byte(`{"cleanup_only":true}`),
+		RetryCount: 41,
+		MaxRetries: 20,
+	}
+	obsolete := fmt.Errorf(
+		"%w: displaced cleanup job",
+		database.ErrTemplateReplicaBuildJobObsolete,
+	)
+
+	result := runLifecycle(context.Background(), db, NewPipelineMetrics("", "", nil), job, obsolete)
+	if !errors.Is(result, database.ErrTemplateReplicaBuildJobObsolete) {
+		t.Fatalf("obsolete cleanup result=%v", result)
+	}
+	if db.retryCalls != 0 || len(db.retried) != 0 {
+		t.Fatalf("obsolete cleanup retry calls=%d records=%d, want none", db.retryCalls, len(db.retried))
+	}
+	failed := db.statusesWithStatus(models.JobStatusFailed)
+	if len(failed) != 1 {
+		t.Fatalf("obsolete cleanup failed status writes=%d, want 1", len(failed))
 	}
 }
 

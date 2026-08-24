@@ -441,6 +441,36 @@ func (q *Queries) DeleteTemplateWithHistory(ctx context.Context, id uuid.UUID) e
 	}
 	defer tx.Rollback(ctx)
 
+	var lockedID uuid.UUID
+	if err := tx.QueryRow(ctx, `
+		SELECT id
+		FROM templates
+		WHERE id = $1
+		FOR UPDATE
+	`, id).Scan(&lockedID); errors.Is(err, pgx.ErrNoRows) {
+		return tx.Commit(ctx)
+	} else if err != nil {
+		return fmt.Errorf("lock template for delete: %w", err)
+	}
+	var unsafeReplicaBuild bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM template_source_replica_builds
+			WHERE template_id = $1
+			  AND (
+				status IN ('pending', 'running', 'cleanup_required', 'ready', 'retiring')
+				OR (destination_vm_moref <> '' AND residue_cleaned_at IS NULL)
+				OR result_replica_id IS NOT NULL
+			  )
+		)
+	`, id).Scan(&unsafeReplicaBuild); err != nil {
+		return fmt.Errorf("recheck replica builds before template delete: %w", err)
+	}
+	if unsafeReplicaBuild {
+		return ErrTemplateReplicaBuildConflict
+	}
+
 	if _, err := tx.Exec(ctx, "DELETE FROM pod_vms WHERE template_id = $1", id); err != nil {
 		return fmt.Errorf("delete pod_vms history: %w", err)
 	}
@@ -945,6 +975,7 @@ const claimJobSQL = `
 		      'template_verify',
 		      'template_revalidate',
 		      'template_health_confirm',
+		      'template_replica_build',
 		      'image_import'
 		    )
 		    OR (
@@ -956,6 +987,7 @@ const claimJobSQL = `
 		        'template_verify',
 		        'template_revalidate',
 		        'template_health_confirm',
+		        'template_replica_build',
 		        'image_import'
 		      )
 		      AND payload->>'cleanup_only' = 'true'
@@ -1004,7 +1036,11 @@ func (q *Queries) UpdateJobStatus(
 			claimed_at = CASE WHEN $2 = 'in_progress' THEN now() ELSE claimed_at END
 		WHERE id = $1
 		  AND claimed_by = $4
-		  AND NOT ($2 = 'completed' AND COALESCE(payload->>'cleanup_only', 'false') = 'true')
+		  AND NOT (
+			$2 = 'completed'
+			AND COALESCE(payload->>'cleanup_only', 'false') = 'true'
+			AND type <> 'template_replica_build'
+		  )
 		  AND (
 		    ($2 = 'in_progress' AND status = 'claimed')
 		    OR ($2 IN ('completed', 'failed', 'rollback') AND status = 'in_progress')

@@ -846,6 +846,81 @@ empty enabled configuration is visible. The resolver never
 crosses compute resources: source replica, target resource pool, and exact
 target host must share the same immutable compute identity.
 
+Retained source replicas for a new compute resource are built through
+`POST /api/v1/admin/templates/{templateID}/source-replica-builds`, not a
+one-shot govmomi helper. The instructor-gated request identifies a ready source
+replica, an idempotency key, destination name, and exact compute/host/pool/
+datastore/folder MoRefs plus matching paths/names. Build-target validation is
+intentionally independent of `VCENTER_HOSTS`, so a host outside the allowlist
+can receive this one retained build without becoming eligible for pod,
+template-staging, health, or any other normal placement. The service account is
+preflighted for the entity-scoped clone/create/delete/snapshot/advanced-config/
+pool/datastore privileges, including clone permission inherited by retained
+destinations, and `Cryptographer.Clone` only for vTPM sources. TLS
+uses the existing strict vCenter client; no build setting may weaken it.
+
+`template_source_replica_builds` and its job form a durable, claim-fenced state
+machine. Immutable inputs and a prepared/submitting phase are committed before
+each vCenter call. Clone, snapshot, linked-clone canary, canary cleanup, and
+residue-cleanup task MoRefs are reconciled after timeout, restart, or failover.
+Clone, snapshot, and linked-clone creation are never blindly resubmitted.
+Destroy submission is the narrow exception: a successor may safely resubmit it
+only after revalidating the exact MoRef plus build, operation, and kind markers.
+Name collisions, marker mismatch, or ambiguous lineage fail closed. Operator
+recovery is limited to status, phase-aware retry, exact cleanup, and
+operation-scoped retirement; there is no broad delete. `resume_phase` accepts
+only forward phases and cleanup failures never replace it. A second recovery
+request is rejected while the linked job remains pending or owned.
+
+The retained VM is a powered-off full clone of the ready source anchor's
+`base-image` snapshot with
+`moveAllDiskBackingsAndDisallowSharing`, the exact requested destination, and
+the shared vTPM clone policy (`replace` when the source has a vTPM). Validation
+requires exact source snapshot and destination inventory identity, powered-off
+state, no pre-seal destination snapshot, firmware/Secure Boot/vTPM-count/
+security-provider and encryption-state parity, independent persistent disks with
+no parent or source backing reuse, no connected or retained ISO, and distinct
+public EK certificate/CSR hash sets for vTPM sources. An unencrypted source must
+produce an unencrypted destination; an encrypted source requires a non-empty
+destination configuration key from the same provider. Config-key uniqueness is
+deliberately not required and the operation does not rekey.
+
+After creating the retained `base-image` snapshot, acceptance creates but never
+boots a linked clone on the configured provisioning datastore, verifies each
+disk has an exact parent in the retained backing chain, and exactly destroys and
+reconciles the marked canary. The destination replica remains `pending` or
+`unhealthy` until cleanup is proven absent. One final transaction rechecks the
+compatible ready source anchor and then promotes the destination replica and
+build together. This proves cloneability only; it does not claim guest/L1
+health. If a build never becomes ready, exact retained-VM cleanup atomically
+persists `residue_cleaned_at` and deletes only that build's non-ready replica
+reservation. A new idempotent build can then reuse the compute; the cleaned
+operation itself cannot resume forward work. Template deletion preflights all
+active, accepted, and not-fully-cleaned build ownership before any staging-VM
+destroy.
+
+The same exact-cleanup endpoint retires a successful `ready` build. Retirement
+first disables the result replica so new placement cannot select it, rejects
+every existing `vm_placements` reference or live downstream build that uses the
+result as its source anchor, and requires the original distinct source anchor
+to remain ready. It destroys only the exact result VM whose
+build/operation/kind markers match, reconciling a lost destroy response before
+safe exact resubmission. One transaction removes the result replica and records
+the build as `retired` only after vCenter absence is proven. The source anchor
+is never a retirement target, and retired history no longer restricts direct
+replica or template deletion. Template deletion and replica-build admission or
+restart share a per-template PostgreSQL advisory lock, and deletion rechecks
+build safety while holding it before any vCenter destroy. A failed downstream
+build releases its source reference only after it either never submitted a VM
+or persisted exact residue cleanup. A forward retry locks and revalidates its
+exact source as ready, so it cannot race an upstream retirement. Metrics are
+`crucible_template_replica_build_total`,
+`crucible_template_replica_build_duration_seconds_{sum,count}`,
+`crucible_template_replica_build_phase`,
+`crucible_template_replica_build_stuck`, and the last-success/failure
+timestamps. The alert/runbook contract is in
+`docs/instructor/templates.md#durable-retained-replica-builds`.
+
 For a pod create, the worker resolves every VM's complete source/compute/pool/
 host plan and commits the complete set to `vm_placements` before the first
 standard-switch mutation. A partial durable plan fails closed. Retries reuse

@@ -2,6 +2,7 @@ package vcenter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -15,23 +16,31 @@ import (
 )
 
 type clonePolicySaboteur struct {
-	next        soap.RoundTripper
-	sourceMoref string
-	injectVTPM  bool
-	wantPolicy  string
+	next       soap.RoundTripper
+	injectVTPM bool
+	wantPolicy string
 
-	mu       sync.Mutex
-	policies map[string]string
+	mu              sync.Mutex
+	hardwareSources map[string]struct{}
+	policies        map[string]string
+	encryption      map[string]*types.CryptoKeyId
 }
 
 func (s *clonePolicySaboteur) RoundTrip(ctx context.Context, req, res soap.HasFault) error {
-	if body, ok := req.(*methods.RetrievePropertiesExBody); ok &&
-		s.injectVTPM &&
-		requestsVMHardware(body.Req, s.sourceMoref) {
+	if body, ok := req.(*methods.RetrievePropertiesExBody); ok {
+		sourceMoref := ""
+		if s.injectVTPM {
+			sourceMoref = s.requestedHardwareSource(body.Req)
+		}
 		if err := s.next.RoundTrip(ctx, req, res); err != nil {
 			return err
 		}
-		return injectVirtualTPM(res, s.sourceMoref)
+		if sourceMoref != "" {
+			if err := injectVirtualTPM(res, sourceMoref); err != nil {
+				return err
+			}
+		}
+		return injectConfigEncryption(res, s.encryptionSnapshot())
 	}
 
 	if body, ok := req.(*methods.CloneVM_TaskBody); ok && body.Req != nil {
@@ -58,6 +67,11 @@ func (s *clonePolicySaboteur) RoundTrip(ctx context.Context, req, res soap.HasFa
 				return fmt.Errorf("clone %q unexpectedly changed the VM storage profile", body.Req.Name)
 			}
 		}
+		if strings.Contains(body.Req.Name, "-retained-replica") {
+			if err := validateSubmittedReplicaBuildSpec(body.Req); err != nil {
+				return err
+			}
+		}
 		s.mu.Lock()
 		s.policies[body.Req.Name] = got
 		s.mu.Unlock()
@@ -67,6 +81,92 @@ func (s *clonePolicySaboteur) RoundTrip(ctx context.Context, req, res soap.HasFa
 		body.Req.Spec.TpmProvisionPolicy = ""
 	}
 	return s.next.RoundTrip(ctx, req, res)
+}
+
+func (s *clonePolicySaboteur) requestedHardwareSource(req *types.RetrievePropertiesEx) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for sourceMoref := range s.hardwareSources {
+		if requestsVMHardware(req, sourceMoref) {
+			return sourceMoref
+		}
+	}
+	return ""
+}
+
+func (s *clonePolicySaboteur) addHardwareSource(moref string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.hardwareSources[moref] = struct{}{}
+}
+
+func (s *clonePolicySaboteur) setEncryption(moref, key, provider string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if key == "" && provider == "" {
+		s.encryption[moref] = nil
+		return
+	}
+	keyID := &types.CryptoKeyId{KeyId: key}
+	if provider != "" {
+		keyID.ProviderId = &types.KeyProviderId{Id: provider}
+	}
+	s.encryption[moref] = keyID
+}
+
+func (s *clonePolicySaboteur) encryptionSnapshot() map[string]*types.CryptoKeyId {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	snapshot := make(map[string]*types.CryptoKeyId, len(s.encryption))
+	for moref, keyID := range s.encryption {
+		if keyID == nil {
+			snapshot[moref] = nil
+			continue
+		}
+		copyKey := *keyID
+		if keyID.ProviderId != nil {
+			copyProvider := *keyID.ProviderId
+			copyKey.ProviderId = &copyProvider
+		}
+		snapshot[moref] = &copyKey
+	}
+	return snapshot
+}
+
+func validateSubmittedReplicaBuildSpec(req *types.CloneVM_Task) error {
+	if req.Spec.PowerOn || req.Spec.Template {
+		return fmt.Errorf("replica clone %q was not submitted as a powered-off VM", req.Name)
+	}
+	if req.Spec.Location.Host == nil || req.Spec.Location.Pool == nil ||
+		req.Spec.Location.Datastore == nil || req.Spec.Snapshot == nil {
+		return fmt.Errorf("replica clone %q omitted exact host, pool, datastore, or snapshot", req.Name)
+	}
+	if req.Spec.Config == nil {
+		return fmt.Errorf("replica clone %q omitted durable operation markers", req.Name)
+	}
+	markers := make(map[string]string)
+	for _, option := range req.Spec.Config.ExtraConfig {
+		value, ok := option.GetOptionValue().Value.(string)
+		if ok {
+			markers[option.GetOptionValue().Key] = value
+		}
+	}
+	if markers[ReplicaBuildMarkerKey] == "" || markers[CloneOperationIDKey] == "" {
+		return fmt.Errorf("replica clone %q omitted ownership markers: %v", req.Name, markers)
+	}
+	wantMove := string(types.VirtualMachineRelocateDiskMoveOptionsMoveAllDiskBackingsAndDisallowSharing)
+	wantKind := ReplicaBuildDestinationKind
+	if strings.HasSuffix(req.Name, "-canary") {
+		wantMove = string(types.VirtualMachineRelocateDiskMoveOptionsCreateNewChildDiskBacking)
+		wantKind = ReplicaBuildCanaryKind
+	}
+	if req.Spec.Location.DiskMoveType != wantMove {
+		return fmt.Errorf("replica clone %q disk move=%q, want %q", req.Name, req.Spec.Location.DiskMoveType, wantMove)
+	}
+	if markers[ReplicaBuildKindKey] != wantKind {
+		return fmt.Errorf("replica clone %q kind marker=%q, want %q", req.Name, markers[ReplicaBuildKindKey], wantKind)
+	}
+	return nil
 }
 
 func (s *clonePolicySaboteur) assertCloneNames(t *testing.T, names ...string) {
@@ -146,6 +246,39 @@ func injectVirtualTPM(res soap.HasFault, sourceMoref string) error {
 	return fmt.Errorf("source VM %s hardware property was not returned", sourceMoref)
 }
 
+func injectConfigEncryption(res soap.HasFault, encryption map[string]*types.CryptoKeyId) error {
+	if len(encryption) == 0 {
+		return nil
+	}
+	body, ok := res.(*methods.RetrievePropertiesExBody)
+	if !ok || body.Res == nil {
+		return fmt.Errorf("unexpected property response %T", res)
+	}
+	for objectIndex := range body.Res.Returnval.Objects {
+		object := &body.Res.Returnval.Objects[objectIndex]
+		keyID, configured := encryption[object.Obj.Value]
+		if !configured {
+			continue
+		}
+		for propertyIndex := range object.PropSet {
+			property := &object.PropSet[propertyIndex]
+			if property.Name != "config" {
+				continue
+			}
+			switch config := property.Val.(type) {
+			case types.VirtualMachineConfigInfo:
+				config.KeyId = keyID
+				property.Val = config
+			case *types.VirtualMachineConfigInfo:
+				config.KeyId = keyID
+			default:
+				return fmt.Errorf("unexpected config property type %T", property.Val)
+			}
+		}
+	}
+	return nil
+}
+
 func TestCloneBuildersApplyVTPMPolicyToSubmittedSpecs(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -173,14 +306,49 @@ func TestCloneBuildersApplyVTPMPolicyToSubmittedSpecs(t *testing.T) {
 				durableName := prefix + "-durable-clone"
 				templateName := prefix + "-template-stage"
 				healthName := "crucible-healthcheck-" + prefix
+				replicaName := prefix + "-retained-replica"
+				canaryName := prefix + "-retained-replica-canary"
+
+				powerState, err := source.PowerState(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if powerState != types.VirtualMachinePowerStatePoweredOff {
+					powerTask, err := source.PowerOff(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := powerTask.Wait(ctx); err != nil {
+						t.Fatal(err)
+					}
+				}
+				snapshotTask, err := source.CreateSnapshot(
+					ctx,
+					"base-image",
+					"clone policy test source",
+					false,
+					false,
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				snapshotResult, err := snapshotTask.WaitForResult(ctx, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				sourceSnapshot, ok := snapshotResult.Result.(types.ManagedObjectReference)
+				if !ok {
+					t.Fatalf("snapshot result=%T, want ManagedObjectReference", snapshotResult.Result)
+				}
 
 				original := c.client.RoundTripper
 				saboteur := &clonePolicySaboteur{
-					next:        original,
-					sourceMoref: source.Reference().Value,
-					injectVTPM:  tt.injectVTPM,
-					wantPolicy:  tt.wantPolicy,
-					policies:    make(map[string]string),
+					next:            original,
+					injectVTPM:      tt.injectVTPM,
+					wantPolicy:      tt.wantPolicy,
+					hardwareSources: map[string]struct{}{source.Reference().Value: {}},
+					policies:        make(map[string]string),
+					encryption:      make(map[string]*types.CryptoKeyId),
 				}
 				c.client.RoundTripper = saboteur
 				defer func() { c.client.RoundTripper = original }()
@@ -191,6 +359,213 @@ func TestCloneBuildersApplyVTPMPolicyToSubmittedSpecs(t *testing.T) {
 						destroySimulatorVM(t, ctx, c, moref)
 					}
 				}()
+
+				replicaTarget := simulatorReplicaBuildTarget(t, ctx, c, allowed)
+				replicaParams := ReplicaBuildCloneParams{
+					BuildID:             "11111111-1111-1111-1111-111111111111",
+					OperationID:         "22222222-2222-2222-2222-222222222222",
+					Kind:                ReplicaBuildDestinationKind,
+					TemplateID:          "33333333-3333-3333-3333-333333333333",
+					SourceReplicaID:     "44444444-4444-4444-4444-444444444444",
+					SourceVMMoref:       source.Reference().Value,
+					SourceSnapshotName:  "base-image",
+					SourceSnapshotMoref: sourceSnapshot.Value,
+					DestinationName:     replicaName,
+					Target:              replicaTarget,
+				}
+				replicaTask, replicaSourceSnapshot, err := c.StartReplicaBuildClone(
+					ctx,
+					replicaParams,
+					func(context.Context) error { return nil },
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if replicaSourceSnapshot != sourceSnapshot.Value {
+					t.Fatalf("replica source snapshot=%s, want %s", replicaSourceSnapshot, sourceSnapshot.Value)
+				}
+				replicaMoref, err := c.WaitReplicaBuildCloneTask(ctx, replicaTask)
+				if err != nil {
+					t.Fatal(err)
+				}
+				created = append(created, replicaMoref)
+				saboteur.addHardwareSource(replicaMoref)
+				// vcsim verifies but does not persist clone-time extraConfig.
+				// Reapply the already-asserted markers so snapshot/canary
+				// reconciliation can exercise the production ownership checks.
+				replicaVM := object.NewVirtualMachine(
+					c.client.Client,
+					types.ManagedObjectReference{Type: "VirtualMachine", Value: replicaMoref},
+				)
+				devices, err := replicaVM.Device(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var deviceChanges []types.BaseVirtualDeviceConfigSpec
+				for _, device := range devices.SelectByType((*types.VirtualCdrom)(nil)) {
+					cdrom := device.(*types.VirtualCdrom)
+					if cdrom.Connectable == nil {
+						cdrom.Connectable = &types.VirtualDeviceConnectInfo{}
+					}
+					cdrom.Connectable.Connected = false
+					cdrom.Connectable.StartConnected = false
+					deviceChanges = append(deviceChanges, &types.VirtualDeviceConfigSpec{
+						Operation: types.VirtualDeviceConfigSpecOperationEdit,
+						Device:    cdrom,
+					})
+				}
+				markerTask, err := replicaVM.Reconfigure(ctx, types.VirtualMachineConfigSpec{
+					ExtraConfig: replicaBuildExtraConfig(
+						"11111111-1111-1111-1111-111111111111",
+						"22222222-2222-2222-2222-222222222222",
+						ReplicaBuildDestinationKind,
+					),
+					DeviceChange: deviceChanges,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := markerTask.Wait(ctx); err != nil {
+					t.Fatal(err)
+				}
+				replicaParams.DestinationVMMoref = replicaMoref
+				if !tt.injectVTPM {
+					if err := c.ValidateReplicaBuildClone(ctx, replicaParams); err != nil {
+						t.Fatalf("production validation rejected unencrypted non-vTPM clone: %v", err)
+					}
+					saboteur.setEncryption(source.Reference().Value, "source-key", "provider-1")
+					saboteur.setEncryption(replicaMoref, "destination-key", "provider-1")
+					if err := c.ValidateReplicaBuildClone(ctx, replicaParams); err != nil {
+						t.Fatalf("production validation rejected matching encrypted clone: %v", err)
+					}
+					saboteur.setEncryption(replicaMoref, "", "")
+					if err := c.ValidateReplicaBuildClone(ctx, replicaParams); err == nil ||
+						!strings.Contains(err.Error(), "empty configuration encryption key") {
+						t.Fatalf("production validation missing destination key error=%v", err)
+					}
+					saboteur.setEncryption(replicaMoref, "", "provider-1")
+					if err := c.ValidateReplicaBuildClone(ctx, replicaParams); err == nil ||
+						!strings.Contains(err.Error(), "empty configuration encryption key") {
+						t.Fatalf("production validation empty destination key error=%v", err)
+					}
+					saboteur.setEncryption(replicaMoref, "destination-key", "provider-2")
+					if err := c.ValidateReplicaBuildClone(ctx, replicaParams); err == nil ||
+						!strings.Contains(err.Error(), "security provider") {
+						t.Fatalf("production validation provider drift error=%v", err)
+					}
+					saboteur.setEncryption(source.Reference().Value, "", "")
+					saboteur.setEncryption(replicaMoref, "unexpected-key", "provider-1")
+					if err := c.ValidateReplicaBuildClone(ctx, replicaParams); err == nil ||
+						!strings.Contains(err.Error(), "unexpectedly encrypted") {
+						t.Fatalf("production validation unencrypted drift error=%v", err)
+					}
+					saboteur.setEncryption(replicaMoref, "", "")
+				}
+				replicaSnapshotTask, err := c.StartReplicaBuildSnapshot(
+					ctx,
+					replicaMoref,
+					"11111111-1111-1111-1111-111111111111",
+					"22222222-2222-2222-2222-222222222222",
+					"base-image",
+					func(context.Context) error { return nil },
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				replicaSnapshot, err := c.WaitReplicaBuildSnapshotTask(ctx, replicaSnapshotTask)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				canaryParams := ReplicaBuildCloneParams{
+					BuildID:               "11111111-1111-1111-1111-111111111111",
+					OperationID:           "55555555-5555-5555-5555-555555555555",
+					SourceOperationID:     "22222222-2222-2222-2222-222222222222",
+					Kind:                  ReplicaBuildCanaryKind,
+					TemplateID:            "33333333-3333-3333-3333-333333333333",
+					SourceReplicaID:       "44444444-4444-4444-4444-444444444444",
+					SourceVMMoref:         replicaMoref,
+					DestinationVMMoref:    replicaMoref,
+					DestinationSnapshot:   replicaSnapshot,
+					DestinationName:       canaryName,
+					Target:                replicaTarget,
+					UseProvisionDatastore: true,
+				}
+				canaryTask, err := c.StartReplicaBuildCanary(
+					ctx,
+					canaryParams,
+					func(context.Context) error { return nil },
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				canaryMoref, err := c.WaitReplicaBuildCloneTask(ctx, canaryTask)
+				if err != nil {
+					t.Fatal(err)
+				}
+				created = append(created, canaryMoref)
+				canaryVM := object.NewVirtualMachine(
+					c.client.Client,
+					types.ManagedObjectReference{Type: "VirtualMachine", Value: canaryMoref},
+				)
+				canaryMarkerTask, err := canaryVM.Reconfigure(ctx, types.VirtualMachineConfigSpec{
+					ExtraConfig: replicaBuildExtraConfig(
+						canaryParams.BuildID,
+						canaryParams.OperationID,
+						ReplicaBuildCanaryKind,
+					),
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := canaryMarkerTask.Wait(ctx); err != nil {
+					t.Fatal(err)
+				}
+				canaryParams.DestinationVMMoref = canaryMoref
+				assertVMOnHost(t, ctx, c, canaryMoref, allowed.MoRef)
+				if _, _, err := c.StartReplicaBuildCanaryCleanup(
+					ctx,
+					canaryMoref,
+					canaryParams.BuildID,
+					"wrong-operation-id",
+					func(context.Context) error { return nil },
+				); err == nil || !errors.Is(err, ErrReplicaBuildAmbiguous) {
+					t.Fatalf("marker-mismatched canary cleanup error=%v, want ambiguity", err)
+				}
+				cleanupTask, alreadyGone, err := c.StartReplicaBuildCanaryCleanup(
+					ctx,
+					canaryMoref,
+					canaryParams.BuildID,
+					canaryParams.OperationID,
+					func(context.Context) error { return nil },
+				)
+				if err != nil || alreadyGone {
+					t.Fatalf("exact canary cleanup task=%s alreadyGone=%t error=%v", cleanupTask, alreadyGone, err)
+				}
+				if err := c.WaitReplicaBuildCleanupTask(ctx, cleanupTask); err != nil {
+					t.Fatal(err)
+				}
+				created = created[:len(created)-1]
+				if exists, err := c.ReplicaBuildCanaryExists(ctx, canaryParams); err != nil || exists {
+					t.Fatalf("canary residue exists=%t error=%v after exact cleanup", exists, err)
+				}
+				if _, _, err := c.StartReplicaBuildResidueCleanup(
+					ctx,
+					replicaMoref,
+					canaryParams.BuildID,
+					"wrong-operation-id",
+					func(context.Context) error { return nil },
+				); err == nil || !errors.Is(err, ErrReplicaBuildAmbiguous) {
+					t.Fatalf("marker-mismatched retained cleanup error=%v, want ambiguity", err)
+				}
+				retainedParams := ReplicaBuildCloneParams{
+					BuildID:            canaryParams.BuildID,
+					OperationID:        canaryParams.SourceOperationID,
+					DestinationVMMoref: replicaMoref,
+				}
+				if exists, err := c.ReplicaBuildRetainedVMExists(ctx, retainedParams); err != nil || !exists {
+					t.Fatalf("wrong-operation cleanup touched retained VM: exists=%t error=%v", exists, err)
+				}
 
 				cloneParams, err := c.ResolveClonePlacement(ctx, CloneVMParams{
 					TemplateName: source.Reference().Value,
@@ -242,12 +617,54 @@ func TestCloneBuildersApplyVTPMPolicyToSubmittedSpecs(t *testing.T) {
 				}
 				created = append(created, health.MoRef)
 
-				saboteur.assertCloneNames(t, durableName, templateName, healthName)
+				saboteur.assertCloneNames(t, replicaName, canaryName, durableName, templateName, healthName)
+				assertVMOnHost(t, ctx, c, replicaMoref, allowed.MoRef)
 				assertVMOnHost(t, ctx, c, durableMoref, allowed.MoRef)
 				assertVMOnHost(t, ctx, c, templateMoref, allowed.MoRef)
 				assertVMOnHost(t, ctx, c, health.MoRef, allowed.MoRef)
 			})
 		})
+	}
+}
+
+func simulatorReplicaBuildTarget(
+	t *testing.T,
+	ctx context.Context,
+	c *Client,
+	host HostIdentity,
+) ReplicaBuildTarget {
+	t.Helper()
+	compute, err := c.finder.ObjectReference(ctx, types.ManagedObjectReference{
+		Type: host.ComputeType, Value: host.ComputeMoRef,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool, err := c.finder.ResourcePool(ctx, simResourcePool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	datastore, err := c.finder.Datastore(ctx, simDatastore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	folder, err := c.finder.Folder(ctx, simVMFolder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ReplicaBuildTarget{
+		ComputeResourceType:  host.ComputeType,
+		ComputeResourceMoref: host.ComputeMoRef,
+		ComputeResourcePath:  inventoryPath(compute),
+		HostMoref:            host.MoRef,
+		HostName:             host.Name,
+		ResourcePoolMoref:    pool.Reference().Value,
+		ResourcePoolPath:     pool.InventoryPath,
+		DatastoreMoref:       datastore.Reference().Value,
+		DatastoreName:        simDatastore,
+		FolderMoref:          folder.Reference().Value,
+		FolderPath:           folder.InventoryPath,
+		ProvisionDatastore:   simDatastore,
 	}
 }
 

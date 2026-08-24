@@ -198,6 +198,8 @@ func (p *Provisioner) ProcessJob(ctx context.Context, job *models.Job) error {
 			return p.RevalidateL1Template(ctx, job)
 		case models.JobTypeTemplateHealthConfirm:
 			return p.ConfirmTemplateHealth(ctx, job)
+		case models.JobTypeTemplateReplicaBuild:
+			return p.BuildTemplateSourceReplica(ctx, job)
 		case models.JobTypeImageImport:
 			return p.ImportImage(ctx, job)
 		case models.JobTypeVMSuspend:
@@ -215,7 +217,7 @@ func isTemplateJobType(jobType string) bool {
 	switch jobType {
 	case models.JobTypeTemplateProvision, models.JobTypeTemplateGeneralize,
 		models.JobTypeTemplateVerify, models.JobTypeTemplateRevalidate,
-		models.JobTypeTemplateHealthConfirm:
+		models.JobTypeTemplateHealthConfirm, models.JobTypeTemplateReplicaBuild:
 		return true
 	default:
 		return false
@@ -312,7 +314,9 @@ func processJobLifecycle(
 	// Error path: retry if possible, otherwise fail terminally.
 	retryable, reason := ClassifyError(err, job.Type)
 	cleanupOnly := jobPayloadCleanupOnly(job) || isCompensationRetry(err)
-	if cleanupOnly && !isCompensatedJobError(err) && !isManualCleanupRequired(err) {
+	if cleanupOnly &&
+		!errors.Is(err, database.ErrTemplateReplicaBuildJobObsolete) &&
+		!isCompensatedJobError(err) && !isManualCleanupRequired(err) {
 		retryable = true
 		reason = RetryReasonCleanup
 	}

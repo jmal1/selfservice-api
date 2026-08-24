@@ -260,6 +260,132 @@ on that host. Target eligibility remains controlled exclusively by the frozen
 a source on another cluster is therefore safe bootstrap preparation, not host
 admission.
 
+#### Durable retained replica builds
+
+Use the asynchronous build API instead of an operator-side govmomi script when
+the target compute resource does not have a retained source yet:
+
+```http
+POST /api/v1/admin/templates/{templateID}/source-replica-builds
+Content-Type: application/json
+
+{
+  "source_replica_id": "11111111-1111-1111-1111-111111111111",
+  "idempotency_key": "intel-cluster-retained-v1",
+  "destination_name": "ubuntu-24-intel-retained",
+  "target": {
+    "compute_resource_type": "ClusterComputeResource",
+    "compute_resource_moref": "domain-c401",
+    "compute_resource_path": "/LAB/host/Intel-Cluster",
+    "host_moref": "host-3401",
+    "host_name": "nuc3.lab.jmal.io",
+    "resource_pool_moref": "resgroup-401",
+    "resource_pool_path": "/LAB/host/Intel-Cluster/Resources/Student-VMs",
+    "datastore_moref": "datastore-401",
+    "datastore_name": "Intel-Templates",
+    "folder_moref": "group-v401",
+    "folder_path": "/LAB/vm/Templates"
+  }
+}
+```
+
+The caller must send both MoRefs and the matching inventory paths/names.
+Crucible resolves and compares every identity before enqueueing. The target host
+may be outside `VCENTER_HOSTS`; this endpoint is the only exception and does not
+add that host, compute resource, or pool to normal placement eligibility. A
+subsequent pod placement on that host still fails the allowlist gate.
+
+The API also checks the vCenter service account's entity-scoped build
+privileges. The minimum set is `VirtualMachine.Provisioning.Clone` on the source
+VM; `VirtualMachine.Inventory.Create`, `VirtualMachine.Inventory.Delete`,
+`VirtualMachine.State.CreateSnapshot`, and
+`VirtualMachine.Config.AdvancedConfig` plus
+`VirtualMachine.Provisioning.Clone` inherited by the target folder;
+`Resource.AssignVMToPool` on the target pool; and
+`Datastore.AllocateSpace` on the retained and provisioning datastores.
+`Cryptographer.Clone` is additionally required on the source and inherited by
+the target folder when the source has a vTPM.
+Crucible uses the normal strict vCenter TLS client and does not add a certificate
+bypass.
+
+`202 Accepted` means a new durable operation and job were committed together.
+Repeating the same template ID, idempotency key, and immutable request returns
+the original operation with `200 OK`; reusing the key with different input
+returns `409 Conflict`. Stale inventory, missing privilege, or an inaccessible
+destination returns `422 Unprocessable Entity` before vCenter mutation.
+
+```http
+GET  /api/v1/admin/templates/{templateID}/source-replica-builds/{buildID}
+POST /api/v1/admin/templates/{templateID}/source-replica-builds/{buildID}/retry
+POST /api/v1/admin/templates/{templateID}/source-replica-builds/{buildID}/cleanup
+```
+
+The status response exposes the durable `status`, `phase`, task MoRefs, exact VM
+MoRefs, cleanup timestamps, and `last_error_code`/`last_error`. `retry` is
+accepted only for a recoverable `failed` build and resumes its persisted phase.
+`cleanup` is accepted for a failed or `cleanup_required` build and performs
+marker- and exact-MoRef-based residue cleanup. It is also the supported
+retirement operation for a successful `ready` build. A second retry or cleanup
+request returns `409 Conflict` while the linked job is pending, claimed, or
+running. Cleanup failures preserve the schema-constrained forward
+`resume_phase`; cleanup-only and terminal phases cannot become retry
+checkpoints.
+
+Ready retirement first marks the result replica non-selectable, rejects every
+existing VM placement reference or non-retired downstream build that uses the
+result as its source anchor, and requires the original distinct source anchor
+to remain ready. The worker destroys only the exact result VM whose
+build/operation/kind markers match. A lost destroy response is reconciled and
+may safely resubmit only that exact destroy. Once absence is proven, one
+transaction removes the result replica and marks the build `retired`; the
+source anchor is never destroyed. Retired history no longer blocks direct
+source-replica or template deletion. Template deletion serializes with new build
+admission and restart, then rechecks build safety before destroying a vCenter
+VM. A failed downstream build releases its historical source reference only
+after it either never submitted a VM or exact residue cleanup was persisted.
+A forward retry revalidates and locks its exact ready source, so an upstream
+retirement cannot race it. There is intentionally no broad delete endpoint.
+Never delete a same-name VM manually until the stored markers, MoRefs, and task
+history have been compared; a collision or ambiguous lineage fails
+closed. During this operation the build reports `status=retiring`; completion
+reports `status=retired` and `phase=retired`.
+
+The worker persists each submission phase before calling vCenter. If a clone,
+snapshot, or cleanup response is lost, a successor reconciles the persisted task
+or exact operation marker. Clone, snapshot, and linked-clone creation are never
+blindly resubmitted. An exact-VM destroy may be resubmitted only after the
+successor revalidates the MoRef and build/operation/kind markers; this closes the
+arm-before-RPC crash window without permitting wrong-object deletion. The retained
+clone is a powered-off full clone of the source's `base-image` snapshot using
+`moveAllDiskBackingsAndDisallowSharing`. A vTPM source uses
+`TpmProvisionPolicy=replace`; the build requires distinct public EK
+certificate/CSR hashes, but deliberately neither rekeys nor requires a distinct
+configuration encryption key.
+
+Before sealing, Crucible verifies source snapshot identity, exact destination
+compute/pool/host/datastore/folder, powered-off state, firmware, Secure Boot,
+vTPM count, security provider and encryption-state parity, independent disk
+backings, and absence of snapshots or attached ISOs. An unencrypted source must
+remain unencrypted; an encrypted source requires a non-empty destination
+configuration key from the same provider. It then creates the destination
+`base-image` snapshot and proves that a powered-off linked clone can be created
+on the configured provisioning datastore with an exact retained parent backing.
+The canary is never booted. Its exact cleanup must finish and leave no marked
+residue before one transaction rechecks the original ready anchor and promotes
+the pending replica plus build to `ready`. This acceptance
+does not establish guest or L1 health.
+
+If acceptance never reaches `ready`, successful exact retained-VM cleanup
+atomically records `residue_cleaned_at` and removes only that build's non-ready
+source-replica reservation. The cleaned operation cannot resume forward work;
+submit a new build with a new idempotency key to reuse that compute resource.
+Template deletion returns `409` before destroying its staging VM while any
+replica build is active, accepted, or still owns an uncleaned VM/reservation.
+
+Do not start one of these builds while provisioning worker claims are disabled:
+`template_replica_build` is a clone-capable job and remains pending under
+`WORKER_PROVISIONING_CLAIMS_ENABLED=false`.
+
 A template keeps using its existing source for backward compatibility only
 until the first replica is registered. Registration durably enables
 source-replica mode; deleting every replica does not restore the legacy
@@ -292,6 +418,54 @@ drift and fails closed.
 > views in this foundation. Registration and placement validate each replica
 > live, but the UI does not yet show an independently confirmed health history
 > per replica.
+
+#### Replica-build Prometheus and Grafana contract
+
+The pipeline exporter publishes:
+
+| Metric | Contract |
+|---|---|
+| `crucible_template_replica_build_total{result}` | Build job attempts by `success` or `error`; transient reconciliation attempts may increment `error`. |
+| `crucible_template_replica_build_duration_seconds_{sum,count}{result}` | Attempt wall time by result. |
+| `crucible_template_replica_build_phase{phase}` | PostgreSQL-backed count of active operations in each durable phase. |
+| `crucible_template_replica_build_stuck` | Active operations whose persisted phase has not changed within the worker's staleness threshold. |
+| `crucible_template_replica_build_last_success_timestamp_seconds` | Latest successful attempt timestamp. |
+| `crucible_template_replica_build_last_failure_timestamp_seconds` | Latest unsuccessful attempt timestamp. |
+
+This repository does not own the live PrometheusRule. Install rules equivalent
+to:
+
+```yaml
+- alert: CrucibleTemplateReplicaBuildStuck
+  expr: crucible_template_replica_build_stuck > 0
+  for: 15m
+  labels:
+    severity: warning
+  annotations:
+    summary: Durable template replica build is stuck
+    description: Inspect the build status API, persisted phase/task MoRefs, provision-worker ownership, and vCenter task history. Do not resubmit or delete by VM name.
+    runbook_url: https://github.com/jmal1/selfservice-api/blob/main/docs/instructor/templates.md#durable-retained-replica-builds
+
+- alert: CrucibleTemplateReplicaBuildCleanupRequired
+  expr: crucible_template_replica_build_phase{phase="cleanup_required"} > 0
+  for: 15m
+  labels:
+    severity: warning
+  annotations:
+    summary: Template replica build requires exact cleanup
+    description: Use GET to inspect stored ownership, then invoke the operation-scoped cleanup endpoint. Escalate ambiguous markers or lineage rather than deleting a same-name VM.
+    runbook_url: https://github.com/jmal1/selfservice-api/blob/main/docs/instructor/templates.md#durable-retained-replica-builds
+
+- alert: CrucibleTemplateReplicaBuildFailures
+  expr: increase(crucible_template_replica_build_total{result="error"}[30m]) > 0
+  for: 5m
+  labels:
+    severity: warning
+  annotations:
+    summary: Template replica build attempts are failing
+    description: Correlate last failure time with the build last_error fields and worker logs; distinguish a retryable timeout from collision, source drift, validation failure, or cleanup_required.
+    runbook_url: https://github.com/jmal1/selfservice-api/blob/main/docs/instructor/templates.md#durable-retained-replica-builds
+```
 
 As soon as state flips to `configuring`, the **Open Build Console**
 button appears.

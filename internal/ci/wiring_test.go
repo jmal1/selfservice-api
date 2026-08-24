@@ -55,6 +55,7 @@ var requiredWiring = map[string][]struct {
 		{"ReconcileTemplateHealth", "without it no template health checks run, crucible_template_health_* metrics are never pushed, and a silently-rotting template is invisible until students hit it live"},
 		{"ReconcileTemplateHealthIfDue", "the 12h ticker is created at process start and reset by every restart; this service deploys several times a day, so WITHOUT the leader-acquisition catch-up the ticker never fires and the feature above is dead on arrival. Note the plain ReconcileTemplateHealth row does not cover this -- it is a substring of this symbol, so it stays green even if the catch-up is deleted"},
 		{"ReplaceTemplateHealthSnapshot", "without the leader-acquisition replacement, Pushgateway retains deleted templates and obsolete raw check_type series from the previous worker process whenever the due-check skips a fresh vCenter cycle"},
+		{"ReconcileTemplateReplicaBuildMetrics", "without it retained replica build phase and stuck-operation gauges are never refreshed"},
 	},
 	"cmd/crucible-runner/main.go": {
 		{"MaterializeActionLibrary", "without it the engine-generated action library is never written to disk, so every library action (http_get, port_open, ssh_exec, …) fails with exit 127 — the original defect, in which workflows appeared to run, the Job exited 0, and no action could possibly pass"},
@@ -524,7 +525,10 @@ func TestJobRecoveryUsesOwnedHeartbeatLeases(t *testing.T) {
 	}
 	for _, required := range []string{
 		"AND claimed_by = $4",
-		"AND NOT ($2 = 'completed' AND COALESCE(payload->>'cleanup_only', 'false') = 'true')",
+		"$2 = 'completed'",
+		"COALESCE(payload->>'cleanup_only', 'false') = 'true'",
+		"type <> 'template_replica_build'",
+		"AND NOT (",
 		"func (q *Queries) RenewJobLease(",
 		"AND claimed_by = $5",
 		"claimed_at < now() - ($1 * interval '1 second')",

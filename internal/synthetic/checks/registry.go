@@ -416,6 +416,7 @@ func All() []synthetic.Check {
 		StudentGuideIndex,
 		ImageUploadRBAC,
 		TemplateHealthStatusRBAC,
+		TemplateReplicaBuildStatusRBAC,
 		TemplatePinRBAC,
 		ContentFilterPolicy(ContentFilterPolicyConfig{}),
 	}
@@ -438,6 +439,7 @@ func ReadOnly() []synthetic.Check {
 		WikiIndexRBAC,
 		StudentGuideIndex,
 		TemplateHealthStatusRBAC,
+		TemplateReplicaBuildStatusRBAC,
 		ContentFilterPolicy(ContentFilterPolicyConfig{}),
 	}
 }

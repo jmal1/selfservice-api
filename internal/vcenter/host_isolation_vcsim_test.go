@@ -413,6 +413,62 @@ func TestResolvePlacementRejectsSourceOnDisallowedHost(t *testing.T) {
 	})
 }
 
+func TestResolveReplicaBuildTargetAllowsExactHostOutsidePlacementAllowlist(t *testing.T) {
+	withSimulator(t, func(ctx context.Context, c *Client, _ *vim25.Client) {
+		_, forbidden, _, _, _ := simulatorHostIsolationFixture(t, ctx, c)
+		computeRef := types.ManagedObjectReference{
+			Type:  forbidden.ComputeType,
+			Value: forbidden.ComputeMoRef,
+		}
+		compute, err := c.finder.ObjectReference(ctx, computeRef)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pool, err := c.finder.ResourcePool(ctx, simResourcePool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		datastore, err := c.finder.Datastore(ctx, simDatastore)
+		if err != nil {
+			t.Fatal(err)
+		}
+		folder, err := c.finder.Folder(ctx, simVMFolder)
+		if err != nil {
+			t.Fatal(err)
+		}
+		target, err := c.ResolveReplicaBuildTarget(ctx, ReplicaBuildTarget{
+			ComputeResourceType:  forbidden.ComputeType,
+			ComputeResourceMoref: forbidden.ComputeMoRef,
+			ComputeResourcePath:  inventoryPath(compute),
+			HostMoref:            forbidden.MoRef,
+			HostName:             forbidden.Name,
+			ResourcePoolMoref:    pool.Reference().Value,
+			ResourcePoolPath:     pool.InventoryPath,
+			DatastoreMoref:       datastore.Reference().Value,
+			DatastoreName:        simDatastore,
+			FolderMoref:          folder.Reference().Value,
+			FolderPath:           folder.InventoryPath,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if target.HostMoref != forbidden.MoRef {
+			t.Fatalf("resolved build host=%s, want explicit outside-allowlist host %s", target.HostMoref, forbidden.MoRef)
+		}
+		if _, err := c.ResolvePlacement(ctx, PlacementRequest{
+			DatastoreName:      simDatastore,
+			NetworkName:        simNetwork,
+			VCPUs:              1,
+			RAMMB:              512,
+			PinnedHostMoRef:    forbidden.MoRef,
+			PinnedPoolMoRef:    pool.Reference().Value,
+			SkipCapacityChecks: true,
+		}); err == nil || !strings.Contains(err.Error(), "outside VCENTER_HOSTS") {
+			t.Fatalf("normal placement on build-only host error=%v, want allowlist rejection", err)
+		}
+	})
+}
+
 func placementRequestForSource(
 	t *testing.T,
 	ctx context.Context,
