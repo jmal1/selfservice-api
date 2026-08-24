@@ -48,6 +48,52 @@ remain available so existing environments can be made safe. The worker also
 continues compensation-only retries for cleanup that began before maintenance;
 those retries cannot resume pod or VM creation.
 
+### Rollback-safe claims containment before a phase-1 upgrade
+
+A live Deployment override is not a rollback control. Helm rollback restores
+the previous revision's rendered environment, so a prior revision with
+`WORKER_PROVISIONING_CLAIMS_ENABLED=true` can briefly claim queued work even
+when the live pod was patched to `false`.
+
+Before pulling upgrade code, building or pushing images, or running a migration:
+
+1. Preserve a clean checkout of the chart revision currently running safely in
+   production.
+2. From the hotfix checkout, create a Helm baseline revision using that safe
+   chart:
+
+   ```bash
+   ./deploy/scripts/deploy.sh \
+     --prepare-claims-baseline \
+     --baseline-chart-dir /path/to/safe-checkout/deploy/helm/selfservice
+   ```
+
+   The command uses the release's existing values, changes
+   `provisioning.workerClaimsEnabled=false`, and pins the worker manifest to the
+   single immutable image digest reported by the running safe worker pods. It
+   rejects a supplied chart whose rendered worker Deployment differs from the
+   live Helm manifest beyond that gate and digest pin, waits for the worker
+   rollout, and verifies both Helm and Kubernetes. The baseline upgrade does
+   not use `--atomic`: a failed baseline must never roll back to the
+   claims-enabled revision. Its failure path reasserts the live claims override
+   and stops; fix the baseline error and rerun it before proceeding.
+3. Re-run the read-only proof:
+
+   ```bash
+   ./deploy/scripts/deploy.sh --verify-rollback-containment
+   ```
+
+Confirm PostgreSQL reports migration **34 clean**; stop for incident recovery
+if it is dirty or at another version. Only after that database check and both
+commands succeed may the operator update the checkout/images and run the normal
+phase-1 deployment. The normal deploy path repeats the Helm/live claims and
+digest-pin proof before `git pull`, and rejects a latest Helm revision whose
+status is not `deployed`; if any part fails, it exits before the migration or
+image upgrade. That current claims-disabled, digest-pinned revision is then the
+target used by `helm upgrade --atomic` if the upgrade fails. Do not use
+`kubectl set env` as a substitute and do not manually select an older
+claims-enabled revision for rollback.
+
 Operators can distinguish ordinary queued work from recovery work in the job
 payload. Pod/VM creation, template staging/generalization/verification/health,
 and image-import jobs are withheld while provisioning claims are disabled

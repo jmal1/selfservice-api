@@ -771,6 +771,21 @@ it must parse as a Go boolean; an invalid value fails process startup rather
 than silently enabling provisioning. Helm exposes these as
 `provisioning.enabled` and `provisioning.workerClaimsEnabled`.
 
+During a claims-contained phase-1 rollout, the current Helm revision must
+already render `provisioning.workerClaimsEnabled=false` before any migration or
+image upgrade begins. A live `kubectl set env` override is not sufficient:
+Helm rollback restores the prior rendered manifest and would erase that
+override. First use `deploy/scripts/deploy.sh --prepare-claims-baseline` with
+the exact currently deployed safe chart checkout. The script pins the baseline
+worker manifest to the one immutable digest reported by the running safe pods;
+it never rolls a failed baseline back to the claims-enabled revision. Then run
+`--verify-rollback-containment`. The deploy path performs the same preflight
+before pulling new code, so its atomic rollback target is durably
+claims-disabled and digest-pinned. Do not build, push, migrate, or upgrade
+phase-1 images until the baseline revision and live worker both pass that
+proof. The database must independently be at migration 34 clean; stop rather
+than deploying if it is dirty or already reports a different version.
+
 When API admission is disabled, the first instruction in each of these
 handlers rejects the request before parsing, allocation, or database access:
 
