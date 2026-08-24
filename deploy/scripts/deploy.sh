@@ -180,7 +180,7 @@ rendered_worker_replicas_from_manifest() {
 }
 
 live_worker_replicas() {
-  kubectl get "deployment/$RELEASE-worker" -n "$NAMESPACE" -o json \
+  kubectl get "Deployment/$RELEASE-worker" -n "$NAMESPACE" -o json \
     | jq -er -f "$WORKER_REPLICA_FILTER"
 }
 
