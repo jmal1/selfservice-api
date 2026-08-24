@@ -338,7 +338,7 @@ func TestReconcileNetwork_RepairsMissingInterfaceSubnetAndBinding(t *testing.T) 
 	}
 }
 
-func TestReconcileNetwork_HealthyActivePodNoChanges(t *testing.T) {
+func TestReconcileNetwork_ConvergedFirewallSkipsApply(t *testing.T) {
 	podID := uuid.New()
 	row := allocatedVLANRow(104, podID, "active")
 
@@ -361,11 +361,82 @@ func TestReconcileNetwork_HealthyActivePodNoChanges(t *testing.T) {
 	if counts.InterfacesRepaired != 0 || counts.SubnetsRepaired != 0 || counts.KeaBindingsRepaired != 0 || counts.KeaRestarted != 0 {
 		t.Fatalf("expected no repairs/restart, got %+v", counts)
 	}
-	if counts.FirewallRulesRepaired != 0 || counts.FirewallApplied != 1 || opn.applyFirewallCalls != 1 {
-		t.Fatalf("expected no model changes and one convergence apply, got counts=%+v applyCalls=%d", counts, opn.applyFirewallCalls)
+	if counts.FirewallRulesRepaired != 0 || counts.FirewallApplied != 0 || opn.applyFirewallCalls != 0 {
+		t.Fatalf("converged firewall must not be applied, got counts=%+v applyCalls=%d", counts, opn.applyFirewallCalls)
 	}
 	if opn.restartDHPCCalls != 0 {
 		t.Fatalf("expected no Kea restart call, got %d", opn.restartDHPCCalls)
+	}
+}
+
+func TestReconcileNetwork_StaleFirewallRuleAppliesOnceThenConverges(t *testing.T) {
+	row := allocatedVLANRow(104, uuid.New(), "active")
+	desired := podPassRuleReadback("opt7", row.Subnet)
+	desired.UUID = "desired"
+	stale := podPassRuleReadback("opt9", "10.100.99.0/24")
+	stale.UUID = "stale"
+	opn := &fakeNetworkOPN{
+		vlans:                  map[int]*opnsense.VLAN{104: {Tag: "104"}},
+		dhcpSubnets:            map[string]*opnsense.DHCPSubnet{row.Subnet: {Subnet: row.Subnet}},
+		selectedDHCPInterfaces: []string{"opt7"},
+		firewallRules:          []opnsense.FirewallRuleInfo{desired, stale},
+	}
+	ssh := &fakeNetworkSSH{findByVLAN: map[int]string{104: "opt7"}}
+	db := &fakeNetworkDB{rows: []database.AllocatedVLAN{row}}
+
+	first, err := reconcileNetwork(context.Background(), opn, ssh, db, discardLogger(), NetworkReconcilerConfig{}, time.Now)
+	if err != nil {
+		t.Fatalf("first reconcileNetwork: %v", err)
+	}
+	if first.FirewallRulesStale != 1 || first.FirewallRulesRemoved != 1 || first.FirewallApplied != 1 {
+		t.Fatalf("stale rule repair did not apply exactly once: %+v", first)
+	}
+	if got := opn.deleteFirewallCalls; len(got) != 1 || got[0] != "stale" {
+		t.Fatalf("unexpected firewall deletions: %v", got)
+	}
+	if opn.applyFirewallCalls != 1 {
+		t.Fatalf("stale rule repair apply calls = %d, want 1", opn.applyFirewallCalls)
+	}
+
+	second, err := reconcileNetwork(context.Background(), opn, ssh, db, discardLogger(), NetworkReconcilerConfig{}, time.Now)
+	if err != nil {
+		t.Fatalf("second reconcileNetwork: %v", err)
+	}
+	if second.FirewallRulesStale != 0 || second.FirewallRulesRemoved != 0 || second.FirewallApplied != 0 {
+		t.Fatalf("second pass did not converge to a no-op: %+v", second)
+	}
+	if opn.applyFirewallCalls != 1 {
+		t.Fatalf("converged second pass reapplied firewall: calls=%d", opn.applyFirewallCalls)
+	}
+}
+
+func TestReconcileNetwork_FirewallApplyErrorReportsMetrics(t *testing.T) {
+	row := allocatedVLANRow(104, uuid.New(), "active")
+	desired := podPassRuleReadback("opt7", row.Subnet)
+	desired.UUID = "desired"
+	stale := podPassRuleReadback("opt9", "10.100.99.0/24")
+	stale.UUID = "stale"
+	opn := &fakeNetworkOPN{
+		vlans:                  map[int]*opnsense.VLAN{104: {Tag: "104"}},
+		dhcpSubnets:            map[string]*opnsense.DHCPSubnet{row.Subnet: {Subnet: row.Subnet}},
+		selectedDHCPInterfaces: []string{"opt7"},
+		firewallRules:          []opnsense.FirewallRuleInfo{desired, stale},
+		applyFirewallErr:       errors.New("transient apply failure"),
+	}
+	ssh := &fakeNetworkSSH{findByVLAN: map[int]string{104: "opt7"}}
+	db := &fakeNetworkDB{rows: []database.AllocatedVLAN{row}}
+
+	counts, err := reconcileNetwork(context.Background(), opn, ssh, db, discardLogger(), NetworkReconcilerConfig{}, time.Now)
+	if err != nil {
+		t.Fatalf("reconcileNetwork: %v", err)
+	}
+	if counts.Errors != 1 || counts.FirewallApplied != 0 || opn.applyFirewallCalls != 1 {
+		t.Fatalf("apply failure was not reported correctly: counts=%+v applyCalls=%d", counts, opn.applyFirewallCalls)
+	}
+	metrics := string(serializeNetworkReconcileCounts(counts))
+	if !strings.Contains(metrics, "crucible_network_reconcile_errors_total 1\n") ||
+		!strings.Contains(metrics, "crucible_network_reconcile_firewall_applied 0\n") {
+		t.Fatalf("apply failure metrics are incorrect:\n%s", metrics)
 	}
 }
 
@@ -438,9 +509,7 @@ func TestReconcileNetwork_ContentFilterInspectionFailureBlocksUnrelatedApply(t *
 func TestReconcileNetwork_FirewallApplyFailureKeepsContentFilterUnhealthy(t *testing.T) {
 	row := allocatedVLANRow(104, uuid.New(), "active")
 	cfg := validContentFilterConfig()
-	pass := podPassRuleReadback("opt7", row.Subnet)
-	pass.UUID = "legacy"
-	firewallRules := []opnsense.FirewallRuleInfo{pass}
+	var firewallRules []opnsense.FirewallRuleInfo
 	for i, rule := range desiredContentFilterRules(cfg) {
 		firewallRules = append(firewallRules, opnsenseFilterGetReadback(rule, fmt.Sprintf("policy-%d", i)))
 	}
