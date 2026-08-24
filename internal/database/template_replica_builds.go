@@ -695,6 +695,12 @@ func (q *Queries) CompleteTemplateReplicaBuildCleanup(
 			FOR UPDATE
 		`, *resultReplicaID, build.TemplateID, build.DestinationVMMoref,
 			build.ComputeResourceType, build.ComputeResourceMoref).Scan(&resultStatus); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf(
+					"%w: cleanup result replica identity does not match the persisted build",
+					ErrTemplateReplicaBuildConflict,
+				)
+			}
 			return fmt.Errorf("lock cleanup result replica: %w", err)
 		}
 		if retiring {
