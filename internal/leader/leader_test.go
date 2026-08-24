@@ -268,6 +268,34 @@ func TestChangesChannel(t *testing.T) {
 	}
 }
 
+func TestLeadershipStateLeaseCancelsAndGenerationAdvances(t *testing.T) {
+	elec := NewAlwaysLeader(slog.Default())
+	first := elec.CurrentLeadership()
+	if !first.IsLeader || first.Generation != 1 || first.Context == nil {
+		t.Fatalf("initial leadership state = %+v, want held generation 1 with lease", first)
+	}
+
+	elec.loseLeadership()
+	select {
+	case <-first.Context.Done():
+	case <-time.After(time.Second):
+		t.Fatal("leadership lease was not cancelled on loss")
+	}
+	lost := elec.CurrentLeadership()
+	if lost.IsLeader || lost.Context != nil {
+		t.Fatalf("lost leadership state = %+v, want follower without lease", lost)
+	}
+
+	elec.becomeLeader()
+	second := elec.CurrentLeadership()
+	if !second.IsLeader || second.Generation != 2 || second.Context == nil {
+		t.Fatalf("reacquired leadership state = %+v, want held generation 2 with lease", second)
+	}
+	if second.Context == first.Context {
+		t.Fatal("reacquisition reused the cancelled leadership lease")
+	}
+}
+
 // --------------------------------------------------------------------------
 // Test: Pusher serializes metrics correctly
 // --------------------------------------------------------------------------
