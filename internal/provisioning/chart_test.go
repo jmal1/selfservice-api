@@ -35,10 +35,18 @@ type chartValues struct {
 			Enabled bool `yaml:"enabled"`
 			DryRun  bool `yaml:"dryRun"`
 		} `yaml:"idleEvaluator"`
+		PipelineReconciler struct {
+			Enabled bool `yaml:"enabled"`
+		} `yaml:"pipelineReconciler"`
+		ContentFilter struct {
+			Enabled bool `yaml:"enabled"`
+		} `yaml:"contentFilter"`
 	} `yaml:"worker"`
 	VCenter struct {
-		Hosts         string `yaml:"hosts"`
-		ResourcePools string `yaml:"resourcePools"`
+		Hosts                     string `yaml:"hosts"`
+		ResourcePools             string `yaml:"resourcePools"`
+		PlacementReservedMemoryMB string `yaml:"placementReservedMemoryMB"`
+		Insecure                  string `yaml:"insecure"`
 	} `yaml:"vcenter"`
 	Synthetic struct {
 		ProvisioningExpectedEnabled bool `yaml:"provisioningExpectedEnabled"`
@@ -129,8 +137,8 @@ func TestProductionProvisioningReopensConservatively(t *testing.T) {
 	if values.ReplicaCount.Worker != 1 {
 		t.Errorf("production worker replicas = %d, want exactly 1 during initial reopening", values.ReplicaCount.Worker)
 	}
-	if !values.Provisioning.Enabled || !values.Provisioning.WorkerClaimsEnabled {
-		t.Fatalf("production provisioning controls = %+v, want admission and worker claims enabled", values.Provisioning)
+	if !values.Provisioning.Enabled || values.Provisioning.WorkerClaimsEnabled {
+		t.Fatalf("production provisioning controls = %+v, want admission on and initial worker claims gated", values.Provisioning)
 	}
 	if !values.Synthetic.ProvisioningExpectedEnabled {
 		t.Fatal("production synthetic must expect provisioning enabled")
@@ -144,33 +152,94 @@ func TestProductionProvisioningReopensConservatively(t *testing.T) {
 	if values.VCenter.ResourcePools != "/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs" {
 		t.Fatalf("production resource pools = %q, want ESXi1-compatible AMD pool only", values.VCenter.ResourcePools)
 	}
+	if values.VCenter.Insecure != "false" {
+		t.Fatalf("production vCenter insecure = %q, want strict TLS", values.VCenter.Insecure)
+	}
+	if values.VCenter.PlacementReservedMemoryMB != "esxi1.lab.jmal.io=8192" {
+		t.Fatalf("production placement reserve = %q, want ESXi1 8 GiB", values.VCenter.PlacementReservedMemoryMB)
+	}
 	if values.Worker.OrphanReconciler.Enabled ||
 		values.Worker.NetworkReconciler.Enabled ||
 		values.Worker.L1Validation.Enabled ||
 		values.Worker.TemplateHealth.Enabled ||
 		values.Worker.IdleEvaluator.Enabled ||
+		values.Worker.PipelineReconciler.Enabled ||
 		!values.Worker.IdleEvaluator.DryRun {
 		t.Fatalf("production worker background mutation controls are not conservatively disabled: %+v", values.Worker)
 	}
 	for path, want := range map[string]string{
 		"replicaCount.worker":                   "1",
 		"provisioning.enabled":                  "true",
-		"provisioning.workerClaimsEnabled":      "true",
+		"provisioning.workerClaimsEnabled":      "false",
 		"synthetic.provisioningExpectedEnabled": "true",
 		"synthetic.lifecycle.enabled":           "false",
 		"synthetic.janitor.enabled":             "false",
 		"synthetic.runner.enabled":              "false",
 		"vcenter.hosts":                         "esxi1.lab.jmal.io",
 		"vcenter.resourcePools":                 "/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs",
+		"vcenter.insecure":                      "false",
+		"vcenter.placementReservedMemoryMB":     "esxi1.lab.jmal.io=8192",
 		"worker.orphanReconciler.enabled":       "false",
 		"worker.networkReconciler.enabled":      "false",
 		"worker.l1Validation.enabled":           "false",
 		"worker.templateHealth.enabled":         "false",
 		"worker.idleEvaluator.enabled":          "false",
 		"worker.idleEvaluator.dryRun":           "true",
+		"worker.pipelineReconciler.enabled":     "false",
 	} {
 		parts := strings.Split(path, ".")
 		if got := chartScalar(t, "values.prod.yaml", parts...); got != want {
+			t.Errorf("%s = %q, want explicit %q", path, got, want)
+		}
+	}
+}
+
+func TestFullFleetOverlayRendersApprovedFinalState(t *testing.T) {
+	values := loadChartValues(t, "values.full-fleet.yaml")
+	if values.ReplicaCount.Worker != 4 {
+		t.Fatalf("full-fleet worker replicas = %d, want 4", values.ReplicaCount.Worker)
+	}
+	if !values.Provisioning.Enabled || !values.Provisioning.WorkerClaimsEnabled {
+		t.Fatalf("full-fleet provisioning controls = %+v, want enabled", values.Provisioning)
+	}
+	if !values.Synthetic.ProvisioningExpectedEnabled ||
+		!values.Synthetic.Lifecycle.Enabled ||
+		!values.Synthetic.Janitor.Enabled ||
+		!values.Synthetic.Runner.Enabled {
+		t.Fatalf("full-fleet synthetics are not fully enabled: %+v", values.Synthetic)
+	}
+	if !values.Worker.L1Validation.Enabled ||
+		!values.Worker.TemplateHealth.Enabled ||
+		!values.Worker.OrphanReconciler.Enabled ||
+		!values.Worker.NetworkReconciler.Enabled ||
+		!values.Worker.IdleEvaluator.Enabled ||
+		values.Worker.IdleEvaluator.DryRun ||
+		!values.Worker.PipelineReconciler.Enabled ||
+		values.Worker.ContentFilter.Enabled {
+		t.Fatalf("full-fleet producer controls are not approved: %+v", values.Worker)
+	}
+	for path, want := range map[string]string{
+		"replicaCount.worker":               "4",
+		"provisioning.enabled":              "true",
+		"provisioning.workerClaimsEnabled":  "true",
+		"vcenter.insecure":                  "false",
+		"vcenter.hosts":                     "esxi1.lab.jmal.io,esxi2.lab.jmal.io,nuc1.lab.jmal.io,nuc2.lab.jmal.io,nuc3.lab.jmal.io",
+		"vcenter.resourcePools":             "/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs,/JMAL-Datacenter/host/Intel-Cluster/Resources/Student-VMs",
+		"vcenter.placementReservedMemoryMB": "esxi1.lab.jmal.io=8192,esxi2.lab.jmal.io=8192,nuc1.lab.jmal.io=4096,nuc2.lab.jmal.io=2048,nuc3.lab.jmal.io=2048",
+		"synthetic.lifecycle.enabled":       "true",
+		"synthetic.janitor.enabled":         "true",
+		"synthetic.runner.enabled":          "true",
+		"worker.l1Validation.enabled":       "true",
+		"worker.templateHealth.enabled":     "true",
+		"worker.orphanReconciler.enabled":   "true",
+		"worker.networkReconciler.enabled":  "true",
+		"worker.idleEvaluator.enabled":      "true",
+		"worker.idleEvaluator.dryRun":       "false",
+		"worker.pipelineReconciler.enabled": "true",
+		"worker.contentFilter.enabled":      "false",
+	} {
+		parts := strings.Split(path, ".")
+		if got := chartScalar(t, "values.full-fleet.yaml", parts...); got != want {
 			t.Errorf("%s = %q, want explicit %q", path, got, want)
 		}
 	}
@@ -186,14 +255,18 @@ func TestChartWiresEveryProvisioningControl(t *testing.T) {
 			"VCENTER_DATASTORE",
 			"VCENTER_RESOURCE_POOLS",
 			"VCENTER_HOSTS",
+			"VCENTER_INSECURE",
 			".Values.vcenter.datastore",
 			".Values.vcenter.resourcePools",
 			".Values.vcenter.hosts",
+			".Values.vcenter.insecure",
 			".Values.provisioning.enabled",
 		},
 		"worker-deployment.yaml": {
 			"WORKER_PROVISIONING_CLAIMS_ENABLED",
 			".Values.provisioning.workerClaimsEnabled",
+			"VCENTER_INSECURE",
+			".Values.vcenter.insecure",
 			"terminationGracePeriodSeconds: {{ .Values.worker.shutdownGracePeriodSeconds }}",
 		},
 		"engine-deployment.yaml": {
