@@ -21,6 +21,7 @@ package leader
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -61,6 +62,20 @@ type Elector struct {
 	isLeader    atomic.Bool
 	transitions atomic.Int64
 	changeCh    chan bool
+
+	stateMu          sync.RWMutex
+	leaderContext    context.Context
+	cancelLeadership context.CancelFunc
+	generation       int64
+}
+
+// LeadershipState is an atomic snapshot of the current leadership lease.
+// Context is cancelled synchronously when the lease is lost. Generation
+// increments on every acquisition, including reacquisition by the same worker.
+type LeadershipState struct {
+	IsLeader   bool
+	Generation int64
+	Context    context.Context
 }
 
 // New creates an Elector. newBackend is called each time a new connection is
@@ -91,6 +106,8 @@ func NewAlwaysLeader(logger *slog.Logger) *Elector {
 		logger:        logger,
 		changeCh:      make(chan bool, 1),
 	}
+	e.leaderContext, e.cancelLeadership = context.WithCancel(context.Background())
+	e.generation = 1
 	e.isLeader.Store(true)
 	e.transitions.Store(1)
 	return e
@@ -104,6 +121,19 @@ func (e *Elector) IsLeader() bool { return e.isLeader.Load() }
 // release events) observed by this instance. Used as the metric value for
 // crucible_worker_leader_transitions_total.
 func (e *Elector) Transitions() int64 { return e.transitions.Load() }
+
+// CurrentLeadership returns a consistent snapshot that leader-owned work can
+// bind to. The snapshot context is the safety boundary for in-flight mutation:
+// it is cancelled directly by loseLeadership, independent of Changes delivery.
+func (e *Elector) CurrentLeadership() LeadershipState {
+	e.stateMu.RLock()
+	defer e.stateMu.RUnlock()
+	return LeadershipState{
+		IsLeader:   e.isLeader.Load(),
+		Generation: e.generation,
+		Context:    e.leaderContext,
+	}
+}
 
 // Changes returns a channel that receives true when leadership is acquired and
 // false when it is lost. The channel is buffered; if the receiver is slow a
@@ -200,23 +230,42 @@ func (e *Elector) attemptLeadership(ctx context.Context) {
 }
 
 func (e *Elector) becomeLeader() {
-	if !e.isLeader.Swap(true) {
-		e.transitions.Add(1)
-		select {
-		case e.changeCh <- true:
-		default:
-		}
-		e.logger.Info("leader election: acquired leadership")
+	e.stateMu.Lock()
+	if e.isLeader.Load() {
+		e.stateMu.Unlock()
+		return
 	}
+	e.leaderContext, e.cancelLeadership = context.WithCancel(context.Background())
+	e.generation++
+	e.isLeader.Store(true)
+	e.transitions.Add(1)
+	e.stateMu.Unlock()
+
+	select {
+	case e.changeCh <- true:
+	default:
+	}
+	e.logger.Info("leader election: acquired leadership")
 }
 
 func (e *Elector) loseLeadership() {
-	if e.isLeader.Swap(false) {
-		e.transitions.Add(1)
-		select {
-		case e.changeCh <- false:
-		default:
-		}
-		e.logger.Info("leader election: lost leadership")
+	e.stateMu.Lock()
+	if !e.isLeader.Load() {
+		e.stateMu.Unlock()
+		return
 	}
+	e.isLeader.Store(false)
+	if e.cancelLeadership != nil {
+		e.cancelLeadership()
+	}
+	e.leaderContext = nil
+	e.cancelLeadership = nil
+	e.transitions.Add(1)
+	e.stateMu.Unlock()
+
+	select {
+	case e.changeCh <- false:
+	default:
+	}
+	e.logger.Info("leader election: lost leadership")
 }

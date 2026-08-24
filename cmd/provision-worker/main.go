@@ -308,6 +308,23 @@ func main() {
 		MinAge: orphanMinAge,
 		Pusher: orphanPusher,
 	}
+	var orphanScheduler *provisioner.OrphanReconcilerScheduler
+	if orphanEnabled {
+		orphanScheduler = provisioner.NewOrphanReconcilerScheduler(
+			func() provisioner.OrphanLeadershipState {
+				state := elec.CurrentLeadership()
+				return provisioner.OrphanLeadershipState{
+					IsLeader:   state.IsLeader,
+					Generation: state.Generation,
+					Context:    state.Context,
+				}
+			},
+			func(runCtx context.Context) (provisioner.ReconcileCounts, error) {
+				return prov.ReconcileVCenterOrphans(runCtx, orphanCfg)
+			},
+			logger,
+		)
+	}
 
 	// Pod-VM DHCP IP reconciler. Keeps pod_vms.ip_address in sync with the
 	// live guest address for running, IP-assigned VMs — catching both a
@@ -602,6 +619,9 @@ func main() {
 		orphanTickerC = t.C
 		logger.Info("vcenter orphan reconciler enabled",
 			"folder", orphanCfg.Folder, "interval", orphanInterval, "min_age", orphanMinAge)
+		// Leadership may already be held before the scheduler is initialized.
+		// Observe current state directly instead of relying only on Changes().
+		orphanScheduler.Start(ctx)
 	}
 
 	// Pod-VM IP reconciler ticker (enabled by default; nil-safe).
@@ -747,12 +767,7 @@ func main() {
 					logger.Error("stuck-upload reconcile failed", "error", err)
 				}
 			case <-orphanTickerC:
-				if !elec.IsLeader() {
-					continue
-				}
-				if _, err := prov.ReconcileVCenterOrphans(ctx, orphanCfg); err != nil {
-					logger.Error("orphan reconcile failed", "error", err)
-				}
+				orphanScheduler.Tick(ctx)
 			case <-ipReconcilerTickerC:
 				if !elec.IsLeader() {
 					continue
@@ -826,6 +841,9 @@ func main() {
 			case isLeader := <-elec.Changes():
 				if l1ValidationScheduler != nil {
 					l1ValidationScheduler.LeadershipChanged(ctx, isLeader)
+				}
+				if orphanScheduler != nil {
+					orphanScheduler.LeadershipChanged(ctx)
 				}
 				if !isLeader {
 					continue
@@ -923,12 +941,19 @@ func main() {
 	if l1ValidationScheduler != nil {
 		l1ValidationScheduler.Stop()
 	}
+	if orphanScheduler != nil {
+		orphanScheduler.Stop()
+	}
 	if !jobRuns.StopAndWait(time.Until(shutdownDeadline)) {
 		logger.Error("worker shutdown deadline reached; durable job recovery will resume unfinished work")
 	}
 	if l1ValidationScheduler != nil &&
 		!l1ValidationScheduler.WaitTimeout(time.Until(shutdownDeadline)) {
 		logger.Error("worker shutdown deadline reached while waiting for L1 trust validation")
+	}
+	if orphanScheduler != nil &&
+		!orphanScheduler.WaitTimeout(time.Until(shutdownDeadline)) {
+		logger.Error("worker shutdown deadline reached while waiting for orphan reconciliation")
 	}
 	if !closeBeforeDeadline(pool, time.Until(shutdownDeadline)) {
 		logger.Error("worker shutdown deadline reached while closing database pool")
