@@ -60,6 +60,7 @@ fi
 
 PIN_BASELINE_SCRIPT="$SCRIPT_DIR/pin-baseline-images.sh"
 CANONICALIZE_WORKLOAD_FILTER="$SCRIPT_DIR/canonicalize-workload-spec.jq"
+WORKER_REPLICA_FILTER="$SCRIPT_DIR/require-single-worker-replica.jq"
 HELM_RELEASE_LOCK="$RELEASE-phase1-deploy-lock"
 HELM_RELEASE_LOCK_HELD=false
 HELM_RELEASE_LOCK_HOLDER=
@@ -159,7 +160,7 @@ runner_image_from_manifest() {
   '
 }
 
-worker_replicas_from_manifest() {
+rendered_worker_replicas_from_manifest() {
   local manifest=$1
   extract_workload_manifest "$manifest" Deployment "$RELEASE-worker" \
     | awk '
@@ -176,6 +177,11 @@ worker_replicas_from_manifest() {
           print value
         }
       '
+}
+
+live_worker_replicas() {
+  kubectl get "deployment/$RELEASE-worker" -n "$NAMESPACE" -o json \
+    | jq -er -f "$WORKER_REPLICA_FILTER"
 }
 
 manifest_workload_inventory() {
@@ -1033,7 +1039,7 @@ verify_manifest_and_live() {
     rm -rf "$tmp_dir"
     return 1
   fi
-  rendered_worker_replicas="$(worker_replicas_from_manifest "$manifest")"
+  rendered_worker_replicas="$(rendered_worker_replicas_from_manifest "$manifest")"
   if [ "$rendered_worker_replicas" != "1" ]; then
     echo "ERROR: current Helm rollback target renders $rendered_worker_replicas workers, not exactly 1." >&2
     rm -rf "$tmp_dir"
@@ -1098,7 +1104,11 @@ verify_manifest_and_live() {
   local live_worker live_claims live_replicas live_runner
   live_worker="$tmp_dir/Deployment-${RELEASE}-worker.yaml"
   live_claims="$(claims_from_manifest < "$live_worker")"
-  live_replicas="$(worker_replicas_from_manifest "$live_worker")"
+  if ! live_replicas="$(live_worker_replicas)"; then
+    echo "ERROR: could not read an integer replica count of exactly 1 from the live worker Deployment." >&2
+    rm -rf "$tmp_dir"
+    return 1
+  fi
   if [ "$live_claims" != "false" ] || [ "$live_replicas" != "1" ]; then
     echo "ERROR: live worker must have claims=false and replicas=1; got claims=$live_claims replicas=$live_replicas." >&2
     rm -rf "$tmp_dir"

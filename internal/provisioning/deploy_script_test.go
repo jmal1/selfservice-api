@@ -324,6 +324,99 @@ func TestDeployWorkloadCanonicalizerKubectlCompatibility(t *testing.T) {
 	}
 }
 
+func TestDeployWorkerReplicaGateKubectlCompatibility(t *testing.T) {
+	kubectl, err := exec.LookPath("kubectl")
+	if err != nil {
+		t.Fatal("kubectl is required to test the deploy worker replica gate")
+	}
+	jq, err := exec.LookPath("jq")
+	if err != nil {
+		t.Fatal("jq is required to test the deploy worker replica gate")
+	}
+
+	deployScript, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(deployScript), `live_replicas="$(worker_replicas_from_manifest "$live_worker")"`) {
+		t.Fatal("deploy script still parses the server-side worker replica count from YAML")
+	}
+
+	fixture := filepath.Join(t.TempDir(), "worker-deployment.yaml")
+	writeFile(t, fixture, `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-replica-fixture
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker-replica-fixture
+  template:
+    metadata:
+      labels:
+        app: worker-replica-fixture
+    spec:
+      containers:
+      - name: worker
+        image: example.invalid/worker@sha256:`+testDigestA+`
+`)
+
+	resource, err := exec.Command(
+		kubectl,
+		"patch",
+		"--local=true",
+		"-f",
+		fixture,
+		"--type=merge",
+		"-p",
+		"{}",
+		"-o",
+		"json",
+	).CombinedOutput()
+	if err != nil {
+		t.Fatalf("real kubectl could not emit the worker Deployment as JSON: %v\n%s", err, resource)
+	}
+
+	filter := filepath.Join("..", "..", "deploy", "scripts", "require-single-worker-replica.jq")
+	tests := []struct {
+		name        string
+		transform   string
+		wantSuccess bool
+	}{
+		{name: "integer one", transform: ".", wantSuccess: true},
+		{name: "missing", transform: "del(.spec.replicas)"},
+		{name: "null", transform: ".spec.replicas = null"},
+		{name: "string", transform: `.spec.replicas = "1"`},
+		{name: "zero", transform: ".spec.replicas = 0"},
+		{name: "two", transform: ".spec.replicas = 2"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			transform := exec.Command(jq, "-c", test.transform)
+			transform.Stdin = strings.NewReader(string(resource))
+			input, transformErr := transform.CombinedOutput()
+			if transformErr != nil {
+				t.Fatalf("could not create replica-count fixture: %v\n%s", transformErr, input)
+			}
+
+			command := exec.Command(jq, "-er", "-f", filter)
+			command.Stdin = strings.NewReader(string(input))
+			output, filterErr := command.CombinedOutput()
+			if test.wantSuccess {
+				if filterErr != nil {
+					t.Fatalf("replicas=1 was rejected: %v\n%s", filterErr, output)
+				}
+				if strings.TrimSpace(string(output)) != "1" {
+					t.Fatalf("replicas=1 produced %q, not 1", output)
+				}
+			} else if filterErr == nil {
+				t.Fatalf("sabotaged replica count unexpectedly passed: %s", output)
+			}
+		})
+	}
+}
+
 func TestDeployScriptRejectsConcurrentReleaseMutation(t *testing.T) {
 	requirePOSIXShell(t)
 	manifest := baselineManifest(true, "*", "false")
@@ -501,13 +594,27 @@ canonical_resource() {
 json_resource() {
   local manifest=$1
   local resource=$2
-  local resource_file canonical kind
+  local resource_file canonical kind replicas
   resource_file=$(mktemp)
   extract_resource "$manifest" "$resource" > "$resource_file"
   canonical=$(canonical_resource "$resource_file")
   kind=${resource%%/*}
-  jq -cn --arg kind "$kind" --arg canonical "$canonical" \
-    '{apiVersion:"fixture/v1",kind:$kind,spec:{fixtureCanonical:$canonical}}'
+  replicas=$(awk '
+    /^spec:[[:space:]]*$/ { spec = 1; next }
+    spec && /^  replicas:[[:space:]]*/ {
+      value = $0
+      sub(/^  replicas:[[:space:]]*/, "", value)
+      print value
+      exit
+    }
+  ' "$resource_file")
+  if [ -n "$replicas" ]; then
+    jq -cn --arg kind "$kind" --arg canonical "$canonical" --argjson replicas "$replicas" \
+      '{apiVersion:"fixture/v1",kind:$kind,spec:{fixtureCanonical:$canonical,replicas:$replicas}}'
+  else
+    jq -cn --arg kind "$kind" --arg canonical "$canonical" \
+      '{apiVersion:"fixture/v1",kind:$kind,spec:{fixtureCanonical:$canonical}}'
+  fi
   rm -f "$resource_file"
 }
 
