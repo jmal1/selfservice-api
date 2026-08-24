@@ -1509,26 +1509,15 @@ func (h *Handler) AdminDeleteTemplate(w http.ResponseWriter, r *http.Request) {
 		respondError(w, r, http.StatusBadRequest, "invalid template id")
 		return
 	}
-	activeReplicaBuild, err := h.db.HasActiveTemplateReplicaBuild(r.Context(), templateID)
+	unsafeReplicaBuild, err := h.db.HasUnsafeTemplateReplicaBuildForDeletion(r.Context(), templateID)
 	if err != nil {
-		h.logger.Error("delete template: check replica builds failed", "error", err, "template_id", templateID)
+		h.logger.Error("delete template: check unsafe replica builds failed", "error", err, "template_id", templateID)
 		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
-	if activeReplicaBuild {
+	if unsafeReplicaBuild {
 		respondError(w, r, http.StatusConflict,
-			"template has an active or cleanup-required source replica build")
-		return
-	}
-	ownedReplicaResource, err := h.db.HasOwnedTemplateReplicaBuildResources(r.Context(), templateID)
-	if err != nil {
-		h.logger.Error("delete template: check owned replica resources failed", "error", err, "template_id", templateID)
-		respondError(w, r, http.StatusInternalServerError, "internal error")
-		return
-	}
-	if ownedReplicaResource {
-		respondError(w, r, http.StatusConflict,
-			"template has a retained source replica that requires an operation-scoped retirement workflow")
+			"template has an active, accepted, or not-fully-cleaned source replica build")
 		return
 	}
 

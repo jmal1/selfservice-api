@@ -26,6 +26,7 @@ type sourceReplicaVCenterStub struct {
 	identity *vcenter.TemplateSourceIdentity
 	target   *vcenter.ReplicaBuildTarget
 	err      error
+	destroy  func(string) error
 }
 
 func (s sourceReplicaVCenterStub) ResolveTemplateSourceIdentity(
@@ -47,6 +48,13 @@ func (s sourceReplicaVCenterStub) ValidateReplicaBuildPrivileges(
 	string,
 	vcenter.ReplicaBuildTarget,
 ) error {
+	return s.err
+}
+
+func (s sourceReplicaVCenterStub) DestroyVM(_ context.Context, moref string) error {
+	if s.destroy != nil {
+		return s.destroy(moref)
+	}
 	return s.err
 }
 
@@ -174,6 +182,140 @@ func TestAdminCreateTemplateSourceReplicaPersistsResolvedIdentityAndPolicy(t *te
 	if dsn == "" {
 		t.Skip("set TEST_DATABASE_URL to an isolated PostgreSQL database to run handler persistence tests")
 	}
+
+	t.Run("delete blocks unsafe replica build before vCenter destroy", func(t *testing.T) {
+		dsn := os.Getenv("TEST_DATABASE_URL")
+		if dsn == "" {
+			t.Skip("set TEST_DATABASE_URL to an isolated PostgreSQL database to run handler persistence tests")
+		}
+		if err := database.RunMigrations(dsn); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		t.Cleanup(cancel)
+		pool, err := pgxpool.New(ctx, dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(pool.Close)
+		templateID := uuid.New()
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO templates (id, name, vcenter_template, vcenter_vm_id, os_type)
+			VALUES ($1, $2, $3, 'vm-5500', 'linux')
+		`, templateID, "delete-guard-"+templateID.String(), "legacy-"+templateID.String()); err != nil {
+			t.Fatal(err)
+		}
+		queries := database.NewQueries(pool)
+		now := time.Now().UTC()
+		anchor := &models.TemplateSourceReplica{
+			TemplateID:           templateID,
+			SourceVMMoref:        "vm-5501",
+			ComputeResourceType:  "ClusterComputeResource",
+			ComputeResourceMoref: "domain-c5501",
+			ComputeResourcePath:  "/DC/host/Source",
+			Status:               models.TemplateSourceReplicaReady,
+			LastValidatedAt:      &now,
+		}
+		if err := queries.CreateTemplateSourceReplica(ctx, anchor); err != nil {
+			t.Fatal(err)
+		}
+		build := &models.TemplateReplicaBuild{
+			TemplateID:           templateID,
+			SourceReplicaID:      anchor.ID,
+			IdempotencyKey:       "delete-ordering",
+			OperationID:          uuid.NewString(),
+			CanaryOperationID:    uuid.NewString(),
+			SourceVMMoref:        anchor.SourceVMMoref,
+			SourceSnapshotName:   "base-image",
+			DestinationName:      "retained-delete-guard",
+			ComputeResourceType:  "ClusterComputeResource",
+			ComputeResourceMoref: "domain-c5502",
+			ComputeResourcePath:  "/DC/host/Target",
+			HostMoref:            "host-5502",
+			HostName:             "target.example.invalid",
+			ResourcePoolMoref:    "resgroup-5502",
+			ResourcePoolPath:     "/DC/host/Target/Resources/Students",
+			DatastoreMoref:       "datastore-5502",
+			DatastoreName:        "replica-ds",
+			FolderMoref:          "group-v5502",
+			FolderPath:           "/DC/vm/Templates",
+			ProvisionDatastore:   "student-ds",
+		}
+		build, _, err = queries.CreateTemplateReplicaBuild(ctx, build, uuid.New())
+		if err != nil {
+			t.Fatal(err)
+		}
+		const worker = "handler-delete-order-test"
+		if _, err := pool.Exec(ctx, `
+			UPDATE jobs SET status = 'in_progress', claimed_by = $2, claimed_at = now()
+			WHERE id = $1
+		`, *build.JobID, worker); err != nil {
+			t.Fatal(err)
+		}
+		build.DestinationVMMoref = "vm-5502"
+		build.Status = models.TemplateReplicaBuildRunning
+		build.Phase = models.TemplateReplicaBuildPhaseValidating
+		if err := queries.SaveTemplateReplicaBuildState(
+			ctx,
+			build,
+			models.TemplateReplicaBuildPhasePending,
+			worker,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := queries.EnsurePendingReplicaForBuild(ctx, build, worker); err != nil {
+			t.Fatal(err)
+		}
+		if err := queries.FailTemplateReplicaBuild(
+			ctx,
+			build,
+			worker,
+			models.TemplateReplicaBuildFailed,
+			models.TemplateReplicaBuildPhaseFailed,
+			"validation_failed",
+			"unsafe result reservation remains",
+		); err != nil {
+			t.Fatal(err)
+		}
+
+		destroyCalls := 0
+		h := NewHandler(
+			queries,
+			nil,
+			sourceReplicaVCenterStub{destroy: func(string) error {
+				destroyCalls++
+				return nil
+			}},
+			slog.New(slog.NewTextHandler(io.Discard, nil)),
+			nil,
+		)
+		req := httptest.NewRequest(http.MethodDelete, "/api/v1/admin/templates/"+templateID.String(), nil)
+		req = withRouteParam(req, "templateID", templateID)
+		rec := httptest.NewRecorder()
+		h.AdminDeleteTemplate(rec, req)
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("delete status=%d body=%s, want 409", rec.Code, rec.Body.String())
+		}
+		if destroyCalls != 0 {
+			t.Fatalf("vCenter DestroyVM calls=%d before DB preflight completed, want 0", destroyCalls)
+		}
+		var templateCount int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM templates WHERE id = $1`, templateID).Scan(&templateCount); err != nil {
+			t.Fatal(err)
+		}
+		if templateCount != 1 {
+			t.Fatal("template row was deleted despite unsafe replica build")
+		}
+		t.Cleanup(func() {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cleanupCancel()
+			_, _ = pool.Exec(cleanupCtx, `DELETE FROM template_source_replica_builds WHERE template_id = $1`, templateID)
+			_, _ = pool.Exec(cleanupCtx, `DELETE FROM jobs WHERE type = 'template_replica_build' AND payload->>'template_id' = $1`, templateID.String())
+			_, _ = pool.Exec(cleanupCtx, `DELETE FROM template_source_replicas WHERE template_id = $1`, templateID)
+			_, _ = pool.Exec(cleanupCtx, `DELETE FROM template_source_replica_policies WHERE template_id = $1`, templateID)
+			_, _ = pool.Exec(cleanupCtx, `DELETE FROM templates WHERE id = $1`, templateID)
+		})
+	})
 	if err := database.RunMigrations(dsn); err != nil {
 		t.Fatal(err)
 	}

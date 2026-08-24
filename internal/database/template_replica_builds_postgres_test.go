@@ -99,6 +99,23 @@ func (f *replicaBuildPostgresFixture) build(key string) *models.TemplateReplicaB
 	}
 }
 
+func (f *replicaBuildPostgresFixture) claimBuildJob(
+	t *testing.T,
+	build *models.TemplateReplicaBuild,
+	worker string,
+) {
+	t.Helper()
+	if build == nil || build.JobID == nil {
+		t.Fatal("build job identity is missing")
+	}
+	if _, err := f.pool.Exec(context.Background(), `
+		UPDATE jobs SET status = 'in_progress', claimed_by = $2, claimed_at = now()
+		WHERE id = $1
+	`, *build.JobID, worker); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCreateTemplateReplicaBuildPostgresConcurrentIdempotency(t *testing.T) {
 	fixture := newReplicaBuildPostgresFixture(t)
 	const callers = 8
@@ -194,6 +211,179 @@ func TestFinalizeTemplateReplicaBuildPostgresIsAnchorFirstAndCleanupGated(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	t.Run("cleanup proof releases reservation", func(t *testing.T) {
+		fixture := newReplicaBuildPostgresFixture(t)
+		build, _, err := fixture.queries.CreateTemplateReplicaBuild(
+			context.Background(),
+			fixture.build("cleanup-release"),
+			uuid.New(),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		const worker = "replica-build-cleanup-test"
+		fixture.claimBuildJob(t, build, worker)
+		build.DestinationVMMoref = "vm-3402"
+		build.Status = models.TemplateReplicaBuildCleanupRequired
+		build.Phase = models.TemplateReplicaBuildPhaseResiduePrepared
+		if err := fixture.queries.SaveTemplateReplicaBuildState(
+			context.Background(),
+			build,
+			models.TemplateReplicaBuildPhasePending,
+			worker,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.queries.EnsurePendingReplicaForBuild(context.Background(), build, worker); err != nil {
+			t.Fatal(err)
+		}
+		resultReplicaID := *build.ResultReplicaID
+		now := time.Now().UTC()
+		build.ResidueCleanedAt = &now
+
+		sabotaged := *build
+		sabotaged.DestinationVMMoref = "vm-9999"
+		if err := fixture.queries.CompleteTemplateReplicaBuildCleanup(
+			context.Background(),
+			&sabotaged,
+			worker,
+			"must not persist mismatched cleanup",
+		); !errors.Is(err, ErrTemplateReplicaBuildConflict) {
+			t.Fatalf("mismatched cleanup error=%v, want conflict", err)
+		}
+		var residueProof *time.Time
+		var persistedResult *uuid.UUID
+		if err := fixture.pool.QueryRow(context.Background(), `
+			SELECT residue_cleaned_at, result_replica_id
+			FROM template_source_replica_builds
+			WHERE id = $1
+		`, build.ID).Scan(&residueProof, &persistedResult); err != nil {
+			t.Fatal(err)
+		}
+		if residueProof != nil || persistedResult == nil || *persistedResult != resultReplicaID {
+			t.Fatalf("sabotaged cleanup partially committed proof=%v result=%v", residueProof, persistedResult)
+		}
+
+		if err := fixture.queries.CompleteTemplateReplicaBuildCleanup(
+			context.Background(),
+			build,
+			worker,
+			"exact retained residue removed",
+		); err != nil {
+			t.Fatal(err)
+		}
+		loaded, err := fixture.queries.GetTemplateReplicaBuild(
+			context.Background(),
+			fixture.templateID,
+			build.ID,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if loaded.ResidueCleanedAt == nil ||
+			loaded.Status != models.TemplateReplicaBuildFailed ||
+			loaded.Phase != models.TemplateReplicaBuildPhaseResidueCleaned ||
+			loaded.ResultReplicaID != nil {
+			t.Fatalf("cleanup terminal state did not survive reload: %+v", loaded)
+		}
+		unsafe, err := fixture.queries.HasUnsafeTemplateReplicaBuildForDeletion(
+			context.Background(),
+			fixture.templateID,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if unsafe {
+			t.Fatal("fully cleaned failed build still blocks template deletion")
+		}
+		var orphanCount int
+		if err := fixture.pool.QueryRow(context.Background(), `
+			SELECT count(*) FROM template_source_replicas WHERE id = $1
+		`, resultReplicaID).Scan(&orphanCount); err != nil {
+			t.Fatal(err)
+		}
+		if orphanCount != 0 {
+			t.Fatalf("non-ready result reservation still exists after exact cleanup: %d", orphanCount)
+		}
+
+		const callers = 6
+		results := make(chan *models.TemplateReplicaBuild, callers)
+		errs := make(chan error, callers)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for range callers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				next, _, err := fixture.queries.CreateTemplateReplicaBuild(
+					context.Background(),
+					fixture.build("cleanup-retry"),
+					uuid.New(),
+				)
+				results <- next
+				errs <- err
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(results)
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		var retryID uuid.UUID
+		for result := range results {
+			if retryID == uuid.Nil {
+				retryID = result.ID
+			}
+			if result.ID != retryID {
+				t.Fatalf("concurrent retry produced builds %s and %s", retryID, result.ID)
+			}
+		}
+	})
+
+	t.Run("failed pre-VM build permits template cascade", func(t *testing.T) {
+		fixture := newReplicaBuildPostgresFixture(t)
+		build, _, err := fixture.queries.CreateTemplateReplicaBuild(
+			context.Background(),
+			fixture.build("pre-vm-failure"),
+			uuid.New(),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		const worker = "replica-build-pre-vm-failure-test"
+		fixture.claimBuildJob(t, build, worker)
+		if err := fixture.queries.FailTemplateReplicaBuild(
+			context.Background(),
+			build,
+			worker,
+			models.TemplateReplicaBuildFailed,
+			models.TemplateReplicaBuildPhaseFailed,
+			"validation_failed",
+			"failed before vCenter submission",
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.queries.DeleteTemplateWithHistory(context.Background(), fixture.templateID); err != nil {
+			t.Fatalf("failed pre-VM build blocked template cascade: %v", err)
+		}
+		var templates, builds int
+		if err := fixture.pool.QueryRow(context.Background(), `
+			SELECT
+				(SELECT count(*) FROM templates WHERE id = $1),
+				(SELECT count(*) FROM template_source_replica_builds WHERE id = $2)
+		`, fixture.templateID, build.ID).Scan(&templates, &builds); err != nil {
+			t.Fatal(err)
+		}
+		if templates != 0 || builds != 0 {
+			t.Fatalf("template/build rows after cascade=%d/%d, want 0/0", templates, builds)
+		}
+	})
 	const worker = "replica-build-finalize-test"
 	if _, err := fixture.pool.Exec(context.Background(), `
 		UPDATE jobs SET status = 'in_progress', claimed_by = $2, claimed_at = now()

@@ -862,11 +862,13 @@ uses the existing strict vCenter client; no build setting may weaken it.
 `template_source_replica_builds` and its job form a durable, claim-fenced state
 machine. Immutable inputs and a prepared/submitting phase are committed before
 each vCenter call. Clone, snapshot, linked-clone canary, canary cleanup, and
-residue-cleanup task MoRefs are reconciled after timeout, restart, or failover;
-an armed operation is never blindly resubmitted. Objects are adopted or deleted
-only by exact MoRef plus the build, operation, and kind markers. Name collisions,
-marker mismatch, or ambiguous lineage fail closed. Operator recovery is limited
-to status, phase-aware retry, and exact cleanup; there is no broad delete.
+residue-cleanup task MoRefs are reconciled after timeout, restart, or failover.
+Clone, snapshot, and linked-clone creation are never blindly resubmitted.
+Destroy submission is the narrow exception: a successor may safely resubmit it
+only after revalidating the exact MoRef plus build, operation, and kind markers.
+Name collisions, marker mismatch, or ambiguous lineage fail closed. Operator
+recovery is limited to status, phase-aware retry, and exact cleanup; there is no
+broad delete.
 
 The retained VM is a powered-off full clone of the ready source anchor's
 `base-image` snapshot with
@@ -886,7 +888,12 @@ reconciles the marked canary. The destination replica remains `pending` or
 `unhealthy` until cleanup is proven absent. One final transaction rechecks the
 compatible ready source anchor and then promotes the destination replica and
 build together. This proves cloneability only; it does not claim guest/L1
-health. Metrics are
+health. If a build never becomes ready, exact retained-VM cleanup atomically
+persists `residue_cleaned_at` and deletes only that build's non-ready replica
+reservation. A new idempotent build can then reuse the compute; the cleaned
+operation itself cannot resume forward work. Template deletion preflights all
+active, accepted, and not-fully-cleaned build ownership before any staging-VM
+destroy. Metrics are
 `crucible_template_replica_build_total`,
 `crucible_template_replica_build_duration_seconds_{sum,count}`,
 `crucible_template_replica_build_phase`,

@@ -36,6 +36,7 @@ type templateReplicaBuildStore interface {
 	EnsurePendingReplicaForBuild(context.Context, *models.TemplateReplicaBuild, string) error
 	FinalizeTemplateReplicaBuild(context.Context, *models.TemplateReplicaBuild, string) error
 	FailTemplateReplicaBuild(context.Context, *models.TemplateReplicaBuild, string, string, string, string, string) error
+	CompleteTemplateReplicaBuildCleanup(context.Context, *models.TemplateReplicaBuild, string, string) error
 }
 
 type templateReplicaBuildClient interface {
@@ -416,9 +417,12 @@ func executeTemplateReplicaBuild(
 				return err
 			}
 
-		case models.TemplateReplicaBuildPhaseCleanupPrepared:
-			if err := client.ValidateReplicaBuildCanary(ctx, canaryReplicaBuildParams(build)); err != nil {
-				return fmt.Errorf("validate linked-clone acceptance canary: %w", err)
+		case models.TemplateReplicaBuildPhaseCleanupPrepared,
+			models.TemplateReplicaBuildPhaseCleanupSubmitting:
+			if build.Phase == models.TemplateReplicaBuildPhaseCleanupPrepared {
+				if err := client.ValidateReplicaBuildCanary(ctx, canaryReplicaBuildParams(build)); err != nil {
+					return fmt.Errorf("validate linked-clone acceptance canary: %w", err)
+				}
 			}
 			armed := false
 			taskRef, gone, err := client.StartReplicaBuildCanaryCleanup(
@@ -428,6 +432,9 @@ func executeTemplateReplicaBuild(
 				build.CanaryOperationID,
 				func(armCtx context.Context) error {
 					err := saveReplicaBuildState(armCtx, store, build, workerID, func() {
+						now := time.Now().UTC()
+						build.SubmissionStartedAt = &now
+						build.CleanupTaskRef = ""
 						build.Phase = models.TemplateReplicaBuildPhaseCleanupSubmitting
 					})
 					armed = err == nil
@@ -436,7 +443,7 @@ func executeTemplateReplicaBuild(
 			)
 			if err != nil {
 				if armed {
-					return fmt.Errorf("acceptance canary cleanup submission outcome is ambiguous: %w", err)
+					return fmt.Errorf("acceptance canary cleanup submission requires reconciliation: %w", err)
 				}
 				return err
 			}
@@ -453,27 +460,6 @@ func executeTemplateReplicaBuild(
 			if err := saveReplicaBuildState(ctx, store, build, workerID, func() {
 				build.CleanupTaskRef = taskRef
 				build.Phase = models.TemplateReplicaBuildPhaseCleanupSubmitted
-			}); err != nil {
-				return err
-			}
-
-		case models.TemplateReplicaBuildPhaseCleanupSubmitting:
-			exists, err := client.ReplicaBuildCanaryExists(ctx, canaryReplicaBuildParams(build))
-			if err != nil {
-				return err
-			}
-			if exists {
-				if replicaBuildSubmissionExpired(build) {
-					return fmt.Errorf("%w: canary cleanup did not remove the exact VM within %s",
-						vcenter.ErrReplicaBuildAmbiguous,
-						replicaBuildAmbiguousSubmissionDeadline)
-				}
-				return replicaBuildReconcileWait(build.Phase)
-			}
-			now := time.Now().UTC()
-			if err := saveReplicaBuildState(ctx, store, build, workerID, func() {
-				build.CleanupCompletedAt = &now
-				build.Phase = models.TemplateReplicaBuildPhaseFinalizing
 			}); err != nil {
 				return err
 			}
@@ -604,24 +590,6 @@ func cleanupTemplateReplicaBuild(
 	}
 	if build.CanaryVMMoref != "" && build.CleanupCompletedAt == nil {
 		switch build.Phase {
-		case models.TemplateReplicaBuildPhaseCleanupSubmitting:
-			exists, err := client.ReplicaBuildCanaryExists(ctx, canaryReplicaBuildParams(build))
-			if err != nil {
-				return err
-			}
-			if exists {
-				if replicaBuildSubmissionExpired(build) {
-					return fmt.Errorf("%w: canary cleanup submission remains ambiguous", vcenter.ErrReplicaBuildAmbiguous)
-				}
-				return replicaBuildReconcileWait(build.Phase)
-			}
-			now := time.Now().UTC()
-			if err := saveReplicaBuildState(ctx, store, build, workerID, func() {
-				build.CleanupCompletedAt = &now
-				build.Phase = models.TemplateReplicaBuildPhaseResiduePrepared
-			}); err != nil {
-				return err
-			}
 		case models.TemplateReplicaBuildPhaseCleanupSubmitted:
 			if err := client.WaitReplicaBuildCleanupTask(ctx, build.CleanupTaskRef); err != nil {
 				exists, findErr := client.ReplicaBuildCanaryExists(ctx, canaryReplicaBuildParams(build))
@@ -663,6 +631,9 @@ func cleanupTemplateReplicaBuild(
 				build.CanaryOperationID,
 				func(armCtx context.Context) error {
 					return saveReplicaBuildState(armCtx, store, build, workerID, func() {
+						now := time.Now().UTC()
+						build.SubmissionStartedAt = &now
+						build.CleanupTaskRef = ""
 						build.Phase = models.TemplateReplicaBuildPhaseCleanupSubmitting
 					})
 				},
@@ -735,40 +706,9 @@ func cleanupTemplateReplicaBuild(
 		}
 	}
 	if build.DestinationVMMoref == "" {
-		return store.FailTemplateReplicaBuild(
-			ctx,
-			build,
-			workerID,
-			models.TemplateReplicaBuildFailed,
-			models.TemplateReplicaBuildPhaseResidueCleaned,
-			"cleanup_complete",
+		return completeTemplateReplicaBuildCleanup(
+			ctx, store, build, workerID,
 			"replica build cleanup completed without a retained VM",
-		)
-	}
-	if build.Phase == models.TemplateReplicaBuildPhaseResidueSubmitting {
-		exists, err := client.ReplicaBuildRetainedVMExists(ctx, retainedReplicaBuildParams(build))
-		if err != nil {
-			return err
-		}
-		if exists {
-			if replicaBuildSubmissionExpired(build) {
-				return fmt.Errorf(
-					"%w: retained replica cleanup submission remains ambiguous",
-					vcenter.ErrReplicaBuildAmbiguous,
-				)
-			}
-			return replicaBuildReconcileWait(build.Phase)
-		}
-		now := time.Now().UTC()
-		build.ResidueCleanedAt = &now
-		return store.FailTemplateReplicaBuild(
-			ctx,
-			build,
-			workerID,
-			models.TemplateReplicaBuildFailed,
-			models.TemplateReplicaBuildPhaseResidueCleaned,
-			"cleanup_complete",
-			"replica build residue was destroyed by operator request",
 		)
 	}
 	if build.Phase == models.TemplateReplicaBuildPhaseResidueSubmitted {
@@ -799,13 +739,8 @@ func cleanupTemplateReplicaBuild(
 		}
 		now := time.Now().UTC()
 		build.ResidueCleanedAt = &now
-		return store.FailTemplateReplicaBuild(
-			ctx,
-			build,
-			workerID,
-			models.TemplateReplicaBuildFailed,
-			models.TemplateReplicaBuildPhaseResidueCleaned,
-			"cleanup_complete",
+		return store.CompleteTemplateReplicaBuildCleanup(
+			ctx, build, workerID,
 			"replica build residue was destroyed by operator request",
 		)
 	}
@@ -816,6 +751,9 @@ func cleanupTemplateReplicaBuild(
 		build.OperationID,
 		func(armCtx context.Context) error {
 			return saveReplicaBuildState(armCtx, store, build, workerID, func() {
+				now := time.Now().UTC()
+				build.SubmissionStartedAt = &now
+				build.ResidueCleanupTaskRef = ""
 				build.Phase = models.TemplateReplicaBuildPhaseResidueSubmitting
 			})
 		},
@@ -824,15 +762,8 @@ func cleanupTemplateReplicaBuild(
 		return err
 	}
 	if gone {
-		now := time.Now().UTC()
-		build.ResidueCleanedAt = &now
-		return store.FailTemplateReplicaBuild(
-			ctx,
-			build,
-			workerID,
-			models.TemplateReplicaBuildFailed,
-			models.TemplateReplicaBuildPhaseResidueCleaned,
-			"cleanup_complete",
+		return completeTemplateReplicaBuildCleanup(
+			ctx, store, build, workerID,
 			"replica build residue was already absent",
 		)
 	}
@@ -843,6 +774,19 @@ func cleanupTemplateReplicaBuild(
 		return err
 	}
 	return replicaBuildReconcileWait(build.Phase)
+}
+
+func completeTemplateReplicaBuildCleanup(
+	ctx context.Context,
+	store templateReplicaBuildStore,
+	build *models.TemplateReplicaBuild,
+	workerID, message string,
+) error {
+	if build.ResidueCleanedAt == nil {
+		now := time.Now().UTC()
+		build.ResidueCleanedAt = &now
+	}
+	return store.CompleteTemplateReplicaBuildCleanup(ctx, build, workerID, message)
 }
 
 func runTemplateReplicaBuild(

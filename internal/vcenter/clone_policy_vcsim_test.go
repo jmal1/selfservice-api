@@ -422,6 +422,23 @@ func TestCloneBuildersApplyVTPMPolicyToSubmittedSpecs(t *testing.T) {
 				if exists, err := c.ReplicaBuildCanaryExists(ctx, canaryParams); err != nil || exists {
 					t.Fatalf("canary residue exists=%t error=%v after exact cleanup", exists, err)
 				}
+				if _, _, err := c.StartReplicaBuildResidueCleanup(
+					ctx,
+					replicaMoref,
+					canaryParams.BuildID,
+					"wrong-operation-id",
+					func(context.Context) error { return nil },
+				); err == nil || !errors.Is(err, ErrReplicaBuildAmbiguous) {
+					t.Fatalf("marker-mismatched retained cleanup error=%v, want ambiguity", err)
+				}
+				retainedParams := ReplicaBuildCloneParams{
+					BuildID:            canaryParams.BuildID,
+					OperationID:        canaryParams.SourceOperationID,
+					DestinationVMMoref: replicaMoref,
+				}
+				if exists, err := c.ReplicaBuildRetainedVMExists(ctx, retainedParams); err != nil || !exists {
+					t.Fatalf("wrong-operation cleanup touched retained VM: exists=%t error=%v", exists, err)
+				}
 
 				cloneParams, err := c.ResolveClonePlacement(ctx, CloneVMParams{
 					TemplateName: source.Reference().Value,

@@ -331,7 +331,10 @@ fails closed.
 
 The worker persists each submission phase before calling vCenter. If a clone,
 snapshot, or cleanup response is lost, a successor reconciles the persisted task
-or exact operation marker and does not blindly submit another task. The retained
+or exact operation marker. Clone, snapshot, and linked-clone creation are never
+blindly resubmitted. An exact-VM destroy may be resubmitted only after the
+successor revalidates the MoRef and build/operation/kind markers; this closes the
+arm-before-RPC crash window without permitting wrong-object deletion. The retained
 clone is a powered-off full clone of the source's `base-image` snapshot using
 `moveAllDiskBackingsAndDisallowSharing`. A vTPM source uses
 `TpmProvisionPolicy=replace`; the build requires distinct public EK
@@ -348,6 +351,13 @@ parent backing. The canary is never booted. Its exact cleanup must finish and
 leave no marked residue before one transaction rechecks the original ready
 anchor and promotes the pending replica plus build to `ready`. This acceptance
 does not establish guest or L1 health.
+
+If acceptance never reaches `ready`, successful exact retained-VM cleanup
+atomically records `residue_cleaned_at` and removes only that build's non-ready
+source-replica reservation. The cleaned operation cannot resume forward work;
+submit a new build with a new idempotency key to reuse that compute resource.
+Template deletion returns `409` before destroying its staging VM while any
+replica build is active, accepted, or still owns an uncleaned VM/reservation.
 
 Do not start one of these builds while provisioning worker claims are disabled:
 `template_replica_build` is a clone-capable job and remains pending under

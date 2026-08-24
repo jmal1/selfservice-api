@@ -3,8 +3,12 @@ BEGIN;
 CREATE TABLE template_source_replica_builds (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     template_id UUID NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
-    source_replica_id UUID NOT NULL REFERENCES template_source_replicas(id) ON DELETE RESTRICT,
-    result_replica_id UUID REFERENCES template_source_replicas(id) ON DELETE RESTRICT,
+    source_replica_id UUID NOT NULL
+        REFERENCES template_source_replicas(id)
+        ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
+    result_replica_id UUID
+        REFERENCES template_source_replicas(id)
+        ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
     job_id UUID UNIQUE REFERENCES jobs(id) ON DELETE RESTRICT,
     idempotency_key TEXT NOT NULL CHECK (idempotency_key <> ''),
     operation_id UUID NOT NULL UNIQUE,

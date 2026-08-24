@@ -185,10 +185,17 @@ lineage is unresolved.
 Use `/retry` only for `status=failed`; it resumes the stored `resume_phase`.
 Use `/cleanup` for failed or `cleanup_required` operations only after confirming
 the stored ownership. Cleanup verifies the exact MoRef and all operation markers
-before deletion. A same-name VM, missing marker, duplicate marker, or property
-read failure must be escalated rather than deleted. `ready` is impossible until
-the linked-clone canary cleanup timestamp is persisted and no marked canary
-residue remains.
+before deletion. If a destroy response is lost, a successor revalidates that
+exact identity and may safely resubmit only the destroy; clone, snapshot, and
+linked-clone creation remain never-resubmit operations. A same-name VM, missing
+marker, duplicate marker, or property read failure must be escalated rather than
+deleted. `ready` is impossible until the linked-clone canary cleanup timestamp is
+persisted and no marked canary residue remains.
+
+After exact retained cleanup, the build reloads with `phase=residue_cleaned`,
+`residue_cleaned_at` set, and no result-replica reservation. Start a new build
+with a new idempotency key to retry that compute. Do not edit replica rows
+manually.
 
 See [Durable retained replica builds](templates.md#durable-retained-replica-builds)
 for API payloads, privilege requirements, metrics, and alert rules.

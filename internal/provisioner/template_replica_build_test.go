@@ -80,6 +80,23 @@ func (f *replicaBuildStoreFake) FailTemplateReplicaBuild(
 	return nil
 }
 
+func (f *replicaBuildStoreFake) CompleteTemplateReplicaBuildCleanup(
+	_ context.Context,
+	build *models.TemplateReplicaBuild,
+	_ string,
+	_ string,
+) error {
+	if build.ResidueCleanedAt == nil {
+		return errors.New("cleanup completion lost residue proof")
+	}
+	f.failedStatus = models.TemplateReplicaBuildFailed
+	f.failedPhase = models.TemplateReplicaBuildPhaseResidueCleaned
+	build.ResultReplicaID = nil
+	build.Status = models.TemplateReplicaBuildFailed
+	build.Phase = models.TemplateReplicaBuildPhaseResidueCleaned
+	return nil
+}
+
 type replicaBuildClientFake struct {
 	startCloneCalls    int
 	startCloneLostOnce bool
@@ -92,6 +109,9 @@ type replicaBuildClientFake struct {
 	startCanaryCleanup int
 	retainedExists     bool
 	findCanary         string
+	canaryCleanupLost  bool
+	residueCleanupLost bool
+	residueGone        bool
 }
 
 func (f *replicaBuildClientFake) StartReplicaBuildClone(
@@ -212,6 +232,9 @@ func (f *replicaBuildClientFake) StartReplicaBuildCanaryCleanup(
 	if err := arm(ctx); err != nil {
 		return "", false, err
 	}
+	if f.canaryCleanupLost && f.startCanaryCleanup == 1 {
+		return "", false, errors.New("destroy response lost")
+	}
 	return "task-cleanup", false, nil
 }
 
@@ -223,6 +246,12 @@ func (f *replicaBuildClientFake) StartReplicaBuildResidueCleanup(
 	f.startResidueCalls++
 	if err := arm(ctx); err != nil {
 		return "", false, err
+	}
+	if f.residueCleanupLost && f.startResidueCalls == 1 {
+		return "", false, errors.New("destroy response lost")
+	}
+	if f.residueGone {
+		return "", true, nil
 	}
 	return "task-residue", false, nil
 }
@@ -391,7 +420,7 @@ func TestExecuteTemplateReplicaBuildRecoversPendingReservationAtValidation(t *te
 	}
 }
 
-func TestCleanupTemplateReplicaBuildReconcilesLostDestroyWithoutResubmission(t *testing.T) {
+func TestCleanupTemplateReplicaBuildRevalidatesLostDestroyByExactMarker(t *testing.T) {
 	store, _ := newReplicaBuildFixture()
 	store.build.Status = models.TemplateReplicaBuildCleanupRequired
 	store.build.Phase = models.TemplateReplicaBuildPhaseResidueSubmitting
@@ -399,7 +428,7 @@ func TestCleanupTemplateReplicaBuildReconcilesLostDestroyWithoutResubmission(t *
 	store.build.DestinationVMMoref = "vm-retained"
 	now := time.Now().UTC()
 	store.build.SubmissionStartedAt = &now
-	client := &replicaBuildClientFake{retainedExists: false}
+	client := &replicaBuildClientFake{retainedExists: false, residueGone: true}
 
 	if err := cleanupTemplateReplicaBuild(
 		context.Background(),
@@ -410,8 +439,8 @@ func TestCleanupTemplateReplicaBuildReconcilesLostDestroyWithoutResubmission(t *
 	); err != nil {
 		t.Fatal(err)
 	}
-	if client.startResidueCalls != 0 {
-		t.Fatalf("ambiguous destroy reconciliation submitted %d duplicate destroy tasks", client.startResidueCalls)
+	if client.startResidueCalls != 1 {
+		t.Fatalf("exact destroy revalidation calls=%d, want 1", client.startResidueCalls)
 	}
 	if store.failedPhase != models.TemplateReplicaBuildPhaseResidueCleaned {
 		t.Fatalf("cleanup terminal phase=%s, want residue_cleaned", store.failedPhase)
@@ -492,5 +521,87 @@ func TestCleanupTemplateReplicaBuildUsesResiduePreparedBeforeDestroySubmission(t
 	}
 	if store.build.Phase != models.TemplateReplicaBuildPhaseResidueSubmitted {
 		t.Fatalf("phase=%s, want residue_submitted", store.build.Phase)
+	}
+}
+
+func TestExecuteTemplateReplicaBuildResubmitsExactCanaryDestroyAfterLostRPC(t *testing.T) {
+	store, job := newReplicaBuildFixture()
+	store.build.Status = models.TemplateReplicaBuildRunning
+	store.build.Phase = models.TemplateReplicaBuildPhaseCleanupPrepared
+	store.build.DestinationVMMoref = "vm-retained"
+	store.build.DestinationSnapshot = "snapshot-retained"
+	store.build.CanaryVMMoref = "vm-canary"
+	client := &replicaBuildClientFake{canaryCleanupLost: true}
+
+	if err := executeTemplateReplicaBuild(context.Background(), store, client, job, "worker-1"); err == nil {
+		t.Fatal("expected accepted-response-loss error")
+	}
+	if store.build.Phase != models.TemplateReplicaBuildPhaseCleanupSubmitting {
+		t.Fatalf("phase after lost destroy response=%s, want cleanup_submitting", store.build.Phase)
+	}
+	if err := executeTemplateReplicaBuild(context.Background(), store, client, job, "worker-2"); err != nil {
+		t.Fatal(err)
+	}
+	if client.startCanaryCleanup != 2 {
+		t.Fatalf("exact canary destroy submissions=%d, want safe re-submission", client.startCanaryCleanup)
+	}
+	if !store.finalized || store.build.CleanupCompletedAt == nil {
+		t.Fatalf("build did not prove canary absence before readiness: %+v", store.build)
+	}
+}
+
+func TestCleanupTemplateReplicaBuildResubmitsExactCanaryDestroyAfterLostRPC(t *testing.T) {
+	store, _ := newReplicaBuildFixture()
+	store.build.Status = models.TemplateReplicaBuildCleanupRequired
+	store.build.Phase = models.TemplateReplicaBuildPhaseCleanupPrepared
+	store.build.ResumePhase = models.TemplateReplicaBuildPhaseCleanupPrepared
+	store.build.DestinationVMMoref = "vm-retained"
+	store.build.CanaryVMMoref = "vm-canary"
+	client := &replicaBuildClientFake{canaryCleanupLost: true}
+
+	if err := cleanupTemplateReplicaBuild(context.Background(), store, client, store.build, "worker-1"); err == nil {
+		t.Fatal("expected accepted-response-loss error")
+	}
+	if err := cleanupTemplateReplicaBuild(context.Background(), store, client, store.build, "worker-2"); err == nil {
+		t.Fatal("expected submitted cleanup reconciliation wait")
+	}
+	if client.startCanaryCleanup != 2 || store.build.Phase != models.TemplateReplicaBuildPhaseCleanupSubmitted {
+		t.Fatalf("canary destroy recovery calls=%d build=%+v", client.startCanaryCleanup, store.build)
+	}
+	if err := cleanupTemplateReplicaBuild(context.Background(), store, client, store.build, "worker-3"); err == nil {
+		t.Fatal("expected retained cleanup reconciliation wait")
+	}
+	if store.build.CleanupCompletedAt == nil || client.startResidueCalls != 1 {
+		t.Fatalf("canary cleanup was not proven before retained cleanup: build=%+v calls=%d", store.build, client.startResidueCalls)
+	}
+}
+
+func TestCleanupTemplateReplicaBuildResubmitsExactResidueDestroyAfterLostRPC(t *testing.T) {
+	store, _ := newReplicaBuildFixture()
+	store.build.Status = models.TemplateReplicaBuildCleanupRequired
+	store.build.Phase = models.TemplateReplicaBuildPhaseResiduePrepared
+	store.build.ResumePhase = models.TemplateReplicaBuildPhaseResiduePrepared
+	store.build.DestinationVMMoref = "vm-retained"
+	now := time.Now().UTC()
+	store.build.CleanupCompletedAt = &now
+	client := &replicaBuildClientFake{residueCleanupLost: true}
+
+	if err := cleanupTemplateReplicaBuild(context.Background(), store, client, store.build, "worker-1"); err == nil {
+		t.Fatal("expected accepted-response-loss error")
+	}
+	if store.build.Phase != models.TemplateReplicaBuildPhaseResidueSubmitting {
+		t.Fatalf("phase after lost residue response=%s, want residue_submitting", store.build.Phase)
+	}
+	if err := cleanupTemplateReplicaBuild(context.Background(), store, client, store.build, "worker-2"); err == nil {
+		t.Fatal("expected submitted residue reconciliation wait")
+	}
+	if client.startResidueCalls != 2 || store.build.Phase != models.TemplateReplicaBuildPhaseResidueSubmitted {
+		t.Fatalf("residue destroy recovery calls=%d build=%+v", client.startResidueCalls, store.build)
+	}
+	if err := cleanupTemplateReplicaBuild(context.Background(), store, client, store.build, "worker-3"); err != nil {
+		t.Fatal(err)
+	}
+	if store.build.ResidueCleanedAt == nil || store.failedPhase != models.TemplateReplicaBuildPhaseResidueCleaned {
+		t.Fatalf("residue cleanup proof was not terminally persisted: %+v", store.build)
 	}
 }
