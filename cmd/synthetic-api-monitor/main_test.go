@@ -497,6 +497,23 @@ func TestProducerCoverageChecks_PassWhenEnabled(t *testing.T) {
 	}
 }
 
+func TestProducerCoverageChecks_AreWiredInMain(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	body := string(src)
+	for _, want := range []string{
+		"for _, check := range producerCoverageChecks(mode.lifecycleEnabled, expectedRunnerEnabled) {",
+		"checks.PodLifecycleEnabled(checks.CoverageConfig{Enabled: lifecycleEnabled})",
+		"checks.RunnerSmokeEnabled(checks.CoverageConfig{Enabled: runnerEnabled})",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("main.go is missing %q; producer coverage wiring is not being registered in production", want)
+		}
+	}
+}
+
 // TestSessionTokenTTL_OutlivesEveryCheckBudget guards the defect found by D2
 // step 5: the session JWT was minted for checkTimeout*(len(checks.All())+1)
 // == 4m30s while lifecycleSafeTimeout granted runner_smoke a 21-minute budget,
