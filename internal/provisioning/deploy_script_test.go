@@ -148,8 +148,8 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			manifest:          baselineManifest(true, "", "false"),
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
-			wantOutput:        "not required immutable rollback revision 161",
-			configureRevision: 160,
+			wantOutput:        "not required immutable rollback revision 162",
+			configureRevision: 161,
 		},
 		{
 			name:       "standard deploy gates before git",
@@ -554,7 +554,7 @@ func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 				writeFile(t, env.atomicRollbackManifest, rollbackManifestWithHistoricalSynthetics(false))
 				writeFile(t, env.containedRollbackManifest, rollbackManifestWithHistoricalSynthetics(true))
 			},
-			wantOutput: "revision-161 immutable image baseline via deployed revision 163",
+			wantOutput: "revision-162 immutable image baseline via deployed revision 164",
 		},
 		{
 			name: "pending synthetic pod destroy after rollback retains lock",
@@ -3154,7 +3154,7 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 		cronjobVerifyMark:         filepath.Join(root, "cronjob-verified"),
 		claimsPausedMark:          filepath.Join(root, "claims-paused.marker"),
 		helmStatus:                "deployed",
-		helmRevision:              161,
+		helmRevision:              162,
 		packageTag:                testSourceSHA,
 		packageDigest:             testDigestB,
 		runArtifactDigest:         testDigestB,
