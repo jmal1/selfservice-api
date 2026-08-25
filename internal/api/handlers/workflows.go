@@ -1,16 +1,31 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/middleware"
 	"github.com/jmal1/selfservice-api/internal/models"
+	"github.com/jmal1/selfservice-api/internal/workflowvalidation"
 )
+
+type workflowActivationStore interface {
+	ActivateWorkflow(context.Context, uuid.UUID) error
+}
+
+func (h *Handler) workflowActivationStore() workflowActivationStore {
+	if h.workflowActivationDB != nil {
+		return h.workflowActivationDB
+	}
+	return h.db
+}
 
 // normalizeScriptLineEndings converts CRLF and bare CR to LF so scripts
 // authored on Windows don't ship to the linux runner with literal carriage
@@ -135,7 +150,7 @@ func (h *Handler) AdminCreateWorkflow(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusCreated, wf)
 }
 
-// AdminUpdateWorkflow updates a workflow. If active, creates a new version.
+// AdminUpdateWorkflow updates a workflow. Reviewed workflows return to draft.
 func (h *Handler) AdminUpdateWorkflow(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "workflowID"))
 	if err != nil {
@@ -242,9 +257,17 @@ func (h *Handler) AdminActivateWorkflow(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if err := h.db.TransitionWorkflowStatus(r.Context(), id,
-		models.WorkflowStatusApproved, models.WorkflowStatusActive); err != nil {
-		respondError(w, r, http.StatusConflict, "workflow is not in approved status")
+	if err := h.workflowActivationStore().ActivateWorkflow(r.Context(), id); err != nil {
+		var validationErr *workflowvalidation.RunActionError
+		switch {
+		case errors.As(err, &validationErr):
+			respondError(w, r, http.StatusUnprocessableEntity, "workflow cannot be activated: "+validationErr.Error())
+		case errors.Is(err, database.ErrWorkflowNotApproved):
+			respondError(w, r, http.StatusConflict, database.ErrWorkflowNotApproved.Error())
+		default:
+			h.logger.Error("failed to activate workflow", "error", err, "workflow_id", id)
+			respondError(w, r, http.StatusInternalServerError, "failed to activate workflow")
+		}
 		return
 	}
 

@@ -25,11 +25,13 @@ shared:
   - '.github/workflows/ci.yaml'
   - '.github/scripts/compute-image-matrix.sh'
   - '.github/path-filters.yaml'
+  - 'internal/actionlibrary/**'
   - 'internal/config/**'
   - 'internal/database/**'
   - 'internal/models/**'
   - 'internal/nats/**'
   - 'internal/provisioning/**'
+  - 'internal/workflowvalidation/**'
 
 api-gateway:
   - 'cmd/api-gateway/**'

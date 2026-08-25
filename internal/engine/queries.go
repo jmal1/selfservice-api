@@ -132,6 +132,7 @@ func (q *Queries) GetWorkflowsForPlaylist(ctx context.Context, playlistID uuid.U
 		JOIN playlist_workflows pw ON w.id = pw.workflow_id
 		WHERE pw.playlist_id = $1
 		  AND w.is_active = true
+		  AND w.status = 'active'
 		ORDER BY pw.execution_order ASC
 	`, playlistID)
 	if err != nil {

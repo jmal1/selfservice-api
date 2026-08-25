@@ -33,6 +33,7 @@ Before producing any output, read the canonical schema and conventions document 
 ## Rules of thumb
 
 - Prefer composing **existing library actions** over authoring new bash. New bash means new code review, new validator findings, new failure modes.
+- Every `run_action` must include a display label followed by a callable: `run_action "SSH is open" port_open ...`. Library slugs are kebab-case database identifiers, but generated bash functions replace hyphens with underscores (`demo-http-service-reachable` → `demo_http_service_reachable`). Never write a label-only call or pass the kebab slug as the command.
 - One action per check — atomic, testable, single-purpose. "Check sshd is running AND check root login is disabled" is two actions, not one.
 - Every action returns `LAST_STUDENT_MESSAGE` with a helpful sentence the student will see. The validator nudges if you forget. Bad: `LAST_STUDENT_MESSAGE="check failed"`. Good: `LAST_STUDENT_MESSAGE="Port 22 is not open on $CRUCIBLE_TARGET_IP — install and start sshd, then retry."`
 - Use `LAST_ERROR` only for errors the *instructor* will read (logs/admin view). Use `LAST_STUDENT_MESSAGE` for everything the student will see.

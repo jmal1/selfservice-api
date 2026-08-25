@@ -56,7 +56,7 @@ the admin UI is a thin wrapper.
 | Field | Required | Notes |
 |---|---|---|
 | `name` | yes | Human-readable; shown in the action picker. |
-| `slug` | yes | `[a-z0-9-]+`, globally unique. This is what workflows call. |
+| `slug` | yes | `[a-z0-9-]+`, globally unique. The runner exports it as a shell function with `-` replaced by `_`. |
 | `description` | yes | One sentence. Shown in the picker. |
 | `action_type` | yes | `command` (most common), `query`, `mutation`, `assertion`. Hint for the UI. |
 | `action_category` | yes | `system`, `network`, `security`, `forensics`, `recon`, `data`. |
@@ -92,8 +92,27 @@ echo "Checking $PARAM_SERVICE is $PARAM_EXPECTED_STATE"
 A workflow calls it like this:
 
 ```bash
-run_action "service-running" service=ssh expected_state=active
+run_action "SSH service is active" service_running --name ssh
 ```
+
+`run_action` always takes a **display label first** and a **callable second**.
+The action's database slug is `service-running`, but its generated shell
+function is `service_running`. The label can contain spaces and is what appears
+in results.
+
+```bash
+# Correct
+run_action "DEMO - HTTP Service Reachable" demo_http_service_reachable
+
+# Invalid: no callable after the label
+run_action "demo-http-service-reachable"
+
+# Invalid: the database slug is not the generated function name
+run_action "DEMO - HTTP Service Reachable" demo-http-service-reachable
+```
+
+Activation checks the persisted workflow against the current action library and
+reports the expected snake-case callable before the workflow can become active.
 
 > [!warning]
 > Param values are passed through the shell unchanged. **Never `eval`**
