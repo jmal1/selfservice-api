@@ -111,6 +111,239 @@ func serverDefaultedSyntheticFoundationEnv(feedURL string) string {
 `
 }
 
+// serverDefaultedWorkerFoundationEnvWithValueFrom builds the worker
+// content-filter env block for the case where
+// WORKER_CONTENT_FILTER_CATEGORY_FEED_BASE_URL is sourced from a Secret or
+// ConfigMap rather than a literal. Real corev1.EnvVar.ValueFrom renders as a
+// "valueFrom:" mapping nested one indent level deeper than the "- name:"
+// line, immediately following it - the exact shape env_from_manifest must
+// distinguish from an omitted (empty) literal value and reject outright,
+// since a secret/configMap-sourced variable is never safely "empty" just
+// because it lacks a literal "value:" line.
+func serverDefaultedWorkerFoundationEnvWithValueFrom(refKind string) string {
+	var refBlock string
+	switch refKind {
+	case "secretKeyRef":
+		refBlock = `          valueFrom:
+            secretKeyRef:
+              name: content-filter-secret
+              key: feed-url
+`
+	case "configMapKeyRef":
+		refBlock = `          valueFrom:
+            configMapKeyRef:
+              name: content-filter-config
+              key: feed-url
+`
+	default:
+		panic("unknown refKind: " + refKind)
+	}
+	return `        env:
+        - name: WORKER_CONTENT_FILTER_ENABLED
+          value: "false"
+        - name: WORKER_CONTENT_FILTER_SOURCE_NETWORK
+          value: "10.100.0.0/16"
+        - name: WORKER_CONTENT_FILTER_CATEGORY_FEED_BASE_URL
+` + refBlock + `        - name: WORKER_CONTENT_FILTER_ALLOWLIST
+`
+}
+
+// serverDefaultedSyntheticFoundationEnvWithValueFrom is the synthetic-cronjob
+// analogue of serverDefaultedWorkerFoundationEnvWithValueFrom above.
+func serverDefaultedSyntheticFoundationEnvWithValueFrom(refKind string) string {
+	var refBlock string
+	switch refKind {
+	case "secretKeyRef":
+		refBlock = `                  valueFrom:
+                    secretKeyRef:
+                      name: content-filter-secret
+                      key: feed-url
+`
+	case "configMapKeyRef":
+		refBlock = `                  valueFrom:
+                    configMapKeyRef:
+                      name: content-filter-config
+                      key: feed-url
+`
+	default:
+		panic("unknown refKind: " + refKind)
+	}
+	return `            env:
+                - name: SYNTHETIC_CONTENT_FILTER_EXPECTED
+                  value: "false"
+                - name: SYNTHETIC_CONTENT_FILTER_SOURCE_NETWORK
+                  value: "10.100.0.0/16"
+                - name: SYNTHETIC_CONTENT_FILTER_CATEGORY_FEED_BASE_URL
+` + refBlock + `                - name: SYNTHETIC_CONTENT_FILTER_ALLOWLIST
+`
+}
+
+// TestEnvFromManifestRejectsValueFrom is the load-bearing regression test for
+// the second, independently-reviewed blocker: the first fix's "any
+// non-'value:' line means the variable was omitted (i.e. empty)" logic also
+// silently accepted a "valueFrom:" secretKeyRef/configMapKeyRef line as an
+// empty value, which would let a Secret- or ConfigMap-sourced content-filter
+// feed URL sail past validate_foundation_intent's "candidate must keep ...
+// its category feed empty" check undetected. env_from_manifest must instead
+// fail closed (non-zero exit, no printed value) whenever the line
+// immediately following "- name: X" is a "valueFrom:" field belonging to
+// that same entry, for both known ValueFrom source kinds and for both
+// foundation vars that legitimately need to read as empty.
+func TestEnvFromManifestRejectsValueFrom(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		variable string
+		manifest string
+	}{
+		{
+			name:     "worker feed url secretKeyRef",
+			variable: "WORKER_CONTENT_FILTER_CATEGORY_FEED_BASE_URL",
+			manifest: serverDefaultedWorkerFoundationEnvWithValueFrom("secretKeyRef"),
+		},
+		{
+			name:     "worker feed url configMapKeyRef",
+			variable: "WORKER_CONTENT_FILTER_CATEGORY_FEED_BASE_URL",
+			manifest: serverDefaultedWorkerFoundationEnvWithValueFrom("configMapKeyRef"),
+		},
+		{
+			name:     "synthetic feed url secretKeyRef",
+			variable: "SYNTHETIC_CONTENT_FILTER_CATEGORY_FEED_BASE_URL",
+			manifest: serverDefaultedSyntheticFoundationEnvWithValueFrom("secretKeyRef"),
+		},
+		{
+			name:     "synthetic feed url configMapKeyRef",
+			variable: "SYNTHETIC_CONTENT_FILTER_CATEGORY_FEED_BASE_URL",
+			manifest: serverDefaultedSyntheticFoundationEnvWithValueFrom("configMapKeyRef"),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			value, code, output := runEnvFromManifest(t, tc.variable, tc.manifest)
+			if code == 0 {
+				t.Fatalf("env_from_manifest %s unexpectedly succeeded with value %q, want it to reject a valueFrom-sourced variable rather than treat it as empty:\n%s", tc.variable, value, output)
+			}
+		})
+	}
+}
+
+// TestEnvFromManifestValueFromSabotage proves TestEnvFromManifestRejectsValueFrom
+// is load-bearing: it runs the *previously shipped* fix (the one that treats
+// any non-"value:" line as an omitted-empty value, without checking whether
+// that line structurally starts the next env item or exits the env
+// list/block/document) against a valueFrom fixture and asserts it wrongly
+// reports the variable as empty. This is exactly the bypass the independent
+// review flagged.
+func TestEnvFromManifestValueFromSabotage(t *testing.T) {
+	requirePOSIXShell(t)
+	const previousEnvFromManifest = `env_from_manifest() {
+  local variable=$1
+  awk -v variable="$variable" '
+    $0 ~ "^[[:space:]]*- name:[[:space:]]*" variable "[[:space:]]*$" {
+      matches++
+      if ((getline next_line) <= 0) {
+        exit 2
+      }
+      if (next_line ~ /^[[:space:]]*value:[[:space:]]*/) {
+        value = next_line
+        sub(/^[[:space:]]*value:[[:space:]]*/, "", value)
+        gsub(/^["'"'"']|["'"'"']$/, "", value)
+      } else {
+        value = ""
+        if (next_line ~ "^[[:space:]]*- name:[[:space:]]*" variable "[[:space:]]*$") {
+          matches++
+        }
+      }
+    }
+    END {
+      if (matches != 1) {
+        exit 3
+      }
+      print value
+    }
+  '
+}
+`
+	manifest := serverDefaultedWorkerFoundationEnvWithValueFrom("secretKeyRef")
+	dir := t.TempDir()
+	manifestPath := filepath.Join(dir, "manifest.yaml")
+	writeFile(t, manifestPath, manifest)
+	scriptPath := filepath.Join(dir, "run.sh")
+	writeExecutable(t, scriptPath, previousEnvFromManifest+
+		"env_from_manifest WORKER_CONTENT_FILTER_CATEGORY_FEED_BASE_URL < \"$1\"\n")
+	out, err := exec.Command("bash", scriptPath, manifestPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("previous env_from_manifest unexpectedly errored (fixture no longer reproduces the bypass): %v\n%s", err, out)
+	}
+	got := strings.TrimSuffix(string(out), "\n")
+	if got != "" {
+		t.Fatalf("previous env_from_manifest returned %q, want it to wrongly report empty for a valueFrom-sourced variable (proving this fixture reproduces the bypass)", got)
+	}
+
+	// The current (hardened) implementation must reject this instead of
+	// silently treating the secret-sourced variable as empty.
+	value, code, output := runEnvFromManifest(t, "WORKER_CONTENT_FILTER_CATEGORY_FEED_BASE_URL", manifest)
+	if code == 0 {
+		t.Fatalf("hardened env_from_manifest unexpectedly succeeded with value %q, want rejection:\n%s", value, output)
+	}
+}
+
+// TestEnvFromManifestOmittedValueListEnd covers the structural shapes that
+// legitimately signal an omitted (empty) value once the consumed line is not
+// itself a "value:" scalar and is not deeper-indented than "- name: X"
+// (which would mean it belongs to X's own entry, e.g. "valueFrom:"): the env
+// list ending because the container has no further env entries and its next
+// field follows at the same indent as the list items (real k8s-rendered
+// YAML aligns a block sequence's "- " markers with their parent mapping
+// key, so a later sibling field of the *container* sits at that same indent
+// - see the "- name: provision-worker" / "env:" / "- name: ..." nesting in
+// serverDefaultedWorkerFoundationEnv above, which mirrors the actual chart
+// and the rest of this package's fixtures), the env list ending via a
+// shallower dedent (e.g. exiting a nested list entirely), and the env list
+// ending because the current YAML document ends and another begins ("---").
+func TestEnvFromManifestOmittedValueListEnd(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		manifest string
+	}{
+		{
+			// This is the shape that actually occurs in real dry-run output
+			// whenever the omitted-value variable happens to be the last env
+			// entry in the container: the container's next field (here
+			// "resources:") is rendered at the *same* indent as "env:" and
+			// its "- name:" items, not indented deeper.
+			name: "list ends via a same-indent sibling container field",
+			manifest: `        env:
+        - name: WORKER_CONTENT_FILTER_CATEGORY_FEED_BASE_URL
+        resources: {}
+`,
+		},
+		{
+			name: "list ends via a dedent to a shallower field",
+			manifest: `          env:
+          - name: WORKER_CONTENT_FILTER_CATEGORY_FEED_BASE_URL
+        resources: {}
+`,
+		},
+		{
+			name: "list ends via a document separator",
+			manifest: `        env:
+        - name: WORKER_CONTENT_FILTER_CATEGORY_FEED_BASE_URL
+---
+apiVersion: v1
+`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			value, code, output := runEnvFromManifest(t, "WORKER_CONTENT_FILTER_CATEGORY_FEED_BASE_URL", tc.manifest)
+			if code != 0 {
+				t.Fatalf("env_from_manifest exited %d:\n%s", code, output)
+			}
+			if value != "" {
+				t.Fatalf("env_from_manifest = %q, want empty", value)
+			}
+		})
+	}
+}
+
 // TestEnvFromManifestOmittedValueSerialization is the load-bearing regression
 // test for the exact 2026-08-25 dry-run failure: a real server-side dry-run
 // response drops an EnvVar's "value:" line entirely when Value is the empty

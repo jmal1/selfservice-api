@@ -181,25 +181,47 @@ env_from_manifest() {
   awk -v variable="$variable" '
     $0 ~ "^[[:space:]]*- name:[[:space:]]*" variable "[[:space:]]*$" {
       matches++
+      match($0, /^[[:space:]]*/)
+      indent = RLENGTH
       if ((getline next_line) <= 0) {
         exit 2
       }
       # A server-defaulted dry-run response marshals corev1.EnvVar with
       # `json:"value,omitempty"`, so an empty Value is not rendered as
       # `value: ""` at all -- the line immediately following "- name: X" can
-      # be the *next* env entrys own "- name:" line instead of Xs value
-      # line. Only treat the consumed line as this variables value when it
-      # is actually a "value:" scalar; otherwise X was omitted (i.e. empty),
-      # and the consumed line must be re-tested against the same name
-      # pattern so an immediately adjacent duplicate of "variable" is still
-      # counted rather than silently swallowed.
+      # instead be the *next* env entrys own "- name:" line, a later sibling
+      # field of the *container* (once the env list has no more items), or a
+      # YAML document separator. All of those are safe to read as "X was
+      # omitted (i.e. empty)" because none of them is a field of Xs own
+      # entry. Real k8s-rendered YAML (see the fixtures in this package)
+      # aligns a block sequences "- " items with their parent key, so any
+      # of those safe shapes sits at the *same or shallower* indent as the
+      # "- name: X" line itself; anything indented *deeper* is a field of Xs
+      # own entry -- most importantly `valueFrom:` (secretKeyRef /
+      # configMapKeyRef), but also any other unrecognized field -- and must
+      # never be silently treated as an empty value: a secret- or
+      # configMap-sourced variable is not empty just because it has no
+      # literal "value:" line.
       if (next_line ~ /^[[:space:]]*value:[[:space:]]*/) {
         value = next_line
         sub(/^[[:space:]]*value:[[:space:]]*/, "", value)
         gsub(/^["'"'"']|["'"'"']$/, "", value)
       } else {
+        match(next_line, /^[[:space:]]*/)
+        next_indent = RLENGTH
+        if (next_indent > indent) {
+          exit 4
+        }
         value = ""
-        if (next_line ~ "^[[:space:]]*- name:[[:space:]]*" variable "[[:space:]]*$") {
+        # The consumed line is not re-examined by this per-line pattern
+        # match, so if it is itself an adjacent "- name: variable" entry at
+        # the same indent (immediately-adjacent duplicate with its own
+        # value also omitted), it must be re-tested here rather than
+        # silently swallowed. Anything else at the same-or-shallower indent
+        # (a sibling container field, a further dedent, or "---") simply
+        # means Xs entry -- and the env list/block/document containing it
+        # -- has ended, with no bearing on duplicate detection.
+        if (next_indent == indent && next_line ~ "^[[:space:]]*- name:[[:space:]]*" variable "[[:space:]]*$") {
           matches++
         }
       }
