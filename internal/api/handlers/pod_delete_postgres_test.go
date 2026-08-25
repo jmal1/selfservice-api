@@ -74,6 +74,13 @@ func newPodDeletePostgresFixture(t *testing.T, vmCount int) *podDeletePostgresFi
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO pods (id, owner_id, name, salt, vlan_id, subnet, status, allow_vm_additions)
+		VALUES ($1, $2, $3, $4, 0, '', 'pending', true)
+	`, fixture.podID, fixture.ownerID, "delete-"+fixture.podID.String(), "abc123"); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatal(err)
+	}
 	vlanTag, subnet, err := fixture.queries.CheckoutVLAN(ctx, tx, fixture.podID, "all")
 	if err != nil {
 		_ = tx.Rollback(ctx)
@@ -81,9 +88,8 @@ func newPodDeletePostgresFixture(t *testing.T, vmCount int) *podDeletePostgresFi
 	}
 	fixture.vlanTag = vlanTag
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO pods (id, owner_id, name, salt, vlan_id, subnet, status, allow_vm_additions)
-		VALUES ($1, $2, $3, $4, $5, $6, 'pending', true)
-	`, fixture.podID, fixture.ownerID, "delete-"+fixture.podID.String(), "abc123", vlanTag, subnet); err != nil {
+		UPDATE pods SET vlan_id = $1, subnet = $2 WHERE id = $3
+	`, vlanTag, subnet, fixture.podID); err != nil {
 		_ = tx.Rollback(ctx)
 		t.Fatal(err)
 	}
