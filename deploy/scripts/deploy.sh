@@ -1894,11 +1894,33 @@ build_upgrade_hook_image_map() {
 # --dry-run=server here (accidentally or otherwise) would turn
 # --force-conflicts into a real, mutating field-ownership takeover against
 # live production objects.
+#
+# The invocation below deliberately uses `command kubectl`, not a bare
+# `kubectl`. Bash resolves an unqualified command name to a matching shell
+# function or alias - including one defined with a `{ ... }` compound
+# command OR a `( ... )` subshell body - before ever doing a PATH lookup for
+# the real binary. If anything else in this file (or anything sourced by
+# it) ever defined `kubectl() { ... }`, `kubectl() ( ... )`, or
+# `alias kubectl=...`, a bare `kubectl` call here would silently run that
+# shadow instead of the real kubectl executable, letting it inject, drop,
+# reorder, or rewrite this call's argv at runtime - for example inserting an
+# unrelated value-consuming flag immediately before --dry-run=server so
+# kubectl's own flag parser consumes the literal string "--dry-run=server"
+# as that flag's *value* instead of recognizing it as --dry-run=server,
+# silently leaving dry-run at its default (server-side mutation) while
+# --force-conflicts is still in effect. `command` forces bash to skip shell
+# function and alias lookup entirely and go straight to a PATH search for
+# the real kubectl binary, so no shadow defined anywhere - regardless of
+# whether it is brace- or subshell-bodied - can ever intercept this call.
+# (Aliases are in any case never expanded in a non-interactive script such
+# as this one unless it explicitly runs `shopt -s expand_aliases`, which it
+# does not; `command` closes the function-shadow path, which is the one
+# that would otherwise work regardless of that setting.)
 kubectl_server_apply_dry_run() {
   local field_manager=$1
   local manifest_path=$2
   local output_format=$3
-  kubectl apply \
+  command kubectl apply \
     --server-side \
     --dry-run=server \
     --force-conflicts \

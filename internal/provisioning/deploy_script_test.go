@@ -874,11 +874,30 @@ const kubectlServerApplyDryRunFunctionName = "kubectl_server_apply_dry_run"
 // and audit than a growing list of individual per-flag scans, each of
 // which can only be proven correct against the specific attacks its
 // author thought to consider.
+//
+// A further independent review found that even this exact-body check does
+// not, by itself, guarantee bash actually executes the real kubectl binary
+// with this literal argv: every kubectl invocation in deploy.sh, including
+// this one, historically called the bare, unqualified command name
+// "kubectl" - which bash resolves to a matching shell function or alias
+// (defined anywhere else in the file, brace- or subshell-bodied) before
+// ever doing a PATH lookup for the real binary. Such a shadow could
+// silently rewrite this call's argv at runtime - for example inserting an
+// unrelated value-consuming flag immediately before --dry-run=server so
+// kubectl's own parser consumes that literal token as the earlier flag's
+// value instead of recognizing it as dry-run - without changing this
+// function's own body at all, defeating byte-equality entirely. The
+// expected body below therefore now begins the kubectl invocation with
+// `command kubectl`, not a bare `kubectl`: `command` forces bash to skip
+// shell function and alias lookup and go straight to a PATH search for the
+// real binary, so no such shadow - however it is defined - can ever
+// intercept this specific call, regardless of what else the file (or
+// anything it sources) defines.
 const kubectlServerApplyDryRunExpectedBody = "kubectl_server_apply_dry_run() {\n" +
 	"  local field_manager=$1\n" +
 	"  local manifest_path=$2\n" +
 	"  local output_format=$3\n" +
-	"  kubectl apply \\\n" +
+	"  command kubectl apply \\\n" +
 	"    --server-side \\\n" +
 	"    --dry-run=server \\\n" +
 	"    --force-conflicts \\\n" +
@@ -1098,36 +1117,61 @@ func findForceConflictsOccurrences(text string) []int {
 //     completely separate leak elsewhere in the file.
 //
 // It also independently rejects any bash function or alias definition named
-// "kubectl" anywhere in the file. Every kubectl invocation in deploy.sh
-// (including inside kubectlServerApplyDryRunFunctionName itself) calls the
-// bare, unqualified command name "kubectl" - bash resolves an unqualified
+// "kubectl" anywhere in the file, whether the function uses a `{ ... }`
+// compound-command body or a `( ... )` subshell body - bash accepts both
+// forms interchangeably as a function definition, and both are resolved in
+// exactly the same way ahead of a PATH lookup. Every kubectl invocation in
+// deploy.sh (including inside kubectlServerApplyDryRunFunctionName itself,
+// prior to the `command kubectl` hardening below) calls the bare,
+// unqualified command name "kubectl" - bash resolves an unqualified
 // command name to a matching shell function or alias before ever doing a
-// PATH lookup for the real binary. A `kubectl() { ... }` shadow function
-// (or `alias kubectl=...`) defined anywhere else in the file would silently
-// intercept every one of those calls, including the one inside
-// kubectlServerApplyDryRunFunctionName - letting it inject, drop, or
-// rewrite argv (for example appending a conflicting --dry-run=none) at
-// runtime without changing kubectlServerApplyDryRunFunctionName's own body
-// at all, which would otherwise still compare equal to
-// kubectlServerApplyDryRunExpectedBody. This check is what makes that
-// byte-equality guarantee actually mean something about what bash will
-// execute, not merely about the helper's own source text in isolation.
-var kubectlShadowDefinitionPattern = regexp.MustCompile(`(?m)^\s*(function\s+kubectl\s*(\(\))?\s*\{|kubectl\s*\(\)\s*\{|alias\s+kubectl=)`)
+// PATH lookup for the real binary. A `kubectl() { ... }` or
+// `kubectl() ( ... )` shadow function (or `alias kubectl=...`) defined
+// anywhere else in the file would silently intercept any bare `kubectl`
+// call reached without `command` - letting it inject, drop, or rewrite
+// argv at runtime (for example inserting an unrelated value-consuming flag
+// immediately before --dry-run=server so kubectl's real flag parser
+// consumes that literal token as the earlier flag's value instead of
+// recognizing it as dry-run) without changing the calling function's own
+// body at all. kubectlServerApplyDryRunFunctionName's own invocation is
+// separately hardened against this by using `command kubectl` (checked via
+// kubectlServerApplyDryRunExpectedBody above, which now requires that
+// prefix); this pattern remains a second, independent, whole-file
+// defense-in-depth check, since a shadow defined here could still
+// intercept any other bare, unqualified `kubectl` call in the file (such as
+// the pre-existing, unrelated `kubectl create --dry-run=server` call used
+// elsewhere) even though it can no longer reach this specific helper.
+var kubectlShadowDefinitionPattern = regexp.MustCompile(`(?m)^\s*(function\s+kubectl\s*(\(\))?\s*[{(]|kubectl\s*\(\)\s*[{(]|alias\s+kubectl=)`)
 
 func checkForceConflictsInvariant(text string) error {
 	stripped := stripBashLineComments(text)
 
 	if loc := kubectlShadowDefinitionPattern.FindStringIndex(stripped); loc != nil {
-		return fmt.Errorf("deploy.sh must never define a shell function or alias named `kubectl` anywhere in the file; bash resolves the bare `kubectl` command name used by every invocation (including inside %s()) to such a shadow before ever consulting PATH for the real binary, letting it inject, drop, or rewrite argv at runtime without changing %s()'s own body at all (found near byte offset %d)", kubectlServerApplyDryRunFunctionName, kubectlServerApplyDryRunFunctionName, loc[0])
+		return fmt.Errorf("deploy.sh must never define a shell function or alias named `kubectl` anywhere in the file (whether brace- or subshell-bodied); bash resolves the bare `kubectl` command name used by any invocation not prefixed with `command` to such a shadow before ever consulting PATH for the real binary, letting it inject, drop, or rewrite argv at runtime (found near byte offset %d)", loc[0])
 	}
 
-	// Exactly one place in the whole file may invoke `kubectl apply` at
-	// all, and it must be inside kubectlServerApplyDryRunFunctionName. This
-	// structurally rules out any other function - mutating or not -
-	// constructing its own separate --server-side/--dry-run=server/
-	// --force-conflicts invocation, or any other kubectl apply entirely.
-	if n := countExactLine(stripped, "kubectl apply"); n != 1 {
-		return fmt.Errorf("expected exactly one `kubectl apply` invocation in the whole file (inside %s()), found %d", kubectlServerApplyDryRunFunctionName, n)
+	// Exactly one place in the whole file may invoke `command kubectl
+	// apply` at all, and it must be inside
+	// kubectlServerApplyDryRunFunctionName. This structurally rules out any
+	// other function - mutating or not - constructing its own separate
+	// --server-side/--dry-run=server/--force-conflicts invocation, or any
+	// other kubectl apply entirely.
+	if n := countExactLine(stripped, "command kubectl apply"); n != 1 {
+		return fmt.Errorf("expected exactly one `command kubectl apply` invocation in the whole file (inside %s()), found %d", kubectlServerApplyDryRunFunctionName, n)
+	}
+
+	// A bare, unqualified `kubectl apply` (missing the `command` prefix)
+	// must never appear anywhere, including inside
+	// kubectlServerApplyDryRunFunctionName itself: without `command`, bash
+	// would resolve the bare "kubectl" name to a shell function or alias
+	// shadow - if one were ever defined anywhere in the file - before doing
+	// a PATH lookup for the real binary, letting such a shadow silently
+	// rewrite this call's argv at runtime without changing this function's
+	// own body at all. This check ensures nobody can reintroduce that
+	// unprotected form later, even if kubectlServerApplyDryRunExpectedBody
+	// were (incorrectly) updated to match it.
+	if n := countExactLine(stripped, "kubectl apply"); n != 0 {
+		return fmt.Errorf("found %d bare `kubectl apply` invocation(s) (missing the `command` prefix) in the whole file; every kubectl apply invocation must read `command kubectl apply` so bash cannot resolve it to a shell function or alias shadow instead of the real binary", n)
 	}
 
 	body, start, end, err := extractFunctionBody(stripped, kubectlServerApplyDryRunFunctionName)
@@ -1602,28 +1646,42 @@ func TestDeployScriptConflictingDryRunAppendFailsAtRuntime(t *testing.T) {
 }
 
 // sabotageDefineKubectlShadowFunction returns a copy of the real deploy.sh
-// with a `kubectl() { ... }` shell function definition inserted near the
-// top of the file, before kubectlServerApplyDryRunFunctionName is defined.
-// Bash resolves the bare, unqualified command name "kubectl" - which is how
-// every kubectl invocation in deploy.sh, including the one inside
-// kubectlServerApplyDryRunFunctionName, is written - to a matching shell
-// function before ever doing a PATH lookup for the real binary. This
-// shadow function is a structural attack the whole-body-equality check
+// with a `kubectl` shell function definition inserted near the top of the
+// file, before kubectlServerApplyDryRunFunctionName is defined. bodyKind
+// selects between bash's two interchangeable function-body forms - "brace"
+// for `kubectl() { ... }` and "subshell" for `kubectl() ( ... )` - both of
+// which bash accepts as a valid function definition and resolves
+// identically. Bash resolves the bare, unqualified command name "kubectl"
+// - which is how every kubectl invocation in deploy.sh was written prior to
+// this round's `command kubectl` hardening - to a matching shell function
+// before ever doing a PATH lookup for the real binary. This shadow function
+// is a structural attack the whole-body-equality check
 // (kubectlServerApplyDryRunExpectedBody) cannot see by construction: it
 // never touches kubectlServerApplyDryRunFunctionName's own body at all, so
-// that body remains byte-for-byte identical to the expected constant, yet
-// bash would still intercept and could silently rewrite the real,
-// unmodified --server-side/--dry-run=server/--force-conflicts call at
-// runtime (for example appending a conflicting --dry-run=none) - exactly
-// the shape a fourth-round independent review reported as unreachable by
-// any check that only inspects the helper's own text.
-func sabotageDefineKubectlShadowFunction(t *testing.T, source string) string {
+// that body remains byte-for-byte identical to the expected constant, yet a
+// bare (non-`command`-prefixed) kubectl call reached elsewhere in the file
+// would still be intercepted and could be silently rewritten at runtime
+// (for example appending a conflicting --dry-run=none) - exactly the shape
+// a fourth-round independent review reported as unreachable by any check
+// that only inspects the helper's own text. A sixth-round independent
+// review additionally reported that the subshell-bodied form specifically
+// evaded an earlier version of the detection regex that matched only the
+// brace-bodied form.
+func sabotageDefineKubectlShadowFunction(t *testing.T, source, bodyKind string) string {
 	t.Helper()
 	const anchor = "kubectl_server_apply_dry_run() {\n"
 	if n := strings.Count(source, anchor); n != 1 {
 		t.Fatalf("expected exactly one occurrence of the %s definition, found %d", kubectlServerApplyDryRunFunctionName, n)
 	}
-	shadow := "kubectl() {\n  command kubectl \"$@\" --dry-run=none\n}\n\n"
+	var shadow string
+	switch bodyKind {
+	case "brace":
+		shadow = "kubectl() {\n  command kubectl \"$@\" --dry-run=none\n}\n\n"
+	case "subshell":
+		shadow = "kubectl() (\n  command kubectl \"$@\" --dry-run=none\n)\n\n"
+	default:
+		t.Fatalf("unknown bodyKind %q", bodyKind)
+	}
 	mutated := strings.Replace(source, anchor, shadow+anchor, 1)
 	if mutated == source {
 		t.Fatal("sabotage mutation had no effect")
@@ -1632,15 +1690,15 @@ func sabotageDefineKubectlShadowFunction(t *testing.T, source string) string {
 }
 
 // TestDeployScriptForceConflictsInvariantDetectsKubectlShadowFunction is a
-// fourth-round independent review's exact structural sabotage:
+// fourth-round independent review's exact structural sabotage, extended by
+// a sixth-round review to also cover the subshell-bodied form:
 // kubectlServerApplyDryRunFunctionName's own body is left completely
-// untouched (it still passes whole-body equality), but a `kubectl() { ... }`
-// shell function is defined elsewhere in the file. Since bash resolves the
-// bare "kubectl" command name used everywhere in deploy.sh to a matching
-// shell function before ever consulting PATH, this shadow would silently
-// intercept and could rewrite every kubectl invocation in the file,
-// including the one, real, still-untouched
-// --server-side/--dry-run=server/--force-conflicts call.
+// untouched (it still passes whole-body equality), but a `kubectl` shell
+// function - either brace- or subshell-bodied - is defined elsewhere in the
+// file. Since bash resolves the bare "kubectl" command name to a matching
+// shell function before ever consulting PATH (for any invocation not
+// itself prefixed with `command`), this shadow would silently intercept
+// and could rewrite any such call reached elsewhere in the file.
 // checkForceConflictsInvariant must reject this independent of the
 // byte-equality check, which by construction cannot see it.
 func TestDeployScriptForceConflictsInvariantDetectsKubectlShadowFunction(t *testing.T) {
@@ -1653,22 +1711,26 @@ func TestDeployScriptForceConflictsInvariantDetectsKubectlShadowFunction(t *test
 		t.Fatalf("precondition failed: unmodified deploy.sh must satisfy the invariant: %v", err)
 	}
 
-	mutated := sabotageDefineKubectlShadowFunction(t, original)
-	if bodyErr := func() error {
-		body, _, _, extractErr := extractFunctionBody(stripBashLineComments(mutated), kubectlServerApplyDryRunFunctionName)
-		if extractErr != nil {
-			return extractErr
-		}
-		if body != kubectlServerApplyDryRunExpectedBody {
-			return fmt.Errorf("sabotage unexpectedly changed %s()'s own body", kubectlServerApplyDryRunFunctionName)
-		}
-		return nil
-	}(); bodyErr != nil {
-		t.Fatalf("precondition failed: sabotage must leave %s()'s own body untouched: %v", kubectlServerApplyDryRunFunctionName, bodyErr)
-	}
+	for _, bodyKind := range []string{"brace", "subshell"} {
+		t.Run(bodyKind, func(t *testing.T) {
+			mutated := sabotageDefineKubectlShadowFunction(t, original, bodyKind)
+			if bodyErr := func() error {
+				body, _, _, extractErr := extractFunctionBody(stripBashLineComments(mutated), kubectlServerApplyDryRunFunctionName)
+				if extractErr != nil {
+					return extractErr
+				}
+				if body != kubectlServerApplyDryRunExpectedBody {
+					return fmt.Errorf("sabotage unexpectedly changed %s()'s own body", kubectlServerApplyDryRunFunctionName)
+				}
+				return nil
+			}(); bodyErr != nil {
+				t.Fatalf("precondition failed: sabotage must leave %s()'s own body untouched: %v", kubectlServerApplyDryRunFunctionName, bodyErr)
+			}
 
-	if err := checkForceConflictsInvariant(mutated); err == nil {
-		t.Fatal("invariant did not detect a `kubectl() { ... }` shadow function defined elsewhere in the file")
+			if err := checkForceConflictsInvariant(mutated); err == nil {
+				t.Fatalf("invariant did not detect a %s-bodied `kubectl` shadow function defined elsewhere in the file", bodyKind)
+			}
+		})
 	}
 }
 
@@ -1816,6 +1878,205 @@ func TestKubectlServerApplyDryRunHelperArgvRejectsConflictingDryRunAppend(t *tes
 			}
 			if !sawServer || !sawNone {
 				t.Fatalf("sabotaged %s shape argv did not contain both the real --dry-run=server and the conflicting --dry-run=none token: %q", shape, argv)
+			}
+		})
+	}
+}
+
+// kubectlBraceShadowFunctionBody and kubectlSubshellShadowFunctionBody are
+// the two forms of a malicious `kubectl` shadow used by the executable
+// tests below: bash accepts a function body written as either a `{ ... }`
+// compound command or a `( ... )` subshell, and resolves the bare name
+// "kubectl" to either one identically, ahead of any PATH lookup, for any
+// invocation that is not itself prefixed with `command`. Both variants, if
+// bash ever actually enters them, first create a marker file at
+// $SHADOW_MARKER - so a test can prove whether bash actually ran the
+// shadow, as opposed to merely defining it unused - and then call through
+// to the real kubectl themselves, appending a conflicting --dry-run=none,
+// to demonstrate concretely what such a shadow could do to any bare,
+// unqualified `kubectl` call it manages to intercept.
+const kubectlBraceShadowFunctionBody = "kubectl() {\n  : > \"$SHADOW_MARKER\"\n  command kubectl \"$@\" --dry-run=none\n}\n\n"
+const kubectlSubshellShadowFunctionBody = "kubectl() (\n  : > \"$SHADOW_MARKER\"\n  command kubectl \"$@\" --dry-run=none\n)\n\n"
+
+// runBashWithKubectlShadow executes a bash harness consisting of shadowDef
+// (a `kubectl` shell-function shadow definition, or "" for none) followed
+// by body (the literal, verbatim source text of a single bash function
+// named kubectlServerApplyDryRunFunctionName - either the real one
+// extracted from deploy.sh, or a deliberately unhardened variant) followed
+// by a call to it, with a recording fake `kubectl` on PATH and a marker
+// file the shadow touches if bash ever actually enters it. It returns the
+// exact argv tokens the fake kubectl received (in call order) and whether
+// the shadow's marker file was created - i.e. whether bash actually
+// resolved the bare "kubectl" name inside body to the shadow rather than to
+// the real fake kubectl on PATH.
+//
+// This is a direct, execution-based proof of what bash's own name
+// resolution does with this exact shadow definition and this exact
+// function body, independent of any Go-side static text analysis: it is
+// the harness a sixth-round independent review asked for so that whether
+// `command kubectl` actually bypasses a shadow is settled by running bash,
+// not by reading the source and reasoning about it.
+func runBashWithKubectlShadow(t *testing.T, shadowDef, body, fieldManager, manifestPath, outputFormat string) (argv []string, shadowInvoked bool) {
+	t.Helper()
+	requirePOSIXShell(t)
+
+	dir := t.TempDir()
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	recordPath := filepath.Join(dir, "argv.record")
+	markerPath := filepath.Join(dir, "shadow.marker")
+
+	writeExecutable(t, filepath.Join(binDir, "kubectl"),
+		"#!/bin/sh\nprintf '%s\\0' \"$@\" >> \"$ARGV_RECORD\"\nexit 0\n")
+
+	harness := "#!/bin/bash\nset -euo pipefail\nNAMESPACE=test-namespace\n" +
+		shadowDef +
+		body +
+		"kubectl_server_apply_dry_run \"$1\" \"$2\" \"$3\"\n"
+	harnessPath := filepath.Join(dir, "harness.sh")
+	writeExecutable(t, harnessPath, harness)
+
+	cmd := exec.Command("bash", harnessPath, fieldManager, manifestPath, outputFormat)
+	cmd.Env = append(os.Environ(),
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"ARGV_RECORD="+recordPath,
+		"SHADOW_MARKER="+markerPath,
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("harness invoking %s (shadow defined=%t) failed: %v\n%s", kubectlServerApplyDryRunFunctionName, shadowDef != "", err, output)
+	}
+
+	recorded, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatalf("fake kubectl did not record any argv: %v", err)
+	}
+	tokens := strings.Split(string(recorded), "\x00")
+	if len(tokens) > 0 && tokens[len(tokens)-1] == "" {
+		tokens = tokens[:len(tokens)-1] // drop the trailing empty element after the final NUL
+	}
+
+	_, statErr := os.Stat(markerPath)
+	return tokens, statErr == nil
+}
+
+// TestKubectlServerApplyDryRunHelperBypassesKubectlShadowFunctions is the
+// executable, direct-execution counterpart of
+// TestDeployScriptForceConflictsInvariantDetectsKubectlShadowFunction: it
+// proves - by actually running bash, not by reasoning about source text -
+// that the real, unmodified kubectl_server_apply_dry_run() body's use of
+// `command kubectl` means a `kubectl` shell-function shadow defined
+// immediately before it, in either a brace- or subshell-bodied form, is
+// never entered at all. Both conditions are checked: the shadow's own
+// marker file must never be created (bash never resolved the bare
+// "kubectl" name inside the helper to the shadow), and the fake kubectl
+// actually on PATH must still receive exactly the same immutable argv as
+// when no shadow is defined at all
+// (TestKubectlServerApplyDryRunHelperArgvIsExactAndImmutable). This is
+// exactly what a sixth-round independent review asked to be proven at the
+// execution level: that the wrapper is not merely absent from the recorded
+// argv, but structurally never invoked in the first place.
+func TestKubectlServerApplyDryRunHelperBypassesKubectlShadowFunctions(t *testing.T) {
+	originalBytes, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _, _, err := extractFunctionBody(string(originalBytes), kubectlServerApplyDryRunFunctionName)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{
+		"apply",
+		"--server-side",
+		"--dry-run=server",
+		"--force-conflicts",
+		"--field-manager=test-field-manager",
+		"-n", "test-namespace",
+		"-f", "/tmp/some-manifest.yaml",
+		"-o", "yaml",
+	}
+
+	cases := []struct {
+		name      string
+		shadowDef string
+	}{
+		{"brace-bodied", kubectlBraceShadowFunctionBody},
+		{"subshell-bodied", kubectlSubshellShadowFunctionBody},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			argv, shadowInvoked := runBashWithKubectlShadow(t, tc.shadowDef, body, "test-field-manager", "/tmp/some-manifest.yaml", "yaml")
+			if shadowInvoked {
+				t.Fatalf("a %s `kubectl` shadow function was entered despite the real helper using `command kubectl`; recorded argv %q", tc.name, argv)
+			}
+			if len(argv) != len(want) {
+				t.Fatalf("argv %q (%d tokens) does not match expected immutable argv %q (%d tokens) with a %s shadow defined", argv, len(argv), want, len(want), tc.name)
+			}
+			for i := range want {
+				if argv[i] != want[i] {
+					t.Fatalf("argv[%d] = %q, want %q (with a %s shadow defined); full argv %q", i, argv[i], want[i], tc.name, argv)
+				}
+			}
+		})
+	}
+}
+
+// TestKubectlShadowFunctionHarnessInterceptsBareKubectlCalls is a
+// counterfactual control for
+// TestKubectlServerApplyDryRunHelperBypassesKubectlShadowFunctions: it
+// proves the shadow-function scaffolding used there is not a no-op, by
+// running the exact same shadow definitions against a deliberately
+// unhardened variant of the helper body - the real body with its
+// "command kubectl apply" prefix stripped back down to a bare
+// "kubectl apply", i.e. what this function looked like before this round's
+// fix - and confirming that in that case the shadow's marker file IS
+// created (bash really did resolve the bare "kubectl" name to the shadow)
+// and the shadow's own conflicting --dry-run=none IS appended to the
+// recorded argv. Without this control, a bug in runBashWithKubectlShadow
+// that made it silently never invoke any shadow at all would make
+// TestKubectlServerApplyDryRunHelperBypassesKubectlShadowFunctions pass for
+// the wrong reason.
+func TestKubectlShadowFunctionHarnessInterceptsBareKubectlCalls(t *testing.T) {
+	originalBytes, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _, _, err := extractFunctionBody(string(originalBytes), kubectlServerApplyDryRunFunctionName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const hardenedLine = "  command kubectl apply \\\n"
+	if !strings.Contains(body, hardenedLine) {
+		t.Fatalf("precondition failed: real helper body does not contain the expected %q line; got:\n%s", hardenedLine, body)
+	}
+	bareBody := strings.Replace(body, hardenedLine, "  kubectl apply \\\n", 1)
+	if bareBody == body {
+		t.Fatal("precondition failed: stripping the `command ` prefix had no effect")
+	}
+
+	cases := []struct {
+		name      string
+		shadowDef string
+	}{
+		{"brace-bodied", kubectlBraceShadowFunctionBody},
+		{"subshell-bodied", kubectlSubshellShadowFunctionBody},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			argv, shadowInvoked := runBashWithKubectlShadow(t, tc.shadowDef, bareBody, "test-field-manager", "/tmp/some-manifest.yaml", "yaml")
+			if !shadowInvoked {
+				t.Fatalf("%s shadow scaffolding did not intercept a bare `kubectl apply` call - the counterfactual control is broken; recorded argv %q", tc.name, argv)
+			}
+			sawNone := false
+			for _, tok := range argv {
+				if tok == "--dry-run=none" {
+					sawNone = true
+				}
+			}
+			if !sawNone {
+				t.Fatalf("%s shadow was entered but did not append its own conflicting --dry-run=none to argv %q", tc.name, argv)
 			}
 		})
 	}
