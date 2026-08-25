@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -821,6 +822,189 @@ func TestDeployScriptPreparesAllWorkloadBaseline(t *testing.T) {
 	}
 }
 
+// TestDeployScriptForceConflictsPairedWithServerSideDryRun is a static
+// invariant: every kubectl apply invocation in deploy.sh must be exactly the
+// three known --server-side --dry-run=server validation-only calls (upgrade
+// hooks, the digest-pinned candidate, and per-document canonicalization),
+// and every one of them must carry --force-conflicts. Production objects
+// (ingress, workload images/env/resources, StatefulSet
+// volumeClaimTemplates, CronJob fields) are already owned by Helm (and one
+// containment field by kubectl-set), so a validation-only SSA dry-run
+// against them must be allowed to take over ownership or Kubernetes
+// correctly rejects it before admission/defaulting validation ever runs.
+// --force-conflicts must never leak onto anything else: the real production
+// apply remains `helm upgrade`, not kubectl apply, and this test proves the
+// total --force-conflicts occurrence count in the file (3) exactly matches
+// the number of server-side dry-run validation calls (3), so a fourth,
+// unpaired, or misplaced occurrence fails this test.
+func TestDeployScriptForceConflictsPairedWithServerSideDryRun(t *testing.T) {
+	source, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+
+	applyBlocks := regexp.MustCompile(`(?s)kubectl apply \\.*?-o (?:yaml|json)[^\n]*`).FindAllString(text, -1)
+	if len(applyBlocks) != 3 {
+		t.Fatalf("expected exactly 3 kubectl apply invocations (upgrade hooks, candidate, per-document canonicalization), found %d:\n%v", len(applyBlocks), applyBlocks)
+	}
+
+	serverSideDryRunCount := 0
+	for _, block := range applyBlocks {
+		hasServerSide := strings.Contains(block, "--server-side")
+		hasDryRunServer := strings.Contains(block, "--dry-run=server")
+		hasForceConflicts := strings.Contains(block, "--force-conflicts")
+		if hasServerSide != hasDryRunServer {
+			t.Fatalf("kubectl apply invocation mixes --server-side and --dry-run=server inconsistently:\n%s", block)
+		}
+		if hasServerSide {
+			serverSideDryRunCount++
+			if !hasForceConflicts {
+				t.Fatalf("server-side dry-run validation must always pair --force-conflicts with --dry-run=server (existing objects are Helm-owned):\n%s", block)
+			}
+		}
+	}
+	if serverSideDryRunCount != 3 {
+		t.Fatalf("expected all 3 kubectl apply invocations to be --server-side --dry-run=server validation-only calls, found %d", serverSideDryRunCount)
+	}
+
+	// Count only actual --force-conflicts flag lines (not explanatory
+	// comments that mention the flag in prose), so this proves the flag
+	// itself never leaks onto a fourth command such as `helm upgrade`.
+	flagOccurrences := forceConflictsFlagLine.FindAllString(text, -1)
+	if len(flagOccurrences) != 3 {
+		t.Fatalf("expected --force-conflicts to appear exactly 3 times as an actual flag (once per server-side dry-run validation call, never elsewhere such as helm upgrade), found %d:\n%v", len(flagOccurrences), flagOccurrences)
+	}
+}
+
+// forceConflictsFlagLine matches an actual `--force-conflicts \` flag line
+// in deploy.sh, as opposed to explanatory comment text that merely mentions
+// the flag in prose.
+var forceConflictsFlagLine = regexp.MustCompile(`(?m)^[ \t]*--force-conflicts \\$`)
+
+// TestDeployScriptServerValidationSucceedsUnderRealisticOwnershipConflicts
+// proves that server_validate_candidate, canonicalize_server_candidate, and
+// validate_upgrade_hooks all still succeed (and the deploy completes) when
+// every existing object they dry-run validate is already owned by another
+// field manager ("helm"), which is the realistic production condition this
+// fix addresses.
+func TestDeployScriptServerValidationSucceedsUnderRealisticOwnershipConflicts(t *testing.T) {
+	requirePOSIXShell(t)
+	live := baselineManifest(true, "", "false")
+	candidate := baselineManifest(true, "*", "false")
+	env := newDeployScriptEnvironment(t, live, candidate)
+	env.simulateOwnershipConflict = true
+	writeFile(t, env.upgradeHookManifest, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestB))
+
+	output, err := env.run("--no-pull")
+	if err != nil {
+		t.Fatalf("candidate validation failed despite --force-conflicts under simulated ownership conflicts: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "deployed exact source") {
+		t.Fatalf("output %q does not indicate a completed deploy", output)
+	}
+	if !strings.Contains(string(output), "server-side dry-run validating immutable upgrade Helm hooks") {
+		t.Fatalf("run did not reach upgrade-hook server validation:\n%s", output)
+	}
+	upgradeBody, readErr := os.ReadFile(env.upgradeLog)
+	if readErr != nil || !strings.Contains(string(upgradeBody), "--atomic") {
+		t.Fatalf("successful candidate did not use atomic Helm upgrade: err=%v body=%q", readErr, upgradeBody)
+	}
+	serverDryRuns, serverReadErr := os.ReadFile(env.serverDryRunLog)
+	if serverReadErr != nil {
+		t.Fatalf("could not read server dry-run log: %v", serverReadErr)
+	}
+	if !strings.Contains(string(serverDryRuns), "--force-conflicts") {
+		t.Fatalf("server-side dry-run invocations did not carry --force-conflicts:\n%s", serverDryRuns)
+	}
+}
+
+// TestDeployScriptForceConflictsIsLoadBearing proves --force-conflicts is
+// not decorative: removing it from any one of the three server-side
+// dry-run validation call sites, in isolation, causes deploy.sh to fail
+// under a realistic ownership conflict against existing Helm-owned
+// objects, exactly as production would without this fix.
+func TestDeployScriptForceConflictsIsLoadBearing(t *testing.T) {
+	requirePOSIXShell(t)
+	originalBytes, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := string(originalBytes)
+
+	for _, functionName := range []string{
+		"validate_upgrade_hooks",
+		"server_validate_candidate",
+		"canonicalize_server_candidate",
+	} {
+		t.Run(functionName, func(t *testing.T) {
+			mutated := stripForceConflictsFromFunction(t, original, functionName)
+			// The sabotaged copy must live alongside the real deploy.sh (not
+			// an isolated temp dir) because deploy.sh locates the Helm chart
+			// via a path relative to its own script directory
+			// ($SCRIPT_DIR/../helm/selfservice); only the repo's deploy/scripts/
+			// directory has that chart as a real sibling.
+			scriptPath := filepath.Join(
+				"..", "..", "deploy", "scripts",
+				"deploy-sabotaged-"+strings.ReplaceAll(functionName, "_", "-")+"-test.sh",
+			)
+			if err := os.WriteFile(scriptPath, []byte(mutated), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { os.Remove(scriptPath) })
+
+			live := baselineManifest(true, "", "false")
+			candidate := baselineManifest(true, "*", "false")
+			env := newDeployScriptEnvironment(t, live, candidate)
+			env.scriptPath = scriptPath
+			env.simulateOwnershipConflict = true
+			writeFile(t, env.upgradeHookManifest, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestB))
+
+			output, runErr := env.run("--no-pull", "--dry-run")
+			if runErr == nil {
+				t.Fatalf("sabotaged %s (missing --force-conflicts) unexpectedly succeeded under a realistic ownership conflict:\n%s", functionName, output)
+			}
+			if !strings.Contains(string(output), "conflict") {
+				t.Fatalf("sabotaged %s failure did not surface the expected ownership-conflict error:\n%s", functionName, output)
+			}
+			if upgradeBody, readErr := os.ReadFile(env.upgradeLog); readErr == nil && len(upgradeBody) > 0 {
+				t.Fatalf("sabotaged %s invoked Helm upgrade despite failing validation: %s", functionName, upgradeBody)
+			}
+		})
+	}
+}
+
+// stripForceConflictsFromFunction returns a copy of source with the
+// --force-conflicts flag line removed from exactly one named bash function's
+// body, leaving every other occurrence (and the rest of the script) intact.
+// It fails the test if the function or the flag cannot be located, or if
+// removal has no effect, so this helper can never silently no-op.
+func stripForceConflictsFromFunction(t *testing.T, source, functionName string) string {
+	t.Helper()
+	marker := functionName + "() {"
+	start := strings.Index(source, marker)
+	if start < 0 {
+		t.Fatalf("could not locate function %s() in deploy.sh", functionName)
+	}
+	relativeEnd := strings.Index(source[start:], "\n}\n")
+	if relativeEnd < 0 {
+		t.Fatalf("could not locate end of function %s() in deploy.sh", functionName)
+	}
+	end := start + relativeEnd + len("\n}\n")
+	body := source[start:end]
+	if !forceConflictsFlagLine.MatchString(body) {
+		t.Fatalf("function %s() does not contain a --force-conflicts flag line to strip", functionName)
+	}
+	stripped := regexp.MustCompile(`(?m)^[ \t]*--force-conflicts \\\n`).ReplaceAllString(body, "")
+	if stripped == body {
+		t.Fatalf("stripping --force-conflicts from %s() had no effect", functionName)
+	}
+	if forceConflictsFlagLine.MatchString(stripped) {
+		t.Fatalf("stripping --force-conflicts from %s() left a residual flag occurrence", functionName)
+	}
+	return source[:start] + stripped + source[end:]
+}
+
 func TestDeployScriptsAreExecutable(t *testing.T) {
 	requirePOSIXShell(t)
 	for _, path := range []string{
@@ -1244,6 +1428,15 @@ type deployScriptEnvironment struct {
 	atomicRollbackMismatch         string
 	postUpgradeMismatch            string
 	postUpgradeObjectMutation      bool
+
+	// simulateOwnershipConflict makes the fake kubectl reject any
+	// `--server-side --dry-run=server` apply that lacks `--force-conflicts`
+	// with a realistic SSA ownership-conflict error, mimicking existing
+	// objects already owned by Helm/kubectl-set in production.
+	simulateOwnershipConflict bool
+	// scriptPath overrides the deploy.sh path invoked by run/runWithUI.
+	// Empty means the real, unmodified repo script.
+	scriptPath string
 }
 
 func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScriptEnvironment {
@@ -1688,6 +1881,17 @@ case "$1" in
       echo "sabotaged final server-side dry-run failure" >&2
       exit 95
     fi
+    if [ "$FAKE_SIMULATE_OWNERSHIP_CONFLICT" = true ] &&
+       [[ "$*" == *"--server-side"* ]] &&
+       [[ "$*" == *"--dry-run=server"* ]] &&
+       [[ "$*" != *"--force-conflicts"* ]]; then
+      echo "error: Apply failed with 1 conflict: conflict with \"helm\" using apps/v1: .spec.replicas" >&2
+      echo "Please review the fields above--they currently have other managers. Here" >&2
+      echo "are the ways you can resolve this warning:" >&2
+      echo "* If you intend to manage all of these fields, please re-run the apply" >&2
+      echo "  command with the --force-conflicts flag." >&2
+      exit 1
+    fi
     manifest=
     while [ "$#" -gt 0 ]; do
       if [ "$1" = "-f" ]; then
@@ -1969,7 +2173,10 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 	if includeUI {
 		args = append(args, "--ui-source-sha", e.uiSourceSHA)
 	}
-	script := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
+	script := e.scriptPath
+	if script == "" {
+		script = filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
+	}
 	cmd := exec.Command("bash", append([]string{script}, args...)...)
 	cmd.Env = append(
 		os.Environ(),
@@ -2002,6 +2209,7 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_EXTERNAL_DRIFT_AFTER_SERVER_DRY_RUN="+strconv.FormatBool(e.externalDriftAfterServerDryRun),
 		"FAKE_FAIL_FINAL_SERVER_DRY_RUN="+strconv.FormatBool(e.failFinalServerDryRun),
 		"FAKE_MUTATE_FINAL_SERVER_OBJECT="+strconv.FormatBool(e.mutateFinalServerObject),
+		"FAKE_SIMULATE_OWNERSHIP_CONFLICT="+strconv.FormatBool(e.simulateOwnershipConflict),
 		"FAKE_DIGEST_A="+testDigestA,
 		"FAKE_DIGEST_B="+testDigestB,
 		"FAKE_SOURCE_SHA="+testSourceSHA,

@@ -1905,9 +1905,15 @@ validate_upgrade_hooks() {
     fi
   done < "$inventory"
   echo "==> server-side dry-run validating immutable upgrade Helm hooks"
+  # --force-conflicts is paired inseparably with --dry-run=server here: these
+  # hook manifests are already Helm-owned, so a validation-only SSA dry-run
+  # must be allowed to take over field ownership to prove admission/defaulting
+  # would succeed. This never affects the real hook execution (Helm applies
+  # the hooks itself during `helm upgrade`), only this read-only proof.
   kubectl apply \
     --server-side \
     --dry-run=server \
+    --force-conflicts \
     --field-manager=crucible-production-deploy-hooks \
     -n "$NAMESPACE" \
     -f "$unpinned_hooks" \
@@ -1997,9 +2003,17 @@ server_validate_candidate() {
   local output=$3
   local canonical_output=$4
   echo "==> server-side dry-run validating the exact digest-pinned candidate"
+  # --force-conflicts is paired inseparably with --dry-run=server here: the
+  # existing production objects (ingress, workload images/env/resources,
+  # StatefulSet volumeClaimTemplates, CronJob fields) are owned by Helm/
+  # kubectl-set, so a validation-only SSA dry-run must be allowed to take
+  # ownership to prove admission/defaulting would succeed. The real apply
+  # remains `helm upgrade`, not this kubectl apply, so this never mutates
+  # anything or changes production's actual field ownership.
   kubectl apply \
     --server-side \
     --dry-run=server \
+    --force-conflicts \
     --field-manager=crucible-production-deploy \
     -n "$NAMESPACE" \
     -f "$manifest" \
@@ -2047,9 +2061,14 @@ canonicalize_server_candidate() {
   split_manifest_documents "$manifest" "$document_dir"
   : > "$rows"
   for document in "$document_dir"/*.yaml; do
+    # --force-conflicts is paired inseparably with --dry-run=server here for
+    # the same reason as server_validate_candidate above: this is a per-
+    # document validation-only SSA dry-run against already Helm-owned
+    # objects, not a mutating apply.
     kubectl apply \
       --server-side \
       --dry-run=server \
+      --force-conflicts \
       --field-manager=crucible-production-deploy \
       -n "$NAMESPACE" \
       -f "$document" \
