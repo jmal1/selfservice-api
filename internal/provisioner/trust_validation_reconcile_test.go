@@ -610,6 +610,10 @@ func (f *fakeRevalidateDB) SetTemplateValidationState(_ context.Context, _ uuid.
 	return nil
 }
 
+func (f *fakeRevalidateDB) MarkTemplateGuestCredentialsVerified(_ context.Context, _ uuid.UUID) error {
+	return nil
+}
+
 func (f *fakeRevalidateDB) GetTemplateByID(_ context.Context, id uuid.UUID) (*models.Template, error) {
 	f.getCalls++
 	if f.tmpl == nil || f.tmpl.ID != id {

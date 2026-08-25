@@ -67,7 +67,8 @@ const BlueprintPinOrderClause = `ORDER BY b.pinned DESC, ` +
 // Migration 000018 added template_state, created_by, vcenter_vm_id,
 // source_type, source_ref, staging_network. Migration 000019 added
 // is_internal. Migration 000029 added visibility. Migration 000030 added
-// pinning support (pinned, pin_order, pinned_at, pinned_by).
+// pinning support (pinned, pin_order, pinned_at, pinned_by). Migration 000036
+// added guest_credentials_verified_at.
 const templateSelectCols = `id, name, vcenter_template, os_type, default_vcpus, default_ram_mb,
 		default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''),
 		default_username, default_password, kind, assign_ip, is_active,
@@ -76,7 +77,8 @@ const templateSelectCols = `id, name, vcenter_template, os_type, default_vcpus, 
 		unattend_mode, unattend_config, guest_id,
 		created_at, updated_at,
 		trust_tier, last_validated_at, last_validation_result,
-		pinned, pin_order, pinned_at, pinned_by`
+		pinned, pin_order, pinned_at, pinned_by,
+		guest_credentials_verified_at`
 
 // scanTemplate populates t from a row whose columns are in templateSelectCols
 // order. Centralizes the column ordering so adding a column in the future
@@ -92,6 +94,7 @@ func scanTemplate(row pgx.Row, t *models.Template) error {
 		&t.CreatedAt, &t.UpdatedAt,
 		&t.TrustTier, &t.LastValidatedAt, &t.LastValidationResult,
 		&t.Pinned, &t.PinOrder, &t.PinnedAt, &t.PinnedBy,
+		&t.GuestCredentialsVerifiedAt,
 	)
 }
 
@@ -390,7 +393,14 @@ func (q *Queries) UpdateTemplate(ctx context.Context, id uuid.UUID, req models.U
 			default_password = COALESCE($10, default_password),
 			kind = COALESCE($11, kind),
 			assign_ip = COALESCE($12, assign_ip),
-			visibility = COALESCE($14, visibility)
+			visibility = COALESCE($14, visibility),
+			guest_credentials_verified_at = CASE
+			    WHEN $9::text IS NOT NULL
+			      OR $10::text IS NOT NULL
+			      OR $11::text IS NOT NULL
+			    THEN NULL
+			    ELSE guest_credentials_verified_at
+			END
 		WHERE id = $1
 		  AND ($13::timestamptz IS NULL OR updated_at = $13)
 		RETURNING `+templateSelectCols+`
@@ -534,7 +544,9 @@ func (q *Queries) UpdateTemplateLifecycleState(ctx context.Context, id uuid.UUID
 func (q *Queries) SetTemplateVCenterVM(ctx context.Context, id uuid.UUID, vcenterVMID string) error {
 	_, err := q.pool.Exec(ctx, `
 		UPDATE templates
-		SET vcenter_vm_id = $2, updated_at = NOW()
+		SET vcenter_vm_id = $2,
+		    guest_credentials_verified_at = NULL,
+		    updated_at = NOW()
 		WHERE id = $1
 	`, id, vcenterVMID)
 	return err
@@ -713,8 +725,10 @@ func (q *Queries) GetPodByID(ctx context.Context, id uuid.UUID) (*models.Pod, er
 		SELECT pv.id, pv.pod_id, pv.template_id, pv.display_name, pv.vcenter_vm_name, pv.vcenter_vm_id,
 		       pv.vcpus, pv.ram_mb, pv.disk_gb, pv.ip_address, pv.status,
 		       COALESCE(t.default_username, ''), COALESCE(t.default_password, ''),
-		       pv.generated_username, pv.generated_password, pv.boot_order, pv.created_at,
-		       COALESCE(t.name, ''), COALESCE(t.os_type, '')
+		       pv.generated_username, pv.generated_password, pv.guest_credentials_verified_at,
+		       pv.guest_credentials_verified_vm_id,
+		       pv.boot_order, pv.created_at,
+		       COALESCE(t.name, ''), COALESCE(t.kind, 'clone_with_customize'), COALESCE(t.os_type, '')
 		FROM pod_vms pv
 		LEFT JOIN templates t ON pv.template_id = t.id
 		WHERE pv.pod_id = $1 AND pv.status != 'deleted' ORDER BY pv.boot_order, pv.created_at
@@ -730,8 +744,10 @@ func (q *Queries) GetPodByID(ctx context.Context, id uuid.UUID) (*models.Pod, er
 			&vm.ID, &vm.PodID, &vm.TemplateID, &vm.DisplayName, &vm.VCenterVMName, &vm.VCenterVMID,
 			&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.IPAddress, &vm.Status,
 			&vm.DefaultUsername, &vm.DefaultPassword,
-			&vm.GeneratedUsername, &vm.GeneratedPassword, &vm.BootOrder, &vm.CreatedAt,
-			&vm.TemplateName, &vm.OSType,
+			&vm.GeneratedUsername, &vm.GeneratedPassword, &vm.GuestCredentialsVerifiedAt,
+			&vm.GuestCredentialsVerifiedVMID,
+			&vm.BootOrder, &vm.CreatedAt,
+			&vm.TemplateName, &vm.TemplateKind, &vm.OSType,
 		); err != nil {
 			return nil, err
 		}
@@ -832,8 +848,10 @@ func (q *Queries) listPodVMsActive(ctx context.Context, podID uuid.UUID) ([]mode
 		SELECT pv.id, pv.pod_id, pv.template_id, pv.display_name, pv.vcenter_vm_name, pv.vcenter_vm_id,
 		       pv.vcpus, pv.ram_mb, pv.disk_gb, pv.ip_address, pv.status,
 		       COALESCE(t.default_username, ''), COALESCE(t.default_password, ''),
-		       pv.generated_username, pv.generated_password, pv.boot_order, pv.created_at,
-		       COALESCE(t.name, ''), COALESCE(t.os_type, '')
+		       pv.generated_username, pv.generated_password, pv.guest_credentials_verified_at,
+		       pv.guest_credentials_verified_vm_id,
+		       pv.boot_order, pv.created_at,
+		       COALESCE(t.name, ''), COALESCE(t.kind, 'clone_with_customize'), COALESCE(t.os_type, '')
 		FROM pod_vms pv
 		LEFT JOIN templates t ON pv.template_id = t.id
 		WHERE pv.pod_id = $1 AND pv.status != 'deleted' ORDER BY pv.boot_order, pv.created_at
@@ -850,8 +868,10 @@ func (q *Queries) listPodVMsActive(ctx context.Context, podID uuid.UUID) ([]mode
 			&vm.ID, &vm.PodID, &vm.TemplateID, &vm.DisplayName, &vm.VCenterVMName, &vm.VCenterVMID,
 			&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.IPAddress, &vm.Status,
 			&vm.DefaultUsername, &vm.DefaultPassword,
-			&vm.GeneratedUsername, &vm.GeneratedPassword, &vm.BootOrder, &vm.CreatedAt,
-			&vm.TemplateName, &vm.OSType,
+			&vm.GeneratedUsername, &vm.GeneratedPassword, &vm.GuestCredentialsVerifiedAt,
+			&vm.GuestCredentialsVerifiedVMID,
+			&vm.BootOrder, &vm.CreatedAt,
+			&vm.TemplateName, &vm.TemplateKind, &vm.OSType,
 		); err != nil {
 			return nil, err
 		}
@@ -1528,8 +1548,9 @@ func (q *Queries) ListPodVMs(ctx context.Context, podID uuid.UUID) ([]models.Pod
 		SELECT pv.id, pv.pod_id, pv.template_id, pv.display_name, pv.vcenter_vm_name, pv.vcenter_vm_id,
 		       pv.vcpus, pv.ram_mb, pv.disk_gb, pv.ip_address, pv.status,
 		       COALESCE(t.default_username, ''), COALESCE(t.default_password, ''),
-		       pv.generated_username, pv.generated_password, pv.created_at,
-		       COALESCE(t.name, ''), COALESCE(t.os_type, '')
+		       pv.generated_username, pv.generated_password, pv.guest_credentials_verified_at,
+		       pv.guest_credentials_verified_vm_id, pv.created_at,
+		       COALESCE(t.name, ''), COALESCE(t.kind, 'clone_with_customize'), COALESCE(t.os_type, '')
 		FROM pod_vms pv
 		LEFT JOIN templates t ON pv.template_id = t.id
 		WHERE pv.pod_id = $1
@@ -1545,8 +1566,9 @@ func (q *Queries) ListPodVMs(ctx context.Context, podID uuid.UUID) ([]models.Pod
 		err := rows.Scan(&vm.ID, &vm.PodID, &vm.TemplateID, &vm.DisplayName, &vm.VCenterVMName, &vm.VCenterVMID,
 			&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.IPAddress, &vm.Status,
 			&vm.DefaultUsername, &vm.DefaultPassword,
-			&vm.GeneratedUsername, &vm.GeneratedPassword, &vm.CreatedAt,
-			&vm.TemplateName, &vm.OSType)
+			&vm.GeneratedUsername, &vm.GeneratedPassword, &vm.GuestCredentialsVerifiedAt,
+			&vm.GuestCredentialsVerifiedVMID, &vm.CreatedAt,
+			&vm.TemplateName, &vm.TemplateKind, &vm.OSType)
 		if err != nil {
 			return nil, err
 		}
@@ -1562,16 +1584,18 @@ func (q *Queries) GetPodVM(ctx context.Context, id uuid.UUID) (*models.PodVM, er
 		SELECT pv.id, pv.pod_id, pv.template_id, pv.display_name, pv.vcenter_vm_name, pv.vcenter_vm_id,
 		       pv.vcpus, pv.ram_mb, pv.disk_gb, pv.ip_address, pv.status,
 		       COALESCE(t.default_username, ''), COALESCE(t.default_password, ''),
-		       pv.generated_username, pv.generated_password, pv.created_at,
-		       COALESCE(t.name, ''), COALESCE(t.os_type, '')
+		       pv.generated_username, pv.generated_password, pv.guest_credentials_verified_at,
+		       pv.guest_credentials_verified_vm_id, pv.created_at,
+		       COALESCE(t.name, ''), COALESCE(t.kind, 'clone_with_customize'), COALESCE(t.os_type, '')
 		FROM pod_vms pv
 		LEFT JOIN templates t ON pv.template_id = t.id
 		WHERE pv.id = $1
 	`, id).Scan(&vm.ID, &vm.PodID, &vm.TemplateID, &vm.DisplayName, &vm.VCenterVMName, &vm.VCenterVMID,
 		&vm.VCPUs, &vm.RAMMB, &vm.DiskGB, &vm.IPAddress, &vm.Status,
 		&vm.DefaultUsername, &vm.DefaultPassword,
-		&vm.GeneratedUsername, &vm.GeneratedPassword, &vm.CreatedAt,
-		&vm.TemplateName, &vm.OSType)
+		&vm.GeneratedUsername, &vm.GeneratedPassword, &vm.GuestCredentialsVerifiedAt,
+		&vm.GuestCredentialsVerifiedVMID, &vm.CreatedAt,
+		&vm.TemplateName, &vm.TemplateKind, &vm.OSType)
 	if err != nil {
 		return nil, err
 	}
@@ -1581,7 +1605,13 @@ func (q *Queries) GetPodVM(ctx context.Context, id uuid.UUID) (*models.PodVM, er
 // UpdatePodVM updates a pod VM's vCenter details after cloning.
 func (q *Queries) UpdatePodVM(ctx context.Context, id uuid.UUID, vcenterVMID, vcenterVMName, status string) error {
 	_, err := q.pool.Exec(ctx, `
-		UPDATE pod_vms SET vcenter_vm_id = $1, vcenter_vm_name = $2, status = $3 WHERE id = $4
+		UPDATE pod_vms
+		SET vcenter_vm_id = $1,
+		    vcenter_vm_name = $2,
+		    status = $3,
+		    guest_credentials_verified_at = NULL,
+		    guest_credentials_verified_vm_id = NULL
+		WHERE id = $4
 	`, vcenterVMID, vcenterVMName, status, id)
 	return err
 }
@@ -1591,7 +1621,12 @@ func (q *Queries) UpdatePodVM(ctx context.Context, id uuid.UUID, vcenterVMID, vc
 // a stale or concurrently finishing add job.
 func (q *Queries) UpdatePodVMFrom(ctx context.Context, id uuid.UUID, fromStatuses []string, vcenterVMID, vcenterVMName, status string) (bool, error) {
 	tag, err := q.pool.Exec(ctx, `
-		UPDATE pod_vms SET vcenter_vm_id = $1, vcenter_vm_name = $2, status = $3
+		UPDATE pod_vms
+		SET vcenter_vm_id = $1,
+		    vcenter_vm_name = $2,
+		    status = $3,
+		    guest_credentials_verified_at = NULL,
+		    guest_credentials_verified_vm_id = NULL
 		WHERE id = $4 AND status = ANY($5)
 	`, vcenterVMID, vcenterVMName, status, id, fromStatuses)
 	if err != nil {
@@ -1924,7 +1959,11 @@ func (q *Queries) AdoptPodVMClone(
 
 	tag, err := tx.Exec(ctx, `
 		UPDATE pod_vms
-		SET vcenter_vm_id = $1, vcenter_vm_name = $2, status = $3
+		SET vcenter_vm_id = $1,
+		    vcenter_vm_name = $2,
+		    status = $3,
+		    guest_credentials_verified_at = NULL,
+		    guest_credentials_verified_vm_id = NULL
 		WHERE id = $4
 		  AND status = ANY($5)
 		  AND (vcenter_vm_id IS NULL OR vcenter_vm_id = $1)
@@ -2038,6 +2077,14 @@ func (q *Queries) CompleteVMCloneCleanup(
 		SET vcenter_vm_id = CASE WHEN vcenter_vm_id = $2 THEN NULL ELSE vcenter_vm_id END,
 		    vcenter_vm_name = CASE WHEN vcenter_vm_id = $2 THEN NULL ELSE vcenter_vm_name END,
 		    ip_address = CASE WHEN vcenter_vm_id = $2 THEN NULL ELSE ip_address END,
+		    guest_credentials_verified_at = CASE
+		        WHEN vcenter_vm_id = $2 THEN NULL
+		        ELSE guest_credentials_verified_at
+		    END,
+		    guest_credentials_verified_vm_id = CASE
+		        WHEN vcenter_vm_id = $2 THEN NULL
+		        ELSE guest_credentials_verified_vm_id
+		    END,
 		    status = CASE
 		        WHEN status IN ('pending', 'cloning', 'configuring')
 		          AND (vcenter_vm_id = $2 OR vcenter_vm_id IS NULL)
@@ -2093,7 +2140,12 @@ func (q *Queries) MarkJobCompensationCompleted(ctx context.Context, jobID uuid.U
 // destroyed, preserving a newer reference if another operation won the race.
 func (q *Queries) ClearPodVMVCenterReference(ctx context.Context, id uuid.UUID, vcenterVMID string) (bool, error) {
 	tag, err := q.pool.Exec(ctx, `
-		UPDATE pod_vms SET vcenter_vm_id = NULL, vcenter_vm_name = NULL, ip_address = NULL
+		UPDATE pod_vms
+		SET vcenter_vm_id = NULL,
+		    vcenter_vm_name = NULL,
+		    ip_address = NULL,
+		    guest_credentials_verified_at = NULL,
+		    guest_credentials_verified_vm_id = NULL
 		WHERE id = $1 AND vcenter_vm_id = $2
 	`, id, vcenterVMID)
 	if err != nil {
@@ -2123,11 +2175,62 @@ func (q *Queries) UpdatePodVMIP(ctx context.Context, id uuid.UUID, ip string) er
 	return err
 }
 
-// UpdatePodVMCredentials stores the generated credentials for a pod VM.
+// UpdatePodVMCredentials stores the credential pair for a pod VM and clears
+// prior acceptance whenever the pair changes.
 func (q *Queries) UpdatePodVMCredentials(ctx context.Context, id uuid.UUID, username, password string) error {
 	_, err := q.pool.Exec(ctx,
-		`UPDATE pod_vms SET generated_username = $2, generated_password = $3 WHERE id = $1`,
+		`UPDATE pod_vms
+		 SET guest_credentials_verified_at = CASE
+		         WHEN generated_username = $2 AND generated_password = $3
+		         THEN guest_credentials_verified_at
+		         ELSE NULL
+		     END,
+		     guest_credentials_verified_vm_id = CASE
+		         WHEN generated_username = $2 AND generated_password = $3
+		         THEN guest_credentials_verified_vm_id
+		         ELSE NULL
+		     END,
+		     generated_username = $2,
+		     generated_password = $3
+		 WHERE id = $1`,
 		id, username, password)
+	return err
+}
+
+// MarkPodVMCredentialsVerified records acceptance only if the credential pair
+// still matches the one authenticated in the guest.
+func (q *Queries) MarkPodVMCredentialsVerified(
+	ctx context.Context,
+	id uuid.UUID,
+	vcenterVMID, username, password string,
+) (bool, error) {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE pod_vms
+		SET guest_credentials_verified_at = NOW(),
+		    guest_credentials_verified_vm_id = $2
+		WHERE id = $1
+		  AND vcenter_vm_id = $2
+		  AND generated_username = $3
+		  AND generated_password = $4
+	`, id, vcenterVMID, username, password)
+	return tag.RowsAffected() == 1, err
+}
+
+func (q *Queries) ClearTemplateGuestCredentialVerification(ctx context.Context, id uuid.UUID) error {
+	_, err := q.pool.Exec(ctx, `
+		UPDATE templates
+		SET guest_credentials_verified_at = NULL, updated_at = NOW()
+		WHERE id = $1
+	`, id)
+	return err
+}
+
+func (q *Queries) MarkTemplateGuestCredentialsVerified(ctx context.Context, id uuid.UUID) error {
+	_, err := q.pool.Exec(ctx, `
+		UPDATE templates
+		SET guest_credentials_verified_at = NOW(), updated_at = NOW()
+		WHERE id = $1
+	`, id)
 	return err
 }
 

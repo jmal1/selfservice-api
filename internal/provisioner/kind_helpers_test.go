@@ -359,6 +359,68 @@ func TestProvisionedPodVMCredentials_CustomizedCloneNeverUsesBootstrapPassword(t
 	}
 }
 
+func TestRequireTemplateGuestCredentialAcceptance(t *testing.T) {
+	verifiedAt := time.Now()
+	for _, tc := range []struct {
+		name    string
+		tmpl    *models.Template
+		wantErr bool
+	}{
+		{
+			name: "legacy customized template is blocked",
+			tmpl: &models.Template{
+				Kind: models.TemplateKindCloneWithCustomize,
+			},
+			wantErr: true,
+		},
+		{
+			name: "durably verified customized template is accepted",
+			tmpl: &models.Template{
+				Kind:                       models.TemplateKindCloneWithCustomize,
+				GuestCredentialsVerifiedAt: &verifiedAt,
+			},
+		},
+		{
+			name: "static template is explicitly exempt",
+			tmpl: &models.Template{
+				Kind: models.TemplateKindCloneNoCustomize,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := requireTemplateGuestCredentialAcceptance(tc.tmpl)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestRequireTemplateGuestCredentialAcceptanceForNewClone(t *testing.T) {
+	legacyCustomized := &models.Template{Kind: models.TemplateKindCloneWithCustomize}
+	if err := requireTemplateGuestCredentialAcceptanceForNewClone(
+		legacyCustomized,
+		"",
+		false,
+	); err == nil {
+		t.Fatal("brand-new customized clone bypassed template acceptance")
+	}
+	if err := requireTemplateGuestCredentialAcceptanceForNewClone(
+		legacyCustomized,
+		"vm-existing",
+		false,
+	); err != nil {
+		t.Fatalf("existing clone was blocked by transient template state: %v", err)
+	}
+	if err := requireTemplateGuestCredentialAcceptanceForNewClone(
+		legacyCustomized,
+		"",
+		true,
+	); err != nil {
+		t.Fatalf("persisted clone recovery was blocked by transient template state: %v", err)
+	}
+}
+
 type fakeGuestCredentialValidator struct {
 	errs  []error
 	calls int

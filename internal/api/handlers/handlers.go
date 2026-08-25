@@ -381,13 +381,22 @@ func hideUnreadyPodCredentials(pod *models.Pod) {
 		return
 	}
 	for i := range pod.VMs {
-		if pod.VMs[i].Status == models.VMStatusRunning {
+		vm := &pod.VMs[i]
+		staticCredentials := vm.TemplateKind == models.TemplateKindCloneNoCustomize ||
+			vm.TemplateKind == models.TemplateKindRegisteredExistingVM
+		customizedCredentialsAccepted := vm.GuestCredentialsVerifiedAt != nil &&
+			vm.VCenterVMID != nil &&
+			*vm.VCenterVMID != "" &&
+			vm.GuestCredentialsVerifiedVMID != nil &&
+			*vm.GuestCredentialsVerifiedVMID == *vm.VCenterVMID
+		if vm.Status == models.VMStatusRunning &&
+			(staticCredentials || customizedCredentialsAccepted) {
 			continue
 		}
-		pod.VMs[i].DefaultUsername = ""
-		pod.VMs[i].DefaultPassword = ""
-		pod.VMs[i].GeneratedUsername = ""
-		pod.VMs[i].GeneratedPassword = ""
+		vm.DefaultUsername = ""
+		vm.DefaultPassword = ""
+		vm.GeneratedUsername = ""
+		vm.GeneratedPassword = ""
 	}
 }
 

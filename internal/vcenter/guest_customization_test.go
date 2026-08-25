@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/vmware/govmomi/vim25/types"
+	"gopkg.in/yaml.v3"
 )
 
 // decodeGuestinfo pulls the decoded userdata / metadata payloads back out of
@@ -78,15 +79,18 @@ func TestGuestinfoCustomization_LinuxSetsDefaultUserPassword(t *testing.T) {
 	if !strings.HasPrefix(userdata, "#cloud-config") {
 		t.Fatalf("linux userdata is not a cloud-config document:\n%s", userdata)
 	}
-	// The bare top-level password: applies to the image's default user
-	// (student on Crucible images). This is the whole point of the fix.
-	if !strings.Contains(userdata, "\npassword: Changeme123!\n") {
-		t.Fatalf("linux userdata missing top-level password:\n%s", userdata)
+	if strings.Contains(userdata, "\npassword: Changeme123!\n") {
+		t.Fatalf("linux userdata must not rely on the image default user:\n%s", userdata)
 	}
+	if !strings.Contains(userdata, "- name: student\n") ||
+		!strings.Contains(userdata, `password: "Changeme123!"`) {
+		t.Fatalf("linux userdata missing explicit student password mapping:\n%s", userdata)
+	}
+
 	if !strings.Contains(userdata, "expire: false") {
 		t.Fatalf("linux userdata must not force password expiry:\n%s", userdata)
 	}
-	if !strings.Contains(userdata, "hostname: tpl-ubuntu-test") {
+	if !strings.Contains(userdata, `hostname: "tpl-ubuntu-test"`) {
 		t.Fatalf("linux userdata missing hostname:\n%s", userdata)
 	}
 	if !strings.Contains(metadata, `"local-hostname": "tpl-ubuntu-test"`) {
@@ -94,6 +98,46 @@ func TestGuestinfoCustomization_LinuxSetsDefaultUserPassword(t *testing.T) {
 	}
 	if !strings.Contains(metadata, `"instance-id": "instance-linux-1"`) {
 		t.Fatalf("linux metadata missing unique instance identity:\n%s", metadata)
+	}
+}
+
+func TestGuestinfoCustomization_LinuxQuotesEveryLeadingSpecialCharacter(t *testing.T) {
+	for _, special := range "!@#$%&*" {
+		password := string(special) + "LeadingSafe1"
+		t.Run(string(special), func(t *testing.T) {
+			opts, err := guestinfoCustomizationForInstance(
+				"linux",
+				password,
+				"safe-host",
+				"safe-instance-"+string(special),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			userdata, _ := decodeGuestinfo(t, opts)
+			var config struct {
+				Chpasswd struct {
+					Users []struct {
+						Name     string `yaml:"name"`
+						Password string `yaml:"password"`
+						Type     string `yaml:"type"`
+					} `yaml:"users"`
+				} `yaml:"chpasswd"`
+			}
+			if err := yaml.Unmarshal(
+				[]byte(strings.TrimPrefix(userdata, "#cloud-config\n")),
+				&config,
+			); err != nil {
+				t.Fatalf("cloud-config did not parse as YAML: %v\n%s", err, userdata)
+			}
+			if len(config.Chpasswd.Users) != 1 {
+				t.Fatalf("chpasswd users = %d, want 1", len(config.Chpasswd.Users))
+			}
+			user := config.Chpasswd.Users[0]
+			if user.Name != "student" || user.Password != password || user.Type != "text" {
+				t.Fatalf("decoded chpasswd user = %+v, want explicit student and exact password", user)
+			}
+		})
 	}
 }
 
@@ -115,6 +159,11 @@ func TestGuestinfoCustomization_WindowsSetsStudentPassword(t *testing.T) {
 	}
 	if !strings.Contains(userdata, "Get-LocalUser -Name 'Student' | Set-LocalUser -Password $password") {
 		t.Fatalf("windows userdata must set the Student account password:\n%s", userdata)
+	}
+	passwordCommand := "Get-LocalUser -Name 'Student' | " +
+		"Set-LocalUser -Password " + "$password"
+	if strings.Count(userdata, passwordCommand) != 1 || strings.Contains(userdata, "******") {
+		t.Fatalf("windows userdata has malformed Student password wiring:\n%s", userdata)
 	}
 	if !strings.Contains(metadata, `"admin_pass": "Changeme123!"`) {
 		t.Fatalf("windows metadata missing admin_pass:\n%s", metadata)

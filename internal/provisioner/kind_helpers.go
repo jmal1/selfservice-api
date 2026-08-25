@@ -2,10 +2,12 @@ package provisioner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jmal1/selfservice-api/internal/models"
 )
 
@@ -139,8 +141,43 @@ func provisionedPodVMCredentials(
 	return user, password, nil
 }
 
+func requireTemplateGuestCredentialAcceptance(tmpl *models.Template) error {
+	if tmpl == nil {
+		return fmt.Errorf("template is required to verify guest credential acceptance")
+	}
+	if resolveTemplateKind(tmpl.Kind) != models.TemplateKindCloneWithCustomize {
+		return nil
+	}
+	if tmpl.GuestCredentialsVerifiedAt == nil {
+		return fmt.Errorf(
+			"customized template %s has not passed durable guest credential authentication; revalidate it before provisioning",
+			tmpl.ID,
+		)
+	}
+	return nil
+}
+
+func requireTemplateGuestCredentialAcceptanceForNewClone(
+	tmpl *models.Template,
+	existingVMMoref string,
+	resumeCloneOperation bool,
+) error {
+	if strings.TrimSpace(existingVMMoref) != "" || resumeCloneOperation {
+		return nil
+	}
+	return requireTemplateGuestCredentialAcceptance(tmpl)
+}
+
 type guestCredentialValidator interface {
 	ValidateGuestCredentials(ctx context.Context, moref, guestUser, guestPassword string) error
+}
+
+type podVMCredentialAcceptanceStore interface {
+	MarkPodVMCredentialsVerified(
+		ctx context.Context,
+		id uuid.UUID,
+		vcenterVMID, username, password string,
+	) (bool, error)
 }
 
 const (
@@ -160,6 +197,7 @@ func waitForPodVMCredentialReady(
 	if resolveTemplateKind(kind) != models.TemplateKindCloneWithCustomize {
 		return nil
 	}
+
 	if !shouldGenerateGuestPassword(kind, osType) {
 		return fmt.Errorf(
 			"%s cannot verify generated credentials for unsupported OS %q",
@@ -180,4 +218,64 @@ func waitForPodVMCredentialReady(
 		)
 	}
 	return nil
+}
+
+// enforcePodVMCredentialAcceptance is the load-bearing production seam between
+// guest authentication and compensation. Customized clones cannot proceed
+// until both VMware Tools accepts the exact persisted pair and the database
+// durably binds that acceptance to the same pair.
+func enforcePodVMCredentialAcceptance(
+	ctx context.Context,
+	store podVMCredentialAcceptanceStore,
+	validator guestCredentialValidator,
+	podVMID uuid.UUID,
+	kind, osType, moref, username, password string,
+	timeout, interval time.Duration,
+	compensate func(error) error,
+) error {
+	if resolveTemplateKind(kind) != models.TemplateKindCloneWithCustomize {
+		return nil
+	}
+	fail := func(err error) error {
+		if compensate != nil {
+			return compensate(err)
+		}
+		return err
+	}
+	if err := waitForPodVMCredentialReady(
+		ctx,
+		validator,
+		kind,
+		osType,
+		moref,
+		username,
+		password,
+		timeout,
+		interval,
+	); err != nil {
+		return fail(err)
+	}
+	applied, err := store.MarkPodVMCredentialsVerified(
+		ctx,
+		podVMID,
+		moref,
+		username,
+		password,
+	)
+	if err != nil {
+		return fail(fmt.Errorf("persist guest credential acceptance: %w", err))
+	}
+	if !applied {
+		return fail(errors.New("guest credential acceptance no longer matches the persisted credential"))
+	}
+	return nil
+}
+
+func podVMCredentialAccepted(vm *models.PodVM) bool {
+	return vm != nil &&
+		vm.GuestCredentialsVerifiedAt != nil &&
+		vm.VCenterVMID != nil &&
+		*vm.VCenterVMID != "" &&
+		vm.GuestCredentialsVerifiedVMID != nil &&
+		*vm.GuestCredentialsVerifiedVMID == *vm.VCenterVMID
 }

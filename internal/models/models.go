@@ -83,6 +83,10 @@ type Template struct {
 	TrustTier            string     `json:"trust_tier" db:"trust_tier"`
 	LastValidatedAt      *time.Time `json:"last_validated_at,omitempty" db:"last_validated_at"`
 	LastValidationResult *string    `json:"last_validation_result,omitempty" db:"last_validation_result"`
+	// GuestCredentialsVerifiedAt is set only after a fresh smoke clone accepts
+	// the generated credential. Legacy customized templates remain nil until
+	// they pass verification under this contract.
+	GuestCredentialsVerifiedAt *time.Time `json:"guest_credentials_verified_at,omitempty" db:"guest_credentials_verified_at"`
 	// Pinning (migration 000030): instructors can pin templates to emphasize them.
 	// Pinned items appear in a dedicated section above the normal list.
 	Pinned   bool       `json:"pinned" db:"pinned"`
@@ -371,10 +375,16 @@ type PodVM struct {
 	DefaultPassword   string    `json:"default_password" db:"default_password"`
 	GeneratedUsername string    `json:"generated_username" db:"generated_username"`
 	GeneratedPassword string    `json:"generated_password" db:"generated_password"`
-	BootOrder         int       `json:"boot_order" db:"boot_order"`
-	CreatedAt         time.Time `json:"created_at" db:"created_at"`
-	TemplateName      string    `json:"template_name,omitempty"`
-	OSType            string    `json:"os_type,omitempty"`
+	// GuestCredentialsVerifiedAt binds credential disclosure and readiness to
+	// an explicit successful guest authentication, not the VM status alone.
+	GuestCredentialsVerifiedAt *time.Time `json:"guest_credentials_verified_at,omitempty" db:"guest_credentials_verified_at"`
+	// GuestCredentialsVerifiedVMID binds acceptance to the exact vCenter clone.
+	GuestCredentialsVerifiedVMID *string   `json:"guest_credentials_verified_vm_id,omitempty" db:"guest_credentials_verified_vm_id"`
+	BootOrder                    int       `json:"boot_order" db:"boot_order"`
+	CreatedAt                    time.Time `json:"created_at" db:"created_at"`
+	TemplateName                 string    `json:"template_name,omitempty"`
+	TemplateKind                 string    `json:"template_kind,omitempty"`
+	OSType                       string    `json:"os_type,omitempty"`
 	// Activity tracking — set by migration 000025.
 	LastConsoleAt  *time.Time `json:"last_console_at,omitempty" db:"last_console_at"`
 	LastActivityAt *time.Time `json:"last_activity_at,omitempty" db:"last_activity_at"`

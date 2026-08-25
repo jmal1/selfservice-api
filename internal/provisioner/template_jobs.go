@@ -1148,6 +1148,11 @@ func (p *Provisioner) runSmokeCheck(
 		return &compensatedJobError{err: errors.New("interrupted smoke clone was destroyed")}
 	}
 	osType := strings.ToLower(tmpl.OSType)
+	if shouldGenerateGuestPassword(tmpl.Kind, osType) {
+		if err := p.db.ClearTemplateGuestCredentialVerification(ctx, tmpl.ID); err != nil {
+			return fmt.Errorf("clear prior template guest credential acceptance: %w", err)
+		}
+	}
 	network := tmpl.StagingNetwork
 	if network == "" {
 		network = models.CanonicalStagingNetwork
@@ -1418,6 +1423,15 @@ func (p *Provisioner) VerifyTemplate(ctx context.Context, job *models.Job) (err 
 		}
 		return p.verifyFailedToReady(ctx, tmpl.ID, checkErr)
 	}
+	if shouldGenerateGuestPassword(tmpl.Kind, strings.ToLower(tmpl.OSType)) {
+		if err := p.db.MarkTemplateGuestCredentialsVerified(ctx, tmpl.ID); err != nil {
+			return p.verifyFailedToReady(
+				ctx,
+				tmpl.ID,
+				fmt.Errorf("persist template guest credential acceptance: %w", err),
+			)
+		}
+	}
 
 	// All checks passed — promote to active and make it visible.
 	p.publishProgress(job.ID, "publish", "Smoke test passed — publishing template")
@@ -1454,6 +1468,7 @@ type TemplateRevalidatePayload struct {
 type revalidateL1CoreDB interface {
 	SetTemplateValidationState(ctx context.Context, id uuid.UUID, result string, at time.Time) error
 	SetTemplateActive(ctx context.Context, id uuid.UUID, active bool) error
+	MarkTemplateGuestCredentialsVerified(ctx context.Context, id uuid.UUID) error
 }
 
 // revalidateL1CorePipeline is the narrow metrics surface for revalidateL1TemplateCore.
@@ -1616,6 +1631,11 @@ func revalidateL1TemplateJob(
 	checkErr := runSmokeCheck(ctx, tmpl, vmMoref, publish)
 	if isCloneForwardRetry(checkErr) {
 		return checkErr
+	}
+	if checkErr == nil && shouldGenerateGuestPassword(tmpl.Kind, strings.ToLower(tmpl.OSType)) {
+		if err := db.MarkTemplateGuestCredentialsVerified(ctx, tmpl.ID); err != nil {
+			checkErr = fmt.Errorf("persist template guest credential acceptance: %w", err)
+		}
 	}
 
 	revalidateL1TemplateCore(ctx, db, pipeline, logger, tmpl, checkErr)

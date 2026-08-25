@@ -1186,9 +1186,13 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr er
 					errors.New("pod became active before its persisted clone operation was reconciled"),
 				)
 			}
+			if err := p.verifyActivePodCredentialAcceptance(ctx, pod); err != nil {
+				return fmt.Errorf("verify already-active pod credentials: %w", err)
+			}
 			if err := p.releaseVMPlacementCapacity(ctx, job, podVMSpecIDs(payload.VMs)); err != nil {
 				return fmt.Errorf("release already-active pod VM capacity reservations: %w", err)
 			}
+
 			return nil
 		}
 		p.logger.Warn("stale pod create job skipped because pod is no longer provisionable",
@@ -1522,6 +1526,20 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr er
 				fmt.Errorf("get template %s for pod VM %s: %w", podVMRow.TemplateID, vmSpec.PodVMID, err),
 			)
 		}
+		if err := requireTemplateGuestCredentialAcceptanceForNewClone(
+			tmpl,
+			existingVMMoref,
+			resumeCloneOperation,
+		); err != nil {
+			return p.failPodCreateWithCleanup(
+				ctx,
+				job,
+				payload,
+				rb,
+				"verify template credential acceptance",
+				fmt.Errorf("template %s is not credential-ready: %w", podVMRow.TemplateID, err),
+			)
+		}
 
 		osType := vmSpec.OSType
 		if osType == "" && tmpl != nil {
@@ -1779,6 +1797,7 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr er
 		username          string
 		password          string
 		requiresReadiness bool
+		alreadyRunning    bool
 	}
 
 	// Group cloned VMs by boot order
@@ -1853,9 +1872,15 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr er
 			}
 			if podVM.Status == models.VMStatusRunning {
 				groupPoweredOn = append(groupPoweredOn, vmPowerInfo{
-					index:  i,
-					vmSpec: vmSpec,
-					moref:  *podVM.VCenterVMID,
+					index:    i,
+					vmSpec:   vmSpec,
+					moref:    *podVM.VCenterVMID,
+					osType:   podVM.OSType,
+					username: podVM.GeneratedUsername,
+					password: podVM.GeneratedPassword,
+					requiresReadiness: !podVMCredentialAccepted(podVM) &&
+						resolveTemplateKind(vmSpec.Kind) == models.TemplateKindCloneWithCustomize,
+					alreadyRunning: true,
 				})
 				continue
 			}
@@ -1880,7 +1905,17 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr er
 				}
 				if current.Status == models.VMStatusRunning &&
 					current.VCenterVMID != nil && *current.VCenterVMID == *podVM.VCenterVMID {
-					groupPoweredOn = append(groupPoweredOn, vmPowerInfo{index: i, vmSpec: vmSpec, moref: *podVM.VCenterVMID})
+					groupPoweredOn = append(groupPoweredOn, vmPowerInfo{
+						index:    i,
+						vmSpec:   vmSpec,
+						moref:    *podVM.VCenterVMID,
+						osType:   current.OSType,
+						username: current.GeneratedUsername,
+						password: current.GeneratedPassword,
+						requiresReadiness: !podVMCredentialAccepted(current) &&
+							resolveTemplateKind(vmSpec.Kind) == models.TemplateKindCloneWithCustomize,
+						alreadyRunning: true,
+					})
 					continue
 				}
 				if current.Status == models.VMStatusDeleted || current.Status == models.VMStatusError {
@@ -1915,13 +1950,14 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr er
 				osType = podVM.OSType
 			}
 			groupPoweredOn = append(groupPoweredOn, vmPowerInfo{
-				index:             i,
-				vmSpec:            vmSpec,
-				moref:             *podVM.VCenterVMID,
-				osType:            osType,
-				username:          podVM.GeneratedUsername,
-				password:          podVM.GeneratedPassword,
-				requiresReadiness: true,
+				index:    i,
+				vmSpec:   vmSpec,
+				moref:    *podVM.VCenterVMID,
+				osType:   osType,
+				username: podVM.GeneratedUsername,
+				password: podVM.GeneratedPassword,
+				requiresReadiness: !podVMCredentialAccepted(podVM) &&
+					resolveTemplateKind(vmSpec.Kind) == models.TemplateKindCloneWithCustomize,
 			})
 		}
 
@@ -1937,9 +1973,11 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr er
 				wg.Add(1)
 				go func(vmInfo vmPowerInfo) {
 					defer wg.Done()
-					err := waitForPodVMCredentialReady(
+					err := enforcePodVMCredentialAcceptance(
 						ctx,
+						p.db,
 						p.vc,
+						vmInfo.vmSpec.PodVMID,
 						vmInfo.vmSpec.Kind,
 						vmInfo.osType,
 						vmInfo.moref,
@@ -1947,6 +1985,7 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr er
 						vmInfo.password,
 						podGuestCredentialReadyTimeout,
 						podGuestCredentialRetryInterval,
+						nil,
 					)
 					if err != nil {
 						credentialErrs <- fmt.Errorf(
@@ -1987,7 +2026,7 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr er
 		}
 
 		for _, info := range groupPoweredOn {
-			if !info.requiresReadiness {
+			if info.alreadyRunning {
 				continue
 			}
 			applied, err = p.db.UpdatePodVMStatusFrom(
@@ -2057,5 +2096,42 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr er
 	}
 
 	p.logger.Info("pod created successfully", "pod_id", pod.ID, "vlan", vlanTag)
+	return nil
+}
+
+func (p *Provisioner) verifyActivePodCredentialAcceptance(
+	ctx context.Context,
+	pod *models.Pod,
+) error {
+	for i := range pod.VMs {
+		vm := &pod.VMs[i]
+		tmpl, err := p.db.GetTemplateByID(ctx, vm.TemplateID)
+		if err != nil {
+			return fmt.Errorf("load template %s for VM %s: %w", vm.TemplateID, vm.ID, err)
+		}
+		if resolveTemplateKind(tmpl.Kind) != models.TemplateKindCloneWithCustomize ||
+			podVMCredentialAccepted(vm) {
+			continue
+		}
+		if vm.Status != models.VMStatusRunning || vm.VCenterVMID == nil || *vm.VCenterVMID == "" {
+			return fmt.Errorf("customized VM %s lacks a running vCenter identity", vm.ID)
+		}
+		if err := enforcePodVMCredentialAcceptance(
+			ctx,
+			p.db,
+			p.vc,
+			vm.ID,
+			tmpl.Kind,
+			vm.OSType,
+			*vm.VCenterVMID,
+			vm.GeneratedUsername,
+			vm.GeneratedPassword,
+			podGuestCredentialReadyTimeout,
+			podGuestCredentialRetryInterval,
+			nil,
+		); err != nil {
+			return fmt.Errorf("VM %s rejected its persisted credential: %w", vm.ID, err)
+		}
+	}
 	return nil
 }

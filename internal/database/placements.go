@@ -126,6 +126,13 @@ func (q *Queries) CreateTemplateSourceReplica(
 		replica.LastValidationError), replica); err != nil {
 		return err
 	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE templates
+		SET guest_credentials_verified_at = NULL, updated_at = NOW()
+		WHERE id = $1
+	`, replica.TemplateID); err != nil {
+		return fmt.Errorf("invalidate template guest credential acceptance: %w", err)
+	}
 	return tx.Commit(ctx)
 }
 
@@ -213,6 +220,15 @@ func (q *Queries) DeleteTemplateSourceReplica(
 	`, replicaID, templateID)
 	if err != nil {
 		return false, fmt.Errorf("delete template source replica: %w", err)
+	}
+	if tag.RowsAffected() == 1 {
+		if _, err := tx.Exec(ctx, `
+			UPDATE templates
+			SET guest_credentials_verified_at = NULL, updated_at = NOW()
+			WHERE id = $1
+		`, templateID); err != nil {
+			return false, fmt.Errorf("invalidate template guest credential acceptance: %w", err)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return false, err

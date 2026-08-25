@@ -769,6 +769,14 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) (retErr error)
 			fmt.Sprintf("pod entered %s", pod.Status),
 		)
 	}
+	osType := ""
+	tmpl, tmplErr := p.db.GetTemplateByID(ctx, podVM.TemplateID)
+	if tmplErr == nil {
+		osType = tmpl.OSType
+	}
+	if tmplErr != nil {
+		return fmt.Errorf("get template for VM placement: %w", tmplErr)
+	}
 	applied, err := p.db.UpdatePodVMStatusFrom(
 		ctx,
 		podVMID,
@@ -825,6 +833,25 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) (retErr error)
 				)
 			}
 			vmRunningPersisted = true
+			if !podVMCredentialAccepted(current) &&
+				resolveTemplateKind(tmpl.Kind) == models.TemplateKindCloneWithCustomize {
+				if err := enforcePodVMCredentialAcceptance(
+					ctx,
+					p.db,
+					p.vc,
+					podVMID,
+					tmpl.Kind,
+					osType,
+					currentMoref,
+					current.GeneratedUsername,
+					current.GeneratedPassword,
+					podGuestCredentialReadyTimeout,
+					podGuestCredentialRetryInterval,
+					nil,
+				); err != nil {
+					return fmt.Errorf("verify persisted running VM guest credentials: %w", err)
+				}
+			}
 			if err := p.releaseVMPlacementCapacity(ctx, job, []uuid.UUID{podVMID}); err != nil {
 				return fmt.Errorf("release running added VM capacity reservation: %w", err)
 			}
@@ -844,20 +871,19 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) (retErr error)
 		}
 		return nil
 	}
+	if err := requireTemplateGuestCredentialAcceptanceForNewClone(
+		tmpl,
+		moref,
+		payload.CloneOperation != nil,
+	); err != nil {
+		return fmt.Errorf("template %s is not credential-ready: %w", podVM.TemplateID, err)
+	}
 
 	pgName := fmt.Sprintf("Pod-VLAN%d", pod.VLANID)
 
 	// Resolve and durably persist credentials before clone submission. Retries
 	// must reuse the exact password already written to guestinfo instead of
 	// generating a new display-only value for an adopted clone.
-	osType := ""
-	tmpl, tmplErr := p.db.GetTemplateByID(ctx, podVM.TemplateID)
-	if tmplErr == nil {
-		osType = tmpl.OSType
-	}
-	if tmplErr != nil {
-		return fmt.Errorf("get template for VM placement: %w", tmplErr)
-	}
 	storedUsername, storedPassword, credentialErr := provisionedPodVMCredentials(
 		tmpl.Kind,
 		osType,
@@ -1123,9 +1149,11 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) (retErr error)
 	// Step 3: prove customized credentials were consumed before the VM can
 	// become success-shaped. Static credential kinds intentionally bypass this
 	// generated-credential gate.
-	if err := waitForPodVMCredentialReady(
+	if err := enforcePodVMCredentialAcceptance(
 		ctx,
+		p.db,
 		p.vc,
+		podVMID,
 		tmpl.Kind,
 		osType,
 		moref,
@@ -1133,15 +1161,18 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) (retErr error)
 		storedPassword,
 		podGuestCredentialReadyTimeout,
 		podGuestCredentialRetryInterval,
+		func(err error) error {
+			return p.failVMAddWithCleanup(
+				ctx,
+				job,
+				podID,
+				podVMID,
+				moref,
+				fmt.Errorf("verify added VM guest credentials: %w", err),
+			)
+		},
 	); err != nil {
-		return p.failVMAddWithCleanup(
-			ctx,
-			job,
-			podID,
-			podVMID,
-			moref,
-			fmt.Errorf("verify added VM guest credentials: %w", err),
-		)
+		return err
 	}
 
 	// Step 4: Wait for IP

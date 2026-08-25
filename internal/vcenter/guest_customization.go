@@ -2,6 +2,7 @@ package vcenter
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 
 	"github.com/vmware/govmomi/vim25/types"
@@ -50,16 +51,27 @@ func guestinfoCustomizationForInstance(osType, password, hostname, instanceID st
 	var userdata, metadata string
 	switch osType {
 	case "linux":
-		// cloud-init format. The bare top-level `password:` applies to the
-		// image's default user, which for Crucible student images is
-		// `student`.
+		passwordYAML, err := json.Marshal(password)
+		if err != nil {
+			return nil, fmt.Errorf("encode Linux guest password: %w", err)
+		}
+		hostnameYAML, err := json.Marshal(hostname)
+		if err != nil {
+			return nil, fmt.Errorf("encode Linux guest hostname: %w", err)
+		}
+		// JSON strings are a YAML-safe scalar subset. Use an explicit user
+		// mapping so cloud-init changes the same account Crucible surfaces
+		// instead of relying on the image's default-user setting.
 		userdata = fmt.Sprintf(`#cloud-config
-password: %s
 chpasswd:
   expire: false
+  users:
+    - name: student
+      password: %s
+      type: text
 ssh_pwauth: true
 hostname: %s
-`, password, hostname)
+`, passwordYAML, hostnameYAML)
 		metadata = fmt.Sprintf(`{"instance-id": "%s", "local-hostname": "%s"}`, instanceID, hostname)
 	case "windows":
 		// cloudbase-init: UserDataPlugin runs #ps1 script to set password.

@@ -1,85 +1,227 @@
 package provisioner
 
 import (
+	"context"
 	"errors"
-	"os"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jmal1/selfservice-api/internal/models"
 )
 
-func credentialProvisioningWiringInvariant(createSrc, vmOpsSrc string) error {
-	createResolve := strings.Index(createSrc, "provisionedPodVMCredentials(")
-	createPersist := strings.Index(createSrc, "p.db.UpdatePodVMCredentials(")
-	createClone := strings.Index(createSrc, "executeDurableVMClone(")
-	createReady := strings.Index(createSrc, "waitForPodVMCredentialReady(")
-	if createResolve < 0 || createPersist < 0 || createClone < 0 ||
-		createResolve > createPersist || createPersist > createClone {
-		return errors.New("pod_create must resolve and persist the reusable credential before clone submission")
-	}
-	if createReady < 0 ||
-		strings.Index(createSrc[createReady:], "models.VMStatusRunning") < 0 {
-		return errors.New("pod_create must authenticate the generated credential before marking the VM running")
-	}
-	if !strings.Contains(createSrc, "Password:     customizationPassword") {
-		return errors.New("pod_create clone params are not constrained to the customization-only password")
-	}
-
-	vmResolve := strings.Index(vmOpsSrc, "provisionedPodVMCredentials(")
-	vmPersist := strings.Index(vmOpsSrc, "p.db.UpdatePodVMCredentials(")
-	vmClone := strings.Index(vmOpsSrc, "executeDurableVMClone(")
-	vmReady := strings.Index(vmOpsSrc, "waitForPodVMCredentialReady(")
-	if vmResolve < 0 || vmPersist < 0 || vmClone < 0 ||
-		vmResolve > vmPersist || vmPersist > vmClone {
-		return errors.New("vm_add must resolve and persist the reusable credential before clone submission")
-	}
-	if vmReady < 0 ||
-		strings.Index(vmOpsSrc[vmReady:], "models.VMStatusRunning") < 0 {
-		return errors.New("vm_add must authenticate the generated credential before marking the VM running")
-	}
-	if !strings.Contains(vmOpsSrc, "Password:     customizationPassword") {
-		return errors.New("vm_add clone params are not constrained to the customization-only password")
-	}
-	return nil
+type fakeCredentialAcceptanceStore struct {
+	applied  bool
+	err      error
+	calls    int
+	podVMID  uuid.UUID
+	moref    string
+	username string
+	password string
 }
 
-func TestCredentialProvisioningWiringIsLoadBearing(t *testing.T) {
-	createBody, err := os.ReadFile("create.go")
+func (f *fakeCredentialAcceptanceStore) MarkPodVMCredentialsVerified(
+	_ context.Context,
+	id uuid.UUID,
+	moref, username, password string,
+) (bool, error) {
+	f.calls++
+	f.podVMID = id
+	f.moref = moref
+	f.username = username
+	f.password = password
+	return f.applied, f.err
+}
+
+func TestCredentialAcceptance_RejectingGuestCompensatesBeforeMarker(t *testing.T) {
+	podVMID := uuid.New()
+	validator := &fakeGuestCredentialValidator{errs: []error{errors.New("guest rejected credential")}}
+	store := &fakeCredentialAcceptanceStore{applied: true}
+	state := models.VMStatusConfiguring
+	compensations := 0
+
+	err := enforcePodVMCredentialAcceptance(
+		context.Background(),
+		store,
+		validator,
+		podVMID,
+		models.TemplateKindCloneWithCustomize,
+		"linux",
+		"vm-101",
+		"student",
+		"Generated1!",
+		0,
+		time.Millisecond,
+		func(cause error) error {
+			compensations++
+			state = models.VMStatusError
+			return cause
+		},
+	)
+
+	if err == nil || !strings.Contains(err.Error(), "guest customization did not install") {
+		t.Fatalf("rejecting guest error = %v", err)
+	}
+	if store.calls != 0 {
+		t.Fatalf("acceptance marker written %d times after guest rejection", store.calls)
+	}
+	if compensations != 1 || state != models.VMStatusError {
+		t.Fatalf("compensation calls/state = %d/%q, want 1/error", compensations, state)
+	}
+}
+
+func TestCredentialAcceptance_MarkerSabotageCompensates(t *testing.T) {
+	podVMID := uuid.New()
+	validator := &fakeGuestCredentialValidator{}
+	store := &fakeCredentialAcceptanceStore{applied: false}
+	state := models.VMStatusConfiguring
+
+	err := enforcePodVMCredentialAcceptance(
+		context.Background(),
+		store,
+		validator,
+		podVMID,
+		models.TemplateKindCloneWithCustomize,
+		"windows",
+		"vm-202",
+		"Student",
+		"Generated2!",
+		time.Second,
+		time.Millisecond,
+		func(cause error) error {
+			state = models.VMStatusError
+			return cause
+		},
+	)
+
+	if err == nil || !strings.Contains(err.Error(), "no longer matches") {
+		t.Fatalf("sabotaged marker error = %v", err)
+	}
+	if validator.calls != 1 || store.calls != 1 {
+		t.Fatalf("validator/marker calls = %d/%d, want 1/1", validator.calls, store.calls)
+	}
+	if state != models.VMStatusError {
+		t.Fatalf("state = %q, want error after marker sabotage", state)
+	}
+}
+
+func TestCredentialAcceptance_SuccessPersistsExactPair(t *testing.T) {
+	podVMID := uuid.New()
+	validator := &fakeGuestCredentialValidator{}
+	store := &fakeCredentialAcceptanceStore{applied: true}
+	compensations := 0
+
+	err := enforcePodVMCredentialAcceptance(
+		context.Background(),
+		store,
+		validator,
+		podVMID,
+		models.TemplateKindCloneWithCustomize,
+		"linux",
+		"vm-303",
+		"student",
+		"Generated3!",
+		time.Second,
+		time.Millisecond,
+		func(cause error) error {
+			compensations++
+			return cause
+		},
+	)
+
 	if err != nil {
 		t.Fatal(err)
 	}
-	vmOpsBody, err := os.ReadFile("vm_ops.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	createSrc := string(createBody)
-	vmOpsSrc := string(vmOpsBody)
-	if err := credentialProvisioningWiringInvariant(createSrc, vmOpsSrc); err != nil {
-		t.Fatal(err)
+	if store.calls != 1 || store.podVMID != podVMID ||
+		store.moref != "vm-303" ||
+		store.username != "student" || store.password != "Generated3!" {
+		t.Fatalf("acceptance marker did not bind the exact pair: %+v", store)
 	}
 
-	sabotages := map[string][2]string{
-		"pod-create-persistence": {
-			strings.Replace(createSrc, "p.db.UpdatePodVMCredentials(", "removedCredentialPersistence(", 1),
-			vmOpsSrc,
-		},
-		"pod-create-readiness": {
-			strings.Replace(createSrc, "waitForPodVMCredentialReady(", "removedCredentialReadiness(", 1),
-			vmOpsSrc,
-		},
-		"vm-add-persistence": {
-			createSrc,
-			strings.Replace(vmOpsSrc, "p.db.UpdatePodVMCredentials(", "removedCredentialPersistence(", 1),
-		},
-		"vm-add-readiness": {
-			createSrc,
-			strings.Replace(vmOpsSrc, "waitForPodVMCredentialReady(", "removedCredentialReadiness(", 1),
-		},
+	if compensations != 0 {
+		t.Fatalf("successful acceptance compensated %d times", compensations)
 	}
-	for name, src := range sabotages {
-		t.Run(name, func(t *testing.T) {
-			if err := credentialProvisioningWiringInvariant(src[0], src[1]); err == nil {
-				t.Fatal("credential invariant survived sabotage")
-			}
-		})
+}
+
+func TestCredentialAcceptance_ReplacementCloneCannotReuseOldMarker(t *testing.T) {
+	oldMoref := "vm-old"
+	newMoref := "vm-replacement"
+	verifiedAt := time.Now()
+	vm := &models.PodVM{
+		VCenterVMID:                  &oldMoref,
+		GuestCredentialsVerifiedAt:   &verifiedAt,
+		GuestCredentialsVerifiedVMID: &oldMoref,
+	}
+	if !podVMCredentialAccepted(vm) {
+		t.Fatal("old clone marker should initially match its exact VM identity")
+	}
+
+	vm.VCenterVMID = &newMoref
+	if podVMCredentialAccepted(vm) {
+		t.Fatal("replacement clone reused acceptance bound to the destroyed VM")
+	}
+
+	validator := &fakeGuestCredentialValidator{}
+	store := &fakeCredentialAcceptanceStore{applied: true}
+	if err := enforcePodVMCredentialAcceptance(
+		context.Background(),
+		store,
+		validator,
+		uuid.New(),
+		models.TemplateKindCloneWithCustomize,
+		"linux",
+		newMoref,
+		"student",
+		"SamePersistedPassword1!",
+		time.Second,
+		time.Millisecond,
+		nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if validator.calls != 1 || store.moref != newMoref {
+		t.Fatalf(
+			"replacement validation calls/marker moref = %d/%q, want 1/%q",
+			validator.calls,
+			store.moref,
+			newMoref,
+		)
+	}
+}
+
+func TestCredentialAcceptance_StaticKindBypassesGeneratedContract(t *testing.T) {
+	validator := &fakeGuestCredentialValidator{errs: []error{errors.New("must not be called")}}
+	store := &fakeCredentialAcceptanceStore{err: errors.New("must not be called")}
+	compensations := 0
+
+	err := enforcePodVMCredentialAcceptance(
+		context.Background(),
+		store,
+		validator,
+		uuid.New(),
+		models.TemplateKindCloneNoCustomize,
+		"linux",
+		"vm-static",
+		"admin",
+		"Static1!",
+		0,
+		0,
+		func(cause error) error {
+			compensations++
+			return cause
+		},
+	)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if validator.calls != 0 || store.calls != 0 || compensations != 0 {
+		t.Fatalf(
+			"static contract invoked validator/marker/compensation = %d/%d/%d",
+			validator.calls,
+			store.calls,
+			compensations,
+		)
 	}
 }
