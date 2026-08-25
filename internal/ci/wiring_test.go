@@ -116,6 +116,25 @@ func TestProvisioningAdmissionPrecedesDatabaseTouchingAudit(t *testing.T) {
 	}
 }
 
+func TestCIWorkflowUsesGoCache(t *testing.T) {
+	root := findRepoRoot(t)
+	body, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "ci.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	src := string(body)
+	if !strings.Contains(src, "uses: actions/setup-go@v5") {
+		t.Fatal("ci.yaml no longer sets up Go with actions/setup-go@v5")
+	}
+	if !strings.Contains(src, "cache: true") {
+		t.Fatal("ci.yaml no longer enables setup-go cache for the test job")
+	}
+	if !strings.Contains(src, "cache-dependency-path: go.sum") {
+		t.Fatal("ci.yaml no longer pins the Go cache key to go.sum")
+	}
+}
+
 // TestCreatePod_ActiveTransitionIsGuarded pins the compare-and-swap on the create
 // job's final status write.
 //
