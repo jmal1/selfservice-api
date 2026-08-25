@@ -857,68 +857,127 @@ func stripBashLineComments(text string) string {
 	return strings.Join(lines, "\n")
 }
 
-// countToken returns how many elements of tokens equal want exactly.
-func countToken(tokens []string, want string) int {
-	n := 0
-	for _, tok := range tokens {
-		if tok == want {
-			n++
+// forceConflictsLiteral is the exact flag text this invariant searches for
+// as a raw substring, rather than via whitespace tokenization. Bash (and
+// kubectl) accept this exact argument immediately adjacent to shell
+// metacharacters other than whitespace - a trailing quote
+// (`"--force-conflicts"`), a semicolon (`--force-conflicts;`), a pipe, a
+// closing paren, etc. - so a scanner that only splits on whitespace (e.g.
+// strings.Fields) can miss a leaked occurrence glued to one of those
+// characters. Scanning for the literal substring instead, and only
+// rejecting a match that is part of a LONGER flag/identifier, catches every
+// one of those forms.
+const forceConflictsLiteral = "--force-conflicts"
+
+// isFlagNameByte reports whether b could be part of a longer flag or
+// identifier name that merely contains forceConflictsLiteral as a
+// substring (e.g. the "-foo" of "--force-conflicts-foo", or the "x" of
+// "x--force-conflicts"), as opposed to a delimiter that could legitimately
+// surround the flag itself, such as a quote, semicolon, pipe, paren, or
+// whitespace.
+func isFlagNameByte(b byte) bool {
+	return b == '-' || b == '_' ||
+		(b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+}
+
+// findForceConflictsOccurrences returns the start byte offset of every
+// occurrence of forceConflictsLiteral in text, excluding occurrences that
+// are a substring of a longer flag/identifier, and excluding occurrences
+// immediately followed by '=' (an explicit value assignment, e.g.
+// "--force-conflicts=false" or "--force-conflicts=true"). Every other
+// neighboring character - a quote, semicolon, pipe, paren, whitespace, or
+// end of input - is accepted, since all of those are valid ways for a shell
+// to delimit this exact bare argument, and this check must not be evadable
+// by choosing one of them instead of a plain space.
+//
+// The '=' exclusion matters because kubectl's --force-conflicts is a
+// boolean flag that also accepts "--force-conflicts=<value>" syntax. Since
+// "false" is the flag's default, "--force-conflicts=false" is functionally
+// identical to omitting the flag entirely - it is not a real occurrence of
+// the enabling flag, merely a substring match on it - so treating it as
+// satisfying "must carry --force-conflicts exactly once" would let a
+// silently-neutered mutation of one of the three known validation blocks
+// pass this invariant. Deliberately excluding any "=" form, including
+// "=true" (which mirrors bare --force-conflicts), keeps this check
+// fail-closed: it must never be satisfied by any text this scanner cannot
+// prove that kubectl treats identically to the bare flag it expects.
+func findForceConflictsOccurrences(text string) []int {
+	var offsets []int
+	for i := 0; i+len(forceConflictsLiteral) <= len(text); i++ {
+		if text[i:i+len(forceConflictsLiteral)] != forceConflictsLiteral {
+			continue
 		}
+		if i > 0 && isFlagNameByte(text[i-1]) {
+			continue
+		}
+		end := i + len(forceConflictsLiteral)
+		if end < len(text) && (isFlagNameByte(text[end]) || text[end] == '=') {
+			continue
+		}
+		offsets = append(offsets, i)
 	}
-	return n
+	return offsets
 }
 
 // checkForceConflictsInvariant proves, independent of how the script happens
-// to be formatted, that --force-conflicts appears as a distinct shell token
-// exactly three times in deploy.sh: exactly once inside each of the three
-// known --server-side --dry-run=server validation-only kubectl apply
-// invocations (upgrade hooks, the digest-pinned candidate, and per-document
+// to be formatted or quoted, that --force-conflicts appears exactly three
+// times in deploy.sh: exactly once inside each of the three known
+// --server-side --dry-run=server validation-only kubectl apply invocations
+// (upgrade hooks, the digest-pinned candidate, and per-document
 // canonicalization), and nowhere else in the file.
 //
-// Detection is whitespace-token based (via strings.Fields over the whole,
-// comment-stripped file), not anchored to any particular line shape. That
-// matters because a naive "does this exact line say `--force-conflicts \`"
+// Detection is a literal substring scan (findForceConflictsOccurrences)
+// over the whole, comment-stripped file, not a whitespace-token or
+// line-shape check. That matters because a naive line- or token-anchored
 // check can be evaded by adding the flag inline on an existing flag's line,
-// or by adding it to any other command entirely (in particular a mutating
-// command such as `kubectl patch`, `kubectl set`, `kubectl delete`, or
-// `helm upgrade`) without ever producing a standalone `--force-conflicts \`
-// line. This check instead totals every occurrence of the token anywhere in
-// the file and requires that total to equal the sum of occurrences found
-// strictly inside the three known validation blocks, so any leakage outside
-// those three blocks - in any formatting - fails it.
+// by quoting it (`"--force-conflicts"`), by placing it immediately before a
+// shell separator such as `;` with no intervening space, or by adding it to
+// any other command entirely (in particular a mutating command such as
+// `kubectl patch`, `kubectl set`, `kubectl delete`, or `helm upgrade`)
+// without ever producing a standalone `--force-conflicts \` line. This
+// check instead totals every literal occurrence anywhere in the file and
+// requires that total to equal the sum of occurrences found strictly
+// inside the three known validation blocks, so any leakage outside those
+// three blocks - in any formatting or quoting - fails it.
 func checkForceConflictsInvariant(text string) error {
 	stripped := stripBashLineComments(text)
 
-	blocks := applyBlockRegex.FindAllString(stripped, -1)
-	if len(blocks) != 3 {
-		return fmt.Errorf("expected exactly 3 kubectl apply invocations (upgrade hooks, candidate, per-document canonicalization), found %d:\n%v", len(blocks), blocks)
+	blockRanges := applyBlockRegex.FindAllStringIndex(stripped, -1)
+	if len(blockRanges) != 3 {
+		blocks := make([]string, len(blockRanges))
+		for i, r := range blockRanges {
+			blocks[i] = stripped[r[0]:r[1]]
+		}
+		return fmt.Errorf("expected exactly 3 kubectl apply invocations (upgrade hooks, candidate, per-document canonicalization), found %d:\n%v", len(blockRanges), blocks)
 	}
 
+	globalOffsets := findForceConflictsOccurrences(stripped)
+
 	blockTotal := 0
-	for _, block := range blocks {
-		tokens := strings.Fields(block)
-		hasServerSide := countToken(tokens, "--server-side") > 0
-		hasDryRunServer := countToken(tokens, "--dry-run=server") > 0
+	for _, r := range blockRanges {
+		block := stripped[r[0]:r[1]]
+		hasServerSide := strings.Contains(block, "--server-side")
+		hasDryRunServer := strings.Contains(block, "--dry-run=server")
 		if hasServerSide != hasDryRunServer {
 			return fmt.Errorf("kubectl apply invocation mixes --server-side and --dry-run=server inconsistently:\n%s", block)
 		}
 		if !hasServerSide {
 			return fmt.Errorf("found a kubectl apply invocation that is not a --server-side --dry-run=server validation call:\n%s", block)
 		}
-		occurrences := countToken(tokens, "--force-conflicts")
+		occurrences := 0
+		for _, offset := range globalOffsets {
+			if offset >= r[0] && offset < r[1] {
+				occurrences++
+			}
+		}
 		if occurrences != 1 {
 			return fmt.Errorf("server-side dry-run validation call must carry --force-conflicts exactly once (found %d):\n%s", occurrences, block)
 		}
 		blockTotal += occurrences
 	}
 
-	globalTokens := strings.Fields(stripped)
-	globalCount := countToken(globalTokens, "--force-conflicts")
-	if globalCount != blockTotal {
-		return fmt.Errorf("found %d --force-conflicts token(s) in deploy.sh but only %d are inside the 3 known server-side dry-run validation calls; --force-conflicts must never appear on any other command (e.g. a mutating kubectl patch/set/delete or helm upgrade)", globalCount, blockTotal)
-	}
-	if globalCount != 3 {
-		return fmt.Errorf("expected --force-conflicts to appear exactly 3 times total, found %d", globalCount)
+	if len(globalOffsets) != blockTotal {
+		return fmt.Errorf("found %d --force-conflicts occurrence(s) in deploy.sh but only %d are inside the 3 known server-side dry-run validation calls; --force-conflicts must never appear on any other command (e.g. a mutating kubectl patch/set/delete or helm upgrade)", len(globalOffsets), blockTotal)
 	}
 	return nil
 }
@@ -953,10 +1012,13 @@ func TestDeployScriptForceConflictsPairedWithServerSideDryRun(t *testing.T) {
 // leaking onto a real mutating kubectl command already present in deploy.sh
 // (kubectl patch and kubectl set env, both of which mutate live cluster
 // state), regardless of whether the leaked flag is written inline on an
-// existing flag's line or as its own new line. A leaked occurrence there
-// would let a mutating operation silently take over field ownership it has
-// no business touching, so the invariant must fail closed on it exactly as
-// it would on the intended validation-only call sites.
+// existing flag's line, as its own new line, double-quoted exactly as a
+// shell would pass it, or glued immediately before a `;` statement
+// terminator with no separating space. A leaked occurrence there would let
+// a mutating operation silently take over field ownership it has no
+// business touching, so the invariant must fail closed on it exactly as it
+// would on the intended validation-only call sites, in every one of these
+// shapes.
 func TestDeployScriptForceConflictsInvariantDetectsMutatingLeakage(t *testing.T) {
 	source, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
 	if err != nil {
@@ -993,6 +1055,33 @@ func TestDeployScriptForceConflictsInvariantDetectsMutatingLeakage(t *testing.T)
 			name: "own line inside a real mutating kubectl set env",
 			old:  "  if ! kubectl set env \"deployment/$RELEASE-worker\" \\\n      -n \"$NAMESPACE\" \\\n      WORKER_PROVISIONING_CLAIMS_ENABLED=false; then",
 			new:  "  if ! kubectl set env \"deployment/$RELEASE-worker\" \\\n      --force-conflicts \\\n      -n \"$NAMESPACE\" \\\n      WORKER_PROVISIONING_CLAIMS_ENABLED=false; then",
+		},
+		{
+			// Same real kubectl set env mutation, but the leaked flag is
+			// double-quoted (`"--force-conflicts"`) exactly as a shell
+			// would accept it - bash strips the quotes and passes the
+			// identical bare argument to kubectl. A whitespace-token
+			// equality check (e.g. strings.Fields plus `tok ==
+			// "--force-conflicts"`) misses this because the quote
+			// characters stay glued to the token; a literal substring scan
+			// must not.
+			name: "quoted leakage into the same real mutating kubectl set env",
+			old:  "  if ! kubectl set env \"deployment/$RELEASE-worker\" \\\n      -n \"$NAMESPACE\" \\\n      WORKER_PROVISIONING_CLAIMS_ENABLED=false; then",
+			new:  "  if ! kubectl set env \"deployment/$RELEASE-worker\" \\\n      \"--force-conflicts\" \\\n      -n \"$NAMESPACE\" \\\n      WORKER_PROVISIONING_CLAIMS_ENABLED=false; then",
+		},
+		{
+			// enforce_synthetic_rollback_containment's real
+			// `kubectl patch cronjob/$api_cronjob ...` mutation, with the
+			// leaked flag appended immediately before the statement
+			// terminator with no separating space
+			// (`--force-conflicts; then`). Bash treats `;` as a command
+			// separator regardless of adjacent whitespace, so this is a
+			// valid, distinct argument to kubectl - but it is glued to the
+			// following `;` with no space, which a whitespace-token scan
+			// would fold into a single non-matching token.
+			name: "semicolon-adjacent leakage into a real mutating kubectl patch",
+			old:  `      -p '{"spec":{"suspend":false,"jobTemplate":{"spec":{"template":{"spec":{"containers":[{"name":"synthetic-api-monitor","env":[{"name":"SYNTHETIC_LIFECYCLE_ENABLED","value":"false"}]}]}}}}}}'; then`,
+			new:  `      -p '{"spec":{"suspend":false,"jobTemplate":{"spec":{"template":{"spec":{"containers":[{"name":"synthetic-api-monitor","env":[{"name":"SYNTHETIC_LIFECYCLE_ENABLED","value":"false"}]}]}}}}}}' --force-conflicts; then`,
 		},
 	}
 
@@ -1133,6 +1222,70 @@ func TestDeployScriptForceConflictsIsLoadBearing(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestDeployScriptForceConflictsInvariantDetectsNeuteredAssignment proves
+// the invariant is not satisfied by a disguised removal: rewriting a
+// legitimate "--force-conflicts \" line to "--force-conflicts=false \" (or
+// "=true") still contains the literal substring "--force-conflicts", but
+// "false" is kubectl's default for this boolean flag, so the assignment
+// form is functionally identical to omitting the flag - and "=true", while
+// functionally equivalent to the bare flag, is not the exact form this
+// script is required to use. Either mutation must be caught exactly like an
+// outright removal, not silently accepted because the substring is still
+// present somewhere in the line.
+func TestDeployScriptForceConflictsInvariantDetectsNeuteredAssignment(t *testing.T) {
+	originalBytes, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := string(originalBytes)
+
+	for _, functionName := range []string{
+		"validate_upgrade_hooks",
+		"server_validate_candidate",
+		"canonicalize_server_candidate",
+	} {
+		for _, value := range []string{"false", "true"} {
+			t.Run(functionName+"_assigned_"+value, func(t *testing.T) {
+				mutated := assignForceConflictsInFunction(t, original, functionName, value)
+				if err := checkForceConflictsInvariant(mutated); err == nil {
+					t.Fatalf("invariant did not detect --force-conflicts=%s replacing the bare flag in %s()", value, functionName)
+				}
+			})
+		}
+	}
+}
+
+// assignForceConflictsInFunction returns a copy of source with the bare
+// "--force-conflicts \" flag line in exactly one named bash function's body
+// rewritten to "--force-conflicts=<value> \", leaving every other
+// occurrence (and the rest of the script) intact. It fails the test if the
+// function or the flag cannot be located, or if the rewrite has no effect.
+func assignForceConflictsInFunction(t *testing.T, source, functionName, value string) string {
+	t.Helper()
+	marker := functionName + "() {"
+	start := strings.Index(source, marker)
+	if start < 0 {
+		t.Fatalf("could not locate function %s() in deploy.sh", functionName)
+	}
+	relativeEnd := strings.Index(source[start:], "\n}\n")
+	if relativeEnd < 0 {
+		t.Fatalf("could not locate end of function %s() in deploy.sh", functionName)
+	}
+	end := start + relativeEnd + len("\n}\n")
+	body := source[start:end]
+	if !forceConflictsFlagLine.MatchString(body) {
+		t.Fatalf("function %s() does not contain a bare --force-conflicts flag line to rewrite", functionName)
+	}
+	rewritten := forceConflictsFlagLine.ReplaceAllString(body, "--force-conflicts="+value+" \\")
+	if rewritten == body {
+		t.Fatalf("rewriting --force-conflicts=%s in %s() had no effect", value, functionName)
+	}
+	if forceConflictsFlagLine.MatchString(rewritten) {
+		t.Fatalf("rewriting --force-conflicts=%s in %s() left a residual bare occurrence", value, functionName)
+	}
+	return source[:start] + rewritten + source[end:]
 }
 
 // stripForceConflictsFromFunction returns a copy of source with the
