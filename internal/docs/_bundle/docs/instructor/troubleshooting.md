@@ -687,18 +687,24 @@ it from `opnsense.sshHostKey` when explicitly set, otherwise from key
 trusted OPNsense console or previously authenticated channel; do not trust a
 first-use network scan.
 
-The owner backs up both owned copies, rejects unsafe CIDRs and conflicting
-manual views, writes atomically, stages the chroot copy at
+The owner writes durable rollback state outside the `*.conf` include glob,
+rejects unsafe CIDRs plus conflicting or overlapping manual views, writes
+atomically, stages the chroot copy at
 `/var/unbound/etc/crucible-student-safesearch.conf`, validates with
 `configctl unbound check` plus direct `unbound-checkconf`, and activates through
 the supported `configctl unbound restart` action followed by a running-service
 check. This extra parsing is required because `configctl` can mask an underlying
-script failure behind exit status 0. Every post-write failure restores or
-removes both copies, validates, and restarts again. Missing, malformed, or
-mismatched host-key pins fail closed. This does **not** enable content
-filtering: the reconciler remains read-only, and the synthetic must still prove
-effective uncached answers from a real student source plus unchanged answers
-from a control source rather than trusting configuration readback.
+script failure behind exit status 0. A later invocation recovers any interrupted
+transaction before accepting the current fragment as its baseline. Every
+post-write failure restores the persistent source before any restart, rebuilds
+and verifies the staged copy, and preserves the backup if recovery is
+incomplete. Once activation and exact readback are marked committed,
+backup-cleanup failure preserves the active configuration for cleanup on the
+next invocation instead of rolling it back. Missing, malformed, or mismatched
+host-key pins fail closed. This does **not** enable content filtering: the
+reconciler remains read-only, and the synthetic must still prove effective
+uncached answers from a real student source plus unchanged answers from a
+control source rather than trusting configuration readback.
 
 The policy must remain disabled until the synthetic can flush/use controlled
 uncached fixtures and verify actual answers from `10.100.0.0/16`.

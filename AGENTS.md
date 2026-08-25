@@ -710,13 +710,19 @@ an `/usr/local/etc/unbound.opnsense.d/*.conf` fragment with
 `/usr/local/etc/unbound.opnsense.d/crucible-student-safesearch.conf`; it never
 edits OPNsense's generated global `safesearch.conf` or any other manual file.
 The owner requires a pinned OpenSSH host public key, rejects unowned/conflicting
-fragments and unsafe source CIDRs, atomically stages the exact fragment at
+fragments, overlapping source CIDRs, and unsafe source CIDRs, atomically stages the exact fragment at
 `/var/unbound/etc/crucible-student-safesearch.conf`, runs
 `configctl unbound check` plus a direct exit-status-bearing
 `unbound-checkconf`, and activates through `configctl unbound restart` followed
 by a running-service check.
-Every failure restores or removes both owned copies, validates, and reconfigures;
-rollback failures are surfaced rather than hidden.
+Before mutation it writes durable rollback state outside the `*.conf` include
+glob. A later invocation recovers an interrupted transaction before accepting
+the current file as a baseline. Every failure restores the persistent source
+before any restart, rebuilds and verifies the staged copy, and retains the
+durable backup when rollback is incomplete. Once activation and exact readback
+are durably marked committed, backup-cleanup failure preserves the active
+configuration for cleanup on the next invocation rather than rolling it back.
+Rollback and ambiguous commit failures are surfaced rather than hidden.
 
 This owner is not wired into `reconcileContentFilter`: activation remains
 read-only. `SupportsSourceScopedSafeSearch` is true only for a client with
