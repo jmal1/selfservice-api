@@ -138,6 +138,7 @@ func (f *podDeletePostgresFixture) handler() *Handler {
 
 func (f *podDeletePostgresFixture) deleteRequest() *http.Request {
 	req := httptest.NewRequest(http.MethodDelete, "/api/v1/pods/"+f.podID.String(), nil)
+	req.RemoteAddr = "192.0.2.1"
 	req = withRoleAndUser(req, models.RoleStudent, f.ownerID)
 	req = withRouteParam(req, "podID", f.podID)
 	return req
