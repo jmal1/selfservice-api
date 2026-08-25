@@ -163,17 +163,45 @@ func (f *podDeletePostgresFixture) claimCreateJob(t *testing.T, workerID string)
 	}
 }
 
+func waitForJobLockHeld(t *testing.T, pool *pgxpool.Pool, jobID uuid.UUID) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		probeCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+		tx, err := pool.Begin(probeCtx)
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		var probeID uuid.UUID
+		err = tx.QueryRow(probeCtx, `SELECT id FROM jobs WHERE id = $1 FOR UPDATE NOWAIT`, jobID).Scan(&probeID)
+		if err == nil {
+			_ = tx.Rollback(probeCtx)
+			cancel()
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		_ = tx.Rollback(probeCtx)
+		cancel()
+		if strings.Contains(err.Error(), "SQLSTATE 55P03") || strings.Contains(err.Error(), "could not obtain lock on row") {
+			return
+		}
+		t.Fatalf("probe job lock: %v", err)
+	}
+	t.Fatal("timed out waiting for cancellation to lock the create job")
+}
+
 func TestDeletePodCancelsNeverStartedPodAndIsIdempotent(t *testing.T) {
 	fixture := newPodDeletePostgresFixture(t, 2)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	t.Cleanup(cancel)
 
-	lockTx, err := fixture.pool.Begin(ctx)
+	podLockTx, err := fixture.pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var locked uuid.UUID
-	if err := lockTx.QueryRow(ctx, `SELECT id FROM jobs WHERE id = $1 FOR UPDATE`, fixture.createJob).Scan(&locked); err != nil {
+	if err := podLockTx.QueryRow(ctx, `SELECT id FROM pods WHERE id = $1 FOR UPDATE`, fixture.podID).Scan(&locked); err != nil {
 		t.Fatal(err)
 	}
 
@@ -183,6 +211,8 @@ func TestDeletePodCancelsNeverStartedPodAndIsIdempotent(t *testing.T) {
 		fixture.handler().DeletePod(rec, fixture.deleteRequest())
 		deleteDone <- rec
 	}()
+
+	waitForJobLockHeld(t, fixture.pool, fixture.createJob)
 
 	claimDone := make(chan struct {
 		job *models.Job
@@ -208,7 +238,7 @@ func TestDeletePodCancelsNeverStartedPodAndIsIdempotent(t *testing.T) {
 		t.Fatal("timed out waiting for concurrent claim to lose the race")
 	}
 
-	if err := lockTx.Rollback(context.Background()); err != nil {
+	if err := podLockTx.Rollback(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 

@@ -28,26 +28,14 @@ type PodDeletionDecision struct {
 
 // CancelPendingPodIfNeverStarted cancels a pending pod only when the create job
 // is still pending and unclaimed, and no VM, placement, or receipt evidence
-// shows that provisioning ever started.
+// shows that provisioning ever started. It locks the create job before the pod
+// to match BeginPodCreateCleanup and avoid delete-vs-worker deadlocks.
 func (q *Queries) CancelPendingPodIfNeverStarted(ctx context.Context, podID uuid.UUID) (*PodDeletionDecision, error) {
 	tx, err := q.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin pod cancellation transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-
-	var podStatus, podError string
-	if err := tx.QueryRow(ctx, `
-		SELECT status, COALESCE(error_message, '')
-		FROM pods
-		WHERE id = $1
-		FOR UPDATE
-	`, podID).Scan(&podStatus, &podError); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, fmt.Errorf("lock pod for cancellation: %w", err)
-		}
-		return nil, fmt.Errorf("lock pod for cancellation: %w", err)
-	}
 
 	var createJobID uuid.UUID
 	var createJobStatus string
@@ -77,6 +65,19 @@ func (q *Queries) CancelPendingPodIfNeverStarted(ctx context.Context, podID uuid
 	)
 	if jobErr != nil && !errors.Is(jobErr, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("lock pod create job for cancellation: %w", jobErr)
+	}
+
+	var podStatus, podError string
+	if err := tx.QueryRow(ctx, `
+		SELECT status, COALESCE(error_message, '')
+		FROM pods
+		WHERE id = $1
+		FOR UPDATE
+	`, podID).Scan(&podStatus, &podError); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("lock pod for cancellation: %w", err)
+		}
+		return nil, fmt.Errorf("lock pod for cancellation: %w", err)
 	}
 
 	if podStatus == models.PodStatusDestroyed && podError == models.PodErrorCancelledBeforeProvisioning {
