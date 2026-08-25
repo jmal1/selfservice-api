@@ -515,6 +515,7 @@ const (
 	PodStatusError         = "error"
 
 	PodErrorManualCleanupRequiredPrefix = "manual_cleanup_required:"
+	PodErrorCancelledBeforeProvisioning = "pod cancelled before provisioning started"
 )
 
 // VM status constants.

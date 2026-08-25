@@ -693,7 +693,7 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// DeletePod queues a pod destruction job.
+// DeletePod cancels a never-started pending pod or queues a destruction job.
 func (h *Handler) DeletePod(w http.ResponseWriter, r *http.Request) {
 	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
 	if err != nil {
@@ -711,6 +711,44 @@ func (h *Handler) DeletePod(w http.ResponseWriter, r *http.Request) {
 	role := middleware.RoleFromContext(r.Context())
 	if pod.OwnerID != userID && role != models.RoleAdmin {
 		respondError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
+
+	if pod.Status == models.PodStatusDestroying {
+		respondError(w, r, http.StatusConflict, "pod is already being destroyed")
+		return
+	}
+
+	if pod.Status == models.PodStatusDestroyed {
+		if pod.ErrorMessage == nil || *pod.ErrorMessage != models.PodErrorCancelledBeforeProvisioning {
+			respondError(w, r, http.StatusConflict, "pod is already destroyed")
+			return
+		}
+	}
+
+	if decision, err := h.db.CancelPendingPodIfNeverStarted(r.Context(), podID); err != nil {
+		h.logger.Error("cancel pod before start failed", "pod_id", podID, "error", err)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
+		return
+	} else if decision != nil && (decision.Outcome == database.PodDeletionOutcomeCancelled ||
+		decision.Outcome == database.PodDeletionOutcomeAlreadyCancelled) {
+		audit.Log(r.Context(), h.db, "pod.delete",
+			audit.Resource("pod", podID),
+			audit.IP(r.RemoteAddr),
+			audit.Detail("mode", "cancelled"),
+			audit.Detail("pod_name", pod.Name),
+			audit.Detail("pod_status", models.PodStatusDestroyed),
+			audit.Detail("job_id", decision.JobID.String()),
+		)
+		body := map[string]any{
+			"pod_id":     podID,
+			"status":     "cancelled",
+			"pod_status": models.PodStatusDestroyed,
+		}
+		if decision.JobID != uuid.Nil {
+			body["job_id"] = decision.JobID
+		}
+		respondJSON(w, http.StatusOK, body)
 		return
 	}
 

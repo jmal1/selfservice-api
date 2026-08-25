@@ -811,6 +811,13 @@ it must parse as a Go boolean; an invalid value fails process startup rather
 than silently enabling provisioning. Helm exposes these as
 `provisioning.enabled` and `provisioning.workerClaimsEnabled`.
 
+A never-started pending `pod_create` can now be cancelled directly by the API
+before any worker claim or external ownership evidence exists. In that case the
+delete path marks the create job terminal, deletes the pending pod VMs, releases
+the VLAN, and never calls vCenter or OPNsense. Once a pod has a claim, a VM
+MoRef, a placement row, or a durable portgroup receipt, delete falls back to
+the normal destroy/manual-cleanup path.
+
 During a claims-contained phase-1 rollout, the current Helm revision must
 already render `provisioning.workerClaimsEnabled=false` before any migration or
 image upgrade begins. A live `kubectl set env` override is not sufficient:
