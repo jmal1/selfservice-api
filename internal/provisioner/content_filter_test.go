@@ -185,8 +185,10 @@ func TestDesiredDNSBLPolicy_PinsCapacityTestedRunning26OptionsAndRequiredFeed(t 
 	}
 	const wantLists = "https://student-filter-feed.lab.jmal.io/lists/drogue.txt," +
 		"https://student-filter-feed.lab.jmal.io/lists/agressif.txt," +
+		"https://student-filter-feed.lab.jmal.io/lists/dangerous_material.txt," +
 		"https://student-filter-feed.lab.jmal.io/lists/audio-video.txt," +
-		"https://student-filter-feed.lab.jmal.io/lists/social_networks.txt"
+		"https://student-filter-feed.lab.jmal.io/lists/social_networks.txt," +
+		"https://student-filter-feed.lab.jmal.io/lists/weapons.txt"
 	if policy.Lists != wantLists {
 		t.Fatalf("Lists = %q, want %q", policy.Lists, wantLists)
 	}

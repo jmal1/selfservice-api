@@ -135,6 +135,7 @@ type OPNsenseConfig struct {
 	SSHHost     string
 	SSHUser     string
 	SSHPassword string
+	SSHHostKey  string
 }
 
 // Load reads configuration from environment variables.
@@ -218,6 +219,7 @@ func Load() (*Config, error) {
 			SSHHost:     getEnv("OPNSENSE_SSH_HOST", "10.10.10.60:22"),
 			SSHUser:     getEnv("OPNSENSE_SSH_USER", "root"),
 			SSHPassword: getEnv("OPNSENSE_SSH_PASSWORD", ""),
+			SSHHostKey:  getEnv("OPNSENSE_SSH_HOST_KEY", ""),
 		},
 		ObjectStore: ObjectStoreConfig{
 			Endpoint:  getEnv("OBJECTSTORE_ENDPOINT", ""),

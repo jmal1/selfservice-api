@@ -26,12 +26,21 @@ type DNSBLPolicy struct {
 	Description string `json:"description"`
 }
 
-// SupportsSourceScopedSafeSearch is deliberately false for this client.
-// OPNsense's built-in Force SafeSearch switch is global. Source-scoped rewrites
-// are possible through custom Unbound views, but this client does not yet own,
-// validate, activate, or roll back those unmanaged configuration fragments.
-func (*Client) SupportsSourceScopedSafeSearch(context.Context) (bool, error) {
-	return false, nil
+// SupportsSourceScopedSafeSearch reports whether this client has the complete,
+// strictly validated SSH configuration required by the transactional fragment
+// owner. API-only clients remain honestly unsupported.
+func (c *Client) SupportsSourceScopedSafeSearch(context.Context) (bool, error) {
+	if strings.TrimSpace(c.config.SSHHost) == "" &&
+		strings.TrimSpace(c.config.SSHUser) == "" &&
+		strings.TrimSpace(c.config.SSHPassword) == "" &&
+		len(c.config.SSHKey) == 0 &&
+		strings.TrimSpace(c.config.SSHHostKey) == "" {
+		return false, nil
+	}
+	if _, err := NewSSHClient(c.config, c.logger); err != nil {
+		return false, fmt.Errorf("source-scoped SafeSearch owner is not configured safely: %w", err)
+	}
+	return true, nil
 }
 
 // VerifySourceScopedContentFilter cannot be implemented through the OPNsense
@@ -39,7 +48,7 @@ func (*Client) SupportsSourceScopedSafeSearch(context.Context) (bool, error) {
 // failures, so an effective check must flush/query uncached controlled names
 // from a student-source network.
 func (*Client) VerifySourceScopedContentFilter(context.Context, string) error {
-	return fmt.Errorf("effective student-source DNS verification is not implemented")
+	return fmt.Errorf("effective uncached DNS verification from a real student source is not implemented")
 }
 
 // GetUnboundSafeSearch reports the global Unbound SafeSearch setting.

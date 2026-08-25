@@ -220,16 +220,20 @@ func (e *safetyCapError) Error() string {
 // (other file types are leaves). Returns a sorted, deduplicated manifest.
 func computeClosure(repoRoot string, seeds []string, verbose bool) (*Manifest, error) {
 	visited := map[string]*ManifestEntry{}
-	queue := append([]string(nil), seeds...)
+	canonicalSeeds := make([]string, len(seeds))
+	for i, seed := range seeds {
+		canonicalSeeds[i] = canonicalRepoPath(seed)
+	}
+	queue := append([]string(nil), canonicalSeeds...)
 
 	// Mark seeds so the UI can highlight them.
 	seedSet := map[string]bool{}
-	for _, s := range seeds {
-		seedSet[filepath.ToSlash(s)] = true
+	for _, seed := range canonicalSeeds {
+		seedSet[seed] = true
 	}
 
 	for len(queue) > 0 {
-		current := filepath.ToSlash(queue[0])
+		current := canonicalRepoPath(queue[0])
 		queue = queue[1:]
 		if _, seen := visited[current]; seen {
 			continue
@@ -309,7 +313,7 @@ func computeClosure(repoRoot string, seeds []string, verbose bool) (*Manifest, e
 	}
 	sort.Strings(paths)
 
-	m := &Manifest{Seeds: append([]string(nil), seeds...)}
+	m := &Manifest{Seeds: canonicalSeeds}
 	for _, p := range paths {
 		e := visited[p]
 		m.Files = append(m.Files, *e)
@@ -324,6 +328,10 @@ func computeClosure(repoRoot string, seeds []string, verbose bool) (*Manifest, e
 	}
 
 	return m, nil
+}
+
+func canonicalRepoPath(value string) string {
+	return strings.ReplaceAll(filepath.ToSlash(value), `\`, "/")
 }
 
 func extractLinks(md string) []string {

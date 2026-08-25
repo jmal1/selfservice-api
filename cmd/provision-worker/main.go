@@ -117,9 +117,14 @@ func main() {
 		SSHHost:     cfg.OPNsense.SSHHost,
 		SSHUser:     cfg.OPNsense.SSHUser,
 		SSHPassword: cfg.OPNsense.SSHPassword,
+		SSHHostKey:  cfg.OPNsense.SSHHostKey,
 	}
 	opnClient := opnsense.New(opnCfg, logger)
-	opnSSH := opnsense.NewSSHClient(opnCfg, logger)
+	opnSSH, err := opnsense.NewSSHClient(opnCfg, logger)
+	if err != nil {
+		logger.Error("OPNsense SSH configuration failed strict validation", "error", err)
+		os.Exit(1)
+	}
 
 	// Create provisioner
 	prov := provisioner.New(queries, vcClient, opnClient, opnSSH, natsClient, logger)

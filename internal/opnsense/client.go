@@ -23,6 +23,7 @@ type Config struct {
 	SSHUser     string // e.g., "root"
 	SSHKey      []byte // private key PEM (or password-based via SSHPassword)
 	SSHPassword string
+	SSHHostKey  string // pinned OpenSSH public key, e.g. "ssh-ed25519 AAAA..."
 }
 
 // VLAN represents an OPNsense VLAN interface.

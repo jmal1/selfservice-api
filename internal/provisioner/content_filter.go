@@ -24,8 +24,10 @@ var contentFilterBypassPorts = []string{
 var contentFilterFeedPaths = []string{
 	"/lists/drogue.txt",
 	"/lists/agressif.txt",
+	"/lists/dangerous_material.txt",
 	"/lists/audio-video.txt",
 	"/lists/social_networks.txt",
+	"/lists/weapons.txt",
 }
 
 // ContentFilterConfig is deliberately deployment-owned. There is no student or

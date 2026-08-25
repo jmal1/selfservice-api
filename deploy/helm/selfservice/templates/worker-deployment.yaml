@@ -120,6 +120,15 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.secrets.opnsense }}
                   key: opnsense-ssh-password
+            - name: OPNSENSE_SSH_HOST_KEY
+              {{- if .Values.opnsense.sshHostKey }}
+              value: {{ .Values.opnsense.sshHostKey | quote }}
+              {{- else }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.opnsense }}
+                  key: opnsense-ssh-host-key
+              {{- end }}
             # Pushgateway destination for the worker's DestroyFailedPusher,
             # which surfaces pods stuck in destroy_failed via the
             # CruciblePodsStuckInDestroyFailed Prometheus alert. Leaving

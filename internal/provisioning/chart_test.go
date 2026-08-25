@@ -267,6 +267,9 @@ func TestChartWiresEveryProvisioningControl(t *testing.T) {
 			".Values.provisioning.workerClaimsEnabled",
 			"VCENTER_INSECURE",
 			".Values.vcenter.insecure",
+			"OPNSENSE_SSH_HOST_KEY",
+			"opnsense-ssh-host-key",
+			".Values.opnsense.sshHostKey",
 			"terminationGracePeriodSeconds: {{ .Values.worker.shutdownGracePeriodSeconds }}",
 		},
 		"engine-deployment.yaml": {
