@@ -3,9 +3,16 @@
 set -euo pipefail
 
 : "${BASELINE_IMAGE_MAP:?BASELINE_IMAGE_MAP is required}"
-: "${BASELINE_RUNNER_IMAGE:?BASELINE_RUNNER_IMAGE is required}"
+PIN_RUNNER_REQUIRED="${PIN_RUNNER_REQUIRED:-true}"
+if [ "$PIN_RUNNER_REQUIRED" = true ]; then
+  : "${BASELINE_RUNNER_IMAGE:?BASELINE_RUNNER_IMAGE is required}"
+fi
+BASELINE_RUNNER_IMAGE="${BASELINE_RUNNER_IMAGE:-}"
 
-awk -v image_map="$BASELINE_IMAGE_MAP" -v runner_image="$BASELINE_RUNNER_IMAGE" '
+awk \
+  -v image_map="$BASELINE_IMAGE_MAP" \
+  -v runner_image="$BASELINE_RUNNER_IMAGE" \
+  -v runner_required="$PIN_RUNNER_REQUIRED" '
   function trim_yaml_value(value) {
     sub(/^[[:space:]]*/, "", value)
     sub(/[[:space:]]*$/, "", value)
@@ -31,7 +38,8 @@ awk -v image_map="$BASELINE_IMAGE_MAP" -v runner_image="$BASELINE_RUNNER_IMAGE" 
       value == "DaemonSet" ||
       value == "StatefulSet" ||
       value == "CronJob" ||
-      value == "Job"
+      value == "Job" ||
+      value == "Pod"
   }
 
   function buffer_line(value) {
@@ -178,7 +186,7 @@ awk -v image_map="$BASELINE_IMAGE_MAP" -v runner_image="$BASELINE_RUNNER_IMAGE" 
 
   END {
     flush_container()
-    if (runner_replaced != 1) {
+    if (runner_required == "true" && runner_replaced != 1) {
       print "ERROR: expected to pin exactly one RUNNER_IMAGE value, replaced " runner_replaced "." > "/dev/stderr"
       failed = 1
     }

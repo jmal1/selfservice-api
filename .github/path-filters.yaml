@@ -23,6 +23,7 @@ shared:
   - 'go.sum'
   - 'Dockerfile'
   - '.github/workflows/ci.yaml'
+  - '.github/scripts/compute-image-matrix.sh'
   - '.github/path-filters.yaml'
   - 'internal/config/**'
   - 'internal/database/**'
@@ -105,6 +106,9 @@ go-tests:
   - 'go.sum'
   - 'cmd/**'
   - 'internal/**'
+  - 'deploy/scripts/**'
   # Production containment values have load-bearing Go guard tests.
   - 'deploy/helm/selfservice/**'
+  - '.github/scripts/**'
+  - '.github/path-filters.yaml'
   - '.github/workflows/ci.yaml'
