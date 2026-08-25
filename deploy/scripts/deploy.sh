@@ -584,12 +584,24 @@ verify_image_revision() (
       ;;
   esac
   config_digest="$(jq -er '.config.digest' <<< "$manifest")"
+  # GHCR serves blob bytes from a redirect (typically to Azure Blob Storage),
+  # not from ghcr.io itself, so this request MUST follow the redirect or it
+  # silently receives an empty body instead of the runtime config. `--location`
+  # alone is sufficient and safe here: curl only forwards the bearer
+  # Authorization header (from --config "$bearer_config") to the initial
+  # ghcr.io host and drops it on any cross-host redirect, so the blob-storage
+  # backend never sees the GHCR token. `--proto`/`--proto-redir` pin both the
+  # initial request and the redirect target to https so a compromised or
+  # misbehaving redirect can't downgrade the transfer.
   config="$(
     curl \
       --config "$bearer_config" \
       --fail \
       --silent \
       --show-error \
+      --location \
+      --proto '=https' \
+      --proto-redir '=https' \
       "https://ghcr.io/v2/$repository_path/blobs/$config_digest"
   )"
   revision="$(jq -er '.config.Labels["org.opencontainers.image.revision"]' <<< "$config")"
