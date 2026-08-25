@@ -5,6 +5,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"compress/gzip"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -822,65 +823,225 @@ func TestDeployScriptPreparesAllWorkloadBaseline(t *testing.T) {
 	}
 }
 
+// applyBlockRegex extracts each full `kubectl apply ... -o (yaml|json)...`
+// invocation (backslash-continued flags included) as a single string.
+var applyBlockRegex = regexp.MustCompile(`(?s)kubectl apply \\.*?-o (?:yaml|json)[^\n]*`)
+
+// forceConflictsFlagLine matches an actual `--force-conflicts \` flag line
+// in deploy.sh, as opposed to explanatory comment text that merely mentions
+// the flag in prose. It is used only by stripForceConflictsFromFunction
+// below to remove one legitimate occurrence; the invariant itself is
+// enforced by checkForceConflictsInvariant, which is not line-shape
+// dependent.
+var forceConflictsFlagLine = regexp.MustCompile(`(?m)^[ \t]*--force-conflicts \\$`)
+
+// stripBashLineComments removes bash "#" comments from every line so that
+// explanatory prose that merely mentions "--force-conflicts" is never
+// mistaken for the real flag by the whitespace-token scan below. A "#" only
+// starts a comment when it begins the line (after leading whitespace) or is
+// preceded by whitespace, matching how bash parses it for the plain,
+// unquoted lines used around these calls.
+func stripBashLineComments(text string) string {
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		for j := 0; j < len(line); j++ {
+			if line[j] != '#' {
+				continue
+			}
+			if j == 0 || line[j-1] == ' ' || line[j-1] == '\t' {
+				lines[i] = line[:j]
+				break
+			}
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// countToken returns how many elements of tokens equal want exactly.
+func countToken(tokens []string, want string) int {
+	n := 0
+	for _, tok := range tokens {
+		if tok == want {
+			n++
+		}
+	}
+	return n
+}
+
+// checkForceConflictsInvariant proves, independent of how the script happens
+// to be formatted, that --force-conflicts appears as a distinct shell token
+// exactly three times in deploy.sh: exactly once inside each of the three
+// known --server-side --dry-run=server validation-only kubectl apply
+// invocations (upgrade hooks, the digest-pinned candidate, and per-document
+// canonicalization), and nowhere else in the file.
+//
+// Detection is whitespace-token based (via strings.Fields over the whole,
+// comment-stripped file), not anchored to any particular line shape. That
+// matters because a naive "does this exact line say `--force-conflicts \`"
+// check can be evaded by adding the flag inline on an existing flag's line,
+// or by adding it to any other command entirely (in particular a mutating
+// command such as `kubectl patch`, `kubectl set`, `kubectl delete`, or
+// `helm upgrade`) without ever producing a standalone `--force-conflicts \`
+// line. This check instead totals every occurrence of the token anywhere in
+// the file and requires that total to equal the sum of occurrences found
+// strictly inside the three known validation blocks, so any leakage outside
+// those three blocks - in any formatting - fails it.
+func checkForceConflictsInvariant(text string) error {
+	stripped := stripBashLineComments(text)
+
+	blocks := applyBlockRegex.FindAllString(stripped, -1)
+	if len(blocks) != 3 {
+		return fmt.Errorf("expected exactly 3 kubectl apply invocations (upgrade hooks, candidate, per-document canonicalization), found %d:\n%v", len(blocks), blocks)
+	}
+
+	blockTotal := 0
+	for _, block := range blocks {
+		tokens := strings.Fields(block)
+		hasServerSide := countToken(tokens, "--server-side") > 0
+		hasDryRunServer := countToken(tokens, "--dry-run=server") > 0
+		if hasServerSide != hasDryRunServer {
+			return fmt.Errorf("kubectl apply invocation mixes --server-side and --dry-run=server inconsistently:\n%s", block)
+		}
+		if !hasServerSide {
+			return fmt.Errorf("found a kubectl apply invocation that is not a --server-side --dry-run=server validation call:\n%s", block)
+		}
+		occurrences := countToken(tokens, "--force-conflicts")
+		if occurrences != 1 {
+			return fmt.Errorf("server-side dry-run validation call must carry --force-conflicts exactly once (found %d):\n%s", occurrences, block)
+		}
+		blockTotal += occurrences
+	}
+
+	globalTokens := strings.Fields(stripped)
+	globalCount := countToken(globalTokens, "--force-conflicts")
+	if globalCount != blockTotal {
+		return fmt.Errorf("found %d --force-conflicts token(s) in deploy.sh but only %d are inside the 3 known server-side dry-run validation calls; --force-conflicts must never appear on any other command (e.g. a mutating kubectl patch/set/delete or helm upgrade)", globalCount, blockTotal)
+	}
+	if globalCount != 3 {
+		return fmt.Errorf("expected --force-conflicts to appear exactly 3 times total, found %d", globalCount)
+	}
+	return nil
+}
+
 // TestDeployScriptForceConflictsPairedWithServerSideDryRun is a static
 // invariant: every kubectl apply invocation in deploy.sh must be exactly the
 // three known --server-side --dry-run=server validation-only calls (upgrade
 // hooks, the digest-pinned candidate, and per-document canonicalization),
-// and every one of them must carry --force-conflicts. Production objects
-// (ingress, workload images/env/resources, StatefulSet
-// volumeClaimTemplates, CronJob fields) are already owned by Helm (and one
-// containment field by kubectl-set), so a validation-only SSA dry-run
-// against them must be allowed to take over ownership or Kubernetes
-// correctly rejects it before admission/defaulting validation ever runs.
-// --force-conflicts must never leak onto anything else: the real production
-// apply remains `helm upgrade`, not kubectl apply, and this test proves the
-// total --force-conflicts occurrence count in the file (3) exactly matches
-// the number of server-side dry-run validation calls (3), so a fourth,
-// unpaired, or misplaced occurrence fails this test.
+// and every one of them must carry --force-conflicts, and nothing else in
+// the file may carry it. Production objects (ingress, workload
+// images/env/resources, StatefulSet volumeClaimTemplates, CronJob fields)
+// are already owned by Helm (and one containment field by kubectl-set), so
+// a validation-only SSA dry-run against them must be allowed to take over
+// ownership or Kubernetes correctly rejects it before admission/defaulting
+// validation ever runs. The real production apply remains `helm upgrade`,
+// not kubectl apply, so this test proves --force-conflicts can never leak
+// onto that or any other command. See checkForceConflictsInvariant for how
+// leakage is detected regardless of formatting.
 func TestDeployScriptForceConflictsPairedWithServerSideDryRun(t *testing.T) {
 	source, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	text := string(source)
-
-	applyBlocks := regexp.MustCompile(`(?s)kubectl apply \\.*?-o (?:yaml|json)[^\n]*`).FindAllString(text, -1)
-	if len(applyBlocks) != 3 {
-		t.Fatalf("expected exactly 3 kubectl apply invocations (upgrade hooks, candidate, per-document canonicalization), found %d:\n%v", len(applyBlocks), applyBlocks)
-	}
-
-	serverSideDryRunCount := 0
-	for _, block := range applyBlocks {
-		hasServerSide := strings.Contains(block, "--server-side")
-		hasDryRunServer := strings.Contains(block, "--dry-run=server")
-		hasForceConflicts := strings.Contains(block, "--force-conflicts")
-		if hasServerSide != hasDryRunServer {
-			t.Fatalf("kubectl apply invocation mixes --server-side and --dry-run=server inconsistently:\n%s", block)
-		}
-		if hasServerSide {
-			serverSideDryRunCount++
-			if !hasForceConflicts {
-				t.Fatalf("server-side dry-run validation must always pair --force-conflicts with --dry-run=server (existing objects are Helm-owned):\n%s", block)
-			}
-		}
-	}
-	if serverSideDryRunCount != 3 {
-		t.Fatalf("expected all 3 kubectl apply invocations to be --server-side --dry-run=server validation-only calls, found %d", serverSideDryRunCount)
-	}
-
-	// Count only actual --force-conflicts flag lines (not explanatory
-	// comments that mention the flag in prose), so this proves the flag
-	// itself never leaks onto a fourth command such as `helm upgrade`.
-	flagOccurrences := forceConflictsFlagLine.FindAllString(text, -1)
-	if len(flagOccurrences) != 3 {
-		t.Fatalf("expected --force-conflicts to appear exactly 3 times as an actual flag (once per server-side dry-run validation call, never elsewhere such as helm upgrade), found %d:\n%v", len(flagOccurrences), flagOccurrences)
+	if err := checkForceConflictsInvariant(string(source)); err != nil {
+		t.Fatal(err)
 	}
 }
 
-// forceConflictsFlagLine matches an actual `--force-conflicts \` flag line
-// in deploy.sh, as opposed to explanatory comment text that merely mentions
-// the flag in prose.
-var forceConflictsFlagLine = regexp.MustCompile(`(?m)^[ \t]*--force-conflicts \\$`)
+// TestDeployScriptForceConflictsInvariantDetectsMutatingLeakage proves the
+// static invariant above is load-bearing against leakage, not merely a
+// count of backslash-continued lines: it must catch --force-conflicts
+// leaking onto a real mutating kubectl command already present in deploy.sh
+// (kubectl patch and kubectl set env, both of which mutate live cluster
+// state), regardless of whether the leaked flag is written inline on an
+// existing flag's line or as its own new line. A leaked occurrence there
+// would let a mutating operation silently take over field ownership it has
+// no business touching, so the invariant must fail closed on it exactly as
+// it would on the intended validation-only call sites.
+func TestDeployScriptForceConflictsInvariantDetectsMutatingLeakage(t *testing.T) {
+	source, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := string(source)
+	if err := checkForceConflictsInvariant(original); err != nil {
+		t.Fatalf("precondition failed: unmodified deploy.sh must satisfy the invariant: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		old  string
+		new  string
+	}{
+		{
+			// enforce_synthetic_rollback_containment's real, unconditional
+			// `kubectl patch cronjob/... --type strategic -p '...'` mutates
+			// a live CronJob. Attaching --force-conflicts inline on its
+			// existing --type flag line (no new line, no distinctive
+			// leading whitespace) is exactly the shape the old
+			// line-anchored regex check could not see.
+			name: "inline on an existing flag line of a real mutating kubectl patch",
+			old:  "      --type strategic \\\n",
+			new:  "      --type strategic --force-conflicts \\\n",
+		},
+		{
+			// contain_failed_atomic_upgrade's real
+			// `kubectl set env deployment/$RELEASE-worker ...` mutates a
+			// live Deployment's environment. This inserts the flag as its
+			// own backslash-continued line (the shape the old regex did
+			// match), proving the new invariant still catches leakage even
+			// in the "obvious" formatting, just onto the wrong command.
+			name: "own line inside a real mutating kubectl set env",
+			old:  "  if ! kubectl set env \"deployment/$RELEASE-worker\" \\\n      -n \"$NAMESPACE\" \\\n      WORKER_PROVISIONING_CLAIMS_ENABLED=false; then",
+			new:  "  if ! kubectl set env \"deployment/$RELEASE-worker\" \\\n      --force-conflicts \\\n      -n \"$NAMESPACE\" \\\n      WORKER_PROVISIONING_CLAIMS_ENABLED=false; then",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if occurrences := strings.Count(original, test.old); occurrences != 1 {
+				t.Fatalf("expected exactly one occurrence of the target text to mutate, found %d:\n%s", occurrences, test.old)
+			}
+			mutated := strings.Replace(original, test.old, test.new, 1)
+			if mutated == original {
+				t.Fatal("mutation had no effect")
+			}
+			err := checkForceConflictsInvariant(mutated)
+			if err == nil {
+				t.Fatal("invariant did not detect --force-conflicts leaking onto a real mutating kubectl command")
+			}
+			if !strings.Contains(err.Error(), "must never appear on any other command") {
+				t.Fatalf("invariant failure did not identify leakage outside the known validation calls: %v", err)
+			}
+		})
+	}
+}
+
+// TestDeployScriptForceConflictsInvariantDetectsRemoval proves the same
+// static invariant fails closed the other direction too: removing
+// --force-conflicts from any one of the three legitimate validation call
+// sites (the same mutation TestDeployScriptForceConflictsIsLoadBearing uses
+// to prove the runtime behavior is load-bearing) must also be caught
+// statically, without needing to actually execute the script.
+func TestDeployScriptForceConflictsInvariantDetectsRemoval(t *testing.T) {
+	originalBytes, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := string(originalBytes)
+
+	for _, functionName := range []string{
+		"validate_upgrade_hooks",
+		"server_validate_candidate",
+		"canonicalize_server_candidate",
+	} {
+		t.Run(functionName, func(t *testing.T) {
+			mutated := stripForceConflictsFromFunction(t, original, functionName)
+			if err := checkForceConflictsInvariant(mutated); err == nil {
+				t.Fatalf("invariant did not detect --force-conflicts removed from %s()", functionName)
+			}
+		})
+	}
+}
 
 // TestDeployScriptServerValidationSucceedsUnderRealisticOwnershipConflicts
 // proves that server_validate_candidate, canonicalize_server_candidate, and
