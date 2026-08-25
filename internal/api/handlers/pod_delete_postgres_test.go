@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -55,7 +56,6 @@ func newPodDeletePostgresFixture(t *testing.T, vmCount int) *podDeletePostgresFi
 		templateID: uuid.New(),
 		podID:      uuid.New(),
 		createJob:  uuid.New(),
-		vlanTag:    3999,
 	}
 
 	if _, err := pool.Exec(ctx, `
@@ -70,16 +70,24 @@ func newPodDeletePostgresFixture(t *testing.T, vmCount int) *podDeletePostgresFi
 	`, fixture.templateID, "delete-"+fixture.templateID.String(), "legacy-"+fixture.templateID.String()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO pods (id, owner_id, name, salt, vlan_id, subnet, status, allow_vm_additions)
-		VALUES ($1, $2, $3, $4, $5, $6, 'pending', true)
-	`, fixture.podID, fixture.ownerID, "delete-"+fixture.podID.String(), "abc123", fixture.vlanTag, "10.100.99.0/24"); err != nil {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO vlan_pool (vlan_tag, subnet, host_scope, pod_id, allocated_at)
-		VALUES ($1, $2, 'all', $3, now())
-	`, fixture.vlanTag, "10.100.99.0/24", fixture.podID); err != nil {
+	vlanTag, subnet, err := fixture.queries.CheckoutVLAN(ctx, tx, fixture.podID, "all")
+	if err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	fixture.vlanTag = vlanTag
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO pods (id, owner_id, name, salt, vlan_id, subnet, status, allow_vm_additions)
+		VALUES ($1, $2, $3, $4, $5, $6, 'pending', true)
+	`, fixture.podID, fixture.ownerID, "delete-"+fixture.podID.String(), "abc123", vlanTag, subnet); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < vmCount; i++ {
@@ -109,7 +117,7 @@ func newPodDeletePostgresFixture(t *testing.T, vmCount int) *podDeletePostgresFi
 		_, _ = pool.Exec(cleanupCtx, `DELETE FROM pod_portgroup_receipts WHERE pod_id = $1`, fixture.podID)
 		_, _ = pool.Exec(cleanupCtx, `DELETE FROM jobs WHERE id = $1`, fixture.createJob)
 		_, _ = pool.Exec(cleanupCtx, `DELETE FROM pod_vms WHERE pod_id = $1`, fixture.podID)
-		_, _ = pool.Exec(cleanupCtx, `DELETE FROM vlan_pool WHERE pod_id = $1 OR vlan_tag = $2`, fixture.podID, fixture.vlanTag)
+		_, _ = pool.Exec(cleanupCtx, `UPDATE vlan_pool SET pod_id = NULL, allocated_at = NULL WHERE pod_id = $1`, fixture.podID)
 		_, _ = pool.Exec(cleanupCtx, `DELETE FROM pods WHERE id = $1`, fixture.podID)
 		_, _ = pool.Exec(cleanupCtx, `DELETE FROM templates WHERE id = $1`, fixture.templateID)
 		_, _ = pool.Exec(cleanupCtx, `DELETE FROM users WHERE id = $1`, fixture.ownerID)
@@ -365,7 +373,7 @@ func TestDeletePodRejectsClaimedJobAndExternalEvidence(t *testing.T) {
 			setup: func(t *testing.T, f *podDeletePostgresFixture) {
 				t.Helper()
 				receipt, err := json.Marshal(map[string]any{
-					"name":    "Pod-VLAN3999",
+					"name":    fmt.Sprintf("Pod-VLAN%d", f.vlanTag),
 					"vlan_id": f.vlanTag,
 					"hosts": []map[string]any{{
 						"host_name":     "esxi1.lab.jmal.io",
@@ -396,11 +404,18 @@ func TestDeletePodRejectsClaimedJobAndExternalEvidence(t *testing.T) {
 			name: "rollback evidence",
 			setup: func(t *testing.T, f *podDeletePostgresFixture) {
 				t.Helper()
+				rollbackSteps, err := json.Marshal([]map[string]any{{
+					"name": "portgroup_create",
+					"data": map[string]any{"name": fmt.Sprintf("Pod-VLAN%d", f.vlanTag)},
+				}})
+				if err != nil {
+					t.Fatal(err)
+				}
 				if _, err := f.pool.Exec(context.Background(), `
 					UPDATE jobs
-					SET rollback_steps = '[{"name":"portgroup_create","data":{"name":"Pod-VLAN3999"}}]'::jsonb
-					WHERE id = $1
-				`, f.createJob); err != nil {
+					SET rollback_steps = $1::jsonb
+					WHERE id = $2
+				`, rollbackSteps, f.createJob); err != nil {
 					t.Fatal(err)
 				}
 			},
