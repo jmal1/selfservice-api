@@ -109,9 +109,17 @@ spec:
                       name: {{ .Values.synthetic.contentFilter.opnsenseSecretName }}
                       key: opnsense-api-secret
                       optional: true
-                {{- if .Values.synthetic.lifecycle.enabled }}
+                # SYNTHETIC_LIFECYCLE_ENABLED is always rendered (never wrapped
+                # in the lifecycle-enabled conditional below). The deploy
+                # safety contract's validate_foundation_intent reads it via
+                # env_from_manifest, which requires EXACTLY ONE match - an
+                # absent key (as happens when this is conditional) fails
+                # closed with a misleading "must keep ...=false" error instead
+                # of asserting the real, explicit intent. See AGENTS.md and
+                # deploy/scripts/deploy.sh.
                 - name: SYNTHETIC_LIFECYCLE_ENABLED
-                  value: "true"
+                  value: {{ .Values.synthetic.lifecycle.enabled | quote }}
+                {{- if .Values.synthetic.lifecycle.enabled }}
                 - name: SYNTHETIC_LIFECYCLE_TEMPLATE
                   value: {{ .Values.synthetic.lifecycle.template | quote }}
                 - name: SYNTHETIC_LIFECYCLE_READY_TIMEOUT
