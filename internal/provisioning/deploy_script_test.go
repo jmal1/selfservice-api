@@ -2841,6 +2841,193 @@ spec:
 	}
 }
 
+// renderedWorkerReplicasPreFixBody is the pre-fix implementation of
+// rendered_worker_replicas_from_manifest(): it matched any "  replicas:"
+// line in the rendered worker Deployment document regardless of which
+// top-level YAML section ("spec:" or "status:") it fell under. A real
+// server-side dry-run apply against an already-live worker Deployment
+// merges in the existing "status:" block, whose "replicas:" field sits at
+// the exact same two-space indent as spec.replicas, so this old parser saw
+// two matches for a perfectly valid manifest and failed closed ("renders X
+// workers, not exactly 1") even though spec.replicas was unambiguous. It is
+// kept here, verbatim, only to prove the fix below is load-bearing.
+const renderedWorkerReplicasPreFixBody = `rendered_worker_replicas_from_manifest() {
+  local manifest=$1
+  extract_workload_manifest "$manifest" Deployment "$RELEASE-worker" \
+    | awk '
+        /^  replicas:[[:space:]]*/ {
+          matches++
+          value = $0
+          sub(/^  replicas:[[:space:]]*/, "", value)
+          gsub(/^["'"'"']|["'"'"']$/, "", value)
+        }
+        END {
+          if (matches != 1 || value == "") {
+            exit 3
+          }
+          print value
+        }
+      '
+}
+`
+
+// TestDeployScriptRenderedWorkerReplicasFromManifestIsSpecScoped proves that
+// rendered_worker_replicas_from_manifest reads exactly spec.replicas from a
+// rendered worker Deployment manifest, even when the manifest also carries a
+// server-populated "status:" section (the shape produced by a real
+// server-side dry-run apply against an already-live Deployment, where the
+// server merges in existing status). It also proves the parser still
+// rejects a manifest missing spec.replicas or with a duplicated
+// spec.replicas, and it reverts the parser to its pre-fix, section-unaware
+// form to prove the fix is load-bearing: without it, the exact same
+// realistic spec+status manifest is wrongly rejected.
+func TestDeployScriptRenderedWorkerReplicasFromManifestIsSpecScoped(t *testing.T) {
+	requirePOSIXShell(t)
+
+	source, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	extractWorkloadManifestBody, _, _, err := extractFunctionBody(string(source), "extract_workload_manifest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentBody, _, _, err := extractFunctionBody(string(source), "rendered_worker_replicas_from_manifest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if currentBody == renderedWorkerReplicasPreFixBody {
+		t.Fatal("rendered_worker_replicas_from_manifest still matches its pre-fix, section-unaware implementation")
+	}
+
+	// A realistic server-side dry-run render of an already-live worker
+	// Deployment: the server merges in a "status:" block whose "replicas:"
+	// field sits at the identical two-space indent as spec.replicas.
+	specAndStatus := `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: selfservice-worker
+  namespace: selfservice
+  uid: 11111111-1111-1111-1111-111111111111
+  resourceVersion: "999"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: selfservice-worker
+  template:
+    metadata:
+      labels:
+        app: selfservice-worker
+    spec:
+      containers:
+      - name: worker
+        image: example.invalid/worker@sha256:` + testDigestA + `
+status:
+  observedGeneration: 5
+  replicas: 1
+  updatedReplicas: 1
+  readyReplicas: 1
+  availableReplicas: 1
+  conditions:
+  - type: Available
+    status: "True"
+`
+
+	missingSpecReplicas := `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: selfservice-worker
+spec:
+  selector:
+    matchLabels:
+      app: selfservice-worker
+  template:
+    metadata:
+      labels:
+        app: selfservice-worker
+    spec:
+      containers:
+      - name: worker
+        image: example.invalid/worker@sha256:` + testDigestA + `
+status:
+  replicas: 1
+`
+
+	duplicateSpecReplicas := `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: selfservice-worker
+spec:
+  replicas: 1
+  replicas: 2
+  selector:
+    matchLabels:
+      app: selfservice-worker
+  template:
+    metadata:
+      labels:
+        app: selfservice-worker
+    spec:
+      containers:
+      - name: worker
+        image: example.invalid/worker@sha256:` + testDigestA + `
+status:
+  replicas: 1
+`
+
+	run := func(t *testing.T, replicaFnBody, manifest string) (string, error) {
+		t.Helper()
+		dir := t.TempDir()
+		manifestPath := filepath.Join(dir, "manifest.yaml")
+		writeFile(t, manifestPath, manifest)
+		// A tiny, self-contained harness: just the two real functions
+		// under test (extract_workload_manifest plus whichever
+		// rendered_worker_replicas_from_manifest body is being
+		// exercised) and the RELEASE variable they depend on, run
+		// directly against a fixture file. This avoids needing the
+		// full deploy.sh run (live cluster stubs, Helm, --ui-source-sha)
+		// for a bug isolated entirely to text parsing.
+		harness := "#!/bin/bash\nset -euo pipefail\nRELEASE=selfservice\n\n" +
+			extractWorkloadManifestBody + "\n" + replicaFnBody +
+			"\nrendered_worker_replicas_from_manifest \"$1\"\n"
+		harnessPath := filepath.Join(dir, "harness.sh")
+		writeFile(t, harnessPath, harness)
+		out, runErr := exec.Command("bash", harnessPath, manifestPath).CombinedOutput()
+		return strings.TrimSpace(string(out)), runErr
+	}
+
+	t.Run("accepts spec.replicas alongside a status.replicas section", func(t *testing.T) {
+		out, runErr := run(t, currentBody, specAndStatus)
+		if runErr != nil {
+			t.Fatalf("fixed parser rejected a realistic spec+status render: %v\n%s", runErr, out)
+		}
+		if out != "1" {
+			t.Fatalf("fixed parser returned %q, want \"1\"", out)
+		}
+	})
+
+	t.Run("rejects a manifest with no spec.replicas", func(t *testing.T) {
+		if out, runErr := run(t, currentBody, missingSpecReplicas); runErr == nil {
+			t.Fatalf("fixed parser accepted a manifest with no spec.replicas: %s", out)
+		}
+	})
+
+	t.Run("rejects a manifest with duplicated spec.replicas", func(t *testing.T) {
+		if out, runErr := run(t, currentBody, duplicateSpecReplicas); runErr == nil {
+			t.Fatalf("fixed parser accepted a manifest with duplicated spec.replicas: %s", out)
+		}
+	})
+
+	t.Run("pre-fix parser fails the exact production shape (load-bearing)", func(t *testing.T) {
+		out, runErr := run(t, renderedWorkerReplicasPreFixBody, specAndStatus)
+		if runErr == nil {
+			t.Fatalf("pre-fix, section-unaware parser unexpectedly accepted a spec+status render: %s -- fix is not load-bearing", out)
+		}
+	})
+}
+
 func TestDeployScriptRejectsConcurrentReleaseMutation(t *testing.T) {
 	requirePOSIXShell(t)
 	manifest := baselineManifest(true, "*", "false")

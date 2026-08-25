@@ -257,9 +257,23 @@ runner_image_from_manifest() {
 
 rendered_worker_replicas_from_manifest() {
   local manifest=$1
+  # extract_workload_manifest returns the whole single-document Deployment
+  # YAML, including a server-populated "status:" section when the manifest
+  # came from a dry-run apply against an existing live object. "status:"
+  # carries its own top-level "  replicas:" field (status.replicas) at the
+  # exact same two-space indent as spec.replicas, so a bare
+  # "/^  replicas:/" match sees two lines and fails as "duplicate" even
+  # though there is exactly one spec.replicas. Track which top-level
+  # ("apiVersion:", "kind:", "metadata:", "spec:", "status:", ...) section
+  # we are currently in and only accept "  replicas:" while inside "spec:".
   extract_workload_manifest "$manifest" Deployment "$RELEASE-worker" \
     | awk '
-        /^  replicas:[[:space:]]*/ {
+        /^[^[:space:]]/ {
+          section = $0
+          sub(/:.*$/, "", section)
+          next
+        }
+        section == "spec" && /^  replicas:[[:space:]]*/ {
           matches++
           value = $0
           sub(/^  replicas:[[:space:]]*/, "", value)
