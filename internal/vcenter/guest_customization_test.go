@@ -44,19 +44,32 @@ func decodeGuestinfo(t *testing.T, opts []types.BaseOptionValue) (userdata, meta
 }
 
 func TestGuestinfoCustomization_EmptyPasswordInjectsNothing(t *testing.T) {
-	if got := guestinfoCustomization("linux", "", "host"); got != nil {
+	got, err := guestinfoCustomizationForInstance("linux", "", "host", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil {
 		t.Fatalf("empty password returned %d options, want nil", len(got))
 	}
 }
 
-func TestGuestinfoCustomization_UnknownOSInjectsNothing(t *testing.T) {
-	if got := guestinfoCustomization("freebsd", "Changeme123!", "host"); got != nil {
-		t.Fatalf("unknown OS returned %d options, want nil", len(got))
+func TestGuestinfoCustomization_UnknownOSFailsClosed(t *testing.T) {
+	if _, err := guestinfoCustomizationForInstance("freebsd", "Changeme123!", "host", "instance-1"); err == nil {
+		t.Fatal("unknown OS accepted a password-bearing customization")
+	}
+}
+
+func TestGuestinfoCustomization_MissingInstanceIDFailsClosed(t *testing.T) {
+	if _, err := guestinfoCustomizationForInstance("linux", "Changeme123!", "host", ""); err == nil {
+		t.Fatal("password-bearing customization accepted an empty instance ID")
 	}
 }
 
 func TestGuestinfoCustomization_LinuxSetsDefaultUserPassword(t *testing.T) {
-	opts := guestinfoCustomization("linux", "Changeme123!", "tpl-ubuntu-test")
+	opts, err := guestinfoCustomizationForInstance("linux", "Changeme123!", "tpl-ubuntu-test", "instance-linux-1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(opts) != 4 {
 		t.Fatalf("linux produced %d options, want 4 (userdata + metadata + 2 encodings)", len(opts))
 	}
@@ -79,10 +92,16 @@ func TestGuestinfoCustomization_LinuxSetsDefaultUserPassword(t *testing.T) {
 	if !strings.Contains(metadata, `"local-hostname": "tpl-ubuntu-test"`) {
 		t.Fatalf("linux metadata missing local-hostname:\n%s", metadata)
 	}
+	if !strings.Contains(metadata, `"instance-id": "instance-linux-1"`) {
+		t.Fatalf("linux metadata missing unique instance identity:\n%s", metadata)
+	}
 }
 
 func TestGuestinfoCustomization_WindowsSetsStudentPassword(t *testing.T) {
-	opts := guestinfoCustomization("windows", "Changeme123!", "tpl-win-test")
+	opts, err := guestinfoCustomizationForInstance("windows", "Changeme123!", "tpl-win-test", "instance-windows-1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(opts) != 4 {
 		t.Fatalf("windows produced %d options, want 4", len(opts))
 	}
@@ -99,5 +118,28 @@ func TestGuestinfoCustomization_WindowsSetsStudentPassword(t *testing.T) {
 	}
 	if !strings.Contains(metadata, `"admin_pass": "Changeme123!"`) {
 		t.Fatalf("windows metadata missing admin_pass:\n%s", metadata)
+	}
+	if !strings.Contains(metadata, `"instance-id": "instance-windows-1"`) {
+		t.Fatalf("windows metadata missing unique instance identity:\n%s", metadata)
+	}
+}
+
+func TestGuestinfoCustomization_InstanceIdentityIsNotHostname(t *testing.T) {
+	first, err := guestinfoCustomizationForInstance("linux", "First1!", "reused-hostname", "clone-operation-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := guestinfoCustomizationForInstance("linux", "Second2!", "reused-hostname", "clone-operation-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, firstMetadata := decodeGuestinfo(t, first)
+	_, secondMetadata := decodeGuestinfo(t, second)
+	if firstMetadata == secondMetadata {
+		t.Fatalf("distinct clone operations produced identical metadata: %s", firstMetadata)
+	}
+	if strings.Contains(firstMetadata, `"instance-id": "reused-hostname"`) ||
+		strings.Contains(secondMetadata, `"instance-id": "reused-hostname"`) {
+		t.Fatalf("hostname was reused as instance identity: first=%s second=%s", firstMetadata, secondMetadata)
 	}
 }

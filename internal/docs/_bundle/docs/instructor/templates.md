@@ -36,11 +36,12 @@ the page.
 
 **Publish is gated by a smoke test.** When you click Publish, the template
 first enters `verifying`: Crucible clones a disposable VM from the
-freshly-generalized image, powers it on, and waits for it to boot unattended
-(VMware Tools + an IP lease). If it boots cleanly the template auto-advances to
-`active`; if it fails to boot the template returns to `ready` with the failure
-recorded, so a bricked image cannot reach students. The throwaway VM is always
-cleaned up.
+freshly-generalized image, powers it on, waits for VMware Tools and an IP lease,
+and authenticates through VMware Tools with the generated student credential.
+If every check succeeds the template auto-advances to `active`; if any check
+fails the template returns to `ready` with the failure recorded, so a VM that
+boots but rejects its advertised password cannot reach students. The throwaway
+VM is always cleaned up.
 
 ---
 
@@ -836,6 +837,20 @@ non-customized template on any OS). The wizard's publish gate blocks blank
 `default_username` / `default_password` on non-customized templates, and
 blank or non-`student` `default_username` on customized Linux templates,
 for exactly this reason.
+
+For every student VM created from `clone_with_customize`, Crucible persists one
+random credential before clone submission and reuses that exact value across
+worker retries. The clone receives a unique first-boot instance identity, and
+the VM remains `configuring` while Crucible asks VMware Tools to authenticate
+the generated `student` / `Student` credential. The pod API does not expose
+either the generated credential or the build-time `Changeme123!` fallback until
+the VM reaches `running`. If cloud-init or Cloudbase-Init does not consume the
+payload within six minutes, provisioning fails and compensates the clone rather
+than returning an apparently ready VM with unusable credentials.
+
+`clone_no_customize` and `registered_existing_vm` are unchanged: Crucible does
+not inject or authenticate a generated password for those kinds. Their static
+template credentials remain the authoritative login.
 
 ---
 

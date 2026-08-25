@@ -847,8 +847,9 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) (retErr error)
 
 	pgName := fmt.Sprintf("Pod-VLAN%d", pod.VLANID)
 
-	// Determine OS type and generate credentials
-	password := ""
+	// Resolve and durably persist credentials before clone submission. Retries
+	// must reuse the exact password already written to guestinfo instead of
+	// generating a new display-only value for an adopted clone.
 	osType := ""
 	tmpl, tmplErr := p.db.GetTemplateByID(ctx, podVM.TemplateID)
 	if tmplErr == nil {
@@ -856,6 +857,28 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) (retErr error)
 	}
 	if tmplErr != nil {
 		return fmt.Errorf("get template for VM placement: %w", tmplErr)
+	}
+	storedUsername, storedPassword, credentialErr := provisionedPodVMCredentials(
+		tmpl.Kind,
+		osType,
+		podVM,
+		tmpl,
+		generatePassword,
+	)
+	if credentialErr != nil {
+		return fmt.Errorf("resolve credentials for added VM %s: %w", podVMID, credentialErr)
+	}
+	if err := p.db.UpdatePodVMCredentials(
+		ctx,
+		podVMID,
+		storedUsername,
+		storedPassword,
+	); err != nil {
+		return fmt.Errorf("persist credentials for added VM %s before clone: %w", podVMID, err)
+	}
+	customizationPassword := ""
+	if shouldGenerateGuestPassword(tmpl.Kind, osType) {
+		customizationPassword = storedPassword
 	}
 	receiptRecord, err := p.db.GetPodPortGroupReceipt(ctx, podID)
 	if err != nil {
@@ -938,10 +961,6 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) (retErr error)
 		return err
 	}
 	placement := placements[0]
-	if osType == "linux" || osType == "windows" {
-		password = generatePassword(12)
-	}
-
 	// Resume support: skip clone if VM was already cloned (e.g., job retry after worker restart)
 	if podVM.VCenterVMID != nil && *podVM.VCenterVMID != "" &&
 		payload.CloneOperation == nil {
@@ -960,7 +979,7 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) (retErr error)
 			RAMmb:        int64(podVM.RAMMB),
 			Network:      pgName,
 			OSType:       osType,
-			Password:     password,
+			Password:     customizationPassword,
 		}, placement)
 		moref, err = executeDurableVMClone(
 			ctx,
@@ -1057,12 +1076,6 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) (retErr error)
 			}
 		}
 
-		// Store generated credentials
-		genUser := "student"
-		if osType == "windows" {
-			genUser = "Student"
-		}
-		_ = p.db.UpdatePodVMCredentials(ctx, podVMID, genUser, password)
 	}
 
 	if err := p.verifyPersistedVMPlacement(ctx, moref, placement); err != nil {
@@ -1107,7 +1120,31 @@ func (p *Provisioner) AddVM(ctx context.Context, job *models.Job) (retErr error)
 		)
 	}
 
-	// Step 3: Wait for IP
+	// Step 3: prove customized credentials were consumed before the VM can
+	// become success-shaped. Static credential kinds intentionally bypass this
+	// generated-credential gate.
+	if err := waitForPodVMCredentialReady(
+		ctx,
+		p.vc,
+		tmpl.Kind,
+		osType,
+		moref,
+		storedUsername,
+		storedPassword,
+		podGuestCredentialReadyTimeout,
+		podGuestCredentialRetryInterval,
+	); err != nil {
+		return p.failVMAddWithCleanup(
+			ctx,
+			job,
+			podID,
+			podVMID,
+			moref,
+			fmt.Errorf("verify added VM guest credentials: %w", err),
+		)
+	}
+
+	// Step 4: Wait for IP
 	ip, err := p.vc.WaitForIP(ctx, moref, 5*time.Minute)
 	if err != nil {
 		p.logger.Warn("timeout waiting for VM IP", "vm", payload.VMName, "error", err)

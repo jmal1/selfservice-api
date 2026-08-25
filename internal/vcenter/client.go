@@ -541,10 +541,18 @@ func (c *Client) ConfigureClonedVM(ctx context.Context, moref string, params Clo
 	}
 
 	// Inject guestinfo for guest OS customization (first-boot password).
-	// Shared with the template-wizard staging clone via guestinfoCustomization
-	// so the two injection paths cannot drift.
-	configSpec.ExtraConfig = append(configSpec.ExtraConfig,
-		guestinfoCustomization(params.OSType, params.Password, params.VMName)...)
+	// The durable operation ID is a per-clone instance identity, so guest
+	// agents cannot mistake this clone for a previously customized VM.
+	customization, err := guestinfoCustomizationForInstance(
+		params.OSType,
+		params.Password,
+		params.VMName,
+		params.OperationID,
+	)
+	if err != nil {
+		return err
+	}
+	configSpec.ExtraConfig = append(configSpec.ExtraConfig, customization...)
 
 	reconfigTask, err := clonedVM.Reconfigure(ctx, configSpec)
 	if err != nil {

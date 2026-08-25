@@ -1167,6 +1167,11 @@ Once vCenter returns a task MoRef, the worker persists it before waiting.
 Successors resume that exact task and never submit a second clone for an armed
 operation. Template verification and revalidation smoke clones use this same
 protocol; their job and template ids provide the immutable operation scope.
+For `clone_with_customize`, the generated guest credential is also durable
+before clone submission and is reused unchanged across retries; it is never
+replaced with the template's `Changeme123!` build password. The clone operation
+UUID is the cloud-init / Cloudbase-Init instance identity, so every clone is a
+new first-boot instance while a resumed operation remains stable.
 Transient task waits before clone acceptance consume the normal forward retry
 budget by resuming that exact persisted task. A forward retry clears only the
 cleanup dispatch marker and retains the operation, task, source, compute, pool,
@@ -1174,6 +1179,16 @@ and host identities. Once the exact clone VM is accepted and staged, any
 placement validation or configuration failure enters cleanup-only compensation
 immediately; retries reconcile and destroy that exact VM and cannot replay
 VLAN, interface, DHCP, firewall, portgroup, or clone setup.
+
+After power-on, a customized pod VM remains `configuring` until VMware Tools
+accepts the exact generated `student` (Linux) or `Student` (Windows)
+credential. The worker polls for up to six minutes to allow cloud-init /
+Cloudbase-Init and their reboot to complete. Failure enters compensation; it
+must never be represented as a `running` VM or active pod. The pod API hides
+both generated and static/build credentials for every non-running VM.
+`clone_no_customize` and `registered_existing_vm` never receive guestinfo
+credential injection and bypass this generated-credential authentication gate;
+their non-empty persisted static template credentials remain authoritative.
 
 Clone task waits have a 15-minute operational deadline and honor lease loss.
 Task or marker recovery stages the exact VM MoRef before any mutable

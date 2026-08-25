@@ -1511,8 +1511,16 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr er
 				"pre-clone terminal-state check",
 			)
 		}
-		if t, tmplErr := p.db.GetTemplateByID(ctx, podVMRow.TemplateID); tmplErr == nil {
-			tmpl = t
+		tmpl, err = p.db.GetTemplateByID(ctx, podVMRow.TemplateID)
+		if err != nil {
+			return p.failPodCreateWithCleanup(
+				ctx,
+				job,
+				payload,
+				rb,
+				"load template credential contract",
+				fmt.Errorf("get template %s for pod VM %s: %w", podVMRow.TemplateID, vmSpec.PodVMID, err),
+			)
 		}
 
 		osType := vmSpec.OSType
@@ -1535,9 +1543,41 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr er
 		//   * registered_existing_vm — same code path as clone_no_customize;
 		//     the source VM is treated as the canonical golden image, and
 		//     CloneVM already does a linked clone off its current snapshot.
-		var generatedPassword string
+		storedUsername, storedPassword, credentialErr := provisionedPodVMCredentials(
+			kind,
+			osType,
+			podVMRow,
+			tmpl,
+			generatePassword,
+		)
+		if credentialErr != nil {
+			return p.failPodCreateWithCleanup(
+				ctx,
+				job,
+				payload,
+				rb,
+				"resolve pod VM credentials",
+				fmt.Errorf("resolve credentials for pod VM %s: %w", vmSpec.PodVMID, credentialErr),
+			)
+		}
+		if err := p.db.UpdatePodVMCredentials(
+			ctx,
+			vmSpec.PodVMID,
+			storedUsername,
+			storedPassword,
+		); err != nil {
+			return p.failPodCreateWithCleanup(
+				ctx,
+				job,
+				payload,
+				rb,
+				"persist pod VM credentials",
+				fmt.Errorf("persist credentials for pod VM %s before clone: %w", vmSpec.PodVMID, err),
+			)
+		}
+		customizationPassword := ""
 		if shouldGenerateGuestPassword(kind, osType) {
-			generatedPassword = generatePassword(12)
+			customizationPassword = storedPassword
 		}
 
 		// Resume support: if a prior worker already cloned this VM (job was
@@ -1621,7 +1661,7 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr er
 				RAMmb:        int64(podVMRow.RAMMB),
 				Network:      pgName,
 				OSType:       osType,
-				Password:     generatedPassword,
+				Password:     customizationPassword,
 			}, placement)
 			moref, cloneErr = executeDurableVMClone(
 				ctx,
@@ -1708,11 +1748,6 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr er
 			}
 		}
 
-		// Resolve credentials to record on the pod_vms row. Pure helper —
-		// see kind_helpers.go for the policy + unit tests.
-		storedUsername, storedPassword := resolvePodVMCredentials(kind, osType, generatedPassword, tmpl)
-		_ = p.db.UpdatePodVMCredentials(ctx, vmSpec.PodVMID, storedUsername, storedPassword)
-
 		if stopped, err := p.stopPodCreateIfStale(ctx, job, pod.ID, payload.VMs, rb, stepName); err != nil {
 			return err
 		} else if stopped {
@@ -1737,9 +1772,13 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr er
 	p.publishProgress(job.ID, "vm_poweron", "Powering on VMs")
 
 	type vmPowerInfo struct {
-		index  int
-		vmSpec VMSpec
-		moref  string
+		index             int
+		vmSpec            VMSpec
+		moref             string
+		osType            string
+		username          string
+		password          string
+		requiresReadiness bool
 	}
 
 	// Group cloned VMs by boot order
@@ -1813,7 +1852,11 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr er
 				)
 			}
 			if podVM.Status == models.VMStatusRunning {
-				groupPoweredOn = append(groupPoweredOn, vmPowerInfo{index: i, vmSpec: vmSpec, moref: *podVM.VCenterVMID})
+				groupPoweredOn = append(groupPoweredOn, vmPowerInfo{
+					index:  i,
+					vmSpec: vmSpec,
+					moref:  *podVM.VCenterVMID,
+				})
 				continue
 			}
 			if podVM.Status == models.VMStatusDeleted || podVM.Status == models.VMStatusError {
@@ -1867,29 +1910,53 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr er
 				)
 			}
 
-			applied, err = p.db.UpdatePodVMStatusFrom(
-				ctx,
-				vmSpec.PodVMID,
-				[]string{models.VMStatusConfiguring},
-				models.VMStatusRunning,
-			)
-			if err != nil {
-				return fmt.Errorf("mark pod VM %s running: %w", vmSpec.PodVMID, err)
+			osType := vmSpec.OSType
+			if podVM.OSType != "" {
+				osType = podVM.OSType
 			}
-			if !applied {
-				return p.failPodCreateForStaleVM(
-					ctx, job, payload, rb, pod.ID, vmSpec.PodVMID, *podVM.VCenterVMID, "mark running",
-				)
-			}
-			groupPoweredOn = append(groupPoweredOn, vmPowerInfo{index: i, vmSpec: vmSpec, moref: *podVM.VCenterVMID})
+			groupPoweredOn = append(groupPoweredOn, vmPowerInfo{
+				index:             i,
+				vmSpec:            vmSpec,
+				moref:             *podVM.VCenterVMID,
+				osType:            osType,
+				username:          podVM.GeneratedUsername,
+				password:          podVM.GeneratedPassword,
+				requiresReadiness: true,
+			})
 		}
 
-		// Wait for IPs in this boot-order group before starting the next group.
+		// Wait for IPs and prove generated credentials are accepted before
+		// marking newly powered VMs running or starting the next boot group.
 		// Skip the wait for any VM whose template was registered with
 		// assign_ip=false — its network is owner-managed (DHCP/static inside
 		// the guest), so the provisioner has no IP to record.
 		var wg sync.WaitGroup
+		credentialErrs := make(chan error, len(groupPoweredOn))
 		for _, info := range groupPoweredOn {
+			if info.requiresReadiness {
+				wg.Add(1)
+				go func(vmInfo vmPowerInfo) {
+					defer wg.Done()
+					err := waitForPodVMCredentialReady(
+						ctx,
+						p.vc,
+						vmInfo.vmSpec.Kind,
+						vmInfo.osType,
+						vmInfo.moref,
+						vmInfo.username,
+						vmInfo.password,
+						podGuestCredentialReadyTimeout,
+						podGuestCredentialRetryInterval,
+					)
+					if err != nil {
+						credentialErrs <- fmt.Errorf(
+							"VM %s rejected its generated credential: %w",
+							vmInfo.vmSpec.VMName,
+							err,
+						)
+					}
+				}(info)
+			}
 			if !info.vmSpec.AssignIP {
 				p.logger.Info("skipping WaitForIP (template assign_ip=false)", "vm", info.vmSpec.VMName)
 				continue
@@ -1907,6 +1974,44 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr er
 			}(info)
 		}
 		wg.Wait()
+		close(credentialErrs)
+		for credentialErr := range credentialErrs {
+			return p.failPodCreateWithCleanup(
+				ctx,
+				job,
+				payload,
+				rb,
+				"verify guest credentials",
+				credentialErr,
+			)
+		}
+
+		for _, info := range groupPoweredOn {
+			if !info.requiresReadiness {
+				continue
+			}
+			applied, err = p.db.UpdatePodVMStatusFrom(
+				ctx,
+				info.vmSpec.PodVMID,
+				[]string{models.VMStatusConfiguring},
+				models.VMStatusRunning,
+			)
+			if err != nil {
+				return fmt.Errorf("mark pod VM %s running: %w", info.vmSpec.PodVMID, err)
+			}
+			if !applied {
+				return p.failPodCreateForStaleVM(
+					ctx,
+					job,
+					payload,
+					rb,
+					pod.ID,
+					info.vmSpec.PodVMID,
+					info.moref,
+					"mark credential-ready VM running",
+				)
+			}
+		}
 
 		toPowerOn = append(toPowerOn, groupPoweredOn...)
 	}

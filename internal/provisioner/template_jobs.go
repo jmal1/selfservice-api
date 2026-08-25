@@ -1302,9 +1302,17 @@ func (p *Provisioner) runSmokeCheck(
 		guestUser, _ := resolvePodVMCredentials(tmpl.Kind, osType, smokePassword, tmpl)
 		publish("smoke_verify_customization",
 			"Verifying guest customization applied (account password reset)")
-		verr := pollGuestCredentials(ctx, func(c context.Context) error {
-			return p.vc.ValidateGuestCredentials(c, cloneMoref, guestUser, smokePassword)
-		}, 6*time.Minute, 15*time.Second)
+		verr := waitForPodVMCredentialReady(
+			ctx,
+			p.vc,
+			tmpl.Kind,
+			osType,
+			cloneMoref,
+			guestUser,
+			smokePassword,
+			podGuestCredentialReadyTimeout,
+			podGuestCredentialRetryInterval,
+		)
 		if verr != nil {
 			return fmt.Errorf(
 				"guest customization did not apply: the clone booted but the %q account was never switched to its generated password within 6m — cloudbase-init/cloud-init likely isn't running on this image (verify the agent is installed + enabled and its config includes the VMware guestinfo metadata service and the user-data/local-scripts plugin): %w",
