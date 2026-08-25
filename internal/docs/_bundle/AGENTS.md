@@ -807,7 +807,7 @@ Then run `--verify-rollback-containment`. It requires the latest revision to be
 the immutable revision **160**, deployed, claims to remain false, exactly one
 worker, every live declared image and ImageID to equal the persisted pin, all
 rollouts and retained CronJob/Job
-evidence to be healthy, and PostgreSQL to be migration 35 clean. Baseline
+evidence to be healthy, and PostgreSQL to be migration 36 clean. Baseline
 preparation proves the migration did not change. Stored, live, and newly
 prepared baseline manifests must also keep content-filter activation disabled
 with an empty feed. The normal deploy repeats the proof before pulling and
@@ -1167,6 +1167,16 @@ Once vCenter returns a task MoRef, the worker persists it before waiting.
 Successors resume that exact task and never submit a second clone for an armed
 operation. Template verification and revalidation smoke clones use this same
 protocol; their job and template ids provide the immutable operation scope.
+For `clone_with_customize`, the generated guest credential is also durable
+before clone submission and is reused unchanged across retries; it is never
+replaced with the template's `Changeme123!` build password. The clone operation
+UUID is the cloud-init / Cloudbase-Init instance identity, so every clone is a
+new first-boot instance while a resumed operation remains stable.
+Migration 000036 adds explicit guest-credential acceptance timestamps to both
+templates and pod VMs. A customized template is not provisionable until a
+fresh smoke clone authenticates and records template acceptance; legacy active
+templates start unaccepted and must be revalidated. Static template kinds are
+the only exemption.
 Transient task waits before clone acceptance consume the normal forward retry
 budget by resuming that exact persisted task. A forward retry clears only the
 cleanup dispatch marker and retains the operation, task, source, compute, pool,
@@ -1174,6 +1184,20 @@ and host identities. Once the exact clone VM is accepted and staged, any
 placement validation or configuration failure enters cleanup-only compensation
 immediately; retries reconcile and destroy that exact VM and cannot replay
 VLAN, interface, DHCP, firewall, portgroup, or clone setup.
+
+After power-on, a customized pod VM remains `configuring` until VMware Tools
+accepts the exact generated `student` (Linux) or `Student` (Windows)
+credential and the worker durably records acceptance for that exact pair and
+vCenter VM MoRef. Clone adoption, replacement, and cleanup clear the marker, so
+a retry cannot transfer acceptance from a destroyed clone to its replacement.
+The worker polls for up to six minutes to allow cloud-init / Cloudbase-Init and
+their reboot to complete. Failure enters compensation; it must never be
+represented as a credential-ready VM or active pod. Status `running` alone is
+not sufficient: legacy customized VMs without a marker matching their current
+MoRef keep their credentials hidden.
+`clone_no_customize` and `registered_existing_vm` never receive guestinfo
+credential injection and bypass this generated-credential authentication gate;
+their non-empty persisted static template credentials remain authoritative.
 
 Clone task waits have a 15-minute operational deadline and honor lease loss.
 Task or marker recovery stages the exact VM MoRef before any mutable

@@ -36,11 +36,14 @@ the page.
 
 **Publish is gated by a smoke test.** When you click Publish, the template
 first enters `verifying`: Crucible clones a disposable VM from the
-freshly-generalized image, powers it on, and waits for it to boot unattended
-(VMware Tools + an IP lease). If it boots cleanly the template auto-advances to
-`active`; if it fails to boot the template returns to `ready` with the failure
-recorded, so a bricked image cannot reach students. The throwaway VM is always
-cleaned up.
+freshly-generalized image, powers it on, waits for VMware Tools and an IP lease,
+and authenticates through VMware Tools with the generated student credential.
+If every check succeeds, Crucible records durable guest-credential acceptance
+and the template auto-advances to `active`; if any check fails the template
+returns to `ready` with the failure recorded, so a VM that boots but rejects its
+advertised password cannot reach students. Legacy customized templates without
+this marker must pass revalidation before they can provision new VMs. The
+throwaway VM is always cleaned up.
 
 ---
 
@@ -836,6 +839,27 @@ non-customized template on any OS). The wizard's publish gate blocks blank
 `default_username` / `default_password` on non-customized templates, and
 blank or non-`student` `default_username` on customized Linux templates,
 for exactly this reason.
+
+For every student VM created from `clone_with_customize`, Crucible persists one
+random credential before clone submission and reuses that exact value across
+worker retries. The clone receives a unique first-boot instance identity, and
+the VM remains `configuring` while Crucible asks VMware Tools to authenticate
+the generated `student` / `Student` credential. Linux cloud-config names the
+`student` user explicitly and YAML-quotes the password; it does not rely on the
+image's default-user setting. Windows user data targets `Student` explicitly.
+The metadata `admin_pass` field alone is not accepted as proof because the
+Cloudbase-Init configured user/plugin chain controls which account receives it.
+The pod API exposes credentials only after authentication and a durable
+acceptance marker for that exact pair and vCenter VM identity; `running` status
+alone is insufficient. Replacing or cleaning up a clone clears acceptance, so a
+replacement must authenticate even when it reuses the persisted password. If
+cloud-init or Cloudbase-Init does not consume the payload within six minutes,
+provisioning fails and compensates the clone rather than returning an apparently
+ready VM with unusable credentials.
+
+`clone_no_customize` and `registered_existing_vm` are unchanged: Crucible does
+not inject or authenticate a generated password for those kinds. Their static
+template credentials remain the authoritative login.
 
 ---
 

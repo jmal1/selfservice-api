@@ -337,6 +337,7 @@ func (h *Handler) ListPods(w http.ResponseWriter, r *http.Request) {
 		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
+	hideUnreadyPodCredentialsFromList(pods)
 	respondJSON(w, http.StatusOK, pods)
 }
 
@@ -367,7 +368,42 @@ func (h *Handler) GetPod(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	hideUnreadyPodCredentials(pod)
 	respondJSON(w, http.StatusOK, pod)
+}
+
+// hideUnreadyPodCredentials prevents the API from showing either a pending
+// generated password or the template's bootstrap password while the worker is
+// still proving guest authentication. A credential becomes user-visible only
+// with the running state that now follows successful authentication.
+func hideUnreadyPodCredentials(pod *models.Pod) {
+	if pod == nil {
+		return
+	}
+	for i := range pod.VMs {
+		vm := &pod.VMs[i]
+		staticCredentials := vm.TemplateKind == models.TemplateKindCloneNoCustomize ||
+			vm.TemplateKind == models.TemplateKindRegisteredExistingVM
+		customizedCredentialsAccepted := vm.GuestCredentialsVerifiedAt != nil &&
+			vm.VCenterVMID != nil &&
+			*vm.VCenterVMID != "" &&
+			vm.GuestCredentialsVerifiedVMID != nil &&
+			*vm.GuestCredentialsVerifiedVMID == *vm.VCenterVMID
+		if vm.Status == models.VMStatusRunning &&
+			(staticCredentials || customizedCredentialsAccepted) {
+			continue
+		}
+		vm.DefaultUsername = ""
+		vm.DefaultPassword = ""
+		vm.GeneratedUsername = ""
+		vm.GeneratedPassword = ""
+	}
+}
+
+func hideUnreadyPodCredentialsFromList(pods []models.Pod) {
+	for i := range pods {
+		hideUnreadyPodCredentials(&pods[i])
+	}
 }
 
 // CreatePod creates the pod + VMs in the DB, then queues a provisioning job.

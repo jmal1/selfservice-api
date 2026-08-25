@@ -117,7 +117,7 @@ Before pulling upgrade code, building or pushing images, or running a migration:
 
 For this foundation rollout the proof requires the latest deployed Helm
 revision to be the immutable revision **160**. PostgreSQL must report migration
-**35 clean**. The script checks that against
+**36 clean**. The script checks that against
 the latest migration in the hotfix checkout and proves the version and dirty
 flag are unchanged across baseline preparation. Stop for incident recovery if
 it reports another state.
@@ -969,6 +969,44 @@ standard vSwitch) that you may want to investigate but are not fatal.
 If all checks are green but provisioning still fails immediately, an
 *intermittent* vCenter fault may be in play. Static checks cannot detect those
 faults; the platform automatically retries them with backoff.
+
+## "The VM boots, but the displayed generated password is rejected"
+
+For `clone_with_customize`, a powered-on VM with healthy VMware Tools is not
+credential-ready by itself. Crucible now keeps the VM in `configuring`, hides
+both generated and build-time credentials from the pod response, and polls
+VMware Tools authentication with the generated `student` (Linux) or `Student`
+(Windows) credential for up to six minutes. Only a successful authentication
+plus a durable acceptance marker for that exact pair and current vCenter VM can
+expose the credential. Legacy customized VMs with `running` status but no
+matching marker remain hidden. Clone replacement/cleanup clears acceptance, so
+the replacement must authenticate again even if the persisted password is
+unchanged. A timeout fails provisioning and cleans up the clone; it must not
+leave an active pod whose displayed credential is unusable.
+
+Check the failed job result first. A message that guest customization did not
+install the generated credential means vCenter accepted the `guestinfo`
+metadata/userdata, but the guest did not successfully consume it. Inspect:
+
+- Linux: `/var/log/cloud-init.log` and `/var/log/cloud-init-output.log`; confirm
+  the VMware datasource is enabled, the explicit `student` chpasswd mapping was
+  processed, and `cloud-init clean` completed before the source snapshot.
+- Windows: the Cloudbase-Init service status and
+  `C:\Program Files\Cloudbase Solutions\Cloudbase-Init\log\cloudbase-init.log`;
+  confirm the VMware GuestInfo metadata service and user-data plugin are
+  enabled and the configured Cloudbase user matches the surfaced `Student`
+  account. Payload presence or `admin_pass` alone is not acceptance.
+
+An active `clone_with_customize` template with no durable guest-credential
+acceptance marker is intentionally blocked from new provisioning. Run a fresh
+template verification/revalidation after repairing the guest agent; do not
+backfill the marker manually.
+
+Do not retry with `Changeme123!` on a customized student clone. That is a
+template build credential, not a runtime fallback. Do not put generated
+passwords in tickets, chat, shell history, or logs. After repairing and
+re-publishing the template, create a fresh disposable pod; do not repair the
+failed clone in place.
 
 ---
 

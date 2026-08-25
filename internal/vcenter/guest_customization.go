@@ -2,6 +2,7 @@ package vcenter
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 
 	"github.com/vmware/govmomi/vim25/types"
@@ -24,27 +25,54 @@ import (
 // `student` account (which has no baked-in password — it is set per-clone)
 // booted with no usable password.
 //
-// Returns nil when password is empty or osType is neither "linux" nor
-// "windows"; callers treat nil as "inject nothing".
+// The template staging path keeps its historically unique VM name as the
+// first-boot identity. Production clones call
+// guestinfoCustomizationForInstance with their durable operation identity.
 func guestinfoCustomization(osType, password, hostname string) []types.BaseOptionValue {
+	extra, _ := guestinfoCustomizationForInstance(osType, password, hostname, hostname)
+	return extra
+}
+
+// guestinfoCustomizationForInstance builds a password-bearing payload whose
+// instanceID is unique per clone operation. Both cloud-init and cloudbase-init
+// use it to decide whether first-boot userdata has already run. It returns nil
+// when password is empty and fails closed if the OS or identity is unsupported.
+func guestinfoCustomizationForInstance(osType, password, hostname, instanceID string) ([]types.BaseOptionValue, error) {
 	if password == "" {
-		return nil
+		return nil, nil
+	}
+	if hostname == "" {
+		return nil, fmt.Errorf("guest customization hostname is required")
+	}
+	if instanceID == "" {
+		return nil, fmt.Errorf("guest customization instance ID is required")
 	}
 
 	var userdata, metadata string
 	switch osType {
 	case "linux":
-		// cloud-init format. The bare top-level `password:` applies to the
-		// image's default user, which for Crucible student images is
-		// `student`.
+		passwordYAML, err := json.Marshal(password)
+		if err != nil {
+			return nil, fmt.Errorf("encode Linux guest password: %w", err)
+		}
+		hostnameYAML, err := json.Marshal(hostname)
+		if err != nil {
+			return nil, fmt.Errorf("encode Linux guest hostname: %w", err)
+		}
+		// JSON strings are a YAML-safe scalar subset. Use an explicit user
+		// mapping so cloud-init changes the same account Crucible surfaces
+		// instead of relying on the image's default-user setting.
 		userdata = fmt.Sprintf(`#cloud-config
-password: %s
 chpasswd:
   expire: false
+  users:
+    - name: student
+      password: %s
+      type: text
 ssh_pwauth: true
 hostname: %s
-`, password, hostname)
-		metadata = fmt.Sprintf(`{"instance-id": "%s", "local-hostname": "%s"}`, hostname, hostname)
+`, passwordYAML, hostnameYAML)
+		metadata = fmt.Sprintf(`{"instance-id": "%s", "local-hostname": "%s"}`, instanceID, hostname)
 	case "windows":
 		// cloudbase-init: UserDataPlugin runs #ps1 script to set password.
 		// SetHostNamePlugin reads local-hostname from metadata.
@@ -55,9 +83,9 @@ $password = ConvertTo-SecureString '%s' -AsPlainText -Force
 Get-LocalUser -Name 'Student' | Set-LocalUser -Password $password
 `, password)
 		metadata = fmt.Sprintf(`{"instance-id": "%s", "local-hostname": "%s", "admin_pass": "%s"}`,
-			hostname, hostname, password)
+			instanceID, hostname, password)
 	default:
-		return nil
+		return nil, fmt.Errorf("guest customization does not support OS %q", osType)
 	}
 
 	var out []types.BaseOptionValue
@@ -73,5 +101,5 @@ Get-LocalUser -Name 'Student' | Set-LocalUser -Password $password
 			&types.OptionValue{Key: "guestinfo.metadata.encoding", Value: "base64"},
 		)
 	}
-	return out
+	return out, nil
 }

@@ -1,7 +1,10 @@
 package provisioner
 
 import (
+	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/jmal1/selfservice-api/internal/models"
 )
@@ -225,6 +228,306 @@ func TestResolvePodVMCredentials(t *testing.T) {
 			}
 			if pass != tc.wantPass {
 				t.Errorf("pass = %q, want %q", pass, tc.wantPass)
+			}
+		})
+	}
+}
+
+func TestProvisionedPodVMCredentials_ReusesPersistedGeneratedPassword(t *testing.T) {
+	for _, osType := range []string{"linux", "windows"} {
+		t.Run(osType, func(t *testing.T) {
+			podVM := &models.PodVM{
+				GeneratedUsername: "stale-name",
+				GeneratedPassword: "AlreadyInjected1!",
+			}
+			tmpl := &models.Template{
+				Kind:            models.TemplateKindCloneWithCustomize,
+				OSType:          osType,
+				DefaultPassword: "Changeme123!",
+			}
+			generateCalls := 0
+			user, password, err := provisionedPodVMCredentials(
+				tmpl.Kind,
+				tmpl.OSType,
+				podVM,
+				tmpl,
+				func(int) string {
+					generateCalls++
+					return "WrongRetryPassword2!"
+				},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantUser := "student"
+			if osType == "windows" {
+				wantUser = "Student"
+			}
+			if user != wantUser || password != podVM.GeneratedPassword {
+				t.Fatalf("credentials = (%q, %q), want (%q, persisted password)", user, password, wantUser)
+			}
+			if generateCalls != 0 {
+				t.Fatalf("retry generated %d replacement passwords", generateCalls)
+			}
+			if password == tmpl.DefaultPassword {
+				t.Fatal("customized clone silently fell back to the template bootstrap password")
+			}
+		})
+	}
+}
+
+func TestProvisionedPodVMCredentials_StaticKindsNeverGenerate(t *testing.T) {
+	for _, kind := range []string{
+		models.TemplateKindCloneNoCustomize,
+		models.TemplateKindRegisteredExistingVM,
+	} {
+		t.Run(kind, func(t *testing.T) {
+			tmpl := &models.Template{
+				Kind:            kind,
+				OSType:          "windows",
+				DefaultUsername: "Administrator",
+				DefaultPassword: "StaticOnly1!",
+			}
+			generateCalls := 0
+			user, password, err := provisionedPodVMCredentials(
+				kind,
+				tmpl.OSType,
+				&models.PodVM{},
+				tmpl,
+				func(int) string {
+					generateCalls++
+					return "MustNotGenerate2!"
+				},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if user != tmpl.DefaultUsername || password != tmpl.DefaultPassword {
+				t.Fatalf("credentials = (%q, %q), want static template credentials", user, password)
+			}
+			if generateCalls != 0 {
+				t.Fatalf("static kind generated %d passwords", generateCalls)
+			}
+		})
+	}
+}
+
+func TestProvisionedPodVMCredentials_StaticRetryIgnoresChangedTemplateDefaults(t *testing.T) {
+	podVM := &models.PodVM{
+		GeneratedUsername: "original-admin",
+		GeneratedPassword: "OriginalStatic1!",
+	}
+	tmpl := &models.Template{
+		Kind:            models.TemplateKindCloneNoCustomize,
+		OSType:          "linux",
+		DefaultUsername: "changed-admin",
+		DefaultPassword: "ChangedStatic2!",
+	}
+	user, password, err := provisionedPodVMCredentials(
+		tmpl.Kind,
+		tmpl.OSType,
+		podVM,
+		tmpl,
+		func(int) string { return "MustNotGenerate3!" },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user != podVM.GeneratedUsername || password != podVM.GeneratedPassword {
+		t.Fatalf("static retry credentials = (%q, %q), want persisted pair", user, password)
+	}
+}
+
+func TestProvisionedPodVMCredentials_CustomizedCloneNeverUsesBootstrapPassword(t *testing.T) {
+	tmpl := &models.Template{
+		Kind:            models.TemplateKindCloneWithCustomize,
+		OSType:          "linux",
+		DefaultPassword: "Changeme123!",
+	}
+	_, password, err := provisionedPodVMCredentials(
+		tmpl.Kind,
+		tmpl.OSType,
+		&models.PodVM{},
+		tmpl,
+		func(int) string { return "PerPodGenerated1!" },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if password != "PerPodGenerated1!" || password == tmpl.DefaultPassword {
+		t.Fatalf("customized password = %q, want fresh per-pod credential", password)
+	}
+}
+
+func TestRequireTemplateGuestCredentialAcceptance(t *testing.T) {
+	verifiedAt := time.Now()
+	for _, tc := range []struct {
+		name    string
+		tmpl    *models.Template
+		wantErr bool
+	}{
+		{
+			name: "legacy customized template is blocked",
+			tmpl: &models.Template{
+				Kind: models.TemplateKindCloneWithCustomize,
+			},
+			wantErr: true,
+		},
+		{
+			name: "durably verified customized template is accepted",
+			tmpl: &models.Template{
+				Kind:                       models.TemplateKindCloneWithCustomize,
+				GuestCredentialsVerifiedAt: &verifiedAt,
+			},
+		},
+		{
+			name: "static template is explicitly exempt",
+			tmpl: &models.Template{
+				Kind: models.TemplateKindCloneNoCustomize,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := requireTemplateGuestCredentialAcceptance(tc.tmpl)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestRequireTemplateGuestCredentialAcceptanceForNewClone(t *testing.T) {
+	legacyCustomized := &models.Template{Kind: models.TemplateKindCloneWithCustomize}
+	if err := requireTemplateGuestCredentialAcceptanceForNewClone(
+		legacyCustomized,
+		"",
+		false,
+	); err == nil {
+		t.Fatal("brand-new customized clone bypassed template acceptance")
+	}
+	if err := requireTemplateGuestCredentialAcceptanceForNewClone(
+		legacyCustomized,
+		"vm-existing",
+		false,
+	); err != nil {
+		t.Fatalf("existing clone was blocked by transient template state: %v", err)
+	}
+	if err := requireTemplateGuestCredentialAcceptanceForNewClone(
+		legacyCustomized,
+		"",
+		true,
+	); err != nil {
+		t.Fatalf("persisted clone recovery was blocked by transient template state: %v", err)
+	}
+}
+
+type fakeGuestCredentialValidator struct {
+	errs  []error
+	calls int
+	moref string
+	user  string
+	pass  string
+}
+
+func (f *fakeGuestCredentialValidator) ValidateGuestCredentials(
+	_ context.Context,
+	moref, user, pass string,
+) error {
+	f.calls++
+	f.moref = moref
+	f.user = user
+	f.pass = pass
+	if len(f.errs) == 0 {
+		return nil
+	}
+	err := f.errs[0]
+	f.errs = f.errs[1:]
+	return err
+}
+
+func TestWaitForPodVMCredentialReady_RequiresGuestAuthentication(t *testing.T) {
+	for _, tc := range []struct {
+		osType string
+		user   string
+	}{
+		{osType: "linux", user: "student"},
+		{osType: "windows", user: "Student"},
+	} {
+		t.Run(tc.osType, func(t *testing.T) {
+			validator := &fakeGuestCredentialValidator{
+				errs: []error{errors.New("tools not ready"), nil},
+			}
+			err := waitForPodVMCredentialReady(
+				context.Background(),
+				validator,
+				models.TemplateKindCloneWithCustomize,
+				tc.osType,
+				"vm-123",
+				tc.user,
+				"Generated1!",
+				time.Second,
+				time.Millisecond,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if validator.calls != 2 ||
+				validator.moref != "vm-123" ||
+				validator.user != tc.user ||
+				validator.pass != "Generated1!" {
+				t.Fatalf("validator calls=%d moref=%q user=%q pass=%q",
+					validator.calls, validator.moref, validator.user, validator.pass)
+			}
+		})
+	}
+}
+
+func TestWaitForPodVMCredentialReady_SabotagedConsumptionFails(t *testing.T) {
+	sabotage := errors.New("InvalidGuestLogin")
+	validator := &fakeGuestCredentialValidator{errs: []error{sabotage}}
+	err := waitForPodVMCredentialReady(
+		context.Background(),
+		validator,
+		models.TemplateKindCloneWithCustomize,
+		"linux",
+		"vm-123",
+		"student",
+		"Generated1!",
+		0,
+		0,
+	)
+	if !errors.Is(err, sabotage) {
+		t.Fatalf("sabotaged guest consumption error = %v, want %v", err, sabotage)
+	}
+	if validator.calls != 1 {
+		t.Fatalf("sabotaged validator calls = %d, want 1", validator.calls)
+	}
+}
+
+func TestWaitForPodVMCredentialReady_StaticKindsBypassGeneratedCredentialGate(t *testing.T) {
+	for _, kind := range []string{
+		models.TemplateKindCloneNoCustomize,
+		models.TemplateKindRegisteredExistingVM,
+	} {
+		t.Run(kind, func(t *testing.T) {
+			validator := &fakeGuestCredentialValidator{
+				errs: []error{errors.New("must not be called")},
+			}
+			if err := waitForPodVMCredentialReady(
+				context.Background(),
+				validator,
+				kind,
+				"windows",
+				"vm-123",
+				"Administrator",
+				"StaticOnly1!",
+				0,
+				0,
+			); err != nil {
+				t.Fatal(err)
+			}
+			if validator.calls != 0 {
+				t.Fatalf("static kind made %d generated-credential validation calls", validator.calls)
 			}
 		})
 	}

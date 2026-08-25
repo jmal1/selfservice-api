@@ -1148,6 +1148,11 @@ func (p *Provisioner) runSmokeCheck(
 		return &compensatedJobError{err: errors.New("interrupted smoke clone was destroyed")}
 	}
 	osType := strings.ToLower(tmpl.OSType)
+	if shouldGenerateGuestPassword(tmpl.Kind, osType) {
+		if err := p.db.ClearTemplateGuestCredentialVerification(ctx, tmpl.ID); err != nil {
+			return fmt.Errorf("clear prior template guest credential acceptance: %w", err)
+		}
+	}
 	network := tmpl.StagingNetwork
 	if network == "" {
 		network = models.CanonicalStagingNetwork
@@ -1302,9 +1307,17 @@ func (p *Provisioner) runSmokeCheck(
 		guestUser, _ := resolvePodVMCredentials(tmpl.Kind, osType, smokePassword, tmpl)
 		publish("smoke_verify_customization",
 			"Verifying guest customization applied (account password reset)")
-		verr := pollGuestCredentials(ctx, func(c context.Context) error {
-			return p.vc.ValidateGuestCredentials(c, cloneMoref, guestUser, smokePassword)
-		}, 6*time.Minute, 15*time.Second)
+		verr := waitForPodVMCredentialReady(
+			ctx,
+			p.vc,
+			tmpl.Kind,
+			osType,
+			cloneMoref,
+			guestUser,
+			smokePassword,
+			podGuestCredentialReadyTimeout,
+			podGuestCredentialRetryInterval,
+		)
 		if verr != nil {
 			return fmt.Errorf(
 				"guest customization did not apply: the clone booted but the %q account was never switched to its generated password within 6m — cloudbase-init/cloud-init likely isn't running on this image (verify the agent is installed + enabled and its config includes the VMware guestinfo metadata service and the user-data/local-scripts plugin): %w",
@@ -1410,6 +1423,15 @@ func (p *Provisioner) VerifyTemplate(ctx context.Context, job *models.Job) (err 
 		}
 		return p.verifyFailedToReady(ctx, tmpl.ID, checkErr)
 	}
+	if shouldGenerateGuestPassword(tmpl.Kind, strings.ToLower(tmpl.OSType)) {
+		if err := p.db.MarkTemplateGuestCredentialsVerified(ctx, tmpl.ID); err != nil {
+			return p.verifyFailedToReady(
+				ctx,
+				tmpl.ID,
+				fmt.Errorf("persist template guest credential acceptance: %w", err),
+			)
+		}
+	}
 
 	// All checks passed — promote to active and make it visible.
 	p.publishProgress(job.ID, "publish", "Smoke test passed — publishing template")
@@ -1446,6 +1468,7 @@ type TemplateRevalidatePayload struct {
 type revalidateL1CoreDB interface {
 	SetTemplateValidationState(ctx context.Context, id uuid.UUID, result string, at time.Time) error
 	SetTemplateActive(ctx context.Context, id uuid.UUID, active bool) error
+	MarkTemplateGuestCredentialsVerified(ctx context.Context, id uuid.UUID) error
 }
 
 // revalidateL1CorePipeline is the narrow metrics surface for revalidateL1TemplateCore.
@@ -1608,6 +1631,11 @@ func revalidateL1TemplateJob(
 	checkErr := runSmokeCheck(ctx, tmpl, vmMoref, publish)
 	if isCloneForwardRetry(checkErr) {
 		return checkErr
+	}
+	if checkErr == nil && shouldGenerateGuestPassword(tmpl.Kind, strings.ToLower(tmpl.OSType)) {
+		if err := db.MarkTemplateGuestCredentialsVerified(ctx, tmpl.ID); err != nil {
+			checkErr = fmt.Errorf("persist template guest credential acceptance: %w", err)
+		}
 	}
 
 	revalidateL1TemplateCore(ctx, db, pipeline, logger, tmpl, checkErr)

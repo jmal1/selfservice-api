@@ -437,6 +437,7 @@ func TestDurableCloneResumeSkipsFreshPlacementResolution(t *testing.T) {
 	retryParams.HostMoRef = "host-sabotaged"
 	retryParams.ResourcePoolMoRef = "resgroup-sabotaged"
 	retryParams.ObservedFreeMemoryMB = 1
+	retryParams.Password = "PersistedPerPod1!"
 
 	moref, err := executeDurableVMClone(
 		context.Background(),
@@ -465,11 +466,13 @@ func TestDurableCloneResumeSkipsFreshPlacementResolution(t *testing.T) {
 		)
 	}
 	got := client.configParams[0]
-	if got.TemplateName != "vm-original-source" ||
+	if got.OperationID != store.operation.OperationID ||
+		got.TemplateName != "vm-original-source" ||
 		got.SourceReplicaID != sourceReplicaID ||
 		got.ComputeResourceMoRef != params.ComputeResourceMoRef ||
 		got.HostMoRef != params.HostMoRef ||
-		got.ResourcePoolMoRef != params.ResourcePoolMoRef {
+		got.ResourcePoolMoRef != params.ResourcePoolMoRef ||
+		got.Password != retryParams.Password {
 		t.Fatalf("resume used mutable placement instead of persisted identity: %+v", got)
 	}
 }
