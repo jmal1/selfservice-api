@@ -49,6 +49,7 @@ type chartValues struct {
 		Insecure                  string `yaml:"insecure"`
 	} `yaml:"vcenter"`
 	Synthetic struct {
+		Suspend                     bool `yaml:"suspend"`
 		ProvisioningExpectedEnabled bool `yaml:"provisioningExpectedEnabled"`
 		Lifecycle                   struct {
 			Enabled bool `yaml:"enabled"`
@@ -142,6 +143,9 @@ func TestProductionProvisioningReopensConservatively(t *testing.T) {
 	}
 	if !values.Synthetic.ProvisioningExpectedEnabled {
 		t.Fatal("production synthetic must expect provisioning enabled")
+	}
+	if values.Synthetic.Suspend {
+		t.Fatal("production non-mutating API monitor CronJob must remain active")
 	}
 	if values.Synthetic.Lifecycle.Enabled || values.Synthetic.Runner.Enabled || values.Synthetic.Janitor.Enabled {
 		t.Fatal("production lifecycle, runner, and destructive janitor synthetics must remain disabled during initial reopening")

@@ -9,6 +9,7 @@ metadata:
     app.kubernetes.io/component: synthetic-monitor
 spec:
   schedule: {{ .Values.synthetic.schedule | quote }}
+  suspend: {{ .Values.synthetic.suspend }}
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 5

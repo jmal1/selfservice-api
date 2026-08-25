@@ -64,7 +64,9 @@ Before pulling upgrade code, building or pushing images, or running a migration:
    production.
 2. From the hotfix checkout, create a Helm baseline revision using that safe
    chart. The deploy host must have `jq`, `kubectl` configured for production,
-   and Helm 3.14+:
+   Helm 3.14+, `curl`, `tar`, `unzip`, and `gh` authenticated for
+   `jmal1/selfservice-api`, `jmal1/selfservice-ui`, their workflow artifacts,
+   and private GHCR packages:
 
    ```bash
    ./deploy/scripts/deploy.sh \
@@ -113,19 +115,151 @@ Before pulling upgrade code, building or pushing images, or running a migration:
    ./deploy/scripts/deploy.sh --verify-rollback-containment
    ```
 
-PostgreSQL must report migration **35 clean**. The script checks that against
+For this foundation rollout the proof requires the latest deployed Helm
+revision to be the immutable revision **160**. PostgreSQL must report migration
+**35 clean**. The script checks that against
 the latest migration in the hotfix checkout and proves the version and dirty
 flag are unchanged across baseline preparation. Stop for incident recovery if
 it reports another state.
 
-Only after both commands succeed may the operator update the checkout/images
-and run the normal phase-1 deployment. The normal deploy path repeats the full
-Helm/live proof before `git pull`, records the exact baseline revision and
-migration state, then repeats the proof after pull and dependency resolution.
-An intervening Helm revision is rejected, so the immutable all-workload
-baseline remains the immediately previous successful revision used by
-`helm upgrade --atomic`. If any part fails, the script exits before the
-application upgrade.
+Only after both commands succeed may the operator run the normal phase-1
+deployment. Do not build or retag images manually. The candidate path requires:
+
+- a clean, attached `main` checkout whose `HEAD` exactly equals the trusted
+  `origin/main` ref;
+- that exact commit to be verified by GitHub;
+- a successful `ci.yaml` push run for the exact commit with successful
+  api-gateway, provision-worker, crucible-engine, synthetic-api-monitor, and
+  crucible-runner build jobs; and
+- one GHCR package version for each component tagged with the **full commit
+  SHA** and identified by an immutable sha256 digest.
+
+The UI candidate is also explicit; omitting it is an error rather than a request
+to preserve whatever UI happens to be live. For this rollout, first validate and
+then apply merge `6570e3034ad718c5840c38efc4c9f51781ce9f42`:
+
+```bash
+UI_SOURCE_SHA=6570e3034ad718c5840c38efc4c9f51781ce9f42
+./deploy/scripts/deploy.sh --dry-run --ui-source-sha "$UI_SOURCE_SHA"
+./deploy/scripts/deploy.sh --ui-source-sha "$UI_SOURCE_SHA"
+```
+
+The deploy proves the exact successful `jmal1/selfservice-ui` `ci.yaml` push run,
+requires successful `test` and `build` jobs, and downloads that run's unexpired
+Buildx `.dockerbuild` record. The record must bind the exported digest to the
+repository, full source revision, expected short-SHA tag, and exact run attempt.
+The selected GHCR digest's immutable OCI revision label must match too.
+
+During the NFS41/UI containment window, the production API-monitor CronJob
+remains active with `spec.suspend=false`, but it must render
+`SYNTHETIC_LIFECYCLE_ENABLED=false`. The production values and deploy validation
+enforce both values in the candidate and live rollback state so non-mutating API
+monitoring continues without creating lifecycle pods. The external
+`synthetic-ui.timer` on `netbirdv01` remains disabled, but it is outside
+Kubernetes and Helm: verify that host-level state independently before and after
+this procedure.
+
+Every main push, including docs-only merges, builds all five images and
+publishes the full-SHA identity, even when the equivalent pull-request path
+matrix would build only one component. Each matrix job uploads its resulting
+digest as an immutable artifact of that exact workflow run. The deploy downloads
+all five artifacts and requires them to equal GHCR's full-SHA resolutions. It
+rejects another full commit tag on the same digest and verifies the immutable
+OCI `org.opencontainers.image.revision` label equals the source commit. A tag
+and label that disagree with the proven run artifact still fail.
+
+A dirty tree, detached or non-main checkout, unexpected origin, remote mismatch,
+unverified commit, missing build, floating-only package version, or digest
+tagged for another commit stops before candidate rendering.
+
+The live worker may temporarily have
+`WORKER_PROVISIONING_CLAIMS_ENABLED=true` even though the stored rollback
+revision correctly renders it as `false`. A real deploy does not misclassify
+that stored revision as claims-enabled. Under the release lock it first proves
+the stored revision is revision 160 with claims disabled and all immutable pins.
+Candidate provenance, digest resolution, rendering, and the first server dry-run
+all happen before the lock or claims mutation. For a real apply, the script then
+locks, proves revision 160 again, explicitly sets the live worker claims value
+back to `false`, waits for the rollout, and performs the complete
+stored-manifest/live-state proof.
+
+The deploy renders the chart only as an intermediate input. It replaces the
+five repository-built images with the exact successful API commit's digests,
+replaces exactly the UI container with the explicit proven UI digest, and
+replaces every other workload image with its exact healthy live digest. This
+preserves PostgreSQL, NATS, NATS box/reloader, and future unrelated external
+chart workloads even when chart defaults use `latest`, unqualified repositories,
+or other mutable tags. External container inventory or repository changes fail
+closed rather than guessing. Docker Hub aliases are normalized:
+`nats` equals `docker.io/library/nats`, and `natsio/x` equals
+`docker.io/natsio/x`. The engine's dynamic `RUNNER_IMAGE`
+uses the same commit-bound runner digest as the warmer.
+
+The final manifest must have no mutable executable workload image, no mutable
+`RUNNER_IMAGE`, exactly one worker,
+`WORKER_PROVISIONING_CLAIMS_ENABLED=false`,
+`WORKER_CONTENT_FILTER_ENABLED=false`, and empty worker/synthetic content-filter
+feed values. Kubernetes validates the complete final post-rendered object set
+with server-side dry-run before lock acquisition or claims mutation.
+`deploy.sh --dry-run` therefore remains useful while a temporary live
+claims-enabled override exists: it prints and diffs this exact digest-pinned
+candidate without pausing claims.
+
+Helm 3 does not send hooks through its post-renderer. The deploy therefore also
+renders the upgrade view, extracts `pre-upgrade` and `post-upgrade` hooks, and
+requires every hook image to already equal the selected commit-built or
+preserved external digest. It server-dry-run validates those hooks separately.
+A floating or wrong hook image fails closed; it is never assumed that the
+ordinary post-renderer will repair it.
+
+For a real apply, after pausing claims the script queries PostgreSQL and requires
+zero jobs in `claimed`, `in_progress`, or `rollback`, and queries every
+Kubernetes Job in the `selfservice` namespace to require `.status.active=0`.
+It also keeps the API monitor unsuspended with lifecycle disabled, suspends the
+janitor/runner clone CronJobs, and rejects every nonterminal synthetic
+`pod_create` or `pod_destroy` row, including pending work left after the
+originating CronJob has exited. Because an expiration destroy payload may have
+only `pod_id`, this check joins `pods` and filters on the authoritative pod name.
+It repeats both drains immediately before Helm. It then re-proves the
+source, revision-160 rollback containment, migration, workload health, external
+live digests, and final server dry-run immediately before
+`helm upgrade --atomic`. Initial and final server-defaulted objects are
+canonicalized and compared in full, not just by image or selected environment
+values. The Helm
+post-renderer pins the apply-time render and byte-compares it to the validated
+candidate; any chart/render drift aborts rather than falling back to floating
+images. There are no unconditional rollout restarts, so unchanged database,
+NATS, and infrastructure pod templates remain unchanged. An intervening
+Helm revision is rejected, leaving the immutable all-workload baseline as the
+immediately previous successful rollback target.
+
+`helm upgrade --atomic` failure is handled explicitly while the release lock is
+still held. Revision 160 is the immutable image/workload baseline, but its
+historical values enabled lifecycle, janitor, and runner synthetics and are not
+safe rollback intent. The script forces claims disabled, immediately reapplies
+the current containment (API monitor unsuspended, lifecycle false,
+janitor/runner suspended), waits for the worker, and proves revision 160, its
+stored and live image identities (including `RUNNER_IMAGE`), workload health,
+migration state, zero nonterminal synthetic create/destroy work, and both job
+drains.
+Helm may record the successful atomic rollback as a newer deployed revision; the
+gate compares that revision's complete image inventory and runner identity with
+the approved revision-160 baseline instead of mistaking the new revision number
+for workload identity.
+It releases the lock only when that rollback proof succeeds, while still
+returning the Helm failure. Any ambiguous or drifted rollback deliberately
+retains the lock for manual intervention. A reported Helm success receives the
+same strict treatment: the deployed manifest and every live ImageID must equal
+the validated candidate map, and the full server-canonical object set must match.
+For the API-monitor CronJob, the deploy creates and waits for a fresh contained
+Job so a retained execution from the old template cannot satisfy the ImageID
+proof. `RUNNER_IMAGE` must match, workloads must be healthy, and both drains
+must remain empty before the lock is released.
+
+The external Playwright synthetic on `netbirdv01` is Docker Compose, not a Helm
+workload. Deploy its separately proven merge
+`b61ca0c5a353d112b5ef8f97666ee528da115442`; this script neither covers nor
+claims to deploy it.
 
 Both baseline creation and the final application-upgrade check hold the
 cluster-visible ConfigMap lock

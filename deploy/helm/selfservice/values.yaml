@@ -327,6 +327,7 @@ engine:
 # pushes results to Pushgateway → Prometheus → Grafana alerts.
 synthetic:
   enabled: true
+  suspend: false
   # Expected response from GET /api/v1/provisioning/status. Keep explicit so
   # planned maintenance reads green only when the API reports the same state.
   provisioningExpectedEnabled: true

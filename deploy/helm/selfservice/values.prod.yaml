@@ -37,6 +37,9 @@ vcenter:
 # Synthetic monitoring remains non-destructive during the initial reopening.
 # Lifecycle, janitor, and runner creation checks stay disabled.
 synthetic:
+  # Keep the non-mutating API monitor active. Destructive lifecycle coverage
+  # remains independently gated below.
+  suspend: false
   provisioningExpectedEnabled: true
   lifecycle:
     enabled: false
@@ -66,6 +69,11 @@ synthetic:
 # separate durable confirmation, so a transient NFS blip cannot page confirmed
 # health.
 worker:
+  contentFilter:
+    # Foundation deployments must remain read-only. The deploy script also
+    # validates these exact values in the final server-defaulted manifest.
+    enabled: false
+    categoryFeedBaseURL: ""
   # Poll persisted L1 validation due state every 5m. Any template older than
   # seven days is enqueued immediately after startup or leader failover.
   l1Validation:

@@ -804,17 +804,120 @@ workload drift blocks the baseline. The command never rolls a failed baseline
 back to a claims-enabled revision.
 
 Then run `--verify-rollback-containment`. It requires the latest revision to be
-deployed, claims to remain false, exactly one worker, every live declared image
-and ImageID to equal the persisted pin, all rollouts and retained CronJob/Job
+the immutable revision **160**, deployed, claims to remain false, exactly one
+worker, every live declared image and ImageID to equal the persisted pin, all
+rollouts and retained CronJob/Job
 evidence to be healthy, and PostgreSQL to be migration 35 clean. Baseline
-preparation proves the migration did not change. The normal deploy repeats the
-proof before pulling and immediately before `helm upgrade --atomic`, rejecting
-an intervening Helm revision so this immutable baseline is the immediately
-previous successful rollback target. Baseline and application mutations hold
-the cluster-visible `configmap/selfservice-phase1-deploy-lock`; every release
-mutation must use this script and honor that lock. Remove a stale lock only
-after proving its recorded holder is no longer active. Do not build, push,
-migrate, or upgrade phase-1 images until those proofs pass.
+preparation proves the migration did not change. Stored, live, and newly
+prepared baseline manifests must also keep content-filter activation disabled
+with an empty feed. The normal deploy repeats the proof before pulling and
+immediately before `helm upgrade --atomic`, rejecting an intervening Helm
+revision so this immutable baseline is the immediately previous successful
+rollback target.
+
+The production candidate is also immutable and source-bound. `deploy.sh`
+requires a clean, attached `main` checkout whose `HEAD` exactly equals trusted
+`origin/main`, verifies that exact commit through GitHub, and requires one
+successful `ci.yaml` push run containing successful builds for api-gateway,
+provision-worker, crucible-engine, synthetic-api-monitor, and crucible-runner.
+Every main push, including docs-only merges, builds all five even when path
+filtering would rebuild only one on a pull request. CI publishes each image with
+the full commit SHA and uploads a per-component digest record bound to that
+workflow run. The deploy downloads those five records from the exact successful
+run and requires GHCR's full-SHA tag to resolve to the identical digest. It also
+rejects a digest carrying another full commit tag and reads the immutable OCI
+config to require `org.opencontainers.image.revision` to equal the source SHA.
+A floating tag, missing artifact/build, retagged older digest, or run/GHCR/OCI
+identity mismatch fails closed.
+
+Production candidates must also name an explicit UI source with
+`--ui-source-sha`; omission never silently preserves the live UI. For this
+rollout the source is `jmal1/selfservice-ui` merge
+`6570e3034ad718c5840c38efc4c9f51781ce9f42`. The deploy proves that exact
+commit's successful `ci.yaml` push run and successful `test` and `build` jobs,
+then downloads the run's Buildx `.dockerbuild` record. Its exported digest,
+repository, source revision, expected short-SHA tag, and builder run attempt
+must agree, and the selected GHCR digest must carry the same immutable OCI
+revision label. Exactly the UI container is replaced with that proven digest.
+
+If the stored rollback revision renders claims disabled but the live worker has
+a temporary claims-enabled override, candidate provenance, rendering, and its
+first server dry-run still happen without mutation. A real apply then acquires
+the release lock, proves revision 160 is immutable and claims-disabled,
+deliberately sets the live worker back to claims disabled, waits for that
+rollout and durable job drain, and only then runs the complete stored/live
+rollback proof. The override does not make the rollback baseline claims-enabled.
+
+Every other rendered image is copied from the exact live ImageID, including
+PostgreSQL, NATS, NATS box/reloader, and future unrelated external chart
+workloads.
+Docker Hub aliases are canonicalized (`nats` equals `docker.io/library/nats`;
+`natsio/x` equals `docker.io/natsio/x`) before repository comparison.
+The final post-rendered manifest must contain only sha256 workload images and a
+sha256 `RUNNER_IMAGE`, one worker, claims disabled, content-filter activation
+disabled, and an empty content-filter feed. Kubernetes server-side dry-run
+validates that final manifest before any lock or claims mutation, and `--dry-run`
+prints that pinned manifest even when live claims are temporarily enabled.
+For a real apply, the script then locks, proves revision 160 again, pauses live
+claims, keeps the API monitor unsuspended with lifecycle disabled, and suspends
+the janitor/runner clone CronJobs before draining work. PostgreSQL must have
+zero `claimed`, `in_progress`, or `rollback` durable jobs and zero nonterminal
+synthetic `pod_create` or `pod_destroy` jobs, including `pending` rows left
+after a CronJob has exited. Destroy rows may carry only `pod_id`, so the drain
+joins `pods` and checks the authoritative pod name rather than trusting
+`payload.pod_name`. Every Kubernetes Job in the namespace must also
+have `.status.active=0`. Immediately before apply,
+under the lock, it re-proves source identity, revision-160 containment,
+migration and workload health, external live digests, and the final server
+dry-run. Initial and final server-defaulted objects are canonicalized and
+compared in full, so a changed command, environment, volume, or other non-image
+field fails closed. Both job drains are checked again directly before Helm. Helm's
+post-renderer byte-compares its apply-time output with the validated candidate before
+`helm upgrade --atomic`; it cannot fall back to chart tags or restart unchanged
+external workloads through mutable image references. Because Helm excludes
+hooks from post-renderer input, the script separately renders the upgrade view
+and extracts every `pre-upgrade` / `post-upgrade` hook. Each executable hook
+image must already equal its commit-built or preserved external digest, and the
+hook is server-dry-run validated; any hook that would need post-renderer pinning
+is rejected before Helm can execute it.
+
+The Playwright synthetic on `netbirdv01` is an external Docker Compose
+deployment. Its separately proven merge
+`b61ca0c5a353d112b5ef8f97666ee528da115442` is not rendered, validated, or
+deployed by this Helm workflow.
+
+During NFS41/UI containment, the non-mutating API-monitor CronJob remains
+unsuspended while `SYNTHETIC_LIFECYCLE_ENABLED=false` in the candidate and live
+rollback state. Revision 160 is the immutable image/workload baseline, but its
+historical values enabled lifecycle, janitor, and runner synthetics and are not
+safe rollback intent. The deploy overrides those values under the lock by
+keeping the API monitor active/non-lifecycle and suspending janitor/runner before
+it will accept rollback containment. The external `synthetic-ui.timer` on
+`netbirdv01` must remain
+disabled and be verified independently; Helm never mutates or proves that
+host-level timer.
+
+An atomic Helm failure never falls through the EXIT trap. While retaining the
+release lock, the script forces claims disabled, immediately reapplies the
+current synthetic containment over revision 160's historical values, and proves
+that the latest deployed rollback revision has revision 160's exact immutable
+image inventory and `RUNNER_IMAGE`. Helm may record rollback as a newer revision;
+revision number alone is not treated as identity. The proof also requires
+readiness, migration, active non-lifecycle API-monitor intent, suspended clone
+CronJobs, zero nonterminal synthetic create/destroy work, and both durable and
+Kubernetes job drains. A complete
+proof releases the lock and returns the original Helm failure. Any failed proof
+retains the lock for manual intervention. After Helm reports success, the
+deployed full object set and every live ImageID must equal the exact candidate.
+For the CronJob, the deploy creates and awaits a fresh contained Job rather than
+trusting a retained Job from the prior template. All workloads must be healthy,
+and both drains must remain empty before release.
+
+Baseline and application mutations hold the cluster-visible
+`configmap/selfservice-phase1-deploy-lock`; every release mutation must use this
+script and honor that lock. Remove a stale lock only after proving its recorded
+holder is no longer active. Do not build, push, migrate, or upgrade phase-1
+images until those proofs pass.
 
 When API admission is disabled, the first instruction in each of these
 handlers rejects the request before parsing, allocation, or database access:
