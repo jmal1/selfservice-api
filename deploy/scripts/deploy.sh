@@ -181,12 +181,28 @@ env_from_manifest() {
   awk -v variable="$variable" '
     $0 ~ "^[[:space:]]*- name:[[:space:]]*" variable "[[:space:]]*$" {
       matches++
-      if (getline <= 0) {
+      if ((getline next_line) <= 0) {
         exit 2
       }
-      value = $0
-      sub(/^[[:space:]]*value:[[:space:]]*/, "", value)
-      gsub(/^["'"'"']|["'"'"']$/, "", value)
+      # A server-defaulted dry-run response marshals corev1.EnvVar with
+      # `json:"value,omitempty"`, so an empty Value is not rendered as
+      # `value: ""` at all -- the line immediately following "- name: X" can
+      # be the *next* env entrys own "- name:" line instead of Xs value
+      # line. Only treat the consumed line as this variables value when it
+      # is actually a "value:" scalar; otherwise X was omitted (i.e. empty),
+      # and the consumed line must be re-tested against the same name
+      # pattern so an immediately adjacent duplicate of "variable" is still
+      # counted rather than silently swallowed.
+      if (next_line ~ /^[[:space:]]*value:[[:space:]]*/) {
+        value = next_line
+        sub(/^[[:space:]]*value:[[:space:]]*/, "", value)
+        gsub(/^["'"'"']|["'"'"']$/, "", value)
+      } else {
+        value = ""
+        if (next_line ~ "^[[:space:]]*- name:[[:space:]]*" variable "[[:space:]]*$") {
+          matches++
+        }
+      }
     }
     END {
       if (matches != 1) {
