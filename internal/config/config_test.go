@@ -34,6 +34,17 @@ func TestProvisioningConfigAcceptsExplicitFalse(t *testing.T) {
 	}
 }
 
+func TestOPNsenseSSHHostKeyLoadsFromEnvironment(t *testing.T) {
+	t.Setenv("OPNSENSE_SSH_HOST_KEY", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.OPNsense.SSHHostKey != "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest" {
+		t.Fatalf("OPNsense.SSHHostKey = %q", cfg.OPNsense.SSHHostKey)
+	}
+}
+
 func TestProvisioningConfigRejectsInvalidBoolean(t *testing.T) {
 	for _, key := range []string{"PROVISIONING_ENABLED", "WORKER_PROVISIONING_CLAIMS_ENABLED"} {
 		t.Run(key, func(t *testing.T) {

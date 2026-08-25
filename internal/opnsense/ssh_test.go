@@ -1,14 +1,114 @@
 package opnsense
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/rsa"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/crypto/ssh"
 )
+
+func TestPinnedHostKeyCallbackRejectsMissingMalformedAndMultipleKeys(t *testing.T) {
+	valid := testSSHHostPublicKey(t)
+	for _, pin := range []string{
+		"",
+		"not-an-openssh-key",
+		valid + "\n" + valid,
+		"from=\"10.0.0.1\" " + valid,
+	} {
+		if _, _, err := pinnedHostKeyCallback(pin); err == nil {
+			t.Fatalf("pinnedHostKeyCallback(%q) succeeded", pin)
+		}
+	}
+}
+
+func TestPinnedHostKeyCallbackRejectsMismatchedHostKey(t *testing.T) {
+	pinned := testSSHHostPublicKey(t)
+	callback, algorithms, err := pinnedHostKeyCallback(pinned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(algorithms) != 1 || algorithms[0] != ssh.KeyAlgoED25519 {
+		t.Fatalf("host-key algorithms = %v, want pinned ED25519 only", algorithms)
+	}
+	sabotage := testSSHPublicKey(t)
+	if err := callback("fwpodv01", &net.TCPAddr{}, sabotage); err == nil {
+		t.Fatal("mismatched SSH host key was accepted")
+	}
+}
+
+func TestPinnedRSAHostKeyOffersOnlyCompatibleAlgorithms(t *testing.T) {
+	private, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := ssh.NewPublicKey(&private.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pin := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key)))
+	_, algorithms, err := pinnedHostKeyCallback(pin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSA}
+	if strings.Join(algorithms, ",") != strings.Join(want, ",") {
+		t.Fatalf("RSA host-key algorithms = %v, want %v", algorithms, want)
+	}
+}
+
+func TestNewSSHClientRequiresPinAndPreservesPasswordAuth(t *testing.T) {
+	cfg := Config{
+		SSHHost:     "10.10.10.60:22",
+		SSHUser:     "root",
+		SSHPassword: "secret",
+		SSHHostKey:  testSSHHostPublicKey(t),
+	}
+	client, err := NewSSHClient(cfg, discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(client.authMethods) != 1 || client.hostKeyCallback == nil ||
+		len(client.hostKeyAlgos) != 1 || client.hostKeyAlgos[0] != ssh.KeyAlgoED25519 {
+		t.Fatalf("SSH client auth/pin not initialized: %+v", client)
+	}
+
+	cfg.SSHHostKey = ""
+	if _, err := NewSSHClient(cfg, discardLogger()); err == nil {
+		t.Fatal("NewSSHClient succeeded without a host-key pin")
+	}
+	cfg.SSHHostKey = testSSHHostPublicKey(t)
+	cfg.SSHPassword = ""
+	if _, err := NewSSHClient(cfg, discardLogger()); err == nil {
+		t.Fatal("NewSSHClient succeeded without an auth method")
+	}
+}
+
+func testSSHHostPublicKey(t *testing.T) string {
+	t.Helper()
+	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(testSSHPublicKey(t))))
+}
+
+func testSSHPublicKey(t *testing.T) ssh.PublicKey {
+	t.Helper()
+	public, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := ssh.NewPublicKey(public)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key
+}
 
 // TestResolveInterfaceScript_ReusesBeforeAllocating pins the ORDER of the two
 // lookups. Reuse must come first: the network reconciler re-asserts desired

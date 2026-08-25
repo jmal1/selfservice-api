@@ -45,3 +45,14 @@ func TestResolveOutDir_RelativeIsRepoRooted(t *testing.T) {
 		t.Fatalf("relative -out not resolved against repo root: got %q, want %q", got, want)
 	}
 }
+
+func TestCanonicalRepoPathAlwaysUsesManifestSeparators(t *testing.T) {
+	for _, input := range []string{
+		`docs\instructor\overview.md`,
+		filepath.FromSlash("docs/instructor/overview.md"),
+	} {
+		if got := canonicalRepoPath(input); got != "docs/instructor/overview.md" {
+			t.Fatalf("canonicalRepoPath(%q) = %q", input, got)
+		}
+	}
+}

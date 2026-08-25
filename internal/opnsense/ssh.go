@@ -15,40 +15,86 @@ import (
 
 // SSHClient handles OPNsense operations that require SSH (interface assignment).
 type SSHClient struct {
-	config Config
-	logger *slog.Logger
+	config          Config
+	logger          *slog.Logger
+	authMethods     []ssh.AuthMethod
+	hostKeyAlgos    []string
+	hostKeyCallback ssh.HostKeyCallback
 }
 
 // NewSSHClient creates an SSH client for OPNsense.
-func NewSSHClient(cfg Config, logger *slog.Logger) *SSHClient {
-	return &SSHClient{config: cfg, logger: logger}
+func NewSSHClient(cfg Config, logger *slog.Logger) (*SSHClient, error) {
+	if strings.TrimSpace(cfg.SSHHost) == "" {
+		return nil, fmt.Errorf("OPNsense SSH host is required")
+	}
+	if strings.TrimSpace(cfg.SSHUser) == "" {
+		return nil, fmt.Errorf("OPNsense SSH user is required")
+	}
+	callback, hostKeyAlgos, err := pinnedHostKeyCallback(cfg.SSHHostKey)
+	if err != nil {
+		return nil, err
+	}
+	authMethods, err := sshAuthMethods(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &SSHClient{
+		config:          cfg,
+		logger:          logger,
+		authMethods:     authMethods,
+		hostKeyAlgos:    hostKeyAlgos,
+		hostKeyCallback: callback,
+	}, nil
 }
 
-// dial establishes an SSH connection to OPNsense.
-func (s *SSHClient) dial() (*ssh.Client, error) {
+func pinnedHostKeyCallback(pin string) (ssh.HostKeyCallback, []string, error) {
+	trimmed := strings.TrimSpace(pin)
+	if trimmed == "" {
+		return nil, nil, fmt.Errorf("OPNsense SSH host-key pin is required")
+	}
+	key, _, options, rest, err := ssh.ParseAuthorizedKey([]byte(trimmed))
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse OPNsense SSH host-key pin: %w", err)
+	}
+	if len(options) != 0 || len(strings.TrimSpace(string(rest))) != 0 {
+		return nil, nil, fmt.Errorf("OPNsense SSH host-key pin must contain exactly one unqualified OpenSSH public key")
+	}
+	algorithms := []string{key.Type()}
+	if key.Type() == ssh.KeyAlgoRSA {
+		algorithms = []string{ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSA}
+	}
+	return ssh.FixedHostKey(key), algorithms, nil
+}
+
+func sshAuthMethods(cfg Config) ([]ssh.AuthMethod, error) {
 	var authMethods []ssh.AuthMethod
 
-	if len(s.config.SSHKey) > 0 {
-		signer, err := ssh.ParsePrivateKey(s.config.SSHKey)
+	if len(cfg.SSHKey) > 0 {
+		signer, err := ssh.ParsePrivateKey(cfg.SSHKey)
 		if err != nil {
 			return nil, fmt.Errorf("parse SSH key: %w", err)
 		}
 		authMethods = append(authMethods, ssh.PublicKeys(signer))
 	}
 
-	if s.config.SSHPassword != "" {
-		authMethods = append(authMethods, ssh.Password(s.config.SSHPassword))
+	if cfg.SSHPassword != "" {
+		authMethods = append(authMethods, ssh.Password(cfg.SSHPassword))
 	}
 
 	if len(authMethods) == 0 {
 		return nil, fmt.Errorf("no SSH auth method configured")
 	}
+	return authMethods, nil
+}
 
+// dial establishes an SSH connection to OPNsense.
+func (s *SSHClient) dial() (*ssh.Client, error) {
 	sshConfig := &ssh.ClientConfig{
-		User:            s.config.SSHUser,
-		Auth:            authMethods,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // OPNsense host key may change
-		Timeout:         10 * time.Second,
+		User:              s.config.SSHUser,
+		Auth:              s.authMethods,
+		HostKeyAlgorithms: s.hostKeyAlgos,
+		HostKeyCallback:   s.hostKeyCallback,
+		Timeout:           10 * time.Second,
 	}
 
 	host := s.config.SSHHost

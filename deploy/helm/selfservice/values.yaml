@@ -107,7 +107,8 @@ worker:
     enabled: false
     sourceNetwork: "10.100.0.0/16"
     # Validated feed: https://student-filter-feed.lab.jmal.io. Keep this empty
-    # until the source-scoped SafeSearch/runtime-verification blocker is closed.
+    # until the effective student-source runtime-verification blocker is closed.
+    # The worker expands this base into the deployment-reviewed schema-2 list set.
     categoryFeedBaseURL: ""
     # Permanent deployment-reviewed exceptions only. There is intentionally no
     # student/instructor mutation API for this list.
@@ -188,6 +189,9 @@ secrets:
   jwt: selfservice-jwt-secret
   oidc: selfservice-oidc
   vcenter: selfservice-vcenter-creds
+  # Keys: opnsense-url, opnsense-api-key, opnsense-api-secret,
+  # opnsense-ssh-password, and the pinned OpenSSH public key
+  # opnsense-ssh-host-key.
   opnsense: selfservice-opnsense-creds
   # Scoped MinIO service account for image uploads. Keys: access-key,
   # secret-key. Sourced from Vault at secret/crucible/minio — this is
@@ -264,6 +268,10 @@ vcenter:
 opnsense:
   sshHost: "10.10.10.60:22"
   sshUser: root
+  # Optional explicit OpenSSH host public key. When empty, the worker requires
+  # `opnsense-ssh-host-key` in secrets.opnsense. Generate the value from a
+  # trusted console with: ssh-keyscan -t ed25519 <host> | awk '{print $2, $3}'
+  sshHostKey: ""
 
 # Database connection (non-secret values; password from K8s secret)
 database:

@@ -647,22 +647,21 @@ The validated internal feed is
 `https://student-filter-feed.lab.jmal.io`. The deployment value
 `categoryFeedBaseURL` is this exact base URL, not a list URL; the worker expands
 it in order to `/lists/drogue.txt`, `/lists/agressif.txt`,
-`/lists/audio-video.txt`, and `/lists/social_networks.txt`. Arbitrary hosts,
-ports, paths, queries, fragments, and userinfo are rejected. Its hostname-only LKG inputs are
-`drogue` (436), `blacklists/agressif/domains` (266), `audio-video` (3,620),
-and `social_networks` (715); IP entries are excluded. OPNsense 26.1 has no
-built-in social-media selector. The capacity-tested built-in selection is
+`/lists/dangerous_material.txt`, `/lists/audio-video.txt`,
+`/lists/social_networks.txt`, and `/lists/weapons.txt`. Arbitrary hosts, ports,
+paths, queries, fragments, and userinfo are rejected. These are the live
+schema-2 custom list categories; IP entries are excluded. OPNsense 26.1 has no
+built-in social-media selector. The capacity-tested built-in selection remains
 exactly `oisd2`, `hgz014`, and `hgz021` (Gambling Mini). Do not substitute the
-larger `hgz019` or `hgz020` gambling lists; `hgz022` does not exist. The
-supervised 4 GB pilot measured 626,913 final domains and 389 MB Unbound RSS
-with this exact selection.
+larger `hgz019` or `hgz020` gambling lists; `hgz022` does not exist.
 
-The repository integration is intentionally read-only even if source-scoped
-SafeSearch capability becomes available: it validates configuration, inspects
-exact firewall/DNSBL state, and verifies effective behavior, but never mutates,
-refreshes, or applies the policy. Supervised activation remains a live-only
-step until a transactional owner can roll back every firewall, DNSBL, Unbound,
-and runtime-verification failure without leaving staged policy behind.
+The repository integration remains intentionally read-only: it validates
+configuration and inspects exact firewall/DNSBL state, but never mutates,
+refreshes, or applies the policy. The transactional source-scoped SafeSearch
+fragment owner is a foundation API only and is not called by
+`reconcileContentFilter`. Supervised activation remains blocked until one
+transaction can roll back every firewall, DNSBL, Unbound, and
+runtime-verification failure without leaving staged policy behind.
 While policy is enabled but inspection is unhealthy, the network reconciler
 also suppresses unrelated firewall applies so they cannot activate a partial
 staged model.
@@ -672,17 +671,40 @@ Activation is asynchronous, the Python module reloads `dnsbl.json` only on an
 uncached query after its 60-second gate, and the action can mask shell failures.
 
 OPNsense does support a source-scoped mechanism outside its built-in switch. A
-reversible pilot used an unmanaged
+reversible pilot used a dedicated
 `/usr/local/etc/unbound.opnsense.d/*.conf` fragment with
 `access-control-view`, a `view` using `view-first: yes`, and SafeSearch
 `local-zone` / `local-data` CNAME rewrites; `configctl unbound check` validated
-the result, and removing the fragment restored normal answers. This integration
-does not yet transactionally own that fragment, so activation remains blocked.
-A follow-up must stage a stable owned fragment, reject conflicts, validate before
-reconfigure, roll back and reconfigure on failure, then prove forced answers from
-a real student source and unchanged answers from a control source. The synthetic
-must repeat the effective uncached student-source check rather than trusting
-configuration readback.
+the result, and removing the fragment restored normal answers.
+
+Crucible now owns only
+`/usr/local/etc/unbound.opnsense.d/crucible-student-safesearch.conf`; it never
+edits generated global `safesearch.conf` or another manual fragment. The worker
+requires `OPNSENSE_SSH_HOST_KEY` as one OpenSSH public-key line
+(`ssh-ed25519 AAAA...`, optionally followed by a comment). The Helm chart takes
+it from `opnsense.sshHostKey` when explicitly set, otherwise from key
+`opnsense-ssh-host-key` in `secrets.opnsense`. Obtain and compare it through a
+trusted OPNsense console or previously authenticated channel; do not trust a
+first-use network scan.
+
+The owner writes durable rollback state outside the `*.conf` include glob,
+rejects unsafe CIDRs plus conflicting or overlapping manual views, writes
+atomically, stages the chroot copy at
+`/var/unbound/etc/crucible-student-safesearch.conf`, validates with
+`configctl unbound check` plus direct `unbound-checkconf`, and activates through
+the supported `configctl unbound restart` action followed by a running-service
+check. This extra parsing is required because `configctl` can mask an underlying
+script failure behind exit status 0. A later invocation recovers any interrupted
+transaction before accepting the current fragment as its baseline. Every
+post-write failure restores the persistent source before any restart, rebuilds
+and verifies the staged copy, and preserves the backup if recovery is
+incomplete. Once activation and exact readback are marked committed,
+backup-cleanup failure preserves the active configuration for cleanup on the
+next invocation instead of rolling it back. Missing, malformed, or mismatched
+host-key pins fail closed. This does **not** enable content filtering: the
+reconciler remains read-only, and the synthetic must still prove effective
+uncached answers from a real student source plus unchanged answers from a
+control source rather than trusting configuration readback.
 
 The policy must remain disabled until the synthetic can flush/use controlled
 uncached fixtures and verify actual answers from `10.100.0.0/16`.
