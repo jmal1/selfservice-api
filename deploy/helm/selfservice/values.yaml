@@ -445,13 +445,13 @@ synthetic:
     # Retry configuration. Mirrors lifecycle retry semantics.
     maxAttempts: 2
     retryBackoff: "30s"
-    # Must exceed WorstCaseCycle(readyTimeout+runTimeout+destroyTimeout, retryBackoff, maxAttempts)
-    # = 2×(480s+600s+90s) + 30s + 60s = 2430s = 40m30s.
+    # Must exceed the Runner-authorized retry cycle:
+    # 2×(480s+600s+90s+60s per-attempt overhead) + 30s = 2490s = 41m30s.
     # 2700s (45 min) leaves 270s margin and still fits the hourly schedule
     # (60 min - 45 min = 15 min gap before the next run).
-    # TestRunnerSmokeRetry_WorstCaseDerivedFromHelmValues enforces this.
-    # lifecycleSafeTimeout() independently widens the per-check budget; this
-    # is the outer Kubernetes bound. If this is smaller than WorstCaseCycle,
+    # TestRunnerSmokeRetry_WorstCaseDerivedFromHelmValues enforces this and the
+    # derived 20m30s per-attempt context plus 44-minute session JWT TTL.
+    # This is the outer Kubernetes bound. If it is smaller than the retry cycle,
     # the pod is SIGKILLed mid-attempt and pushes no metric (stale series).
     activeDeadlineSeconds: 2700
     layer: "runner"

@@ -26,7 +26,7 @@ metadata:
     app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: synthetic-monitor
 spec:
-  schedule: {{ .Values.synthetic.runner.schedule | quote }}
+  schedule: {{ required "synthetic.runner.schedule is required" .Values.synthetic.runner.schedule | quote }}
   # Forbid, not Replace: a run in flight owns a real pod and a runner Job.
   # Killing it mid-flight would orphan both, and the replacement would then
   # trip the synthetic user's pod quota with a 409.
@@ -37,7 +37,7 @@ spec:
   jobTemplate:
     spec:
       backoffLimit: 0
-      activeDeadlineSeconds: {{ .Values.synthetic.runner.activeDeadlineSeconds | default 1500 }}
+      activeDeadlineSeconds: {{ required "synthetic.runner.activeDeadlineSeconds is required" .Values.synthetic.runner.activeDeadlineSeconds }}
       ttlSecondsAfterFinished: 1800
       template:
         metadata:
@@ -89,15 +89,15 @@ spec:
                 - name: SYNTHETIC_RUNNER_PLAYLIST_ID
                   value: {{ .Values.synthetic.runner.playlistID | quote }}
                 - name: SYNTHETIC_RUNNER_READY_TIMEOUT
-                  value: {{ .Values.synthetic.runner.readyTimeout | default "8m" | quote }}
+                  value: {{ required "synthetic.runner.readyTimeout is required" .Values.synthetic.runner.readyTimeout | quote }}
                 - name: SYNTHETIC_RUNNER_RUN_TIMEOUT
-                  value: {{ .Values.synthetic.runner.runTimeout | default "10m" | quote }}
+                  value: {{ required "synthetic.runner.runTimeout is required" .Values.synthetic.runner.runTimeout | quote }}
                 - name: SYNTHETIC_RUNNER_DESTROY_TIMEOUT
-                  value: {{ .Values.synthetic.runner.destroyTimeout | default "90s" | quote }}
+                  value: {{ required "synthetic.runner.destroyTimeout is required" .Values.synthetic.runner.destroyTimeout | quote }}
                 - name: SYNTHETIC_RUNNER_MAX_ATTEMPTS
-                  value: {{ .Values.synthetic.runner.maxAttempts | default 2 | quote }}
+                  value: {{ required "synthetic.runner.maxAttempts is required" .Values.synthetic.runner.maxAttempts | quote }}
                 - name: SYNTHETIC_RUNNER_RETRY_BACKOFF
-                  value: {{ .Values.synthetic.runner.retryBackoff | default "30s" | quote }}
+                  value: {{ required "synthetic.runner.retryBackoff is required" .Values.synthetic.runner.retryBackoff | quote }}
               resources:
                 {{- toYaml .Values.synthetic.resources | nindent 16 }}
               securityContext:

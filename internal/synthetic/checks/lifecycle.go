@@ -3,6 +3,7 @@ package checks
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -59,13 +60,13 @@ type PodLifecycleConfig struct {
 //
 // The Helm chart (deploy/helm/selfservice/values.yaml, lifecycle.readyTimeout)
 // pins this to the same 150 s in the deployed CronJob. Code default and chart
-// default MUST agree; WorstCaseCycle in the test suite enforces the arithmetic
+// default MUST agree; the Helm-derived contract test enforces the arithmetic
 // against the chart values directly.
 //
 // Worst-case pod_lifecycle cycle time with 2 attempts and 30 s backoff:
 //
-//	2 × (ReadyTimeout + DestroyTimeout) + Backoff + overhead
-//	= 2 × (150 s + 90 s) + 30 s + 60 s = 570 s = 9 m 30 s < 10 min ✓
+//	2 × (ReadyTimeout + DestroyTimeout + per-attempt overhead) + Backoff
+//	= 2 × (150 s + 90 s + 30 s) + 30 s = 570 s = 9 m 30 s < 10 min ✓
 func DefaultPodLifecycleConfig(templateName string) PodLifecycleConfig {
 	return PodLifecycleConfig{
 		TemplateName:   templateName,
@@ -161,6 +162,7 @@ func runPodLifecycle(ctx context.Context, c *synthetic.Client, cfg PodLifecycleC
 		log.Error("lifecycle: wait for active failed", "http_status", status, "error", err.Error())
 		return status, fmt.Errorf("wait for active: %w", err)
 	}
+
 	log.Info("lifecycle: pod reached active")
 
 	// 5b. Probe the testing dashboard on the LIVE pod.
@@ -395,6 +397,8 @@ func probeTestingDashboard(ctx context.Context, c *synthetic.Client, podID strin
 // of wantStatuses, the overall timeout expires, or an unrecoverable error
 // occurs. The Pod's "error" status terminates the wait early with a failure.
 func waitForPodStatus(ctx context.Context, c *synthetic.Client, podID string, wantStatuses []string, timeout, interval time.Duration) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	deadline := time.Now().Add(timeout)
 	// Cap interval to a fraction of the timeout so short timeouts (tests,
 	// fast-fail configs) still get multiple poll attempts.
@@ -409,6 +413,12 @@ func waitForPodStatus(ctx context.Context, c *synthetic.Client, podID string, wa
 	for {
 		resp, err := c.Do(ctx, http.MethodGet, "/api/v1/pods/"+podID, nil)
 		if err != nil {
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return lastStatus, fmt.Errorf(
+					"timed out waiting for status %v (last seen %q) after %s",
+					wantStatuses, lastPodStatus, timeout,
+				)
+			}
 			return lastStatus, err
 		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -450,6 +460,12 @@ func waitForPodStatus(ctx context.Context, c *synthetic.Client, podID string, wa
 
 		select {
 		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return lastStatus, fmt.Errorf(
+					"timed out waiting for status %v (last seen %q) after %s",
+					wantStatuses, lastPodStatus, timeout,
+				)
+			}
 			return lastStatus, ctx.Err()
 		case <-time.After(interval):
 		}

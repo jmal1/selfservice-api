@@ -540,6 +540,24 @@ The validator runs in two layers:
 
 Source: [`internal/scriptvalidator/wrap.go`](internal/scriptvalidator/wrap.go), [`internal/scriptvalidator/detect.go`](internal/scriptvalidator/detect.go), [`internal/scriptvalidator/validator.go`](internal/scriptvalidator/validator.go).
 
+### 12.2 Platform `runner_smoke` timeout envelope
+
+Do not infer the assessment runner's platform health from a shorter client
+timeout. The dedicated hourly `runner_smoke` CronJob currently resolves an
+8-minute pod-ready phase, a 10-minute assessment-run phase, and a 90-second
+destroy phase. The monitor adds 30 seconds for ordinary request overhead and
+reserves another 30 seconds for final cleanup, so the outer per-attempt context
+is 20 minutes 30 seconds. Two attempts with a 30-second backoff authorize a
+maximum 41-minute-30-second retry cycle. Its session JWT is minted for 44
+minutes, the Kubernetes Job deadline is 45 minutes, and the
+schedule is hourly.
+
+Those limits are one contract. A `401` before the retry cycle finishes, a
+`context deadline exceeded` before a configured phase can finish, or a Job
+deadline at or below the session TTL indicates deployment/runtime drift rather
+than an assessment authoring error. See
+[`docs/instructor/troubleshooting.md`](docs/instructor/troubleshooting.md#runner_smoke-synthetic-check-is-firing).
+
 ---
 
 ## 13. When you should hand back to the human

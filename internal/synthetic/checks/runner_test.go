@@ -659,3 +659,56 @@ func TestRunnerSmoke_Metadata(t *testing.T) {
 		}
 	}
 }
+
+func TestBoundedRunnerAttemptContexts_ReserveOperationAndCleanupOverhead(t *testing.T) {
+	cfg := RunnerSmokeConfig{
+		ReadyTimeout:   10 * time.Millisecond,
+		RunTimeout:     20 * time.Millisecond,
+		DestroyTimeout: 30 * time.Millisecond,
+	}
+	start := time.Now()
+	attemptCtx, workCtx, cancel := boundedRunnerAttemptContexts(context.Background(), cfg)
+	defer cancel()
+
+	attemptDeadline, ok := attemptCtx.Deadline()
+	if !ok {
+		t.Fatal("attempt context has no deadline")
+	}
+	workDeadline, ok := workCtx.Deadline()
+	if !ok {
+		t.Fatal("work context has no deadline")
+	}
+	if got := attemptDeadline.Sub(workDeadline); got != synthetic.CheckCleanupReserve {
+		t.Fatalf("cleanup reserve=%s, want %s", got, synthetic.CheckCleanupReserve)
+	}
+
+	phaseBudget := cfg.ReadyTimeout + cfg.RunTimeout + cfg.DestroyTimeout
+	workBudget := workDeadline.Sub(start)
+	wantWorkBudget := phaseBudget + synthetic.CheckAttemptOverhead - synthetic.CheckCleanupReserve
+	if delta := workBudget - wantWorkBudget; delta < -10*time.Millisecond || delta > 10*time.Millisecond {
+		t.Fatalf("ordinary work budget=%s, want %s within timer setup tolerance", workBudget, wantWorkBudget)
+	}
+	if got := attemptDeadline.Sub(start); got < cfg.AttemptTimeout()-10*time.Millisecond ||
+		got > cfg.AttemptTimeout()+10*time.Millisecond {
+		t.Fatalf("attempt budget=%s, want %s within timer setup tolerance", got, cfg.AttemptTimeout())
+	}
+}
+
+func TestWaitForRunTerminal_BoundsInFlightRequest(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	start := time.Now()
+	_, _, err := waitForRunTerminal(
+		context.Background(), synthetic.NewClient(srv.URL, ""),
+		"pod-1", "run-1", 50*time.Millisecond, time.Second,
+	)
+	if err == nil || !strings.Contains(err.Error(), "timed out waiting for terminal run status") {
+		t.Fatalf("waitForRunTerminal error=%v, want phase timeout", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("in-flight run request exceeded phase timeout: elapsed=%s", elapsed)
+	}
+}

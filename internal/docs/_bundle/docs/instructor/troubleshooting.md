@@ -777,6 +777,18 @@ Job scheduling → Multus NAD attachment → macvlan DHCP lease → Kali image
 pull → action execution → callback → results persisted. When it fires, one
 of those links is broken.
 
+The deployed timeout envelope is intentionally layered: 8 minutes to reach an
+active pod, 10 minutes for the assessment run, 90 seconds to destroy, and a
+fixed 30-second allowance for ordinary requests plus a 30-second final-cleanup
+reserve per attempt. That yields a 20-minute-30-second outer context per
+attempt and a 41-minute-30-second maximum for two attempts plus the 30-second
+retry backoff. The synthetic session JWT lasts 44 minutes, the
+Kubernetes Job deadline is 45 minutes, and the CronJob runs hourly. A `401`
+before the retry cycle completes or `context deadline exceeded` before a
+configured phase can finish means these limits have drifted; investigate the
+rendered CronJob and monitor image rather than rotating credentials or changing
+the assessment playlist.
+
 **First three things to check:**
 
 1. **Is the Kali runner Kubernetes Job scheduling?**
