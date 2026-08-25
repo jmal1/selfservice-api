@@ -114,6 +114,13 @@ func newPodDeletePostgresFixture(t *testing.T, vmCount int) *podDeletePostgresFi
 	`, fixture.createJob, fixture.podID, fixture.ownerID); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE jobs
+		SET created_at = now() - interval '1 day'
+		WHERE id = $1
+	`, fixture.createJob); err != nil {
+		t.Fatal(err)
+	}
 
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
