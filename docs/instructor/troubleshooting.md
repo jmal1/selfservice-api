@@ -218,10 +218,10 @@ The live worker may temporarily have
 `WORKER_PROVISIONING_CLAIMS_ENABLED=true` even though the stored rollback
 revision correctly renders it as `false`. A real deploy does not misclassify
 that stored revision as claims-enabled. Under the release lock it first proves
-the stored revision is revision 161 with claims disabled and all immutable pins.
+the stored revision is revision 162 with claims disabled and all immutable pins.
 Candidate provenance, digest resolution, rendering, and the first server dry-run
 all happen before the lock or claims mutation. For a real apply, the script then
-locks, proves revision 161 again, explicitly sets the live worker claims value
+locks, proves revision 162 again, explicitly sets the live worker claims value
 back to `false`, waits for the rollout, and performs the complete
 stored-manifest/live-state proof.
 
@@ -280,7 +280,7 @@ still held. Revision 160 is the immutable image/workload baseline, but its
 historical values enabled lifecycle, janitor, and runner synthetics and are not
 safe rollback intent. The script forces claims disabled, immediately reapplies
 the current containment (API monitor unsuspended, lifecycle false,
-janitor/runner suspended), waits for the worker, and proves revision 161, its
+janitor/runner suspended), waits for the worker, and proves revision 162, its
 stored and live image identities (including `RUNNER_IMAGE`), workload health,
 migration state, zero nonterminal synthetic create/destroy work, and both job
 drains.

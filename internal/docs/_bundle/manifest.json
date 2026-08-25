@@ -14,7 +14,7 @@
       "path": "AGENTS.md",
       "title": "AGENTS.md — Crucible AI Authoring Reference",
       "size": 79565,
-      "sha256": "6d6b715bd72f0aadfa6a16f47071d7ca0732c6d3d9d22213f0c84bfc38e52678",
+      "sha256": "9727659665c0c81ef52645c1f9f46a5727b4a24c1a1ec02ea42606b474295383",
       "is_markdown": true,
       "links_out": [
         "deploy/runner/actions.sh",
@@ -203,7 +203,7 @@
       "path": "docs/instructor/troubleshooting.md",
       "title": "Troubleshooting",
       "size": 63432,
-      "sha256": "74cedbf594d35a4e7ee9a34b805d1a0bad0f7d1f6636a1b20ebfbe1ef16d3c1c",
+      "sha256": "914e988f1861e5c0a484b48ada455c77006d26f6bd25f4b8aeb0cc5eec62f49b",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/actions.md",

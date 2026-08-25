@@ -874,7 +874,7 @@ revision label. Exactly the UI container is replaced with that proven digest.
 If the stored rollback revision renders claims disabled but the live worker has
 a temporary claims-enabled override, candidate provenance, rendering, and its
 first server dry-run still happen without mutation. A real apply then acquires
-the release lock, proves revision 161 is immutable and claims-disabled,
+the release lock, proves revision 162 is immutable and claims-disabled,
 deliberately sets the live worker back to claims disabled, waits for that
 rollout and durable job drain, and only then runs the complete stored/live
 rollback proof. The override does not make the rollback baseline claims-enabled.
@@ -889,7 +889,7 @@ sha256 `RUNNER_IMAGE`, one worker, claims disabled, content-filter activation
 disabled, and an empty content-filter feed. Kubernetes server-side dry-run
 validates that final manifest before any lock or claims mutation, and `--dry-run`
 prints that pinned manifest even when live claims are temporarily enabled.
-For a real apply, the script then locks, proves revision 161 again, pauses live
+For a real apply, the script then locks, proves revision 162 again, pauses live
 claims, keeps the API monitor unsuspended with lifecycle disabled, and suspends
 the janitor/runner clone CronJobs before draining work. PostgreSQL must have
 zero `claimed`, `in_progress`, or `rollback` durable jobs and zero nonterminal
@@ -930,8 +930,8 @@ host-level timer.
 
 An atomic Helm failure never falls through the EXIT trap. While retaining the
 release lock, the script forces claims disabled, immediately reapplies the
-current synthetic containment over revision 161's historical values, and proves
-that the latest deployed rollback revision has revision 161's exact immutable
+current synthetic containment over revision 162's historical values, and proves
+that the latest deployed rollback revision has revision 162's exact immutable
 image inventory and `RUNNER_IMAGE`. Helm may record rollback as a newer revision;
 revision number alone is not treated as identity. The proof also requires
 readiness, migration, active non-lifecycle API-monitor intent, suspended clone
