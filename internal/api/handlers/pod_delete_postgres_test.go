@@ -193,7 +193,7 @@ func waitForJobLockHeld(t *testing.T, pool *pgxpool.Pool, jobID uuid.UUID) {
 }
 
 func TestDeletePodCancelsNeverStartedPodAndIsIdempotent(t *testing.T) {
-	fixture := newPodDeletePostgresFixture(t, 2)
+	fixture := newPodDeletePostgresFixture(t, 1)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	t.Cleanup(cancel)
 
@@ -321,19 +321,18 @@ func TestDeletePodCancelsNeverStartedPodAndIsIdempotent(t *testing.T) {
 		t.Fatalf("VLAN allocation still attached to pod %s", vlanPodID)
 	}
 
-	var auditAction string
-	var auditDetails []byte
+	var auditAction, auditMode string
 	if err := fixture.pool.QueryRow(ctx, `
-		SELECT action, COALESCE(details, '{}'::jsonb)
+		SELECT action, COALESCE(details->>'mode', '')
 		FROM audit_log
 		WHERE resource_id = $1
 		ORDER BY id DESC
 		LIMIT 1
-	`, fixture.podID).Scan(&auditAction, &auditDetails); err != nil {
+	`, fixture.podID).Scan(&auditAction, &auditMode); err != nil {
 		t.Fatal(err)
 	}
-	if auditAction != "pod.delete" || !strings.Contains(string(auditDetails), `"mode":"cancelled"`) {
-		t.Fatalf("audit entry = %s %s", auditAction, auditDetails)
+	if auditAction != "pod.delete" || auditMode != "cancelled" {
+		t.Fatalf("audit entry = %s %s", auditAction, auditMode)
 	}
 
 	rec2 := httptest.NewRecorder()
@@ -371,6 +370,75 @@ func TestDeletePodRejectsClaimedJobAndExternalEvidence(t *testing.T) {
 			setup: func(t *testing.T, f *podDeletePostgresFixture) {
 				t.Helper()
 				f.claimCreateJob(t, "claimed-delete-worker")
+			},
+			want: http.StatusAccepted,
+		},
+		{
+			name: "retried create job",
+			setup: func(t *testing.T, f *podDeletePostgresFixture) {
+				t.Helper()
+				workerID := "retried-delete-worker"
+				f.claimCreateJob(t, workerID)
+				if err := f.queries.RetryJob(context.Background(), f.createJob, time.Now().Add(time.Hour), false, nil, workerID); err != nil {
+					t.Fatal(err)
+				}
+				var (
+					status     string
+					retryCount int
+					claimedBy  *string
+					claimedAt  *time.Time
+					startedAt  *time.Time
+				)
+				if err := f.pool.QueryRow(context.Background(), `
+					SELECT status, retry_count, claimed_by, claimed_at, started_at
+					FROM jobs
+					WHERE id = $1
+				`, f.createJob).Scan(&status, &retryCount, &claimedBy, &claimedAt, &startedAt); err != nil {
+					t.Fatal(err)
+				}
+				if status != models.JobStatusPending || retryCount != 1 || claimedBy != nil || claimedAt != nil || startedAt != nil {
+					t.Fatalf("retried job state = status:%s retry_count:%d claimed_by:%v claimed_at:%v started_at:%v", status, retryCount, claimedBy, claimedAt, startedAt)
+				}
+			},
+			want: http.StatusAccepted,
+		},
+		{
+			name: "recovered stale job",
+			setup: func(t *testing.T, f *podDeletePostgresFixture) {
+				t.Helper()
+				workerID := "recovered-delete-worker"
+				f.claimCreateJob(t, workerID)
+				if _, err := f.pool.Exec(context.Background(), `
+					UPDATE jobs
+					SET claimed_at = now() - interval '2 hours'
+					WHERE id = $1
+				`, f.createJob); err != nil {
+					t.Fatal(err)
+				}
+				recovered, err := f.queries.RecoverStaleJobs(context.Background(), time.Hour)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if recovered != 1 {
+					t.Fatalf("recovered job count = %d, want 1", recovered)
+				}
+				var (
+					status     string
+					retryCount int
+					claimedBy  *string
+					claimedAt  *time.Time
+					startedAt  *time.Time
+				)
+				if err := f.pool.QueryRow(context.Background(), `
+					SELECT status, retry_count, claimed_by, claimed_at, started_at
+					FROM jobs
+					WHERE id = $1
+				`, f.createJob).Scan(&status, &retryCount, &claimedBy, &claimedAt, &startedAt); err != nil {
+					t.Fatal(err)
+				}
+				if status != models.JobStatusPending || retryCount != 1 || claimedBy != nil || claimedAt != nil || startedAt != nil {
+					t.Fatalf("recovered job state = status:%s retry_count:%d claimed_by:%v claimed_at:%v started_at:%v", status, retryCount, claimedBy, claimedAt, startedAt)
+				}
 			},
 			want: http.StatusAccepted,
 		},
@@ -462,7 +530,7 @@ func TestDeletePodRejectsClaimedJobAndExternalEvidence(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			fixture := newPodDeletePostgresFixture(t, 1)
+			fixture := newPodDeletePostgresFixture(t, 2)
 			tc.setup(t, fixture)
 
 			rec := httptest.NewRecorder()

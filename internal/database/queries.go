@@ -1354,7 +1354,7 @@ func (q *Queries) CountRetryPendingJobs(ctx context.Context) (int, error) {
 }
 
 const recoverStaleJobsSQL = `
-		UPDATE jobs SET status = 'pending', claimed_by = NULL, claimed_at = NULL, started_at = NULL
+		UPDATE jobs SET status = 'pending', claimed_by = NULL, claimed_at = NULL, started_at = NULL, retry_count = retry_count + 1
 		WHERE status IN ('in_progress', 'claimed')
 		  AND completed_at IS NULL
 		  AND (claimed_at IS NULL OR claimed_at < now() - ($1 * interval '1 second'))

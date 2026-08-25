@@ -39,14 +39,11 @@ func (q *Queries) CancelPendingPodIfNeverStarted(ctx context.Context, podID uuid
 
 	var createJobID uuid.UUID
 	var createJobStatus string
-	var claimedBySet, claimedAtSet, startedAtSet, completedAtSet bool
+	var retryCount int
 	var rollbackCount int
 	jobErr := tx.QueryRow(ctx, `
 		SELECT id, status,
-		       claimed_by IS NOT NULL,
-		       claimed_at IS NOT NULL,
-		       started_at IS NOT NULL,
-		       completed_at IS NOT NULL,
+		       COALESCE(retry_count, 0),
 		       COALESCE(jsonb_array_length(rollback_steps), 0)
 		FROM jobs
 		WHERE type = $1
@@ -57,10 +54,7 @@ func (q *Queries) CancelPendingPodIfNeverStarted(ctx context.Context, podID uuid
 	`, models.JobTypePodCreate, podID.String()).Scan(
 		&createJobID,
 		&createJobStatus,
-		&claimedBySet,
-		&claimedAtSet,
-		&startedAtSet,
-		&completedAtSet,
+		&retryCount,
 		&rollbackCount,
 	)
 	if jobErr != nil && !errors.Is(jobErr, pgx.ErrNoRows) {
@@ -88,8 +82,7 @@ func (q *Queries) CancelPendingPodIfNeverStarted(ctx context.Context, podID uuid
 	}
 
 	if podStatus != models.PodStatusPending || errors.Is(jobErr, pgx.ErrNoRows) ||
-		createJobStatus != models.JobStatusPending || claimedBySet || claimedAtSet ||
-		startedAtSet || completedAtSet || rollbackCount != 0 {
+		createJobStatus != models.JobStatusPending || retryCount != 0 || rollbackCount != 0 {
 		if err := tx.Commit(ctx); err != nil {
 			return nil, fmt.Errorf("commit pod cancellation preflight: %w", err)
 		}
@@ -105,8 +98,6 @@ func (q *Queries) CancelPendingPodIfNeverStarted(ctx context.Context, podID uuid
 	if err != nil {
 		return nil, fmt.Errorf("lock pod VMs for cancellation: %w", err)
 	}
-	defer rows.Close()
-
 	evidence := false
 	for rows.Next() {
 		var (
@@ -128,6 +119,7 @@ func (q *Queries) CancelPendingPodIfNeverStarted(ctx context.Context, podID uuid
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("inspect pod VM cancellation evidence: %w", err)
 	}
+	rows.Close()
 	if evidence {
 		if err := tx.Commit(ctx); err != nil {
 			return nil, fmt.Errorf("commit pod cancellation preflight: %w", err)
