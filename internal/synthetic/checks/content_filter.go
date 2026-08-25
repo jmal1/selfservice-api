@@ -61,7 +61,7 @@ func ContentFilterPolicy(cfg ContentFilterPolicyConfig) synthetic.Check {
 			}
 			policies := make([]opnsense.DNSBLPolicy, 0, len(rows))
 			for _, row := range rows {
-				if row.Description != "crucible:content-filter:v1" {
+				if row.Description != provisioner.ContentFilterDNSBLDescription {
 					continue
 				}
 				policy, err := cfg.Reader.GetDNSBLPolicy(ctx, row.UUID)

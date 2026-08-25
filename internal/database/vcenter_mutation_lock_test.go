@@ -23,7 +23,53 @@ func TestVCenterPortGroupAdvisoryLockKeyIsStable(t *testing.T) {
 	}
 }
 
+func TestContentFilterAdvisoryLockKeyIsStable(t *testing.T) {
+	const productionKey int64 = 0x435243424c4f434b
+	if contentFilterMutationAdvisoryLockKey != productionKey {
+		t.Fatalf(
+			"content-filter advisory lock key changed from %x to %x; mixed worker versions would mutate concurrently",
+			productionKey,
+			contentFilterMutationAdvisoryLockKey,
+		)
+	}
+}
+
+func TestContentFilterCanaryReservationAdvisoryLockKeyIsStable(t *testing.T) {
+	const productionKey int64 = 0x43524343414e4152
+	if contentFilterCanaryReservationAdvisoryLockKey != productionKey {
+		t.Fatalf(
+			"content-filter canary reservation advisory lock key changed from %x to %x; checkout could race reservation replacement",
+			productionKey,
+			contentFilterCanaryReservationAdvisoryLockKey,
+		)
+	}
+}
+
 func TestVCenterPortGroupAdvisoryLockSerializesTwoClients(t *testing.T) {
+	assertAdvisoryLockSerializes(t, func(
+		client *Queries,
+		ctx context.Context,
+		mutate func(context.Context) error,
+	) error {
+		return client.WithVCenterPortGroupMutationLock(ctx, mutate)
+	})
+}
+
+func TestContentFilterAdvisoryLockSerializesTwoClients(t *testing.T) {
+	assertAdvisoryLockSerializes(t, func(
+		client *Queries,
+		ctx context.Context,
+		mutate func(context.Context) error,
+	) error {
+		return client.WithContentFilterMutationLock(ctx, mutate)
+	})
+}
+
+func assertAdvisoryLockSerializes(
+	t *testing.T,
+	lock func(*Queries, context.Context, func(context.Context) error) error,
+) {
+	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("set TEST_DATABASE_URL to an isolated PostgreSQL database to run the cross-client advisory-lock test")
@@ -57,7 +103,7 @@ func TestVCenterPortGroupAdvisoryLockSerializesTwoClients(t *testing.T) {
 		wg.Add(1)
 		go func(client *Queries) {
 			defer wg.Done()
-			errs <- client.WithVCenterPortGroupMutationLock(ctx, func(context.Context) error {
+			errs <- lock(client, ctx, func(context.Context) error {
 				now := active.Add(1)
 				for {
 					previous := maximum.Load()
@@ -79,7 +125,7 @@ func TestVCenterPortGroupAdvisoryLockSerializesTwoClients(t *testing.T) {
 		}
 	}
 	if got := maximum.Load(); got != 1 {
-		t.Fatalf("maximum concurrent vCenter mutation sections = %d, want 1", got)
+		t.Fatalf("maximum concurrent mutation sections = %d, want 1", got)
 	}
 }
 

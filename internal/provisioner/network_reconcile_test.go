@@ -2,6 +2,7 @@ package provisioner
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -48,6 +49,11 @@ type fakeNetworkOPN struct {
 	updateFirewallCalls    []opnsense.FirewallRule
 	applyFirewallErr       error
 	applyFirewallCalls     int
+	globalSafeSearch       bool
+}
+
+func (*fakeNetworkOPN) BeginContentFilterTransaction(ctx context.Context) (context.Context, func(), error) {
+	return ctx, func() {}, nil
 }
 
 func (f *fakeNetworkOPN) GetVLANByTag(_ context.Context, tag int) (*opnsense.VLAN, error) {
@@ -133,12 +139,13 @@ func (f *fakeNetworkOPN) CreateFirewallRule(_ context.Context, rule opnsense.Fir
 		return "", f.createFirewallErr
 	}
 	f.createFirewallCalls = append(f.createFirewallCalls, rule)
+	ruleUUID := fmt.Sprintf("fw-%d", len(f.createFirewallCalls))
 	// Model the canonical shape opnsense.GetFirewallRules yields from a
 	// firewall/filter/get read-back of a rule created via addRule (lower-cased,
 	// sorted interface set, empty ports, description dropped). A verbatim
 	// round-trip of the create struct would hide the real bug.
-	f.firewallRules = append(f.firewallRules, opnsenseFilterGetReadback(rule, "fw-uuid"))
-	return "fw-uuid", nil
+	f.firewallRules = append(f.firewallRules, opnsenseFilterGetReadback(rule, ruleUUID))
+	return ruleUUID, nil
 }
 
 func (f *fakeNetworkOPN) DeleteFirewallRule(_ context.Context, ruleUUID string) error {
@@ -168,7 +175,7 @@ func (f *fakeNetworkOPN) UpdateFirewallRule(_ context.Context, ruleUUID string, 
 }
 
 func (f *fakeNetworkOPN) GetUnboundSafeSearch(context.Context) (bool, error) {
-	return true, nil
+	return f.globalSafeSearch, nil
 }
 
 func (f *fakeNetworkOPN) SetUnboundSafeSearch(context.Context, bool) error { return nil }
@@ -194,6 +201,34 @@ func (f *fakeNetworkOPN) DeleteDNSBLPolicy(context.Context, string) error { retu
 func (f *fakeNetworkOPN) ReconfigureUnbound(context.Context) error { return nil }
 
 func (f *fakeNetworkOPN) RefreshUnboundDNSBL(context.Context) error { return nil }
+
+func (f *fakeNetworkOPN) SnapshotSourceScopedSafeSearch(context.Context) (opnsense.SourceScopedSafeSearchState, error) {
+	return opnsense.SourceScopedSafeSearchState{}, nil
+}
+
+func (f *fakeNetworkOPN) ReadSourceScopedSafeSearchState(context.Context) (opnsense.SourceScopedSafeSearchReadOnlyState, error) {
+	return opnsense.SourceScopedSafeSearchReadOnlyState{}, nil
+}
+
+func (f *fakeNetworkOPN) ConfigureSourceScopedSafeSearch(context.Context, string) error { return nil }
+
+func (f *fakeNetworkOPN) RestoreSourceScopedSafeSearch(context.Context, opnsense.SourceScopedSafeSearchState) error {
+	return nil
+}
+
+func (f *fakeNetworkOPN) InspectSourceScopedSafeSearch(context.Context, string) error { return nil }
+
+func (f *fakeNetworkOPN) CheckStudentIPv6InternetRoute(context.Context, []string) error {
+	return nil
+}
+
+func (f *fakeNetworkOPN) ActivateUnboundDNSBL(context.Context, []opnsense.DNSBLPolicy) error {
+	return nil
+}
+
+func (f *fakeNetworkOPN) InspectUnboundDNSBLRuntime(context.Context, []opnsense.DNSBLPolicy) error {
+	return nil
+}
 
 // opnsenseFilterGetReadback models the canonical FirewallRuleInfo that
 // opnsense.GetFirewallRules produces for a rule created via addRule, after
@@ -260,10 +295,12 @@ func (f *fakeNetworkSSH) AssignInterface(_ context.Context, vlanTag int, _ strin
 }
 
 type fakeNetworkDB struct {
-	rows       []database.AllocatedVLAN
-	listErr    error
-	releaseErr map[uuid.UUID]error
-	released   []uuid.UUID
+	rows         []database.AllocatedVLAN
+	listErr      error
+	releaseErr   map[uuid.UUID]error
+	released     []uuid.UUID
+	transaction  *database.ContentFilterTransaction
+	reservations []string
 }
 
 func (f *fakeNetworkDB) ListAllocatedVLANs(_ context.Context) ([]database.AllocatedVLAN, error) {
@@ -278,6 +315,45 @@ func (f *fakeNetworkDB) ReleaseVLAN(_ context.Context, podID uuid.UUID) error {
 		return err
 	}
 	f.released = append(f.released, podID)
+	return nil
+}
+
+func (f *fakeNetworkDB) WithContentFilterMutationLock(ctx context.Context, mutate func(context.Context) error) error {
+	return mutate(ctx)
+}
+
+func (f *fakeNetworkDB) GetContentFilterTransaction(context.Context) (*database.ContentFilterTransaction, error) {
+	return f.transaction, nil
+}
+
+func (f *fakeNetworkDB) CreateContentFilterTransaction(
+	_ context.Context,
+	operationID uuid.UUID,
+	sourceNetwork string,
+	snapshot json.RawMessage,
+) error {
+	f.transaction = &database.ContentFilterTransaction{
+		OperationID:   operationID,
+		SourceNetwork: sourceNetwork,
+		Snapshot:      append(json.RawMessage(nil), snapshot...),
+	}
+	return nil
+}
+
+func (f *fakeNetworkDB) CompleteContentFilterTransaction(_ context.Context, operationID uuid.UUID) error {
+	if f.transaction != nil && f.transaction.OperationID != operationID {
+		return errors.New("transaction identity changed")
+	}
+	f.transaction = nil
+	return nil
+}
+
+func (f *fakeNetworkDB) ListContentFilterCanaryReservations(context.Context) ([]string, error) {
+	return append([]string(nil), f.reservations...), nil
+}
+
+func (f *fakeNetworkDB) ReplaceContentFilterCanaryReservations(_ context.Context, sources []string) error {
+	f.reservations = append([]string(nil), sources...)
 	return nil
 }
 
@@ -440,7 +516,7 @@ func TestReconcileNetwork_FirewallApplyErrorReportsMetrics(t *testing.T) {
 	}
 }
 
-func TestReconcileNetwork_ContentFilterWaitsForGeneratedCleanup(t *testing.T) {
+func TestReconcileNetwork_ContentFilterConvergesBeforeGeneratedCleanup(t *testing.T) {
 	row := allocatedVLANRow(104, uuid.New(), "active")
 	first := podPassRuleReadback("opt7", row.Subnet)
 	first.UUID = "legacy-1"
@@ -453,6 +529,7 @@ func TestReconcileNetwork_ContentFilterWaitsForGeneratedCleanup(t *testing.T) {
 			selectedDHCPInterfaces: []string{"opt7"},
 			firewallRules:          []opnsense.FirewallRuleInfo{first, second},
 		},
+		sourceScopedSupported: true,
 	}
 	ssh := &fakeNetworkSSH{findByVLAN: map[int]string{104: "opt7"}}
 	db := &fakeNetworkDB{rows: []database.AllocatedVLAN{row}}
@@ -464,15 +541,49 @@ func TestReconcileNetwork_ContentFilterWaitsForGeneratedCleanup(t *testing.T) {
 		t.Fatalf("reconcileNetwork: %v", err)
 	}
 	if counts.FirewallRulesDuplicate != 1 || counts.FirewallRulesRemoved != 1 ||
-		counts.ContentFilterExpected != 1 || counts.ContentFilterHealthy != 0 {
-		t.Fatalf("content filter did not wait for cleanup convergence: %+v", counts)
+		counts.ContentFilterExpected != 1 || counts.ContentFilterControllerReady != 1 ||
+		counts.ContentFilterEffectiveReady != 0 {
+		t.Fatalf("content filter did not precede generated cleanup: %+v", counts)
 	}
-	if len(opn.createDNSBLCalls) != 0 || opn.verifyRuntimeCalls != 0 {
-		t.Fatalf("partial content policy mutated before generated cleanup converged: dns=%v verify=%d",
+	if len(opn.createDNSBLCalls) != 1 || opn.verifyRuntimeCalls != 0 {
+		t.Fatalf("controller/effective separation failed: dns=%v verify=%d",
 			opn.createDNSBLCalls, opn.verifyRuntimeCalls)
 	}
-	if opn.applyFirewallCalls != 0 {
-		t.Fatalf("partial content policy was activated by an unrelated firewall apply: %d", opn.applyFirewallCalls)
+	if opn.applyFirewallCalls != 2 {
+		t.Fatalf("content policy and subsequent generated cleanup were not applied in order: %d", opn.applyFirewallCalls)
+	}
+}
+
+func TestReconcileNetwork_GlobalSafeSearchFlipBlocksGeneratedFirewallApply(t *testing.T) {
+	row := allocatedVLANRow(104, uuid.New(), "active")
+	first := podPassRuleReadback("opt7", row.Subnet)
+	first.UUID = "legacy-1"
+	second := first
+	second.UUID = "legacy-2"
+	opn := &fakeContentFilterOPN{
+		fakeNetworkOPN: &fakeNetworkOPN{
+			vlans:                  map[int]*opnsense.VLAN{104: {Tag: "104"}},
+			dhcpSubnets:            map[string]*opnsense.DHCPSubnet{row.Subnet: {Subnet: row.Subnet}},
+			selectedDHCPInterfaces: []string{"opt7"},
+			firewallRules:          []opnsense.FirewallRuleInfo{first, second},
+		},
+		sourceScopedSupported:  true,
+		globalSafeSearchAtCall: 6,
+	}
+	ssh := &fakeNetworkSSH{findByVLAN: map[int]string{104: "opt7"}}
+	db := &fakeNetworkDB{rows: []database.AllocatedVLAN{row}}
+
+	counts, err := reconcileNetwork(context.Background(), opn, ssh, db, discardLogger(), NetworkReconcilerConfig{
+		ContentFilter: validContentFilterConfig(),
+	}, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts.ContentFilterControllerReady != 0 || counts.FirewallApplied != 1 || counts.Errors != 1 {
+		t.Fatalf("late global SafeSearch flip did not block generated apply: %+v", counts)
+	}
+	if opn.applyFirewallCalls != 1 {
+		t.Fatalf("generated firewall apply ran after global SafeSearch flip: calls=%d", opn.applyFirewallCalls)
 	}
 }
 
@@ -486,7 +597,6 @@ func TestReconcileNetwork_ContentFilterInspectionFailureBlocksUnrelatedApply(t *
 			selectedDHCPInterfaces: []string{"opt7"},
 			firewallRules:          []opnsense.FirewallRuleInfo{pass},
 		},
-		sourceScopedSupported: true,
 	}
 	ssh := &fakeNetworkSSH{findByVLAN: map[int]string{104: "opt7"}}
 	db := &fakeNetworkDB{rows: []database.AllocatedVLAN{row}}
@@ -497,13 +607,85 @@ func TestReconcileNetwork_ContentFilterInspectionFailureBlocksUnrelatedApply(t *
 	if err != nil {
 		t.Fatalf("reconcileNetwork: %v", err)
 	}
-	if counts.ContentFilterHealthy != 0 || counts.Errors != 1 {
+	if counts.ContentFilterControllerReady != 0 || counts.Errors != 1 {
 		t.Fatalf("failed inspection reported a healthy policy: %+v", counts)
 	}
 	if opn.applyFirewallCalls != 0 {
 		t.Fatalf("failed inspection activated staged firewall model: applies=%d", opn.applyFirewallCalls)
 	}
 	assertNoContentFilterMutation(t, opn)
+}
+
+func TestReconcileNetwork_DisabledSafeSearchReadFailureDoesNotBlockPodFirewallRepair(t *testing.T) {
+	row := allocatedVLANRow(104, uuid.New(), "active")
+	first := podPassRuleReadback("opt7", row.Subnet)
+	first.UUID = "duplicate-1"
+	second := first
+	second.UUID = "duplicate-2"
+	opn := &fakeContentFilterOPN{
+		fakeNetworkOPN: &fakeNetworkOPN{
+			vlans:                  map[int]*opnsense.VLAN{104: {Tag: "104"}},
+			dhcpSubnets:            map[string]*opnsense.DHCPSubnet{row.Subnet: {Subnet: row.Subnet}},
+			selectedDHCPInterfaces: []string{"opt7"},
+			firewallRules:          []opnsense.FirewallRuleInfo{first, second},
+		},
+		failOnce: map[string]error{"read-safe": errors.New("SSH unavailable")},
+	}
+	ssh := &fakeNetworkSSH{findByVLAN: map[int]string{104: "opt7"}}
+	db := &fakeNetworkDB{rows: []database.AllocatedVLAN{row}}
+
+	counts, err := reconcileNetwork(
+		context.Background(),
+		opn,
+		ssh,
+		db,
+		discardLogger(),
+		NetworkReconcilerConfig{},
+		time.Now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts.ContentFilterControllerReady != 0 || counts.Errors != 1 {
+		t.Fatalf("disabled inspection failure was reported dishonestly: %+v", counts)
+	}
+	if counts.FirewallRulesRemoved != 1 || counts.FirewallApplied != 1 || opn.applyFirewallCalls != 1 {
+		t.Fatalf("disabled SSH failure blocked unrelated pod-firewall repair: counts=%+v applies=%d",
+			counts, opn.applyFirewallCalls)
+	}
+}
+
+func TestReconcileNetwork_ContentFilterCanaryRejectsEveryRetainedAllocation(t *testing.T) {
+	for _, status := range []string{models.PodStatusDestroying, models.PodStatusDestroyFailed} {
+		t.Run(status, func(t *testing.T) {
+			row := allocatedVLANRow(122, uuid.New(), status)
+			opn := &fakeContentFilterOPN{
+				fakeNetworkOPN:        &fakeNetworkOPN{},
+				sourceScopedSupported: true,
+			}
+			db := &fakeNetworkDB{rows: []database.AllocatedVLAN{row}}
+			cfg := validContentFilterConfig()
+			cfg.Canary = true
+			cfg.SourceNetwork = row.Subnet
+
+			counts, err := reconcileNetwork(
+				context.Background(),
+				opn,
+				&fakeNetworkSSH{},
+				db,
+				discardLogger(),
+				NetworkReconcilerConfig{ContentFilter: cfg},
+				time.Now,
+			)
+			if err != nil {
+				t.Fatalf("reconcileNetwork: %v", err)
+			}
+			if counts.ContentFilterControllerReady != 0 || counts.Errors != 1 {
+				t.Fatalf("retained canary allocation was accepted: %+v", counts)
+			}
+			assertNoContentFilterMutation(t, opn)
+		})
+	}
 }
 
 func TestReconcileNetwork_FirewallApplyFailureKeepsContentFilterUnhealthy(t *testing.T) {
@@ -535,7 +717,7 @@ func TestReconcileNetwork_FirewallApplyFailureKeepsContentFilterUnhealthy(t *tes
 	if err != nil {
 		t.Fatalf("reconcileNetwork: %v", err)
 	}
-	if counts.ContentFilterExpected != 1 || counts.ContentFilterHealthy != 0 ||
+	if counts.ContentFilterExpected != 1 || counts.ContentFilterControllerReady != 0 ||
 		counts.ContentFilterSuccessAt != 0 || counts.Errors != 1 {
 		t.Fatalf("failed apply reported a false-green policy: %+v", counts)
 	}
@@ -1209,26 +1391,27 @@ func TestNetworkReconcilePusher_Push_SerializesExpectedMetrics(t *testing.T) {
 		HTTP:           srv.Client(),
 	}
 	err := p.Push(context.Background(), NetworkReconcileCounts{
-		AllocatedVLANs:         4,
-		ActivePodVLANs:         3,
-		InterfacesRepaired:     1,
-		SubnetsRepaired:        2,
-		KeaBindingsRepaired:    3,
-		FirewallRulesTotal:     16,
-		FirewallRulesGenerated: 6,
-		FirewallRulesDuplicate: 1,
-		FirewallRulesStale:     2,
-		FirewallRulesRemoved:   3,
-		FirewallCleanupLimited: 1,
-		ContentFilterExpected:  1,
-		ContentFilterHealthy:   0,
-		ContentFilterMissing:   2,
-		ContentFilterDrifted:   1,
-		ContentFilterRemoved:   3,
-		ContentFilterSuccessAt: 1234567890,
-		VLANsReleased:          1,
-		Errors:                 2,
-		KeaRestarted:           1,
+		AllocatedVLANs:               4,
+		ActivePodVLANs:               3,
+		InterfacesRepaired:           1,
+		SubnetsRepaired:              2,
+		KeaBindingsRepaired:          3,
+		FirewallRulesTotal:           16,
+		FirewallRulesGenerated:       6,
+		FirewallRulesDuplicate:       1,
+		FirewallRulesStale:           2,
+		FirewallRulesRemoved:         3,
+		FirewallCleanupLimited:       1,
+		ContentFilterExpected:        1,
+		ContentFilterControllerReady: 0,
+		ContentFilterEffectiveReady:  0,
+		ContentFilterMissing:         2,
+		ContentFilterDrifted:         1,
+		ContentFilterRemoved:         3,
+		ContentFilterSuccessAt:       1234567890,
+		VLANsReleased:                1,
+		Errors:                       2,
+		KeaRestarted:                 1,
 	})
 	if err != nil {
 		t.Fatalf("Push: %v", err)
@@ -1254,7 +1437,8 @@ func TestNetworkReconcilePusher_Push_SerializesExpectedMetrics(t *testing.T) {
 		`crucible_opnsense_firewall_rules{kind="removed"} 3`,
 		`crucible_opnsense_firewall_cleanup_limited 1`,
 		`crucible_content_filter_policy{kind="expected"} 1`,
-		`crucible_content_filter_policy{kind="healthy"} 0`,
+		`crucible_content_filter_policy{kind="controller_ready"} 0`,
+		`crucible_content_filter_policy{kind="effective_ready"} 0`,
 		`crucible_content_filter_policy{kind="missing"} 2`,
 		`crucible_content_filter_policy{kind="drifted"} 1`,
 		`crucible_content_filter_policy{kind="removed"} 3`,

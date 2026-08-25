@@ -106,14 +106,15 @@ func serializeNetworkReconcileCounts(c NetworkReconcileCounts) []byte {
 	b.WriteString("# TYPE crucible_opnsense_firewall_cleanup_limited gauge\n")
 	fmt.Fprintf(&b, "crucible_opnsense_firewall_cleanup_limited %d\n", c.FirewallCleanupLimited)
 
-	b.WriteString("# HELP crucible_content_filter_policy Content-filter expectation, health, and repaired drift at the latest reconcile.\n")
+	b.WriteString("# HELP crucible_content_filter_policy Content-filter intent, controller convergence, effective readiness, and repaired drift at the latest reconcile.\n")
 	b.WriteString("# TYPE crucible_content_filter_policy gauge\n")
 	for _, row := range []struct {
 		kind  string
 		value int
 	}{
 		{"expected", c.ContentFilterExpected},
-		{"healthy", c.ContentFilterHealthy},
+		{"controller_ready", c.ContentFilterControllerReady},
+		{"effective_ready", c.ContentFilterEffectiveReady},
 		{"missing", c.ContentFilterMissing},
 		{"drifted", c.ContentFilterDrifted},
 		{"removed", c.ContentFilterRemoved},

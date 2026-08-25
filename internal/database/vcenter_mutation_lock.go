@@ -14,7 +14,7 @@ import (
 // it would allow old and new workers to mutate standard switches concurrently.
 const vCenterPortGroupAdvisoryLockKey int64 = 0x4352554349424c45
 
-const vCenterPortGroupUnlockTimeout = 10 * time.Second
+const sessionAdvisoryUnlockTimeout = 10 * time.Second
 
 // WithVCenterPortGroupMutationLock serializes standard-vSwitch mutations across
 // worker processes. It deliberately uses a session advisory lock without a
@@ -80,7 +80,7 @@ func (q *Queries) withSessionAdvisoryLock(
 	}
 
 	defer func() {
-		unlockCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), vCenterPortGroupUnlockTimeout)
+		unlockCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionAdvisoryUnlockTimeout)
 		defer cancel()
 		var unlocked bool
 		unlockErr := conn.QueryRow(

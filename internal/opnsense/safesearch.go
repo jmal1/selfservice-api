@@ -69,23 +69,133 @@ type sourceScopedSafeSearchSnapshot struct {
 }
 
 type sourceScopedSafeSearchBackup struct {
-	previous  sourceScopedSafeSearchSnapshot
-	committed bool
-	desired   []byte
+	previous      sourceScopedSafeSearchSnapshot
+	committed     bool
+	desired       []byte
+	desiredExists bool
 }
 
 type sourceScopedSafeSearchManager struct {
 	remote sourceScopedSafeSearchRemote
 }
 
+// SourceScopedSafeSearchState is an exact snapshot of Crucible's owned
+// persistent and staged Unbound fragment.
+type SourceScopedSafeSearchState struct {
+	Content []byte
+	Exists  bool
+}
+
+// SourceScopedSafeSearchReadOnlyState reports owned fragments and an
+// interrupted transaction without recovering or changing either one.
+type SourceScopedSafeSearchReadOnlyState struct {
+	State           SourceScopedSafeSearchState
+	RecoveryPending bool
+}
+
 // ConfigureSourceScopedSafeSearch installs the dedicated student-only Unbound
-// view transactionally. It is intentionally not called by content-filter
-// reconciliation yet.
+// view transactionally.
 func (s *SSHClient) ConfigureSourceScopedSafeSearch(ctx context.Context, sourceNetwork string) error {
 	fragment, canonicalSource, err := renderSourceScopedSafeSearch(sourceNetwork)
 	if err != nil {
 		return err
 	}
+	return s.withSourceScopedSafeSearchManager(ctx, func(manager sourceScopedSafeSearchManager) error {
+		return manager.configure(ctx, canonicalSource, fragment)
+	})
+}
+
+// SnapshotSourceScopedSafeSearch returns the exact owned fragment after
+// recovering any interrupted transaction. Persistent and staged copies must
+// agree before a snapshot is accepted.
+func (s *SSHClient) SnapshotSourceScopedSafeSearch(ctx context.Context) (SourceScopedSafeSearchState, error) {
+	var result SourceScopedSafeSearchState
+	err := s.withSourceScopedSafeSearchManager(ctx, func(manager sourceScopedSafeSearchManager) error {
+		if err := manager.recoverInterruptedTransaction(ctx); err != nil {
+			return fmt.Errorf("recover interrupted SafeSearch transaction: %w", err)
+		}
+
+		persistent, err := manager.readOwnedSnapshot(ctx, sourceScopedSafeSearchPath)
+		if err != nil {
+			return fmt.Errorf("read persistent SafeSearch fragment: %w", err)
+		}
+		staged, err := manager.readOwnedSnapshot(ctx, sourceScopedSafeSearchStagedPath)
+		if err != nil {
+			return fmt.Errorf("read staged SafeSearch fragment: %w", err)
+		}
+		if persistent.exists != staged.exists || !bytes.Equal(persistent.content, staged.content) {
+			return fmt.Errorf("persistent and staged SafeSearch fragments differ; refusing ambiguous snapshot")
+		}
+		result = SourceScopedSafeSearchState{
+			Content: bytes.Clone(persistent.content),
+			Exists:  persistent.exists,
+		}
+		return nil
+	})
+	return result, err
+}
+
+// ReadSourceScopedSafeSearchState inspects the exact persistent, staged, and
+// durable-backup artifacts without acquiring a mutating lock or recovering.
+func (s *SSHClient) ReadSourceScopedSafeSearchState(ctx context.Context) (SourceScopedSafeSearchReadOnlyState, error) {
+	client, err := s.dial()
+	if err != nil {
+		return SourceScopedSafeSearchReadOnlyState{}, fmt.Errorf("SSH connect: %w", err)
+	}
+	defer client.Close()
+	manager := sourceScopedSafeSearchManager{
+		remote: &sshSourceScopedSafeSearchRemote{client: client},
+	}
+	return manager.readOnlyState(ctx)
+}
+
+// RestoreSourceScopedSafeSearch transactionally restores a prior exact
+// Crucible-owned snapshot. An absent snapshot removes only Crucible's fixed
+// owned paths.
+func (s *SSHClient) RestoreSourceScopedSafeSearch(ctx context.Context, state SourceScopedSafeSearchState) error {
+	desired := sourceScopedSafeSearchSnapshot{
+		content: bytes.Clone(state.Content),
+		exists:  state.Exists,
+	}
+	source := ""
+	if desired.exists {
+		if !bytes.HasPrefix(desired.content, []byte(sourceScopedSafeSearchMarker+"\n")) {
+			return fmt.Errorf("restore source-scoped SafeSearch: snapshot is not Crucible-owned")
+		}
+		var err error
+		source, err = sourceNetworkFromSafeSearchFragment(desired.content)
+		if err != nil {
+			return fmt.Errorf("restore source-scoped SafeSearch: %w", err)
+		}
+	} else if len(desired.content) != 0 {
+		return fmt.Errorf("restore source-scoped SafeSearch: absent snapshot contains content")
+	}
+	return s.withSourceScopedSafeSearchManager(ctx, func(manager sourceScopedSafeSearchManager) error {
+		return manager.setState(ctx, source, desired)
+	})
+}
+
+// InspectSourceScopedSafeSearch verifies exact persistent and staged desired
+// content without mutating Unbound.
+func (s *SSHClient) InspectSourceScopedSafeSearch(ctx context.Context, sourceNetwork string) error {
+	desired, _, err := renderSourceScopedSafeSearch(sourceNetwork)
+	if err != nil {
+		return err
+	}
+	state, err := s.SnapshotSourceScopedSafeSearch(ctx)
+	if err != nil {
+		return err
+	}
+	if !state.Exists || !bytes.Equal(state.Content, desired) {
+		return fmt.Errorf("source-scoped SafeSearch fragment is not exact desired state")
+	}
+	return nil
+}
+
+func (s *SSHClient) withSourceScopedSafeSearchManager(
+	ctx context.Context,
+	fn func(sourceScopedSafeSearchManager) error,
+) error {
 	client, err := s.dial()
 	if err != nil {
 		return fmt.Errorf("SSH connect: %w", err)
@@ -99,15 +209,15 @@ func (s *SSHClient) ConfigureSourceScopedSafeSearch(ctx context.Context, sourceN
 	manager := sourceScopedSafeSearchManager{
 		remote: &sshSourceScopedSafeSearchRemote{client: client},
 	}
-	configureErr := manager.configure(ctx, canonicalSource, fragment)
+	operationErr := fn(manager)
 	if releaseErr := release(); releaseErr != nil {
-		return errors.Join(configureErr, fmt.Errorf("release source-scoped SafeSearch lock: %w", releaseErr))
+		return errors.Join(operationErr, fmt.Errorf("release source-scoped SafeSearch lock: %w", releaseErr))
 	}
-	return configureErr
+	return operationErr
 }
 
 // ConfigureSourceScopedSafeSearch exposes the owner through the combined
-// OPNsense client without wiring it into the read-only reconciler.
+// OPNsense client.
 func (c *Client) ConfigureSourceScopedSafeSearch(ctx context.Context, sourceNetwork string) error {
 	sshClient, err := NewSSHClient(c.config, c.logger)
 	if err != nil {
@@ -116,7 +226,50 @@ func (c *Client) ConfigureSourceScopedSafeSearch(ctx context.Context, sourceNetw
 	return sshClient.ConfigureSourceScopedSafeSearch(ctx, sourceNetwork)
 }
 
+func (c *Client) SnapshotSourceScopedSafeSearch(ctx context.Context) (SourceScopedSafeSearchState, error) {
+	sshClient, err := NewSSHClient(c.config, c.logger)
+	if err != nil {
+		return SourceScopedSafeSearchState{}, fmt.Errorf("snapshot source-scoped SafeSearch: %w", err)
+	}
+	return sshClient.SnapshotSourceScopedSafeSearch(ctx)
+}
+
+func (c *Client) ReadSourceScopedSafeSearchState(ctx context.Context) (SourceScopedSafeSearchReadOnlyState, error) {
+	sshClient, err := NewSSHClient(c.config, c.logger)
+	if err != nil {
+		return SourceScopedSafeSearchReadOnlyState{}, fmt.Errorf("read source-scoped SafeSearch state: %w", err)
+	}
+	return sshClient.ReadSourceScopedSafeSearchState(ctx)
+}
+
+func (c *Client) RestoreSourceScopedSafeSearch(ctx context.Context, state SourceScopedSafeSearchState) error {
+	sshClient, err := NewSSHClient(c.config, c.logger)
+	if err != nil {
+		return fmt.Errorf("restore source-scoped SafeSearch: %w", err)
+	}
+	return sshClient.RestoreSourceScopedSafeSearch(ctx, state)
+}
+
+func (c *Client) InspectSourceScopedSafeSearch(ctx context.Context, sourceNetwork string) error {
+	sshClient, err := NewSSHClient(c.config, c.logger)
+	if err != nil {
+		return fmt.Errorf("inspect source-scoped SafeSearch: %w", err)
+	}
+	return sshClient.InspectSourceScopedSafeSearch(ctx, sourceNetwork)
+}
+
 func (m sourceScopedSafeSearchManager) configure(ctx context.Context, sourceNetwork string, fragment []byte) error {
+	return m.setState(ctx, sourceNetwork, sourceScopedSafeSearchSnapshot{
+		content: bytes.Clone(fragment),
+		exists:  true,
+	})
+}
+
+func (m sourceScopedSafeSearchManager) setState(
+	ctx context.Context,
+	sourceNetwork string,
+	desired sourceScopedSafeSearchSnapshot,
+) error {
 	if err := m.recoverInterruptedTransaction(ctx); err != nil {
 		return fmt.Errorf("recover interrupted SafeSearch transaction: %w", err)
 	}
@@ -131,19 +284,38 @@ func (m sourceScopedSafeSearchManager) configure(ctx context.Context, sourceNetw
 	if previous.exists != previousStaged.exists || !bytes.Equal(previous.content, previousStaged.content) {
 		return fmt.Errorf("persistent and staged SafeSearch fragments differ; refusing ambiguous transaction")
 	}
-	if err := m.remote.CheckConflicts(ctx, sourceNetwork); err != nil {
-		return fmt.Errorf("check Unbound fragment conflicts: %w", err)
+	if desired.exists {
+		if !bytes.HasPrefix(desired.content, []byte(sourceScopedSafeSearchMarker+"\n")) {
+			return fmt.Errorf("desired SafeSearch fragment is not Crucible-owned")
+		}
+		if err := m.remote.CheckConflicts(ctx, sourceNetwork); err != nil {
+			return fmt.Errorf("check Unbound fragment conflicts: %w", err)
+		}
+	} else if len(desired.content) != 0 {
+		return fmt.Errorf("absent desired SafeSearch state contains content")
 	}
-	preparedBackup := encodeSafeSearchBackup(previous, false, fragment)
+	if previous.exists == desired.exists && bytes.Equal(previous.content, desired.content) {
+		return nil
+	}
+	preparedBackup := encodeSafeSearchBackup(previous, false, desired.content)
 	if err := m.remote.WriteFileAtomic(ctx, sourceScopedSafeSearchBackupPath, preparedBackup); err != nil {
 		return fmt.Errorf("persist SafeSearch rollback state: %w", err)
 	}
 
-	if err := m.remote.WriteFileAtomic(ctx, sourceScopedSafeSearchPath, fragment); err != nil {
-		return m.rollback(previous, fmt.Errorf("write owned SafeSearch fragment: %w", err))
-	}
-	if err := m.remote.CopyFileAtomic(ctx, sourceScopedSafeSearchPath, sourceScopedSafeSearchStagedPath); err != nil {
-		return m.rollback(previous, fmt.Errorf("stage owned SafeSearch fragment: %w", err))
+	if desired.exists {
+		if err := m.remote.WriteFileAtomic(ctx, sourceScopedSafeSearchPath, desired.content); err != nil {
+			return m.rollback(previous, fmt.Errorf("write owned SafeSearch fragment: %w", err))
+		}
+		if err := m.remote.CopyFileAtomic(ctx, sourceScopedSafeSearchPath, sourceScopedSafeSearchStagedPath); err != nil {
+			return m.rollback(previous, fmt.Errorf("stage owned SafeSearch fragment: %w", err))
+		}
+	} else {
+		if err := m.remote.RemoveFile(ctx, sourceScopedSafeSearchPath); err != nil {
+			return m.rollback(previous, fmt.Errorf("remove owned SafeSearch fragment: %w", err))
+		}
+		if err := m.remote.RemoveFile(ctx, sourceScopedSafeSearchStagedPath); err != nil {
+			return m.rollback(previous, fmt.Errorf("remove staged SafeSearch fragment: %w", err))
+		}
 	}
 	if err := m.remote.CheckUnbound(ctx); err != nil {
 		return m.rollback(previous, fmt.Errorf("validate staged Unbound configuration: %w", err))
@@ -156,12 +328,12 @@ func (m sourceScopedSafeSearchManager) configure(ctx context.Context, sourceNetw
 		if err != nil {
 			return m.rollback(previous, fmt.Errorf("verify activated fragment %s: %w", path, err))
 		}
-		if !exists || !bytes.Equal(content, fragment) {
+		if exists != desired.exists || !bytes.Equal(content, desired.content) {
 			return m.rollback(previous,
 				fmt.Errorf("verify activated fragment %s: exact content mismatch", path))
 		}
 	}
-	committedBackup := encodeSafeSearchBackup(previous, true, fragment)
+	committedBackup := encodeSafeSearchBackup(previous, true, desired.content)
 	if err := m.remote.WriteFileAtomic(ctx, sourceScopedSafeSearchBackupPath, committedBackup); err != nil {
 		content, exists, readErr := m.remote.ReadFile(ctx, sourceScopedSafeSearchBackupPath)
 		if readErr != nil {
@@ -283,7 +455,7 @@ func (m sourceScopedSafeSearchManager) recoverInterruptedTransaction(ctx context
 		if err != nil {
 			return fmt.Errorf("verify committed fragment %s: %w", path, err)
 		}
-		if !currentExists || !bytes.Equal(current, backup.desired) {
+		if currentExists != backup.desiredExists || !bytes.Equal(current, backup.desired) {
 			return fmt.Errorf("committed SafeSearch transaction conflicts with current fragment %s", path)
 		}
 	}
@@ -291,6 +463,36 @@ func (m sourceScopedSafeSearchManager) recoverInterruptedTransaction(ctx context
 		return fmt.Errorf("remove committed SafeSearch transaction backup: %w", err)
 	}
 	return nil
+}
+
+func (m sourceScopedSafeSearchManager) readOnlyState(ctx context.Context) (SourceScopedSafeSearchReadOnlyState, error) {
+	persistent, err := m.readOwnedSnapshot(ctx, sourceScopedSafeSearchPath)
+	if err != nil {
+		return SourceScopedSafeSearchReadOnlyState{}, fmt.Errorf("read persistent SafeSearch fragment: %w", err)
+	}
+	staged, err := m.readOwnedSnapshot(ctx, sourceScopedSafeSearchStagedPath)
+	if err != nil {
+		return SourceScopedSafeSearchReadOnlyState{}, fmt.Errorf("read staged SafeSearch fragment: %w", err)
+	}
+	if persistent.exists != staged.exists || !bytes.Equal(persistent.content, staged.content) {
+		return SourceScopedSafeSearchReadOnlyState{}, errors.New("persistent and staged SafeSearch fragments differ")
+	}
+	backupContent, backupExists, err := m.remote.ReadFile(ctx, sourceScopedSafeSearchBackupPath)
+	if err != nil {
+		return SourceScopedSafeSearchReadOnlyState{}, fmt.Errorf("read SafeSearch recovery state: %w", err)
+	}
+	if backupExists {
+		if _, err := decodeSafeSearchBackup(backupContent); err != nil {
+			return SourceScopedSafeSearchReadOnlyState{}, fmt.Errorf("invalid durable SafeSearch recovery state: %w", err)
+		}
+	}
+	return SourceScopedSafeSearchReadOnlyState{
+		State: SourceScopedSafeSearchState{
+			Content: bytes.Clone(persistent.content),
+			Exists:  persistent.exists,
+		},
+		RecoveryPending: backupExists,
+	}, nil
 }
 
 func (m sourceScopedSafeSearchManager) readOwnedSnapshot(ctx context.Context, path string) (sourceScopedSafeSearchSnapshot, error) {
@@ -360,7 +562,10 @@ func encodeSafeSearchBackup(snapshot sourceScopedSafeSearchSnapshot, committed b
 		state = "present"
 		payload = base64.StdEncoding.EncodeToString(snapshot.content)
 	}
-	desiredPayload := base64.StdEncoding.EncodeToString(desired)
+	desiredPayload := ""
+	if len(desired) > 0 {
+		desiredPayload = base64.StdEncoding.EncodeToString(desired)
+	}
 	return []byte(sourceScopedBackupMarker + "\n" + phase + "\n" + state + "\n" + payload + "\n" + desiredPayload + "\n")
 }
 
@@ -377,19 +582,28 @@ func decodeSafeSearchBackup(content []byte) (sourceScopedSafeSearchBackup, error
 	default:
 		return sourceScopedSafeSearchBackup{}, fmt.Errorf("unexpected backup phase %q", lines[1])
 	}
-	desired, err := base64.StdEncoding.DecodeString(lines[4])
-	if err != nil {
-		return sourceScopedSafeSearchBackup{}, fmt.Errorf("decode desired payload: %w", err)
-	}
-	if !bytes.HasPrefix(desired, []byte(sourceScopedSafeSearchMarker+"\n")) {
-		return sourceScopedSafeSearchBackup{}, fmt.Errorf("desired payload is not Crucible-owned")
+	var desired []byte
+	desiredExists := lines[4] != ""
+	if desiredExists {
+		var err error
+		desired, err = base64.StdEncoding.DecodeString(lines[4])
+		if err != nil {
+			return sourceScopedSafeSearchBackup{}, fmt.Errorf("decode desired payload: %w", err)
+		}
+		if !bytes.HasPrefix(desired, []byte(sourceScopedSafeSearchMarker+"\n")) {
+			return sourceScopedSafeSearchBackup{}, fmt.Errorf("desired payload is not Crucible-owned")
+		}
 	}
 	switch lines[2] {
 	case "absent":
 		if lines[3] != "" {
 			return sourceScopedSafeSearchBackup{}, fmt.Errorf("absent backup contains a payload")
 		}
-		return sourceScopedSafeSearchBackup{committed: committed, desired: desired}, nil
+		return sourceScopedSafeSearchBackup{
+			committed:     committed,
+			desired:       desired,
+			desiredExists: desiredExists,
+		}, nil
 	case "present":
 		decoded, err := base64.StdEncoding.DecodeString(lines[3])
 		if err != nil {
@@ -399,13 +613,25 @@ func decodeSafeSearchBackup(content []byte) (sourceScopedSafeSearchBackup, error
 			return sourceScopedSafeSearchBackup{}, fmt.Errorf("backup payload is not Crucible-owned")
 		}
 		return sourceScopedSafeSearchBackup{
-			previous:  sourceScopedSafeSearchSnapshot{content: decoded, exists: true},
-			committed: committed,
-			desired:   desired,
+			previous:      sourceScopedSafeSearchSnapshot{content: decoded, exists: true},
+			committed:     committed,
+			desired:       desired,
+			desiredExists: desiredExists,
 		}, nil
 	default:
 		return sourceScopedSafeSearchBackup{}, fmt.Errorf("unexpected backup state %q", lines[2])
 	}
+}
+
+func sourceNetworkFromSafeSearchFragment(content []byte) (string, error) {
+	for _, line := range strings.Split(string(content), "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) != 3 || fields[0] != "access-control-view:" || fields[2] != sourceScopedSafeSearchView {
+			continue
+		}
+		return validateStudentSourceNetwork(fields[1])
+	}
+	return "", fmt.Errorf("owned fragment does not contain the managed access-control-view")
 }
 
 func renderSourceScopedSafeSearch(sourceNetwork string) ([]byte, string, error) {

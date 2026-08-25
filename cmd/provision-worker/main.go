@@ -399,6 +399,7 @@ func main() {
 		}
 	}
 	contentFilterEnabled := strings.EqualFold(os.Getenv("WORKER_CONTENT_FILTER_ENABLED"), "true")
+	contentFilterCanary := strings.EqualFold(os.Getenv("WORKER_CONTENT_FILTER_CANARY"), "true")
 	contentFilterSourceNetwork := os.Getenv("WORKER_CONTENT_FILTER_SOURCE_NETWORK")
 	if contentFilterSourceNetwork == "" {
 		contentFilterSourceNetwork = "10.100.0.0/16"
@@ -421,6 +422,7 @@ func main() {
 		FirewallCleanupLimit: networkFirewallCleanupLimit,
 		ContentFilter: provisioner.ContentFilterConfig{
 			Enabled:             contentFilterEnabled,
+			Canary:              contentFilterCanary,
 			SourceNetwork:       contentFilterSourceNetwork,
 			CategoryFeedBaseURL: os.Getenv("WORKER_CONTENT_FILTER_CATEGORY_FEED_BASE_URL"),
 			Allowlist:           contentFilterAllowlist,

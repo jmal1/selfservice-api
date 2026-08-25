@@ -2,6 +2,8 @@ package provisioner
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -28,31 +30,33 @@ type NetworkReconcilerConfig struct {
 
 // NetworkReconcileCounts summarizes one network reconciliation pass.
 type NetworkReconcileCounts struct {
-	AllocatedVLANs         int
-	ActivePodVLANs         int
-	InterfacesRepaired     int
-	SubnetsRepaired        int
-	KeaBindingsRepaired    int
-	FirewallRulesRepaired  int
-	FirewallRulesTotal     int
-	FirewallRulesGenerated int
-	FirewallRulesDuplicate int
-	FirewallRulesStale     int
-	FirewallRulesRemoved   int
-	FirewallCleanupLimited int
-	ContentFilterExpected  int
-	ContentFilterHealthy   int
-	ContentFilterMissing   int
-	ContentFilterDrifted   int
-	ContentFilterRemoved   int
-	ContentFilterSuccessAt int64
-	VLANsReleased          int
-	Errors                 int
-	KeaRestarted           int
-	FirewallApplied        int
+	AllocatedVLANs               int
+	ActivePodVLANs               int
+	InterfacesRepaired           int
+	SubnetsRepaired              int
+	KeaBindingsRepaired          int
+	FirewallRulesRepaired        int
+	FirewallRulesTotal           int
+	FirewallRulesGenerated       int
+	FirewallRulesDuplicate       int
+	FirewallRulesStale           int
+	FirewallRulesRemoved         int
+	FirewallCleanupLimited       int
+	ContentFilterExpected        int
+	ContentFilterControllerReady int
+	ContentFilterEffectiveReady  int
+	ContentFilterMissing         int
+	ContentFilterDrifted         int
+	ContentFilterRemoved         int
+	ContentFilterSuccessAt       int64
+	VLANsReleased                int
+	Errors                       int
+	KeaRestarted                 int
+	FirewallApplied              int
 }
 
 type networkReconcileOPN interface {
+	BeginContentFilterTransaction(ctx context.Context) (context.Context, func(), error)
 	GetVLANByTag(ctx context.Context, tag int) (*opnsense.VLAN, error)
 	CreateVLAN(ctx context.Context, parentIf string, tag int, descr string) (string, error)
 	ReconfigureVLANs(ctx context.Context) error
@@ -63,12 +67,25 @@ type networkReconcileOPN interface {
 	RestartDHCP(ctx context.Context) error
 	GetFirewallRules(ctx context.Context) ([]opnsense.FirewallRuleInfo, error)
 	CreateFirewallRule(ctx context.Context, rule opnsense.FirewallRule) (string, error)
+	UpdateFirewallRule(ctx context.Context, uuid string, rule opnsense.FirewallRule) error
 	DeleteFirewallRule(ctx context.Context, uuid string) error
 	ApplyFirewall(ctx context.Context) error
+	GetUnboundSafeSearch(ctx context.Context) (bool, error)
 	SupportsSourceScopedSafeSearch(ctx context.Context) (bool, error)
+	SnapshotSourceScopedSafeSearch(ctx context.Context) (opnsense.SourceScopedSafeSearchState, error)
+	ReadSourceScopedSafeSearchState(ctx context.Context) (opnsense.SourceScopedSafeSearchReadOnlyState, error)
+	ConfigureSourceScopedSafeSearch(ctx context.Context, sourceNetwork string) error
+	RestoreSourceScopedSafeSearch(ctx context.Context, state opnsense.SourceScopedSafeSearchState) error
+	InspectSourceScopedSafeSearch(ctx context.Context, sourceNetwork string) error
+	CheckStudentIPv6InternetRoute(ctx context.Context, studentInterfaces []string) error
 	VerifySourceScopedContentFilter(ctx context.Context, sourceNetwork string) error
 	ListDNSBLPolicies(ctx context.Context) ([]opnsense.DNSBLPolicy, error)
 	GetDNSBLPolicy(ctx context.Context, uuid string) (opnsense.DNSBLPolicy, error)
+	CreateDNSBLPolicy(ctx context.Context, policy opnsense.DNSBLPolicy) (string, error)
+	UpdateDNSBLPolicy(ctx context.Context, uuid string, policy opnsense.DNSBLPolicy) error
+	DeleteDNSBLPolicy(ctx context.Context, uuid string) error
+	ActivateUnboundDNSBL(ctx context.Context, expected []opnsense.DNSBLPolicy) error
+	InspectUnboundDNSBLRuntime(ctx context.Context, expected []opnsense.DNSBLPolicy) error
 }
 
 type networkReconcileSSH interface {
@@ -79,6 +96,17 @@ type networkReconcileSSH interface {
 type networkReconcileDB interface {
 	ListAllocatedVLANs(ctx context.Context) ([]database.AllocatedVLAN, error)
 	ReleaseVLAN(ctx context.Context, podID uuid.UUID) error
+	WithContentFilterMutationLock(ctx context.Context, mutate func(context.Context) error) error
+	GetContentFilterTransaction(ctx context.Context) (*database.ContentFilterTransaction, error)
+	CreateContentFilterTransaction(
+		ctx context.Context,
+		operationID uuid.UUID,
+		sourceNetwork string,
+		snapshot json.RawMessage,
+	) error
+	CompleteContentFilterTransaction(ctx context.Context, operationID uuid.UUID) error
+	ListContentFilterCanaryReservations(ctx context.Context) ([]string, error)
+	ReplaceContentFilterCanaryReservations(ctx context.Context, sources []string) error
 }
 
 // ReconcileNetwork is the Provisioner-bound entry point.
@@ -87,6 +115,26 @@ func (p *Provisioner) ReconcileNetwork(ctx context.Context, cfg NetworkReconcile
 }
 
 func reconcileNetwork(
+	ctx context.Context,
+	opn networkReconcileOPN,
+	opnSSH networkReconcileSSH,
+	db networkReconcileDB,
+	logger *slog.Logger,
+	cfg NetworkReconcilerConfig,
+	now func() time.Time,
+) (counts NetworkReconcileCounts, retErr error) {
+	err := db.WithContentFilterMutationLock(ctx, func(lockCtx context.Context) error {
+		var err error
+		counts, err = reconcileNetworkLocked(lockCtx, opn, opnSSH, db, logger, cfg, now)
+		return err
+	})
+	if err != nil {
+		return counts, err
+	}
+	return counts, nil
+}
+
+func reconcileNetworkLocked(
 	ctx context.Context,
 	opn networkReconcileOPN,
 	opnSSH networkReconcileSSH,
@@ -112,8 +160,9 @@ func reconcileNetwork(
 	counts.AllocatedVLANs = len(allocations)
 	var needsKeaRestart bool
 	var needsFirewallApply bool
-	contentFilterSafeToApply := !cfg.ContentFilter.Enabled
+	contentFilterSafeToApply := false
 	var desiredFirewallRules []desiredPodFirewallRule
+	var retainedSubnets []string
 	firewallMappingComplete := true
 
 	// Fetch existing firewall rules once so we can verify each active pod has a
@@ -132,6 +181,7 @@ func reconcileNetwork(
 	for _, row := range allocations {
 		if isTerminalPodStatus(row.PodStatus) {
 			if err := db.ReleaseVLAN(ctx, row.PodID); err != nil {
+				retainedSubnets = append(retainedSubnets, row.Subnet)
 				counts.Errors++
 				log.Warn("network reconcile: failed to release terminal pod vlan allocation",
 					"pod_id", row.PodID, "pod_name", row.PodName, "pod_status", row.PodStatus,
@@ -141,6 +191,7 @@ func reconcileNetwork(
 			counts.VLANsReleased++
 			continue
 		}
+		retainedSubnets = append(retainedSubnets, row.Subnet)
 		if row.PodStatus == models.PodStatusDestroying || row.PodStatus == models.PodStatusDestroyFailed {
 			// Destruction retries still need the original VLAN/interface/subnet
 			// mapping to finish exact firewall cleanup safely. Do not race an
@@ -250,68 +301,94 @@ func reconcileNetwork(
 
 	}
 
-	var fwResult podFirewallReconcileResult
-	var fwReconcileErr error
-	if fwRulesAvailable {
-		fwResult, _, fwReconcileErr = reconcilePodFirewallRules(
-			ctx,
-			opn,
-			fwRules,
-			desiredFirewallRules,
-			firewallMappingComplete,
-			cfg.MaxFirewallRules,
-			cfg.FirewallCleanupLimit,
-		)
-		counts.FirewallRulesTotal = fwResult.TotalRules
-		counts.FirewallRulesGenerated = fwResult.GeneratedRules
-		counts.FirewallRulesDuplicate = fwResult.DuplicateRules
-		counts.FirewallRulesStale = fwResult.StaleRules
-		counts.FirewallRulesRepaired = fwResult.CreatedRules
-		counts.FirewallRulesRemoved = fwResult.RemovedRules
-		if fwResult.CleanupLimited {
-			counts.FirewallCleanupLimited = 1
-		}
-		if fwResult.Mutated {
-			needsFirewallApply = true
-		}
-		if fwReconcileErr != nil {
-			counts.Errors++
-			log.Warn("network reconcile: firewall ownership reconciliation failed", "error", fwReconcileErr)
-		}
-	}
-
 	if cfg.ContentFilter.Enabled {
 		counts.ContentFilterExpected = 1
-		switch {
-		case !fwRulesAvailable:
-			log.Warn("network reconcile: skipping content filter because firewall inventory is unavailable")
-		case fwReconcileErr != nil:
-			log.Warn("network reconcile: skipping content filter because generated-rule reconciliation failed")
-		case !firewallMappingComplete:
-			counts.Errors++
-			log.Warn("network reconcile: skipping content filter because active pod interface mapping is incomplete")
-		case fwResult.DuplicateRules > 0 || fwResult.StaleRules > 0 || fwResult.CleanupLimited:
-			counts.Errors++
-			log.Warn("network reconcile: content filter activation blocked until generated-rule cleanup converges",
-				"duplicates", fwResult.DuplicateRules,
-				"stale", fwResult.StaleRules,
-				"cleanup_limited", fwResult.CleanupLimited)
-		default:
-			policyResult, policyErr := reconcileContentFilter(ctx, opn, fwRules, cfg.ContentFilter)
-			counts.ContentFilterMissing = policyResult.MissingRules
-			counts.ContentFilterDrifted = policyResult.DriftedRules
-			counts.ContentFilterRemoved = policyResult.RemovedRules
-			if policyResult.Healthy {
-				counts.ContentFilterHealthy = 1
-				contentFilterSafeToApply = true
-			}
-			if policyErr != nil {
+	}
+	var policyResult contentFilterReconcileResult
+	var policyErr error
+	policyErrorAlreadyCounted := false
+	switch {
+	case !fwRulesAvailable:
+		policyErr = errors.New("firewall inventory is unavailable")
+		policyErrorAlreadyCounted = true
+	case cfg.ContentFilter.Enabled && !firewallMappingComplete:
+		policyErr = errors.New("active pod interface mapping is incomplete")
+	case cfg.ContentFilter.Enabled && InspectGeneratedPodFirewallRules(fwRules, 0) != nil:
+		policyErr = errors.New("ambiguous generated-rule inventory")
+	default:
+		activeInterfaces := make([]string, 0, len(desiredFirewallRules))
+		for _, desired := range desiredFirewallRules {
+			activeInterfaces = append(activeInterfaces, desired.Rule.Interface)
+		}
+		policyResult, policyErr = reconcileContentFilter(
+			ctx,
+			opn,
+			db,
+			retainedSubnets,
+			activeInterfaces,
+			cfg.ContentFilter,
+		)
+	}
+	counts.ContentFilterMissing = policyResult.MissingRules
+	counts.ContentFilterDrifted = policyResult.DriftedRules
+	counts.ContentFilterRemoved = policyResult.RemovedRules
+	if policyResult.ControllerReady {
+		counts.ContentFilterControllerReady = 1
+	}
+	contentFilterSafeToApply = policyResult.FirewallSafeToApply
+	if policyResult.EffectiveReady {
+		counts.ContentFilterEffectiveReady = 1
+	}
+	if policyResult.FirewallApplied {
+		counts.FirewallApplied = 1
+	}
+	if policyErr != nil && !policyErrorAlreadyCounted {
+		counts.Errors++
+	}
+	if policyErr != nil {
+		log.Warn("network reconcile: content-filter controller is not ready", "error", policyErr)
+	}
+
+	var fwResult podFirewallReconcileResult
+	var fwReconcileErr error
+	if fwRulesAvailable && contentFilterSafeToApply {
+		firewallInventory := fwRules
+		if cfg.ContentFilter.Enabled {
+			var refreshErr error
+			firewallInventory, refreshErr = opn.GetFirewallRules(ctx)
+			if refreshErr != nil {
 				counts.Errors++
-				log.Warn("network reconcile: content filter reconciliation failed", "error", policyErr)
+				fwReconcileErr = fmt.Errorf("refresh firewall inventory after content-filter reconciliation: %w", refreshErr)
+				log.Warn("network reconcile: skipping generated-rule reconciliation", "error", fwReconcileErr)
 			}
 		}
-	} else {
-		counts.ContentFilterHealthy = 1
+		if fwReconcileErr == nil {
+			fwResult, _, fwReconcileErr = reconcilePodFirewallRules(
+				ctx,
+				opn,
+				firewallInventory,
+				desiredFirewallRules,
+				firewallMappingComplete,
+				cfg.MaxFirewallRules,
+				cfg.FirewallCleanupLimit,
+			)
+			counts.FirewallRulesTotal = fwResult.TotalRules
+			counts.FirewallRulesGenerated = fwResult.GeneratedRules
+			counts.FirewallRulesDuplicate = fwResult.DuplicateRules
+			counts.FirewallRulesStale = fwResult.StaleRules
+			counts.FirewallRulesRepaired = fwResult.CreatedRules
+			counts.FirewallRulesRemoved = fwResult.RemovedRules
+			if fwResult.CleanupLimited {
+				counts.FirewallCleanupLimited = 1
+			}
+			if fwResult.Mutated {
+				needsFirewallApply = true
+			}
+			if fwReconcileErr != nil {
+				counts.Errors++
+				log.Warn("network reconcile: firewall ownership reconciliation failed", "error", fwReconcileErr)
+			}
+		}
 	}
 
 	if needsKeaRestart {
@@ -326,18 +403,27 @@ func reconcileNetwork(
 	if needsFirewallApply {
 		if !contentFilterSafeToApply {
 			log.Warn("network reconcile: refusing firewall apply while content-filter inspection is unhealthy")
+		} else if cfg.ContentFilter.Enabled {
+			if err := requireGlobalSafeSearchDisabled(ctx, opn); err != nil {
+				counts.Errors++
+				counts.ContentFilterControllerReady = 0
+				log.Warn("network reconcile: refusing firewall apply while global SafeSearch is not explicitly disabled", "error", err)
+			} else if err := opn.ApplyFirewall(ctx); err != nil {
+				counts.Errors++
+				counts.ContentFilterControllerReady = 0
+				log.Warn("network reconcile: failed to apply firewall", "error", err)
+			} else {
+				counts.FirewallApplied = 1
+			}
 		} else if err := opn.ApplyFirewall(ctx); err != nil {
 			counts.Errors++
-			if counts.ContentFilterExpected == 1 {
-				counts.ContentFilterHealthy = 0
-			}
 			log.Warn("network reconcile: failed to apply firewall", "error", err)
 		} else {
 			counts.FirewallApplied = 1
-			if counts.ContentFilterExpected == 1 && counts.ContentFilterHealthy == 1 {
-				counts.ContentFilterSuccessAt = now().Unix()
-			}
 		}
+	}
+	if counts.ContentFilterExpected == 1 && counts.ContentFilterControllerReady == 1 {
+		counts.ContentFilterSuccessAt = now().Unix()
 	}
 
 	log.Info("network reconcile complete",
@@ -354,7 +440,8 @@ func reconcileNetwork(
 		"firewall_rules_removed", counts.FirewallRulesRemoved,
 		"firewall_cleanup_limited", counts.FirewallCleanupLimited,
 		"content_filter_expected", counts.ContentFilterExpected,
-		"content_filter_healthy", counts.ContentFilterHealthy,
+		"content_filter_controller_ready", counts.ContentFilterControllerReady,
+		"content_filter_effective_ready", counts.ContentFilterEffectiveReady,
 		"content_filter_missing", counts.ContentFilterMissing,
 		"content_filter_drifted", counts.ContentFilterDrifted,
 		"content_filter_removed", counts.ContentFilterRemoved,

@@ -15,9 +15,11 @@ func TestRenderSourceScopedSafeSearchMatchesOPNsense26Mappings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if source != "10.100.0.0/16" {
 		t.Fatalf("source = %q", source)
 	}
+
 	text := string(fragment)
 	for _, required := range []string{
 		sourceScopedSafeSearchMarker,
@@ -43,6 +45,38 @@ func TestRenderSourceScopedSafeSearchMatchesOPNsense26Mappings(t *testing.T) {
 	}
 	if strings.Contains(text, "safesearch.conf") || strings.Count(text, "\nview:\n") != 1 {
 		t.Fatalf("fragment edits a global file or renders multiple views:\n%s", text)
+	}
+}
+
+func TestReadOnlySafeSearchStateReportsRecoveryWithoutMutation(t *testing.T) {
+	remote := newFakeSafeSearchRemote()
+	fragment, _, err := renderSourceScopedSafeSearch("10.100.0.0/16")
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote.files[sourceScopedSafeSearchPath] = bytes.Clone(fragment)
+	remote.files[sourceScopedSafeSearchStagedPath] = bytes.Clone(fragment)
+	remote.files[sourceScopedSafeSearchBackupPath] = encodeSafeSearchBackup(
+		sourceScopedSafeSearchSnapshot{},
+		false,
+		fragment,
+	)
+	manager := sourceScopedSafeSearchManager{remote: remote}
+
+	state, err := manager.readOnlyState(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.State.Exists || !bytes.Equal(state.State.Content, fragment) || !state.RecoveryPending {
+		t.Fatalf("read-only state = %+v", state)
+	}
+	for _, call := range remote.calls {
+		if call != "read" {
+			t.Fatalf("read-only inspection performed %q", call)
+		}
+	}
+	if _, exists := remote.files[sourceScopedSafeSearchBackupPath]; !exists {
+		t.Fatal("read-only inspection removed recovery state")
 	}
 }
 
@@ -136,6 +170,7 @@ func TestSourceScopedSafeSearchManagerSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if err := manager.configure(context.Background(), source, fragment); err != nil {
 		t.Fatal(err)
 	}
@@ -144,11 +179,77 @@ func TestSourceScopedSafeSearchManagerSuccess(t *testing.T) {
 			t.Errorf("%s did not contain exact rendered fragment", path)
 		}
 	}
+
 	if _, exists := remote.files[sourceScopedSafeSearchBackupPath]; exists {
 		t.Fatal("successful transaction retained rollback state")
 	}
 	if got := strings.Join(remote.calls, ","); got != "read,read,read,conflicts,write,write,copy,check,reconfigure,read,read,write,remove" {
 		t.Fatalf("transaction calls = %s", got)
+	}
+}
+
+func TestSourceScopedSafeSearchManagerSkipsExactNoOp(t *testing.T) {
+	fragment, source, err := renderSourceScopedSafeSearch("10.100.0.0/16")
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := newFakeSafeSearchRemote()
+	remote.files[sourceScopedSafeSearchPath] = bytes.Clone(fragment)
+	remote.files[sourceScopedSafeSearchStagedPath] = bytes.Clone(fragment)
+
+	if err := (sourceScopedSafeSearchManager{remote: remote}).configure(
+		context.Background(),
+		source,
+		fragment,
+	); err != nil {
+		t.Fatal(err)
+	}
+	for _, call := range remote.calls {
+		switch call {
+		case "write", "copy", "remove", "check", "reconfigure":
+			t.Fatalf("exact SafeSearch no-op performed %q: %v", call, remote.calls)
+		}
+	}
+}
+
+func TestSourceScopedSafeSearchManagerTransactionallyRemovesOwnedState(t *testing.T) {
+	previous := []byte(sourceScopedSafeSearchMarker + "\n" +
+		"server:\n    access-control-view: 10.100.0.0/16 " + sourceScopedSafeSearchView + "\n")
+	remote := newFakeSafeSearchRemote()
+	remote.files[sourceScopedSafeSearchPath] = bytes.Clone(previous)
+	remote.files[sourceScopedSafeSearchStagedPath] = bytes.Clone(previous)
+	manager := sourceScopedSafeSearchManager{remote: remote}
+
+	if err := manager.setState(context.Background(), "", sourceScopedSafeSearchSnapshot{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{sourceScopedSafeSearchPath, sourceScopedSafeSearchStagedPath, sourceScopedSafeSearchBackupPath} {
+		if _, exists := remote.files[path]; exists {
+			t.Fatalf("transactional removal retained %s", path)
+		}
+	}
+}
+
+func TestSourceScopedSafeSearchManagerRollsBackFailedRemoval(t *testing.T) {
+	previous := []byte(sourceScopedSafeSearchMarker + "\n" +
+		"server:\n    access-control-view: 10.100.0.0/16 " + sourceScopedSafeSearchView + "\n")
+	remote := newFakeSafeSearchRemote()
+	remote.files[sourceScopedSafeSearchPath] = bytes.Clone(previous)
+	remote.files[sourceScopedSafeSearchStagedPath] = bytes.Clone(previous)
+	remote.failCalls[8] = true
+
+	err := (sourceScopedSafeSearchManager{remote: remote}).setState(
+		context.Background(),
+		"",
+		sourceScopedSafeSearchSnapshot{},
+	)
+	if err == nil || !strings.Contains(err.Error(), "rollback completed") {
+		t.Fatalf("failed removal error = %v", err)
+	}
+	for _, path := range []string{sourceScopedSafeSearchPath, sourceScopedSafeSearchStagedPath} {
+		if !bytes.Equal(remote.files[path], previous) {
+			t.Fatalf("failed removal did not restore %s", path)
+		}
 	}
 }
 

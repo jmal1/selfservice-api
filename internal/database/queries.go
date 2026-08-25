@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -17,7 +18,8 @@ import (
 
 // Queries provides type-safe database operations.
 type Queries struct {
-	pool *pgxpool.Pool
+	pool                      *pgxpool.Pool
+	contentFilterMutationLock sync.Mutex
 }
 
 // NewQueries creates a new Queries instance.
@@ -636,6 +638,17 @@ func (q *Queries) CheckoutVLAN(ctx context.Context, tx pgx.Tx, podID uuid.UUID, 
 	var vlanTag int
 	var subnet string
 
+	// Concurrent checkouts share this short transaction lock. Reservation
+	// replacement takes the exclusive form, atomically proves the /24 inactive,
+	// and installs its exclusion before any checkout can continue.
+	if _, err := tx.Exec(
+		ctx,
+		"SELECT pg_advisory_xact_lock_shared($1)",
+		contentFilterCanaryReservationAdvisoryLockKey,
+	); err != nil {
+		return 0, "", fmt.Errorf("acquire content-filter allocation fence: %w", err)
+	}
+
 	query := `
 		UPDATE vlan_pool SET pod_id = $1, allocated_at = now()
 		WHERE id = (
@@ -650,6 +663,14 @@ func (q *Queries) CheckoutVLAN(ctx context.Context, tx pgx.Tx, podID uuid.UUID, 
 	} else if hostScope != "" {
 		query += fmt.Sprintf(` AND host_scope = '%s'`, hostScope)
 	}
+
+	query += `
+			AND NOT EXISTS (
+				SELECT 1
+				FROM content_filter_canary_reservations reservation
+				WHERE reservation.source_network = vlan_pool.subnet::cidr
+			)
+	`
 
 	query += `
 			ORDER BY RANDOM()

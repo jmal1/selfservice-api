@@ -51,6 +51,7 @@ const (
 	envCheckTimeout           = "SYNTHETIC_CHECK_TIMEOUT"   // optional duration, default 30s
 	envProvisioningExpected   = "SYNTHETIC_PROVISIONING_EXPECTED_ENABLED"
 	envContentFilterExpected  = "SYNTHETIC_CONTENT_FILTER_EXPECTED"
+	envContentFilterCanary    = "SYNTHETIC_CONTENT_FILTER_CANARY"
 	envContentFilterSource    = "SYNTHETIC_CONTENT_FILTER_SOURCE_NETWORK"
 	envContentFilterFeedBase  = "SYNTHETIC_CONTENT_FILTER_CATEGORY_FEED_BASE_URL"
 	envContentFilterAllowlist = "SYNTHETIC_CONTENT_FILTER_ALLOWLIST"
@@ -909,6 +910,7 @@ func provisionerContentFilterConfig(getenv func(string) string) provisioner.Cont
 	}
 	return provisioner.ContentFilterConfig{
 		Enabled:             strings.EqualFold(getenv(envContentFilterExpected), "true"),
+		Canary:              strings.EqualFold(getenv(envContentFilterCanary), "true"),
 		SourceNetwork:       source,
 		CategoryFeedBaseURL: getenv(envContentFilterFeedBase),
 		Allowlist:           splitCSV(getenv(envContentFilterAllowlist)),

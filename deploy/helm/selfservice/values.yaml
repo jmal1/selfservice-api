@@ -97,14 +97,16 @@ worker:
     # Delete at most this many exact blank/Crucible-owned generated rules per
     # pass, apply once, then report cleanup_limited until the next pass.
     firewallCleanupLimit: 100
-  # Student egress/DNS content policy. Activation is deliberately separate
-  # from the network reconciler and defaults off. Do not enable until the
+  # Student egress/DNS content policy. The exact-owned transactional controller
+  # defaults off. Do not enable until the
   # supervised firewall inventory check is clean and categoryFeedBaseURL is the
-  # validated internal publisher base. Activation also
-  # remains read-only until transactional custom-view ownership and effective
-  # student-source verification are implemented.
+  # validated internal publisher base and the real student-source effective
+  # verification lane is implemented.
   contentFilter:
     enabled: false
+    # Canary mode permits only one explicitly selected, currently inactive
+    # 10.100.x.0/24. Final mode permits only 10.100.0.0/16.
+    canary: false
     sourceNetwork: "10.100.0.0/16"
     # Validated feed: https://student-filter-feed.lab.jmal.io. Keep this empty
     # until the effective student-source runtime-verification blocker is closed.

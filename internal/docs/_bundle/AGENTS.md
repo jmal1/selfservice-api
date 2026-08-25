@@ -692,18 +692,74 @@ The capacity-tested built-in selection remains exactly `oisd2`, `hgz014`, and
 and `hgz022` does not exist. Missing/invalid feed configuration fails before
 any partial policy mutation.
 
-Activation is also intentionally read-only in the worker today: it validates
-configuration, inspects exact firewall/DNSBL state, and requires runtime
-verification, but does not create, update, delete, refresh, or apply policy. This
-prevents a failed multi-system activation from leaving a partial model that a
-later unrelated firewall apply could activate. While policy is enabled but
-inspection is unhealthy, the network reconciler also suppresses unrelated
-firewall applies.
+The worker now has a desired-state controller, but activation remains disabled
+in checked-in Helm values. Final mode accepts only `10.100.0.0/16`. Canary mode
+must be set explicitly and accepts only one canonical `10.100.x.0/24` that does
+not overlap any retained VLAN allocation, including `destroying` and
+`destroy_failed` pods; arbitrary networks fail before mutation. Final mode also
+requires every retained allocation to be a canonical `/24` within
+`10.100.0.0/16`. The selected canary is durably reserved from `vlan_pool` for
+the full lifetime of canary mode, not just one reconcile pass. Reservation
+replacement is journaled with the OPNsense snapshot, recovered after crashes,
+and serialized with VLAN checkout through a dedicated short-lived
+shared/exclusive PostgreSQL advisory lock. Reservation replacement atomically
+rechecks that each `/24` is unallocated before inserting it; concurrent VLAN
+checkouts share the lock and continue normally outside that short transaction.
+The controller owns only exact `crucible:content-filter:v1:*` firewall and DNSBL
+objects. It preserves every manual object and fails closed on an ambiguous
+owned-looking shape. Complete OPNsense firewall behavior fields are retained in
+the snapshot; unknown or non-default gateway, reply-to, schedule, state,
+TCP-flag, shaping, tag, limit, or priority behavior is ambiguous and blocks
+mutation rather than being lost during rollback.
+
+A stable cross-process PostgreSQL advisory lock serializes every Crucible
+firewall mutation and the complete controller transaction. Before the first
+OPNsense mutation, the controller persists an exact owned firewall, DNSBL, and
+Unbound fragment snapshot in `content_filter_transactions`. A later enabled
+pass recovers that journal before accepting current state; disabled mode is
+strictly read-only and reports controller-not-ready while a journal or any
+owned/global SafeSearch state, pending SafeSearch recovery backup, or canary
+reservation remains. Disabled inspection never invokes either recovery owner.
+If SSH inspection is unavailable, controller readiness remains false, but
+generated pod-firewall repair may proceed only after API inventory has proven
+that no exact-owned content-filter firewall rule remains.
+The transaction stages DNSBL and global
+quick firewall models, validates source/order/count/readback, configures the
+transactional SafeSearch owner, applies firewall state, and runs the supported
+OPNsense DNSBL action. Because that action masks shell failures, success also
+requires a freshly replaced, parseable `dnsbl.json` with the exact owned UUID,
+source scope, and at least one generated domain. Any failure restores and
+exactly reads back every owned surface with an independent rollback timeout;
+incomplete rollback retains both the durable journal and the conservative
+canary reservation. The reservation returns to its snapshot state only after
+every OPNsense surface is restored and verified. Recovery runs before validating
+new desired-state allocations. Generated per-pod broad passes are reconciled
+only after the content-filter controller converges, and pod create/destroy
+firewall paths refuse mutation while a recovery journal and any owned or
+ambiguous content-filter firewall model coexist. With disabled intent, they may
+continue only after a fresh API inventory proves exact-owned firewall state is
+absent; the journal remains visible and is recovered only by a later enabled
+controller pass.
+An exact no-op pass performs readback but does not restart Unbound, regenerate
+DNSBL feeds, or reapply the firewall; those activation paths run only for model
+or runtime drift.
+
+The controller also inspects live OPNsense route/interface diagnostics. Every
+`::/0` or `default` route counts even when its gateway is `link#N`, and every
+non-link-local IPv6 address on an active student `optN` interface is rejected
+until equivalent IPv6 controls exist. Management and staging interfaces are not
+included in that test. Local firewall DNS is explicitly passed before the
+external TCP/UDP 53 deny; bypass denies preserve destinations inside
+`10.100.0.0/16`; ordinary TCP 443 remains allowed.
 
 OPNsense 26.1's
 built-in Force SafeSearch setting is a general/global Unbound switch, while the
 approved scope must leave management and staging unchanged. Do not enable the
-global switch. A reversible live pilot proved source-scoped SafeSearch can use
+global switch. The controller requires the setting to be present, non-null, and
+explicitly false before recovery, staging, every firewall activation, DNSBL
+activation, and final commit; enabled, missing, null, unknown, or unreadable
+state fails closed before activation. A reversible live pilot proved
+source-scoped SafeSearch can use
 an `/usr/local/etc/unbound.opnsense.d/*.conf` fragment with
 `access-control-view`, `view-first: yes`, and SafeSearch `local-zone` /
 `local-data` rewrites. Crucible owns only
@@ -724,13 +780,15 @@ are durably marked committed, backup-cleanup failure preserves the active
 configuration for cleanup on the next invocation rather than rolling it back.
 Rollback and ambiguous commit failures are surfaced rather than hidden.
 
-This owner is not wired into `reconcileContentFilter`: activation remains
-read-only. `SupportsSourceScopedSafeSearch` is true only for a client with
-complete, valid SSH auth and host-key pinning; API-only clients report false.
-Effective verification remains unsupported until the read-only synthetic can
-use uncached controlled fixtures from a real student-source query path and an
-unchanged control source. DNSBL apply is asynchronous, and its action can return
-OK while masking shell errors; never trust API/model status alone.
+This owner is wired into `reconcileContentFilter`, but policy intent, controller
+convergence, and effective enforcement are deliberately separate. The
+`controller_ready` metric can become `1` after exact model/runtime readback;
+`effective_ready` remains `0`. Effective verification is still unsupported
+until the read-only synthetic can use uncached controlled fixtures from a real
+student-source query path and an unchanged control source. Do not interpret
+controller convergence as effective filtering. `SupportsSourceScopedSafeSearch`
+is true only for a client with complete, valid SSH auth and host-key pinning;
+API-only clients report false.
 
 ### Firewall generated-rule ownership
 
@@ -807,7 +865,7 @@ Then run `--verify-rollback-containment`. It requires the latest revision to be
 the immutable revision **160**, deployed, claims to remain false, exactly one
 worker, every live declared image and ImageID to equal the persisted pin, all
 rollouts and retained CronJob/Job
-evidence to be healthy, and PostgreSQL to be migration 35 clean. Baseline
+evidence to be healthy, and PostgreSQL to be migration 36 clean. Baseline
 preparation proves the migration did not change. Stored, live, and newly
 prepared baseline manifests must also keep content-filter activation disabled
 with an empty feed. The normal deploy repeats the proof before pulling and

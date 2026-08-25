@@ -51,6 +51,12 @@ func TestGetFirewallRules_ParsesFilterGetOptionMaps(t *testing.T) {
 	            "any": {"value": "any", "selected": 1},
 	            "TCP": {"value": "TCP", "selected": 0}
 	          },
+	          "statetype": {
+	            "keep": {"value": "keep state", "selected": 1},
+	            "none": {"value": "no state", "selected": 0}
+	          },
+	          "gateway": "",
+	          "sched": "",
 	          "source_net": "10.100.0.0/24",
 	          "source_port": "",
 	          "destination_net": "any",
@@ -135,6 +141,9 @@ func TestGetFirewallRules_ParsesFilterGetOptionMaps(t *testing.T) {
 	if pod.Description != "" || pod.Enabled != "1" || pod.Sequence != "1" {
 		t.Errorf("pod scalar fields not parsed: %+v", pod)
 	}
+	if pod.Advanced["statetype"] != "keep" || pod.Advanced["gateway"] != "" || pod.Advanced["sched"] != "" {
+		t.Errorf("pod advanced behavior fields not preserved: %+v", pod.Advanced)
+	}
 
 	mgmt, ok := byUUID["bbbb-mgmt"]
 	if !ok {
@@ -184,6 +193,10 @@ func TestCreateFirewallRule_UsesOPNsense26DescriptionField(t *testing.T) {
 		Source:      "10.100.15.0/24",
 		Destination: "any",
 		Description: "crucible:pod-pass:v1:vlan=115",
+		Advanced: map[string]string{
+			"statetype": "keep",
+			"gateway":   "",
+		},
 	})
 	if err != nil {
 		t.Fatalf("CreateFirewallRule: %v", err)
@@ -201,6 +214,15 @@ func TestCreateFirewallRule_UsesOPNsense26DescriptionField(t *testing.T) {
 	}
 	if description != "crucible:pod-pass:v1:vlan=115" {
 		t.Fatalf("description = %q", description)
+	}
+	for field, want := range map[string]string{"statetype": "keep", "gateway": ""} {
+		var gotValue string
+		if err := json.Unmarshal(rule[field], &gotValue); err != nil {
+			t.Fatalf("advanced field %s missing or invalid: %v", field, err)
+		}
+		if gotValue != want {
+			t.Fatalf("advanced field %s = %q, want %q", field, gotValue, want)
+		}
 	}
 }
 

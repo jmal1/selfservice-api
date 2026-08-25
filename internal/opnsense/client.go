@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -48,11 +49,12 @@ type Client struct {
 	config     Config
 	httpClient *http.Client
 	logger     *slog.Logger
+	policyLock chan struct{}
 }
 
 // New creates an OPNsense client.
 func New(cfg Config, logger *slog.Logger) *Client {
-	return &Client{
+	client := &Client{
 		config: cfg,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
@@ -63,6 +65,44 @@ func New(cfg Config, logger *slog.Logger) *Client {
 			},
 		},
 		logger: logger,
+	}
+	client.policyLock = make(chan struct{}, 1)
+	client.policyLock <- struct{}{}
+	return client
+}
+
+type contentFilterTransactionKey struct{}
+
+// BeginContentFilterTransaction serializes the full content-filter transaction
+// with every firewall apply issued by this worker process. The returned context
+// marks calls made by the transaction so ApplyFirewall does not reacquire the
+// same lock.
+func (c *Client) BeginContentFilterTransaction(ctx context.Context) (context.Context, func(), error) {
+	select {
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	case <-c.policyLock:
+	}
+	txCtx := context.WithValue(ctx, contentFilterTransactionKey{}, c)
+	var released bool
+	return txCtx, func() {
+		if released {
+			return
+		}
+		released = true
+		c.policyLock <- struct{}{}
+	}, nil
+}
+
+func (c *Client) acquirePolicyMutation(ctx context.Context) (func(), error) {
+	if owner, ok := ctx.Value(contentFilterTransactionKey{}).(*Client); ok && owner == c {
+		return func() {}, nil
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.policyLock:
+		return func() { c.policyLock <- struct{}{} }, nil
 	}
 }
 
@@ -418,28 +458,33 @@ func (c *Client) GetDHCPSubnetByNetwork(ctx context.Context, subnet string) (*DH
 
 // FirewallRule represents a firewall filter rule.
 type FirewallRule struct {
-	Enabled           string `json:"enabled"`
-	Sequence          string `json:"sequence,omitempty"`
-	Quick             string `json:"quick,omitempty"`
-	Action            string `json:"action"`    // "pass" or "block"
-	Interface         string `json:"interface"` // empty means global/floating
-	InterfaceInvert   string `json:"interfacenot,omitempty"`
-	Direction         string `json:"direction"`  // "in"
-	IPProtocol        string `json:"ipprotocol"` // "inet"
-	Protocol          string `json:"protocol"`   // "any", "TCP", etc.
-	SourceInvert      string `json:"source_not,omitempty"`
-	Source            string `json:"source_net"` // e.g., "10.100.0.0/24"
-	SourcePort        string `json:"source_port,omitempty"`
-	DestinationInvert string `json:"destination_not,omitempty"`
-	Destination       string `json:"destination_net"`
-	DestinationPort   string `json:"destination_port,omitempty"`
-	Log               string `json:"log,omitempty"`
-	Description       string `json:"description"`
+	Enabled           string            `json:"enabled"`
+	Sequence          string            `json:"sequence,omitempty"`
+	Quick             string            `json:"quick,omitempty"`
+	Action            string            `json:"action"`    // "pass" or "block"
+	Interface         string            `json:"interface"` // empty means global/floating
+	InterfaceInvert   string            `json:"interfacenot,omitempty"`
+	Direction         string            `json:"direction"`  // "in"
+	IPProtocol        string            `json:"ipprotocol"` // "inet"
+	Protocol          string            `json:"protocol"`   // "any", "TCP", etc.
+	SourceInvert      string            `json:"source_not,omitempty"`
+	Source            string            `json:"source_net"` // e.g., "10.100.0.0/24"
+	SourcePort        string            `json:"source_port,omitempty"`
+	DestinationInvert string            `json:"destination_not,omitempty"`
+	Destination       string            `json:"destination_net"`
+	DestinationPort   string            `json:"destination_port,omitempty"`
+	Log               string            `json:"log,omitempty"`
+	Description       string            `json:"description"`
+	Advanced          map[string]string `json:"-"`
 }
 
 // CreateFirewallRule creates a firewall filter rule.
 func (c *Client) CreateFirewallRule(ctx context.Context, rule FirewallRule) (string, error) {
-	payload := map[string]any{"rule": rule}
+	rulePayload, err := firewallRuleMutationPayload(rule)
+	if err != nil {
+		return "", fmt.Errorf("create firewall rule payload: %w", err)
+	}
+	payload := map[string]any{"rule": rulePayload}
 
 	resp, err := c.doRequest(ctx, "POST", "/firewall/filter/addRule", payload)
 	if err != nil {
@@ -463,7 +508,11 @@ func (c *Client) UpdateFirewallRule(ctx context.Context, uuid string, rule Firew
 	if strings.TrimSpace(uuid) == "" {
 		return fmt.Errorf("update firewall rule: uuid is required")
 	}
-	resp, err := c.doRequest(ctx, "POST", "/firewall/filter/setRule/"+uuid, map[string]any{"rule": rule})
+	rulePayload, err := firewallRuleMutationPayload(rule)
+	if err != nil {
+		return fmt.Errorf("update firewall rule %s payload: %w", uuid, err)
+	}
+	resp, err := c.doRequest(ctx, "POST", "/firewall/filter/setRule/"+uuid, map[string]any{"rule": rulePayload})
 	if err != nil {
 		return fmt.Errorf("update firewall rule %s: %w", uuid, err)
 	}
@@ -471,6 +520,28 @@ func (c *Client) UpdateFirewallRule(ctx context.Context, uuid string, rule Firew
 		return fmt.Errorf("update firewall rule %s: %w", uuid, err)
 	}
 	return nil
+}
+
+func firewallRuleMutationPayload(rule FirewallRule) (map[string]any, error) {
+	data, err := json.Marshal(rule)
+	if err != nil {
+		return nil, err
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil, err
+	}
+	for key, value := range rule.Advanced {
+		switch key {
+		case "enabled", "sequence", "quick", "action", "interface", "interfacenot",
+			"direction", "ipprotocol", "protocol", "source_not", "source_net",
+			"source_port", "destination_not", "destination_net", "destination_port",
+			"log", "description":
+			return nil, fmt.Errorf("advanced field %q overlaps a core firewall field", key)
+		}
+		payload[key] = value
+	}
+	return payload, nil
 }
 
 // DeleteFirewallRule removes a firewall rule by UUID.
@@ -515,6 +586,7 @@ type FirewallRuleInfo struct {
 	Action            string // "pass" or "block"
 	Log               string
 	Description       string
+	Advanced          map[string]string
 }
 
 // opnOption is a single entry in an OPNsense select-field option map, as returned
@@ -535,23 +607,47 @@ func (o opnOption) isSelected() bool {
 // filterGetRule mirrors one rule under filter.rules.rule in a firewall/filter/get
 // response. Select fields are option-maps; the rest are plain strings.
 type filterGetRule struct {
-	Enabled           string               `json:"enabled"`
-	Sequence          string               `json:"sequence"`
-	Quick             string               `json:"quick"`
-	Interface         map[string]opnOption `json:"interface"`
-	InterfaceInvert   string               `json:"interfacenot"`
-	Direction         map[string]opnOption `json:"direction"`
-	Action            map[string]opnOption `json:"action"`
-	IPProtocol        map[string]opnOption `json:"ipprotocol"`
-	Protocol          map[string]opnOption `json:"protocol"`
-	SourceInvert      string               `json:"source_not"`
-	SourceNet         string               `json:"source_net"`
-	SourcePort        string               `json:"source_port"`
-	DestinationInvert string               `json:"destination_not"`
-	DestinationNet    string               `json:"destination_net"`
-	DestinationPort   string               `json:"destination_port"`
-	Log               string               `json:"log"`
-	Description       string               `json:"description"`
+	Enabled           string                     `json:"enabled"`
+	Sequence          string                     `json:"sequence"`
+	Quick             string                     `json:"quick"`
+	Interface         map[string]opnOption       `json:"interface"`
+	InterfaceInvert   string                     `json:"interfacenot"`
+	Direction         map[string]opnOption       `json:"direction"`
+	Action            map[string]opnOption       `json:"action"`
+	IPProtocol        map[string]opnOption       `json:"ipprotocol"`
+	Protocol          map[string]opnOption       `json:"protocol"`
+	SourceInvert      string                     `json:"source_not"`
+	SourceNet         string                     `json:"source_net"`
+	SourcePort        string                     `json:"source_port"`
+	DestinationInvert string                     `json:"destination_not"`
+	DestinationNet    string                     `json:"destination_net"`
+	DestinationPort   string                     `json:"destination_port"`
+	Log               string                     `json:"log"`
+	Description       string                     `json:"description"`
+	Advanced          map[string]json.RawMessage `json:"-"`
+}
+
+func (r *filterGetRule) UnmarshalJSON(data []byte) error {
+	type plainFilterGetRule filterGetRule
+	var decoded plainFilterGetRule
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	for _, key := range []string{
+		"enabled", "sequence", "quick", "interface", "interfacenot",
+		"direction", "action", "ipprotocol", "protocol", "source_not",
+		"source_net", "source_port", "destination_not", "destination_net",
+		"destination_port", "log", "description", "sort_order", "prio_group",
+	} {
+		delete(fields, key)
+	}
+	*r = filterGetRule(decoded)
+	r.Advanced = fields
+	return nil
 }
 
 const maxFirewallRulesResponseBytes = 128 << 20
@@ -794,6 +890,10 @@ func normalizeFilterGetRule(uuid string, r filterGetRule) (FirewallRuleInfo, err
 	if err != nil {
 		return FirewallRuleInfo{}, fmt.Errorf("action: %w", err)
 	}
+	advanced, err := normalizeAdvancedFirewallFields(r.Advanced)
+	if err != nil {
+		return FirewallRuleInfo{}, err
+	}
 	return FirewallRuleInfo{
 		UUID:              strings.TrimSpace(uuid),
 		Enabled:           canonicalFirewallField(r.Enabled),
@@ -813,7 +913,78 @@ func normalizeFilterGetRule(uuid string, r filterGetRule) (FirewallRuleInfo, err
 		Action:            action,
 		Log:               canonicalFirewallField(r.Log),
 		Description:       strings.TrimSpace(r.Description),
+		Advanced:          advanced,
 	}, nil
+}
+
+func normalizeAdvancedFirewallFields(fields map[string]json.RawMessage) (map[string]string, error) {
+	if len(fields) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]string, len(fields))
+	for key, raw := range fields {
+		value, err := normalizeAdvancedFirewallField(raw)
+		if err != nil {
+			return nil, fmt.Errorf("advanced field %q: %w", key, err)
+		}
+		out[key] = value
+	}
+	return out, nil
+}
+
+func normalizeAdvancedFirewallField(raw json.RawMessage) (string, error) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return "", nil
+	}
+	var scalar string
+	if err := json.Unmarshal(raw, &scalar); err == nil {
+		return canonicalFirewallField(scalar), nil
+	}
+	var boolean bool
+	if err := json.Unmarshal(raw, &boolean); err == nil {
+		return strconv.FormatBool(boolean), nil
+	}
+	var number json.Number
+	if err := json.Unmarshal(raw, &number); err == nil {
+		return number.String(), nil
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err == nil {
+		if len(object) == 0 {
+			return "", nil
+		}
+		options := make(map[string]opnOption, len(object))
+		optionMap := true
+		for key, value := range object {
+			var option opnOption
+			if err := json.Unmarshal(value, &option); err != nil || len(option.Selected) == 0 {
+				optionMap = false
+				break
+			}
+			options[key] = option
+		}
+		if optionMap {
+			return selectedOptionSetStrict(options, false)
+		}
+		compact, err := json.Marshal(object)
+		if err != nil {
+			return "", err
+		}
+		return canonicalFirewallField(string(compact)), nil
+	}
+	var array []json.RawMessage
+	if err := json.Unmarshal(raw, &array); err == nil {
+		if len(array) == 0 {
+			return "", nil
+		}
+		compact, err := json.Marshal(array)
+		if err != nil {
+			return "", err
+		}
+		return canonicalFirewallField(string(compact)), nil
+	}
+	return "", fmt.Errorf("unsupported JSON value %s", raw)
 }
 
 func expectJSONDelim(dec *json.Decoder, want json.Delim) error {
@@ -892,6 +1063,11 @@ func canonicalFirewallField(v string) string {
 
 // ApplyFirewall applies pending firewall changes.
 func (c *Client) ApplyFirewall(ctx context.Context) error {
+	release, err := c.acquirePolicyMutation(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire firewall apply lock: %w", err)
+	}
+	defer release()
 	resp, err := c.doRequest(ctx, "POST", "/firewall/filter/apply", map[string]any{})
 	if err != nil {
 		return err

@@ -509,10 +509,15 @@ func (p *Provisioner) newPodCreateRollbackEngine(
 		if err := json.Unmarshal(data, &d); err != nil {
 			return err
 		}
-		if err := p.opn.DeleteFirewallRule(ctx, d.UUID); err != nil {
-			return err
-		}
-		return p.opn.ApplyFirewall(ctx)
+		return p.db.WithContentFilterMutationLock(ctx, func(lockCtx context.Context) error {
+			if err := requireContentFilterFirewallMutationSafe(lockCtx, p.db, p.opn); err != nil {
+				return err
+			}
+			if err := p.opn.DeleteFirewallRule(lockCtx, d.UUID); err != nil {
+				return err
+			}
+			return p.opn.ApplyFirewall(lockCtx)
+		})
 	})
 	rb.RegisterUndo("portgroup_create", func(ctx context.Context, data json.RawMessage) error {
 		record, err := p.db.GetPodPortGroupReceipt(ctx, podID)
@@ -1357,15 +1362,24 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr er
 	// --- Step 4b: Create firewall rule to allow pod traffic ---
 	p.publishProgress(job.ID, "firewall_create", "Creating firewall rule for pod network")
 
-	fwRuleUUID, fwRuleCreated, err := ensurePodFirewallRule(
-		ctx,
-		p.opn,
-		int(vlanTag),
-		ifName,
-		subnet,
-		defaultMaxFirewallRules,
-		defaultFirewallCleanupLimit,
-	)
+	var fwRuleUUID string
+	var fwRuleCreated bool
+	err = p.db.WithContentFilterMutationLock(ctx, func(lockCtx context.Context) error {
+		if err := requireContentFilterFirewallMutationSafe(lockCtx, p.db, p.opn); err != nil {
+			return err
+		}
+		var ensureErr error
+		fwRuleUUID, fwRuleCreated, ensureErr = ensurePodFirewallRule(
+			lockCtx,
+			p.opn,
+			int(vlanTag),
+			ifName,
+			subnet,
+			defaultMaxFirewallRules,
+			defaultFirewallCleanupLimit,
+		)
+		return ensureErr
+	})
 	if fwRuleCreated {
 		if err := rb.Record(ctx, "firewall_create", map[string]string{"uuid": fwRuleUUID}); err != nil {
 			return err

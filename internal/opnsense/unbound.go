@@ -1,6 +1,7 @@
 package opnsense
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -67,6 +68,10 @@ func (c *Client) GetUnboundSafeSearch(ctx context.Context) (bool, error) {
 	if err := json.Unmarshal(resp, &result); err != nil {
 		return false, fmt.Errorf("parse Unbound settings: %w", err)
 	}
+	raw := bytes.TrimSpace(result.Unbound.General.SafeSearch)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return false, fmt.Errorf("parse Unbound safesearch: setting is missing or null")
+	}
 	value, err := scalarModelValue(result.Unbound.General.SafeSearch)
 	if err != nil {
 		return false, fmt.Errorf("parse Unbound safesearch: %w", err)
@@ -74,7 +79,7 @@ func (c *Client) GetUnboundSafeSearch(ctx context.Context) (bool, error) {
 	switch strings.ToLower(value) {
 	case "1", "true":
 		return true, nil
-	case "0", "false", "":
+	case "0", "false":
 		return false, nil
 	default:
 		return false, fmt.Errorf("unexpected Unbound safesearch value %q", value)

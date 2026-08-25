@@ -181,14 +181,23 @@ func (p *Provisioner) DestroyPod(ctx context.Context, job *models.Job) error {
 		errors = append(errors, cleanupErr)
 		return p.failPodDestroy(ctx, pod.ID, errors)
 	} else if ifName != "" {
-		if removed, cleanupErr := deletePodFirewallRules(
-			ctx,
-			p.opn,
-			ifName,
-			subnet,
-			defaultMaxFirewallRules,
-			defaultFirewallCleanupLimit,
-		); cleanupErr != nil {
+		var removed int
+		cleanupErr := p.db.WithContentFilterMutationLock(ctx, func(lockCtx context.Context) error {
+			if err := requireContentFilterFirewallMutationSafe(lockCtx, p.db, p.opn); err != nil {
+				return err
+			}
+			var deleteErr error
+			removed, deleteErr = deletePodFirewallRules(
+				lockCtx,
+				p.opn,
+				ifName,
+				subnet,
+				defaultMaxFirewallRules,
+				defaultFirewallCleanupLimit,
+			)
+			return deleteErr
+		})
+		if cleanupErr != nil {
 			p.logger.Warn("failed to clean generated firewall rules",
 				"vlan", vlanTag, "interface", ifName, "removed", removed, "error", cleanupErr)
 			errors = append(errors, fmt.Errorf("delete firewall rules: %w", cleanupErr))

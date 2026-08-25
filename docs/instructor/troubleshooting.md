@@ -117,7 +117,7 @@ Before pulling upgrade code, building or pushing images, or running a migration:
 
 For this foundation rollout the proof requires the latest deployed Helm
 revision to be the immutable revision **160**. PostgreSQL must report migration
-**35 clean**. The script checks that against
+**36 clean**. The script checks that against
 the latest migration in the hotfix checkout and proves the version and dirty
 flag are unchanged across baseline preparation. Stop for incident recovery if
 it reports another state.
@@ -789,20 +789,64 @@ built-in social-media selector. The capacity-tested built-in selection remains
 exactly `oisd2`, `hgz014`, and `hgz021` (Gambling Mini). Do not substitute the
 larger `hgz019` or `hgz020` gambling lists; `hgz022` does not exist.
 
-The repository integration remains intentionally read-only: it validates
-configuration and inspects exact firewall/DNSBL state, but never mutates,
-refreshes, or applies the policy. The transactional source-scoped SafeSearch
-fragment owner is a foundation API only and is not called by
-`reconcileContentFilter`. Supervised activation remains blocked until one
-transaction can roll back every firewall, DNSBL, Unbound, and
-runtime-verification failure without leaving staged policy behind.
-While policy is enabled but inspection is unhealthy, the network reconciler
-also suppresses unrelated firewall applies so they cannot activate a partial
-staged model.
+The repository now includes an exact-owned desired-state controller, while
+checked-in Helm values still keep activation disabled. Final mode accepts only
+`10.100.0.0/16`. Explicit canary mode accepts one inactive
+`10.100.x.0/24`; overlap with any retained VLAN allocation, including a
+`destroying` or `destroy_failed` pod, fails before mutation. Final mode rejects
+any retained allocation that is not a canonical `/24` inside
+`10.100.0.0/16`. The canary stays durably excluded from VLAN checkout for the
+entire canary mode. The exclusion is part of the crash-recovery snapshot and
+uses a dedicated short-lived shared/exclusive PostgreSQL advisory lock with
+VLAN checkout. Reservation replacement atomically rechecks that the `/24` is
+unallocated; concurrent checkouts are not blocked for the full OPNsense
+transaction.
+
+The controller holds a stable cross-process PostgreSQL advisory lock shared by
+every Crucible firewall mutation. Before changing OPNsense, it persists the
+exact owned firewall, DNSBL, and SafeSearch snapshot in
+`content_filter_transactions`, stages only
+`crucible:content-filter:v1:*` objects, validates source/order/count/model
+readback, applies through supported OPNsense paths, and then reads every surface
+back. An enabled pass recovers an interrupted journal before taking a new
+baseline. Manual and ambiguous objects are never changed. Any failure restores
+and exactly verifies all owned surfaces with an independent rollback timeout;
+failed recovery retains the journal and conservative canary exclusion for the
+next enabled pass. The exclusion returns to its prior snapshot only after every
+OPNsense surface is restored and verified, and recovery runs before validation
+of a new desired source. Generated per-pod broad passes run only after this
+controller transaction converges; pod create/destroy firewall paths refuse to
+mutate or apply while a recovery journal and any owned or ambiguous
+content-filter firewall state coexist. When intent is disabled they may proceed
+only after fresh API inventory proves exact-owned firewall state absent; this
+does not clear or recover the journal.
+An exact no-op pass still proves model/runtime state but does not restart
+Unbound, regenerate the six feeds, or reapply the firewall. Those operations
+run only when model or runtime drift requires them.
+Unknown or non-default advanced firewall behavior such as gateway, reply-to,
+schedule, state policy, TCP flags, shaping, tags, limits, or priority fails
+closed so rollback cannot silently discard it.
+
+When policy intent is disabled, the controller never creates, updates, deletes,
+applies, restarts, or recovers anything. It reports `controller_ready=1` only
+when no journal, owned firewall/DNSBL object, source-scoped fragment, or global
+SafeSearch setting remains. Pending SafeSearch recovery state and durable canary
+reservations are residual state too. Disabled inspection uses file reads only;
+it never takes the SafeSearch mutation lock, rewrites Unbound files, restarts
+Unbound, or removes a recovery backup. Residual state is an operator-visible
+failure, not a silent cleanup.
+If that read-only SSH inspection is unavailable, `controller_ready` remains
+false. Generated per-pod firewall repair can still proceed only when API
+inventory has already proven that no exact-owned content-filter firewall rule
+remains, so a transient SSH failure does not disable the default pod-network
+self-healing loop.
 
 Do not treat a successful DNSBL API action as proof of runtime enforcement.
-Activation is asynchronous, the Python module reloads `dnsbl.json` only on an
-uncached query after its 60-second gate, and the action can mask shell failures.
+The action can mask shell failures. The controller therefore requires a freshly
+replaced, parseable `dnsbl.json` containing the exact owned policy UUID/source
+and generated domains. The Python module still reloads that file only on an
+uncached query after its 60-second gate, so this is controller readback, not
+effective student-path verification.
 
 OPNsense does support a source-scoped mechanism outside its built-in switch. A
 reversible pilot used a dedicated
@@ -821,6 +865,18 @@ it from `opnsense.sshHostKey` when explicitly set, otherwise from key
 trusted OPNsense console or previously authenticated channel; do not trust a
 first-use network scan.
 
+The built-in global Force SafeSearch switch must remain off. The controller
+requires a present, non-null, explicitly false value before recovery, every
+firewall apply, DNSBL activation, and commit. Enabled, missing, null, unknown,
+or unreadable state blocks activation so management and staging DNS cannot
+inherit the student policy.
+
+The IPv6 guard treats every `::/0` or `default` route as routed even when
+OPNsense reports a `link#N` gateway. Any non-link-local address on an active
+student `optN` interface, including ULA/NAT66 addressing, blocks activation
+until equivalent IPv6 policy exists. Management and staging interfaces remain
+outside that source-scoped check.
+
 The owner writes durable rollback state outside the `*.conf` include glob,
 rejects unsafe CIDRs plus conflicting or overlapping manual views, writes
 atomically, stages the chroot copy at
@@ -835,11 +891,13 @@ and verifies the staged copy, and preserves the backup if recovery is
 incomplete. Once activation and exact readback are marked committed,
 backup-cleanup failure preserves the active configuration for cleanup on the
 next invocation instead of rolling it back. Missing, malformed, or mismatched
-host-key pins fail closed. This does **not** enable content filtering: the
-reconciler remains read-only, and the synthetic must still prove effective
-uncached answers from a real student source plus unchanged answers from a
-control source rather than trusting configuration readback.
+host-key pins fail closed. This does **not** enable content filtering in production. Helm remains disabled,
+and the synthetic must still prove effective uncached answers from a real
+student source plus unchanged answers from a control source rather than trusting
+configuration readback.
 
+`crucible_content_filter_policy{kind="controller_ready"}` reports exact
+controller convergence. `kind="effective_ready"` intentionally remains `0`.
 The policy must remain disabled until the synthetic can flush/use controlled
 uncached fixtures and verify actual answers from `10.100.0.0/16`.
 
@@ -896,7 +954,7 @@ delta(crucible_opnsense_firewall_rules{kind="total"}[15m]) > 25
 ```promql
 (crucible_content_filter_policy{kind="expected"} == 1)
 and on(job, component, layer)
-(crucible_content_filter_policy{kind="healthy"} == 0)
+(crucible_content_filter_policy{kind="controller_ready"} == 0)
 ```
 
 ```promql

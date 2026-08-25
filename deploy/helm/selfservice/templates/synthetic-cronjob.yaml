@@ -83,6 +83,8 @@ spec:
                   value: {{ .Values.synthetic.instructorUsername | quote }}
                 - name: SYNTHETIC_CONTENT_FILTER_EXPECTED
                   value: {{ .Values.worker.contentFilter.enabled | default false | quote }}
+                - name: SYNTHETIC_CONTENT_FILTER_CANARY
+                  value: {{ .Values.worker.contentFilter.canary | default false | quote }}
                 - name: SYNTHETIC_CONTENT_FILTER_SOURCE_NETWORK
                   value: {{ .Values.worker.contentFilter.sourceNetwork | default "10.100.0.0/16" | quote }}
                 - name: SYNTHETIC_CONTENT_FILTER_CATEGORY_FEED_BASE_URL

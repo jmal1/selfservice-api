@@ -30,7 +30,7 @@ func TestGetDNSBLPolicy_ParsesOPNsense26ModelShape(t *testing.T) {
 	    "address": "",
 	    "nxdomain": "1",
 	    "cache_ttl": "3600",
-	    "description": "crucible:content-filter:v1"
+	    "description": "crucible:content-filter:v1:dnsbl"
 	  }
 	}`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -114,7 +114,7 @@ func TestCreateDNSBLPolicy_RejectsValidationFailure(t *testing.T) {
 
 	c := New(Config{BaseURL: srv.URL}, discardLogger())
 	if _, err := c.CreateDNSBLPolicy(context.Background(), DNSBLPolicy{
-		Enabled: "1", SourceNets: "bad", Description: "crucible:content-filter:v1",
+		Enabled: "1", SourceNets: "bad", Description: "crucible:content-filter:v1:dnsbl",
 	}); err == nil {
 		t.Fatal("CreateDNSBLPolicy succeeded despite OPNsense validation error")
 	}
@@ -151,5 +151,25 @@ func TestGetUnboundSafeSearch_RejectsUnknownValue(t *testing.T) {
 	c := New(Config{BaseURL: srv.URL}, discardLogger())
 	if _, err := c.GetUnboundSafeSearch(context.Background()); err == nil {
 		t.Fatal("unknown safesearch value must fail closed")
+	}
+}
+
+func TestGetUnboundSafeSearch_RequiresExplicitPresentValue(t *testing.T) {
+	for _, body := range []string{
+		`{"unbound":{"general":{}}}`,
+		`{"unbound":{"general":{"safesearch":null}}}`,
+		`{"unbound":{}}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, body)
+			}))
+			defer srv.Close()
+
+			c := New(Config{BaseURL: srv.URL}, discardLogger())
+			if _, err := c.GetUnboundSafeSearch(context.Background()); err == nil {
+				t.Fatal("missing/null global SafeSearch value was accepted as disabled")
+			}
+		})
 	}
 }
