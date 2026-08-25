@@ -1867,6 +1867,47 @@ build_upgrade_hook_image_map() {
   done < "$hook_inventory"
 }
 
+# kubectl_server_apply_dry_run is the single place in this script that may
+# invoke `kubectl apply --server-side --dry-run=server`. Centralizing the
+# exact, fixed argv tuple here - rather than repeating it independently at
+# each call site - means there is exactly one place that needs to carry
+# --server-side, --dry-run=server, and --force-conflicts as their own
+# complete, literal, unparameterized shell words; every caller supplies only
+# the field manager, manifest path, and output format as ordinary
+# arguments, so none of those fixed flags can be disguised, concatenated
+# with a caller-supplied value, or otherwise hidden inside another flag's
+# text the way a raw substring scan over free-form call-site text could be
+# fooled (for example a decoy such as
+# --field-manager=X--dry-run=server sitting next to an actual
+# --dry-run=none, which would still "contain" the safe substring while
+# really performing a mutating, non-dry-run apply).
+#
+# --force-conflicts is paired inseparably with --dry-run=server here:
+# existing production objects are owned by Helm (and one containment field
+# by kubectl-set), so a validation-only server-side dry-run must be allowed
+# to take over field ownership to prove admission/defaulting would succeed.
+# The real apply remains `helm upgrade`, never this function, so this can
+# never mutate anything or change production's actual field ownership.
+#
+# This function must NEVER be called from any mutating code path - only
+# from the three read-only validation call sites below - because dropping
+# --dry-run=server here (accidentally or otherwise) would turn
+# --force-conflicts into a real, mutating field-ownership takeover against
+# live production objects.
+kubectl_server_apply_dry_run() {
+  local field_manager=$1
+  local manifest_path=$2
+  local output_format=$3
+  kubectl apply \
+    --server-side \
+    --dry-run=server \
+    --force-conflicts \
+    --field-manager="$field_manager" \
+    -n "$NAMESPACE" \
+    -f "$manifest_path" \
+    -o "$output_format"
+}
+
 validate_upgrade_hooks() {
   local unpinned_hooks=$1
   local resolved_images=$2
@@ -1905,19 +1946,13 @@ validate_upgrade_hooks() {
     fi
   done < "$inventory"
   echo "==> server-side dry-run validating immutable upgrade Helm hooks"
-  # --force-conflicts is paired inseparably with --dry-run=server here: these
-  # hook manifests are already Helm-owned, so a validation-only SSA dry-run
-  # must be allowed to take over field ownership to prove admission/defaulting
-  # would succeed. This never affects the real hook execution (Helm applies
-  # the hooks itself during `helm upgrade`), only this read-only proof.
-  kubectl apply \
-    --server-side \
-    --dry-run=server \
-    --force-conflicts \
-    --field-manager=crucible-production-deploy-hooks \
-    -n "$NAMESPACE" \
-    -f "$unpinned_hooks" \
-    -o yaml > "$server"
+  # See kubectl_server_apply_dry_run for why --force-conflicts is paired
+  # inseparably with --dry-run=server: these hook manifests are already
+  # Helm-owned, so a validation-only SSA dry-run must be allowed to take
+  # over field ownership to prove admission/defaulting would succeed. This
+  # never affects the real hook execution (Helm applies the hooks itself
+  # during `helm upgrade`), only this read-only proof.
+  kubectl_server_apply_dry_run crucible-production-deploy-hooks "$unpinned_hooks" yaml > "$server"
   manifest_workload_inventory "$server" true > "$server_inventory"
   if ! diff -u <(sort "$image_map") <(sort "$server_inventory"); then
     echo "ERROR: server-defaulted upgrade hooks changed the validated image inventory." >&2
@@ -2003,21 +2038,15 @@ server_validate_candidate() {
   local output=$3
   local canonical_output=$4
   echo "==> server-side dry-run validating the exact digest-pinned candidate"
-  # --force-conflicts is paired inseparably with --dry-run=server here: the
-  # existing production objects (ingress, workload images/env/resources,
-  # StatefulSet volumeClaimTemplates, CronJob fields) are owned by Helm/
-  # kubectl-set, so a validation-only SSA dry-run must be allowed to take
-  # ownership to prove admission/defaulting would succeed. The real apply
-  # remains `helm upgrade`, not this kubectl apply, so this never mutates
-  # anything or changes production's actual field ownership.
-  kubectl apply \
-    --server-side \
-    --dry-run=server \
-    --force-conflicts \
-    --field-manager=crucible-production-deploy \
-    -n "$NAMESPACE" \
-    -f "$manifest" \
-    -o yaml > "$output"
+  # See kubectl_server_apply_dry_run for why --force-conflicts is paired
+  # inseparably with --dry-run=server: the existing production objects
+  # (ingress, workload images/env/resources, StatefulSet
+  # volumeClaimTemplates, CronJob fields) are owned by Helm/kubectl-set, so
+  # a validation-only SSA dry-run must be allowed to take ownership to prove
+  # admission/defaulting would succeed. The real apply remains
+  # `helm upgrade`, not this kubectl apply, so this never mutates anything
+  # or changes production's actual field ownership.
+  kubectl_server_apply_dry_run crucible-production-deploy "$manifest" yaml > "$output"
   validate_candidate_manifest "$output" "$expected_map" "$output.inventory"
   canonicalize_server_candidate "$manifest" "$canonical_output"
 }
@@ -2061,18 +2090,11 @@ canonicalize_server_candidate() {
   split_manifest_documents "$manifest" "$document_dir"
   : > "$rows"
   for document in "$document_dir"/*.yaml; do
-    # --force-conflicts is paired inseparably with --dry-run=server here for
-    # the same reason as server_validate_candidate above: this is a per-
-    # document validation-only SSA dry-run against already Helm-owned
-    # objects, not a mutating apply.
-    kubectl apply \
-      --server-side \
-      --dry-run=server \
-      --force-conflicts \
-      --field-manager=crucible-production-deploy \
-      -n "$NAMESPACE" \
-      -f "$document" \
-      -o json \
+    # See kubectl_server_apply_dry_run for why --force-conflicts is paired
+    # inseparably with --dry-run=server, for the same reason as
+    # server_validate_candidate above: this is a per-document validation-only
+    # SSA dry-run against already Helm-owned objects, not a mutating apply.
+    kubectl_server_apply_dry_run crucible-production-deploy "$document" json \
       | jq -cS '
           del(
             .metadata.creationTimestamp,

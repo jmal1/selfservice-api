@@ -823,9 +823,99 @@ func TestDeployScriptPreparesAllWorkloadBaseline(t *testing.T) {
 	}
 }
 
-// applyBlockRegex extracts each full `kubectl apply ... -o (yaml|json)...`
-// invocation (backslash-continued flags included) as a single string.
-var applyBlockRegex = regexp.MustCompile(`(?s)kubectl apply \\.*?-o (?:yaml|json)[^\n]*`)
+// kubectlServerApplyDryRunFunctionName is the single bash function in
+// deploy.sh that may ever invoke
+// `kubectl apply --server-side --dry-run=server --force-conflicts`. This
+// exact, fixed argv tuple is centralized behind one helper (see
+// deploy/scripts/deploy.sh) rather than repeated independently at each of
+// the three validation call sites, precisely so that pinning the fixed
+// flags down to individual, exact, non-parameterized shell lines actually
+// means something: a decoy embedded in some other flag's value (for
+// example --field-manager=X--dry-run=server glued next to a real, changed
+// --dry-run=none) cannot be mistaken for the real flag, because it would
+// have to be its own line, byte-for-byte identical to the required literal
+// - not merely a substring anywhere in a larger free-form block.
+const kubectlServerApplyDryRunFunctionName = "kubectl_server_apply_dry_run"
+
+// forceConflictsValidationCallers are the only bash functions allowed to
+// invoke kubectlServerApplyDryRunFunctionName. Any other function -
+// mutating or not - doing so is a structural violation.
+var forceConflictsValidationCallers = []string{
+	"validate_upgrade_hooks",
+	"server_validate_candidate",
+	"canonicalize_server_candidate",
+}
+
+// exactBodyLines returns every line of body with surrounding whitespace and
+// a trailing "\" line-continuation removed, so a fixed flag written as
+// "    --dry-run=server \" on its own line normalizes to exactly
+// "--dry-run=server". Comparing whole normalized lines - rather than
+// scanning for a substring anywhere in the body - is what makes the checks
+// below immune to a decoy glued onto the end of a *different* line: doing
+// so changes that other line's content, but can never make it become
+// byte-for-byte equal to one of these expected, exact lines.
+func exactBodyLines(body string) []string {
+	rawLines := strings.Split(body, "\n")
+	lines := make([]string, len(rawLines))
+	for i, raw := range rawLines {
+		trimmed := strings.TrimSpace(raw)
+		trimmed = strings.TrimSuffix(trimmed, `\`)
+		lines[i] = strings.TrimSpace(trimmed)
+	}
+	return lines
+}
+
+// countExactLine reports how many lines in body, once normalized by
+// exactBodyLines, equal want exactly.
+func countExactLine(body, want string) int {
+	count := 0
+	for _, line := range exactBodyLines(body) {
+		if line == want {
+			count++
+		}
+	}
+	return count
+}
+
+// countLinesWithPrefix reports how many normalized lines in body begin with
+// prefix. This is used to prove no *additional*, conflicting variant of a
+// fixed flag (for example a second, appended "--dry-run=none" line
+// alongside the real "--dry-run=server" line) has been introduced anywhere
+// in the body. kubectl (like most flag parsers) honors the last occurrence
+// of a repeated flag, so a same-line exact-match count alone would not
+// catch a redundant, differently-valued line placed after the real one;
+// requiring the *only* line with this prefix to be the expected exact line
+// does.
+func countLinesWithPrefix(body, prefix string) int {
+	count := 0
+	for _, line := range exactBodyLines(body) {
+		if strings.HasPrefix(line, prefix) {
+			count++
+		}
+	}
+	return count
+}
+
+// extractFunctionBody returns the full source text of the named bash
+// function (from its "name() {" marker through its closing "\n}\n"), and
+// the byte offsets of that span within source. It fails if the function
+// cannot be found, or is defined more than once.
+func extractFunctionBody(source, functionName string) (body string, start, end int, err error) {
+	marker := functionName + "() {"
+	start = strings.Index(source, marker)
+	if start < 0 {
+		return "", 0, 0, fmt.Errorf("could not locate function %s() in deploy.sh", functionName)
+	}
+	if strings.Contains(source[start+len(marker):], marker) {
+		return "", 0, 0, fmt.Errorf("function %s() is defined more than once in deploy.sh", functionName)
+	}
+	relativeEnd := strings.Index(source[start:], "\n}\n")
+	if relativeEnd < 0 {
+		return "", 0, 0, fmt.Errorf("could not locate end of function %s() in deploy.sh", functionName)
+	}
+	end = start + relativeEnd + len("\n}\n")
+	return source[start:end], start, end, nil
+}
 
 // forceConflictsFlagLine matches an actual `--force-conflicts \` flag line
 // in deploy.sh, as opposed to explanatory comment text that merely mentions
@@ -919,65 +1009,96 @@ func findForceConflictsOccurrences(text string) []int {
 	return offsets
 }
 
-// checkForceConflictsInvariant proves, independent of how the script happens
-// to be formatted or quoted, that --force-conflicts appears exactly three
-// times in deploy.sh: exactly once inside each of the three known
-// --server-side --dry-run=server validation-only kubectl apply invocations
-// (upgrade hooks, the digest-pinned candidate, and per-document
-// canonicalization), and nowhere else in the file.
+// checkForceConflictsInvariant proves, independent of how deploy.sh happens
+// to be formatted, that the fixed, non-parameterized argv tuple
+// --server-side / --dry-run=server / --force-conflicts is written exactly
+// once in the entire file, inside kubectlServerApplyDryRunFunctionName, and
+// that every one of the three known validation-only call sites reaches it
+// - and nothing else in the file (in particular no mutating command, and
+// no fourth caller) can reach or reconstruct it.
 //
-// Detection is a literal substring scan (findForceConflictsOccurrences)
-// over the whole, comment-stripped file, not a whitespace-token or
-// line-shape check. That matters because a naive line- or token-anchored
-// check can be evaded by adding the flag inline on an existing flag's line,
-// by quoting it (`"--force-conflicts"`), by placing it immediately before a
-// shell separator such as `;` with no intervening space, or by adding it to
-// any other command entirely (in particular a mutating command such as
-// `kubectl patch`, `kubectl set`, `kubectl delete`, or `helm upgrade`)
-// without ever producing a standalone `--force-conflicts \` line. This
-// check instead totals every literal occurrence anywhere in the file and
-// requires that total to equal the sum of occurrences found strictly
-// inside the three known validation blocks, so any leakage outside those
-// three blocks - in any formatting or quoting - fails it.
+// This check combines two independent detection strategies, because each
+// closes a gap the other cannot:
+//
+//  1. Exact, whole-line comparison (via exactBodyLines/countExactLine/
+//     countLinesWithPrefix) for the fixed flags inside the one helper
+//     function's body. A raw substring scan across a whole block can be
+//     fooled by a decoy hidden inside a *different* flag's value (e.g.
+//     --field-manager=X--dry-run=server glued next to an actual, changed
+//     --dry-run=none) - the decoy substring is present, but the real,
+//     effective dry-run value is not "server". Requiring the flag to be
+//     its own complete, byte-for-byte-identical line is not fooled by that,
+//     and countLinesWithPrefix additionally rules out a second, differently
+//     valued line for the same flag family placed elsewhere in the body
+//     (kubectl honors the last occurrence of a repeated flag, so a
+//     same-line exact-match count alone would not catch that).
+//  2. A literal substring scan (findForceConflictsOccurrences) over the
+//     *whole*, comment-stripped file, independent of block/function
+//     boundaries, to prove --force-conflicts appears nowhere else - in
+//     particular not leaked, in any formatting or quoting, onto a mutating
+//     command such as `kubectl patch`, `kubectl set`, `kubectl delete`, or
+//     `helm upgrade`.
 func checkForceConflictsInvariant(text string) error {
 	stripped := stripBashLineComments(text)
 
-	blockRanges := applyBlockRegex.FindAllStringIndex(stripped, -1)
-	if len(blockRanges) != 3 {
-		blocks := make([]string, len(blockRanges))
-		for i, r := range blockRanges {
-			blocks[i] = stripped[r[0]:r[1]]
-		}
-		return fmt.Errorf("expected exactly 3 kubectl apply invocations (upgrade hooks, candidate, per-document canonicalization), found %d:\n%v", len(blockRanges), blocks)
+	// Exactly one place in the whole file may invoke `kubectl apply` at
+	// all, and it must be inside kubectlServerApplyDryRunFunctionName. This
+	// structurally rules out any other function - mutating or not -
+	// constructing its own separate --server-side/--dry-run=server/
+	// --force-conflicts invocation, or any other kubectl apply entirely.
+	if n := countExactLine(stripped, "kubectl apply"); n != 1 {
+		return fmt.Errorf("expected exactly one `kubectl apply` invocation in the whole file (inside %s()), found %d", kubectlServerApplyDryRunFunctionName, n)
 	}
 
+	body, start, end, err := extractFunctionBody(stripped, kubectlServerApplyDryRunFunctionName)
+	if err != nil {
+		return err
+	}
+
+	if n := countExactLine(body, "kubectl apply"); n != 1 {
+		return fmt.Errorf("%s() must contain exactly one `kubectl apply` line (found %d)", kubectlServerApplyDryRunFunctionName, n)
+	}
+	if n := countLinesWithPrefix(body, "--server-side"); n != 1 || countExactLine(body, "--server-side") != 1 {
+		return fmt.Errorf("%s() must contain exactly one exact `--server-side` line and no other --server-side variant (found %d matching line(s))", kubectlServerApplyDryRunFunctionName, n)
+	}
+	if n := countLinesWithPrefix(body, "--dry-run="); n != 1 || countExactLine(body, "--dry-run=server") != 1 {
+		return fmt.Errorf("%s() must contain exactly one --dry-run= line, and it must be exactly `--dry-run=server` (found %d --dry-run= line(s), %d of which are exactly --dry-run=server)", kubectlServerApplyDryRunFunctionName, n, countExactLine(body, "--dry-run=server"))
+	}
+	if n := countLinesWithPrefix(body, "--force-conflicts"); n != 1 || countExactLine(body, "--force-conflicts") != 1 {
+		return fmt.Errorf("%s() must contain exactly one --force-conflicts line, and it must be exactly `--force-conflicts` with no value suffix (found %d matching line(s))", kubectlServerApplyDryRunFunctionName, n)
+	}
+
+	// Independently confirm --force-conflicts does not leak anywhere else
+	// in the file, in any formatting or quoting, using the permissive
+	// literal-substring scan (which is deliberately not restricted to
+	// whole-line matches, so it also catches leakage glued inline onto an
+	// existing flag's line, quoted, or placed immediately before a shell
+	// separator such as `;`).
 	globalOffsets := findForceConflictsOccurrences(stripped)
-
-	blockTotal := 0
-	for _, r := range blockRanges {
-		block := stripped[r[0]:r[1]]
-		hasServerSide := strings.Contains(block, "--server-side")
-		hasDryRunServer := strings.Contains(block, "--dry-run=server")
-		if hasServerSide != hasDryRunServer {
-			return fmt.Errorf("kubectl apply invocation mixes --server-side and --dry-run=server inconsistently:\n%s", block)
-		}
-		if !hasServerSide {
-			return fmt.Errorf("found a kubectl apply invocation that is not a --server-side --dry-run=server validation call:\n%s", block)
-		}
-		occurrences := 0
-		for _, offset := range globalOffsets {
-			if offset >= r[0] && offset < r[1] {
-				occurrences++
-			}
-		}
-		if occurrences != 1 {
-			return fmt.Errorf("server-side dry-run validation call must carry --force-conflicts exactly once (found %d):\n%s", occurrences, block)
-		}
-		blockTotal += occurrences
+	if len(globalOffsets) != 1 {
+		return fmt.Errorf("found %d --force-conflicts occurrence(s) in deploy.sh but exactly 1 is expected (inside %s()); --force-conflicts must never appear on any other command (e.g. a mutating kubectl patch/set/delete or helm upgrade)", len(globalOffsets), kubectlServerApplyDryRunFunctionName)
+	}
+	if globalOffsets[0] < start || globalOffsets[0] >= end {
+		return fmt.Errorf("the single --force-conflicts occurrence in deploy.sh is not inside %s()", kubectlServerApplyDryRunFunctionName)
 	}
 
-	if len(globalOffsets) != blockTotal {
-		return fmt.Errorf("found %d --force-conflicts occurrence(s) in deploy.sh but only %d are inside the 3 known server-side dry-run validation calls; --force-conflicts must never appear on any other command (e.g. a mutating kubectl patch/set/delete or helm upgrade)", len(globalOffsets), blockTotal)
+	// Every known validation call site must reach the centralizing helper
+	// exactly once, and the helper must not be reachable from anywhere
+	// else in the file (in particular not from a mutating function).
+	totalCalls := 0
+	for _, caller := range forceConflictsValidationCallers {
+		callerBody, _, _, err := extractFunctionBody(stripped, caller)
+		if err != nil {
+			return err
+		}
+		calls := countLinesWithPrefix(callerBody, kubectlServerApplyDryRunFunctionName+" ")
+		if calls != 1 {
+			return fmt.Errorf("%s() must call %s() exactly once (found %d call(s))", caller, kubectlServerApplyDryRunFunctionName, calls)
+		}
+		totalCalls += calls
+	}
+	if n := countLinesWithPrefix(stripped, kubectlServerApplyDryRunFunctionName+" "); n != totalCalls {
+		return fmt.Errorf("found %d call(s) to %s() in deploy.sh but only %d are inside the %d known validation-only callers; it must never be reachable from any other function (e.g. a mutating one)", n, kubectlServerApplyDryRunFunctionName, totalCalls, len(forceConflictsValidationCallers))
 	}
 	return nil
 }
@@ -1107,10 +1228,11 @@ func TestDeployScriptForceConflictsInvariantDetectsMutatingLeakage(t *testing.T)
 
 // TestDeployScriptForceConflictsInvariantDetectsRemoval proves the same
 // static invariant fails closed the other direction too: removing
-// --force-conflicts from any one of the three legitimate validation call
-// sites (the same mutation TestDeployScriptForceConflictsIsLoadBearing uses
-// to prove the runtime behavior is load-bearing) must also be caught
-// statically, without needing to actually execute the script.
+// --force-conflicts from the single centralizing helper that all three
+// validation call sites depend on (the same mutation
+// TestDeployScriptForceConflictsIsLoadBearing uses to prove the runtime
+// behavior is load-bearing) must also be caught statically, without needing
+// to actually execute the script.
 func TestDeployScriptForceConflictsInvariantDetectsRemoval(t *testing.T) {
 	originalBytes, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
 	if err != nil {
@@ -1118,17 +1240,154 @@ func TestDeployScriptForceConflictsInvariantDetectsRemoval(t *testing.T) {
 	}
 	original := string(originalBytes)
 
-	for _, functionName := range []string{
-		"validate_upgrade_hooks",
-		"server_validate_candidate",
-		"canonicalize_server_candidate",
-	} {
-		t.Run(functionName, func(t *testing.T) {
-			mutated := stripForceConflictsFromFunction(t, original, functionName)
+	mutated := stripForceConflictsFromFunction(t, original, kubectlServerApplyDryRunFunctionName)
+	if err := checkForceConflictsInvariant(mutated); err == nil {
+		t.Fatalf("invariant did not detect --force-conflicts removed from %s()", kubectlServerApplyDryRunFunctionName)
+	}
+}
+
+// sabotageDryRunDowngradeWithDecoy returns a copy of the real deploy.sh with
+// the centralizing helper's real --dry-run=server flag downgraded to
+// --dry-run=none (which would make kubectl perform a real, mutating,
+// --force-conflicts server-side apply against live production objects),
+// plus a decoy "--dry-run=server" substring glued onto other, unrelated
+// text - reproducing the exact structural attack the final independent
+// review identified: a naive substring scan (or a test harness that joins
+// argv into one string and substring-matches it) can be fooled into
+// believing the safe flag is present, even though the real, effective
+// --dry-run value is not "server". decoyIn selects where the decoy is
+// hidden: "field-manager" (the reviewer's exact reported shape - glued onto
+// the field-manager argument at the candidate call site, with no space, so
+// it becomes one distinct-but-different argv token such as
+// "crucible-production-deploy--dry-run=server"), "filename" (glued onto the
+// manifest path argument instead), or "comment" (placed on its own comment
+// line immediately next to the corrupted flag, inside the helper itself -
+// proving comment-stripping means it can never rescue the invariant).
+func sabotageDryRunDowngradeWithDecoy(t *testing.T, source, decoyIn string) string {
+	t.Helper()
+	const realFlagLine = "    --dry-run=server \\\n"
+	if n := strings.Count(source, realFlagLine); n != 1 {
+		t.Fatalf("expected exactly one occurrence of the real --dry-run=server flag line, found %d", n)
+	}
+	const callSite = `  kubectl_server_apply_dry_run crucible-production-deploy "$manifest" yaml > "$output"` + "\n"
+	if n := strings.Count(source, callSite); n != 1 {
+		t.Fatalf("expected exactly one occurrence of the candidate call site, found %d", n)
+	}
+
+	var mutated string
+	switch decoyIn {
+	case "field-manager":
+		mutated = strings.Replace(source, realFlagLine, "    --dry-run=none \\\n", 1)
+		mutated = strings.Replace(mutated, callSite,
+			"  kubectl_server_apply_dry_run crucible-production-deploy--dry-run=server \"$manifest\" yaml > \"$output\"\n", 1)
+	case "filename":
+		mutated = strings.Replace(source, realFlagLine, "    --dry-run=none \\\n", 1)
+		mutated = strings.Replace(mutated, callSite,
+			"  kubectl_server_apply_dry_run crucible-production-deploy \"$manifest--dry-run=server\" yaml > \"$output\"\n", 1)
+	case "comment":
+		mutated = strings.Replace(source, realFlagLine,
+			"    --dry-run=none \\\n    # --dry-run=server intentionally preserved for compatibility\n", 1)
+	default:
+		t.Fatalf("unknown decoyIn %q", decoyIn)
+	}
+	if mutated == source {
+		t.Fatal("sabotage mutation had no effect")
+	}
+	return mutated
+}
+
+// TestDeployScriptForceConflictsInvariantDetectsDryRunDowngradeWithDecoy is
+// the final independent review's exact structural sabotage: the real,
+// effective --dry-run flag value is silently downgraded from "server" to
+// "none" (which would make kubectl perform a real, mutating,
+// --force-conflicts server-side apply against live production objects),
+// while a decoy "--dry-run=server" substring is glued onto unrelated nearby
+// text so a naive substring-scan invariant (or a test harness that joins
+// argv into one string and substring-matches it) is fooled into believing
+// the safe flag is still present. checkForceConflictsInvariant must not be
+// satisfied by any of these decoy placements, because it requires the
+// centralizing helper's --dry-run= line to be its own complete, exact,
+// byte-for-byte line - never a substring embedded in a different flag's
+// value, a different argument's value, or a comment.
+func TestDeployScriptForceConflictsInvariantDetectsDryRunDowngradeWithDecoy(t *testing.T) {
+	originalBytes, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := string(originalBytes)
+	if err := checkForceConflictsInvariant(original); err != nil {
+		t.Fatalf("precondition failed: unmodified deploy.sh must satisfy the invariant: %v", err)
+	}
+
+	for _, decoyIn := range []string{"field-manager", "filename", "comment"} {
+		t.Run(decoyIn, func(t *testing.T) {
+			mutated := sabotageDryRunDowngradeWithDecoy(t, original, decoyIn)
 			if err := checkForceConflictsInvariant(mutated); err == nil {
-				t.Fatalf("invariant did not detect --force-conflicts removed from %s()", functionName)
+				t.Fatalf("invariant did not detect --dry-run=server downgraded to --dry-run=none with a decoy hidden in the %s", decoyIn)
 			}
 		})
+	}
+}
+
+// TestDeployScriptDryRunDowngradeWithDecoyFailsAtRuntime is the runtime
+// counterpart of the static test above: it actually executes the
+// reviewer's exact sabotage (real --dry-run flag downgraded to "none", with
+// a decoy "--dry-run=server" glued onto the field-manager argument) through
+// the fake-kubectl test harness, and proves the harness's own exact-argv
+// safety sentinel (the "FAKE KUBECTL SAFETY VIOLATION" check in the apply)
+// case) fires and aborts the run, independent of the static Go-side
+// invariant entirely. This proves the fix is not merely a source-text
+// lint: even if a sabotaged deploy.sh somehow slipped past the static
+// check, this specific decoy shape would still be caught the moment it
+// actually executes, because kubectl (and this fake) parses
+// --field-manager=X--dry-run=server as one distinct, non-matching argv
+// token - never as a --dry-run=server flag.
+func TestDeployScriptDryRunDowngradeWithDecoyFailsAtRuntime(t *testing.T) {
+	requirePOSIXShell(t)
+	originalBytes, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := string(originalBytes)
+	mutated := sabotageDryRunDowngradeWithDecoy(t, original, "field-manager")
+
+	// The sabotaged copy must live alongside the real deploy.sh (not an
+	// isolated temp dir) because deploy.sh locates the Helm chart via a
+	// path relative to its own script directory
+	// ($SCRIPT_DIR/../helm/selfservice); only the repo's deploy/scripts/
+	// directory has that chart as a real sibling.
+	scriptPath := filepath.Join("..", "..", "deploy", "scripts", "deploy-sabotaged-dry-run-decoy-test.sh")
+	if err := os.WriteFile(scriptPath, []byte(mutated), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(scriptPath) })
+
+	live := baselineManifest(true, "", "false")
+	candidate := baselineManifest(true, "*", "false")
+	env := newDeployScriptEnvironment(t, live, candidate)
+	env.scriptPath = scriptPath
+	// Deliberately do NOT write env.upgradeHookManifest: validate_upgrade_hooks
+	// early-returns (`[ ! -s "$unpinned_hooks" ]`) when there are no rendered
+	// upgrade hooks, without ever calling kubectl_server_apply_dry_run. That
+	// keeps this test's first (and only) real kubectl invocation the
+	// server_validate_candidate call - the exact call site the "field-manager"
+	// decoy was planted on - rather than validate_upgrade_hooks's own,
+	// undecorated call, which (since the corrupted --dry-run flag lives in
+	// the one shared helper) would otherwise trip the safety sentinel first
+	// and make this test pass for the wrong reason, without ever exercising
+	// the decoy shape it claims to prove.
+	output, runErr := env.run("--no-pull", "--dry-run")
+	if runErr == nil {
+		t.Fatalf("sabotaged dry-run-downgrade-with-decoy script unexpectedly succeeded:\n%s", output)
+	}
+	if !strings.Contains(string(output), "FAKE KUBECTL SAFETY VIOLATION") {
+		t.Fatalf("sabotaged run did not trip the fake kubectl's exact-argv safety sentinel:\n%s", output)
+	}
+	if !strings.Contains(string(output), "crucible-production-deploy--dry-run=server") {
+		t.Fatalf("sabotaged run's safety violation did not originate from the decoy-bearing server_validate_candidate call site:\n%s", output)
+	}
+	if upgradeBody, readErr := os.ReadFile(env.upgradeLog); readErr == nil && len(upgradeBody) > 0 {
+		t.Fatalf("sabotaged script invoked Helm upgrade despite failing validation: %s", upgradeBody)
 	}
 }
 
@@ -1170,10 +1429,10 @@ func TestDeployScriptServerValidationSucceedsUnderRealisticOwnershipConflicts(t 
 }
 
 // TestDeployScriptForceConflictsIsLoadBearing proves --force-conflicts is
-// not decorative: removing it from any one of the three server-side
-// dry-run validation call sites, in isolation, causes deploy.sh to fail
-// under a realistic ownership conflict against existing Helm-owned
-// objects, exactly as production would without this fix.
+// not decorative: removing it from the single centralizing helper that all
+// three server-side dry-run validation call sites depend on causes
+// deploy.sh to fail under a realistic ownership conflict against existing
+// Helm-owned objects, exactly as production would without this fix.
 func TestDeployScriptForceConflictsIsLoadBearing(t *testing.T) {
 	requirePOSIXShell(t)
 	originalBytes, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
@@ -1182,58 +1441,50 @@ func TestDeployScriptForceConflictsIsLoadBearing(t *testing.T) {
 	}
 	original := string(originalBytes)
 
-	for _, functionName := range []string{
-		"validate_upgrade_hooks",
-		"server_validate_candidate",
-		"canonicalize_server_candidate",
-	} {
-		t.Run(functionName, func(t *testing.T) {
-			mutated := stripForceConflictsFromFunction(t, original, functionName)
-			// The sabotaged copy must live alongside the real deploy.sh (not
-			// an isolated temp dir) because deploy.sh locates the Helm chart
-			// via a path relative to its own script directory
-			// ($SCRIPT_DIR/../helm/selfservice); only the repo's deploy/scripts/
-			// directory has that chart as a real sibling.
-			scriptPath := filepath.Join(
-				"..", "..", "deploy", "scripts",
-				"deploy-sabotaged-"+strings.ReplaceAll(functionName, "_", "-")+"-test.sh",
-			)
-			if err := os.WriteFile(scriptPath, []byte(mutated), 0o755); err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { os.Remove(scriptPath) })
+	mutated := stripForceConflictsFromFunction(t, original, kubectlServerApplyDryRunFunctionName)
+	// The sabotaged copy must live alongside the real deploy.sh (not an
+	// isolated temp dir) because deploy.sh locates the Helm chart via a
+	// path relative to its own script directory
+	// ($SCRIPT_DIR/../helm/selfservice); only the repo's deploy/scripts/
+	// directory has that chart as a real sibling.
+	scriptPath := filepath.Join(
+		"..", "..", "deploy", "scripts",
+		"deploy-sabotaged-"+strings.ReplaceAll(kubectlServerApplyDryRunFunctionName, "_", "-")+"-test.sh",
+	)
+	if err := os.WriteFile(scriptPath, []byte(mutated), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(scriptPath) })
 
-			live := baselineManifest(true, "", "false")
-			candidate := baselineManifest(true, "*", "false")
-			env := newDeployScriptEnvironment(t, live, candidate)
-			env.scriptPath = scriptPath
-			env.simulateOwnershipConflict = true
-			writeFile(t, env.upgradeHookManifest, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestB))
+	live := baselineManifest(true, "", "false")
+	candidate := baselineManifest(true, "*", "false")
+	env := newDeployScriptEnvironment(t, live, candidate)
+	env.scriptPath = scriptPath
+	env.simulateOwnershipConflict = true
+	writeFile(t, env.upgradeHookManifest, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestB))
 
-			output, runErr := env.run("--no-pull", "--dry-run")
-			if runErr == nil {
-				t.Fatalf("sabotaged %s (missing --force-conflicts) unexpectedly succeeded under a realistic ownership conflict:\n%s", functionName, output)
-			}
-			if !strings.Contains(string(output), "conflict") {
-				t.Fatalf("sabotaged %s failure did not surface the expected ownership-conflict error:\n%s", functionName, output)
-			}
-			if upgradeBody, readErr := os.ReadFile(env.upgradeLog); readErr == nil && len(upgradeBody) > 0 {
-				t.Fatalf("sabotaged %s invoked Helm upgrade despite failing validation: %s", functionName, upgradeBody)
-			}
-		})
+	output, runErr := env.run("--no-pull", "--dry-run")
+	if runErr == nil {
+		t.Fatalf("sabotaged %s (missing --force-conflicts) unexpectedly succeeded under a realistic ownership conflict:\n%s", kubectlServerApplyDryRunFunctionName, output)
+	}
+	if !strings.Contains(string(output), "conflict") {
+		t.Fatalf("sabotaged %s failure did not surface the expected ownership-conflict error:\n%s", kubectlServerApplyDryRunFunctionName, output)
+	}
+	if upgradeBody, readErr := os.ReadFile(env.upgradeLog); readErr == nil && len(upgradeBody) > 0 {
+		t.Fatalf("sabotaged %s invoked Helm upgrade despite failing validation: %s", kubectlServerApplyDryRunFunctionName, upgradeBody)
 	}
 }
 
 // TestDeployScriptForceConflictsInvariantDetectsNeuteredAssignment proves
-// the invariant is not satisfied by a disguised removal: rewriting a
-// legitimate "--force-conflicts \" line to "--force-conflicts=false \" (or
-// "=true") still contains the literal substring "--force-conflicts", but
-// "false" is kubectl's default for this boolean flag, so the assignment
-// form is functionally identical to omitting the flag - and "=true", while
-// functionally equivalent to the bare flag, is not the exact form this
-// script is required to use. Either mutation must be caught exactly like an
-// outright removal, not silently accepted because the substring is still
-// present somewhere in the line.
+// the invariant is not satisfied by a disguised removal: rewriting the
+// centralizing helper's legitimate "--force-conflicts \" line to
+// "--force-conflicts=false \" (or "=true") still contains the literal
+// substring "--force-conflicts", but "false" is kubectl's default for this
+// boolean flag, so the assignment form is functionally identical to
+// omitting the flag - and "=true", while functionally equivalent to the
+// bare flag, is not the exact form this script is required to use. Either
+// mutation must be caught exactly like an outright removal, not silently
+// accepted because the substring is still present somewhere in the line.
 func TestDeployScriptForceConflictsInvariantDetectsNeuteredAssignment(t *testing.T) {
 	originalBytes, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
 	if err != nil {
@@ -1241,19 +1492,13 @@ func TestDeployScriptForceConflictsInvariantDetectsNeuteredAssignment(t *testing
 	}
 	original := string(originalBytes)
 
-	for _, functionName := range []string{
-		"validate_upgrade_hooks",
-		"server_validate_candidate",
-		"canonicalize_server_candidate",
-	} {
-		for _, value := range []string{"false", "true"} {
-			t.Run(functionName+"_assigned_"+value, func(t *testing.T) {
-				mutated := assignForceConflictsInFunction(t, original, functionName, value)
-				if err := checkForceConflictsInvariant(mutated); err == nil {
-					t.Fatalf("invariant did not detect --force-conflicts=%s replacing the bare flag in %s()", value, functionName)
-				}
-			})
-		}
+	for _, value := range []string{"false", "true"} {
+		t.Run(kubectlServerApplyDryRunFunctionName+"_assigned_"+value, func(t *testing.T) {
+			mutated := assignForceConflictsInFunction(t, original, kubectlServerApplyDryRunFunctionName, value)
+			if err := checkForceConflictsInvariant(mutated); err == nil {
+				t.Fatalf("invariant did not detect --force-conflicts=%s replacing the bare flag in %s()", value, kubectlServerApplyDryRunFunctionName)
+			}
+		})
 	}
 }
 
@@ -2188,17 +2433,53 @@ case "$1" in
     ;;
   apply)
     printf '%s\n' "$*" >> "$FAKE_SERVER_DRY_RUN_LOG"
+    # Parse the exact argv tokens actual kubectl would receive - never "$*"
+    # substring matching, which a decoy value glued onto another flag (for
+    # example --field-manager=X--dry-run=server, while the real --dry-run
+    # value is actually "none") could satisfy even though the real flag is
+    # unsafe. Every comparison below is against one exact, whole argv
+    # element, exactly as bash itself would have split it.
+    has_server_side=false
+    has_dry_run_server=false
+    has_force_conflicts=false
+    output_format=
+    manifest=
+    prev=
+    for arg in "$@"; do
+      case "$prev" in
+        -f) manifest=$arg ;;
+        -o) output_format=$arg ;;
+      esac
+      case "$arg" in
+        --server-side) has_server_side=true ;;
+        --dry-run=server) has_dry_run_server=true ;;
+        --force-conflicts) has_force_conflicts=true ;;
+      esac
+      prev=$arg
+    done
+    # Fake-kubectl safety sentinel, not merely a test-only assertion: any
+    # invocation that carries --force-conflicts without an exact,
+    # unadulterated --dry-run=server argv token has exactly the shape of a
+    # real, mutating, force-conflicts server-side apply against production -
+    # the one thing this whole change must never do. Fail loudly and
+    # distinctly here (rather than silently proceeding as if it were the
+    # intended validation-only call) so a sabotaged deploy.sh is caught the
+    # moment it actually runs, independent of any static source-text check.
+    if [ "$has_force_conflicts" = true ] && [ "$has_dry_run_server" != true ]; then
+      echo "FAKE KUBECTL SAFETY VIOLATION: --force-conflicts without an exact --dry-run=server argv token (has_server_side=$has_server_side); this is exactly the shape of a real, mutating apply in production: $*" >&2
+      exit 87
+    fi
     dry_run_count=$(grep -c -- '-o yaml' "$FAKE_SERVER_DRY_RUN_LOG" || true)
     if [ "$FAKE_FAIL_FINAL_SERVER_DRY_RUN" = true ] &&
-       [[ "$*" == *"-o yaml"* ]] &&
+       [ "$output_format" = yaml ] &&
        [ "$dry_run_count" -ge 2 ]; then
       echo "sabotaged final server-side dry-run failure" >&2
       exit 95
     fi
     if [ "$FAKE_SIMULATE_OWNERSHIP_CONFLICT" = true ] &&
-       [[ "$*" == *"--server-side"* ]] &&
-       [[ "$*" == *"--dry-run=server"* ]] &&
-       [[ "$*" != *"--force-conflicts"* ]]; then
+       [ "$has_server_side" = true ] &&
+       [ "$has_dry_run_server" = true ] &&
+       [ "$has_force_conflicts" != true ]; then
       echo "error: Apply failed with 1 conflict: conflict with \"helm\" using apps/v1: .spec.replicas" >&2
       echo "Please review the fields above--they currently have other managers. Here" >&2
       echo "are the ways you can resolve this warning:" >&2
@@ -2206,16 +2487,8 @@ case "$1" in
       echo "  command with the --force-conflicts flag." >&2
       exit 1
     fi
-    manifest=
-    while [ "$#" -gt 0 ]; do
-      if [ "$1" = "-f" ]; then
-        manifest=$2
-        break
-      fi
-      shift
-    done
     [ -n "$manifest" ]
-    if [[ "$*" == *"-o json"* ]]; then
+    if [ "$output_format" = json ]; then
       resource=$(awk '
         /^kind:[[:space:]]*/ {
           kind = $0
