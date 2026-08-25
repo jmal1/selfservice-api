@@ -1637,7 +1637,7 @@ case "$1" in
     elif [[ "$*" == *"FROM jobs"* ]]; then
       printf '%s\n' "$FAKE_ACTIVE_JOBS"
     else
-      printf '35:false\n'
+      printf '36:false\n'
     fi
     ;;
   create)
