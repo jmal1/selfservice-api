@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"net/http"
 	"os"
 	"strings"
 	"testing"
@@ -428,6 +430,87 @@ func TestResolveMode_DefaultAndJanitorStillBehave(t *testing.T) {
 				t.Errorf("lifecycleEnabled = %v, want %v", m.lifecycleEnabled, tt.wantLifecycle)
 			}
 		})
+	}
+}
+
+func TestProducerCoverageChecks_TracksBothExpectedProducers(t *testing.T) {
+	checks := producerCoverageChecks(false, true)
+	if len(checks) != 2 {
+		t.Fatalf("producerCoverageChecks returned %d checks, want 2", len(checks))
+	}
+	if checks[0].Name() != "pod_lifecycle_enabled" || checks[1].Name() != "runner_smoke_enabled" {
+		t.Fatalf("producerCoverageChecks returned %q then %q, want pod_lifecycle_enabled then runner_smoke_enabled",
+			checks[0].Name(), checks[1].Name())
+	}
+}
+
+func TestProducerCoverageChecks_AlertWhenDisabled(t *testing.T) {
+	tests := []struct {
+		name    string
+		check   synthetic.Check
+		wantErr string
+	}{
+		{
+			name:    "pod lifecycle disabled",
+			check:   checks.PodLifecycleEnabled(checks.CoverageConfig{Enabled: false}),
+			wantErr: "SYNTHETIC_LIFECYCLE_ENABLED=false",
+		},
+		{
+			name:    "runner smoke disabled",
+			check:   checks.RunnerSmokeEnabled(checks.CoverageConfig{Enabled: false}),
+			wantErr: "SYNTHETIC_RUNNER_EXPECTED_ENABLED=false",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			status, err := tc.check.Run(context.Background(), synthetic.NewClient("http://x", ""))
+			if err == nil {
+				t.Fatal("expected coverage check to fail when disabled")
+			}
+			if status != http.StatusServiceUnavailable {
+				t.Fatalf("status=%d, want 503", status)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error %q does not contain %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestProducerCoverageChecks_PassWhenEnabled(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		check synthetic.Check
+	}{
+		{"pod lifecycle enabled", checks.PodLifecycleEnabled(checks.CoverageConfig{Enabled: true})},
+		{"runner smoke enabled", checks.RunnerSmokeEnabled(checks.CoverageConfig{Enabled: true})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status, err := tc.check.Run(context.Background(), synthetic.NewClient("http://x", ""))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if status != http.StatusOK {
+				t.Fatalf("status=%d, want 200", status)
+			}
+		})
+	}
+}
+
+func TestProducerCoverageChecks_AreWiredInMain(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	body := string(src)
+	for _, want := range []string{
+		"for _, check := range producerCoverageChecks(mode.lifecycleEnabled, expectedRunnerEnabled) {",
+		"checks.PodLifecycleEnabled(checks.CoverageConfig{Enabled: lifecycleEnabled})",
+		"checks.RunnerSmokeEnabled(checks.CoverageConfig{Enabled: runnerEnabled})",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("main.go is missing %q; producer coverage wiring is not being registered in production", want)
+		}
 	}
 }
 

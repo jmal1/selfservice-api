@@ -417,6 +417,8 @@ func TestEnvFromManifestScalarAndBooleanValues(t *testing.T) {
           value: "ghcr.io/jmal1/selfservice-crucible-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         - name: SYNTHETIC_LIFECYCLE_ENABLED
           value: "false"
+        - name: SYNTHETIC_RUNNER_EXPECTED_ENABLED
+          value: "true"
 `
 	for _, tc := range []struct {
 		variable string
@@ -425,6 +427,7 @@ func TestEnvFromManifestScalarAndBooleanValues(t *testing.T) {
 		{"WORKER_PROVISIONING_CLAIMS_ENABLED", "true"},
 		{"RUNNER_IMAGE", "ghcr.io/jmal1/selfservice-crucible-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 		{"SYNTHETIC_LIFECYCLE_ENABLED", "false"},
+		{"SYNTHETIC_RUNNER_EXPECTED_ENABLED", "true"},
 	} {
 		value, code, output := runEnvFromManifest(t, tc.variable, manifest)
 		if code != 0 {

@@ -295,6 +295,8 @@ func TestChartWiresEveryProvisioningControl(t *testing.T) {
 		"synthetic-cronjob.yaml": {
 			"SYNTHETIC_PROVISIONING_EXPECTED_ENABLED",
 			".Values.synthetic.provisioningExpectedEnabled",
+			"SYNTHETIC_RUNNER_EXPECTED_ENABLED",
+			".Values.synthetic.runner.enabled",
 		},
 	}
 	for name, fragments := range files {
@@ -441,6 +443,58 @@ func TestSyntheticCronJobLifecycleEnabledRendersAcrossOverlays(t *testing.T) {
 		wantLine := `value: "` + wantValue + `"`
 		if !strings.Contains(rest, wantLine) {
 			t.Fatalf("overlay %q rendered SYNTHETIC_LIFECYCLE_ENABLED with %q, want %q", overlay, strings.TrimSpace(rest), wantLine)
+		}
+	}
+
+	assertExactlyOne(t, render("values.prod.yaml"), "values.prod.yaml", "false")
+	assertExactlyOne(t, render("values.full-fleet.yaml"), "values.full-fleet.yaml", "true")
+}
+
+func TestSyntheticCronJobRunnerExpectedEnabledRendersAcrossOverlays(t *testing.T) {
+	helmPath, err := exec.LookPath("helm")
+	if err != nil {
+		t.Skip("helm not available")
+	}
+	chartDir := filepath.Join("..", "..", "deploy", "helm", "selfservice")
+	if _, err := os.Stat(filepath.Join(chartDir, "charts")); err != nil {
+		t.Skip("chart dependencies not vendored; run `helm dependency build` in deploy/helm/selfservice first")
+	}
+
+	render := func(overlay string) string {
+		t.Helper()
+		args := []string{"template", "selfservice", ".", "-f", "values.yaml"}
+		if overlay != "" {
+			args = append(args, "-f", overlay)
+		}
+		args = append(args, "--show-only", "templates/synthetic-cronjob.yaml")
+		cmd := exec.Command(helmPath, args...)
+		cmd.Dir = chartDir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("helm template (overlay=%q) failed: %v\n%s", overlay, err, out)
+		}
+		return string(out)
+	}
+
+	assertExactlyOne := func(t *testing.T, rendered, overlay, wantValue string) {
+		t.Helper()
+		const nameLine = "- name: SYNTHETIC_RUNNER_EXPECTED_ENABLED"
+		if n := strings.Count(rendered, nameLine); n != 1 {
+			t.Fatalf("overlay %q rendered SYNTHETIC_RUNNER_EXPECTED_ENABLED %d times, want exactly 1:\n%s", overlay, n, rendered)
+		}
+		idx := strings.Index(rendered, nameLine)
+		line := rendered[idx:]
+		if nl := strings.IndexByte(line, '\n'); nl != -1 {
+			line = line[:nl]
+		}
+		valueLineStart := idx + len(line) + 1
+		rest := rendered[valueLineStart:]
+		if nl := strings.IndexByte(rest, '\n'); nl != -1 {
+			rest = rest[:nl]
+		}
+		wantLine := `value: "` + wantValue + `"`
+		if !strings.Contains(rest, wantLine) {
+			t.Fatalf("overlay %q rendered SYNTHETIC_RUNNER_EXPECTED_ENABLED with %q, want %q", overlay, strings.TrimSpace(rest), wantLine)
 		}
 	}
 

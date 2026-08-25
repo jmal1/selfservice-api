@@ -80,6 +80,9 @@ const (
 	// envLifecycleRetryBackoff overrides the default 30s pause between
 	// pod_lifecycle retry attempts.
 	envLifecycleRetryBackoff = "SYNTHETIC_LIFECYCLE_RETRY_BACKOFF"
+	// envRunnerExpectedEnabled is the chart-controlled source of truth for
+	// whether the main monitor should emit the runner_smoke coverage signal.
+	envRunnerExpectedEnabled = "SYNTHETIC_RUNNER_EXPECTED_ENABLED"
 
 	// envJanitorMode, when truthy, replaces the entire check set with the
 	// single synthetic_janitor check. This is the standalone defense-in-depth
@@ -229,6 +232,10 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	expectedRunnerEnabled, err := strictEnvBool(os.Getenv, envRunnerExpectedEnabled, false)
+	if err != nil {
+		return err
+	}
 	activeChecks := checks.All()
 	if !expectedProvisioning {
 		activeChecks = checks.ReadOnly()
@@ -239,6 +246,11 @@ func run(logger *slog.Logger) error {
 	activeChecks = replaceCheck(activeChecks, checks.TemplateVisibilityEnforced(checks.TemplateVisibilityConfig{
 		ProvisioningEnabled: expectedProvisioning,
 	}))
+	if mode.kind == modeDefault {
+		for _, check := range producerCoverageChecks(mode.lifecycleEnabled, expectedRunnerEnabled) {
+			activeChecks = replaceCheck(activeChecks, check)
+		}
+	}
 	maxGeneratedRules := 256
 	if v := os.Getenv(envContentFilterMaxRules); v != "" {
 		maxGeneratedRules, err = strconv.Atoi(v)
@@ -888,6 +900,13 @@ func replaceCheck(all []synthetic.Check, replacement synthetic.Check) []syntheti
 		}
 	}
 	return append(all, replacement)
+}
+
+func producerCoverageChecks(lifecycleEnabled, runnerEnabled bool) []synthetic.Check {
+	return []synthetic.Check{
+		checks.PodLifecycleEnabled(checks.CoverageConfig{Enabled: lifecycleEnabled}),
+		checks.RunnerSmokeEnabled(checks.CoverageConfig{Enabled: runnerEnabled}),
+	}
 }
 
 func strictEnvBool(getenv func(string) string, key string, fallback bool) (bool, error) {
