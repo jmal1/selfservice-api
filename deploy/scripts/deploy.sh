@@ -2059,16 +2059,52 @@ server_validate_candidate() {
   local expected_map=$2
   local output=$3
   local canonical_output=$4
+  local document_dir="$output.documents"
+  local document
   echo "==> server-side dry-run validating the exact digest-pinned candidate"
-  # See kubectl_server_apply_dry_run for why --force-conflicts is paired
-  # inseparably with --dry-run=server: the existing production objects
-  # (ingress, workload images/env/resources, StatefulSet
-  # volumeClaimTemplates, CronJob fields) are owned by Helm/kubectl-set, so
-  # a validation-only SSA dry-run must be allowed to take ownership to prove
-  # admission/defaulting would succeed. The real apply remains
-  # `helm upgrade`, not this kubectl apply, so this never mutates anything
-  # or changes production's actual field ownership.
-  kubectl_server_apply_dry_run crucible-production-deploy "$manifest" yaml > "$output"
+  # `kubectl apply -f <multi-document-manifest> -o yaml` does not return
+  # `---`-separated top-level documents the way the input was written: it
+  # collapses every applied object into one `apiVersion: v1, kind: List`
+  # wrapper with the individual objects nested under `items:`. This script's
+  # manifest_workload_inventory only ever recognizes a document's own
+  # top-level (unindented) `kind:` line, so it cannot see a Deployment,
+  # DaemonSet, CronJob, etc. nested inside a List's `items:` - it silently
+  # produces an empty inventory, and require_core_workloads then fails with
+  # "missing image inventory for required chart workload ...". This is
+  # reproduced independently against live k3s, not merely inferred.
+  #
+  # The fix is to never hand kubectl a multi-document `-f` input for `-o
+  # yaml` here: split the exact rendered candidate into its individual
+  # documents (the same split_manifest_documents used by
+  # canonicalize_server_candidate below), run the dry-run apply one document
+  # at a time so kubectl always returns one plain top-level object per call,
+  # and reassemble those server-defaulted objects into a `---`-separated
+  # multi-document manifest ourselves before handing it to
+  # validate_candidate_manifest. Running the per-document dry-run again here
+  # (rather than only in canonicalize_server_candidate) duplicates work, but
+  # keeps this function's inventory/digest validation and the canonical
+  # comparison independent, exact-equality checks.
+  rm -rf "$document_dir"
+  if ! split_manifest_documents "$manifest" "$document_dir"; then
+    echo "ERROR: candidate manifest has no YAML documents to server-side dry-run validate." >&2
+    rm -rf "$document_dir"
+    return 1
+  fi
+  : > "$output"
+  for document in "$document_dir"/*.yaml; do
+    # See kubectl_server_apply_dry_run for why --force-conflicts is paired
+    # inseparably with --dry-run=server, for the same reason as
+    # canonicalize_server_candidate below: this is a per-document
+    # validation-only SSA dry-run against already Helm-owned objects, not a
+    # mutating apply. This script runs under `set -euo pipefail` and this
+    # call is not guarded by `if`/`&&`/`||`, so a failure on any one
+    # document aborts the whole deploy immediately - this function's caller
+    # can never reach a partial $output, validate_candidate_manifest, or
+    # Helm with an incomplete candidate.
+    kubectl_server_apply_dry_run crucible-production-deploy "$document" yaml >> "$output"
+    printf -- '---\n' >> "$output"
+  done
+  rm -rf "$document_dir"
   validate_candidate_manifest "$output" "$expected_map" "$output.inventory"
   canonicalize_server_candidate "$manifest" "$canonical_output"
 }

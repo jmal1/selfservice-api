@@ -468,7 +468,7 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 					t.Fatalf("successful candidate did not use atomic Helm upgrade: err=%v body=%q", readErr, upgradeBody)
 				}
 				serverDryRuns, serverReadErr := os.ReadFile(env.serverDryRunLog)
-				if serverReadErr != nil || strings.Count(string(serverDryRuns), "-o yaml") != 2 {
+				if serverReadErr != nil || countLogicalServerValidations(t, serverDryRuns) != 2 {
 					t.Fatalf("candidate was not server-validated before and under the apply lock: err=%v log=%q", serverReadErr, serverDryRuns)
 				}
 				applied, appliedErr := os.ReadFile(env.appliedManifest)
@@ -521,13 +521,13 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 			}
 			if test.name == "final server dry run fails" {
 				serverDryRuns, serverReadErr := os.ReadFile(env.serverDryRunLog)
-				if serverReadErr != nil || strings.Count(string(serverDryRuns), "-o yaml") != 2 {
+				if serverReadErr != nil || countLogicalServerValidations(t, serverDryRuns) != 2 {
 					t.Fatalf("server sabotage did not reach the final under-lock dry-run: err=%v log=%q", serverReadErr, serverDryRuns)
 				}
 			}
 			if test.name == "final server object mutation" {
 				serverDryRuns, serverReadErr := os.ReadFile(env.serverDryRunLog)
-				if serverReadErr != nil || strings.Count(string(serverDryRuns), "-o yaml") != 2 {
+				if serverReadErr != nil || countLogicalServerValidations(t, serverDryRuns) != 2 {
 					t.Fatalf("server mutation did not reach the final canonical comparison: err=%v log=%q", serverReadErr, serverDryRuns)
 				}
 			}
@@ -764,7 +764,7 @@ func TestDeployScriptDryRunPrintsFinalCandidate(t *testing.T) {
 		t.Fatalf("dry-run mutated the temporary live claims override: %v", statErr)
 	}
 	serverDryRuns, serverReadErr := os.ReadFile(env.serverDryRunLog)
-	if serverReadErr != nil || strings.Count(string(serverDryRuns), "-o yaml") != 1 {
+	if serverReadErr != nil || countLogicalServerValidations(t, serverDryRuns) != 1 {
 		t.Fatalf("dry-run did not server-validate exactly once: err=%v log=%q", serverReadErr, serverDryRuns)
 	}
 }
@@ -963,6 +963,57 @@ func countLinesWithPrefix(body, prefix string) int {
 		if strings.HasPrefix(line, prefix) {
 			count++
 		}
+	}
+	return count
+}
+
+// splitDocumentFileNamePattern matches the numbered filenames
+// split_manifest_documents (deploy.sh) produces for each document of a
+// multi-document manifest it splits, e.g. "000001.yaml", "000002.yaml".
+var splitDocumentFileNamePattern = regexp.MustCompile(`^\d{6}\.yaml$`)
+
+// countLogicalServerValidations reports how many logical server-side
+// dry-run validation passes appear in a $FAKE_SERVER_DRY_RUN_LOG-shaped log
+// (one line per kubectl invocation, each line the space-joined argv).
+// server_validate_candidate now issues one "-o yaml" kubectl call per
+// document in the candidate manifest instead of one call for the whole
+// manifest - splitting multi-document input avoids kubectl's real
+// `List`-wrapping of multi-document "-o yaml" apply output (see the
+// comment on server_validate_candidate in deploy.sh) - so what used to be
+// exactly one logged "-o yaml" line per logical validation pass is now one
+// line per document in that pass. This counts only the first document of
+// each pass (a "-f" argument whose basename is exactly "000001.yaml") or an
+// unsplit direct file path (used by validate_upgrade_hooks, which is never
+// split), so callers can keep asserting a fixed number of logical
+// validation passes regardless of how many documents a candidate manifest
+// happens to render.
+func countLogicalServerValidations(t *testing.T, log []byte) int {
+	t.Helper()
+	count := 0
+	trimmed := strings.TrimRight(string(log), "\n")
+	if trimmed == "" {
+		return 0
+	}
+	for _, line := range strings.Split(trimmed, "\n") {
+		fields := strings.Fields(line)
+		isYAML := false
+		manifestPath := ""
+		for i, field := range fields {
+			if field == "-o" && i+1 < len(fields) && fields[i+1] == "yaml" {
+				isYAML = true
+			}
+			if field == "-f" && i+1 < len(fields) {
+				manifestPath = fields[i+1]
+			}
+		}
+		if !isYAML {
+			continue
+		}
+		base := filepath.Base(manifestPath)
+		if splitDocumentFileNamePattern.MatchString(base) && base != "000001.yaml" {
+			continue
+		}
+		count++
 	}
 	return count
 }
@@ -1387,7 +1438,7 @@ func sabotageDryRunDowngradeWithDecoy(t *testing.T, source, decoyIn string) stri
 	if n := strings.Count(source, realFlagLine); n != 1 {
 		t.Fatalf("expected exactly one occurrence of the real --dry-run=server flag line, found %d", n)
 	}
-	const callSite = `  kubectl_server_apply_dry_run crucible-production-deploy "$manifest" yaml > "$output"` + "\n"
+	const callSite = `    kubectl_server_apply_dry_run crucible-production-deploy "$document" yaml >> "$output"` + "\n"
 	if n := strings.Count(source, callSite); n != 1 {
 		t.Fatalf("expected exactly one occurrence of the candidate call site, found %d", n)
 	}
@@ -1397,11 +1448,11 @@ func sabotageDryRunDowngradeWithDecoy(t *testing.T, source, decoyIn string) stri
 	case "field-manager":
 		mutated = strings.Replace(source, realFlagLine, "    --dry-run=none \\\n", 1)
 		mutated = strings.Replace(mutated, callSite,
-			"  kubectl_server_apply_dry_run crucible-production-deploy--dry-run=server \"$manifest\" yaml > \"$output\"\n", 1)
+			"    kubectl_server_apply_dry_run crucible-production-deploy--dry-run=server \"$document\" yaml >> \"$output\"\n", 1)
 	case "filename":
 		mutated = strings.Replace(source, realFlagLine, "    --dry-run=none \\\n", 1)
 		mutated = strings.Replace(mutated, callSite,
-			"  kubectl_server_apply_dry_run crucible-production-deploy \"$manifest--dry-run=server\" yaml > \"$output\"\n", 1)
+			"    kubectl_server_apply_dry_run crucible-production-deploy \"$document--dry-run=server\" yaml >> \"$output\"\n", 1)
 	case "comment":
 		mutated = strings.Replace(source, realFlagLine,
 			"    --dry-run=none \\\n    # --dry-run=server intentionally preserved for compatibility\n", 1)
@@ -2119,6 +2170,199 @@ func TestDeployScriptServerValidationSucceedsUnderRealisticOwnershipConflicts(t 
 	}
 }
 
+// TestDeployScriptServerValidateCandidateHandlesListWrappedMultiDocumentOutput
+// is the regression test for the production incident this change fixes: a
+// real `kubectl apply --server-side --dry-run=server -f <multi-document
+// manifest> -o yaml` does not return the applied objects as `---`-separated
+// top-level documents - it collapses them into one `apiVersion: v1, kind:
+// List` wrapper with the individual objects nested under `items:`. Because
+// manifest_workload_inventory only recognizes a document's own top-level
+// (unindented) `kind:` line, handing it that List wrapper silently produces
+// an empty inventory and require_core_workloads then fails with "missing
+// image inventory for required chart workload ...", exactly as reported
+// independently against live k3s. The fake kubectl used by this whole test
+// file reproduces that exact List-wrapping behavior for any `-f` "-o yaml"
+// apply of a manifest with more than one YAML document (see the `apply)`
+// case's `-o yaml` branch), so baselineManifest - which always has multiple
+// Deployment/CronJob/DaemonSet documents - now exercises the real bug
+// whenever server_validate_candidate is handed the whole manifest in one
+// call. This test proves the actual fix (splitting into individual
+// documents before each dry-run call, then reassembling the results) lets a
+// realistic multi-document candidate validate and deploy successfully, with
+// every required workload present in the resulting inventory.
+func TestDeployScriptServerValidateCandidateHandlesListWrappedMultiDocumentOutput(t *testing.T) {
+	requirePOSIXShell(t)
+	live := baselineManifest(true, "", "false")
+	candidate := baselineManifest(true, "*", "false")
+	env := newDeployScriptEnvironment(t, live, candidate)
+	writeFile(t, env.upgradeHookManifest, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestB))
+
+	output, err := env.run("--no-pull")
+	if err != nil {
+		t.Fatalf("multi-document candidate validation unexpectedly failed: %v\n%s", err, output)
+	}
+	if strings.Contains(string(output), "missing image inventory") {
+		t.Fatalf("multi-document candidate hit the List-wrapping inventory bug:\n%s", output)
+	}
+	upgradeBody, readErr := os.ReadFile(env.upgradeLog)
+	if readErr != nil || !strings.Contains(string(upgradeBody), "--atomic") {
+		t.Fatalf("successful multi-document candidate did not use atomic Helm upgrade: err=%v body=%q", readErr, upgradeBody)
+	}
+
+	serverDryRuns, serverReadErr := os.ReadFile(env.serverDryRunLog)
+	if serverReadErr != nil {
+		t.Fatalf("could not read server dry-run log: %v", serverReadErr)
+	}
+	// The split must have actually happened: prove the log recorded more
+	// than one distinct per-document "-f" manifest path for "-o yaml"
+	// calls (not just one call against the whole candidate manifest).
+	documentPaths := map[string]bool{}
+	for _, line := range strings.Split(strings.TrimRight(string(serverDryRuns), "\n"), "\n") {
+		fields := strings.Fields(line)
+		isYAML := false
+		manifestPath := ""
+		for i, field := range fields {
+			if field == "-o" && i+1 < len(fields) && fields[i+1] == "yaml" {
+				isYAML = true
+			}
+			if field == "-f" && i+1 < len(fields) {
+				manifestPath = fields[i+1]
+			}
+		}
+		if isYAML && splitDocumentFileNamePattern.MatchString(filepath.Base(manifestPath)) {
+			documentPaths[manifestPath] = true
+		}
+	}
+	if len(documentPaths) < 2 {
+		t.Fatalf("expected server_validate_candidate to issue at least 2 distinct per-document dry-run calls for the multi-document candidate, saw %d:\n%s", len(documentPaths), serverDryRuns)
+	}
+
+	assertManifestImagesPinned(t, env.appliedManifest, testDigestB, testDigestB, env.extraRepository)
+	applied, appliedErr := os.ReadFile(env.appliedManifest)
+	if appliedErr != nil {
+		t.Fatalf("successful candidate did not persist applied manifest: %v", appliedErr)
+	}
+	for _, workload := range []string{
+		"name: selfservice-api",
+		"name: selfservice-worker",
+		"name: selfservice-engine",
+		"name: selfservice-ui",
+	} {
+		if !strings.Contains(string(applied), workload) {
+			t.Fatalf("applied manifest is missing required workload %q:\n%s", workload, applied)
+		}
+	}
+}
+
+// revertServerValidateCandidateToSingleCall returns a copy of source with
+// server_validate_candidate() rewritten to its pre-fix implementation,
+// which hands kubectl the whole candidate manifest in a single "-o yaml"
+// dry-run call instead of splitting it into individual documents first.
+// This is the exact shape of the bug this change fixes, and is used as the
+// load-bearing counterfactual: a caller relying on this function's fix must
+// fail exactly the way production did without it.
+func revertServerValidateCandidateToSingleCall(t *testing.T, source string) string {
+	t.Helper()
+	marker := "server_validate_candidate() {"
+	start := strings.Index(source, marker)
+	if start < 0 {
+		t.Fatal("could not locate server_validate_candidate() in deploy.sh")
+	}
+	relativeEnd := strings.Index(source[start:], "\n}\n")
+	if relativeEnd < 0 {
+		t.Fatal("could not locate end of server_validate_candidate() in deploy.sh")
+	}
+	end := start + relativeEnd + len("\n}\n")
+	const oldBody = `server_validate_candidate() {
+  local manifest=$1
+  local expected_map=$2
+  local output=$3
+  local canonical_output=$4
+  echo "==> server-side dry-run validating the exact digest-pinned candidate"
+  kubectl_server_apply_dry_run crucible-production-deploy "$manifest" yaml > "$output"
+  validate_candidate_manifest "$output" "$expected_map" "$output.inventory"
+  canonicalize_server_candidate "$manifest" "$canonical_output"
+}
+`
+	if source[start:end] == oldBody {
+		t.Fatal("server_validate_candidate() already matches the pre-fix single-call form; nothing to revert")
+	}
+	return source[:start] + oldBody + source[end:]
+}
+
+// TestDeployScriptServerValidateCandidateMultiDocumentSplitIsLoadBearing
+// proves the per-document split in server_validate_candidate is not
+// incidental: reverting it to the pre-fix single whole-manifest "-o yaml"
+// call reproduces the exact reported production failure ("missing image
+// inventory for required chart workload ...") against a realistic
+// multi-document candidate, and Helm is never invoked.
+func TestDeployScriptServerValidateCandidateMultiDocumentSplitIsLoadBearing(t *testing.T) {
+	requirePOSIXShell(t)
+	originalBytes, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := string(originalBytes)
+
+	mutated := revertServerValidateCandidateToSingleCall(t, original)
+	// See TestDeployScriptForceConflictsIsLoadBearing for why the sabotaged
+	// copy must live alongside the real deploy.sh rather than an isolated
+	// temp dir: it locates the Helm chart via a path relative to its own
+	// script directory.
+	scriptPath := filepath.Join(
+		"..", "..", "deploy", "scripts",
+		"deploy-sabotaged-server-validate-candidate-single-call-test.sh",
+	)
+	if err := os.WriteFile(scriptPath, []byte(mutated), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(scriptPath) })
+
+	live := baselineManifest(true, "", "false")
+	candidate := baselineManifest(true, "*", "false")
+	env := newDeployScriptEnvironment(t, live, candidate)
+	env.scriptPath = scriptPath
+	writeFile(t, env.upgradeHookManifest, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestB))
+
+	output, runErr := env.run("--no-pull")
+	if runErr == nil {
+		t.Fatalf("sabotaged server_validate_candidate (single whole-manifest call) unexpectedly succeeded against a multi-document candidate:\n%s", output)
+	}
+	if !strings.Contains(string(output), "missing image inventory for required chart workload") {
+		t.Fatalf("sabotaged server_validate_candidate did not reproduce the exact reported production failure:\n%s", output)
+	}
+	if upgradeBody, readErr := os.ReadFile(env.upgradeLog); readErr == nil && len(upgradeBody) > 0 {
+		t.Fatalf("sabotaged server_validate_candidate invoked Helm upgrade despite failing validation: %s", upgradeBody)
+	}
+}
+
+// TestDeployScriptServerValidateCandidateAbortsOnPerDocumentDryRunFailure
+// proves that a failure validating any single document within the
+// candidate manifest aborts the whole deploy before Helm is ever invoked -
+// server_validate_candidate's per-document loop is a bare (unguarded) call
+// relying on `set -euo pipefail` to propagate the failure immediately, and
+// this proves that propagation actually happens at runtime, not just in
+// the source text.
+func TestDeployScriptServerValidateCandidateAbortsOnPerDocumentDryRunFailure(t *testing.T) {
+	requirePOSIXShell(t)
+	live := baselineManifest(true, "", "false")
+	candidate := baselineManifest(true, "*", "false")
+	env := newDeployScriptEnvironment(t, live, candidate)
+	env.failServerValidateDocument = "selfservice-worker"
+	writeFile(t, env.upgradeHookManifest, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestB))
+
+	output, runErr := env.run("--no-pull")
+	if runErr == nil {
+		t.Fatalf("deploy unexpectedly succeeded despite a sabotaged per-document dry-run failure:\n%s", output)
+	}
+	if !strings.Contains(string(output), "sabotaged per-document server-side dry-run failure for selfservice-worker") {
+		t.Fatalf("output did not surface the expected per-document dry-run failure:\n%s", output)
+	}
+	if upgradeBody, readErr := os.ReadFile(env.upgradeLog); readErr == nil && len(upgradeBody) > 0 {
+		t.Fatalf("per-document dry-run failure did not abort before Helm upgrade: %s", upgradeBody)
+	}
+}
+
 // TestDeployScriptForceConflictsIsLoadBearing proves --force-conflicts is
 // not decorative: removing it from the single centralizing helper that all
 // three server-side dry-run validation call sites depend on causes
@@ -2684,6 +2928,11 @@ type deployScriptEnvironment struct {
 	// with a realistic SSA ownership-conflict error, mimicking existing
 	// objects already owned by Helm/kubectl-set in production.
 	simulateOwnershipConflict bool
+	// failServerValidateDocument, when set to a workload's metadata name
+	// (e.g. "selfservice-worker"), makes the fake kubectl fail exactly the
+	// "-o yaml" server-side dry-run apply for that one candidate document,
+	// simulating a real per-document admission/defaulting failure.
+	failServerValidateDocument string
 	// scriptPath overrides the deploy.sh path invoked by run/runWithUI.
 	// Empty means the real, unmodified repo script.
 	scriptPath string
@@ -2849,6 +3098,39 @@ current_manifest() {
   fi
 }
 
+# count_logical_yaml_calls reports how many logical server-side dry-run
+# validation passes have appeared in $FAKE_SERVER_DRY_RUN_LOG so far,
+# counting "-o yaml" invocations. server_validate_candidate now issues one
+# "-o yaml" kubectl call per document in the candidate manifest (splitting
+# multi-document input avoids kubectl's real List-wrapping of multi-doc
+# "-o yaml" apply output - see the comment on server_validate_candidate in
+# deploy.sh), so one logical validation pass appears in the log as one call
+# per split document, numbered 000001.yaml, 000002.yaml, .... This counts
+# only the first document of each pass (a manifest path whose basename is
+# exactly "000001.yaml") or an unsplit direct file path (used by
+# validate_upgrade_hooks, which is never split), so the result reports the
+# same logical-pass count regardless of how many documents the manifest
+# being validated happens to contain.
+count_logical_yaml_calls() {
+  [ -f "$FAKE_SERVER_DRY_RUN_LOG" ] || { echo 0; return; }
+  awk '
+    {
+      is_yaml = 0
+      manifest = ""
+      for (i = 1; i <= NF; i++) {
+        if ($i == "-o" && $(i + 1) == "yaml") { is_yaml = 1 }
+        if ($i == "-f") { manifest = $(i + 1) }
+      }
+      if (!is_yaml) { next }
+      n = split(manifest, parts, "/")
+      base = parts[n]
+      if (base ~ /^[0-9]{6}\.yaml$/ && base != "000001.yaml") { next }
+      count++
+    }
+    END { print count + 0 }
+  ' "$FAKE_SERVER_DRY_RUN_LOG"
+}
+
 extract_resource() {
   local manifest=$1
   local wanted=${2#*/}
@@ -2914,7 +3196,7 @@ json_resource() {
   extract_resource "$manifest" "$resource" > "$resource_file"
   canonical=$(canonical_resource "$resource_file")
   kind=${resource%%/*}
-  server_yaml_count=$(grep -c -- '-o yaml' "$FAKE_SERVER_DRY_RUN_LOG" || true)
+  server_yaml_count=$(count_logical_yaml_calls)
   if [ "$FAKE_MUTATE_FINAL_SERVER_OBJECT" = true ] &&
      [ "$server_yaml_count" -ge 2 ] &&
      [ "$resource" = "Deployment/selfservice-api" ]; then
@@ -3213,12 +3495,18 @@ case "$1" in
       echo "FAKE KUBECTL SAFETY VIOLATION: --force-conflicts present without the exact required tuple of exactly one --server-side, one --dry-run=server, and one --force-conflicts (server_side=$server_side_count/$server_side_ok_count dry_run=$dry_run_count/$dry_run_server_count force_conflicts=$force_conflicts_count/$force_conflicts_ok_count); this is exactly the shape of a real, mutating apply in production: $*" >&2
       exit 87
     fi
-    dry_run_count_log=$(grep -c -- '-o yaml' "$FAKE_SERVER_DRY_RUN_LOG" || true)
+    dry_run_count_log=$(count_logical_yaml_calls)
     if [ "$FAKE_FAIL_FINAL_SERVER_DRY_RUN" = true ] &&
        [ "$output_format" = yaml ] &&
        [ "$dry_run_count_log" -ge 2 ]; then
       echo "sabotaged final server-side dry-run failure" >&2
       exit 95
+    fi
+    if [ -n "${FAKE_FAIL_SERVER_VALIDATE_DOCUMENT:-}" ] &&
+       [ "$output_format" = yaml ] &&
+       grep -q "^  name: $FAKE_FAIL_SERVER_VALIDATE_DOCUMENT\$" "$manifest"; then
+      echo "sabotaged per-document server-side dry-run failure for $FAKE_FAIL_SERVER_VALIDATE_DOCUMENT" >&2
+      exit 93
     fi
     if [ "$FAKE_SIMULATE_OWNERSHIP_CONFLICT" = true ] &&
        [ "$server_side_and_dry_run_exact" = true ] &&
@@ -3248,7 +3536,27 @@ case "$1" in
       [ -n "$resource" ]
       json_resource "$manifest" "$resource"
     else
-      cat "$manifest"
+      # Real kubectl does not return "---"-separated top-level documents
+      # for a multi-document "-f" "-o yaml" apply: it collapses every
+      # applied object into one "apiVersion: v1, kind: List" wrapper with
+      # the individual objects nested (indented) under "items:". This is
+      # the exact production bug server_validate_candidate's per-document
+      # splitting works around (see its comment in deploy.sh) - reproduce
+      # it here so a regression (e.g. reverting to one whole-manifest call)
+      # is caught by tests, not just discovered in production. A
+      # single-document "-f" input (the shape every current caller now
+      # uses) is unaffected and still echoed as-is.
+      doc_count=$(awk '
+        /^---[[:space:]]*$/ { if (doc != "") { c++ }; doc = ""; next }
+        { doc = doc $0 }
+        END { if (doc != "") { c++ }; print c + 0 }
+      ' "$manifest")
+      if [ "$doc_count" -gt 1 ]; then
+        printf 'apiVersion: v1\nkind: List\nmetadata:\n  resourceVersion: ""\nitems:\n'
+        sed -e '/^---[[:space:]]*$/d' -e 's/^/  /' "$manifest"
+      else
+        cat "$manifest"
+      fi
       : > "$FAKE_SERVER_DRY_RUN_MARKER"
     fi
     ;;
@@ -3540,6 +3848,7 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_FAIL_FINAL_SERVER_DRY_RUN="+strconv.FormatBool(e.failFinalServerDryRun),
 		"FAKE_MUTATE_FINAL_SERVER_OBJECT="+strconv.FormatBool(e.mutateFinalServerObject),
 		"FAKE_SIMULATE_OWNERSHIP_CONFLICT="+strconv.FormatBool(e.simulateOwnershipConflict),
+		"FAKE_FAIL_SERVER_VALIDATE_DOCUMENT="+e.failServerValidateDocument,
 		"FAKE_DIGEST_A="+testDigestA,
 		"FAKE_DIGEST_B="+testDigestB,
 		"FAKE_SOURCE_SHA="+testSourceSHA,
