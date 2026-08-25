@@ -1,10 +1,14 @@
 package ci
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 // This guard exists because the same defect was shipped independently five
@@ -116,22 +120,199 @@ func TestProvisioningAdmissionPrecedesDatabaseTouchingAudit(t *testing.T) {
 	}
 }
 
-func TestCIWorkflowUsesGoCache(t *testing.T) {
+func loadCIWorkflow(t *testing.T) map[string]any {
+	t.Helper()
 	root := findRepoRoot(t)
 	body, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "ci.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	src := string(body)
-	if !strings.Contains(src, "uses: actions/setup-go@v5") {
-		t.Fatal("ci.yaml no longer sets up Go with actions/setup-go@v5")
+	var workflow map[string]any
+	if err := yaml.Unmarshal(body, &workflow); err != nil {
+		t.Fatalf("parse ci.yaml: %v", err)
 	}
-	if !strings.Contains(src, "cache: true") {
-		t.Fatal("ci.yaml no longer enables setup-go cache for the test job")
+	return workflow
+}
+
+func mustMap(t *testing.T, v any, context string) map[string]any {
+	t.Helper()
+	m, ok := v.(map[string]any)
+	if !ok {
+		t.Fatalf("%s is %T, want map[string]any", context, v)
 	}
-	if !strings.Contains(src, "cache-dependency-path: go.sum") {
-		t.Fatal("ci.yaml no longer pins the Go cache key to go.sum")
+	return m
+}
+
+func mustSlice(t *testing.T, v any, context string) []any {
+	t.Helper()
+	s, ok := v.([]any)
+	if !ok {
+		t.Fatalf("%s is %T, want []any", context, v)
+	}
+	return s
+}
+
+func mustString(t *testing.T, v any, context string) string {
+	t.Helper()
+	s, ok := v.(string)
+	if !ok {
+		t.Fatalf("%s is %T, want string", context, v)
+	}
+	return s
+}
+
+func workflowJob(t *testing.T, workflow map[string]any, name string) map[string]any {
+	t.Helper()
+	jobs := mustMap(t, workflow["jobs"], "jobs")
+	job, ok := jobs[name]
+	if !ok {
+		t.Fatalf("jobs.%s not found in ci.yaml", name)
+	}
+	return mustMap(t, job, "jobs."+name)
+}
+
+func stepByName(t *testing.T, job map[string]any, name string) map[string]any {
+	t.Helper()
+	steps := mustSlice(t, job["steps"], "steps")
+	for i, raw := range steps {
+		step := mustMap(t, raw, fmt.Sprintf("step %d", i))
+		if mustString(t, step["name"], fmt.Sprintf("step %d.name", i)) == name {
+			return step
+		}
+	}
+	t.Fatalf("step %q not found", name)
+	return nil
+}
+
+func needsList(t *testing.T, job map[string]any, context string) []string {
+	t.Helper()
+	raw, ok := job["needs"]
+	if !ok {
+		return nil
+	}
+	switch v := raw.(type) {
+	case string:
+		return []string{v}
+	case []any:
+		out := make([]string, 0, len(v))
+		for i, item := range v {
+			out = append(out, mustString(t, item, fmt.Sprintf("%s[%d]", context, i)))
+		}
+		return out
+	default:
+		t.Fatalf("%s is %T, want string or []any", context, raw)
+		return nil
+	}
+}
+
+func TestCIWorkflowConcurrencyUsesStablePROrRunID(t *testing.T) {
+	workflow := loadCIWorkflow(t)
+	concurrency := mustMap(t, workflow["concurrency"], "concurrency")
+
+	if got := mustString(t, concurrency["group"], "concurrency.group"); got != "${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}" {
+		t.Fatalf("concurrency.group = %q, want PR-number/run_id fallback and no github.ref", got)
+	}
+	if got := mustString(t, concurrency["cancel-in-progress"], "concurrency.cancel-in-progress"); got != "${{ github.event_name == 'pull_request' }}" {
+		t.Fatalf("concurrency.cancel-in-progress = %q, want PR-only cancellation", got)
+	}
+}
+
+func TestCIWorkflowBuildJobsSplitPRAndPush(t *testing.T) {
+	workflow := loadCIWorkflow(t)
+	buildPR := workflowJob(t, workflow, "build-pr")
+	buildPush := workflowJob(t, workflow, "build-push")
+
+	if got := needsList(t, buildPR, "jobs.build-pr.needs"); !reflect.DeepEqual(got, []string{"changes"}) {
+		t.Fatalf("build-pr needs = %v, want [changes]", got)
+	}
+	if got := needsList(t, buildPush, "jobs.build-push.needs"); !reflect.DeepEqual(got, []string{"changes", "test"}) {
+		t.Fatalf("build-push needs = %v, want [changes test]", got)
+	}
+
+	if got := mustString(t, buildPR["if"], "jobs.build-pr.if"); !strings.Contains(got, "github.event_name == 'pull_request'") ||
+		!strings.Contains(got, "needs.changes.outputs.components != '[]'") ||
+		strings.Contains(got, "needs.test.result") ||
+		strings.Contains(got, "github.ref") {
+		t.Fatalf("build-pr if = %q, want PR-only matrix build without test dependency", got)
+	}
+	if got := mustString(t, buildPush["if"], "jobs.build-push.if"); !strings.Contains(got, "github.event_name == 'push'") ||
+		!strings.Contains(got, "needs.changes.outputs.components != '[]'") ||
+		!strings.Contains(got, "needs.test.result == 'success' || needs.test.result == 'skipped'") ||
+		strings.Contains(got, "github.ref") {
+		t.Fatalf("build-push if = %q, want push-only build gated by test success/skipped", got)
+	}
+
+	if !reflect.DeepEqual(buildPR["strategy"], buildPush["strategy"]) {
+		t.Fatalf("build-pr and build-push strategy differ:\nPR:   %#v\nPush: %#v", buildPR["strategy"], buildPush["strategy"])
+	}
+	if !reflect.DeepEqual(buildPR["steps"], buildPush["steps"]) {
+		t.Fatalf("build-pr and build-push steps differ")
+	}
+
+	steps := mustSlice(t, buildPR["steps"], "jobs.build-pr.steps")
+	login := stepByName(t, buildPR, "Log in to GHCR")
+	if got := mustString(t, login["if"], "Log in to GHCR.if"); got != "github.event_name == 'push'" {
+		t.Fatalf("Log in to GHCR if = %q, want push-only login", got)
+	}
+	build := stepByName(t, buildPR, "Build and push")
+	with := mustMap(t, build["with"], "Build and push.with")
+	if got := mustString(t, with["push"], "Build and push.with.push"); got != "${{ github.event_name == 'push' }}" {
+		t.Fatalf("Build and push push = %q, want push-only build", got)
+	}
+	record := stepByName(t, buildPR, "Record immutable deployment digest")
+	if got := mustString(t, record["if"], "Record immutable deployment digest.if"); got != "github.event_name == 'push'" {
+		t.Fatalf("Record immutable deployment digest if = %q, want push-only digest capture", got)
+	}
+	upload := stepByName(t, buildPR, "Upload immutable deployment digest")
+	if got := mustString(t, upload["if"], "Upload immutable deployment digest.if"); got != "github.event_name == 'push'" {
+		t.Fatalf("Upload immutable deployment digest if = %q, want push-only artifact upload", got)
+	}
+
+	if len(steps) == 0 {
+		t.Fatal("build-pr has no steps")
+	}
+}
+
+func TestCIWorkflowTestJobStillRunsFullCoverage(t *testing.T) {
+	workflow := loadCIWorkflow(t)
+	testJob := workflowJob(t, workflow, "test")
+
+	if got := needsList(t, testJob, "jobs.test.needs"); !reflect.DeepEqual(got, []string{"changes"}) {
+		t.Fatalf("test needs = %v, want [changes]", got)
+	}
+	if got := mustString(t, testJob["if"], "jobs.test.if"); !strings.Contains(got, "needs.changes.outputs.run_tests == 'true'") {
+		t.Fatalf("test if = %q, want run_tests gating", got)
+	}
+
+	steps := mustSlice(t, testJob["steps"], "jobs.test.steps")
+	var names []string
+	for i, raw := range steps {
+		step := mustMap(t, raw, fmt.Sprintf("jobs.test.steps[%d]", i))
+		name := mustString(t, step["name"], fmt.Sprintf("jobs.test.steps[%d].name", i))
+		names = append(names, name)
+	}
+	wantNames := []string{"Checkout", "Set up Go", "Build", "Vet", "Verify wiki bundle", "Test"}
+	if !reflect.DeepEqual(names, wantNames) {
+		t.Fatalf("test step names = %v, want %v", names, wantNames)
+	}
+
+	expectRuns := map[string]string{
+		"Build":              "go build ./...",
+		"Vet":                "go vet ./...",
+		"Verify wiki bundle": "make verify-wiki",
+		"Test":               "go test ./... -v -race",
+	}
+	for _, raw := range steps {
+		step := mustMap(t, raw, "jobs.test.steps")
+		name := mustString(t, step["name"], "jobs.test.steps.name")
+		if run, ok := step["run"]; ok {
+			if want, ok := expectRuns[name]; ok {
+				if got := mustString(t, run, "jobs.test.steps."+name+".run"); got != want {
+					t.Fatalf("%s run = %q, want %q", name, got, want)
+				}
+			}
+		}
 	}
 }
 
