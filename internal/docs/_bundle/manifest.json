@@ -13,8 +13,8 @@
     {
       "path": "AGENTS.md",
       "title": "AGENTS.md — Crucible AI Authoring Reference",
-      "size": 78206,
-      "sha256": "a74f5e2a97765f6f968885ba55ceedef9e352d9bb20da49d3f7aab97493a5970",
+      "size": 79565,
+      "sha256": "4a5d6dd53c5182526c3c3b2e51e88a07cc77cd31e61b86802a7060a570c0dfa0",
       "is_markdown": true,
       "links_out": [
         "deploy/runner/actions.sh",
@@ -46,8 +46,8 @@
     {
       "path": "docs/ai-prompts/build-workflow.md",
       "title": "Prompt: \"Build me a Crucible workflow\"",
-      "size": 5153,
-      "sha256": "97e1c0b77f26c97de31ef9f1983c9f9b42447f0d229fe9b7edcd8e331a40b0f0",
+      "size": 5518,
+      "sha256": "e2c182c967fa513c8d0647770f5374bbfa6c73c90736ea683e838a0f013bef68",
       "is_markdown": true,
       "from_seed": true
     },
@@ -62,16 +62,16 @@
     {
       "path": "docs/ai/build-workflow-prompt.md",
       "title": "Build-a-Workflow Prompt Template",
-      "size": 3497,
-      "sha256": "60dce876251c3ca2ad41e68610be668b7595109123285408bdfb121563a6639d",
+      "size": 3793,
+      "sha256": "4ceec85edb0fdd9854e9b21339432a3eeeefcedef71d57f5208fc6c40dea9615",
       "is_markdown": true,
       "from_seed": true
     },
     {
       "path": "docs/instructor/actions.md",
       "title": "Building Library Actions",
-      "size": 6823,
-      "sha256": "6be069a3258c041d788ee8abf7a5b6630617c44d95bd7840d3f3677db1478eeb",
+      "size": 7578,
+      "sha256": "5281e5907bd2be5f9a218223b57d85dd261f65032691ef6ee1d694f0c9206135",
       "is_markdown": true,
       "links_out": [
         "AGENTS.md",
@@ -89,8 +89,8 @@
     {
       "path": "docs/instructor/glossary.md",
       "title": "Glossary",
-      "size": 4885,
-      "sha256": "6e232ee82e02785099f3f16acb97c2bde151b06356058052490ff5c6f3501aae",
+      "size": 5021,
+      "sha256": "0293a4459a063598792c575af5abf7b32e137c64f7963718b3dd3f6937e74f97",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/actions.md",
@@ -169,8 +169,8 @@
     {
       "path": "docs/instructor/runner-environment.md",
       "title": "Runner Environment",
-      "size": 8612,
-      "sha256": "4916d0c328c6904f812221438b6ab02c74e7a31fa32c5f06296523709c86911f",
+      "size": 9604,
+      "sha256": "52bcae8184d5cf4147879d14185c18b3b82665686929985c6115397217478655",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/overview.md",
@@ -202,8 +202,8 @@
     {
       "path": "docs/instructor/troubleshooting.md",
       "title": "Troubleshooting",
-      "size": 60675,
-      "sha256": "9f5871229d20fe9a233c89df44a612a53d95b5e374442f5ff91766f5a8d0d840",
+      "size": 61840,
+      "sha256": "1232d7f713fc44e5ddc244f62cec21bf3f9a55048d6e696291767f503da1758e",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/actions.md",
@@ -221,8 +221,8 @@
     {
       "path": "docs/instructor/workflows.md",
       "title": "Building Workflows",
-      "size": 7656,
-      "sha256": "630dbb9d96a2862024accd792407f15343ec36ff4e7ba41cb5341b903540d1fa",
+      "size": 9020,
+      "sha256": "e3861c8e4bb75bb2b8858b4461d6789a5114d8196cea61c99bfc44e1c52e7e48",
       "is_markdown": true,
       "links_out": [
         "AGENTS.md",
@@ -385,5 +385,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 406747
+  "total_bytes": 413179
 }

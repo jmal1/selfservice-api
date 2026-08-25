@@ -2,9 +2,10 @@ package engine
 
 import (
 	"fmt"
-	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/jmal1/selfservice-api/internal/actionlibrary"
 )
 
 // LibraryAction is one reusable action body from the `actions` table with
@@ -26,8 +27,6 @@ const actionLibraryPath = "/opt/crucible/lib/library.sh"
 // runner uses to confirm it wrote what it thinks it wrote.
 const actionLibraryHeader = "# Crucible action library — GENERATED PER RUN, DO NOT EDIT"
 
-var libraryFuncNamePattern = regexp.MustCompile(`^[a-z_][a-z0-9_]*$`)
-
 // libraryFuncName converts a library action slug into the shell function name a
 // workflow author calls.
 //
@@ -37,11 +36,7 @@ var libraryFuncNamePattern = regexp.MustCompile(`^[a-z_][a-z0-9_]*$`)
 // legal in bash function names but cannot be called without quoting in many
 // contexts and make shellcheck complain, so the underscore form is the contract.
 func libraryFuncName(slug string) (string, error) {
-	name := strings.ReplaceAll(strings.TrimSpace(slug), "-", "_")
-	if !libraryFuncNamePattern.MatchString(name) {
-		return "", fmt.Errorf("library action slug %q does not yield a legal shell function name (got %q)", slug, name)
-	}
-	return name, nil
+	return actionlibrary.CallableName(slug)
 }
 
 // buildActionLibrary renders library actions into a sourceable bash file of

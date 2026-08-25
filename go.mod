@@ -22,6 +22,7 @@ require (
 	k8s.io/api v0.35.3
 	k8s.io/apimachinery v0.35.3
 	k8s.io/client-go v0.35.3
+	mvdan.cc/sh/v3 v3.12.0
 )
 
 require (

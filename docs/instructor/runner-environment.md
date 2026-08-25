@@ -151,13 +151,42 @@ shipping. The difference is deliberate — a warning is the right level for your
 own drafts, but a missing tool in a shipped library action would exit 127
 in the middle of someone else's graded assessment.
 
+### Calling `run_action`
+
+The runner helper takes a display label followed by the command or function it
+must execute:
+
+```bash
+run_action "<display label>" <command-or-library-function> [args...]
+```
+
+Inline commands keep their normal executable name:
+
+```bash
+run_action "HTTP probe" bash -c 'curl -fsS --max-time 5 "$CRUCIBLE_TARGET_IP"'
+```
+
+Database library slugs are kebab-case, but the generated bash functions sourced
+from `/opt/crucible/lib/library.sh` are snake-case. For slug
+`demo-http-service-reachable`, call:
+
+```bash
+run_action "DEMO - HTTP Service Reachable" demo_http_service_reachable
+```
+
+A label without a second argument has nothing to execute. Passing
+`demo-http-service-reachable` as that second argument asks the shell for a
+nonexistent command instead of the injected function. Both forms are rejected
+when the workflow is activated.
+
 ---
 
 ## Filesystem layout
 
 | Path | Contents |
 |---|---|
-| `/opt/crucible/lib/actions.sh` | Shell helpers (`run_action`, context emit) |
+| `/opt/crucible/lib/actions.sh` | Shell helpers (`run_action`, context emit); sources the generated library |
+| `/opt/crucible/lib/library.sh` | Per-run database library actions as snake-case shell functions |
 | `/opt/crucible/bin/` | Crucible CLI wrappers (winrm, context, etc.) |
 | `/tmp/` | Scratch space; cleared between runs |
 | `/var/tmp/run-<RUN_ID>/` | Per-run scratch; preserved until the run completes |

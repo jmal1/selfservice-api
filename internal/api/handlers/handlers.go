@@ -70,6 +70,10 @@ type Handler struct {
 	// WithRunsDB. See runsStore().
 	runsDB runsListDB
 
+	// workflowActivationDB optionally overrides the activation boundary's
+	// narrow database surface for handler tests. Production defaults to h.db.
+	workflowActivationDB workflowActivationStore
+
 	// Preflight checks. Set via WithPreflightVCenter. nil = not configured;
 	// AdminPreflightTemplate returns 503 and the provision gate is skipped.
 	vcPreflight  PreflightVCenter

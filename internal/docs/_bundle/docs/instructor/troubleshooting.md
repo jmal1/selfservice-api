@@ -522,9 +522,9 @@ The script is broken or the environment is wrong. Walk through:
    right.
 3. **SSH manually.** From the runner pod, can you actually reach the
    target? `ssh -o ConnectTimeout=5 "$CRUCIBLE_TARGET_USERNAME@$CRUCIBLE_TARGET_IP" 'true'`.
-4. **Check the workflow status.** Edits to an `active` workflow create
-   a new revision — the run might be using the version you launched
-   before your fix.
+4. **Check the workflow status.** Editing reviewed or active content returns
+   the workflow to `draft`. New runs exclude it until review and activation;
+   a run already in flight keeps the snapshot it launched with.
 
 ---
 
@@ -568,9 +568,41 @@ This must be the first non-comment line of every workflow script.
 
 ---
 
+## Activation says `run_action` is missing a command or suggests a snake-case callable
+
+`run_action` needs two distinct values before any action arguments:
+
+```bash
+run_action "<display label>" <command-or-library-function> [args...]
+```
+
+For database library actions, convert the kebab-case slug to the injected
+snake-case function:
+
+```bash
+# Library slug: demo-http-service-reachable
+run_action "DEMO - HTTP Service Reachable" demo_http_service_reachable
+```
+
+These stale forms are invalid and activation returns `422`:
+
+```bash
+run_action "demo-http-service-reachable"
+run_action "DEMO - HTTP Service Reachable" demo-http-service-reachable
+```
+
+The first has only a label and no command. The second tries to execute the
+database slug, but the generated function is `demo_http_service_reachable`.
+Use the callable named in the activation error.
+
+---
+
 ## "Action status is `error`, message says a command is not available" (exit 127)
 
 A tool your workflow script calls is not installed in the assessment runner.
+For older active workflows, first check whether the unavailable command is a
+kebab-case library slug. If so, preserve the display label and replace only the
+second argument with the snake-case callable.
 
 | What the student sees | What the instructor sees |
 |---|---|
@@ -648,14 +680,15 @@ everywhere the action is used.
 
 ---
 
-## "Workflow passes in `draft`, fails after `active`"
+## "Workflow stopped appearing in runs after I edited it"
 
-Most often: you've activated an **old revision**. When you edit an
-active workflow, a new revision is created and becomes the "head", but
-in-flight playlist runs continue against their launched version.
+Any edit to reviewed or active workflow content returns it to `draft` and
+clears the old approval. This prevents an imported or hand-written malformed
+script from remaining active after PATCH.
 
-Check the Workflows admin page → revision selector. Confirm the
-revision marked "head" is the one you intended.
+Submit, approve, and activate the edited workflow again. New playlist runs
+exclude it until then. Runs already in flight continue against their immutable
+launch snapshot.
 
 ---
 

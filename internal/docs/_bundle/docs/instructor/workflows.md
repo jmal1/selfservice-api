@@ -35,9 +35,9 @@ Three things to notice:
    helper. Always at the top.
 2. **`set -euo pipefail`** — fail loud on errors, unset variables, and
    broken pipes. Saves you from "passed because grep printed nothing".
-3. **`run_action "<name>" <cmd>`** — every grading step is wrapped in
+3. **`run_action "<display label>" <command-or-function> [args...]`** — every grading step is wrapped in
    `run_action` so the engine can capture per-step pass/fail, output,
-   and duration.
+   and duration. The label and executable are separate required arguments.
 
 A workflow with no `run_action` calls is treated as a single anonymous step.
 Use explicit `run_action` blocks to give students named, individual line items
@@ -114,17 +114,18 @@ cat /etc/ssh/sshd_config        # instructor-only
 
 ## Patterns: composing actions
 
-If you're using the library, prefer `run_action` with action slugs over
-inline bash. The engine resolves the slug to the registered action
-script and substitutes `PARAM_*` env vars from the args.
+If you're using the library, call the generated shell function instead of
+inlining bash. Library action slugs are kebab-case in the database, while runner
+callables replace each hyphen with an underscore: `service-running` becomes
+`service_running`.
 
 ```bash
 source /opt/crucible/lib/actions.sh
 set -euo pipefail
 
 # Library action: checks systemd unit state via SSH to the target
-run_action "service-running" service=ssh
-run_action "service-running" service=ufw
+run_action "SSH service is active" service_running --name ssh
+run_action "UFW service is active" service_running --name ufw
 
 # Inline check that doesn't deserve a library entry
 run_action "audit-log-exists" bash -c '
@@ -134,6 +135,23 @@ run_action "audit-log-exists" bash -c '
             exit 1
         }
 '
+```
+
+The first argument is the result label shown to instructors and students. The
+second is what the runner executes. These are invalid:
+
+```bash
+# Missing the command/function argument
+run_action "demo-http-service-reachable"
+
+# Uses the database slug where the generated function is required
+run_action "DEMO - HTTP Service Reachable" demo-http-service-reachable
+```
+
+The valid library call is:
+
+```bash
+run_action "DEMO - HTTP Service Reachable" demo_http_service_reachable
 ```
 
 When mixing library actions and inline checks, the **ordering still matters**:
@@ -157,10 +175,17 @@ Transition via the admin UI Workflows page, or:
 - `PATCH /api/v1/admin/workflows/{id}/approve` (pending_review → approved, **admin only**)
 - `PATCH /api/v1/admin/workflows/{id}/activate` (approved → active)
 
-Once a workflow is `active`, edits create a **new revision** rather than
-mutating the existing record. Active revisions referenced by an in-flight
-playlist run continue to use the version with which they launched; your edit
-becomes the new "head".
+Activation re-reads the persisted script and current database action library.
+It returns `422 Unprocessable Entity` if a `run_action` omits its second
+command/function argument or uses a known kebab-case library slug instead of
+the generated snake-case callable. The error identifies the line and expected
+callable, so imported and hand-written scripts cannot bypass the guard.
+
+Editing a `pending_review`, `approved`, or `active` workflow returns that
+workflow to `draft` and clears its prior approval. It is excluded from new
+playlist runs until it passes review and activation again. A run that already
+started keeps its immutable launch snapshot, so the edit cannot change work
+already in flight.
 
 ---
 
@@ -190,8 +215,9 @@ You have three options, in order of fidelity:
 | Always passes, even when student hasn't done the work | Missing `set -e`; or test command silently succeeds (e.g. `grep || true`) |
 | Times out at 300s for no apparent reason | SSH hang to target — add `-o ConnectTimeout=5` |
 | "command not found: run_action" | Forgot the `source /opt/crucible/lib/actions.sh` line |
+| Activation rejects `demo-http-service-reachable` and suggests `demo_http_service_reachable` | The library slug was passed as the command; keep the label first and use the generated snake-case function second |
 | Student sees no message on failure | No `STUDENT_MSG:` lines; only debug output |
-| Works in `draft`, breaks once approved | You edited after approval — a new revision was created; check which is active |
+| Workflow disappeared from new playlist runs after an edit | Reviewed content returns to `draft`; submit, approve, and activate the edited workflow again |
 
 More in [Troubleshooting](troubleshooting.md).
 

@@ -5,7 +5,7 @@ authoring docs.
 
 | Term | Definition |
 |---|---|
-| **Action** | A reusable, parameterised one-step grading helper, stored in the action library. Called from workflows via `run_action "<slug>"`. See [Building Actions](actions.md). |
+| **Action** | A reusable, parameterised one-step grading helper, stored in the action library. Called as `run_action "<display label>" <snake_case_callable>`. See [Building Actions](actions.md). |
 | **Action library** | The collection of registered actions, scoped to the deployment. Managed via `/api/v1/admin/actions`. |
 | **Active** | A workflow or playlist status meaning "approved and usable in student-facing playlist runs". Final lifecycle state. |
 | **Approved** | A workflow lifecycle state meaning "an admin reviewed and signed off, ready to activate". |
@@ -26,13 +26,13 @@ authoring docs.
 | **Playlist** | Ordered list of workflows packaged as a single graded lab. See [Building Playlists](playlists.md). |
 | **Pod** | A live, isolated set of VMs deployed for one student from a blueprint. Lives on its own VLAN. |
 | **Required** | A `workflows[].required` flag on a playlist entry. If `false`, the entry's failure won't fail the overall playlist. |
-| **Revision** | When you edit an active workflow or playlist, a new revision is created. In-flight runs use the version they launched with; new clicks pick up the new head. |
+| **Revision** | Immutable workflow snapshot created when a run launches. Editing reviewed or active content returns the workflow to draft; an already-running assessment keeps its launch snapshot. |
 | **Run** | One execution of a workflow or playlist against a pod. Has a UUID exposed as `CRUCIBLE_RUN_ID` to scripts. |
 | **Runner** | Synonym for "Kali runner". |
 | **Script mode** | A workflow `creation_mode` where the author writes raw bash directly (vs the visual builder). |
 | **`set -euo pipefail`** | The bash incantation you should put at the top of every workflow. Fails on errors, unset variables, and broken pipes. |
 | **Setup script** | An optional workflow field that runs once before the main `script`. Hard 60s timeout. |
-| **Slug** | A `[a-z0-9-]+` identifier, globally unique within its type. Used in URLs and `run_action` calls. |
+| **Slug** | A `[a-z0-9-]+` identifier, globally unique within its type. Library slugs identify database records; their `run_action` callable replaces `-` with `_` (for example, `port-open` → `port_open`). |
 | **`STUDENT_MSG:`** | Output line prefix that surfaces text to the student. Every other line is instructor-only. |
 | **Target** | A VM in the student's pod that workflows grade. Identified by `CRUCIBLE_TARGET_IP` (primary) or `CRUCIBLE_TARGET_<SLOT>_IP` (additional). |
 | **Template** | A frozen vSphere VM image, used as the basis for cloning targets and runners. Managed in vCenter + the Crucible templates table. |

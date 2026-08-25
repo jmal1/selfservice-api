@@ -329,15 +329,15 @@ func (q *Queries) ListAllRuns(ctx context.Context) ([]models.Run, error) {
 
 // RunsListFilter holds filter parameters for ListAllRunsFiltered.
 type RunsListFilter struct {
-	TriggeredBy   *uuid.UUID // exact match on triggered_by user UUID
+	TriggeredBy    *uuid.UUID // exact match on triggered_by user UUID
 	TriggeredByStr string     // substring match on triggered_by username/display_name
-	PodOwner      *uuid.UUID // exact match on pod owner UUID
-	PodOwnerStr   string     // substring match on pod owner username/display_name
-	Status        string     // exact match on run status
-	From          *time.Time // created_at >= From
-	To            *time.Time // created_at <= To
-	Limit         int        // default 200, max 1000
-	Offset        int        // pagination offset
+	PodOwner       *uuid.UUID // exact match on pod owner UUID
+	PodOwnerStr    string     // substring match on pod owner username/display_name
+	Status         string     // exact match on run status
+	From           *time.Time // created_at >= From
+	To             *time.Time // created_at <= To
+	Limit          int        // default 200, max 1000
+	Offset         int        // pagination offset
 }
 
 // ListAllRunsFiltered returns runs matching the provided filters (admin view).
@@ -529,10 +529,13 @@ func (q *Queries) CreateWorkflow(ctx context.Context, wf *models.Workflow) error
 	return nil
 }
 
-// UpdateWorkflow updates a workflow's metadata.
+// UpdateWorkflow updates a workflow and returns any reviewed revision to draft.
 func (q *Queries) UpdateWorkflow(ctx context.Context, id uuid.UUID, name, description, category,
 	script, setupScript *string, timeoutSeconds *int, creationMode *string, actions []models.Action) error {
 
+	contentChanged := workflowEditRequiresReview(
+		name, description, category, script, setupScript, timeoutSeconds, creationMode,
+	)
 	_, err := q.pool.Exec(ctx, `
 		UPDATE workflows SET
 			name = COALESCE($2, name),
@@ -542,10 +545,19 @@ func (q *Queries) UpdateWorkflow(ctx context.Context, id uuid.UUID, name, descri
 			setup_script = COALESCE($6, setup_script),
 			timeout_seconds = COALESCE($7, timeout_seconds),
 			creation_mode = COALESCE($8, creation_mode),
+			status = CASE WHEN $9 THEN 'draft' ELSE status END,
+			approved_by = CASE WHEN $9 THEN NULL ELSE approved_by END,
 			updated_at = NOW()
 		WHERE id = $1
-	`, id, name, description, category, script, setupScript, timeoutSeconds, creationMode)
+	`, id, name, description, category, script, setupScript, timeoutSeconds, creationMode, contentChanged)
 	return err
+}
+
+func workflowEditRequiresReview(name, description, category, script, setupScript *string,
+	timeoutSeconds *int, creationMode *string) bool {
+	return name != nil || description != nil || category != nil ||
+		script != nil || setupScript != nil || timeoutSeconds != nil ||
+		creationMode != nil
 }
 
 // TransitionWorkflowStatus atomically transitions a workflow between states.
@@ -915,12 +927,12 @@ func (q *Queries) SetBlueprintVMPlaylists(ctx context.Context, blueprintID uuid.
 
 // BlueprintVMPlaylistsResolvedRow represents a row in the GetBlueprintVMPlaylistsResolved result.
 type BlueprintVMPlaylistsResolvedRow struct {
-	VMSlot       int       `json:"vm_slot"`
-	PlaylistID   uuid.UUID `json:"playlist_id"`
-	PlaylistName string    `json:"name"`
-	PlaylistSlug string    `json:"slug"`
-	Source       string    `json:"source"` // "blueprint_override" or "template_default"
-	ExecutionOrder int     `json:"execution_order"`
+	VMSlot         int       `json:"vm_slot"`
+	PlaylistID     uuid.UUID `json:"playlist_id"`
+	PlaylistName   string    `json:"name"`
+	PlaylistSlug   string    `json:"slug"`
+	Source         string    `json:"source"` // "blueprint_override" or "template_default"
+	ExecutionOrder int       `json:"execution_order"`
 }
 
 // GetBlueprintVMPlaylistsResolved returns the resolved playlists for each VM slot on a blueprint,

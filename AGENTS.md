@@ -42,6 +42,11 @@ You produce a JSON payload for `POST /api/v1/admin/workflows`:
 
 That single API call is sufficient to create the workflow. After review, an admin moves it `draft` → `pending_review` → `approved` → `active` via the workflow lifecycle endpoints.
 
+Editing a `pending_review`, `approved`, or `active` workflow returns it to
+`draft` and clears its prior approval. New playlist runs exclude it until it is
+reviewed and activated again; a run already in flight keeps its immutable
+launch snapshot.
+
 ### 2b. A reusable **library action**
 
 Example user request: *"Add a library action that checks if a systemd unit is running on the target."*
@@ -67,7 +72,10 @@ You produce a JSON payload for `POST /api/v1/admin/actions`:
 }
 ```
 
-A workflow then references this action by including a `run_action "service-running" ...` invocation in its `script`.
+A workflow references this action with a display label followed by the generated
+snake-case callable: `run_action "Service is running" service_running ...`.
+The library slug remains `service-running`; do not pass that kebab-case slug as
+the command.
 
 ---
 
@@ -205,6 +213,10 @@ the run detail page, so you can always confirm what a given result refers to.
 
 Wraps a single command, reports start/end events to the sidecar, captures exit code + duration, and auto-extracts JSON fields from stdout into the context.
 
+Both parts are required: the first argument is only the human-readable result
+label, and the second argument is the command or library function to execute.
+`run_action "demo-http-service-reachable"` has no command and is invalid.
+
 ```bash
 # Single command, no shell interpolation
 run_action "ssh-root-denied" ssh -o BatchMode=yes -o ConnectTimeout=5 root@"$CRUCIBLE_TARGET_IP" true
@@ -244,6 +256,24 @@ set -euo pipefail
 run_action "HTTPS responds" http_get --url "https://$CRUCIBLE_TARGET_IP/" --expect-status 200
 run_action "SSH is open"    port_open --host "$CRUCIBLE_TARGET_IP" --port 22
 ```
+
+The label and callable are deliberately different fields. For a library action
+whose slug is `demo-http-service-reachable`, write:
+
+```bash
+run_action "DEMO - HTTP Service Reachable" demo_http_service_reachable
+```
+
+Do **not** write either malformed form:
+
+```bash
+run_action "demo-http-service-reachable"
+run_action "DEMO - HTTP Service Reachable" demo-http-service-reachable
+```
+
+Workflow activation validates this contract against the current database action
+library. A missing command or a known kebab-case library slug blocks activation
+and the API response names the expected snake-case callable.
 
 Pass the flags the action's own body parses — each library body has a `--flag value` argument loop;
 read the action in the library catalog (`docs/instructor/actions.md`) to see its accepted flags.
@@ -485,6 +515,7 @@ Whenever you generate a workflow or action, the instructor will likely paste it 
 5. **Slug uniqueness** — slugs are global. Pick something distinctive (`hardening-ssh-rootlogin-no`, not `ssh-check`).
 6. **Timeouts are sane** — `timeout_seconds` should be 2-3× the slowest realistic action; default 60s for actions, 300s for workflows is usually right.
 7. **No leaked secrets** — never echo `$CRUCIBLE_TARGET_PASSWORD` or write it to a file outside `$CRUCIBLE_WORKDIR`.
+8. **Every `run_action` has label + callable** — for a library slug such as `port-open`, the second argument is `port_open`, not `port-open`.
 
 ### 12.1 Admin script validator wrapper model (read before authoring action bodies)
 
