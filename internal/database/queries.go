@@ -882,16 +882,29 @@ func (q *Queries) listPodVMsActive(ctx context.Context, podID uuid.UUID) ([]mode
 
 // --- Jobs ---
 
-// CreateJob inserts a new job and returns it.
-func (q *Queries) CreateJob(ctx context.Context, jobType string, payload []byte) (*models.Job, error) {
+type jobRowQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+func createJob(ctx context.Context, querier jobRowQuerier, jobType string, payload []byte) (*models.Job, error) {
 	var j models.Job
-	err := q.pool.QueryRow(ctx, `
+	err := querier.QueryRow(ctx, `
 		INSERT INTO jobs (type, payload) VALUES ($1, $2)
 		RETURNING id, type, payload, status, retry_count, max_retries, rollback_steps, created_at
 	`, jobType, payload).Scan(
 		&j.ID, &j.Type, &j.Payload, &j.Status, &j.RetryCount, &j.MaxRetries, &j.RollbackSteps, &j.CreatedAt,
 	)
 	return &j, err
+}
+
+// CreateJob inserts a new job and returns it.
+func (q *Queries) CreateJob(ctx context.Context, jobType string, payload []byte) (*models.Job, error) {
+	return createJob(ctx, q.pool, jobType, payload)
+}
+
+// CreateJobTx inserts a new job as part of the caller's transaction.
+func (q *Queries) CreateJobTx(ctx context.Context, tx pgx.Tx, jobType string, payload []byte) (*models.Job, error) {
+	return createJob(ctx, tx, jobType, payload)
 }
 
 const lockTemplateForRevalidationSQL = `

@@ -30,6 +30,7 @@ import (
 type Handler struct {
 	db              *database.Queries
 	events          *events.Client
+	jobEvents       jobCreatedPublisher
 	vc              VCenterConsole
 	vcFolders       VCenterFolderEnumerator
 	logger          *slog.Logger
@@ -90,6 +91,10 @@ type Handler struct {
 	provisioningMetrics    provisioningAdmissionMetrics
 }
 
+type jobCreatedPublisher interface {
+	PublishJobCreated(jobID uuid.UUID, jobType string) error
+}
+
 type imageUploadMetrics interface {
 	RecordImageUpload(kind, result string)
 }
@@ -132,7 +137,14 @@ type VCenterConsole interface {
 
 // NewHandler creates a new Handler.
 func NewHandler(db *database.Queries, events *events.Client, vc VCenterConsole, logger *slog.Logger, allowedOrigins []string) *Handler {
-	return &Handler{db: db, events: events, vc: vc, logger: logger, allowedOrigins: allowedOrigins}
+	return &Handler{
+		db:             db,
+		events:         events,
+		jobEvents:      events,
+		vc:             vc,
+		logger:         logger,
+		allowedOrigins: allowedOrigins,
+	}
 }
 
 // WithProvisioningAdmission configures the API maintenance gate. When this
@@ -630,12 +642,6 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		h.logger.Error("commit tx failed", "error", err)
-		respondError(w, r, http.StatusInternalServerError, "internal error")
-		return
-	}
-
 	// Create job payload matching worker's CreatePodPayload struct
 	type jobPayload struct {
 		PodID   uuid.UUID      `json:"pod_id"`
@@ -643,23 +649,33 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 		VMs     []workerVMSpec `json:"vms"`
 		UserID  string         `json:"user_id"`
 	}
-	payload, _ := json.Marshal(jobPayload{
+	payload, err := json.Marshal(jobPayload{
 		PodID:   podID,
 		PodName: req.Name,
 		VMs:     vmSpecs,
 		UserID:  userID.String(),
 	})
+	if err != nil {
+		h.logger.Error("marshal pod create job payload failed", "error", err)
+		respondError(w, r, http.StatusInternalServerError, "failed to queue provisioning job")
+		return
+	}
 
-	// Insert job
-	job, err := h.db.CreateJob(ctx, models.JobTypePodCreate, payload)
+	job, err := h.db.CreateJobTx(ctx, tx, models.JobTypePodCreate, payload)
 	if err != nil {
 		h.logger.Error("create job failed", "error", err)
 		respondError(w, r, http.StatusInternalServerError, "failed to queue provisioning job")
 		return
 	}
 
+	if err := tx.Commit(ctx); err != nil {
+		h.logger.Error("commit tx failed", "error", err)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
+		return
+	}
+
 	// Notify workers via NATS
-	if err := h.events.PublishJobCreated(job.ID, job.Type); err != nil {
+	if err := h.jobEvents.PublishJobCreated(job.ID, job.Type); err != nil {
 		h.logger.Warn("failed to publish job created event", "error", err, "job_id", job.ID)
 	}
 
