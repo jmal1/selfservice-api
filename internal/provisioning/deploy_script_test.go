@@ -4188,6 +4188,8 @@ spec:
               value: "false"
             - name: SYNTHETIC_CONTENT_FILTER_CATEGORY_FEED_BASE_URL
               value: ""
+            - name: SYNTHETIC_RUNNER_EXPECTED_ENABLED
+              value: "false"
             - name: SYNTHETIC_LIFECYCLE_ENABLED
               value: "false"
 ---

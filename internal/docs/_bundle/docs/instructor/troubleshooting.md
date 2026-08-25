@@ -159,6 +159,48 @@ monitoring continues without creating lifecycle pods. The external
 Kubernetes and Helm: verify that host-level state independently before and after
 this procedure.
 
+### Synthetic producer coverage alerts
+
+Do not aggregate synthetic freshness across layers. A fresh API run must not
+hide a stale or absent runner/UI producer, and Pushgateway retention means
+absence must be coerced explicitly.
+
+Use per-layer freshness rules derived from the chart schedule and deadline:
+
+```promql
+(time() - (
+  max by (layer) (crucible_synthetic_run_timestamp_seconds{layer="api"})
+  or on(layer) label_replace(vector(0), "layer", "api", "", "")
+)) > 15 * 60
+```
+
+```promql
+(time() - (
+  max by (layer) (crucible_synthetic_run_timestamp_seconds{layer="runner"})
+  or on(layer) label_replace(vector(0), "layer", "runner", "", "")
+)) > 105 * 60
+```
+
+Use `for: 5m` on the alerting rule itself if you want scrape jitter damped, but
+keep the freshness threshold tied to the rendered Helm values:
+`synthetic.schedule` + `synthetic.runner.schedule` plus each CronJob's
+`activeDeadlineSeconds`. The API monitor's current values yield 15 minutes; the
+runner smoke CronJob yields 105 minutes.
+
+The required mutating producer now emits an explicit coverage signal. Alert on
+the check itself so a gated-off producer goes red instead of disappearing:
+
+```promql
+1 - crucible_synthetic_check_success{check="pod_lifecycle_enabled"} > 0
+or
+1 - crucible_synthetic_check_success{check="runner_smoke_enabled"} > 0
+```
+
+The external `synthetic-ui.timer` remains owned by its separate host and
+deployment. If that producer exports the shared `crucible_synthetic_run_timestamp_seconds`
+metric with `layer="ui"`, install the same per-layer freshness pattern there in
+its own observability repo.
+
 Every main push, including docs-only merges, builds all five images and
 publishes the full-SHA identity, even when the equivalent pull-request path
 matrix would build only one component. Each matrix job uploads its resulting

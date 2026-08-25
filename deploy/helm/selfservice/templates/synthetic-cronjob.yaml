@@ -51,6 +51,8 @@ spec:
                   value: {{ .Values.synthetic.checkTimeout | quote }}
                 - name: SYNTHETIC_PROVISIONING_EXPECTED_ENABLED
                   value: {{ .Values.synthetic.provisioningExpectedEnabled | quote }}
+                - name: SYNTHETIC_RUNNER_EXPECTED_ENABLED
+                  value: {{ .Values.synthetic.runner.enabled | quote }}
                 - name: SYNTHETIC_USER_ID
                   valueFrom:
                     secretKeyRef:
