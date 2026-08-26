@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -18,6 +19,10 @@ var (
 	ErrPodVMNotFound               = errors.New("pod VM not found")
 	ErrPodJobRejected              = errors.New("pod does not accept new mutator jobs")
 	ErrPodDestroyNotNeeded         = errors.New("pod destroy is no longer needed")
+	ErrPodExtensionRejected        = errors.New("pod cannot be extended")
+	ErrPodAlreadyDestroyed         = errors.New("pod is already destroyed")
+	ErrPodDestroyJobObsolete       = errors.New("pod destroy job is not authoritative")
+	ErrPodDestroyOwnershipLost     = errors.New("pod no longer owns its exact VLAN")
 )
 
 // serializedPodJobTypes is the exhaustive set of durable jobs whose payload
@@ -305,6 +310,7 @@ const (
 	podDestroyAlways podDestroyRequirement = iota
 	podDestroyIfExpired
 	podDestroyIfEmpty
+	podDestroyIfFailed
 )
 
 // CreatePodDestroyJob is the explicit user-requested/error-cleanup producer.
@@ -336,10 +342,21 @@ func (q *Queries) CreateEmptyPodDestroyJob(
 	return q.createPodDestroyJob(ctx, podID, payload, podDestroyIfEmpty)
 }
 
+// RequeueFailedPodDestroyJob is the destroy_failed sweeper producer. It keeps
+// partial cleanup on the original durable job ID and revalidates exact VLAN
+// ownership before making that job claimable again.
+func (q *Queries) RequeueFailedPodDestroyJob(
+	ctx context.Context,
+	podID uuid.UUID,
+	payload []byte,
+) (_ *models.Job, queued bool, err error) {
+	return q.createPodDestroyJob(ctx, podID, payload, podDestroyIfFailed)
+}
+
 // createPodDestroyJob serializes every pod_destroy producer on the pod row.
-// The first destroy job is authoritative forever, across every job status.
-// Reusing even completed or failed work prevents a delayed producer from
-// launching a second cleanup against a VLAN that may already be reassigned.
+// The first destroy job ID is authoritative forever, across every job status.
+// Terminal work is restarted on that same ID only while the pod remains
+// recoverable and owns its exact VLAN allocation.
 func (q *Queries) createPodDestroyJob(
 	ctx context.Context,
 	podID uuid.UUID,
@@ -357,13 +374,15 @@ func (q *Queries) createPodDestroyJob(
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	var status string
+	var vlanTag int
+	var subnet string
 	var expired bool
 	if err := tx.QueryRow(ctx, `
-		SELECT status, expires_at IS NOT NULL AND expires_at < now()
+		SELECT status, vlan_id, subnet, expires_at IS NOT NULL AND expires_at < now()
 		FROM pods
 		WHERE id = $1
 		FOR UPDATE
-	`, podID).Scan(&status, &expired); err != nil {
+	`, podID).Scan(&status, &vlanTag, &subnet, &expired); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, false, fmt.Errorf("lock pod %s for pod_destroy enqueue: %w", podID, ErrPodNotFound)
 		}
@@ -393,6 +412,53 @@ func (q *Queries) createPodDestroyJob(
 		&existing.CreatedAt,
 	)
 	if err == nil {
+		if (existing.Status == models.JobStatusCompleted || existing.Status == models.JobStatusFailed) &&
+			podDestroyCanRestart(status, requirement) {
+			required, requirementErr := podDestroyRequirementSatisfied(ctx, tx, podID, status, expired, requirement)
+			if requirementErr != nil {
+				return nil, false, requirementErr
+			}
+			ownsResources, ownershipErr := podOwnsExactVLAN(ctx, tx, podID, vlanTag, subnet)
+			if ownershipErr != nil {
+				return nil, false, ownershipErr
+			}
+			if required && ownsResources {
+				// This is the only pod->existing-job write. It is safe from the
+				// worker job->pod order because workers can own only
+				// pending/claimed/in_progress jobs, while this conditional update
+				// accepts only the already-observed terminal status.
+				tag, updateErr := tx.Exec(ctx, `
+					UPDATE jobs
+					SET status = $2,
+					    claimed_by = NULL,
+					    claimed_at = NULL,
+					    started_at = NULL,
+					    completed_at = NULL,
+					    result = NULL,
+					    next_attempt_at = NULL,
+					    retry_count = 0
+					WHERE id = $1
+					  AND status = $3
+				`, existing.ID, models.JobStatusPending, existing.Status)
+				if updateErr != nil {
+					return nil, false, fmt.Errorf("requeue authoritative pod_destroy job %s for pod %s: %w", existing.ID, podID, updateErr)
+				}
+				if tag.RowsAffected() != 1 {
+					return nil, false, fmt.Errorf("requeue authoritative pod_destroy job %s for pod %s: terminal status changed", existing.ID, podID)
+				}
+				existing.Status = models.JobStatusPending
+				existing.ClaimedBy = nil
+				existing.ClaimedAt = nil
+				existing.StartedAt = nil
+				existing.CompletedAt = nil
+				existing.Result = nil
+				existing.NextAttemptAt = nil
+				if err := tx.Commit(ctx); err != nil {
+					return nil, false, fmt.Errorf("commit pod_destroy requeue for %s: %w", podID, err)
+				}
+				return &existing, true, nil
+			}
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return nil, false, fmt.Errorf("commit pod_destroy reuse for %s: %w", podID, err)
 		}
@@ -406,31 +472,29 @@ func (q *Queries) createPodDestroyJob(
 	// allocating infrastructure, and pod_destroy is their cleanup path.
 	switch status {
 	case models.PodStatusDestroying,
-		models.PodStatusDestroyFailed,
 		models.PodStatusDestroyed,
 		"cancelled":
 		return nil, false, &PodJobRejectedError{PodID: podID, Status: status, Type: models.JobTypePodDestroy}
+	case models.PodStatusDestroyFailed:
+		if requirement != podDestroyIfFailed {
+			return nil, false, &PodJobRejectedError{PodID: podID, Status: status, Type: models.JobTypePodDestroy}
+		}
 	}
 
-	switch requirement {
-	case podDestroyIfExpired:
-		if status != models.PodStatusActive || !expired {
-			return nil, false, fmt.Errorf("pod %s is not currently expired: %w", podID, ErrPodDestroyNotNeeded)
+	required, err := podDestroyRequirementSatisfied(ctx, tx, podID, status, expired, requirement)
+	if err != nil {
+		return nil, false, err
+	}
+	if !required {
+		return nil, false, fmt.Errorf("pod %s no longer satisfies pod_destroy requirement: %w", podID, ErrPodDestroyNotNeeded)
+	}
+	if requirement == podDestroyIfFailed {
+		ownsResources, ownershipErr := podOwnsExactVLAN(ctx, tx, podID, vlanTag, subnet)
+		if ownershipErr != nil {
+			return nil, false, ownershipErr
 		}
-	case podDestroyIfEmpty:
-		var empty bool
-		if err := tx.QueryRow(ctx, `
-			SELECT NOT EXISTS (
-				SELECT 1
-				FROM pod_vms
-				WHERE pod_id = $1
-				  AND status != $2
-			)
-		`, podID, models.VMStatusDeleted).Scan(&empty); err != nil {
-			return nil, false, fmt.Errorf("revalidate empty pod %s before pod_destroy enqueue: %w", podID, err)
-		}
-		if !empty {
-			return nil, false, fmt.Errorf("pod %s still has active VMs: %w", podID, ErrPodDestroyNotNeeded)
+		if !ownsResources {
+			return nil, false, fmt.Errorf("destroy_failed pod %s no longer owns its exact VLAN: %w", podID, ErrPodDestroyNotNeeded)
 		}
 	}
 
@@ -442,4 +506,244 @@ func (q *Queries) createPodDestroyJob(
 		return nil, false, fmt.Errorf("commit pod_destroy job for %s: %w", podID, err)
 	}
 	return job, true, nil
+}
+
+func podDestroyCanRestart(status string, requirement podDestroyRequirement) bool {
+	switch status {
+	case models.PodStatusPending,
+		models.PodStatusProvisioning,
+		models.PodStatusActive,
+		models.PodStatusError,
+		models.PodStatusDestroying:
+		return true
+	case models.PodStatusDestroyFailed:
+		return requirement == podDestroyIfFailed
+	default:
+		return false
+	}
+}
+
+func podDestroyRequirementSatisfied(
+	ctx context.Context,
+	tx pgx.Tx,
+	podID uuid.UUID,
+	status string,
+	expired bool,
+	requirement podDestroyRequirement,
+) (bool, error) {
+	switch requirement {
+	case podDestroyAlways:
+		return true, nil
+	case podDestroyIfExpired:
+		return status == models.PodStatusActive && expired, nil
+	case podDestroyIfEmpty:
+		var empty bool
+		if err := tx.QueryRow(ctx, `
+			SELECT NOT EXISTS (
+				SELECT 1
+				FROM pod_vms
+				WHERE pod_id = $1
+				  AND status != $2
+			)
+		`, podID, models.VMStatusDeleted).Scan(&empty); err != nil {
+			return false, fmt.Errorf("revalidate empty pod %s before pod_destroy enqueue: %w", podID, err)
+		}
+		return empty, nil
+	case podDestroyIfFailed:
+		return status == models.PodStatusDestroyFailed, nil
+	default:
+		return false, fmt.Errorf("unknown pod_destroy requirement %d", requirement)
+	}
+}
+
+func podOwnsExactVLAN(
+	ctx context.Context,
+	tx pgx.Tx,
+	podID uuid.UUID,
+	vlanTag int,
+	subnet string,
+) (bool, error) {
+	var owns bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM vlan_pool
+			WHERE pod_id = $1
+			  AND vlan_tag = $2
+			  AND subnet = $3
+		)
+	`, podID, vlanTag, subnet).Scan(&owns); err != nil {
+		return false, fmt.Errorf("verify exact VLAN ownership for pod %s: %w", podID, err)
+	}
+	return owns, nil
+}
+
+// PreparePodDestroy is the worker-entry half of the serialization contract.
+// The worker logically owns the job first, then this transaction locks the pod,
+// verifies the authoritative job ID and exact VLAN ownership, and transitions
+// the pod to destroying before any infrastructure side effect.
+func (q *Queries) PreparePodDestroy(
+	ctx context.Context,
+	podID, jobID uuid.UUID,
+	claimOwner string,
+) (*models.Pod, error) {
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin pod destroy preparation: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := lockOwnedPodDestroyJob(ctx, tx, podID, jobID, claimOwner); err != nil {
+		return nil, err
+	}
+
+	pod := &models.Pod{ID: podID}
+	if err := tx.QueryRow(ctx, `
+		SELECT status, vlan_id, subnet
+		FROM pods
+		WHERE id = $1
+		FOR UPDATE
+	`, podID).Scan(&pod.Status, &pod.VLANID, &pod.Subnet); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("lock pod %s for destroy preparation: %w", podID, ErrPodNotFound)
+		}
+		return nil, fmt.Errorf("lock pod %s for destroy preparation: %w", podID, err)
+	}
+	if pod.Status == models.PodStatusDestroyed {
+		return nil, fmt.Errorf("pod %s: %w", podID, ErrPodAlreadyDestroyed)
+	}
+
+	var authoritativeID uuid.UUID
+	if err := tx.QueryRow(ctx, `
+		SELECT id
+		FROM jobs
+		WHERE type = $1
+		  AND payload->>'pod_id' = $2
+		ORDER BY created_at ASC, id ASC
+		LIMIT 1
+	`, models.JobTypePodDestroy, podID.String()).Scan(&authoritativeID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("pod %s has no authoritative destroy job: %w", podID, ErrPodDestroyJobObsolete)
+		}
+		return nil, fmt.Errorf("find authoritative destroy job for pod %s: %w", podID, err)
+	}
+	if authoritativeID != jobID {
+		return nil, fmt.Errorf("pod %s authoritative destroy job is %s, not %s: %w", podID, authoritativeID, jobID, ErrPodDestroyJobObsolete)
+	}
+
+	ownsResources, err := podOwnsExactVLAN(ctx, tx, podID, pod.VLANID, pod.Subnet)
+	if err != nil {
+		return nil, err
+	}
+	if !ownsResources {
+		return nil, fmt.Errorf("pod %s VLAN %d/%s: %w", podID, pod.VLANID, pod.Subnet, ErrPodDestroyOwnershipLost)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE pods
+		SET status = $2,
+		    error_message = '',
+		    updated_at = now()
+		WHERE id = $1
+	`, podID, models.PodStatusDestroying); err != nil {
+		return nil, fmt.Errorf("mark pod %s destroying before cleanup: %w", podID, err)
+	}
+	pod.Status = models.PodStatusDestroying
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit pod destroy preparation for %s: %w", podID, err)
+	}
+	return pod, nil
+}
+
+func lockOwnedPodDestroyJob(
+	ctx context.Context,
+	tx pgx.Tx,
+	podID, jobID uuid.UUID,
+	claimOwner string,
+) error {
+	var lockedID uuid.UUID
+	if err := tx.QueryRow(ctx, `
+		SELECT id
+		FROM jobs
+		WHERE id = $1
+		  AND type = $2
+		  AND payload->>'pod_id' = $3
+		  AND status = $4
+		  AND claimed_by = $5
+		FOR UPDATE
+	`, jobID, models.JobTypePodDestroy, podID.String(), models.JobStatusInProgress, claimOwner).Scan(&lockedID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("pod_destroy job %s is not owned in_progress by %s: %w", jobID, claimOwner, ErrJobLeaseLost)
+		}
+		return fmt.Errorf("lock owned pod_destroy job %s: %w", jobID, err)
+	}
+	return nil
+}
+
+// ExtendPod atomically locks the pod, rejects existing destroy intent, records
+// the attestation, and updates expiration. It shares the pod serialization row
+// with expiration enqueue, so exactly one operation wins.
+func (q *Queries) ExtendPod(
+	ctx context.Context,
+	podID, userID uuid.UUID,
+	newExpiry time.Time,
+) (*models.PodAttestation, error) {
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin pod extension: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var status string
+	var previousExpiry *time.Time
+	if err := tx.QueryRow(ctx, `
+		SELECT status, expires_at
+		FROM pods
+		WHERE id = $1
+		FOR UPDATE
+	`, podID).Scan(&status, &previousExpiry); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("lock pod %s for extension: %w", podID, ErrPodNotFound)
+		}
+		return nil, fmt.Errorf("lock pod %s for extension: %w", podID, err)
+	}
+	if status != models.PodStatusActive {
+		return nil, fmt.Errorf("pod %s has status %q: %w", podID, status, ErrPodExtensionRejected)
+	}
+
+	destroyExists, err := podHasAuthoritativeDestroyJob(ctx, tx, podID)
+	if err != nil {
+		return nil, err
+	}
+	if destroyExists {
+		return nil, fmt.Errorf("pod %s has authoritative destroy intent: %w", podID, ErrPodExtensionRejected)
+	}
+
+	attestation := &models.PodAttestation{
+		PodID:             podID,
+		UserID:            userID,
+		PreviousExpiresAt: previousExpiry,
+		NewExpiresAt:      newExpiry,
+	}
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO pod_attestations (pod_id, user_id, previous_expires_at, new_expires_at)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id, created_at
+	`, podID, userID, previousExpiry, newExpiry).Scan(&attestation.ID, &attestation.CreatedAt); err != nil {
+		return nil, fmt.Errorf("insert pod extension attestation for %s: %w", podID, err)
+	}
+	if tag, err := tx.Exec(ctx, `
+		UPDATE pods
+		SET expires_at = $2,
+		    updated_at = now()
+		WHERE id = $1
+		  AND status = $3
+	`, podID, newExpiry, models.PodStatusActive); err != nil {
+		return nil, fmt.Errorf("update pod %s expiration: %w", podID, err)
+	} else if tag.RowsAffected() != 1 {
+		return nil, fmt.Errorf("update pod %s expiration: %w", podID, ErrPodExtensionRejected)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit pod %s extension: %w", podID, err)
+	}
+	return attestation, nil
 }

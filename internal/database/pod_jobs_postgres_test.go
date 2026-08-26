@@ -84,11 +84,40 @@ func newPodJobsPostgresFixture(t *testing.T, status string) *podJobsPostgresFixt
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cleanupCancel()
 		_, _ = pool.Exec(cleanupCtx, `DELETE FROM jobs WHERE payload->>'pod_id' = $1`, fixture.podID.String())
+		_, _ = pool.Exec(cleanupCtx, `UPDATE vlan_pool SET pod_id = NULL, allocated_at = NULL WHERE pod_id = $1`, fixture.podID)
 		_, _ = pool.Exec(cleanupCtx, `DELETE FROM pods WHERE id = $1`, fixture.podID)
 		_, _ = pool.Exec(cleanupCtx, `DELETE FROM templates WHERE id = $1`, fixture.templateID)
 		_, _ = pool.Exec(cleanupCtx, `DELETE FROM users WHERE id = $1`, fixture.ownerID)
 	})
 	return fixture
+}
+
+func (f *podJobsPostgresFixture) assignAvailableVLAN(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+	var vlanTag int
+	var subnet string
+	if err := f.pool.QueryRow(ctx, `
+		UPDATE vlan_pool
+		SET pod_id = $1,
+		    allocated_at = now()
+		WHERE id = (
+			SELECT id
+			FROM vlan_pool
+			WHERE pod_id IS NULL
+			ORDER BY id
+			FOR UPDATE SKIP LOCKED
+			LIMIT 1
+		)
+		RETURNING vlan_tag, subnet
+	`, f.podID).Scan(&vlanTag, &subnet); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.pool.Exec(ctx, `
+		UPDATE pods SET vlan_id = $2, subnet = $3 WHERE id = $1
+	`, f.podID, vlanTag, subnet); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func podDestroyPayload(t *testing.T, podID uuid.UUID, source string) []byte {
@@ -239,6 +268,717 @@ func TestPodDestroyPostgresReusesAuthoritativeJobAcrossEveryStatus(t *testing.T)
 				t.Fatalf("reused job %s, want %s", job.ID, existingID)
 			}
 		})
+	}
+}
+
+func TestPodDestroyPostgresRequeuesFailedPreTransitionJobWithSameID(t *testing.T) {
+	fixture := newPodJobsPostgresFixture(t, models.PodStatusActive)
+	fixture.assignAvailableVLAN(t)
+	ctx := context.Background()
+	existingID := uuid.New()
+	if _, err := fixture.pool.Exec(ctx, `
+					INSERT INTO jobs (id, type, payload, status, completed_at, result, retry_count, max_retries)
+					VALUES (
+						$1,
+						'pod_destroy',
+						jsonb_build_object('pod_id', $2::text),
+						'failed',
+						now(),
+						'{"error":"pre-transition failure"}',
+						3,
+						3
+					)
+				`, existingID, fixture.podID); err != nil {
+		t.Fatal(err)
+	}
+
+	job, queued, err := fixture.queries.CreatePodDestroyJob(
+		ctx,
+		fixture.podID,
+		podDestroyPayload(t, fixture.podID, "retry"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !queued {
+		t.Fatal("terminal pre-transition destroy job was not requeued")
+	}
+	if job.ID != existingID || job.Status != models.JobStatusPending {
+		t.Fatalf("requeued job = %s/%q, want %s/%q", job.ID, job.Status, existingID, models.JobStatusPending)
+	}
+
+	var (
+		count       int
+		status      string
+		retryCount  int
+		completedAt *time.Time
+		result      []byte
+	)
+	if err := fixture.pool.QueryRow(ctx, `
+					SELECT count(*) OVER (), status, retry_count, completed_at, result
+					FROM jobs
+					WHERE type = 'pod_destroy'
+					  AND payload->>'pod_id' = $1
+				`, fixture.podID.String()).Scan(&count, &status, &retryCount, &completedAt, &result); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 || status != models.JobStatusPending || retryCount != 0 || completedAt != nil || result != nil {
+		t.Fatalf("persisted requeue = count %d status %q retries %d completed_at %v result %s", count, status, retryCount, completedAt, result)
+	}
+}
+
+func TestPodDestroyPostgresRequeuesCompletedNonterminalInconsistency(t *testing.T) {
+	fixture := newPodJobsPostgresFixture(t, models.PodStatusActive)
+	fixture.assignAvailableVLAN(t)
+	ctx := context.Background()
+	existingID := uuid.New()
+	if _, err := fixture.pool.Exec(ctx, `
+					INSERT INTO jobs (id, type, payload, status, completed_at)
+					VALUES ($1, 'pod_destroy', jsonb_build_object('pod_id', $2::text), 'completed', now())
+				`, existingID, fixture.podID); err != nil {
+		t.Fatal(err)
+	}
+
+	job, queued, err := fixture.queries.CreatePodDestroyJob(
+		ctx,
+		fixture.podID,
+		podDestroyPayload(t, fixture.podID, "retry"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !queued || job.ID != existingID || job.Status != models.JobStatusPending {
+		t.Fatalf("completed/nonterminal reconciliation = job %v queued %v", job, queued)
+	}
+}
+
+func TestPodDestroyPostgresDoesNotRequeuePartialCleanup(t *testing.T) {
+	fixture := newPodJobsPostgresFixture(t, models.PodStatusDestroyFailed)
+	fixture.assignAvailableVLAN(t)
+	ctx := context.Background()
+	existingID := uuid.New()
+	if _, err := fixture.pool.Exec(ctx, `
+					INSERT INTO jobs (id, type, payload, status, completed_at)
+					VALUES ($1, 'pod_destroy', jsonb_build_object('pod_id', $2::text), 'failed', now())
+				`, existingID, fixture.podID); err != nil {
+		t.Fatal(err)
+	}
+
+	job, queued, err := fixture.queries.CreatePodDestroyJob(
+		ctx,
+		fixture.podID,
+		podDestroyPayload(t, fixture.podID, "retry"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued || job.ID != existingID || job.Status != models.JobStatusFailed {
+		t.Fatalf("partial-cleanup reuse = job %v queued %v", job, queued)
+	}
+
+	job, queued, err = fixture.queries.RequeueFailedPodDestroyJob(
+		ctx,
+		fixture.podID,
+		podDestroyPayload(t, fixture.podID, "destroy_failed_sweep"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !queued || job.ID != existingID || job.Status != models.JobStatusPending {
+		t.Fatalf("serialized partial-cleanup retry = job %v queued %v", job, queued)
+	}
+}
+
+func TestPodDestroyPostgresRequeuesTerminalDestroyingInconsistency(t *testing.T) {
+	fixture := newPodJobsPostgresFixture(t, models.PodStatusDestroying)
+	fixture.assignAvailableVLAN(t)
+	ctx := context.Background()
+	existingID := uuid.New()
+	if _, err := fixture.pool.Exec(ctx, `
+		INSERT INTO jobs (id, type, payload, status, completed_at)
+		VALUES ($1, 'pod_destroy', jsonb_build_object('pod_id', $2::text), 'failed', now())
+	`, existingID, fixture.podID); err != nil {
+		t.Fatal(err)
+	}
+
+	job, queued, err := fixture.queries.CreatePodDestroyJob(
+		ctx,
+		fixture.podID,
+		podDestroyPayload(t, fixture.podID, "terminal_destroying_retry"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !queued || job.ID != existingID || job.Status != models.JobStatusPending {
+		t.Fatalf("destroying reconciliation = job %v queued %v", job, queued)
+	}
+}
+
+func TestFinalizePodDestroyPostgresAtomicallyUpdatesStatusAndReleasesVLAN(t *testing.T) {
+	fixture := newPodJobsPostgresFixture(t, models.PodStatusActive)
+	fixture.assignAvailableVLAN(t)
+	ctx := context.Background()
+	jobID := uuid.New()
+	claimOwner := "worker-" + uuid.NewString()
+	if _, err := fixture.pool.Exec(ctx, `
+		INSERT INTO jobs (id, type, payload, status, claimed_by, claimed_at)
+		VALUES ($1, 'pod_destroy', jsonb_build_object('pod_id', $2::text), 'in_progress', $3, now())
+	`, jobID, fixture.podID, claimOwner); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.queries.PreparePodDestroy(ctx, fixture.podID, jobID, claimOwner); err != nil {
+		t.Fatal(err)
+	}
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
+	functionName := "test_fail_vlan_release_" + suffix
+	triggerName := "test_fail_vlan_release_" + suffix
+	if _, err := fixture.pool.Exec(ctx, fmt.Sprintf(`
+		CREATE FUNCTION %s() RETURNS trigger
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			RAISE EXCEPTION 'injected VLAN release failure';
+		END;
+		$$
+	`, functionName)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(ctx, fmt.Sprintf(`
+		CREATE TRIGGER %s
+		BEFORE UPDATE ON vlan_pool
+		FOR EACH ROW
+		WHEN (OLD.pod_id = '%s'::uuid AND NEW.pod_id IS NULL)
+		EXECUTE FUNCTION %s()
+	`, triggerName, fixture.podID, functionName)); err != nil {
+		t.Fatal(err)
+	}
+	dropTrigger := func() {
+		_, _ = fixture.pool.Exec(context.Background(), fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON vlan_pool", triggerName))
+		_, _ = fixture.pool.Exec(context.Background(), "DROP FUNCTION IF EXISTS "+functionName+"()")
+	}
+	defer dropTrigger()
+
+	if err := fixture.queries.FinalizePodDestroy(ctx, fixture.podID, jobID, claimOwner); err == nil {
+		t.Fatal("injected VLAN release failure did not fail finalization")
+	}
+	var status string
+	var ownsVLAN bool
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT
+			(SELECT status FROM pods WHERE id = $1),
+			EXISTS (SELECT 1 FROM vlan_pool WHERE pod_id = $1)
+	`, fixture.podID).Scan(&status, &ownsVLAN); err != nil {
+		t.Fatal(err)
+	}
+	if status != models.PodStatusDestroying || !ownsVLAN {
+		t.Fatalf("rolled-back finalization left status/ownership %q/%v, want destroying/true", status, ownsVLAN)
+	}
+
+	dropTrigger()
+	if err := fixture.queries.FinalizePodDestroy(ctx, fixture.podID, jobID, claimOwner); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT
+			(SELECT status FROM pods WHERE id = $1),
+			EXISTS (SELECT 1 FROM vlan_pool WHERE pod_id = $1)
+	`, fixture.podID).Scan(&status, &ownsVLAN); err != nil {
+		t.Fatal(err)
+	}
+	if status != models.PodStatusDestroyed || ownsVLAN {
+		t.Fatalf("committed finalization left status/ownership %q/%v, want destroyed/false", status, ownsVLAN)
+	}
+}
+
+func TestPreparePodDestroyPostgresTransitionsAuthoritativeOwnedJob(t *testing.T) {
+	fixture := newPodJobsPostgresFixture(t, models.PodStatusActive)
+	fixture.assignAvailableVLAN(t)
+	ctx := context.Background()
+	jobID := uuid.New()
+	claimOwner := "worker-" + uuid.NewString()
+	if _, err := fixture.pool.Exec(ctx, `
+		INSERT INTO jobs (id, type, payload, status, claimed_by, claimed_at)
+		VALUES ($1, 'pod_destroy', jsonb_build_object('pod_id', $2::text), 'in_progress', $3, now())
+	`, jobID, fixture.podID, claimOwner); err != nil {
+		t.Fatal(err)
+	}
+
+	pod, err := fixture.queries.PreparePodDestroy(ctx, fixture.podID, jobID, claimOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pod.ID != fixture.podID || pod.Status != models.PodStatusDestroying {
+		t.Fatalf("prepared pod = %v, want %s destroying", pod, fixture.podID)
+	}
+	var status string
+	if err := fixture.pool.QueryRow(ctx, `SELECT status FROM pods WHERE id = $1`, fixture.podID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != models.PodStatusDestroying {
+		t.Fatalf("persisted pod status = %q, want destroying", status)
+	}
+}
+
+func TestPrepareAndFinalizePodDestroyPostgresRejectStaleClaimGeneration(t *testing.T) {
+	fixture := newPodJobsPostgresFixture(t, models.PodStatusActive)
+	fixture.assignAvailableVLAN(t)
+	ctx := context.Background()
+	jobID := uuid.New()
+	currentClaim := "worker-current-" + uuid.NewString()
+	staleClaim := "worker-stale-" + uuid.NewString()
+	if _, err := fixture.pool.Exec(ctx, `
+		INSERT INTO jobs (id, type, payload, status, claimed_by, claimed_at)
+		VALUES ($1, 'pod_destroy', jsonb_build_object('pod_id', $2::text), 'in_progress', $3, now())
+	`, jobID, fixture.podID, currentClaim); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := fixture.queries.PreparePodDestroy(ctx, fixture.podID, jobID, staleClaim); !errors.Is(err, ErrJobLeaseLost) {
+		t.Fatalf("stale prepare error = %v, want %v", err, ErrJobLeaseLost)
+	}
+	if err := fixture.queries.FinalizePodDestroy(ctx, fixture.podID, jobID, staleClaim); !errors.Is(err, ErrJobLeaseLost) {
+		t.Fatalf("stale finalize error = %v, want %v", err, ErrJobLeaseLost)
+	}
+
+	var status string
+	var ownsVLAN bool
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT
+			(SELECT status FROM pods WHERE id = $1),
+			EXISTS (SELECT 1 FROM vlan_pool WHERE pod_id = $1)
+	`, fixture.podID).Scan(&status, &ownsVLAN); err != nil {
+		t.Fatal(err)
+	}
+	if status != models.PodStatusActive || !ownsVLAN {
+		t.Fatalf("stale claim changed status/ownership to %q/%v", status, ownsVLAN)
+	}
+}
+
+func TestPreparePodDestroyPostgresRejectsLostVLANOwnership(t *testing.T) {
+	fixture := newPodJobsPostgresFixture(t, models.PodStatusActive)
+	fixture.assignAvailableVLAN(t)
+	ctx := context.Background()
+	if _, err := fixture.pool.Exec(ctx, `
+		UPDATE vlan_pool SET pod_id = NULL, allocated_at = NULL WHERE pod_id = $1
+	`, fixture.podID); err != nil {
+		t.Fatal(err)
+	}
+	jobID := uuid.New()
+	claimOwner := "worker-" + uuid.NewString()
+	if _, err := fixture.pool.Exec(ctx, `
+		INSERT INTO jobs (id, type, payload, status, claimed_by, claimed_at)
+		VALUES ($1, 'pod_destroy', jsonb_build_object('pod_id', $2::text), 'in_progress', $3, now())
+	`, jobID, fixture.podID, claimOwner); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := fixture.queries.PreparePodDestroy(ctx, fixture.podID, jobID, claimOwner); !errors.Is(err, ErrPodDestroyOwnershipLost) {
+		t.Fatalf("prepare error = %v, want %v", err, ErrPodDestroyOwnershipLost)
+	}
+	var status string
+	if err := fixture.pool.QueryRow(ctx, `SELECT status FROM pods WHERE id = $1`, fixture.podID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != models.PodStatusActive {
+		t.Fatalf("ownership rejection changed pod status to %q", status)
+	}
+}
+
+func TestPreparePodDestroyPostgresTreatsDestroyedPodAsNoOpBeforeVLANRead(t *testing.T) {
+	fixture := newPodJobsPostgresFixture(t, models.PodStatusActive)
+	fixture.assignAvailableVLAN(t)
+	ctx := context.Background()
+	jobID := uuid.New()
+	claimOwner := "worker-" + uuid.NewString()
+	if _, err := fixture.pool.Exec(ctx, `
+		INSERT INTO jobs (id, type, payload, status, claimed_by, claimed_at)
+		VALUES ($1, 'pod_destroy', jsonb_build_object('pod_id', $2::text), 'in_progress', $3, now())
+	`, jobID, fixture.podID, claimOwner); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `UPDATE pods SET status = 'destroyed' WHERE id = $1`, fixture.podID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `
+		UPDATE vlan_pool SET pod_id = NULL, allocated_at = NULL WHERE pod_id = $1
+	`, fixture.podID); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := fixture.queries.PreparePodDestroy(ctx, fixture.podID, jobID, claimOwner); !errors.Is(err, ErrPodAlreadyDestroyed) {
+		t.Fatalf("prepare error = %v, want %v", err, ErrPodAlreadyDestroyed)
+	}
+}
+
+func TestPreparePodDestroyPostgresRejectsNonAuthoritativeDuplicate(t *testing.T) {
+	fixture := newPodJobsPostgresFixture(t, models.PodStatusActive)
+	fixture.assignAvailableVLAN(t)
+	ctx := context.Background()
+	authoritativeID := uuid.New()
+	duplicateID := uuid.New()
+	claimOwner := "worker-" + uuid.NewString()
+	if _, err := fixture.pool.Exec(ctx, `
+		INSERT INTO jobs (id, type, payload, status, claimed_by, claimed_at, created_at)
+		VALUES
+			($1, 'pod_destroy', jsonb_build_object('pod_id', $3::text), 'failed', NULL, NULL, now() - interval '1 minute'),
+			($2, 'pod_destroy', jsonb_build_object('pod_id', $3::text), 'in_progress', $4, now(), now())
+	`, authoritativeID, duplicateID, fixture.podID, claimOwner); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := fixture.queries.PreparePodDestroy(ctx, fixture.podID, duplicateID, claimOwner); !errors.Is(err, ErrPodDestroyJobObsolete) {
+		t.Fatalf("prepare error = %v, want %v", err, ErrPodDestroyJobObsolete)
+	}
+	var status string
+	if err := fixture.pool.QueryRow(ctx, `SELECT status FROM pods WHERE id = $1`, fixture.podID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != models.PodStatusActive {
+		t.Fatalf("obsolete duplicate changed pod status to %q", status)
+	}
+}
+
+func TestPodDestroyPostgresDoesNotRequeueAfterVLANReassignment(t *testing.T) {
+	fixture := newPodJobsPostgresFixture(t, models.PodStatusActive)
+	fixture.assignAvailableVLAN(t)
+	ctx := context.Background()
+	otherPodID := uuid.New()
+	if _, err := fixture.pool.Exec(ctx, `
+					INSERT INTO pods (id, owner_id, name, status, vlan_id, subnet)
+					SELECT $1, owner_id, $2, 'destroyed', vlan_id, subnet
+					FROM pods
+					WHERE id = $3
+				`, otherPodID, "reassigned-"+otherPodID.String(), fixture.podID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = fixture.pool.Exec(context.Background(), `DELETE FROM pods WHERE id = $1`, otherPodID)
+	})
+	if _, err := fixture.pool.Exec(ctx, `
+					UPDATE vlan_pool SET pod_id = $2 WHERE pod_id = $1
+				`, fixture.podID, otherPodID); err != nil {
+		t.Fatal(err)
+	}
+	existingID := uuid.New()
+	if _, err := fixture.pool.Exec(ctx, `
+					INSERT INTO jobs (id, type, payload, status, completed_at)
+					VALUES ($1, 'pod_destroy', jsonb_build_object('pod_id', $2::text), 'failed', now())
+				`, existingID, fixture.podID); err != nil {
+		t.Fatal(err)
+	}
+
+	job, queued, err := fixture.queries.CreatePodDestroyJob(
+		ctx,
+		fixture.podID,
+		podDestroyPayload(t, fixture.podID, "delayed"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued || job.ID != existingID || job.Status != models.JobStatusFailed {
+		t.Fatalf("reassigned VLAN reconciliation = job %v queued %v", job, queued)
+	}
+}
+
+func TestPodDestroyPostgresDoesNotRequeueNonterminalPodWithoutExactVLANOwnership(t *testing.T) {
+	fixture := newPodJobsPostgresFixture(t, models.PodStatusActive)
+	fixture.assignAvailableVLAN(t)
+	ctx := context.Background()
+	if _, err := fixture.pool.Exec(ctx, `
+		UPDATE vlan_pool SET pod_id = NULL, allocated_at = NULL WHERE pod_id = $1
+	`, fixture.podID); err != nil {
+		t.Fatal(err)
+	}
+	existingID := uuid.New()
+	if _, err := fixture.pool.Exec(ctx, `
+		INSERT INTO jobs (id, type, payload, status, completed_at)
+		VALUES ($1, 'pod_destroy', jsonb_build_object('pod_id', $2::text), 'failed', now())
+	`, existingID, fixture.podID); err != nil {
+		t.Fatal(err)
+	}
+
+	job, queued, err := fixture.queries.CreatePodDestroyJob(
+		ctx,
+		fixture.podID,
+		podDestroyPayload(t, fixture.podID, "delayed"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued || job.ID != existingID || job.Status != models.JobStatusFailed {
+		t.Fatalf("released VLAN reconciliation = job %v queued %v", job, queued)
+	}
+}
+
+func TestPodDestroyPostgresConcurrentRetryRequeuesOnce(t *testing.T) {
+	fixture := newPodJobsPostgresFixture(t, models.PodStatusActive)
+	fixture.assignAvailableVLAN(t)
+	ctx := context.Background()
+	existingID := uuid.New()
+	if _, err := fixture.pool.Exec(ctx, `
+					INSERT INTO jobs (id, type, payload, status, completed_at)
+					VALUES ($1, 'pod_destroy', jsonb_build_object('pod_id', $2::text), 'failed', now())
+				`, existingID, fixture.podID); err != nil {
+		t.Fatal(err)
+	}
+
+	const producers = 8
+	type result struct {
+		job    *models.Job
+		queued bool
+		err    error
+	}
+	results := make(chan result, producers)
+	start := make(chan struct{})
+	for i := 0; i < producers; i++ {
+		go func() {
+			<-start
+			job, queued, err := fixture.queries.CreatePodDestroyJob(
+				ctx,
+				fixture.podID,
+				podDestroyPayload(t, fixture.podID, "concurrent_retry"),
+			)
+			results <- result{job: job, queued: queued, err: err}
+		}()
+	}
+	close(start)
+
+	queuedCount := 0
+	for i := 0; i < producers; i++ {
+		got := <-results
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		if got.job.ID != existingID {
+			t.Fatalf("retry returned job %s, want %s", got.job.ID, existingID)
+		}
+		if got.queued {
+			queuedCount++
+		}
+	}
+	if queuedCount != 1 {
+		t.Fatalf("requeue publishers = %d, want 1", queuedCount)
+	}
+}
+
+func installAdvisoryBlockingInsertTrigger(
+	t *testing.T,
+	fixture *podJobsPostgresFixture,
+	table, predicate string,
+) (int64, func()) {
+	t.Helper()
+	ctx := context.Background()
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	functionName := "test_block_insert_" + suffix
+	triggerName := "test_block_insert_" + suffix
+	key := time.Now().UnixNano() & 0x3fffffff
+	if _, err := fixture.pool.Exec(ctx, fmt.Sprintf(`
+					CREATE FUNCTION %s() RETURNS trigger
+					LANGUAGE plpgsql
+					AS $$
+					BEGIN
+						PERFORM pg_advisory_xact_lock(%d);
+						RETURN NEW;
+					END;
+					$$
+				`, functionName, key)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(ctx, fmt.Sprintf(`
+					CREATE TRIGGER %s
+					BEFORE INSERT ON %s
+					FOR EACH ROW
+					WHEN (%s)
+					EXECUTE FUNCTION %s()
+				`, triggerName, table, predicate, functionName)); err != nil {
+		_, _ = fixture.pool.Exec(ctx, "DROP FUNCTION "+functionName+"()")
+		t.Fatal(err)
+	}
+	cleanup := func() {
+		_, _ = fixture.pool.Exec(context.Background(), fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON %s", triggerName, table))
+		_, _ = fixture.pool.Exec(context.Background(), "DROP FUNCTION IF EXISTS "+functionName+"()")
+	}
+	t.Cleanup(cleanup)
+	return key, cleanup
+}
+
+func waitForAdvisoryWaiter(t *testing.T, pool *pgxpool.Pool, key int64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var waiting int
+		if err := pool.QueryRow(context.Background(), `
+						SELECT count(*)
+						FROM pg_locks
+						WHERE locktype = 'advisory'
+						  AND NOT granted
+						  AND objid::bigint = $1
+					`, key).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("transaction did not wait on advisory lock %d", key)
+}
+
+func TestPodExpirationAndExtensionPostgresExtensionWins(t *testing.T) {
+	fixture := newPodJobsPostgresFixture(t, models.PodStatusActive)
+	ctx := context.Background()
+	if _, err := fixture.pool.Exec(ctx, `
+					UPDATE pods SET expires_at = now() - interval '1 minute' WHERE id = $1
+				`, fixture.podID); err != nil {
+		t.Fatal(err)
+	}
+
+	key, _ := installAdvisoryBlockingInsertTrigger(
+		t,
+		fixture,
+		"pod_attestations",
+		fmt.Sprintf("NEW.pod_id = '%s'::uuid", fixture.podID),
+	)
+	lockConn, err := fixture.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockConn.Release()
+	if _, err := lockConn.Exec(ctx, `SELECT pg_advisory_lock($1)`, key); err != nil {
+		t.Fatal(err)
+	}
+	locked := true
+	defer func() {
+		if locked {
+			_, _ = lockConn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, key)
+		}
+	}()
+
+	newExpiry := time.Now().Add(7 * 24 * time.Hour)
+	extensionResult := make(chan error, 1)
+	go func() {
+		_, err := fixture.queries.ExtendPod(ctx, fixture.podID, fixture.ownerID, newExpiry)
+		extensionResult <- err
+	}()
+	waitForAdvisoryWaiter(t, fixture.pool, key)
+
+	expirationResult := make(chan error, 1)
+	go func() {
+		_, _, err := fixture.queries.CreateExpiredPodDestroyJob(
+			ctx,
+			fixture.podID,
+			podDestroyPayload(t, fixture.podID, "expiration"),
+		)
+		expirationResult <- err
+	}()
+	select {
+	case err := <-expirationResult:
+		t.Fatalf("expiration returned before extension released the pod lock: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, err := lockConn.Exec(ctx, `SELECT pg_advisory_unlock($1)`, key); err != nil {
+		t.Fatal(err)
+	}
+	locked = false
+
+	if err := <-extensionResult; err != nil {
+		t.Fatalf("extension failed: %v", err)
+	}
+	if err := <-expirationResult; !errors.Is(err, ErrPodDestroyNotNeeded) {
+		t.Fatalf("expiration error = %v, want %v", err, ErrPodDestroyNotNeeded)
+	}
+
+	var attestations, destroyJobs int
+	if err := fixture.pool.QueryRow(ctx, `
+					SELECT
+						(SELECT count(*) FROM pod_attestations WHERE pod_id = $1),
+						(SELECT count(*) FROM jobs WHERE type = 'pod_destroy' AND payload->>'pod_id' = $1::text)
+				`, fixture.podID).Scan(&attestations, &destroyJobs); err != nil {
+		t.Fatal(err)
+	}
+	if attestations != 1 || destroyJobs != 0 {
+		t.Fatalf("extension-first result = %d attestations, %d destroy jobs", attestations, destroyJobs)
+	}
+}
+
+func TestPodExpirationAndExtensionPostgresExpirationWins(t *testing.T) {
+	fixture := newPodJobsPostgresFixture(t, models.PodStatusActive)
+	ctx := context.Background()
+	if _, err := fixture.pool.Exec(ctx, `
+					UPDATE pods SET expires_at = now() - interval '1 minute' WHERE id = $1
+				`, fixture.podID); err != nil {
+		t.Fatal(err)
+	}
+
+	key, _ := installAdvisoryBlockingInsertTrigger(
+		t,
+		fixture,
+		"jobs",
+		fmt.Sprintf("NEW.type = 'pod_destroy' AND NEW.payload->>'pod_id' = '%s'", fixture.podID),
+	)
+	lockConn, err := fixture.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockConn.Release()
+	if _, err := lockConn.Exec(ctx, `SELECT pg_advisory_lock($1)`, key); err != nil {
+		t.Fatal(err)
+	}
+	locked := true
+	defer func() {
+		if locked {
+			_, _ = lockConn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, key)
+		}
+	}()
+
+	expirationResult := make(chan error, 1)
+	go func() {
+		_, _, err := fixture.queries.CreateExpiredPodDestroyJob(
+			ctx,
+			fixture.podID,
+			podDestroyPayload(t, fixture.podID, "expiration"),
+		)
+		expirationResult <- err
+	}()
+	waitForAdvisoryWaiter(t, fixture.pool, key)
+
+	extensionResult := make(chan error, 1)
+	go func() {
+		_, err := fixture.queries.ExtendPod(
+			ctx,
+			fixture.podID,
+			fixture.ownerID,
+			time.Now().Add(7*24*time.Hour),
+		)
+		extensionResult <- err
+	}()
+	select {
+	case err := <-extensionResult:
+		t.Fatalf("extension returned before expiration released the pod lock: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, err := lockConn.Exec(ctx, `SELECT pg_advisory_unlock($1)`, key); err != nil {
+		t.Fatal(err)
+	}
+	locked = false
+
+	if err := <-expirationResult; err != nil {
+		t.Fatalf("expiration failed: %v", err)
+	}
+	if err := <-extensionResult; !errors.Is(err, ErrPodExtensionRejected) {
+		t.Fatalf("extension error = %v, want %v", err, ErrPodExtensionRejected)
+	}
+
+	var attestations, destroyJobs int
+	if err := fixture.pool.QueryRow(ctx, `
+					SELECT
+						(SELECT count(*) FROM pod_attestations WHERE pod_id = $1),
+						(SELECT count(*) FROM jobs WHERE type = 'pod_destroy' AND payload->>'pod_id' = $1::text)
+				`, fixture.podID).Scan(&attestations, &destroyJobs); err != nil {
+		t.Fatal(err)
+	}
+	if attestations != 0 || destroyJobs != 1 {
+		t.Fatalf("expiration-first result = %d attestations, %d destroy jobs", attestations, destroyJobs)
 	}
 }
 

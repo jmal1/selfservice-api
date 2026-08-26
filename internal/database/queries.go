@@ -686,6 +686,47 @@ func (q *Queries) ReleaseVLAN(ctx context.Context, podID uuid.UUID) error {
 	return err
 }
 
+// FinalizePodDestroy atomically marks a pod destroyed and releases its VLAN.
+// Workers call this while owning the destroy job, preserving job->pod order.
+func (q *Queries) FinalizePodDestroy(
+	ctx context.Context,
+	podID, jobID uuid.UUID,
+	claimOwner string,
+) error {
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin pod destroy finalization: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockOwnedPodDestroyJob(ctx, tx, podID, jobID, claimOwner); err != nil {
+		return err
+	}
+	if tag, err := tx.Exec(ctx, `
+		UPDATE pods
+		SET status = $2,
+		    error_message = '',
+		    updated_at = now()
+		WHERE id = $1
+		  AND status = $3
+	`, podID, models.PodStatusDestroyed, models.PodStatusDestroying); err != nil {
+		return fmt.Errorf("mark pod %s destroyed: %w", podID, err)
+	} else if tag.RowsAffected() != 1 {
+		return fmt.Errorf("mark pod %s destroyed from destroying: %w", podID, ErrPodJobRejected)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE vlan_pool
+		SET pod_id = NULL,
+		    allocated_at = NULL
+		WHERE pod_id = $1
+	`, podID); err != nil {
+		return fmt.Errorf("release VLAN for destroyed pod %s: %w", podID, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit pod destroy finalization for %s: %w", podID, err)
+	}
+	return nil
+}
+
 // CreatePod inserts a pod record with a checked-out VLAN.
 func (q *Queries) CreatePod(ctx context.Context, tx pgx.Tx, pod *models.Pod) error {
 	return tx.QueryRow(ctx, `
@@ -2705,23 +2746,6 @@ func (q *Queries) CountUserSnapshots(ctx context.Context, podVMID uuid.UUID) (in
 		return 0, fmt.Errorf("count user snapshots: %w", err)
 	}
 	return count, nil
-}
-
-// --- Pod Expiration ---
-
-// UpdatePodExpiry updates the expires_at timestamp for a pod.
-func (q *Queries) UpdatePodExpiry(ctx context.Context, podID uuid.UUID, expiresAt time.Time) error {
-	_, err := q.pool.Exec(ctx, `UPDATE pods SET expires_at = $1, updated_at = now() WHERE id = $2`, expiresAt, podID)
-	return err
-}
-
-// CreatePodAttestation records a pod extension event.
-func (q *Queries) CreatePodAttestation(ctx context.Context, a *models.PodAttestation) error {
-	return q.pool.QueryRow(ctx, `
-		INSERT INTO pod_attestations (pod_id, user_id, previous_expires_at, new_expires_at)
-		VALUES ($1, $2, $3, $4)
-		RETURNING id, created_at
-	`, a.PodID, a.UserID, a.PreviousExpiresAt, a.NewExpiresAt).Scan(&a.ID, &a.CreatedAt)
 }
 
 // ListExpiredPods returns active pods that have passed their expiration time.

@@ -20,6 +20,7 @@ var expectedSerializedPodJobProducerInventory = map[string][]string{
 	"pod_destroy": {
 		"internal/api/handlers/handlers.go:CreatePodDestroyJob",
 		"internal/provisioner/expiration.go:CreateExpiredPodDestroyJob",
+		"internal/provisioner/destroy.go:RequeueFailedPodDestroyJob",
 		"internal/provisioner/vm_ops.go:CreateEmptyPodDestroyJob",
 	},
 	"vm_add":             {"internal/api/handlers/handlers.go:CreateVMAddJob"},
@@ -40,6 +41,7 @@ var expectedSerializedBoundaryCalls = map[string]map[string]int{
 		"CreatePodDestroyJob":  1,
 		"CreateVMAddJob":       1,
 		"CreateVMJob":          2,
+		"ExtendPod":            2,
 	},
 	"internal/api/handlers/blueprints.go": {
 		"CreatePodCreateJobTx": 1,
@@ -49,6 +51,10 @@ var expectedSerializedBoundaryCalls = map[string]map[string]int{
 	},
 	"internal/provisioner/expiration.go": {
 		"CreateExpiredPodDestroyJob": 1,
+	},
+	"internal/provisioner/destroy.go": {
+		"RequeueFailedPodDestroyJob": 1,
+		"PreparePodDestroy":          1,
 	},
 	"internal/provisioner/vm_ops.go": {
 		"CreateEmptyPodDestroyJob": 1,
@@ -95,8 +101,11 @@ func TestSerializedPodJobProducerInventoryUsesOnlySharedBoundary(t *testing.T) {
 			"CreatePodDestroyJob",
 			"CreateExpiredPodDestroyJob",
 			"CreateEmptyPodDestroyJob",
+			"RequeueFailedPodDestroyJob",
+			"PreparePodDestroy",
 			"CreateVMAddJob",
 			"CreateVMJob",
+			"ExtendPod",
 		} {
 			count := strings.Count(string(body), "."+method+"(")
 			if count == 0 {
@@ -125,6 +134,46 @@ func TestSerializedPodJobProducerInventoryUsesOnlySharedBoundary(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestPodExtensionPersistenceUsesOnlySerializedBoundary(t *testing.T) {
+	root := findRepoRoot(t)
+	attestationInsert := regexp.MustCompile(`(?is)\binsert\s+into\s+pod_attestations\b`)
+	expiryUpdate := regexp.MustCompile(`(?is)\bupdate\s+pods\s+set\s+expires_at\b`)
+	actual := make(map[string]int)
+	err := filepath.WalkDir(filepath.Join(root, "internal"), func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if strings.Contains(string(body), ".CreatePodAttestation(") ||
+			strings.Contains(string(body), ".UpdatePodExpiry(") {
+			rel, _ := filepath.Rel(root, path)
+			t.Errorf("%s bypasses the serialized pod extension boundary", filepath.ToSlash(rel))
+		}
+		count := len(attestationInsert.FindAll(body, -1)) + len(expiryUpdate.FindAll(body, -1))
+		if count == 0 {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		actual[filepath.ToSlash(rel)] = count
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertExactFileCounts(t, "pod extension persistence", actual, map[string]int{
+		"internal/database/pod_jobs.go": 2,
+	})
 }
 
 func TestProductionGenericAndRawJobInsertionInventoryIsStable(t *testing.T) {

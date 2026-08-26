@@ -714,11 +714,6 @@ func (h *Handler) DeletePod(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if pod.Status == models.PodStatusDestroying || pod.Status == models.PodStatusDestroyed {
-		respondError(w, r, http.StatusConflict, "pod is already being destroyed")
-		return
-	}
-
 	payload, _ := json.Marshal(map[string]string{"pod_id": podID.String(), "pod_name": pod.Name, "user_id": userID.String()})
 	job, created, err := h.db.CreatePodDestroyJob(r.Context(), podID, payload)
 	if err != nil {
@@ -790,22 +785,13 @@ func (h *Handler) ExtendPod(w http.ResponseWriter, r *http.Request) {
 	}
 	newExpiry := time.Now().Add(extension)
 
-	// Record attestation
-	attestation := &models.PodAttestation{
-		PodID:             podID,
-		UserID:            userID,
-		PreviousExpiresAt: pod.ExpiresAt,
-		NewExpiresAt:      newExpiry,
-	}
-	if err := h.db.CreatePodAttestation(r.Context(), attestation); err != nil {
-		h.logger.Error("create attestation failed", "error", err)
-		respondError(w, r, http.StatusInternalServerError, "internal error")
-		return
-	}
-
-	// Update pod expiry
-	if err := h.db.UpdatePodExpiry(r.Context(), podID, newExpiry); err != nil {
-		h.logger.Error("update pod expiry failed", "error", err)
+	attestation, err := h.db.ExtendPod(r.Context(), podID, userID, newExpiry)
+	if err != nil {
+		if errors.Is(err, database.ErrPodExtensionRejected) {
+			respondError(w, r, http.StatusConflict, "pod cannot be extended after destruction is queued")
+			return
+		}
+		h.logger.Error("extend pod failed", "error", err)
 		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
@@ -813,7 +799,7 @@ func (h *Handler) ExtendPod(w http.ResponseWriter, r *http.Request) {
 	audit.Log(r.Context(), h.db, "pod.extend",
 		audit.Resource("pod", podID),
 		audit.IP(r.RemoteAddr),
-		audit.Detail("previous_expires_at", fmt.Sprintf("%v", pod.ExpiresAt)),
+		audit.Detail("previous_expires_at", fmt.Sprintf("%v", attestation.PreviousExpiresAt)),
 		audit.Detail("new_expires_at", newExpiry.Format(time.RFC3339)),
 	)
 
@@ -846,20 +832,12 @@ func (h *Handler) AdminExtendPod(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.UserIDFromContext(r.Context())
 	newExpiry := time.Now().Add(30 * 24 * time.Hour)
 
-	attestation := &models.PodAttestation{
-		PodID:             podID,
-		UserID:            userID,
-		PreviousExpiresAt: pod.ExpiresAt,
-		NewExpiresAt:      newExpiry,
-	}
-	if err := h.db.CreatePodAttestation(r.Context(), attestation); err != nil {
-		h.logger.Error("create attestation failed", "error", err)
-		respondError(w, r, http.StatusInternalServerError, "internal error")
-		return
-	}
-
-	if err := h.db.UpdatePodExpiry(r.Context(), podID, newExpiry); err != nil {
-		h.logger.Error("update pod expiry failed", "error", err)
+	if _, err := h.db.ExtendPod(r.Context(), podID, userID, newExpiry); err != nil {
+		if errors.Is(err, database.ErrPodExtensionRejected) {
+			respondError(w, r, http.StatusConflict, "pod cannot be extended after destruction is queued")
+			return
+		}
+		h.logger.Error("admin extend pod failed", "error", err)
 		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
