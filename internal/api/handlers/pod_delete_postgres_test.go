@@ -893,13 +893,16 @@ func TestDeletePodQueuesDestroyForTerminalProtectedJobs(t *testing.T) {
 	}
 }
 
-func TestDeletePodExactLockRaceWithQueuedVmDestroyFallsBack(t *testing.T) {
+func TestCancelPendingPodIfNeverStartedIgnoresLockedCompetingTerminalJob(t *testing.T) {
 	fixture := newPodDeletePostgresFixture(t, 1)
 	ctx := context.Background()
-	competingJobID := fixture.insertJob(t, models.JobTypeVMSnapshotDelete, map[string]string{
-		"pod_id":    fixture.podID.String(),
-		"pod_vm_id": fixture.podVMIDs[0].String(),
+	competingJobID := fixture.insertJob(t, models.JobTypePodDestroy, map[string]string{
+		"pod_id":  fixture.podID.String(),
+		"user_id": fixture.ownerID.String(),
 	})
+	if _, err := fixture.pool.Exec(ctx, `UPDATE jobs SET status = 'failed', completed_at = now() WHERE id = $1`, competingJobID); err != nil {
+		t.Fatal(err)
+	}
 
 	lockCtx, lockCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer lockCancel()
@@ -913,38 +916,39 @@ func TestDeletePodExactLockRaceWithQueuedVmDestroyFallsBack(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	done := make(chan *httptest.ResponseRecorder, 1)
+	done := make(chan struct {
+		decision *database.PodDeletionDecision
+		err      error
+	}, 1)
 	go func() {
-		rec := httptest.NewRecorder()
-		fixture.handler().DeletePod(rec, fixture.deleteRequest())
-		done <- rec
+		decision, err := fixture.queries.CancelPendingPodIfNeverStarted(lockCtx, fixture.podID)
+		done <- struct {
+			decision *database.PodDeletionDecision
+			err      error
+		}{decision: decision, err: err}
 	}()
 
+	var result struct {
+		decision *database.PodDeletionDecision
+		err      error
+	}
 	select {
-	case rec := <-done:
-		_ = tx.Rollback(lockCtx)
-		t.Fatalf("delete returned early while competing job row was locked: %d body=%s", rec.Code, rec.Body.String())
-	case <-time.After(250 * time.Millisecond):
-	}
-
-	var podLocked uuid.UUID
-	if err := tx.QueryRow(lockCtx, `SELECT id FROM pods WHERE id = $1 FOR UPDATE NOWAIT`, fixture.podID).Scan(&podLocked); err != nil {
-		_ = tx.Rollback(lockCtx)
-		t.Fatalf("worker-style pod lock after job lock failed: %v", err)
-	}
-
-	if err := tx.Commit(lockCtx); err != nil {
-		t.Fatal(err)
-	}
-
-	var rec *httptest.ResponseRecorder
-	select {
-	case rec = <-done:
+	case result = <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for delete response after releasing competing locks")
+		_ = tx.Rollback(lockCtx)
+		t.Fatal("timed out waiting for cancellation decision with locked competing job")
 	}
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("delete status = %d body=%s, want 409 conflict", rec.Code, rec.Body.String())
+	if result.err != nil {
+		_ = tx.Rollback(lockCtx)
+		t.Fatal(result.err)
+	}
+	if result.decision == nil || result.decision.Outcome != database.PodDeletionOutcomeNeedsDestroy {
+		_ = tx.Rollback(lockCtx)
+		t.Fatalf("decision = %#v, want needs_destroy", result.decision)
+	}
+
+	if err := tx.Rollback(lockCtx); err != nil {
+		t.Fatal(err)
 	}
 
 	var podStatus string
@@ -952,15 +956,15 @@ func TestDeletePodExactLockRaceWithQueuedVmDestroyFallsBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	if podStatus != models.PodStatusPending {
-		t.Fatalf("pod status = %s, want pending after conflict", podStatus)
+		t.Fatalf("pod status = %s, want pending after conservative fallback", podStatus)
 	}
 
 	var createJobStatus string
 	if err := fixture.pool.QueryRow(ctx, `SELECT status FROM jobs WHERE id = $1`, fixture.createJob).Scan(&createJobStatus); err != nil {
 		t.Fatal(err)
 	}
-	if createJobStatus != models.JobStatusPending && createJobStatus != models.JobStatusClaimed {
-		t.Fatalf("create job status = %s, want pending or claimed after conflict", createJobStatus)
+	if createJobStatus != models.JobStatusPending {
+		t.Fatalf("create job status = %s, want pending after conservative fallback", createJobStatus)
 	}
 
 	var destroyJobs int
@@ -970,8 +974,8 @@ func TestDeletePodExactLockRaceWithQueuedVmDestroyFallsBack(t *testing.T) {
 	`, fixture.podID.String()).Scan(&destroyJobs); err != nil {
 		t.Fatal(err)
 	}
-	if destroyJobs != 0 {
-		t.Fatalf("destroy jobs = %d, want 0 on conflict", destroyJobs)
+	if destroyJobs != 1 {
+		t.Fatalf("destroy jobs = %d, want 1 locked terminal evidence row only", destroyJobs)
 	}
 }
 

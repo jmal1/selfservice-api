@@ -26,7 +26,7 @@ type PodDeletionDecision struct {
 	JobID   uuid.UUID
 }
 
-func podCancellationProtectedJobs(ctx context.Context, tx pgx.Tx, podID, excludeJobID uuid.UUID, lockRows bool) (bool, error) {
+func podCancellationProtectedJobs(ctx context.Context, tx pgx.Tx, podID, excludeJobID uuid.UUID) (bool, error) {
 	query := `
 		WITH pod_vm_ids AS (
 			SELECT id::text AS pod_vm_id
@@ -46,9 +46,6 @@ func podCancellationProtectedJobs(ctx context.Context, tx pgx.Tx, podID, exclude
 		    OR j.payload->>'pod_vm_id' IN (SELECT pod_vm_id FROM pod_vm_ids)
 		  )
 		ORDER BY ot.ord, j.created_at ASC, j.id ASC`
-	if lockRows {
-		query += " FOR UPDATE"
-	}
 
 	rows, err := tx.Query(ctx, query, podID, excludeJobID, serializedPodJobTypes)
 	if err != nil {
@@ -73,8 +70,7 @@ func podCancellationProtectedJobs(ctx context.Context, tx pgx.Tx, podID, exclude
 // CancelPendingPodIfNeverStarted cancels a pending pod only when the create job
 // is still pristine and no job, VM, placement, or receipt evidence shows that
 // provisioning ever started. It locks the authoritative create job first, then
-// any existing protected jobs, and never locks an existing job while holding the
-// pod row.
+// the pod, and only reads protected jobs when checking for evidence.
 func (q *Queries) CancelPendingPodIfNeverStarted(ctx context.Context, podID uuid.UUID) (*PodDeletionDecision, error) {
 	tx, err := q.pool.Begin(ctx)
 	if err != nil {
@@ -140,7 +136,7 @@ func (q *Queries) CancelPendingPodIfNeverStarted(ctx context.Context, podID uuid
 		rollbackCount == 0
 
 	var competingEvidence bool
-	competingEvidence, err = podCancellationProtectedJobs(ctx, tx, podID, createJobID, true)
+	competingEvidence, err = podCancellationProtectedJobs(ctx, tx, podID, createJobID)
 	if err != nil {
 		return nil, err
 	}
@@ -168,7 +164,7 @@ func (q *Queries) CancelPendingPodIfNeverStarted(ctx context.Context, podID uuid
 		return &PodDeletionDecision{Outcome: PodDeletionOutcomeAlreadyCancelled, JobID: createJobID}, nil
 	}
 
-	postEvidence, err := podCancellationProtectedJobs(ctx, tx, podID, createJobID, false)
+	postEvidence, err := podCancellationProtectedJobs(ctx, tx, podID, createJobID)
 	if err != nil {
 		return nil, err
 	}
