@@ -3407,8 +3407,9 @@ type deployScriptEnvironment struct {
 	commitVerified            bool
 	missingBuild              string
 	gitDirty                  bool
-	liveHelmRelease           string
-	liveHelmNamespace         string
+	// Model Helm ownership metadata present live but absent from server-side dry-run objects.
+	liveHelmRelease   string
+	liveHelmNamespace string
 
 	failFinalServerDryRun          bool
 	externalDriftAfterServerDryRun bool
