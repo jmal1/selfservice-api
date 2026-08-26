@@ -47,6 +47,7 @@ type retryRecord struct {
 	nextAt        time.Time
 	cleanupOnly   bool
 	cleanupTarget []byte
+	result        []byte
 }
 
 type fakeJobDB struct {
@@ -104,6 +105,42 @@ func (f *fakeJobDB) UpdateJobStatus(
 		return err
 	}
 	return nil
+}
+
+func (f *fakeJobDB) RetryTemplateProvisionJob(
+	_ context.Context,
+	id uuid.UUID,
+	nextAt time.Time,
+	result []byte,
+	_ string,
+) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	call := f.retryCalls
+	f.retryCalls++
+	if call < len(f.retryErrs) && f.retryErrs[call] != nil {
+		return f.retryErrs[call]
+	}
+	if f.retryErr != nil {
+		return f.retryErr
+	}
+	f.retried = append(f.retried, retryRecord{id: id, nextAt: nextAt, result: result})
+	return nil
+}
+
+func (f *fakeJobDB) FailTemplateProvisionJob(
+	_ context.Context,
+	id uuid.UUID,
+	_ string,
+	result []byte,
+) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.statusErr[models.JobStatusFailed]; err != nil {
+		return false, err
+	}
+	f.statuses = append(f.statuses, statusRecord{id: id, status: models.JobStatusFailed, result: result})
+	return true, nil
 }
 
 func (f *fakeJobDB) statusesWithStatus(s string) []statusRecord {
@@ -189,6 +226,115 @@ func TestHandleJobOutcome_RetryableReturnsPending(t *testing.T) {
 	key := "template_provision|" + RetryReasonTransientClone
 	if m.jobRetries[key] == 0 {
 		t.Errorf("crucible_job_retries_total[%s] not incremented", key)
+	}
+}
+
+func TestTemplateProvisionFailureResultPreservesFirstAndCurrentFailures(t *testing.T) {
+	firstCause := errors.New("clone source VM: wait clone task: The virtual disk is either corrupted or not a supported format: first")
+	first := marshalTemplateProvisionFailure(nil, firstCause, 0, 3)
+	secondCause := errors.New("clone source VM: wait clone task: The virtual disk is either corrupted or not a supported format: second")
+	second := marshalTemplateProvisionFailure(first, secondCause, 1, 3)
+
+	var result templateProvisionFailureResult
+	if err := json.Unmarshal(second, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.FirstRawError != firstCause.Error() || result.CurrentRawError != secondCause.Error() {
+		t.Fatalf("failure history = first %q current %q", result.FirstRawError, result.CurrentRawError)
+	}
+	if result.FirstAttempt != 1 || result.CurrentAttempt != 2 || result.Attempts != 2 {
+		t.Fatalf(
+			"attempt fields = first %d current %d attempts %d",
+			result.FirstAttempt,
+			result.CurrentAttempt,
+			result.Attempts,
+		)
+	}
+	if result.Error != result.CurrentError || result.RawError != result.CurrentRawError {
+		t.Fatalf("compatibility fields do not mirror current failure: %+v", result)
+	}
+}
+
+func TestTemplateProvisionRetryPersistenceFailureDoesNotBecomeTerminal(t *testing.T) {
+	db := &fakeJobDB{retryErr: errors.New("database unavailable")}
+	metrics := NewPipelineMetrics("", "", nil)
+	job := &models.Job{
+		ID:         uuid.New(),
+		Type:       models.JobTypeTemplateProvision,
+		RetryCount: 0,
+		MaxRetries: 3,
+	}
+	result := runLifecycle(
+		context.Background(),
+		db,
+		metrics,
+		job,
+		errors.New("clone source VM: wait clone task: The virtual disk is either corrupted or not a supported format."),
+	)
+	if result == nil || !strings.Contains(result.Error(), "persist template provision retry") {
+		t.Fatalf("retry persistence result = %v", result)
+	}
+	if len(db.statusesWithStatus(models.JobStatusFailed)) != 0 {
+		t.Fatal("retry persistence infrastructure failure was misclassified as terminal")
+	}
+	if metrics.templateTransitions[models.TemplateStateProvisioning+"|"+models.TemplateStateError] != 0 {
+		t.Fatal("retry persistence infrastructure failure emitted a terminal template transition")
+	}
+}
+
+func TestTemplateProvisionTerminalTransitionMetricRequiresCommittedOwnership(t *testing.T) {
+	cause := errors.New("source_ref is invalid")
+	for _, tc := range []struct {
+		name       string
+		statusErr  error
+		wantMetric float64
+	}{
+		{name: "committed", wantMetric: 1},
+		{name: "lease lost", statusErr: database.ErrJobLeaseLost, wantMetric: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := &fakeJobDB{statusErr: map[string]error{models.JobStatusFailed: tc.statusErr}}
+			metrics := NewPipelineMetrics("", "", nil)
+			job := &models.Job{
+				ID:         uuid.New(),
+				Type:       models.JobTypeTemplateProvision,
+				Payload:    []byte(`{"template_id":"` + uuid.NewString() + `"}`),
+				RetryCount: 0,
+				MaxRetries: 3,
+			}
+			result := runLifecycle(context.Background(), db, metrics, job, cause)
+			if tc.statusErr == nil && !errors.Is(result, cause) {
+				t.Fatalf("terminal result = %v, want original cause", result)
+			}
+			if tc.statusErr != nil && !errors.Is(result, tc.statusErr) {
+				t.Fatalf("claim-loss result = %v, want %v", result, tc.statusErr)
+			}
+			key := models.TemplateStateProvisioning + "|" + models.TemplateStateError
+			if got := metrics.templateTransitions[key]; got != tc.wantMetric {
+				t.Fatalf("transition metric = %g, want %g", got, tc.wantMetric)
+			}
+		})
+	}
+}
+
+func TestTemplateProvisionRetryThenSuccessReplacesFailureResult(t *testing.T) {
+	db := &fakeJobDB{}
+	job := &models.Job{
+		ID:         uuid.New(),
+		Type:       models.JobTypeTemplateProvision,
+		Result:     marshalTemplateProvisionFailure(nil, errors.New("first failure"), 0, 3),
+		RetryCount: 1,
+		MaxRetries: 3,
+	}
+	if err := runLifecycle(context.Background(), db, NewPipelineMetrics("", "", nil), job, nil); err != nil {
+		t.Fatal(err)
+	}
+	completed := db.statusesWithStatus(models.JobStatusCompleted)
+	if len(completed) != 1 {
+		t.Fatalf("completed writes = %d, want 1", len(completed))
+	}
+	if strings.Contains(string(completed[0].result), "first failure") {
+		t.Fatalf("successful result retained stale failure: %s", completed[0].result)
 	}
 }
 

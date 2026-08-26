@@ -13,11 +13,50 @@ def optional_array($path):
   else error($path + " must be an array or null")
   end;
 
+def validate_managed_annotation($key; $expected):
+  if has($key) then
+    .[$key] as $actual
+    | if ($actual | type) != "string" then
+        error(".metadata.annotations[" + ($key | tojson) + "] must be a string")
+      elif $actual != $expected then
+        error(
+          ".metadata.annotations[" + ($key | tojson) + "] must equal " +
+          ($expected | tojson)
+        )
+      else
+        .
+      end
+  else
+    .
+  end;
+
 . | require_object("resource") as $resource
 | if $resource.kind != $kind then
     error("resource kind must be " + $kind)
   else
-    $resource.spec | require_object(".spec")
+    $resource.spec | require_object(".spec") as $spec
+    | if $kind == "Job" then
+        $spec
+      else
+        $resource.metadata | require_object(".metadata") as $metadata
+        | $metadata.annotations | optional_object(".metadata.annotations") as $annotations
+        | ($annotations // {})
+        | validate_managed_annotation("meta.helm.sh/release-name"; $release)
+        | validate_managed_annotation("meta.helm.sh/release-namespace"; $namespace)
+        | del(."meta.helm.sh/release-name")
+        | del(."meta.helm.sh/release-namespace")
+        | (if $kind == "Deployment" then
+            del(."deployment.kubernetes.io/revision")
+          else
+            .
+          end) as $normalized_annotations
+        | {
+            metadata: {
+              annotations: $normalized_annotations
+            },
+            spec: $spec
+          }
+      end
   end
 | if $kind != "Job" then
     .

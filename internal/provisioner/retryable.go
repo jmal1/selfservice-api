@@ -30,6 +30,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/models"
 	"github.com/jmal1/selfservice-api/internal/vcenter"
 )
@@ -90,6 +91,12 @@ var deterministicPhrases = []string{
 // unrecognised error.
 func ClassifyError(err error, jobType string) (retryable bool, reason string) {
 	if err == nil {
+		return false, ""
+	}
+	if errors.Is(err, database.ErrPodDestroyBlockedByMutator) {
+		if jobType == models.JobTypeVMDestroy {
+			return true, RetryReasonCleanup
+		}
 		return false, ""
 	}
 	var compensatedErr *compensatedJobError

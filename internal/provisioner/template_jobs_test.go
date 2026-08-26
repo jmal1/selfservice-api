@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"reflect"
 	"strings"
@@ -722,8 +725,7 @@ func (f *fakeISOVC) DetachCDROMs(_ context.Context, moref string) error {
 }
 
 // fakeISODB records lifecycle transitions and keeps the template's current
-// state in sync so markTemplateErrorViaDB (which re-reads the row) observes the
-// same state the code just moved it through.
+// state in sync with successful provision transitions.
 type fakeISODB struct {
 	tmpl   *models.Template
 	getErr error
@@ -964,7 +966,8 @@ func indexOf(xs []string, want string) int {
 // TestProvisionTemplate_ISO_BadSourceRef proves a malformed installer path is
 // rejected BEFORE any VM is created — the real assertion is that CreateBlankVM
 // recorded zero calls, so a typo can never orphan a half-built shell in vCenter.
-// The template must also land in 'error' with an actionable message.
+// The template must remain provisioning so the job lifecycle can own retry or
+// the atomic terminal transition.
 func TestProvisionTemplate_ISO_BadSourceRef(t *testing.T) {
 	payload := baseISOPayload()
 	payload.SourceRef = "NAS-BackupsAndISOS/ISOs/ubuntu.iso" // missing the [datastore] brackets
@@ -980,8 +983,8 @@ func TestProvisionTemplate_ISO_BadSourceRef(t *testing.T) {
 	if vc.uploadCalls != 0 || vc.powerOnCalls != 0 || vc.waitCalls != 0 {
 		t.Errorf("no vCenter side effects expected on a bad ref (uploads=%d powerOn=%d waits=%d)", vc.uploadCalls, vc.powerOnCalls, vc.waitCalls)
 	}
-	if got := db.finalState(); got != models.TemplateStateError {
-		t.Errorf("final template state = %q, want %q", got, models.TemplateStateError)
+	if got := db.finalState(); got != models.TemplateStateProvisioning {
+		t.Errorf("final template state = %q, want %q", got, models.TemplateStateProvisioning)
 	}
 	// Actionable message: it should name the offending ref and the expected form.
 	if !strings.Contains(err.Error(), payload.SourceRef) || !strings.Contains(err.Error(), "[datastore]") {
@@ -1018,9 +1021,38 @@ func TestProvisionTemplate_ISO_RemasterUnsupportedFailsLoudly(t *testing.T) {
 	if vc.waitCalls != 0 {
 		t.Errorf("must NOT proceed to wait for Tools (the silent-downgrade bug); WaitForTools called %d time(s)", vc.waitCalls)
 	}
-	if got := db.finalState(); got != models.TemplateStateError {
-		t.Errorf("final template state = %q, want %q", got, models.TemplateStateError)
+	if got := db.finalState(); got != models.TemplateStateProvisioning {
+		t.Errorf("final template state = %q, want %q", got, models.TemplateStateProvisioning)
 	}
+}
+
+func TestProvisionTemplateCloneAttemptDoesNotOwnErrorTransition(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "template_jobs.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var provision *ast.FuncDecl
+	for _, declaration := range file.Decls {
+		fn, ok := declaration.(*ast.FuncDecl)
+		if ok && fn.Name.Name == "ProvisionTemplate" {
+			provision = fn
+			break
+		}
+	}
+	if provision == nil {
+		t.Fatal("ProvisionTemplate declaration not found")
+	}
+	ast.Inspect(provision.Body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if ok && selector.Sel.Name == "markTemplateError" {
+			t.Errorf("ProvisionTemplate directly calls markTemplateError; terminal state must be owned by processJobLifecycle")
+		}
+		return true
+	})
 }
 
 // --- generalize completion sentinel -----------------------------------------

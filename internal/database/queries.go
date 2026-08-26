@@ -686,6 +686,47 @@ func (q *Queries) ReleaseVLAN(ctx context.Context, podID uuid.UUID) error {
 	return err
 }
 
+// FinalizePodDestroy atomically marks a pod destroyed and releases its VLAN.
+// Workers call this while owning the destroy job, preserving job->pod order.
+func (q *Queries) FinalizePodDestroy(
+	ctx context.Context,
+	podID, jobID uuid.UUID,
+	claimOwner string,
+) error {
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin pod destroy finalization: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockOwnedPodDestroyJob(ctx, tx, podID, jobID, claimOwner); err != nil {
+		return err
+	}
+	if tag, err := tx.Exec(ctx, `
+		UPDATE pods
+		SET status = $2,
+		    error_message = '',
+		    updated_at = now()
+		WHERE id = $1
+		  AND status = $3
+	`, podID, models.PodStatusDestroyed, models.PodStatusDestroying); err != nil {
+		return fmt.Errorf("mark pod %s destroyed: %w", podID, err)
+	} else if tag.RowsAffected() != 1 {
+		return fmt.Errorf("mark pod %s destroyed from destroying: %w", podID, ErrPodJobRejected)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE vlan_pool
+		SET pod_id = NULL,
+		    allocated_at = NULL
+		WHERE pod_id = $1
+	`, podID); err != nil {
+		return fmt.Errorf("release VLAN for destroyed pod %s: %w", podID, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit pod destroy finalization for %s: %w", podID, err)
+	}
+	return nil
+}
+
 // CreatePod inserts a pod record with a checked-out VLAN.
 func (q *Queries) CreatePod(ctx context.Context, tx pgx.Tx, pod *models.Pod) error {
 	return tx.QueryRow(ctx, `
@@ -882,16 +923,35 @@ func (q *Queries) listPodVMsActive(ctx context.Context, podID uuid.UUID) ([]mode
 
 // --- Jobs ---
 
-// CreateJob inserts a new job and returns it.
-func (q *Queries) CreateJob(ctx context.Context, jobType string, payload []byte) (*models.Job, error) {
+type jobRowQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+func createJob(ctx context.Context, querier jobRowQuerier, jobType string, payload []byte) (*models.Job, error) {
 	var j models.Job
-	err := q.pool.QueryRow(ctx, `
+	err := querier.QueryRow(ctx, `
 		INSERT INTO jobs (type, payload) VALUES ($1, $2)
 		RETURNING id, type, payload, status, retry_count, max_retries, rollback_steps, created_at
 	`, jobType, payload).Scan(
 		&j.ID, &j.Type, &j.Payload, &j.Status, &j.RetryCount, &j.MaxRetries, &j.RollbackSteps, &j.CreatedAt,
 	)
 	return &j, err
+}
+
+// CreateJob inserts a new job and returns it.
+func (q *Queries) CreateJob(ctx context.Context, jobType string, payload []byte) (*models.Job, error) {
+	if isSerializedPodJobType(jobType) {
+		return nil, fmt.Errorf("%s: %w", jobType, ErrPodJobRequiresSerialization)
+	}
+	return createJob(ctx, q.pool, jobType, payload)
+}
+
+// CreateJobTx inserts a new job as part of the caller's transaction.
+func (q *Queries) CreateJobTx(ctx context.Context, tx pgx.Tx, jobType string, payload []byte) (*models.Job, error) {
+	if isSerializedPodJobType(jobType) {
+		return nil, fmt.Errorf("%s: %w", jobType, ErrPodJobRequiresSerialization)
+	}
+	return createJob(ctx, tx, jobType, payload)
 }
 
 const lockTemplateForRevalidationSQL = `
@@ -1019,7 +1079,7 @@ const claimJobSQL = `
 		LIMIT 1
 	)
 	RETURNING id, type, payload, status, claimed_by, claimed_at,
-	          retry_count, max_retries, next_attempt_at, rollback_steps, created_at
+	          result, retry_count, max_retries, next_attempt_at, rollback_steps, created_at
 `
 
 // ClaimJob atomically claims the next pending job for a worker.
@@ -1033,7 +1093,7 @@ func (q *Queries) ClaimJob(ctx context.Context, workerID string, provisioningCla
 	var j models.Job
 	err := q.pool.QueryRow(ctx, claimJobSQL, workerID, provisioningClaimsEnabled).Scan(
 		&j.ID, &j.Type, &j.Payload, &j.Status, &j.ClaimedBy, &j.ClaimedAt,
-		&j.RetryCount, &j.MaxRetries, &j.NextAttemptAt, &j.RollbackSteps, &j.CreatedAt,
+		&j.Result, &j.RetryCount, &j.MaxRetries, &j.NextAttemptAt, &j.RollbackSteps, &j.CreatedAt,
 	)
 	if err == pgx.ErrNoRows {
 		return nil, nil
@@ -1050,7 +1110,11 @@ func (q *Queries) UpdateJobStatus(
 	result []byte,
 ) error {
 	tag, err := q.pool.Exec(ctx, `
-		UPDATE jobs SET status = $2, result = $3,
+		UPDATE jobs SET status = $2,
+			result = CASE
+				WHEN $2 = 'in_progress' AND type = 'template_provision' AND $3::jsonb IS NULL THEN result
+				ELSE $3
+			END,
 			started_at = CASE WHEN $2 = 'in_progress' AND started_at IS NULL THEN now() ELSE started_at END,
 			completed_at = CASE WHEN $2 IN ('completed', 'failed', 'rollback') THEN now() ELSE completed_at END,
 			claimed_at = CASE WHEN $2 = 'in_progress' THEN now() ELSE claimed_at END
@@ -1073,6 +1137,127 @@ func (q *Queries) UpdateJobStatus(
 		return fmt.Errorf("%w: job %s is not owned by %s for status %s", ErrJobLeaseLost, id, workerID, status)
 	}
 	return nil
+}
+
+// RetryTemplateProvisionJob atomically records a failed provision attempt and
+// returns the owned job to pending. The template remains in provisioning until
+// a later attempt succeeds or FailTemplateProvisionJob commits a terminal
+// failure.
+func (q *Queries) RetryTemplateProvisionJob(
+	ctx context.Context,
+	id uuid.UUID,
+	nextAt time.Time,
+	result []byte,
+	workerID string,
+) error {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE jobs
+		SET status          = 'pending',
+		    result          = $3,
+		    retry_count     = retry_count + 1,
+		    claimed_by      = NULL,
+		    claimed_at      = NULL,
+		    started_at      = NULL,
+		    completed_at    = NULL,
+		    next_attempt_at = $2
+		WHERE id = $1
+		  AND type = 'template_provision'
+		  AND claimed_by = $4
+		  AND status = 'in_progress'
+	`, id, nextAt, result, workerID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("%w: template_provision job %s is not owned by %s for retry scheduling", ErrJobLeaseLost, id, workerID)
+	}
+	return nil
+}
+
+// FailTemplateProvisionJob atomically transitions an owned template_provision
+// job to failed and its payload-selected template from provisioning to error.
+// No caller-provided template ID is accepted: the durable job payload is the
+// authority for the row that may be changed.
+func (q *Queries) FailTemplateProvisionJob(
+	ctx context.Context,
+	id uuid.UUID,
+	workerID string,
+	result []byte,
+) (bool, error) {
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("begin template provision failure transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var payload []byte
+	err = tx.QueryRow(ctx, `
+		SELECT payload
+		FROM jobs
+		WHERE id = $1
+		  AND type = 'template_provision'
+		  AND claimed_by = $2
+		  AND status = 'in_progress'
+		FOR UPDATE
+	`, id, workerID).Scan(&payload)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, fmt.Errorf("%w: template_provision job %s is not owned by %s for terminal failure", ErrJobLeaseLost, id, workerID)
+	}
+	if err != nil {
+		return false, fmt.Errorf("lock template provision job %s: %w", id, err)
+	}
+
+	var ownedPayload struct {
+		TemplateID uuid.UUID `json:"template_id"`
+	}
+	if err := json.Unmarshal(payload, &ownedPayload); err != nil {
+		return false, fmt.Errorf("parse owned template_provision payload for job %s: %w", id, err)
+	}
+	if ownedPayload.TemplateID == uuid.Nil {
+		return false, fmt.Errorf("owned template_provision job %s has no template_id", id)
+	}
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE templates
+		SET template_state = 'error',
+		    updated_at = now()
+		WHERE id = $1
+		  AND template_state = 'provisioning'
+	`, ownedPayload.TemplateID)
+	if err != nil {
+		return false, fmt.Errorf("transition template %s to error: %w", ownedPayload.TemplateID, err)
+	}
+	if tag.RowsAffected() != 1 {
+		return false, fmt.Errorf(
+			"%w: template %s is no longer provisioning for owned job %s",
+			ErrJobLeaseLost,
+			ownedPayload.TemplateID,
+			id,
+		)
+	}
+
+	tag, err = tx.Exec(ctx, `
+		UPDATE jobs
+		SET status = 'failed',
+		    result = $3,
+		    completed_at = now(),
+		    next_attempt_at = NULL
+		WHERE id = $1
+		  AND type = 'template_provision'
+		  AND claimed_by = $2
+		  AND status = 'in_progress'
+	`, id, workerID, result)
+	if err != nil {
+		return false, fmt.Errorf("persist terminal template provision job %s: %w", id, err)
+	}
+	if tag.RowsAffected() != 1 {
+		return false, fmt.Errorf("%w: template_provision job %s lost ownership before terminal failure", ErrJobLeaseLost, id)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("commit template provision failure transaction: %w", err)
+	}
+	return true, nil
 }
 
 // RenewJobLease refreshes claimed_at only while workerID still owns an active
@@ -2686,23 +2871,6 @@ func (q *Queries) CountUserSnapshots(ctx context.Context, podVMID uuid.UUID) (in
 		return 0, fmt.Errorf("count user snapshots: %w", err)
 	}
 	return count, nil
-}
-
-// --- Pod Expiration ---
-
-// UpdatePodExpiry updates the expires_at timestamp for a pod.
-func (q *Queries) UpdatePodExpiry(ctx context.Context, podID uuid.UUID, expiresAt time.Time) error {
-	_, err := q.pool.Exec(ctx, `UPDATE pods SET expires_at = $1, updated_at = now() WHERE id = $2`, expiresAt, podID)
-	return err
-}
-
-// CreatePodAttestation records a pod extension event.
-func (q *Queries) CreatePodAttestation(ctx context.Context, a *models.PodAttestation) error {
-	return q.pool.QueryRow(ctx, `
-		INSERT INTO pod_attestations (pod_id, user_id, previous_expires_at, new_expires_at)
-		VALUES ($1, $2, $3, $4)
-		RETURNING id, created_at
-	`, a.PodID, a.UserID, a.PreviousExpiresAt, a.NewExpiresAt).Scan(&a.ID, &a.CreatedAt)
 }
 
 // ListExpiredPods returns active pods that have passed their expiration time.

@@ -4,6 +4,9 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/jmal1/selfservice-api/internal/database"
+	"github.com/jmal1/selfservice-api/internal/models"
 )
 
 // TestClassifyError_RetryableExamples verifies the primary retryable cases,
@@ -151,6 +154,15 @@ func TestClassifyError_SafeDefault(t *testing.T) {
 	}
 	if ok, _ := ClassifyError(nil, "template_provision"); ok {
 		t.Error("ClassifyError(nil) = retryable, want false")
+	}
+}
+
+func TestClassifyErrorRetriesBlockedLastVMDestroyOnly(t *testing.T) {
+	if ok, reason := ClassifyError(database.ErrPodDestroyBlockedByMutator, models.JobTypeVMDestroy); !ok || reason != RetryReasonCleanup {
+		t.Fatalf("blocked vm_destroy classification = %v/%q, want true/%q", ok, reason, RetryReasonCleanup)
+	}
+	if ok, reason := ClassifyError(database.ErrPodDestroyBlockedByMutator, models.JobTypeVMStart); ok || reason != "" {
+		t.Fatalf("blocked vm_start classification = %v/%q, want false/empty", ok, reason)
 	}
 }
 

@@ -32,10 +32,19 @@ func (p *Provisioner) DestroyPod(ctx context.Context, job *models.Job) error {
 	if err != nil {
 		return fmt.Errorf("invalid pod_id: %w", err)
 	}
-
-	pod, err := p.db.GetPodByID(ctx, podID)
+	claimOwner, _, err := claimedJobLease(job)
 	if err != nil {
-		return fmt.Errorf("get pod: %w", err)
+		return err
+	}
+
+	pod, err := p.db.PreparePodDestroy(ctx, podID, job.ID, claimOwner)
+	if err != nil {
+		if stderrors.Is(err, database.ErrPodAlreadyDestroyed) ||
+			stderrors.Is(err, database.ErrPodDestroyJobObsolete) {
+			p.logger.Info("pod destroy job has no remaining work", "pod_id", podID, "job_id", job.ID, "reason", err)
+			return nil
+		}
+		return fmt.Errorf("prepare pod destroy: %w", err)
 	}
 
 	vlanTag := pod.VLANID
@@ -43,8 +52,6 @@ func (p *Provisioner) DestroyPod(ctx context.Context, job *models.Job) error {
 	subnet := pod.Subnet
 	var errors []error
 
-	// Mark pod as destroying
-	_ = p.db.UpdatePodStatus(ctx, pod.ID, "destroying", "")
 	p.publishProgress(job.ID, "destroying", "Starting pod destruction")
 
 	// --- Step 1: Power off all VMs ---
@@ -230,8 +237,9 @@ func (p *Provisioner) DestroyPod(ctx context.Context, job *models.Job) error {
 		return p.failPodDestroy(ctx, pod.ID, errors)
 	}
 
-	_ = p.db.UpdatePodStatus(ctx, pod.ID, "destroyed", "")
-	_ = p.db.ReleaseVLAN(ctx, pod.ID)
+	if err := p.db.FinalizePodDestroy(ctx, pod.ID, job.ID, claimOwner); err != nil {
+		return fmt.Errorf("finalize pod %s destruction: %w", pod.ID, err)
+	}
 	p.publishProgress(job.ID, "destroyed", "Pod destroyed successfully")
 	p.logger.Info("pod destroyed successfully", "pod_id", pod.ID, "vlan", vlanTag)
 	return nil
@@ -239,7 +247,9 @@ func (p *Provisioner) DestroyPod(ctx context.Context, job *models.Job) error {
 
 func (p *Provisioner) failPodDestroy(ctx context.Context, podID uuid.UUID, errors []error) error {
 	destroyErr := fmt.Errorf("pod destroy incomplete with %d errors: %v", len(errors), errors)
-	_ = p.db.UpdatePodStatus(ctx, podID, models.PodStatusDestroyFailed, destroyErr.Error())
+	if err := p.db.UpdatePodStatus(ctx, podID, models.PodStatusDestroyFailed, destroyErr.Error()); err != nil {
+		return stderrors.Join(destroyErr, fmt.Errorf("mark pod %s destroy_failed: %w", podID, err))
+	}
 	p.logger.Warn("pod destruction incomplete, marked destroy_failed",
 		"pod_id", podID, "error_count", len(errors))
 	return destroyErr
@@ -252,7 +262,11 @@ func (p *Provisioner) failPodDestroyManual(ctx context.Context, podID uuid.UUID,
 		models.PodErrorManualCleanupRequiredPrefix,
 		destroyErr,
 	)
-	_ = p.db.UpdatePodStatus(ctx, podID, models.PodStatusDestroyFailed, manualErr.Error())
+	if err := p.db.UpdatePodStatus(ctx, podID, models.PodStatusDestroyFailed, manualErr.Error()); err != nil {
+		return &manualCleanupRequiredError{
+			err: stderrors.Join(manualErr, fmt.Errorf("mark pod %s destroy_failed: %w", podID, err)),
+		}
+	}
 	p.logger.Warn("pod destruction requires manual cleanup",
 		"pod_id", podID, "error_count", len(errors))
 	return &manualCleanupRequiredError{
@@ -269,9 +283,8 @@ func portGroupReceiptRequiresManualCleanup(err error) bool {
 		stderrors.Is(err, vcenter.ErrAmbiguousHostIdentity)
 }
 
-// RetryFailedDestroys finds pods stuck in "destroy_failed" and re-runs
-// the destroy workflow for each. Since every step is idempotent, re-running
-// the full sequence is safe — already-completed steps are no-ops.
+// RetryFailedDestroys finds pods stuck in "destroy_failed" and requeues their
+// authoritative durable destroy job. Workers then claim the retry normally.
 //
 // After the sweep, the post-retry count is pushed to Pushgateway (if a
 // DestroyFailedPusher is configured) so the CruciblePodsStuckInDestroyFailed
@@ -290,19 +303,21 @@ func (p *Provisioner) RetryFailedDestroys(ctx context.Context) {
 
 	p.logger.Info("retrying failed destroys", "count", len(pods))
 	for _, pod := range pods {
-		// Create a synthetic job so DestroyPod can reuse the same code path
 		payload, _ := json.Marshal(DestroyPodPayload{PodID: pod.ID.String()})
-		syntheticJob := &models.Job{
-			ID:      pod.ID, // reuse pod ID as job ID for logging
-			Type:    models.JobTypePodDestroy,
-			Payload: payload,
+		job, queued, err := p.db.RequeueFailedPodDestroyJob(ctx, pod.ID, payload)
+		if err != nil {
+			p.logger.Warn("failed to requeue destroy", "pod_id", pod.ID, "error", err)
+			continue
 		}
-
-		p.logger.Info("retrying destroy for pod", "pod_id", pod.ID, "vlan", pod.VLANID)
-		if err := p.DestroyPod(ctx, syntheticJob); err != nil {
-			p.logger.Warn("retry destroy still failing", "pod_id", pod.ID, "error", err)
-		} else {
-			p.logger.Info("retry destroy succeeded", "pod_id", pod.ID)
+		if !queued {
+			p.logger.Info("destroy retry already queued", "pod_id", pod.ID, "job_id", job.ID)
+			continue
+		}
+		p.logger.Info("requeued failed destroy", "pod_id", pod.ID, "job_id", job.ID, "vlan", pod.VLANID)
+		if p.nats != nil {
+			if err := p.nats.PublishJobCreated(job.ID, job.Type); err != nil {
+				p.logger.Warn("failed to publish destroy retry event", "pod_id", pod.ID, "job_id", job.ID, "error", err)
+			}
 		}
 	}
 

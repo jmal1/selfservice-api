@@ -832,6 +832,8 @@ it must parse as a Go boolean; an invalid value fails process startup rather
 than silently enabling provisioning. Helm exposes these as
 `provisioning.enabled` and `provisioning.workerClaimsEnabled`.
 
+A never-started pending `pod_create` can now be cancelled directly by the API before any worker claim or external ownership evidence exists. In that case the delete path marks the create job terminal, marks the pending pod VM rows deleted, releases the VLAN, and never calls vCenter or OPNsense. Once a pod has a claim, a VM MoRef, a placement row, or a durable portgroup receipt, delete falls back to the normal destroy/manual-cleanup path.
+
 During a claims-contained phase-1 rollout, the current Helm revision must
 already render `provisioning.workerClaimsEnabled=false` before any migration or
 image upgrade begins. A live `kubectl set env` override is not sufficient:
@@ -993,6 +995,8 @@ gated. When worker provisioning claims are disabled, ordinary clone-, create-,
 template-staging/validation, and image-import jobs are excluded inside the
 atomic claim query and remain pending; destroy jobs and any withheld type marked
 `cleanup_only` remain claimable.
+
+`template_provision` owns template terminal state only through its lease-fenced job lifecycle: retryable clone or ISO failures keep `templates.template_state=provisioning` while one atomic job update records `error`/optional `raw_error`/`attempts` plus preserved `first_*` and refreshed `current_*` failure fields, increments `retry_count`, clears claim timestamps, and schedules `next_attempt_at`; a later claim preserves that result through `in_progress`, success replaces it with the success envelope, and only a non-retryable or exhausted owned attempt may atomically commit both `jobs.status=failed` and the matching payload-selected template's `provisioning`→`error` transition. Lease loss, retry-write failure, malformed ownership identity, or either failed terminal write must leave the template unchanged for stale-job recovery, and transition metrics are emitted only after the terminal transaction commits.
 
 `VCENTER_HOSTS` is the single canonical allowlist for both VM placement and
 standard-vSwitch portgroup mutation. Worker startup resolves every configured
