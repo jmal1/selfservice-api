@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/jmal1/selfservice-api/internal/database"
@@ -123,20 +125,41 @@ func newPodDeletePostgresFixture(t *testing.T, vmCount int) *podDeletePostgresFi
 	}
 
 	t.Cleanup(func() {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cleanupCancel()
-		_, _ = pool.Exec(cleanupCtx, `DELETE FROM audit_log WHERE resource_id = $1`, fixture.podID)
-		_, _ = pool.Exec(cleanupCtx, `DELETE FROM vm_placements WHERE job_id = $1`, fixture.createJob)
-		_, _ = pool.Exec(cleanupCtx, `DELETE FROM pod_portgroup_receipts WHERE pod_id = $1`, fixture.podID)
-		_, _ = pool.Exec(cleanupCtx, `DELETE FROM jobs WHERE id = $1`, fixture.createJob)
-		_, _ = pool.Exec(cleanupCtx, `DELETE FROM pod_vms WHERE pod_id = $1`, fixture.podID)
-		_, _ = pool.Exec(cleanupCtx, `UPDATE vlan_pool SET pod_id = NULL, allocated_at = NULL WHERE pod_id = $1`, fixture.podID)
-		_, _ = pool.Exec(cleanupCtx, `DELETE FROM pods WHERE id = $1`, fixture.podID)
-		_, _ = pool.Exec(cleanupCtx, `DELETE FROM templates WHERE id = $1`, fixture.templateID)
-		_, _ = pool.Exec(cleanupCtx, `DELETE FROM users WHERE id = $1`, fixture.ownerID)
+		fixture.cleanup(t)
 	})
 
 	return fixture
+}
+
+func (f *podDeletePostgresFixture) cleanup(t *testing.T) {
+	t.Helper()
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cleanupCancel()
+	_, _ = f.pool.Exec(cleanupCtx, `DELETE FROM audit_log WHERE resource_id = $1`, f.podID)
+	_, _ = f.pool.Exec(cleanupCtx, `DELETE FROM vm_placements WHERE job_id = $1`, f.createJob)
+	_, _ = f.pool.Exec(cleanupCtx, `DELETE FROM pod_portgroup_receipts WHERE pod_id = $1`, f.podID)
+	_, _ = f.pool.Exec(cleanupCtx, `
+		DELETE FROM jobs
+		WHERE payload->>'pod_id' = $1::text
+		   OR payload->>'user_id' = $2::text
+	`, f.podID, f.ownerID)
+	var remainingJobs int
+	if err := f.pool.QueryRow(cleanupCtx, `
+		SELECT COUNT(*)
+		FROM jobs
+		WHERE payload->>'pod_id' = $1::text
+		   OR payload->>'user_id' = $2::text
+	`, f.podID, f.ownerID).Scan(&remainingJobs); err != nil {
+		t.Fatalf("count fixture jobs during cleanup: %v", err)
+	}
+	if remainingJobs != 0 {
+		t.Fatalf("fixture cleanup leaked %d owned job(s)", remainingJobs)
+	}
+	_, _ = f.pool.Exec(cleanupCtx, `DELETE FROM pod_vms WHERE pod_id = $1`, f.podID)
+	_, _ = f.pool.Exec(cleanupCtx, `UPDATE vlan_pool SET pod_id = NULL, allocated_at = NULL WHERE pod_id = $1`, f.podID)
+	_, _ = f.pool.Exec(cleanupCtx, `DELETE FROM pods WHERE id = $1`, f.podID)
+	_, _ = f.pool.Exec(cleanupCtx, `DELETE FROM templates WHERE id = $1`, f.templateID)
+	_, _ = f.pool.Exec(cleanupCtx, `DELETE FROM users WHERE id = $1`, f.ownerID)
 }
 
 func (f *podDeletePostgresFixture) handler() *Handler {
@@ -199,6 +222,49 @@ func waitForJobLockHeld(t *testing.T, pool *pgxpool.Pool, jobID uuid.UUID) {
 	t.Fatal("timed out waiting for cancellation to lock the create job")
 }
 
+func probeExactCreateJobUnavailable(t *testing.T, pool *pgxpool.Pool, jobID uuid.UUID) {
+	t.Helper()
+	probeCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	tx, err := pool.Begin(probeCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(probeCtx) }()
+
+	var claimedID uuid.UUID
+	err = tx.QueryRow(probeCtx, `
+		SELECT id
+		FROM jobs
+		WHERE id = $1
+		  AND status = 'pending'
+		  AND (
+		    $2
+		    OR type NOT IN (
+		      'pod_create',
+		      'vm_add',
+		      'template_provision',
+		      'template_generalize',
+		      'template_verify',
+		      'template_revalidate',
+		      'template_health_confirm',
+		      'template_replica_build',
+		      'image_import'
+		    )
+		    OR payload->>'cleanup_only' = 'true'
+		  )
+		  AND (next_attempt_at IS NULL OR next_attempt_at <= now())
+		FOR UPDATE SKIP LOCKED
+		LIMIT 1
+	`, jobID, true).Scan(&claimedID)
+	if err == nil {
+		t.Fatalf("exact create job probe unexpectedly claimed %s", claimedID)
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("exact create job probe failed: %v", err)
+	}
+}
+
 func TestDeletePodCancelsNeverStartedPodAndIsIdempotent(t *testing.T) {
 	fixture := newPodDeletePostgresFixture(t, 1)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -222,29 +288,7 @@ func TestDeletePodCancelsNeverStartedPodAndIsIdempotent(t *testing.T) {
 
 	waitForJobLockHeld(t, fixture.pool, fixture.createJob)
 
-	claimDone := make(chan struct {
-		job *models.Job
-		err error
-	}, 1)
-	go func() {
-		job, err := fixture.queries.ClaimJob(ctx, "delete-race-worker", true)
-		claimDone <- struct {
-			job *models.Job
-			err error
-		}{job: job, err: err}
-	}()
-
-	select {
-	case claimResult := <-claimDone:
-		if claimResult.err != nil {
-			t.Fatalf("claim raced cancellation: %v", claimResult.err)
-		}
-		if claimResult.job != nil {
-			t.Fatalf("claim raced cancellation and claimed job %+v", claimResult.job)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for concurrent claim to lose the race")
-	}
+	probeExactCreateJobUnavailable(t, fixture.pool, fixture.createJob)
 
 	if err := podLockTx.Rollback(context.Background()); err != nil {
 		t.Fatal(err)
@@ -364,6 +408,7 @@ func TestDeletePodCancelsNeverStartedPodAndIsIdempotent(t *testing.T) {
 	if destroyJobs != 0 {
 		t.Fatalf("idempotent cancellation enqueued %d destroy jobs", destroyJobs)
 	}
+	fixture.cleanup(t)
 }
 
 func TestDeletePodRejectsClaimedJobAndExternalEvidence(t *testing.T) {
