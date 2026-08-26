@@ -1037,75 +1037,6 @@ func (q *Queries) CreateTemplateRevalidateJobIfAbsent(
 	return &job, true, nil
 }
 
-// CreatePodDestroyJobIfAbsent enqueues a pod_destroy job unless one is already
-// pending, claimed, or in progress for the same pod. The pod row is locked
-// first so concurrent enqueues serialize instead of duplicating destroy work.
-func (q *Queries) CreatePodDestroyJobIfAbsent(
-	ctx context.Context,
-	podID uuid.UUID,
-	payload []byte,
-) (_ *models.Job, created bool, err error) {
-	tx, err := q.pool.Begin(ctx)
-	if err != nil {
-		return nil, false, fmt.Errorf("begin pod destroy enqueue: %w", err)
-	}
-	defer func() {
-		_ = tx.Rollback(ctx)
-	}()
-
-	var lockedPodID uuid.UUID
-	if err := tx.QueryRow(ctx, `
-		SELECT id
-		FROM pods
-		WHERE id = $1
-		FOR UPDATE
-	`, podID).Scan(&lockedPodID); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, false, fmt.Errorf("lock pod %s for pod destroy enqueue: pod not found", podID)
-		}
-		return nil, false, fmt.Errorf("lock pod %s for pod destroy enqueue: %w", podID, err)
-	}
-
-	var existing models.Job
-	err = tx.QueryRow(ctx, `
-		SELECT id, type, payload, status, retry_count, max_retries, rollback_steps, created_at
-		FROM jobs
-		WHERE type = $1
-		  AND status IN ('pending', 'claimed', 'in_progress')
-		  AND payload->>'pod_id' = $2::text
-		ORDER BY created_at ASC, id ASC
-		FOR UPDATE
-		LIMIT 1
-	`, models.JobTypePodDestroy, podID.String()).Scan(
-		&existing.ID,
-		&existing.Type,
-		&existing.Payload,
-		&existing.Status,
-		&existing.RetryCount,
-		&existing.MaxRetries,
-		&existing.RollbackSteps,
-		&existing.CreatedAt,
-	)
-	if err == nil {
-		if err := tx.Commit(ctx); err != nil {
-			return nil, false, fmt.Errorf("commit pod destroy reuse for %s: %w", podID, err)
-		}
-		return &existing, false, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return nil, false, fmt.Errorf("check existing pod destroy job for %s: %w", podID, err)
-	}
-
-	job, err := q.CreateJobTx(ctx, tx, models.JobTypePodDestroy, payload)
-	if err != nil {
-		return nil, false, fmt.Errorf("insert pod destroy job for %s: %w", podID, err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, false, fmt.Errorf("commit pod destroy enqueue for %s: %w", podID, err)
-	}
-	return job, true, nil
-}
-
 const claimJobSQL = `
 	UPDATE jobs SET
 		status = 'claimed',
@@ -1423,7 +1354,7 @@ func (q *Queries) CountRetryPendingJobs(ctx context.Context) (int, error) {
 }
 
 const recoverStaleJobsSQL = `
-		UPDATE jobs SET status = 'pending', claimed_by = NULL, claimed_at = NULL, started_at = NULL, retry_count = retry_count + 1
+		UPDATE jobs SET status = 'pending', claimed_by = NULL, claimed_at = NULL, started_at = NULL
 		WHERE status IN ('in_progress', 'claimed')
 		  AND completed_at IS NULL
 		  AND (claimed_at IS NULL OR claimed_at < now() - ($1 * interval '1 second'))

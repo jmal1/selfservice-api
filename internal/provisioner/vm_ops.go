@@ -255,7 +255,7 @@ func (p *Provisioner) DestroyVM(ctx context.Context, job *models.Job) error {
 	}
 
 	if remaining == 0 {
-		p.logger.Info("no remaining VMs in pod, ensuring pod destruction", "pod_id", podID)
+		p.logger.Info("no remaining VMs in pod, queueing pod destruction", "pod_id", podID)
 		p.publishProgress(job.ID, "pod_auto_cleanup", "Pod has no VMs left — queueing cleanup")
 
 		claimOwner, _, err := claimedJobLease(job)

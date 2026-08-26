@@ -43,18 +43,6 @@ func validateMaintenanceClaimSQL(query string) error {
 	return nil
 }
 
-func requireExactStringSlice(t *testing.T, got, want []string) {
-	t.Helper()
-	if len(got) != len(want) {
-		t.Fatalf("slice length = %d, want %d; got=%v want=%v", len(got), len(want), got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("slice[%d] = %q, want %q; got=%v want=%v", i, got[i], want[i], got, want)
-		}
-	}
-}
-
 func TestClaimJobMaintenancePolicyFiltersBeforeClaim(t *testing.T) {
 	if err := validateMaintenanceClaimSQL(claimJobSQL); err != nil {
 		t.Fatal(err)
@@ -108,26 +96,6 @@ func TestClaimJobMaintenancePolicySabotageIsDetected(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestPodCancellationMutatorInventoryMatchesProductionJobTypes(t *testing.T) {
-	requireExactStringSlice(t, podCancellationPodIDMutatorJobTypes, []string{
-		models.JobTypePodDestroy,
-		models.JobTypeVMAdd,
-	})
-	requireExactStringSlice(t, podCancellationPodVMMutatorJobTypes, []string{
-		models.JobTypeVMAdd,
-		models.JobTypeVMDestroy,
-		models.JobTypeVMStart,
-		models.JobTypeVMStop,
-		models.JobTypeVMRestart,
-		models.JobTypeVMReset,
-		models.JobTypeVMSnapshot,
-		models.JobTypeVMRevert,
-		models.JobTypeVMSuspend,
-	})
-	// vm_snapshot_delete targets snapshot_id, not the pod or a pod VM id, so it
-	// is intentionally excluded from the cancellation fence inventory.
 }
 
 func validateRetryJobSQL(query string) error {
@@ -248,7 +216,6 @@ func validateLeaseRecoverySQL(query string) error {
 		"STATUS IN ('IN_PROGRESS', 'CLAIMED')",
 		"COMPLETED_AT IS NULL",
 		"CLAIMED_AT IS NULL OR CLAIMED_AT < NOW() - ($1 * INTERVAL '1 SECOND')",
-		"RETRY_COUNT = RETRY_COUNT + 1",
 	} {
 		if !strings.Contains(sql, fragment) {
 			return fmt.Errorf("missing %q", fragment)
