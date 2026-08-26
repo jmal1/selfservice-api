@@ -717,6 +717,10 @@ func (h *Handler) DeletePod(w http.ResponseWriter, r *http.Request) {
 	payload, _ := json.Marshal(map[string]string{"pod_id": podID.String(), "pod_name": pod.Name, "user_id": userID.String()})
 	job, created, err := h.db.CreatePodDestroyJob(r.Context(), podID, payload)
 	if err != nil {
+		if errors.Is(err, database.ErrPodDestroyBlockedByMutator) {
+			respondError(w, r, http.StatusConflict, "pod has an operation in progress; retry deletion after it completes")
+			return
+		}
 		if errors.Is(err, database.ErrPodJobRejected) {
 			respondError(w, r, http.StatusConflict, "pod is already being destroyed")
 			return

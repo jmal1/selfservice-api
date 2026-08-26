@@ -145,6 +145,7 @@ func TestPodExtensionPersistenceUsesOnlySerializedBoundary(t *testing.T) {
 		if err != nil {
 			return err
 		}
+
 		if entry.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
@@ -174,6 +175,26 @@ func TestPodExtensionPersistenceUsesOnlySerializedBoundary(t *testing.T) {
 	assertExactFileCounts(t, "pod extension persistence", actual, map[string]int{
 		"internal/database/pod_jobs.go": 2,
 	})
+}
+
+func TestLastVMDestroyUsesVerifiedCurrentJobExclusion(t *testing.T) {
+	root := findRepoRoot(t)
+	body, err := os.ReadFile(filepath.Join(root, "internal", "provisioner", "vm_ops.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(body)
+	for _, fragment := range []string{
+		"claimedJobLease(job)",
+		"&database.PodDestroyVMJobExclusion{",
+		"JobID:      job.ID",
+		"PodVMID:    podVMID",
+		"ClaimOwner: claimOwner",
+	} {
+		if !strings.Contains(source, fragment) {
+			t.Errorf("last-VM cleanup no longer verifies current vm_destroy identity: missing %q", fragment)
+		}
+	}
 }
 
 func TestProductionGenericAndRawJobInsertionInventoryIsStable(t *testing.T) {

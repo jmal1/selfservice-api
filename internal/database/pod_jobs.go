@@ -23,6 +23,8 @@ var (
 	ErrPodAlreadyDestroyed         = errors.New("pod is already destroyed")
 	ErrPodDestroyJobObsolete       = errors.New("pod destroy job is not authoritative")
 	ErrPodDestroyOwnershipLost     = errors.New("pod no longer owns its exact VLAN")
+	ErrPodDestroyBlockedByMutator  = errors.New("pod destroy is blocked by nonterminal mutator work")
+	ErrPodDestroyExclusionInvalid  = errors.New("pod destroy mutator exclusion is invalid")
 )
 
 // serializedPodJobTypes is the exhaustive set of durable jobs whose payload
@@ -61,6 +63,34 @@ type PodJobRejectedError struct {
 	Type   string
 }
 
+type PodDestroyBlockedError struct {
+	PodID     uuid.UUID
+	JobID     uuid.UUID
+	JobType   string
+	JobStatus string
+}
+
+func (e *PodDestroyBlockedError) Error() string {
+	return fmt.Sprintf(
+		"pod %s destroy blocked by %s job %s in status %q: %v",
+		e.PodID,
+		e.JobType,
+		e.JobID,
+		e.JobStatus,
+		ErrPodDestroyBlockedByMutator,
+	)
+}
+
+func (e *PodDestroyBlockedError) Unwrap() error {
+	return ErrPodDestroyBlockedByMutator
+}
+
+type PodDestroyVMJobExclusion struct {
+	JobID      uuid.UUID
+	PodVMID    uuid.UUID
+	ClaimOwner string
+}
+
 func (e *PodJobRejectedError) Error() string {
 	return fmt.Sprintf("pod %s in status %q rejects %s: %v", e.PodID, e.Status, e.Type, ErrPodJobRejected)
 }
@@ -76,6 +106,16 @@ func isSerializedPodJobType(jobType string) bool {
 		}
 	}
 	return false
+}
+
+func serializedPodMutatorTypes() []string {
+	jobTypes := make([]string, 0, len(serializedPodJobTypes)-1)
+	for _, jobType := range serializedPodJobTypes {
+		if jobType != models.JobTypePodDestroy {
+			jobTypes = append(jobTypes, jobType)
+		}
+	}
+	return jobTypes
 }
 
 func podRejectsMutatorJob(status string) bool {
@@ -319,7 +359,7 @@ func (q *Queries) CreatePodDestroyJob(
 	podID uuid.UUID,
 	payload []byte,
 ) (_ *models.Job, created bool, err error) {
-	return q.createPodDestroyJob(ctx, podID, payload, podDestroyAlways)
+	return q.createPodDestroyJob(ctx, podID, payload, podDestroyAlways, nil)
 }
 
 // CreateExpiredPodDestroyJob revalidates expiration while holding the same pod
@@ -329,7 +369,7 @@ func (q *Queries) CreateExpiredPodDestroyJob(
 	podID uuid.UUID,
 	payload []byte,
 ) (_ *models.Job, created bool, err error) {
-	return q.createPodDestroyJob(ctx, podID, payload, podDestroyIfExpired)
+	return q.createPodDestroyJob(ctx, podID, payload, podDestroyIfExpired, nil)
 }
 
 // CreateEmptyPodDestroyJob revalidates that no non-deleted VM remains while
@@ -338,8 +378,9 @@ func (q *Queries) CreateEmptyPodDestroyJob(
 	ctx context.Context,
 	podID uuid.UUID,
 	payload []byte,
+	exclusion *PodDestroyVMJobExclusion,
 ) (_ *models.Job, created bool, err error) {
-	return q.createPodDestroyJob(ctx, podID, payload, podDestroyIfEmpty)
+	return q.createPodDestroyJob(ctx, podID, payload, podDestroyIfEmpty, exclusion)
 }
 
 // RequeueFailedPodDestroyJob is the destroy_failed sweeper producer. It keeps
@@ -350,7 +391,7 @@ func (q *Queries) RequeueFailedPodDestroyJob(
 	podID uuid.UUID,
 	payload []byte,
 ) (_ *models.Job, queued bool, err error) {
-	return q.createPodDestroyJob(ctx, podID, payload, podDestroyIfFailed)
+	return q.createPodDestroyJob(ctx, podID, payload, podDestroyIfFailed, nil)
 }
 
 // createPodDestroyJob serializes every pod_destroy producer on the pod row.
@@ -362,6 +403,7 @@ func (q *Queries) createPodDestroyJob(
 	podID uuid.UUID,
 	payload []byte,
 	requirement podDestroyRequirement,
+	exclusion *PodDestroyVMJobExclusion,
 ) (_ *models.Job, created bool, err error) {
 	if err := validatePodJobPayload(payload, podID, nil); err != nil {
 		return nil, false, err
@@ -423,6 +465,9 @@ func (q *Queries) createPodDestroyJob(
 				return nil, false, ownershipErr
 			}
 			if required && ownsResources {
+				if err := rejectPodDestroyWithNonterminalMutator(ctx, tx, podID, requirement, exclusion); err != nil {
+					return nil, false, err
+				}
 				// This is the only pod->existing-job write. It is safe from the
 				// worker job->pod order because workers can own only
 				// pending/claimed/in_progress jobs, while this conditional update
@@ -498,6 +543,9 @@ func (q *Queries) createPodDestroyJob(
 		}
 	}
 
+	if err := rejectPodDestroyWithNonterminalMutator(ctx, tx, podID, requirement, exclusion); err != nil {
+		return nil, false, err
+	}
 	job, err := createJob(ctx, tx, models.JobTypePodDestroy, payload)
 	if err != nil {
 		return nil, false, fmt.Errorf("insert pod_destroy job for %s: %w", podID, err)
@@ -506,6 +554,92 @@ func (q *Queries) createPodDestroyJob(
 		return nil, false, fmt.Errorf("commit pod_destroy job for %s: %w", podID, err)
 	}
 	return job, true, nil
+}
+
+func rejectPodDestroyWithNonterminalMutator(
+	ctx context.Context,
+	tx pgx.Tx,
+	podID uuid.UUID,
+	requirement podDestroyRequirement,
+	exclusion *PodDestroyVMJobExclusion,
+) error {
+	var excludedJobID uuid.UUID
+	if exclusion != nil {
+		if requirement != podDestroyIfEmpty {
+			return fmt.Errorf("pod %s exclusion is only valid for empty-pod cleanup: %w", podID, ErrPodDestroyExclusionInvalid)
+		}
+		var valid bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM jobs j
+				JOIN pod_vms vm
+				  ON vm.id = $2
+				 AND vm.pod_id = $4
+				  AND vm.status = $7
+				WHERE j.id = $1
+				  AND j.type = $5
+				  AND j.status = $6
+				  AND j.claimed_by = $3
+				  AND j.payload->>'pod_id' = $4::text
+				  AND j.payload->>'pod_vm_id' = $2::text
+			)
+		`,
+			exclusion.JobID,
+			exclusion.PodVMID,
+			exclusion.ClaimOwner,
+			podID,
+			models.JobTypeVMDestroy,
+			models.JobStatusInProgress,
+			models.VMStatusDeleted,
+		).Scan(&valid); err != nil {
+			return fmt.Errorf("verify current vm_destroy exclusion for pod %s: %w", podID, err)
+		}
+		if !valid {
+			return fmt.Errorf(
+				"job %s is not the owned in_progress vm_destroy for deleted VM %s in pod %s: %w",
+				exclusion.JobID,
+				exclusion.PodVMID,
+				podID,
+				ErrPodDestroyExclusionInvalid,
+			)
+		}
+		excludedJobID = exclusion.JobID
+	}
+
+	var blocker PodDestroyBlockedError
+	err := tx.QueryRow(ctx, `
+		SELECT j.id, j.type, j.status
+		FROM jobs j
+		WHERE j.type = ANY($1)
+		  AND j.status = ANY($2)
+		  AND ($3::uuid = $4::uuid OR j.id != $3::uuid)
+		  AND (
+		    j.payload->>'pod_id' = $5
+		    OR j.payload->>'pod_vm_id' IN (
+		      SELECT id::text
+		      FROM pod_vms
+		      WHERE pod_id = $6
+		    )
+		  )
+		ORDER BY j.created_at ASC, j.id ASC
+		LIMIT 1
+	`,
+		serializedPodMutatorTypes(),
+		[]string{models.JobStatusPending, models.JobStatusClaimed, models.JobStatusInProgress},
+		excludedJobID,
+		uuid.Nil,
+		podID.String(),
+		podID,
+	).Scan(&blocker.JobID, &blocker.JobType, &blocker.JobStatus)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("scan nonterminal mutator work for pod %s: %w", podID, err)
+	}
+	blocker.PodID = podID
+	return &blocker
 }
 
 func podDestroyCanRestart(status string, requirement podDestroyRequirement) bool {

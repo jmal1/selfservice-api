@@ -36,6 +36,23 @@ func TestSerializedPodJobTypeInventoryIsExhaustive(t *testing.T) {
 	}
 }
 
+func TestSerializedPodMutatorInventoryExcludesOnlyDestroy(t *testing.T) {
+	got := serializedPodMutatorTypes()
+	if len(got) != len(serializedPodJobTypes)-1 {
+		t.Fatalf("serialized pod mutator inventory = %v, want every protected type except pod_destroy", got)
+	}
+	index := 0
+	for _, jobType := range serializedPodJobTypes {
+		if jobType == models.JobTypePodDestroy {
+			continue
+		}
+		if got[index] != jobType {
+			t.Fatalf("serialized pod mutator inventory[%d] = %q, want %q", index, got[index], jobType)
+		}
+		index++
+	}
+}
+
 func TestGenericCreateJobRejectsEverySerializedPodJobType(t *testing.T) {
 	q := &Queries{}
 	payload, err := json.Marshal(map[string]string{"pod_id": uuid.NewString()})

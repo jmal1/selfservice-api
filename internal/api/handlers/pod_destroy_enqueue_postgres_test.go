@@ -334,3 +334,67 @@ func TestExtendPodPostgresRejectsAuthoritativeDestroyWithoutAudit(t *testing.T) 
 		t.Fatalf("rejected extension wrote %d attestations and %d success audits", attestations, audits)
 	}
 }
+
+func TestDeletePodPostgresPendingMutatorReturnsConflictWithoutAuditOrEvent(t *testing.T) {
+	fixture := newPodCreatePostgresFixture(t)
+	podID := uuid.New()
+	podVMID := uuid.New()
+	if _, err := fixture.pool.Exec(context.Background(), `
+		INSERT INTO pods (id, owner_id, name, status, vlan_id, subnet)
+		VALUES ($1, $2, 'delete-blocked', 'active', $3, '10.253.250.0/24')
+	`, podID, fixture.userID, fixture.vlanTag); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(context.Background(), `
+		INSERT INTO pod_vms (id, pod_id, template_id, display_name, vcpus, ram_mb, disk_gb, status)
+		VALUES ($1, $2, $3, 'target', 1, 1024, 10, 'running')
+	`, podVMID, podID, fixture.templateID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(context.Background(), `
+		INSERT INTO jobs (type, payload, status)
+		VALUES (
+			'vm_start',
+			jsonb_build_object(
+				'pod_id', $1::text,
+				'pod_vm_id', $2::text,
+				'user_id', $3::text
+			),
+			'pending'
+		)
+	`, podID, podVMID, fixture.userID); err != nil {
+		t.Fatal(err)
+	}
+
+	publisher := &concurrentJobPublisher{}
+	h := NewHandler(
+		fixture.queries,
+		nil,
+		nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		nil,
+	)
+	h.jobEvents = publisher
+	rec := httptest.NewRecorder()
+	h.DeletePod(rec, deletePodRequest(podID, fixture.userID))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("delete status = %d body=%s, want 409", rec.Code, rec.Body.String())
+	}
+
+	var destroyJobs, audits int
+	if err := fixture.pool.QueryRow(context.Background(), `
+		SELECT
+			(SELECT count(*) FROM jobs WHERE type = 'pod_destroy' AND payload->>'pod_id' = $1::text),
+			(SELECT count(*) FROM audit_log WHERE resource_id = $1::uuid AND action = 'pod.delete')
+	`, podID).Scan(&destroyJobs, &audits); err != nil {
+		t.Fatal(err)
+	}
+	if destroyJobs != 0 || audits != 0 {
+		t.Fatalf("blocked delete wrote %d destroy jobs and %d audits", destroyJobs, audits)
+	}
+	publisher.mu.Lock()
+	defer publisher.mu.Unlock()
+	if len(publisher.jobIDs) != 0 {
+		t.Fatalf("blocked delete published %d job events", len(publisher.jobIDs))
+	}
+}

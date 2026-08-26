@@ -187,7 +187,7 @@ func TestPodDestroyProducersPostgresConvergeOnOneAuthoritativeJob(t *testing.T) 
 			if source == "expiration" {
 				job, created, err = fixture.queries.CreateExpiredPodDestroyJob(ctx, fixture.podID, payload)
 			} else {
-				job, created, err = fixture.queries.CreateEmptyPodDestroyJob(ctx, fixture.podID, payload)
+				job, created, err = fixture.queries.CreateEmptyPodDestroyJob(ctx, fixture.podID, payload, nil)
 			}
 			var jobID uuid.UUID
 			if job != nil {
@@ -1161,6 +1161,7 @@ func TestPodDestroyPostgresCannotInsertAfterTerminalCommit(t *testing.T) {
 			ctx,
 			fixture.podID,
 			payload,
+			nil,
 		)
 		result <- err
 	}()
@@ -1267,6 +1268,7 @@ func TestEmptyPodDestroyPostgresRevalidatesConcurrentVMAdd(t *testing.T) {
 		ctx,
 		fixture.podID,
 		podDestroyPayload(t, fixture.podID, "vm_destroy"),
+		nil,
 	)
 	if !errors.Is(err, ErrPodDestroyNotNeeded) {
 		t.Fatalf("non-empty cleanup enqueue error = %v, want %v", err, ErrPodDestroyNotNeeded)
@@ -1559,5 +1561,379 @@ func TestPodDestroyPostgresDoesNotLockExistingJobAfterPod(t *testing.T) {
 		SELECT status FROM pods WHERE id = $1 FOR UPDATE
 	`, fixture.podID).Scan(&status); err != nil {
 		t.Fatalf("worker could not continue job -> pod ordering: %v", err)
+	}
+}
+
+func insertProtectedVMJob(
+	t *testing.T,
+	fixture *podJobsPostgresFixture,
+	jobType, status, claimOwner string,
+) uuid.UUID {
+	t.Helper()
+	jobID := uuid.New()
+	if _, err := fixture.pool.Exec(context.Background(), `
+		INSERT INTO jobs (id, type, payload, status, claimed_by, claimed_at)
+		VALUES (
+			$1,
+			$2,
+			jsonb_build_object('pod_id', $3::text, 'pod_vm_id', $4::text),
+			$5,
+			NULLIF($6, ''),
+			CASE WHEN $6 = '' THEN NULL ELSE now() END
+		)
+	`, jobID, jobType, fixture.podID, fixture.podVMID, status, claimOwner); err != nil {
+		t.Fatal(err)
+	}
+	return jobID
+}
+
+func TestPodDestroyPostgresPendingMutatorBlocksThenCompletedRetrySucceeds(t *testing.T) {
+	fixture := newPodJobsPostgresFixture(t, models.PodStatusActive)
+	ctx := context.Background()
+	actionID := insertProtectedVMJob(t, fixture, models.JobTypeVMStart, models.JobStatusPending, "")
+
+	job, created, err := fixture.queries.CreatePodDestroyJob(
+		ctx,
+		fixture.podID,
+		podDestroyPayload(t, fixture.podID, "explicit"),
+	)
+	var blocked *PodDestroyBlockedError
+	if !errors.As(err, &blocked) {
+		t.Fatalf("destroy error = %v, want PodDestroyBlockedError", err)
+	}
+	if blocked.JobID != actionID || blocked.JobType != models.JobTypeVMStart || blocked.JobStatus != models.JobStatusPending {
+		t.Fatalf("blocker = %+v, want pending vm_start %s", blocked, actionID)
+	}
+	if job != nil || created {
+		t.Fatalf("blocked destroy returned job=%v created=%v", job, created)
+	}
+
+	if _, err := fixture.pool.Exec(ctx, `
+		UPDATE jobs SET status = 'completed', completed_at = now() WHERE id = $1
+	`, actionID); err != nil {
+		t.Fatal(err)
+	}
+	job, created, err = fixture.queries.CreatePodDestroyJob(
+		ctx,
+		fixture.podID,
+		podDestroyPayload(t, fixture.podID, "explicit_retry"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created || job == nil || job.Type != models.JobTypePodDestroy {
+		t.Fatalf("retry after action completion returned job=%v created=%v", job, created)
+	}
+}
+
+func TestPodDestroyPostgresClaimedAndInProgressMutatorsBlockExpiration(t *testing.T) {
+	for _, status := range []string{models.JobStatusClaimed, models.JobStatusInProgress} {
+		t.Run(status, func(t *testing.T) {
+			fixture := newPodJobsPostgresFixture(t, models.PodStatusActive)
+			ctx := context.Background()
+			if _, err := fixture.pool.Exec(ctx, `
+				UPDATE pods SET expires_at = now() - interval '1 minute' WHERE id = $1
+			`, fixture.podID); err != nil {
+				t.Fatal(err)
+			}
+			insertProtectedVMJob(t, fixture, models.JobTypeVMReset, status, "worker-"+uuid.NewString())
+
+			job, created, err := fixture.queries.CreateExpiredPodDestroyJob(
+				ctx,
+				fixture.podID,
+				podDestroyPayload(t, fixture.podID, "expiration"),
+			)
+			if !errors.Is(err, ErrPodDestroyBlockedByMutator) {
+				t.Fatalf("expiration error = %v, want %v", err, ErrPodDestroyBlockedByMutator)
+			}
+			if job != nil || created {
+				t.Fatalf("blocked expiration returned job=%v created=%v", job, created)
+			}
+		})
+	}
+}
+
+func TestPodDestroyPostgresTerminalRequeueWaitsForMutator(t *testing.T) {
+	fixture := newPodJobsPostgresFixture(t, models.PodStatusActive)
+	fixture.assignAvailableVLAN(t)
+	ctx := context.Background()
+	destroyID := uuid.New()
+	if _, err := fixture.pool.Exec(ctx, `
+		INSERT INTO jobs (id, type, payload, status, completed_at)
+		VALUES ($1, 'pod_destroy', jsonb_build_object('pod_id', $2::text), 'failed', now())
+	`, destroyID, fixture.podID); err != nil {
+		t.Fatal(err)
+	}
+	insertProtectedVMJob(t, fixture, models.JobTypeVMStop, models.JobStatusPending, "")
+
+	job, queued, err := fixture.queries.CreatePodDestroyJob(
+		ctx,
+		fixture.podID,
+		podDestroyPayload(t, fixture.podID, "retry"),
+	)
+	if !errors.Is(err, ErrPodDestroyBlockedByMutator) {
+		t.Fatalf("terminal requeue error = %v, want %v", err, ErrPodDestroyBlockedByMutator)
+	}
+	if job != nil || queued {
+		t.Fatalf("blocked terminal requeue returned job=%v queued=%v", job, queued)
+	}
+	var status string
+	if err := fixture.pool.QueryRow(ctx, `SELECT status FROM jobs WHERE id = $1`, destroyID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != models.JobStatusFailed {
+		t.Fatalf("blocked authoritative job status = %q, want failed", status)
+	}
+}
+
+func TestPodDestroyPostgresVerifiedCurrentVMDestroyExclusion(t *testing.T) {
+	fixture := newPodJobsPostgresFixture(t, models.PodStatusActive)
+	ctx := context.Background()
+	if _, err := fixture.pool.Exec(ctx, `
+		UPDATE pod_vms SET status = $2 WHERE id = $1
+	`, fixture.podVMID, models.VMStatusDeleted); err != nil {
+		t.Fatal(err)
+	}
+	claimOwner := "worker-" + uuid.NewString()
+	currentJobID := insertProtectedVMJob(t, fixture, models.JobTypeVMDestroy, models.JobStatusInProgress, claimOwner)
+
+	job, created, err := fixture.queries.CreateEmptyPodDestroyJob(
+		ctx,
+		fixture.podID,
+		podDestroyPayload(t, fixture.podID, "last_vm"),
+		&PodDestroyVMJobExclusion{
+			JobID:      currentJobID,
+			PodVMID:    fixture.podVMID,
+			ClaimOwner: claimOwner,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created || job == nil || job.Type != models.JobTypePodDestroy {
+		t.Fatalf("verified exclusion returned job=%v created=%v", job, created)
+	}
+}
+
+func TestPodDestroyPostgresRejectsForgedWrongAndTerminalExclusions(t *testing.T) {
+	tests := []struct {
+		name       string
+		jobType    string
+		jobStatus  string
+		claimOwner string
+		exclusion  func(jobID, podVMID uuid.UUID, owner string) *PodDestroyVMJobExclusion
+	}{
+		{
+			name:       "forged claim owner",
+			jobType:    models.JobTypeVMDestroy,
+			jobStatus:  models.JobStatusInProgress,
+			claimOwner: "current-owner",
+			exclusion: func(jobID, podVMID uuid.UUID, _ string) *PodDestroyVMJobExclusion {
+				return &PodDestroyVMJobExclusion{JobID: jobID, PodVMID: podVMID, ClaimOwner: "forged-owner"}
+			},
+		},
+		{
+			name:       "wrong job type",
+			jobType:    models.JobTypeVMStart,
+			jobStatus:  models.JobStatusInProgress,
+			claimOwner: "current-owner",
+			exclusion: func(jobID, podVMID uuid.UUID, owner string) *PodDestroyVMJobExclusion {
+				return &PodDestroyVMJobExclusion{JobID: jobID, PodVMID: podVMID, ClaimOwner: owner}
+			},
+		},
+		{
+			name:       "terminal vm destroy",
+			jobType:    models.JobTypeVMDestroy,
+			jobStatus:  models.JobStatusCompleted,
+			claimOwner: "current-owner",
+			exclusion: func(jobID, podVMID uuid.UUID, owner string) *PodDestroyVMJobExclusion {
+				return &PodDestroyVMJobExclusion{JobID: jobID, PodVMID: podVMID, ClaimOwner: owner}
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newPodJobsPostgresFixture(t, models.PodStatusActive)
+			ctx := context.Background()
+			if _, err := fixture.pool.Exec(ctx, `
+				UPDATE pod_vms SET status = $2 WHERE id = $1
+			`, fixture.podVMID, models.VMStatusDeleted); err != nil {
+				t.Fatal(err)
+			}
+			jobID := insertProtectedVMJob(t, fixture, tc.jobType, tc.jobStatus, tc.claimOwner)
+
+			job, created, err := fixture.queries.CreateEmptyPodDestroyJob(
+				ctx,
+				fixture.podID,
+				podDestroyPayload(t, fixture.podID, "forged_exclusion"),
+				tc.exclusion(jobID, fixture.podVMID, tc.claimOwner),
+			)
+			if !errors.Is(err, ErrPodDestroyExclusionInvalid) {
+				t.Fatalf("exclusion error = %v, want %v", err, ErrPodDestroyExclusionInvalid)
+			}
+			if job != nil || created {
+				t.Fatalf("invalid exclusion returned job=%v created=%v", job, created)
+			}
+		})
+	}
+}
+
+func TestPodDestroyPostgresCurrentVMDestroyExclusionDoesNotHideOtherMutators(t *testing.T) {
+	fixture := newPodJobsPostgresFixture(t, models.PodStatusActive)
+	ctx := context.Background()
+	if _, err := fixture.pool.Exec(ctx, `
+		UPDATE pod_vms SET status = $2 WHERE id = $1
+	`, fixture.podVMID, models.VMStatusDeleted); err != nil {
+		t.Fatal(err)
+	}
+	claimOwner := "worker-" + uuid.NewString()
+	currentJobID := insertProtectedVMJob(t, fixture, models.JobTypeVMDestroy, models.JobStatusInProgress, claimOwner)
+	firstOther := insertProtectedVMJob(t, fixture, models.JobTypeVMStart, models.JobStatusPending, "")
+	secondOther := insertProtectedVMJob(t, fixture, models.JobTypeVMStop, models.JobStatusClaimed, "other-"+uuid.NewString())
+
+	job, created, err := fixture.queries.CreateEmptyPodDestroyJob(
+		ctx,
+		fixture.podID,
+		podDestroyPayload(t, fixture.podID, "last_vm"),
+		&PodDestroyVMJobExclusion{
+			JobID:      currentJobID,
+			PodVMID:    fixture.podVMID,
+			ClaimOwner: claimOwner,
+		},
+	)
+	var blocked *PodDestroyBlockedError
+	if !errors.As(err, &blocked) {
+		t.Fatalf("destroy error = %v, want PodDestroyBlockedError", err)
+	}
+	if blocked.JobID != firstOther && blocked.JobID != secondOther {
+		t.Fatalf("blocker %s is neither remaining mutator %s nor %s", blocked.JobID, firstOther, secondOther)
+	}
+	if blocked.JobID == currentJobID {
+		t.Fatal("verified current vm_destroy incorrectly blocked itself")
+	}
+	if job != nil || created {
+		t.Fatalf("blocked destroy returned job=%v created=%v", job, created)
+	}
+}
+
+func TestPodDestroyAndVMActionPostgresActionCommitsFirst(t *testing.T) {
+	fixture := newPodJobsPostgresFixture(t, models.PodStatusActive)
+	ctx := context.Background()
+	key, _ := installAdvisoryBlockingInsertTrigger(
+		t,
+		fixture,
+		"jobs",
+		fmt.Sprintf("NEW.type = 'vm_start' AND NEW.payload->>'pod_id' = '%s'", fixture.podID),
+	)
+	lockConn, err := fixture.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockConn.Release()
+	if _, err := lockConn.Exec(ctx, `SELECT pg_advisory_lock($1)`, key); err != nil {
+		t.Fatal(err)
+	}
+	locked := true
+	defer func() {
+		if locked {
+			_, _ = lockConn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, key)
+		}
+	}()
+
+	actionResult := make(chan error, 1)
+	actionPayload := vmJobPayload(t, fixture.podID, fixture.podVMID)
+	go func() {
+		_, err := fixture.queries.CreateVMJob(
+			ctx,
+			fixture.podID,
+			fixture.podVMID,
+			models.JobTypeVMStart,
+			actionPayload,
+		)
+		actionResult <- err
+	}()
+	waitForAdvisoryWaiter(t, fixture.pool, key)
+
+	destroyResult := make(chan error, 1)
+	destroyPayload := podDestroyPayload(t, fixture.podID, "explicit")
+	go func() {
+		_, _, err := fixture.queries.CreatePodDestroyJob(ctx, fixture.podID, destroyPayload)
+		destroyResult <- err
+	}()
+	select {
+	case err := <-destroyResult:
+		t.Fatalf("destroy returned before action released the pod lock: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, err := lockConn.Exec(ctx, `SELECT pg_advisory_unlock($1)`, key); err != nil {
+		t.Fatal(err)
+	}
+	locked = false
+	if err := <-actionResult; err != nil {
+		t.Fatalf("action enqueue failed: %v", err)
+	}
+	if err := <-destroyResult; !errors.Is(err, ErrPodDestroyBlockedByMutator) {
+		t.Fatalf("destroy error = %v, want %v", err, ErrPodDestroyBlockedByMutator)
+	}
+}
+
+func TestPodDestroyAndVMActionPostgresDestroyCommitsFirst(t *testing.T) {
+	fixture := newPodJobsPostgresFixture(t, models.PodStatusActive)
+	ctx := context.Background()
+	key, _ := installAdvisoryBlockingInsertTrigger(
+		t,
+		fixture,
+		"jobs",
+		fmt.Sprintf("NEW.type = 'pod_destroy' AND NEW.payload->>'pod_id' = '%s'", fixture.podID),
+	)
+	lockConn, err := fixture.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockConn.Release()
+	if _, err := lockConn.Exec(ctx, `SELECT pg_advisory_lock($1)`, key); err != nil {
+		t.Fatal(err)
+	}
+	locked := true
+	defer func() {
+		if locked {
+			_, _ = lockConn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, key)
+		}
+	}()
+
+	destroyResult := make(chan error, 1)
+	destroyPayload := podDestroyPayload(t, fixture.podID, "explicit")
+	go func() {
+		_, _, err := fixture.queries.CreatePodDestroyJob(ctx, fixture.podID, destroyPayload)
+		destroyResult <- err
+	}()
+	waitForAdvisoryWaiter(t, fixture.pool, key)
+
+	actionResult := make(chan error, 1)
+	actionPayload := vmJobPayload(t, fixture.podID, fixture.podVMID)
+	go func() {
+		_, err := fixture.queries.CreateVMJob(
+			ctx,
+			fixture.podID,
+			fixture.podVMID,
+			models.JobTypeVMStart,
+			actionPayload,
+		)
+		actionResult <- err
+	}()
+	select {
+	case err := <-actionResult:
+		t.Fatalf("action returned before destroy released the pod lock: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, err := lockConn.Exec(ctx, `SELECT pg_advisory_unlock($1)`, key); err != nil {
+		t.Fatal(err)
+	}
+	locked = false
+	if err := <-destroyResult; err != nil {
+		t.Fatalf("destroy enqueue failed: %v", err)
+	}
+	if err := <-actionResult; !errors.Is(err, ErrPodJobRejected) {
+		t.Fatalf("action error = %v, want %v", err, ErrPodJobRejected)
 	}
 }

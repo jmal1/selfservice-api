@@ -36,7 +36,9 @@ func (p *Provisioner) expireStale(ctx context.Context) {
 
 		job, created, err := p.db.CreateExpiredPodDestroyJob(ctx, podID, payload)
 		if err != nil {
-			if errors.Is(err, database.ErrPodJobRejected) || errors.Is(err, database.ErrPodDestroyNotNeeded) {
+			if errors.Is(err, database.ErrPodJobRejected) ||
+				errors.Is(err, database.ErrPodDestroyNotNeeded) ||
+				errors.Is(err, database.ErrPodDestroyBlockedByMutator) {
 				p.logger.Info("expiration destroy no longer needed", "pod_id", podID, "error", err)
 				continue
 			}
