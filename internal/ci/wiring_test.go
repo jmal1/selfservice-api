@@ -226,6 +226,8 @@ func TestCIWorkflowConcurrencyUsesStablePROrRunID(t *testing.T) {
 	}
 }
 
+// Pull request branch filters match the target branch, so dependent PRs need
+// an unrestricted trigger while image-publishing pushes stay main-only.
 func TestCIWorkflowTriggersDependentPRsButPublishesOnlyFromMain(t *testing.T) {
 	workflow := loadCIWorkflow(t)
 	triggers := mustMap(t, workflow["on"], "on")
