@@ -2626,14 +2626,22 @@ canonical_live_workload_spec() {
   local kind=$1
   local name=$2
   kubectl get "$kind/$name" -n "$NAMESPACE" -o json \
-    | jq -cS -e --arg kind "$kind" -f "$CANONICALIZE_WORKLOAD_FILTER"
+    | jq -cS -e \
+        --arg kind "$kind" \
+        --arg release "$RELEASE" \
+        --arg namespace "$NAMESPACE" \
+        -f "$CANONICALIZE_WORKLOAD_FILTER"
 }
 
 canonical_desired_workload_spec() {
   local kind=$1
   local manifest=$2
   kubectl create --dry-run=server -n "$NAMESPACE" -f "$manifest" -o json \
-    | jq -cS -e --arg kind "$kind" -f "$CANONICALIZE_WORKLOAD_FILTER"
+    | jq -cS -e \
+        --arg kind "$kind" \
+        --arg release "$RELEASE" \
+        --arg namespace "$NAMESPACE" \
+        -f "$CANONICALIZE_WORKLOAD_FILTER"
 }
 
 verify_manifest_and_live() {
