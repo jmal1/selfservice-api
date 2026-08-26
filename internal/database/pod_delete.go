@@ -45,8 +45,11 @@ func (q *Queries) CancelPendingPodIfNeverStarted(ctx context.Context, podID uuid
 		SELECT id, status,
 		       COALESCE(retry_count, 0),
 		       CASE
-		         WHEN rollback_steps IS NULL THEN 0
-		         WHEN jsonb_typeof(rollback_steps) = 'array' THEN COALESCE(jsonb_array_length(rollback_steps), 0)
+		         WHEN jsonb_typeof(rollback_steps) = 'array' THEN
+		           CASE
+		             WHEN COALESCE(jsonb_array_length(rollback_steps), 0) = 0 THEN 0
+		             ELSE 1
+		           END
 		         ELSE 1
 		       END
 		FROM jobs
