@@ -82,6 +82,7 @@ const (
 
 var _ pipelineMetricsSink = (*PipelineMetrics)(nil)
 var _ jobStatusUpdater = (*database.Queries)(nil)
+var _ templateProvisionJobStatusUpdater = (*database.Queries)(nil)
 
 // Provisioner orchestrates pod lifecycle operations.
 type Provisioner struct {
