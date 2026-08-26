@@ -862,8 +862,8 @@ func (h *Handler) ExtendPod(w http.ResponseWriter, r *http.Request) {
 	}
 	newExpiry := time.Now().Add(extension)
 
-	// Update pod expiry
-	if err := h.db.UpdatePodExpiry(r.Context(), podID, newExpiry); err != nil {
+	attestation, err := h.db.ExtendPod(r.Context(), podID, userID, newExpiry)
+	if err != nil {
 		if errors.Is(err, database.ErrPodExtensionRejected) {
 			respondError(w, r, http.StatusConflict, "pod cannot be extended after destruction is queued")
 			return
@@ -876,7 +876,7 @@ func (h *Handler) ExtendPod(w http.ResponseWriter, r *http.Request) {
 	audit.Log(r.Context(), h.db, "pod.extend",
 		audit.Resource("pod", podID),
 		audit.FromRequest(r),
-		audit.Detail("previous_expires_at", fmt.Sprintf("%v", pod.ExpiresAt)),
+		audit.Detail("previous_expires_at", fmt.Sprintf("%v", attestation.PreviousExpiresAt)),
 		audit.Detail("new_expires_at", newExpiry.Format(time.RFC3339)),
 	)
 
