@@ -3,8 +3,8 @@ name: Build and Push Images
 on:
   push:
     branches: [main]
+  # Stacked pull requests target parent branches, so PR CI intentionally has no target-branch filter.
   pull_request:
-    branches: [main]
     paths-ignore:
       - '**.md'
       - 'docs/**'

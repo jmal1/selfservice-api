@@ -226,6 +226,22 @@ func TestCIWorkflowConcurrencyUsesStablePROrRunID(t *testing.T) {
 	}
 }
 
+func TestCIWorkflowTriggersDependentPRsButPublishesOnlyFromMain(t *testing.T) {
+	workflow := loadCIWorkflow(t)
+	triggers := mustMap(t, workflow["on"], "on")
+
+	pullRequest := mustMap(t, triggers["pull_request"], "on.pull_request")
+	if branches, restricted := pullRequest["branches"]; restricted {
+		t.Fatalf("on.pull_request.branches = %v, want no target-branch restriction so dependent PRs run", branches)
+	}
+
+	push := mustMap(t, triggers["push"], "on.push")
+	branches := mustSlice(t, push["branches"], "on.push.branches")
+	if len(branches) != 1 || mustString(t, branches[0], "on.push.branches[0]") != "main" {
+		t.Fatalf("on.push.branches = %v, want exactly [main] so feature branches cannot publish images", branches)
+	}
+}
+
 func TestCIWorkflowBuildJobsSplitPRAndPush(t *testing.T) {
 	workflow := loadCIWorkflow(t)
 	buildPR := workflowJob(t, workflow, "build-pr")
