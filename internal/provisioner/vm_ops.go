@@ -256,12 +256,16 @@ func (p *Provisioner) DestroyVM(ctx context.Context, job *models.Job) error {
 		p.publishProgress(job.ID, "pod_auto_cleanup", "Pod has no VMs left — queueing cleanup")
 
 		destroyPayload, _ := json.Marshal(map[string]string{"pod_id": podID.String()})
-		destroyJob, err := p.db.CreateJob(ctx, models.JobTypePodDestroy, destroyPayload)
+		destroyJob, created, err := p.db.CreateEmptyPodDestroyJob(ctx, podID, destroyPayload)
 		if err != nil {
+			if errors.Is(err, database.ErrPodJobRejected) || errors.Is(err, database.ErrPodDestroyNotNeeded) {
+				p.logger.Info("pod auto-destroy no longer needed", "pod_id", podID, "error", err)
+				return nil
+			}
 			p.logger.Error("failed to queue pod auto-destroy", "pod_id", podID, "error", err)
 			return nil
 		}
-		if p.nats != nil {
+		if created && p.nats != nil {
 			_ = p.nats.PublishJobCreated(destroyJob.ID, destroyJob.Type)
 		}
 	}

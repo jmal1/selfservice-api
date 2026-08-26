@@ -3,6 +3,9 @@ package provisioner
 import (
 	"context"
 	"encoding/json"
+	"errors"
+
+	"github.com/jmal1/selfservice-api/internal/database"
 )
 
 // ExpireStale queues pod_destroy jobs for any pods whose expiry has passed.
@@ -31,19 +34,26 @@ func (p *Provisioner) expireStale(ctx context.Context) {
 			"reason": "expired",
 		})
 
-		job, err := p.db.CreateJob(ctx, "pod_destroy", payload)
+		job, created, err := p.db.CreateExpiredPodDestroyJob(ctx, podID, payload)
 		if err != nil {
+			if errors.Is(err, database.ErrPodJobRejected) || errors.Is(err, database.ErrPodDestroyNotNeeded) {
+				p.logger.Info("expiration destroy no longer needed", "pod_id", podID, "error", err)
+				continue
+			}
 			p.logger.Error("failed to queue expiration destroy", "pod_id", podID, "error", err)
 			continue
 		}
 
-		if err := p.nats.PublishJobCreated(job.ID, job.Type); err != nil {
-			p.logger.Warn("failed to publish expiration job event", "error", err)
+		if created && p.nats != nil {
+			if err := p.nats.PublishJobCreated(job.ID, job.Type); err != nil {
+				p.logger.Warn("failed to publish expiration job event", "error", err)
+			}
 		}
 
-		p.logger.Info("queued expiration destroy",
+		p.logger.Info("ensured expiration destroy",
 			"pod_id", podID,
 			"job_id", job.ID,
+			"created", created,
 		)
 	}
 }

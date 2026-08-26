@@ -2,12 +2,14 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
 	"github.com/jmal1/selfservice-api/internal/audit"
+	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/middleware"
 	"github.com/jmal1/selfservice-api/internal/models"
 )
@@ -109,6 +111,7 @@ func (h *Handler) CreateVMSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	payload, _ := json.Marshal(map[string]string{
+		"pod_id":      podID.String(),
 		"pod_vm_id":   vmID.String(),
 		"name":        body.Name,
 		"description": body.Description,
@@ -116,8 +119,12 @@ func (h *Handler) CreateVMSnapshot(w http.ResponseWriter, r *http.Request) {
 		"vm_name":     vm.DisplayName,
 		"pod_name":    pod.Name,
 	})
-	job, err := h.db.CreateJob(r.Context(), models.JobTypeVMSnapshot, payload)
+	job, err := h.db.CreateVMJob(r.Context(), podID, vmID, models.JobTypeVMSnapshot, payload)
 	if err != nil {
+		if errors.Is(err, database.ErrPodJobRejected) {
+			http.Error(w, "pod is not available for VM operations", http.StatusConflict)
+			return
+		}
 		h.logger.Error("create snapshot job failed", "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -194,6 +201,7 @@ func (h *Handler) RevertToInitial(w http.ResponseWriter, r *http.Request) {
 	}
 
 	payload, _ := json.Marshal(map[string]string{
+		"pod_id":        podID.String(),
 		"pod_vm_id":     vmID.String(),
 		"snapshot_id":   initialSnap.ID.String(),
 		"user_id":       userID.String(),
@@ -201,8 +209,12 @@ func (h *Handler) RevertToInitial(w http.ResponseWriter, r *http.Request) {
 		"pod_name":      pod.Name,
 		"snapshot_name": initialSnap.Name,
 	})
-	job, err := h.db.CreateJob(r.Context(), models.JobTypeVMRevert, payload)
+	job, err := h.db.CreateVMJob(r.Context(), podID, vmID, models.JobTypeVMRevert, payload)
 	if err != nil {
+		if errors.Is(err, database.ErrPodJobRejected) {
+			http.Error(w, "pod is not available for VM operations", http.StatusConflict)
+			return
+		}
 		h.logger.Error("create revert-initial job failed", "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -275,6 +287,7 @@ func (h *Handler) RevertToSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	payload, _ := json.Marshal(map[string]string{
+		"pod_id":        podID.String(),
 		"pod_vm_id":     vmID.String(),
 		"snapshot_id":   snapID.String(),
 		"user_id":       userID.String(),
@@ -282,8 +295,12 @@ func (h *Handler) RevertToSnapshot(w http.ResponseWriter, r *http.Request) {
 		"pod_name":      pod.Name,
 		"snapshot_name": snap.Name,
 	})
-	job, err := h.db.CreateJob(r.Context(), models.JobTypeVMRevert, payload)
+	job, err := h.db.CreateVMJob(r.Context(), podID, vmID, models.JobTypeVMRevert, payload)
 	if err != nil {
+		if errors.Is(err, database.ErrPodJobRejected) {
+			http.Error(w, "pod is not available for VM operations", http.StatusConflict)
+			return
+		}
 		h.logger.Error("create revert job failed", "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -355,14 +372,20 @@ func (h *Handler) DeleteVMSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	payload, _ := json.Marshal(map[string]string{
+		"pod_id":        podID.String(),
+		"pod_vm_id":     vmID.String(),
 		"snapshot_id":   snapID.String(),
 		"user_id":       userID.String(),
 		"vm_name":       vm.DisplayName,
 		"pod_name":      pod.Name,
 		"snapshot_name": snap.Name,
 	})
-	job, err := h.db.CreateJob(r.Context(), models.JobTypeVMSnapshotDelete, payload)
+	job, err := h.db.CreateVMJob(r.Context(), podID, vmID, models.JobTypeVMSnapshotDelete, payload)
 	if err != nil {
+		if errors.Is(err, database.ErrPodJobRejected) {
+			http.Error(w, "pod is not available for VM operations", http.StatusConflict)
+			return
+		}
 		h.logger.Error("create snapshot delete job failed", "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return

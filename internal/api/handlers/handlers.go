@@ -661,7 +661,7 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	job, err := h.db.CreateJobTx(ctx, tx, models.JobTypePodCreate, payload)
+	job, err := h.db.CreatePodCreateJobTx(ctx, tx, podID, payload)
 	if err != nil {
 		h.logger.Error("create job failed", "error", err)
 		respondError(w, r, http.StatusInternalServerError, "failed to queue provisioning job")
@@ -720,15 +720,21 @@ func (h *Handler) DeletePod(w http.ResponseWriter, r *http.Request) {
 	}
 
 	payload, _ := json.Marshal(map[string]string{"pod_id": podID.String(), "pod_name": pod.Name, "user_id": userID.String()})
-	job, err := h.db.CreateJob(r.Context(), models.JobTypePodDestroy, payload)
+	job, created, err := h.db.CreatePodDestroyJob(r.Context(), podID, payload)
 	if err != nil {
+		if errors.Is(err, database.ErrPodJobRejected) {
+			respondError(w, r, http.StatusConflict, "pod is already being destroyed")
+			return
+		}
 		h.logger.Error("create destroy job failed", "error", err)
 		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
-	if err := h.events.PublishJobCreated(job.ID, job.Type); err != nil {
-		h.logger.Warn("failed to publish job created event", "error", err)
+	if created {
+		if err := h.jobEvents.PublishJobCreated(job.ID, job.Type); err != nil {
+			h.logger.Warn("failed to publish job created event", "error", err)
+		}
 	}
 
 	audit.Log(r.Context(), h.db, "pod.delete",
@@ -738,9 +744,13 @@ func (h *Handler) DeletePod(w http.ResponseWriter, r *http.Request) {
 		audit.Detail("job_id", job.ID.String()),
 	)
 
-	respondJSON(w, http.StatusAccepted, map[string]any{
+	responseStatus := http.StatusAccepted
+	if !created && (job.Status == models.JobStatusCompleted || job.Status == models.JobStatusFailed) {
+		responseStatus = http.StatusOK
+	}
+	respondJSON(w, responseStatus, map[string]any{
 		"job_id": job.ID,
-		"status": "pending",
+		"status": job.Status,
 	})
 }
 
@@ -915,8 +925,12 @@ func (h *Handler) DeleteVM(w http.ResponseWriter, r *http.Request) {
 		"vm_name":   vmName,
 		"user_id":   userID.String(),
 	})
-	job, err := h.db.CreateJob(r.Context(), models.JobTypeVMDestroy, payload)
+	job, err := h.db.CreateVMJob(r.Context(), podID, vmID, models.JobTypeVMDestroy, payload)
 	if err != nil {
+		if errors.Is(err, database.ErrPodJobRejected) {
+			respondError(w, r, http.StatusConflict, "pod is not available for VM operations")
+			return
+		}
 		h.logger.Error("create vm destroy job failed", "error", err)
 		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
@@ -1043,6 +1057,7 @@ func (h *Handler) AddVM(w http.ResponseWriter, r *http.Request) {
 
 	// Create pod_vm record
 	vm := &models.PodVM{
+		ID:          uuid.New(),
 		PodID:       podID,
 		TemplateID:  req.TemplateID,
 		DisplayName: req.DisplayName,
@@ -1051,12 +1066,6 @@ func (h *Handler) AddVM(w http.ResponseWriter, r *http.Request) {
 		DiskGB:      diskGB,
 		Status:      models.VMStatusPending,
 	}
-	if err := h.db.CreatePodVM(r.Context(), vm); err != nil {
-		h.logger.Error("create pod vm failed", "error", err)
-		respondError(w, r, http.StatusInternalServerError, "internal error")
-		return
-	}
-
 	// Queue vm_add job
 	payload, _ := json.Marshal(map[string]string{
 		"pod_id":        podID.String(),
@@ -1066,8 +1075,12 @@ func (h *Handler) AddVM(w http.ResponseWriter, r *http.Request) {
 		"display_name":  req.DisplayName,
 		"user_id":       userID.String(),
 	})
-	job, err := h.db.CreateJob(r.Context(), models.JobTypeVMAdd, payload)
+	job, err := h.db.CreateVMAddJob(r.Context(), vm, payload)
 	if err != nil {
+		if errors.Is(err, database.ErrPodJobRejected) {
+			respondError(w, r, http.StatusConflict, "pod must be active to add VMs")
+			return
+		}
 		h.logger.Error("create vm add job failed", "error", err)
 		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
@@ -1151,8 +1164,12 @@ func (h *Handler) VMPowerAction(w http.ResponseWriter, r *http.Request) {
 		"vm_name":   vm.DisplayName,
 		"pod_name":  pod.Name,
 	})
-	job, err := h.db.CreateJob(r.Context(), jobType, payload)
+	job, err := h.db.CreateVMJob(r.Context(), podID, vmID, jobType, payload)
 	if err != nil {
+		if errors.Is(err, database.ErrPodJobRejected) {
+			respondError(w, r, http.StatusConflict, "pod is not available for VM operations")
+			return
+		}
 		h.logger.Error("create vm power job failed", "error", err)
 		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return

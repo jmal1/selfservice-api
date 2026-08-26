@@ -899,11 +899,17 @@ func createJob(ctx context.Context, querier jobRowQuerier, jobType string, paylo
 
 // CreateJob inserts a new job and returns it.
 func (q *Queries) CreateJob(ctx context.Context, jobType string, payload []byte) (*models.Job, error) {
+	if isSerializedPodJobType(jobType) {
+		return nil, fmt.Errorf("%s: %w", jobType, ErrPodJobRequiresSerialization)
+	}
 	return createJob(ctx, q.pool, jobType, payload)
 }
 
 // CreateJobTx inserts a new job as part of the caller's transaction.
 func (q *Queries) CreateJobTx(ctx context.Context, tx pgx.Tx, jobType string, payload []byte) (*models.Job, error) {
+	if isSerializedPodJobType(jobType) {
+		return nil, fmt.Errorf("%s: %w", jobType, ErrPodJobRequiresSerialization)
+	}
 	return createJob(ctx, tx, jobType, payload)
 }
 

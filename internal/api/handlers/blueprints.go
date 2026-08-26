@@ -318,7 +318,7 @@ func (h *Handler) DeployBlueprint(w http.ResponseWriter, r *http.Request) {
 		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
-	job, err := h.db.CreateJobTx(r.Context(), tx, models.JobTypePodCreate, payload)
+	job, err := h.db.CreatePodCreateJobTx(r.Context(), tx, podID, payload)
 	if err != nil {
 		h.logger.Error("create job failed", "error", err)
 		respondError(w, r, http.StatusInternalServerError, "internal error")
