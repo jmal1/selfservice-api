@@ -17,7 +17,25 @@ def optional_array($path):
 | if $resource.kind != $kind then
     error("resource kind must be " + $kind)
   else
-    $resource.spec | require_object(".spec")
+    $resource.spec | require_object(".spec") as $spec
+    | if $kind == "Job" then
+        $spec
+      else
+        $resource.metadata | require_object(".metadata") as $metadata
+        | $metadata.annotations | optional_object(".metadata.annotations") as $annotations
+        | {
+            metadata: {
+              annotations: (
+                if $kind == "Deployment" then
+                  (($annotations // {}) | del(."deployment.kubernetes.io/revision"))
+                else
+                  ($annotations // {})
+                end
+              )
+            },
+            spec: $spec
+          }
+      end
   end
 | if $kind != "Job" then
     .
