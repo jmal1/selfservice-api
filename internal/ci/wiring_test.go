@@ -172,6 +172,14 @@ func workflowJob(t *testing.T, workflow map[string]any, name string) map[string]
 	return mustMap(t, job, "jobs."+name)
 }
 
+func requireWorkflowJobAbsent(t *testing.T, workflow map[string]any, name string) {
+	t.Helper()
+	jobs := mustMap(t, workflow["jobs"], "jobs")
+	if _, ok := jobs[name]; ok {
+		t.Fatalf("jobs.%s unexpectedly present in ci.yaml", name)
+	}
+}
+
 func stepByName(t *testing.T, job map[string]any, name string) map[string]any {
 	t.Helper()
 	steps := mustSlice(t, job["steps"], "steps")
@@ -221,13 +229,14 @@ func TestCIWorkflowConcurrencyUsesStablePROrRunID(t *testing.T) {
 func TestCIWorkflowBuildJobsSplitPRAndPush(t *testing.T) {
 	workflow := loadCIWorkflow(t)
 	buildPR := workflowJob(t, workflow, "build-pr")
-	buildPush := workflowJob(t, workflow, "build-push")
+	build := workflowJob(t, workflow, "build")
+	requireWorkflowJobAbsent(t, workflow, "build-push")
 
 	if got := needsList(t, buildPR, "jobs.build-pr.needs"); !reflect.DeepEqual(got, []string{"changes"}) {
 		t.Fatalf("build-pr needs = %v, want [changes]", got)
 	}
-	if got := needsList(t, buildPush, "jobs.build-push.needs"); !reflect.DeepEqual(got, []string{"changes", "test"}) {
-		t.Fatalf("build-push needs = %v, want [changes test]", got)
+	if got := needsList(t, build, "jobs.build.needs"); !reflect.DeepEqual(got, []string{"changes", "test"}) {
+		t.Fatalf("build needs = %v, want [changes test]", got)
 	}
 
 	if got := mustString(t, buildPR["if"], "jobs.build-pr.if"); !strings.Contains(got, "github.event_name == 'pull_request'") ||
@@ -236,19 +245,19 @@ func TestCIWorkflowBuildJobsSplitPRAndPush(t *testing.T) {
 		strings.Contains(got, "github.ref") {
 		t.Fatalf("build-pr if = %q, want PR-only matrix build without test dependency", got)
 	}
-	if got := mustString(t, buildPush["if"], "jobs.build-push.if"); !strings.Contains(got, "github.event_name == 'push'") ||
+	if got := mustString(t, build["if"], "jobs.build.if"); !strings.Contains(got, "github.event_name == 'push'") ||
 		!strings.HasPrefix(strings.TrimSpace(got), "always() &&") ||
 		!strings.Contains(got, "needs.changes.outputs.components != '[]'") ||
 		!strings.Contains(got, "needs.test.result == 'success' || needs.test.result == 'skipped'") ||
 		strings.Contains(got, "github.ref") {
-		t.Fatalf("build-push if = %q, want push-only build gated by test success/skipped", got)
+		t.Fatalf("build if = %q, want push-only build gated by test success/skipped", got)
 	}
 
-	if !reflect.DeepEqual(buildPR["strategy"], buildPush["strategy"]) {
-		t.Fatalf("build-pr and build-push strategy differ:\nPR:   %#v\nPush: %#v", buildPR["strategy"], buildPush["strategy"])
+	if !reflect.DeepEqual(buildPR["strategy"], build["strategy"]) {
+		t.Fatalf("build-pr and build strategy differ:\nPR:   %#v\nPush: %#v", buildPR["strategy"], build["strategy"])
 	}
-	if !reflect.DeepEqual(buildPR["steps"], buildPush["steps"]) {
-		t.Fatalf("build-pr and build-push steps differ")
+	if !reflect.DeepEqual(buildPR["steps"], build["steps"]) {
+		t.Fatalf("build-pr and build steps differ")
 	}
 
 	steps := mustSlice(t, buildPR["steps"], "jobs.build-pr.steps")
@@ -256,8 +265,8 @@ func TestCIWorkflowBuildJobsSplitPRAndPush(t *testing.T) {
 	if got := mustString(t, login["if"], "Log in to GHCR.if"); got != "github.event_name == 'push'" {
 		t.Fatalf("Log in to GHCR if = %q, want push-only login", got)
 	}
-	build := stepByName(t, buildPR, "Build and push")
-	with := mustMap(t, build["with"], "Build and push.with")
+	buildStep := stepByName(t, buildPR, "Build and push")
+	with := mustMap(t, buildStep["with"], "Build and push.with")
 	if got := mustString(t, with["push"], "Build and push.with.push"); got != "${{ github.event_name == 'push' }}" {
 		t.Fatalf("Build and push push = %q, want push-only build", got)
 	}
@@ -277,17 +286,32 @@ func TestCIWorkflowBuildJobsSplitPRAndPush(t *testing.T) {
 
 func TestCIWorkflowPushBuildRemainsEligibleWhenTestsSkip(t *testing.T) {
 	workflow := loadCIWorkflow(t)
-	buildPush := workflowJob(t, workflow, "build-push")
+	build := workflowJob(t, workflow, "build")
 
-	got := mustString(t, buildPush["if"], "jobs.build-push.if")
+	got := mustString(t, build["if"], "jobs.build.if")
 	if !strings.HasPrefix(strings.TrimSpace(got), "always() &&") {
-		t.Fatalf("build-push if = %q, want always() fallback so skipped tests do not block push builds", got)
+		t.Fatalf("build if = %q, want always() fallback so skipped tests do not block push builds", got)
 	}
 	if !strings.Contains(got, "needs.changes.outputs.components != '[]'") {
-		t.Fatalf("build-push if = %q, want nonempty matrix gate", got)
+		t.Fatalf("build if = %q, want nonempty matrix gate", got)
 	}
 	if !strings.Contains(got, "needs.test.result == 'success' || needs.test.result == 'skipped'") {
-		t.Fatalf("build-push if = %q, want skipped tests accepted but failures rejected", got)
+		t.Fatalf("build if = %q, want skipped tests accepted but failures rejected", got)
+	}
+}
+
+func TestCIWorkflowBuildJobMatchesDeployProof(t *testing.T) {
+	workflow := loadCIWorkflow(t)
+	workflowJob(t, workflow, "build")
+	requireWorkflowJobAbsent(t, workflow, "build-push")
+
+	root := findRepoRoot(t)
+	body, err := os.ReadFile(filepath.Join(root, "deploy", "scripts", "deploy.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `--arg job "build ($component)"`) {
+		t.Fatal(`deploy.sh no longer proves successful image builds with job names "build ($component)"`)
 	}
 }
 
