@@ -508,13 +508,7 @@ then either backfill an exact per-host receipt with reliable ownership evidence
 or complete the cleanup manually. A transient `RemovePortGroup` failure follows
 the same resource-retention rule but remains retryable.
 
-If you delete a pod before provisioning ever starts, Crucible now cancels the
-pending `pod_create` job in the database, marks the pod and its VM rows
-terminal, releases the VLAN, and never calls vCenter or OPNsense. That path is
-only taken while the create job is still pending and unclaimed and there is no
-VM MoRef, placement, or portgroup receipt evidence. Once any of those
-ownership signals exist, delete falls back to the normal destroy/manual cleanup
-path instead of pretending the pod was never started.
+If you delete a pod before provisioning ever starts, Crucible now cancels the pending `pod_create` job in the database, marks the pod and VM rows deleted, releases the VLAN, and never calls vCenter or OPNsense. That path is only taken while the create job is still pending and unclaimed and there is no VM MoRef, placement, or portgroup receipt evidence. Once any of those ownership signals exist, delete falls back to the normal destroy/manual cleanup path instead of pretending the pod was never started.
 
 Authenticated clients can check the stable read-only contract at
 `GET /api/v1/provisioning/status`:

@@ -442,6 +442,18 @@ func (f *podDeletePostgresFixture) insertJob(t *testing.T, jobType string, paylo
 	return jobID
 }
 
+func vmJobPayload(t *testing.T, podID, podVMID uuid.UUID) []byte {
+	t.Helper()
+	payload, err := json.Marshal(map[string]string{
+		"pod_id":    podID.String(),
+		"pod_vm_id": podVMID.String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload
+}
+
 func waitForJobLockHeld(t *testing.T, pool *pgxpool.Pool, jobID uuid.UUID) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -468,6 +480,34 @@ func waitForJobLockHeld(t *testing.T, pool *pgxpool.Pool, jobID uuid.UUID) {
 		t.Fatalf("probe job lock: %v", err)
 	}
 	t.Fatal("timed out waiting for cancellation to lock the create job")
+}
+
+func waitForPodLockHeld(t *testing.T, pool *pgxpool.Pool, podID uuid.UUID) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		probeCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+		tx, err := pool.Begin(probeCtx)
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		var probeID uuid.UUID
+		err = tx.QueryRow(probeCtx, `SELECT id FROM pods WHERE id = $1 FOR UPDATE NOWAIT`, podID).Scan(&probeID)
+		if err == nil {
+			_ = tx.Rollback(probeCtx)
+			cancel()
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		_ = tx.Rollback(probeCtx)
+		cancel()
+		if strings.Contains(err.Error(), "SQLSTATE 55P03") || strings.Contains(err.Error(), "could not obtain lock on row") {
+			return
+		}
+		t.Fatalf("probe pod lock: %v", err)
+	}
+	t.Fatal("timed out waiting for cancellation to lock the pod")
 }
 
 func probeExactCreateJobUnavailable(t *testing.T, pool *pgxpool.Pool, jobID uuid.UUID) {
@@ -713,6 +753,7 @@ func TestDeletePodFallsBackForCompetingVMMutators(t *testing.T) {
 		{name: "claimed vm_destroy", jobType: models.JobTypeVMDestroy, claim: true},
 		{name: "queued vm_add", jobType: models.JobTypeVMAdd},
 		{name: "queued vm_snapshot", jobType: models.JobTypeVMSnapshot},
+		{name: "queued vm_snapshot_delete", jobType: models.JobTypeVMSnapshotDelete},
 	}
 
 	for _, tc := range tests {
@@ -779,10 +820,11 @@ func TestDeletePodFallsBackForCompetingVMMutators(t *testing.T) {
 func TestDeletePodExactLockRaceWithQueuedVmDestroyFallsBack(t *testing.T) {
 	fixture := newPodDeletePostgresFixture(t, 1)
 	ctx := context.Background()
-	vmDestroyID := fixture.insertJob(t, models.JobTypeVMDestroy, map[string]string{
+	competingJobID := fixture.insertJob(t, models.JobTypeVMSnapshotDelete, map[string]string{
 		"pod_id":    fixture.podID.String(),
 		"pod_vm_id": fixture.podVMIDs[0].String(),
 	})
+
 	lockCtx, lockCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer lockCancel()
 	tx, err := fixture.pool.Begin(lockCtx)
@@ -790,29 +832,32 @@ func TestDeletePodExactLockRaceWithQueuedVmDestroyFallsBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	var locked uuid.UUID
-	if err := tx.QueryRow(lockCtx, `SELECT id FROM jobs WHERE id = $1 FOR UPDATE`, vmDestroyID).Scan(&locked); err != nil {
+	if err := tx.QueryRow(lockCtx, `SELECT id FROM jobs WHERE id = $1 FOR UPDATE`, competingJobID).Scan(&locked); err != nil {
 		_ = tx.Rollback(lockCtx)
 		t.Fatal(err)
 	}
 
 	done := make(chan *httptest.ResponseRecorder, 1)
-	publisher := &podDeleteRecordingJobCreatedPublisher{}
 	go func() {
 		rec := httptest.NewRecorder()
-		h := fixture.handler()
-		h.jobEvents = publisher
-		h.DeletePod(rec, fixture.deleteRequest())
+		fixture.handler().DeletePod(rec, fixture.deleteRequest())
 		done <- rec
 	}()
 
 	select {
 	case rec := <-done:
 		_ = tx.Rollback(lockCtx)
-		t.Fatalf("delete returned early while vm_destroy row was locked: %d body=%s", rec.Code, rec.Body.String())
+		t.Fatalf("delete returned early while competing job row was locked: %d body=%s", rec.Code, rec.Body.String())
 	case <-time.After(250 * time.Millisecond):
 	}
 
-	if err := tx.Rollback(lockCtx); err != nil {
+	var podLocked uuid.UUID
+	if err := tx.QueryRow(lockCtx, `SELECT id FROM pods WHERE id = $1 FOR UPDATE NOWAIT`, fixture.podID).Scan(&podLocked); err != nil {
+		_ = tx.Rollback(lockCtx)
+		t.Fatalf("worker-style pod lock after job lock failed: %v", err)
+	}
+
+	if err := tx.Commit(lockCtx); err != nil {
 		t.Fatal(err)
 	}
 
@@ -820,7 +865,7 @@ func TestDeletePodExactLockRaceWithQueuedVmDestroyFallsBack(t *testing.T) {
 	select {
 	case rec = <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for delete response after releasing vm_destroy lock")
+		t.Fatal("timed out waiting for delete response after releasing competing locks")
 	}
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("delete status = %d body=%s, want 409 conflict", rec.Code, rec.Body.String())
@@ -852,11 +897,193 @@ func TestDeletePodExactLockRaceWithQueuedVmDestroyFallsBack(t *testing.T) {
 	if destroyJobs != 0 {
 		t.Fatalf("destroy jobs = %d, want 0 on conflict", destroyJobs)
 	}
+}
+
+func TestDeletePodRejectsProducerCommittedBeforePodLock(t *testing.T) {
+	fixture := newPodDeletePostgresFixture(t, 1)
+	ctx := context.Background()
+
+	producerTxCtx, producerCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer producerCancel()
+	producerTx, err := fixture.pool.Begin(producerTxCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var heldPod uuid.UUID
+	if err := producerTx.QueryRow(producerTxCtx, `SELECT id FROM pods WHERE id = $1 FOR UPDATE`, fixture.podID).Scan(&heldPod); err != nil {
+		_ = producerTx.Rollback(producerTxCtx)
+		t.Fatal(err)
+	}
+
+	deleteDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		fixture.handler().DeletePod(rec, fixture.deleteRequest())
+		deleteDone <- rec
+	}()
+
+	waitForJobLockHeld(t, fixture.pool, fixture.createJob)
+
+	producerJobID := uuid.New()
+	if _, err := producerTx.Exec(producerTxCtx, `
+		INSERT INTO jobs (id, type, payload)
+		VALUES ($1, $2, jsonb_build_object('pod_id', $3::text, 'pod_vm_id', $4::text))
+	`, producerJobID, models.JobTypeVMSnapshotDelete, fixture.podID, fixture.podVMIDs[0]); err != nil {
+		_ = producerTx.Rollback(producerTxCtx)
+		t.Fatal(err)
+	}
+	if err := producerTx.Commit(producerTxCtx); err != nil {
+		t.Fatal(err)
+	}
+	fixture.trackJobID(producerJobID)
+
+	var rec *httptest.ResponseRecorder
+	select {
+	case rec = <-deleteDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for delete response after producer commit")
+	}
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("delete status = %d body=%s, want 409 conflict", rec.Code, rec.Body.String())
+	}
+
+	var podStatus string
+	if err := fixture.pool.QueryRow(ctx, `SELECT status FROM pods WHERE id = $1`, fixture.podID).Scan(&podStatus); err != nil {
+		t.Fatal(err)
+	}
+	if podStatus != models.PodStatusPending {
+		t.Fatalf("pod status = %s, want pending after rejection", podStatus)
+	}
+
+	var createJobStatus string
+	if err := fixture.pool.QueryRow(ctx, `SELECT status FROM jobs WHERE id = $1`, fixture.createJob).Scan(&createJobStatus); err != nil {
+		t.Fatal(err)
+	}
+	if createJobStatus != models.JobStatusPending {
+		t.Fatalf("create job status = %s, want pending after rejection", createJobStatus)
+	}
+
+	var destroyJobs int
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM jobs
+		WHERE type = 'pod_destroy' AND payload->>'pod_id' = $1::text
+	`, fixture.podID.String()).Scan(&destroyJobs); err != nil {
+		t.Fatal(err)
+	}
+	if destroyJobs != 0 {
+		t.Fatalf("destroy jobs = %d, want 0 after rejection", destroyJobs)
+	}
+
+	var competingJobs int
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM jobs
+		WHERE id = $1 AND type = $2 AND payload->>'pod_id' = $3::text
+	`, producerJobID, models.JobTypeVMSnapshotDelete, fixture.podID.String()).Scan(&competingJobs); err != nil {
+		t.Fatal(err)
+	}
+	if competingJobs != 1 {
+		t.Fatalf("producer job count = %d, want 1 committed job", competingJobs)
+	}
+}
+
+func TestDeletePodProducerWaitsForDestroyedPodAndReceivesRejection(t *testing.T) {
+	fixture := newPodDeletePostgresFixture(t, 1)
+	publisher := &recordingJobStatusPublisher{
+		pool:    fixture.pool,
+		podID:   fixture.podID,
+		jobID:   fixture.createJob,
+		vlanTag: fixture.vlanTag,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	vlanLockTx, err := fixture.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var vlanID int64
+	if err := vlanLockTx.QueryRow(ctx, `SELECT id FROM vlan_pool WHERE vlan_tag = $1 FOR UPDATE`, fixture.vlanTag).Scan(&vlanID); err != nil {
+		_ = vlanLockTx.Rollback(ctx)
+		t.Fatal(err)
+	}
+
+	deleteDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		fixture.handlerWithJobStatusPublisher(publisher).DeletePod(rec, fixture.deleteRequest())
+		deleteDone <- rec
+	}()
+
+	waitForJobLockHeld(t, fixture.pool, fixture.createJob)
+	waitForPodLockHeld(t, fixture.pool, fixture.podID)
+
+	producerCtx, producerCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer producerCancel()
+	producerDone := make(chan error, 1)
+	go func() {
+		_, err := fixture.queries.CreateVMJob(producerCtx, fixture.podID, fixture.podVMIDs[0], models.JobTypeVMSnapshotDelete, vmJobPayload(t, fixture.podID, fixture.podVMIDs[0]))
+		producerDone <- err
+	}()
+
+	if err := vlanLockTx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var rec *httptest.ResponseRecorder
+	select {
+	case rec = <-deleteDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for cancellation response")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cancel status = %d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+
+	var podStatus, podError string
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT status, COALESCE(error_message, '')
+		FROM pods
+		WHERE id = $1
+	`, fixture.podID).Scan(&podStatus, &podError); err != nil {
+		t.Fatal(err)
+	}
+	if podStatus != models.PodStatusDestroyed || podError != models.PodErrorCancelledBeforeProvisioning {
+		t.Fatalf("pod state = %s/%q, want destroyed/%q", podStatus, podError, models.PodErrorCancelledBeforeProvisioning)
+	}
+
+	var createJobStatus string
+	if err := fixture.pool.QueryRow(ctx, `SELECT status FROM jobs WHERE id = $1`, fixture.createJob).Scan(&createJobStatus); err != nil {
+		t.Fatal(err)
+	}
+	if createJobStatus != models.JobStatusFailed {
+		t.Fatalf("create job status = %s, want failed after cancellation", createJobStatus)
+	}
+
+	var producerErr error
+	select {
+	case producerErr = <-producerDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for vm_snapshot_delete producer")
+	}
+	if !errors.Is(producerErr, database.ErrPodJobRejected) {
+		t.Fatalf("producer error = %v, want %v", producerErr, database.ErrPodJobRejected)
+	}
+
+	var producerJobs int
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM jobs
+		WHERE type = $1 AND payload->>'pod_id' = $2::text
+	`, models.JobTypeVMSnapshotDelete, fixture.podID.String()).Scan(&producerJobs); err != nil {
+		t.Fatal(err)
+	}
+	if producerJobs != 0 {
+		t.Fatalf("producer jobs = %d, want 0 after rejection", producerJobs)
+	}
 
 	publisher.mu.Lock()
-	if len(publisher.calls) != 0 {
+	if len(publisher.calls) != 1 {
 		publisher.mu.Unlock()
-		t.Fatalf("job created publish calls = %d, want 0", len(publisher.calls))
+		t.Fatalf("job status publish calls = %d, want 1", len(publisher.calls))
 	}
 	publisher.mu.Unlock()
 }
@@ -1091,6 +1318,166 @@ func TestDeletePodRejectsClaimedJobAndExternalEvidence(t *testing.T) {
 			if jobID, ok := body["job_id"].(string); !ok || jobID == "" {
 				t.Fatalf("cancel response missing job_id: %+v", body)
 			}
+		})
+	}
+}
+
+func TestDeletePodRejectsAmbiguousCreateJobLifecycleEvidence(t *testing.T) {
+	tests := []struct {
+		name   string
+		setup  func(t *testing.T, f *podDeletePostgresFixture)
+		verify func(t *testing.T, f *podDeletePostgresFixture)
+	}{
+		{
+			name: "cleanup_only payload",
+			setup: func(t *testing.T, f *podDeletePostgresFixture) {
+				t.Helper()
+				if _, err := f.pool.Exec(context.Background(), `
+					UPDATE jobs
+					SET payload = jsonb_set(payload, '{cleanup_only}', 'true'::jsonb, true)
+					WHERE id = $1
+				`, f.createJob); err != nil {
+					t.Fatal(err)
+				}
+			},
+			verify: func(t *testing.T, f *podDeletePostgresFixture) {
+				t.Helper()
+				var cleanupOnly bool
+				if err := f.pool.QueryRow(context.Background(), `
+					SELECT COALESCE(payload->>'cleanup_only', 'false')::boolean
+					FROM jobs
+					WHERE id = $1
+				`, f.createJob).Scan(&cleanupOnly); err != nil {
+					t.Fatal(err)
+				}
+				if !cleanupOnly {
+					t.Fatal("cleanup_only evidence was cleared")
+				}
+			},
+		},
+		{
+			name: "next_attempt_at scheduled retry",
+			setup: func(t *testing.T, f *podDeletePostgresFixture) {
+				t.Helper()
+				if _, err := f.pool.Exec(context.Background(), `
+					UPDATE jobs
+					SET retry_count = 1,
+					    next_attempt_at = now() + interval '1 hour'
+					WHERE id = $1
+				`, f.createJob); err != nil {
+					t.Fatal(err)
+				}
+			},
+			verify: func(t *testing.T, f *podDeletePostgresFixture) {
+				t.Helper()
+				var nextAttemptAt *time.Time
+				if err := f.pool.QueryRow(context.Background(), `
+					SELECT next_attempt_at
+					FROM jobs
+					WHERE id = $1
+				`, f.createJob).Scan(&nextAttemptAt); err != nil {
+					t.Fatal(err)
+				}
+				if nextAttemptAt == nil {
+					t.Fatal("next_attempt_at evidence was cleared")
+				}
+			},
+		},
+		{
+			name: "started_at evidence",
+			setup: func(t *testing.T, f *podDeletePostgresFixture) {
+				t.Helper()
+				if _, err := f.pool.Exec(context.Background(), `
+					UPDATE jobs
+					SET started_at = now()
+					WHERE id = $1
+				`, f.createJob); err != nil {
+					t.Fatal(err)
+				}
+			},
+			verify: func(t *testing.T, f *podDeletePostgresFixture) {
+				t.Helper()
+				var startedAt *time.Time
+				if err := f.pool.QueryRow(context.Background(), `
+					SELECT started_at
+					FROM jobs
+					WHERE id = $1
+				`, f.createJob).Scan(&startedAt); err != nil {
+					t.Fatal(err)
+				}
+				if startedAt == nil {
+					t.Fatal("started_at evidence was cleared")
+				}
+			},
+		},
+		{
+			name: "completed_at evidence",
+			setup: func(t *testing.T, f *podDeletePostgresFixture) {
+				t.Helper()
+				if _, err := f.pool.Exec(context.Background(), `
+					UPDATE jobs
+					SET completed_at = now()
+					WHERE id = $1
+				`, f.createJob); err != nil {
+					t.Fatal(err)
+				}
+			},
+			verify: func(t *testing.T, f *podDeletePostgresFixture) {
+				t.Helper()
+				var completedAt *time.Time
+				if err := f.pool.QueryRow(context.Background(), `
+					SELECT completed_at
+					FROM jobs
+					WHERE id = $1
+				`, f.createJob).Scan(&completedAt); err != nil {
+					t.Fatal(err)
+				}
+				if completedAt == nil {
+					t.Fatal("completed_at evidence was cleared")
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newPodDeletePostgresFixture(t, 1)
+			tc.setup(t, fixture)
+
+			rec := httptest.NewRecorder()
+			fixture.handler().DeletePod(rec, fixture.deleteRequest())
+			if rec.Code != http.StatusConflict {
+				t.Fatalf("delete status = %d body=%s, want 409 conflict", rec.Code, rec.Body.String())
+			}
+
+			var body map[string]any
+			if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+				t.Fatalf("decode conflict response: %v", err)
+			}
+			if body["error"] == "" {
+				t.Fatalf("conflict response missing error: %+v", body)
+			}
+
+			var podStatus string
+			if err := fixture.pool.QueryRow(context.Background(), `SELECT status FROM pods WHERE id = $1`, fixture.podID).Scan(&podStatus); err != nil {
+				t.Fatal(err)
+			}
+			if podStatus != models.PodStatusPending {
+				t.Fatalf("pod status = %s, want pending while cancellation is rejected", podStatus)
+			}
+
+			var destroyJobs int
+			if err := fixture.pool.QueryRow(context.Background(), `
+				SELECT COUNT(*) FROM jobs
+				WHERE type = 'pod_destroy' AND payload->>'pod_id' = $1::text
+			`, fixture.podID.String()).Scan(&destroyJobs); err != nil {
+				t.Fatal(err)
+			}
+			if destroyJobs != 0 {
+				t.Fatalf("destroy jobs = %d, want 0 on conflict", destroyJobs)
+			}
+
+			tc.verify(t, fixture)
 		})
 	}
 }

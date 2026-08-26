@@ -21,32 +21,60 @@ const (
 	PodDeletionOutcomeNeedsDestroy     PodDeletionOutcome = "needs_destroy"
 )
 
-var podCancellationPodIDMutatorJobTypes = []string{
-	models.JobTypePodDestroy,
-	models.JobTypeVMAdd,
-}
-
-var podCancellationPodVMMutatorJobTypes = []string{
-	models.JobTypeVMAdd,
-	models.JobTypeVMDestroy,
-	models.JobTypeVMStart,
-	models.JobTypeVMStop,
-	models.JobTypeVMRestart,
-	models.JobTypeVMReset,
-	models.JobTypeVMSnapshot,
-	models.JobTypeVMRevert,
-	models.JobTypeVMSuspend,
-}
-
 type PodDeletionDecision struct {
 	Outcome PodDeletionOutcome
 	JobID   uuid.UUID
 }
 
+func podCancellationProtectedJobs(ctx context.Context, tx pgx.Tx, podID, excludeJobID uuid.UUID, lockRows bool) (bool, error) {
+	query := `
+		WITH pod_vm_ids AS (
+			SELECT id::text AS pod_vm_id
+			FROM pod_vms
+			WHERE pod_id = $1
+		),
+		ordered_types AS (
+			SELECT job_type, ord
+			FROM unnest($3::text[]) WITH ORDINALITY AS job_types(job_type, ord)
+		)
+		SELECT j.id
+		FROM jobs j
+		JOIN ordered_types ot ON ot.job_type = j.type
+		WHERE j.id <> $2
+		  AND (
+		    j.payload->>'pod_id' = $1::text
+		    OR j.payload->>'pod_vm_id' IN (SELECT pod_vm_id FROM pod_vm_ids)
+		  )
+		ORDER BY ot.ord, j.created_at ASC, j.id ASC`
+	if lockRows {
+		query += " FOR UPDATE"
+	}
+
+	rows, err := tx.Query(ctx, query, podID, excludeJobID, serializedPodJobTypes)
+	if err != nil {
+		return false, fmt.Errorf("scan protected pod jobs for %s: %w", podID, err)
+	}
+	defer rows.Close()
+
+	evidence := false
+	for rows.Next() {
+		var jobID uuid.UUID
+		if err := rows.Scan(&jobID); err != nil {
+			return false, fmt.Errorf("scan protected pod jobs for %s: %w", podID, err)
+		}
+		evidence = true
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("scan protected pod jobs for %s: %w", podID, err)
+	}
+	return evidence, nil
+}
+
 // CancelPendingPodIfNeverStarted cancels a pending pod only when the create job
-// is still pending and unclaimed, and no VM, placement, or receipt evidence
-// shows that provisioning ever started. It locks the create job before the pod
-// to match BeginPodCreateCleanup and avoid delete-vs-worker deadlocks.
+// is still pristine and no job, VM, placement, or receipt evidence shows that
+// provisioning ever started. It locks the authoritative create job first, then
+// any existing protected jobs, and never locks an existing job while holding the
+// pod row.
 func (q *Queries) CancelPendingPodIfNeverStarted(ctx context.Context, podID uuid.UUID) (*PodDeletionDecision, error) {
 	tx, err := q.pool.Begin(ctx)
 	if err != nil {
@@ -57,14 +85,23 @@ func (q *Queries) CancelPendingPodIfNeverStarted(ctx context.Context, podID uuid
 	var createJobID uuid.UUID
 	var createJobStatus string
 	var retryCount int
+	var cleanupOnly bool
 	var rollbackCount int
+	var claimedBy sql.NullString
+	var claimedAt, startedAt, completedAt, nextAttemptAt sql.NullTime
 	jobErr := tx.QueryRow(ctx, `
 		SELECT id, status,
 		       COALESCE(retry_count, 0),
+		       COALESCE(payload->>'cleanup_only', 'false') = 'true',
+		       claimed_by,
+		       claimed_at,
+		       started_at,
+		       completed_at,
+		       next_attempt_at,
 		       CASE
 		         WHEN jsonb_typeof(rollback_steps) = 'array' THEN
 		           CASE
-		             WHEN COALESCE(jsonb_array_length(rollback_steps), 0) = 0 THEN 0
+		             WHEN jsonb_array_length(rollback_steps) = 0 THEN 0
 		             ELSE 1
 		           END
 		         ELSE 1
@@ -72,17 +109,43 @@ func (q *Queries) CancelPendingPodIfNeverStarted(ctx context.Context, podID uuid
 		FROM jobs
 		WHERE type = $1
 		  AND payload->>'pod_id' = $2::text
-		ORDER BY created_at ASC
+		ORDER BY created_at ASC, id ASC
 		FOR UPDATE
 		LIMIT 1
 	`, models.JobTypePodCreate, podID.String()).Scan(
 		&createJobID,
 		&createJobStatus,
 		&retryCount,
+		&cleanupOnly,
+		&claimedBy,
+		&claimedAt,
+		&startedAt,
+		&completedAt,
+		&nextAttemptAt,
 		&rollbackCount,
 	)
 	if jobErr != nil && !errors.Is(jobErr, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("lock pod create job for cancellation: %w", jobErr)
+	}
+
+	pristineCreateJob := jobErr == nil &&
+		createJobStatus == models.JobStatusPending &&
+		retryCount == 0 &&
+		!cleanupOnly &&
+		!claimedBy.Valid &&
+		!claimedAt.Valid &&
+		!startedAt.Valid &&
+		!completedAt.Valid &&
+		!nextAttemptAt.Valid &&
+		rollbackCount == 0
+
+	var competingEvidence bool
+	competingEvidence, err = podCancellationProtectedJobs(ctx, tx, podID, createJobID, true)
+	if err != nil {
+		return nil, err
+	}
+	if competingEvidence {
+		pristineCreateJob = false
 	}
 
 	var podStatus, podError string
@@ -105,8 +168,13 @@ func (q *Queries) CancelPendingPodIfNeverStarted(ctx context.Context, podID uuid
 		return &PodDeletionDecision{Outcome: PodDeletionOutcomeAlreadyCancelled, JobID: createJobID}, nil
 	}
 
-	if podStatus != models.PodStatusPending || errors.Is(jobErr, pgx.ErrNoRows) ||
-		createJobStatus != models.JobStatusPending || retryCount != 0 || rollbackCount != 0 {
+	postEvidence, err := podCancellationProtectedJobs(ctx, tx, podID, createJobID, false)
+	if err != nil {
+		return nil, err
+	}
+
+	needsDestroy := !pristineCreateJob || postEvidence || podStatus != models.PodStatusPending || errors.Is(jobErr, pgx.ErrNoRows)
+	if needsDestroy {
 		if err := tx.Commit(ctx); err != nil {
 			return nil, fmt.Errorf("commit pod cancellation preflight: %w", err)
 		}
@@ -146,36 +214,6 @@ func (q *Queries) CancelPendingPodIfNeverStarted(ctx context.Context, podID uuid
 	}
 	rows.Close()
 	if evidence {
-		if err := tx.Commit(ctx); err != nil {
-			return nil, fmt.Errorf("commit pod cancellation preflight: %w", err)
-		}
-		return &PodDeletionDecision{Outcome: PodDeletionOutcomeNeedsDestroy, JobID: createJobID}, nil
-	}
-
-	var competingJobID uuid.UUID
-	competingJobErr := tx.QueryRow(ctx, `
-		WITH locked_pod_vms AS (
-			SELECT id::text AS pod_vm_id
-			FROM pod_vms
-			WHERE pod_id = $1
-			ORDER BY created_at ASC, id ASC
-			FOR UPDATE
-		)
-		SELECT id
-		FROM jobs
-		WHERE status IN ('pending', 'claimed', 'in_progress')
-		  AND (
-		    (type = ANY($2::text[]) AND payload->>'pod_id' = $1::text)
-		    OR (type = ANY($3::text[]) AND payload->>'pod_vm_id' IN (SELECT pod_vm_id FROM locked_pod_vms))
-		  )
-		ORDER BY created_at ASC, id ASC
-		FOR UPDATE
-		LIMIT 1
-	`, podID, podCancellationPodIDMutatorJobTypes, podCancellationPodVMMutatorJobTypes).Scan(&competingJobID)
-	if competingJobErr != nil && !errors.Is(competingJobErr, pgx.ErrNoRows) {
-		return nil, fmt.Errorf("check competing pod cancellation jobs: %w", competingJobErr)
-	}
-	if competingJobErr == nil {
 		if err := tx.Commit(ctx); err != nil {
 			return nil, fmt.Errorf("commit pod cancellation preflight: %w", err)
 		}
@@ -282,8 +320,8 @@ func (q *Queries) CancelPendingPodIfNeverStarted(ctx context.Context, podID uuid
 		WHERE pod_id = $1
 	`, podID); err != nil {
 		return nil, fmt.Errorf("release pod VLAN during cancellation: %w", err)
-	} else if tag.RowsAffected() == 0 {
-		return nil, fmt.Errorf("release pod VLAN during cancellation: allocation for pod %s not found", podID)
+	} else if tag.RowsAffected() != 1 {
+		return nil, fmt.Errorf("release pod VLAN during cancellation: allocation for pod %s affected %d rows", podID, tag.RowsAffected())
 	}
 
 	if err := tx.Commit(ctx); err != nil {
