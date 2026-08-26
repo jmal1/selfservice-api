@@ -21,6 +21,23 @@ const (
 	PodDeletionOutcomeNeedsDestroy     PodDeletionOutcome = "needs_destroy"
 )
 
+var podCancellationPodIDMutatorJobTypes = []string{
+	models.JobTypePodDestroy,
+	models.JobTypeVMAdd,
+}
+
+var podCancellationPodVMMutatorJobTypes = []string{
+	models.JobTypeVMAdd,
+	models.JobTypeVMDestroy,
+	models.JobTypeVMStart,
+	models.JobTypeVMStop,
+	models.JobTypeVMRestart,
+	models.JobTypeVMReset,
+	models.JobTypeVMSnapshot,
+	models.JobTypeVMRevert,
+	models.JobTypeVMSuspend,
+}
+
 type PodDeletionDecision struct {
 	Outcome PodDeletionOutcome
 	JobID   uuid.UUID
@@ -100,6 +117,7 @@ func (q *Queries) CancelPendingPodIfNeverStarted(ctx context.Context, podID uuid
 		SELECT id, status, vcenter_vm_id, vcenter_vm_name, ip_address
 		FROM pod_vms
 		WHERE pod_id = $1
+		ORDER BY created_at ASC, id ASC
 		FOR UPDATE
 	`, podID)
 	if err != nil {
@@ -128,6 +146,36 @@ func (q *Queries) CancelPendingPodIfNeverStarted(ctx context.Context, podID uuid
 	}
 	rows.Close()
 	if evidence {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, fmt.Errorf("commit pod cancellation preflight: %w", err)
+		}
+		return &PodDeletionDecision{Outcome: PodDeletionOutcomeNeedsDestroy, JobID: createJobID}, nil
+	}
+
+	var competingJobID uuid.UUID
+	competingJobErr := tx.QueryRow(ctx, `
+		WITH locked_pod_vms AS (
+			SELECT id::text AS pod_vm_id
+			FROM pod_vms
+			WHERE pod_id = $1
+			ORDER BY created_at ASC, id ASC
+			FOR UPDATE
+		)
+		SELECT id
+		FROM jobs
+		WHERE status IN ('pending', 'claimed', 'in_progress')
+		  AND (
+		    (type = ANY($2::text[]) AND payload->>'pod_id' = $1::text)
+		    OR (type = ANY($3::text[]) AND payload->>'pod_vm_id' IN (SELECT pod_vm_id FROM locked_pod_vms))
+		  )
+		ORDER BY created_at ASC, id ASC
+		FOR UPDATE
+		LIMIT 1
+	`, podID, podCancellationPodIDMutatorJobTypes, podCancellationPodVMMutatorJobTypes).Scan(&competingJobID)
+	if competingJobErr != nil && !errors.Is(competingJobErr, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("check competing pod cancellation jobs: %w", competingJobErr)
+	}
+	if competingJobErr == nil {
 		if err := tx.Commit(ctx); err != nil {
 			return nil, fmt.Errorf("commit pod cancellation preflight: %w", err)
 		}

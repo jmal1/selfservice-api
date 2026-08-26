@@ -803,7 +803,7 @@ func (h *Handler) DeletePod(w http.ResponseWriter, r *http.Request) {
 	if isNilJobCreatedPublisher(jobCreatedPublisher) {
 		jobCreatedPublisher = h.events
 	}
-	if !isNilJobCreatedPublisher(jobCreatedPublisher) {
+	if created && !isNilJobCreatedPublisher(jobCreatedPublisher) {
 		if err := jobCreatedPublisher.PublishJobCreated(job.ID, job.Type); err != nil {
 			h.logger.Warn("failed to publish job created event", "error", err)
 		}

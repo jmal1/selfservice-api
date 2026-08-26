@@ -403,6 +403,45 @@ func (f *podDeletePostgresFixture) claimCreateJob(t *testing.T, workerID string)
 	}
 }
 
+func (f *podDeletePostgresFixture) claimJob(t *testing.T, jobID uuid.UUID, workerID string) {
+	t.Helper()
+	res, err := f.pool.Exec(context.Background(), `
+		UPDATE jobs
+		SET status = 'claimed',
+		    claimed_by = $2,
+		    claimed_at = now()
+		WHERE id = $1
+		  AND status = 'pending'
+		  AND claimed_by IS NULL
+		  AND claimed_at IS NULL
+		  AND started_at IS NULL
+		  AND completed_at IS NULL
+	`, jobID, workerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows := res.RowsAffected(); rows != 1 {
+		t.Fatalf("claim job rows = %d, want 1 for %s", rows, jobID)
+	}
+}
+
+func (f *podDeletePostgresFixture) insertJob(t *testing.T, jobType string, payload any) uuid.UUID {
+	t.Helper()
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobID := uuid.New()
+	if _, err := f.pool.Exec(context.Background(), `
+		INSERT INTO jobs (id, type, payload)
+		VALUES ($1, $2, $3)
+	`, jobID, jobType, body); err != nil {
+		t.Fatal(err)
+	}
+	f.trackJobID(jobID)
+	return jobID
+}
+
 func waitForJobLockHeld(t *testing.T, pool *pgxpool.Pool, jobID uuid.UUID) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -662,6 +701,265 @@ func TestDeletePodCancelsNeverStartedPodAndIsIdempotent(t *testing.T) {
 	}
 	publisher.mu.Unlock()
 	fixture.cleanup(t)
+}
+
+func TestDeletePodFallsBackForCompetingVMMutators(t *testing.T) {
+	tests := []struct {
+		name    string
+		jobType string
+		claim   bool
+	}{
+		{name: "queued vm_destroy", jobType: models.JobTypeVMDestroy},
+		{name: "claimed vm_destroy", jobType: models.JobTypeVMDestroy, claim: true},
+		{name: "queued vm_add", jobType: models.JobTypeVMAdd},
+		{name: "queued vm_snapshot", jobType: models.JobTypeVMSnapshot},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newPodDeletePostgresFixture(t, 1)
+			ctx := context.Background()
+			payload := map[string]string{
+				"pod_id":    fixture.podID.String(),
+				"pod_vm_id": fixture.podVMIDs[0].String(),
+			}
+			jobID := fixture.insertJob(t, tc.jobType, payload)
+			if tc.claim {
+				fixture.claimJob(t, jobID, "claimed-mutator-worker")
+			}
+
+			publisher := &podDeleteRecordingJobCreatedPublisher{}
+			rec := httptest.NewRecorder()
+			h := fixture.handler()
+			h.jobEvents = publisher
+			h.DeletePod(rec, fixture.deleteRequest())
+			if rec.Code != http.StatusAccepted {
+				t.Fatalf("delete status = %d body=%s, want 202 fallback destroy", rec.Code, rec.Body.String())
+			}
+
+			body := fixture.decodeDeleteResponse(t, rec)
+			if body["status"] != "pending" {
+				t.Fatalf("delete response = %+v, want queued destroy", body)
+			}
+			destroyJobIDStr, ok := body["job_id"].(string)
+			if !ok || destroyJobIDStr == "" {
+				t.Fatalf("delete response missing destroy job id: %+v", body)
+			}
+			destroyJobID, err := uuid.Parse(destroyJobIDStr)
+			if err != nil {
+				t.Fatalf("parse destroy job id: %v", err)
+			}
+			fixture.trackJobID(destroyJobID)
+
+			var podStatus string
+			if err := fixture.pool.QueryRow(ctx, `SELECT status FROM pods WHERE id = $1`, fixture.podID).Scan(&podStatus); err != nil {
+				t.Fatal(err)
+			}
+			if podStatus != models.PodStatusPending {
+				t.Fatalf("pod status = %s, want pending while destroy job is queued", podStatus)
+			}
+
+			var createJobStatus string
+			if err := fixture.pool.QueryRow(ctx, `SELECT status FROM jobs WHERE id = $1`, fixture.createJob).Scan(&createJobStatus); err != nil {
+				t.Fatal(err)
+			}
+			if createJobStatus != models.JobStatusPending {
+				t.Fatalf("create job status = %s, want pending fallback", createJobStatus)
+			}
+
+			var mutatorStatus string
+			if err := fixture.pool.QueryRow(ctx, `SELECT status FROM jobs WHERE id = $1`, jobID).Scan(&mutatorStatus); err != nil {
+				t.Fatal(err)
+			}
+			wantMutatorStatus := models.JobStatusPending
+			if tc.claim {
+				wantMutatorStatus = models.JobStatusClaimed
+			}
+			if mutatorStatus != wantMutatorStatus {
+				t.Fatalf("mutator job status = %s, want %s", mutatorStatus, wantMutatorStatus)
+			}
+
+			var destroyJobs int
+			if err := fixture.pool.QueryRow(ctx, `
+				SELECT COUNT(*) FROM jobs
+				WHERE type = 'pod_destroy' AND payload->>'pod_id' = $1::text
+			`, fixture.podID.String()).Scan(&destroyJobs); err != nil {
+				t.Fatal(err)
+			}
+			if destroyJobs != 1 {
+				t.Fatalf("destroy jobs = %d, want 1 queued destroy", destroyJobs)
+			}
+
+			publisher.mu.Lock()
+			if len(publisher.calls) != 1 {
+				publisher.mu.Unlock()
+				t.Fatalf("job created publish calls = %d, want 1", len(publisher.calls))
+			}
+			call := publisher.calls[0]
+			publisher.mu.Unlock()
+			if call.jobID != destroyJobID || call.jobType != models.JobTypePodDestroy {
+				t.Fatalf("job created publish = %+v, want destroy job %s", call, destroyJobID)
+			}
+		})
+	}
+}
+
+func TestDeletePodExactLockRaceWithQueuedVmDestroyFallsBack(t *testing.T) {
+	fixture := newPodDeletePostgresFixture(t, 1)
+	ctx := context.Background()
+	vmDestroyID := fixture.insertJob(t, models.JobTypeVMDestroy, map[string]string{
+		"pod_id":    fixture.podID.String(),
+		"pod_vm_id": fixture.podVMIDs[0].String(),
+	})
+	lockCtx, lockCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer lockCancel()
+	tx, err := fixture.pool.Begin(lockCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var locked uuid.UUID
+	if err := tx.QueryRow(lockCtx, `SELECT id FROM jobs WHERE id = $1 FOR UPDATE`, vmDestroyID).Scan(&locked); err != nil {
+		_ = tx.Rollback(lockCtx)
+		t.Fatal(err)
+	}
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	publisher := &podDeleteRecordingJobCreatedPublisher{}
+	go func() {
+		rec := httptest.NewRecorder()
+		h := fixture.handler()
+		h.jobEvents = publisher
+		h.DeletePod(rec, fixture.deleteRequest())
+		done <- rec
+	}()
+
+	select {
+	case rec := <-done:
+		_ = tx.Rollback(lockCtx)
+		t.Fatalf("delete returned early while vm_destroy row was locked: %d body=%s", rec.Code, rec.Body.String())
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	if err := tx.Rollback(lockCtx); err != nil {
+		t.Fatal(err)
+	}
+
+	var rec *httptest.ResponseRecorder
+	select {
+	case rec = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for delete response after releasing vm_destroy lock")
+	}
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("delete status = %d body=%s, want 202 fallback destroy", rec.Code, rec.Body.String())
+	}
+	body := fixture.decodeDeleteResponse(t, rec)
+	destroyJobIDStr, ok := body["job_id"].(string)
+	if !ok || destroyJobIDStr == "" {
+		t.Fatalf("delete response missing destroy job id: %+v", body)
+	}
+	destroyJobID, err := uuid.Parse(destroyJobIDStr)
+	if err != nil {
+		t.Fatalf("parse destroy job id: %v", err)
+	}
+	fixture.trackJobID(destroyJobID)
+
+	var podStatus string
+	if err := fixture.pool.QueryRow(ctx, `SELECT status FROM pods WHERE id = $1`, fixture.podID).Scan(&podStatus); err != nil {
+		t.Fatal(err)
+	}
+	if podStatus != models.PodStatusPending {
+		t.Fatalf("pod status = %s, want pending after destroy fallback", podStatus)
+	}
+
+	var createJobStatus string
+	if err := fixture.pool.QueryRow(ctx, `SELECT status FROM jobs WHERE id = $1`, fixture.createJob).Scan(&createJobStatus); err != nil {
+		t.Fatal(err)
+	}
+	if createJobStatus != models.JobStatusPending {
+		t.Fatalf("create job status = %s, want pending after lock race fallback", createJobStatus)
+	}
+
+	var destroyJobs int
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM jobs
+		WHERE type = 'pod_destroy' AND payload->>'pod_id' = $1::text
+	`, fixture.podID.String()).Scan(&destroyJobs); err != nil {
+		t.Fatal(err)
+	}
+	if destroyJobs != 1 {
+		t.Fatalf("destroy jobs = %d, want 1 queued destroy after lock race", destroyJobs)
+	}
+
+	publisher.mu.Lock()
+	if len(publisher.calls) != 1 {
+		publisher.mu.Unlock()
+		t.Fatalf("job created publish calls = %d, want 1", len(publisher.calls))
+	}
+	publisher.mu.Unlock()
+}
+
+func TestDeletePodReusesExistingPodDestroyJob(t *testing.T) {
+	fixture := newPodDeletePostgresFixture(t, 1)
+	ctx := context.Background()
+	existingDestroyID := fixture.insertJob(t, models.JobTypePodDestroy, map[string]string{
+		"pod_id": fixture.podID.String(),
+	})
+	fixture.claimJob(t, existingDestroyID, "existing-destroy-worker")
+
+	publisher := &podDeleteRecordingJobCreatedPublisher{}
+	rec := httptest.NewRecorder()
+	h := fixture.handler()
+	h.jobEvents = publisher
+	h.DeletePod(rec, fixture.deleteRequest())
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("delete status = %d body=%s, want 202 reuse destroy", rec.Code, rec.Body.String())
+	}
+	body := fixture.decodeDeleteResponse(t, rec)
+	if body["status"] != "pending" {
+		t.Fatalf("delete response = %+v, want queued destroy", body)
+	}
+	jobIDStr, ok := body["job_id"].(string)
+	if !ok || jobIDStr == "" {
+		t.Fatalf("delete response missing job_id: %+v", body)
+	}
+	if jobIDStr != existingDestroyID.String() {
+		t.Fatalf("delete response job_id = %s, want existing destroy job %s", jobIDStr, existingDestroyID)
+	}
+
+	var podStatus string
+	if err := fixture.pool.QueryRow(ctx, `SELECT status FROM pods WHERE id = $1`, fixture.podID).Scan(&podStatus); err != nil {
+		t.Fatal(err)
+	}
+	if podStatus != models.PodStatusPending {
+		t.Fatalf("pod status = %s, want pending while destroy job is pending", podStatus)
+	}
+
+	var existingDestroyStatus string
+	if err := fixture.pool.QueryRow(ctx, `SELECT status FROM jobs WHERE id = $1`, existingDestroyID).Scan(&existingDestroyStatus); err != nil {
+		t.Fatal(err)
+	}
+	if existingDestroyStatus != models.JobStatusClaimed {
+		t.Fatalf("existing destroy job status = %s, want claimed", existingDestroyStatus)
+	}
+
+	var destroyJobs int
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM jobs
+		WHERE type = 'pod_destroy' AND payload->>'pod_id' = $1::text
+	`, fixture.podID.String()).Scan(&destroyJobs); err != nil {
+		t.Fatal(err)
+	}
+	if destroyJobs != 1 {
+		t.Fatalf("destroy jobs = %d, want 1 reused job", destroyJobs)
+	}
+
+	publisher.mu.Lock()
+	if len(publisher.calls) != 0 {
+		publisher.mu.Unlock()
+		t.Fatalf("job created publish calls = %d, want 0 when reusing destroy job", len(publisher.calls))
+	}
+	publisher.mu.Unlock()
 }
 
 func TestDeletePodDoesNotPublishStatusOnTransactionFailure(t *testing.T) {
