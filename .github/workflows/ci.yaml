@@ -153,6 +153,7 @@ jobs:
   build-push:
     needs: [changes, test]
     if: |
+      always() &&
       github.event_name == 'push' &&
       needs.changes.outputs.components != '[]' &&
       (needs.test.result == 'success' || needs.test.result == 'skipped')
@@ -188,8 +189,6 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache: true
-          cache-dependency-path: go.sum
 
       - name: Build
         run: go build ./...

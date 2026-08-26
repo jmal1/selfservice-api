@@ -237,6 +237,7 @@ func TestCIWorkflowBuildJobsSplitPRAndPush(t *testing.T) {
 		t.Fatalf("build-pr if = %q, want PR-only matrix build without test dependency", got)
 	}
 	if got := mustString(t, buildPush["if"], "jobs.build-push.if"); !strings.Contains(got, "github.event_name == 'push'") ||
+		!strings.HasPrefix(strings.TrimSpace(got), "always() &&") ||
 		!strings.Contains(got, "needs.changes.outputs.components != '[]'") ||
 		!strings.Contains(got, "needs.test.result == 'success' || needs.test.result == 'skipped'") ||
 		strings.Contains(got, "github.ref") {
@@ -271,6 +272,22 @@ func TestCIWorkflowBuildJobsSplitPRAndPush(t *testing.T) {
 
 	if len(steps) == 0 {
 		t.Fatal("build-pr has no steps")
+	}
+}
+
+func TestCIWorkflowPushBuildRemainsEligibleWhenTestsSkip(t *testing.T) {
+	workflow := loadCIWorkflow(t)
+	buildPush := workflowJob(t, workflow, "build-push")
+
+	got := mustString(t, buildPush["if"], "jobs.build-push.if")
+	if !strings.HasPrefix(strings.TrimSpace(got), "always() &&") {
+		t.Fatalf("build-push if = %q, want always() fallback so skipped tests do not block push builds", got)
+	}
+	if !strings.Contains(got, "needs.changes.outputs.components != '[]'") {
+		t.Fatalf("build-push if = %q, want nonempty matrix gate", got)
+	}
+	if !strings.Contains(got, "needs.test.result == 'success' || needs.test.result == 'skipped'") {
+		t.Fatalf("build-push if = %q, want skipped tests accepted but failures rejected", got)
 	}
 }
 
