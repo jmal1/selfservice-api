@@ -462,6 +462,10 @@ func waitForJobLockHeld(t *testing.T, pool *pgxpool.Pool, jobID uuid.UUID) {
 		tx, err := pool.Begin(probeCtx)
 		if err != nil {
 			cancel()
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				time.Sleep(20 * time.Millisecond)
+				continue
+			}
 			t.Fatal(err)
 		}
 		var probeID uuid.UUID
@@ -474,6 +478,10 @@ func waitForJobLockHeld(t *testing.T, pool *pgxpool.Pool, jobID uuid.UUID) {
 		}
 		_ = tx.Rollback(probeCtx)
 		cancel()
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
 		if strings.Contains(err.Error(), "SQLSTATE 55P03") || strings.Contains(err.Error(), "could not obtain lock on row") {
 			return
 		}
@@ -490,6 +498,10 @@ func waitForPodLockHeld(t *testing.T, pool *pgxpool.Pool, podID uuid.UUID) {
 		tx, err := pool.Begin(probeCtx)
 		if err != nil {
 			cancel()
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				time.Sleep(20 * time.Millisecond)
+				continue
+			}
 			t.Fatal(err)
 		}
 		var probeID uuid.UUID
@@ -502,6 +514,10 @@ func waitForPodLockHeld(t *testing.T, pool *pgxpool.Pool, podID uuid.UUID) {
 		}
 		_ = tx.Rollback(probeCtx)
 		cancel()
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
 		if strings.Contains(err.Error(), "SQLSTATE 55P03") || strings.Contains(err.Error(), "could not obtain lock on row") {
 			return
 		}
