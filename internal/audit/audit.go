@@ -15,7 +15,9 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"net"
 	"net/http"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -124,7 +126,20 @@ func Log(ctx context.Context, db *database.Queries, action string, opts ...Optio
 
 // FromRequest is a convenience that creates options from an http.Request.
 func FromRequest(r *http.Request) Option {
-	return IP(r.RemoteAddr)
+	return IP(normalizeRemoteAddr(r.RemoteAddr))
+}
+
+func normalizeRemoteAddr(remoteAddr string) string {
+	if remoteAddr == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		return host
+	}
+	if ip := net.ParseIP(strings.Trim(remoteAddr, "[]")); ip != nil {
+		return ip.String()
+	}
+	return remoteAddr
 }
 
 // contextKey is unexported to prevent collisions.

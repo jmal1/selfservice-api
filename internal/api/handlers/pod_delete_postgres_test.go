@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 
 	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/models"
+	events "github.com/jmal1/selfservice-api/internal/nats"
 )
 
 type podDeletePostgresFixture struct {
@@ -31,6 +33,7 @@ type podDeletePostgresFixture struct {
 	podID      uuid.UUID
 	podVMIDs   []uuid.UUID
 	createJob  uuid.UUID
+	jobIDs     map[uuid.UUID]struct{}
 	vlanTag    int
 }
 
@@ -58,7 +61,9 @@ func newPodDeletePostgresFixture(t *testing.T, vmCount int) *podDeletePostgresFi
 		templateID: uuid.New(),
 		podID:      uuid.New(),
 		createJob:  uuid.New(),
+		jobIDs:     map[uuid.UUID]struct{}{},
 	}
+	fixture.jobIDs[fixture.createJob] = struct{}{}
 
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO users (id, oidc_sub, username, email)
@@ -136,24 +141,21 @@ func (f *podDeletePostgresFixture) cleanup(t *testing.T) {
 	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cleanupCancel()
 	_, _ = f.pool.Exec(cleanupCtx, `DELETE FROM audit_log WHERE resource_id = $1`, f.podID)
-	_, _ = f.pool.Exec(cleanupCtx, `DELETE FROM vm_placements WHERE job_id = $1`, f.createJob)
-	_, _ = f.pool.Exec(cleanupCtx, `DELETE FROM pod_portgroup_receipts WHERE pod_id = $1`, f.podID)
-	_, _ = f.pool.Exec(cleanupCtx, `
-		DELETE FROM jobs
-		WHERE payload->>'pod_id' = $1::text
-		   OR payload->>'user_id' = $2::text
-	`, f.podID, f.ownerID)
-	var remainingJobs int
-	if err := f.pool.QueryRow(cleanupCtx, `
-		SELECT COUNT(*)
-		FROM jobs
-		WHERE payload->>'pod_id' = $1::text
-		   OR payload->>'user_id' = $2::text
-	`, f.podID, f.ownerID).Scan(&remainingJobs); err != nil {
-		t.Fatalf("count fixture jobs during cleanup: %v", err)
+	for jobID := range f.jobIDs {
+		_, _ = f.pool.Exec(cleanupCtx, `DELETE FROM vm_placements WHERE job_id = $1`, jobID)
 	}
-	if remainingJobs != 0 {
-		t.Fatalf("fixture cleanup leaked %d owned job(s)", remainingJobs)
+	_, _ = f.pool.Exec(cleanupCtx, `DELETE FROM pod_portgroup_receipts WHERE pod_id = $1`, f.podID)
+	for jobID := range f.jobIDs {
+		_, _ = f.pool.Exec(cleanupCtx, `DELETE FROM jobs WHERE id = $1`, jobID)
+	}
+	for jobID := range f.jobIDs {
+		var remaining int
+		if err := f.pool.QueryRow(cleanupCtx, `SELECT COUNT(*) FROM jobs WHERE id = $1`, jobID).Scan(&remaining); err != nil {
+			t.Fatalf("count tracked fixture job %s during cleanup: %v", jobID, err)
+		}
+		if remaining != 0 {
+			t.Fatalf("fixture cleanup leaked tracked job %s", jobID)
+		}
 	}
 	_, _ = f.pool.Exec(cleanupCtx, `DELETE FROM pod_vms WHERE pod_id = $1`, f.podID)
 	_, _ = f.pool.Exec(cleanupCtx, `UPDATE vlan_pool SET pod_id = NULL, allocated_at = NULL WHERE pod_id = $1`, f.podID)
@@ -166,9 +168,96 @@ func (f *podDeletePostgresFixture) handler() *Handler {
 	return NewHandler(f.queries, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 }
 
+func (f *podDeletePostgresFixture) handlerWithJobStatusPublisher(publisher jobStatusPublisher) *Handler {
+	h := f.handler()
+	h.jobStatusEvents = publisher
+	return h
+}
+
+func (f *podDeletePostgresFixture) trackJobID(jobID uuid.UUID) {
+	f.jobIDs[jobID] = struct{}{}
+}
+
+type recordingJobStatusPublisher struct {
+	pool    *pgxpool.Pool
+	podID   uuid.UUID
+	jobID   uuid.UUID
+	vlanTag int
+
+	mu                     sync.Mutex
+	calls                  []recordedJobStatusEvent
+	observedPodStatus      string
+	observedPodError       string
+	observedJobStatus      string
+	observedVLANAllocation string
+	observedErr            error
+}
+
+type recordedJobStatusEvent struct {
+	subject string
+	evt     events.Event
+}
+
+func (p *recordingJobStatusPublisher) PublishRaw(subject string, evt events.Event) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		p.setObservedErr(err)
+		return nil
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var podStatus, podError, jobStatus string
+	var vlanAllocation sql.NullString
+	if err := tx.QueryRow(ctx, `
+		SELECT status, COALESCE(error_message, '')
+		FROM pods
+		WHERE id = $1
+		FOR UPDATE NOWAIT
+	`, p.podID).Scan(&podStatus, &podError); err != nil {
+		p.setObservedErr(err)
+		return nil
+	}
+	if err := tx.QueryRow(ctx, `
+		SELECT status
+		FROM jobs
+		WHERE id = $1
+		FOR UPDATE NOWAIT
+	`, p.jobID).Scan(&jobStatus); err != nil {
+		p.setObservedErr(err)
+		return nil
+	}
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(pod_id::text, '')
+		FROM vlan_pool
+		WHERE vlan_tag = $1
+		FOR UPDATE NOWAIT
+	`, p.vlanTag).Scan(&vlanAllocation); err != nil {
+		p.setObservedErr(err)
+		return nil
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls = append(p.calls, recordedJobStatusEvent{subject: subject, evt: evt})
+	p.observedPodStatus = podStatus
+	p.observedPodError = podError
+	p.observedJobStatus = jobStatus
+	p.observedVLANAllocation = vlanAllocation.String
+	p.observedErr = nil
+	return nil
+}
+
+func (p *recordingJobStatusPublisher) setObservedErr(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.observedErr = err
+}
+
 func (f *podDeletePostgresFixture) deleteRequest() *http.Request {
 	req := httptest.NewRequest(http.MethodDelete, "/api/v1/pods/"+f.podID.String(), nil)
-	req.RemoteAddr = "192.0.2.1"
+	req.RemoteAddr = "192.0.2.1:1234"
 	req = withRoleAndUser(req, models.RoleStudent, f.ownerID)
 	req = withRouteParam(req, "podID", f.podID)
 	return req
@@ -267,6 +356,12 @@ func probeExactCreateJobUnavailable(t *testing.T, pool *pgxpool.Pool, jobID uuid
 
 func TestDeletePodCancelsNeverStartedPodAndIsIdempotent(t *testing.T) {
 	fixture := newPodDeletePostgresFixture(t, 1)
+	publisher := &recordingJobStatusPublisher{
+		pool:    fixture.pool,
+		podID:   fixture.podID,
+		jobID:   fixture.createJob,
+		vlanTag: fixture.vlanTag,
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	t.Cleanup(cancel)
 
@@ -282,7 +377,7 @@ func TestDeletePodCancelsNeverStartedPodAndIsIdempotent(t *testing.T) {
 	deleteDone := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
 		rec := httptest.NewRecorder()
-		fixture.handler().DeletePod(rec, fixture.deleteRequest())
+		fixture.handlerWithJobStatusPublisher(publisher).DeletePod(rec, fixture.deleteRequest())
 		deleteDone <- rec
 	}()
 
@@ -320,6 +415,38 @@ func TestDeletePodCancelsNeverStartedPodAndIsIdempotent(t *testing.T) {
 	}
 	if podStatus != models.PodStatusDestroyed || podError != models.PodErrorCancelledBeforeProvisioning {
 		t.Fatalf("pod state = %s/%q, want destroyed/%q", podStatus, podError, models.PodErrorCancelledBeforeProvisioning)
+	}
+
+	publisher.mu.Lock()
+	if len(publisher.calls) != 1 {
+		publisher.mu.Unlock()
+		t.Fatalf("job status publish calls = %d, want 1", len(publisher.calls))
+	}
+	call := publisher.calls[0]
+	observedPodStatus := publisher.observedPodStatus
+	observedPodError := publisher.observedPodError
+	observedJobStatus := publisher.observedJobStatus
+	observedVLANAllocation := publisher.observedVLANAllocation
+	observedErr := publisher.observedErr
+	publisher.mu.Unlock()
+	wantSubject := fmt.Sprintf(events.SubjectJobStatus, fixture.createJob)
+	if call.subject != wantSubject {
+		t.Fatalf("job status subject = %q, want %q", call.subject, wantSubject)
+	}
+	if call.evt.Type != "job.status" || call.evt.JobID != fixture.createJob.String() || call.evt.Status != models.JobStatusFailed || call.evt.Message != models.PodErrorCancelledBeforeProvisioning {
+		t.Fatalf("job status event = %+v, want failed cancellation event", call.evt)
+	}
+	if observedErr != nil {
+		t.Fatalf("job status publish observed error: %v", observedErr)
+	}
+	if observedPodStatus != models.PodStatusDestroyed || observedPodError != models.PodErrorCancelledBeforeProvisioning {
+		t.Fatalf("job status publish observed pod state = %s/%q", observedPodStatus, observedPodError)
+	}
+	if observedJobStatus != models.JobStatusFailed {
+		t.Fatalf("job status publish observed job status = %s, want failed", observedJobStatus)
+	}
+	if observedVLANAllocation != "" {
+		t.Fatalf("job status publish observed vlan allocation = %q, want released", observedVLANAllocation)
 	}
 
 	var jobStatus string
@@ -408,7 +535,55 @@ func TestDeletePodCancelsNeverStartedPodAndIsIdempotent(t *testing.T) {
 	if destroyJobs != 0 {
 		t.Fatalf("idempotent cancellation enqueued %d destroy jobs", destroyJobs)
 	}
+	publisher.mu.Lock()
+	if len(publisher.calls) != 1 {
+		publisher.mu.Unlock()
+		t.Fatalf("idempotent cancellation republished job status %d times, want 1", len(publisher.calls))
+	}
+	publisher.mu.Unlock()
 	fixture.cleanup(t)
+}
+
+func TestDeletePodDoesNotPublishStatusOnTransactionFailure(t *testing.T) {
+	fixture := newPodDeletePostgresFixture(t, 1)
+	publisher := &recordingJobStatusPublisher{
+		pool:    fixture.pool,
+		podID:   fixture.podID,
+		jobID:   fixture.createJob,
+		vlanTag: fixture.vlanTag,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	t.Cleanup(cancel)
+
+	jobLockTx, err := fixture.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var locked uuid.UUID
+	if err := jobLockTx.QueryRow(ctx, `SELECT id FROM jobs WHERE id = $1 FOR UPDATE`, fixture.createJob).Scan(&locked); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = jobLockTx.Rollback(context.Background()) }()
+
+	req := fixture.deleteRequest()
+	reqCtx, reqCancel := context.WithTimeout(req.Context(), 2*time.Second)
+	defer reqCancel()
+	req = req.WithContext(reqCtx)
+
+	rec := httptest.NewRecorder()
+	fixture.handlerWithJobStatusPublisher(publisher).DeletePod(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("delete status = %d body=%s, want 500 on transaction failure", rec.Code, rec.Body.String())
+	}
+
+	publisher.mu.Lock()
+	defer publisher.mu.Unlock()
+	if len(publisher.calls) != 0 {
+		t.Fatalf("published %d job status events on transaction failure", len(publisher.calls))
+	}
+	if publisher.observedErr != nil {
+		t.Fatalf("unexpected publish attempt on transaction failure: %v", publisher.observedErr)
+	}
 }
 
 func TestDeletePodRejectsClaimedJobAndExternalEvidence(t *testing.T) {
@@ -598,6 +773,13 @@ func TestDeletePodRejectsClaimedJobAndExternalEvidence(t *testing.T) {
 			if body["status"] != "pending" {
 				t.Fatalf("fallback delete response = %+v, want queued destroy", body)
 			}
+			if jobID, ok := body["job_id"].(string); !ok || jobID == "" {
+				t.Fatalf("fallback delete response missing job_id: %+v", body)
+			} else if parsed, err := uuid.Parse(jobID); err != nil {
+				t.Fatalf("parse destroy job id: %v", err)
+			} else {
+				fixture.trackJobID(parsed)
+			}
 
 			var podStatus string
 			if err := fixture.pool.QueryRow(context.Background(), `SELECT status FROM pods WHERE id = $1`, fixture.podID).Scan(&podStatus); err != nil {
@@ -619,4 +801,28 @@ func TestDeletePodRejectsClaimedJobAndExternalEvidence(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDeletePodFixtureCleanupLeavesSameUserSentinelJob(t *testing.T) {
+	fixture := newPodDeletePostgresFixture(t, 1)
+	sentinelJobID := uuid.New()
+	sentinelPodID := uuid.New()
+	ctx := context.Background()
+	if _, err := fixture.pool.Exec(ctx, `
+		INSERT INTO jobs (id, type, payload)
+		VALUES ($1, 'pod_destroy', jsonb_build_object('pod_id', $2::text, 'user_id', $3::text))
+	`, sentinelJobID, sentinelPodID, fixture.ownerID); err != nil {
+		t.Fatal(err)
+	}
+
+	fixture.cleanup(t)
+
+	var exists bool
+	if err := fixture.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM jobs WHERE id = $1)`, sentinelJobID).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if !exists {
+		t.Fatal("same-user sentinel job was deleted by fixture cleanup")
+	}
+	_, _ = fixture.pool.Exec(ctx, `DELETE FROM jobs WHERE id = $1`, sentinelJobID)
 }

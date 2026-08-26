@@ -31,6 +31,7 @@ type Handler struct {
 	db              *database.Queries
 	events          *events.Client
 	jobEvents       jobCreatedPublisher
+	jobStatusEvents jobStatusPublisher
 	vc              VCenterConsole
 	vcFolders       VCenterFolderEnumerator
 	logger          *slog.Logger
@@ -95,6 +96,10 @@ type jobCreatedPublisher interface {
 	PublishJobCreated(jobID uuid.UUID, jobType string) error
 }
 
+type jobStatusPublisher interface {
+	PublishRaw(subject string, evt events.Event) error
+}
+
 type imageUploadMetrics interface {
 	RecordImageUpload(kind, result string)
 }
@@ -138,12 +143,13 @@ type VCenterConsole interface {
 // NewHandler creates a new Handler.
 func NewHandler(db *database.Queries, events *events.Client, vc VCenterConsole, logger *slog.Logger, allowedOrigins []string) *Handler {
 	return &Handler{
-		db:             db,
-		events:         events,
-		jobEvents:      events,
-		vc:             vc,
-		logger:         logger,
-		allowedOrigins: allowedOrigins,
+		db:              db,
+		events:          events,
+		jobEvents:       events,
+		jobStatusEvents: events,
+		vc:              vc,
+		logger:          logger,
+		allowedOrigins:  allowedOrigins,
 	}
 }
 
@@ -682,7 +688,7 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 	// Audit
 	audit.Log(r.Context(), h.db, "pod.create",
 		audit.Resource("job", job.ID),
-		audit.IP(r.RemoteAddr),
+		audit.FromRequest(r),
 		audit.Detail("pod_id", podID.String()),
 	)
 
@@ -732,9 +738,24 @@ func (h *Handler) DeletePod(w http.ResponseWriter, r *http.Request) {
 		return
 	} else if decision != nil && (decision.Outcome == database.PodDeletionOutcomeCancelled ||
 		decision.Outcome == database.PodDeletionOutcomeAlreadyCancelled) {
+		if decision.Outcome == database.PodDeletionOutcomeCancelled &&
+			h.jobStatusEvents != nil &&
+			decision.JobID != uuid.Nil {
+			if err := h.jobStatusEvents.PublishRaw(
+				fmt.Sprintf(events.SubjectJobStatus, decision.JobID),
+				events.Event{
+					Type:    "job.status",
+					JobID:   decision.JobID.String(),
+					Status:  models.JobStatusFailed,
+					Message: models.PodErrorCancelledBeforeProvisioning,
+				},
+			); err != nil {
+				h.logger.Warn("failed to publish job status event", "job_id", decision.JobID, "error", err)
+			}
+		}
 		audit.Log(r.Context(), h.db, "pod.delete",
 			audit.Resource("pod", podID),
-			audit.IP(r.RemoteAddr),
+			audit.FromRequest(r),
 			audit.Detail("mode", "cancelled"),
 			audit.Detail("pod_name", pod.Name),
 			audit.Detail("pod_status", models.PodStatusDestroyed),
@@ -776,7 +797,7 @@ func (h *Handler) DeletePod(w http.ResponseWriter, r *http.Request) {
 
 	audit.Log(r.Context(), h.db, "pod.delete",
 		audit.Resource("pod", podID),
-		audit.IP(r.RemoteAddr),
+		audit.FromRequest(r),
 		audit.Detail("pod_name", pod.Name),
 		audit.Detail("job_id", job.ID.String()),
 	)
@@ -827,8 +848,8 @@ func (h *Handler) ExtendPod(w http.ResponseWriter, r *http.Request) {
 	}
 	newExpiry := time.Now().Add(extension)
 
-	attestation, err := h.db.ExtendPod(r.Context(), podID, userID, newExpiry)
-	if err != nil {
+	// Update pod expiry
+	if err := h.db.UpdatePodExpiry(r.Context(), podID, newExpiry); err != nil {
 		if errors.Is(err, database.ErrPodExtensionRejected) {
 			respondError(w, r, http.StatusConflict, "pod cannot be extended after destruction is queued")
 			return
@@ -840,8 +861,8 @@ func (h *Handler) ExtendPod(w http.ResponseWriter, r *http.Request) {
 
 	audit.Log(r.Context(), h.db, "pod.extend",
 		audit.Resource("pod", podID),
-		audit.IP(r.RemoteAddr),
-		audit.Detail("previous_expires_at", fmt.Sprintf("%v", attestation.PreviousExpiresAt)),
+		audit.FromRequest(r),
+		audit.Detail("previous_expires_at", fmt.Sprintf("%v", pod.ExpiresAt)),
 		audit.Detail("new_expires_at", newExpiry.Format(time.RFC3339)),
 	)
 
@@ -886,7 +907,7 @@ func (h *Handler) AdminExtendPod(w http.ResponseWriter, r *http.Request) {
 
 	audit.Log(r.Context(), h.db, "pod.admin_extend",
 		audit.Resource("pod", podID),
-		audit.IP(r.RemoteAddr),
+		audit.FromRequest(r),
 		audit.Detail("new_expires_at", newExpiry.Format(time.RFC3339)),
 	)
 
@@ -962,7 +983,7 @@ func (h *Handler) DeleteVM(w http.ResponseWriter, r *http.Request) {
 
 	audit.Log(r.Context(), h.db, "vm.delete",
 		audit.Resource("vm", vmID),
-		audit.IP(r.RemoteAddr),
+		audit.FromRequest(r),
 		audit.Detail("job_id", job.ID.String()),
 	)
 
@@ -1112,7 +1133,7 @@ func (h *Handler) AddVM(w http.ResponseWriter, r *http.Request) {
 
 	audit.Log(r.Context(), h.db, "vm.add",
 		audit.Resource("vm", vm.ID),
-		audit.IP(r.RemoteAddr),
+		audit.FromRequest(r),
 		audit.Detail("job_id", job.ID.String()),
 	)
 
@@ -1201,7 +1222,7 @@ func (h *Handler) VMPowerAction(w http.ResponseWriter, r *http.Request) {
 
 	audit.Log(r.Context(), h.db, "vm."+action,
 		audit.Resource("vm", vmID),
-		audit.IP(r.RemoteAddr),
+		audit.FromRequest(r),
 		audit.Detail("job_id", job.ID.String()),
 	)
 
@@ -1302,7 +1323,7 @@ func (h *Handler) AdminReorderTemplates(w http.ResponseWriter, r *http.Request) 
 	}
 
 	h.auditLog(r.Context(), "templates.reorder",
-		audit.IP(r.RemoteAddr),
+		audit.FromRequest(r),
 		audit.Detail("count", fmt.Sprintf("%d", len(req))),
 	)
 
@@ -1345,7 +1366,7 @@ func (h *Handler) AdminSetTemplatePin(w http.ResponseWriter, r *http.Request) {
 
 	h.auditLog(r.Context(), "template.pin",
 		audit.Resource("template", templateID),
-		audit.IP(r.RemoteAddr),
+		audit.FromRequest(r),
 		audit.Detail("pin_order", fmt.Sprintf("%d", req.PinOrder)),
 	)
 
@@ -1380,7 +1401,7 @@ func (h *Handler) AdminUnpinTemplate(w http.ResponseWriter, r *http.Request) {
 
 	h.auditLog(r.Context(), "template.unpin",
 		audit.Resource("template", templateID),
-		audit.IP(r.RemoteAddr),
+		audit.FromRequest(r),
 	)
 
 	respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -1698,7 +1719,7 @@ func (h *Handler) AdminDeleteTemplate(w http.ResponseWriter, r *http.Request) {
 			"template_id", tmpl.ID, "moref", tmpl.VCenterVMID, "error", destroyErr)
 		audit.Log(r.Context(), h.db, "template.delete_failed",
 			audit.Resource("template", tmpl.ID),
-			audit.IP(r.RemoteAddr),
+			audit.FromRequest(r),
 			audit.Detail("moref", tmpl.VCenterVMID),
 			audit.Detail("error", destroyErr.Error()),
 		)
@@ -1717,7 +1738,7 @@ func (h *Handler) AdminDeleteTemplate(w http.ResponseWriter, r *http.Request) {
 
 	audit.Log(r.Context(), h.db, "template.delete",
 		audit.Resource("template", tmpl.ID),
-		audit.IP(r.RemoteAddr),
+		audit.FromRequest(r),
 		audit.Detail("name", tmpl.Name),
 		audit.Detail("state", tmpl.TemplateState),
 		audit.Detail("moref", tmpl.VCenterVMID),
