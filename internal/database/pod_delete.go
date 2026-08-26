@@ -44,7 +44,11 @@ func (q *Queries) CancelPendingPodIfNeverStarted(ctx context.Context, podID uuid
 	jobErr := tx.QueryRow(ctx, `
 		SELECT id, status,
 		       COALESCE(retry_count, 0),
-		       COALESCE(jsonb_array_length(rollback_steps), 0)
+		       CASE
+		         WHEN rollback_steps IS NULL THEN 0
+		         WHEN jsonb_typeof(rollback_steps) = 'array' THEN COALESCE(jsonb_array_length(rollback_steps), 0)
+		         ELSE 1
+		       END
 		FROM jobs
 		WHERE type = $1
 		  AND payload->>'pod_id' = $2::text

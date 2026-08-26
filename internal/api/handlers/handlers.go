@@ -96,6 +96,16 @@ type jobCreatedPublisher interface {
 	PublishJobCreated(jobID uuid.UUID, jobType string) error
 }
 
+func isNilJobCreatedPublisher(p jobCreatedPublisher) bool {
+	if p == nil {
+		return true
+	}
+	if client, ok := p.(*events.Client); ok {
+		return client == nil
+	}
+	return false
+}
+
 type jobStatusPublisher interface {
 	PublishRaw(subject string, evt events.Event) error
 }
@@ -789,8 +799,12 @@ func (h *Handler) DeletePod(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if created {
-		if err := h.jobEvents.PublishJobCreated(job.ID, job.Type); err != nil {
+	jobCreatedPublisher := h.jobEvents
+	if isNilJobCreatedPublisher(jobCreatedPublisher) {
+		jobCreatedPublisher = h.events
+	}
+	if !isNilJobCreatedPublisher(jobCreatedPublisher) {
+		if err := jobCreatedPublisher.PublishJobCreated(job.ID, job.Type); err != nil {
 			h.logger.Warn("failed to publish job created event", "error", err)
 		}
 	}

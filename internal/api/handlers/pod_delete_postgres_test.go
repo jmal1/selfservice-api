@@ -290,6 +290,23 @@ type recordedJobStatusEvent struct {
 	evt     events.Event
 }
 
+type podDeleteRecordingJobCreatedPublisher struct {
+	mu    sync.Mutex
+	calls []recordedJobCreatedEvent
+}
+
+type recordedJobCreatedEvent struct {
+	jobID   uuid.UUID
+	jobType string
+}
+
+func (p *podDeleteRecordingJobCreatedPublisher) PublishJobCreated(jobID uuid.UUID, jobType string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls = append(p.calls, recordedJobCreatedEvent{jobID: jobID, jobType: jobType})
+	return nil
+}
+
 func (p *recordingJobStatusPublisher) PublishRaw(subject string, evt events.Event) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -951,5 +968,102 @@ func TestDeletePodCleanupFailsLoudlyWhenAuditRowLocked(t *testing.T) {
 	}
 	if err := tx.Rollback(lockCtx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDeletePodRoutesLegacyObjectRollbackStepsToDestroy(t *testing.T) {
+	fixture := newPodDeletePostgresFixture(t, 1)
+	ctx := context.Background()
+	if _, err := fixture.pool.Exec(ctx, `
+		UPDATE jobs
+		SET rollback_steps = $1::jsonb
+		WHERE id = $2
+	`, `{"name":"portgroup_create"}`, fixture.createJob); err != nil {
+		t.Fatal(err)
+	}
+
+	decision, err := fixture.queries.CancelPendingPodIfNeverStarted(ctx, fixture.podID)
+	if err != nil {
+		t.Fatalf("cancel pending pod: %v", err)
+	}
+	if decision == nil || decision.Outcome != database.PodDeletionOutcomeNeedsDestroy || decision.JobID != fixture.createJob {
+		t.Fatalf("database decision = %+v, want needs_destroy with create job", decision)
+	}
+
+	publisher := &podDeleteRecordingJobCreatedPublisher{}
+	rec := httptest.NewRecorder()
+	h := fixture.handler()
+	h.jobEvents = publisher
+	h.DeletePod(rec, fixture.deleteRequest())
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("delete status = %d body=%s, want 202 fallback destroy", rec.Code, rec.Body.String())
+	}
+
+	var body map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode delete response: %v", err)
+	}
+	if body["status"] != "pending" {
+		t.Fatalf("delete response = %+v, want queued destroy", body)
+	}
+	destroyJobIDStr, ok := body["job_id"].(string)
+	if !ok || destroyJobIDStr == "" {
+		t.Fatalf("delete response missing destroy job id: %+v", body)
+	}
+	destroyJobID, err := uuid.Parse(destroyJobIDStr)
+	if err != nil {
+		t.Fatalf("parse destroy job id: %v", err)
+	}
+
+	var podStatus string
+	if err := fixture.pool.QueryRow(ctx, `SELECT status FROM pods WHERE id = $1`, fixture.podID).Scan(&podStatus); err != nil {
+		t.Fatal(err)
+	}
+	if podStatus != models.PodStatusPending {
+		t.Fatalf("pod status = %s, want pending after destroy fallback", podStatus)
+	}
+
+	var createJobStatus string
+	if err := fixture.pool.QueryRow(ctx, `SELECT status FROM jobs WHERE id = $1`, fixture.createJob).Scan(&createJobStatus); err != nil {
+		t.Fatal(err)
+	}
+	if createJobStatus != models.JobStatusPending {
+		t.Fatalf("create job status = %s, want pending fallback", createJobStatus)
+	}
+
+	var destroyJobs int
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM jobs
+		WHERE type = 'pod_destroy' AND payload->>'pod_id' = $1::text
+	`, fixture.podID.String()).Scan(&destroyJobs); err != nil {
+		t.Fatal(err)
+	}
+	if destroyJobs != 1 {
+		t.Fatalf("destroy jobs = %d, want 1 queued destroy", destroyJobs)
+	}
+
+	publisher.mu.Lock()
+	if len(publisher.calls) != 1 {
+		publisher.mu.Unlock()
+		t.Fatalf("job created publish calls = %d, want 1", len(publisher.calls))
+	}
+	call := publisher.calls[0]
+	publisher.mu.Unlock()
+	if call.jobID != destroyJobID || call.jobType != models.JobTypePodDestroy {
+		t.Fatalf("job created publish = %+v, want destroy job %s", call, destroyJobID)
+	}
+
+	var auditAction, auditMode, auditJobID string
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT action, COALESCE(details->>'mode', ''), COALESCE(details->>'job_id', '')
+		FROM audit_log
+		WHERE resource_id = $1
+		ORDER BY id DESC
+		LIMIT 1
+	`, fixture.podID).Scan(&auditAction, &auditMode, &auditJobID); err != nil {
+		t.Fatal(err)
+	}
+	if auditAction != "pod.delete" || auditMode != "" || auditJobID != destroyJobIDStr {
+		t.Fatalf("audit entry = action:%s mode:%q job:%s, want fallback destroy audit", auditAction, auditMode, auditJobID)
 	}
 }
