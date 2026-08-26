@@ -555,7 +555,7 @@ func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 				writeFile(t, env.atomicRollbackManifest, rollbackManifestWithHistoricalSynthetics(false))
 				writeFile(t, env.containedRollbackManifest, rollbackManifestWithHistoricalSynthetics(true))
 			},
-			wantOutput: "revision-162 immutable image baseline via deployed revision 164",
+			wantOutput: "revision-163 immutable image baseline via deployed revision 165",
 		},
 		{
 			name: "pending synthetic pod destroy after rollback retains lock",
