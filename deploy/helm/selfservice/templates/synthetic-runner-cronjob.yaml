@@ -12,7 +12,7 @@
 # full check set with the single runner_smoke check.
 #
 # The env block below is written out EXPLICITLY rather than shared with the
-# */10 monitor. That is deliberate: SYNTHETIC_LIFECYCLE_ENABLED is a global
+# */12 monitor. That is deliberate: SYNTHETIC_LIFECYCLE_ENABLED is a global
 # in values.yaml, and inheriting it used to silently shadow runner mode
 # (the binary registered the api check set while pushing under
 # layer="runner"). main.go now refuses that combination and warns, but not
@@ -46,6 +46,7 @@ spec:
             app.kubernetes.io/component: synthetic-monitor
         spec:
           restartPolicy: Never
+          terminationGracePeriodSeconds: {{ required "synthetic.runner.terminationGracePeriodSeconds is required" .Values.synthetic.runner.terminationGracePeriodSeconds }}
           {{- with .Values.imagePullSecrets }}
           imagePullSecrets:
             {{- toYaml . | nindent 12 }}
@@ -98,6 +99,10 @@ spec:
                   value: {{ required "synthetic.runner.maxAttempts is required" .Values.synthetic.runner.maxAttempts | quote }}
                 - name: SYNTHETIC_RUNNER_RETRY_BACKOFF
                   value: {{ required "synthetic.runner.retryBackoff is required" .Values.synthetic.runner.retryBackoff | quote }}
+                - name: SYNTHETIC_RUNNER_ACTIVE_DEADLINE
+                  value: {{ printf "%ds" (int (required "synthetic.runner.activeDeadlineSeconds is required" .Values.synthetic.runner.activeDeadlineSeconds)) | quote }}
+                - name: SYNTHETIC_RUNNER_SCHEDULE_INTERVAL
+                  value: {{ required "synthetic.runner.scheduleInterval is required" .Values.synthetic.runner.scheduleInterval | quote }}
               resources:
                 {{- toYaml .Values.synthetic.resources | nindent 16 }}
               securityContext:

@@ -3,6 +3,7 @@ package synthetic
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -42,6 +43,11 @@ const CheckAttemptOverhead = 60 * time.Second
 // final best-effort DELETE after ordinary work stops.
 const CheckCleanupReserve = 30 * time.Second
 
+// RunnerSessionTokenMargin keeps the runner-only JWT valid beyond the Job
+// deadline and final cleanup reserve without allowing it to reach the next
+// scheduled run.
+const RunnerSessionTokenMargin = 30 * time.Second
+
 // CheckAttemptTimeout returns the outer context budget for one check attempt.
 func CheckAttemptTimeout(phases ...time.Duration) time.Duration {
 	total := CheckAttemptOverhead
@@ -62,6 +68,26 @@ func RetryCycleTimeout(perAttempt time.Duration, cfg RetryConfig) time.Duration 
 		time.Duration(attempts-1)*cfg.Backoff
 }
 
+// RunnerSessionTokenTTL derives the runner-only JWT lifetime from the
+// Kubernetes Job deadline. The token must survive SIGTERM cleanup at the hard
+// deadline, but must expire before the next scheduled runner starts.
+func RunnerSessionTokenTTL(activeDeadline, scheduleInterval time.Duration) (time.Duration, error) {
+	if activeDeadline <= 0 {
+		return 0, fmt.Errorf("runner active deadline must be positive")
+	}
+	if scheduleInterval <= 0 {
+		return 0, fmt.Errorf("runner schedule interval must be positive")
+	}
+	ttl := activeDeadline + CheckCleanupReserve + RunnerSessionTokenMargin
+	if ttl >= scheduleInterval {
+		return 0, fmt.Errorf(
+			"runner session TTL %s must be shorter than schedule interval %s",
+			ttl, scheduleInterval,
+		)
+	}
+	return ttl, nil
+}
+
 // DefaultRetryConfig returns production-safe retry defaults for the expensive
 // vCenter-dependent checks.
 //
@@ -69,8 +95,8 @@ func RetryCycleTimeout(perAttempt time.Duration, cfg RetryConfig) time.Duration 
 // worst-case pod_lifecycle cycle time of:
 //
 //	2 × (ReadyTimeout + DestroyTimeout + per-attempt overhead) + Backoff
-//	= 2 × (150s + 90s + 30s) + 30s
-//	= 570s = 9.5 minutes < 10-minute CronJob schedule
+//	= 2 × (150s + 90s + 60s) + 30s
+//	= 630s = 10.5 minutes < 12-minute CronJob schedule
 //
 // For runner_smoke (hourly CronJob), the same config with the chart-aligned
 // 8-minute ReadyTimeout and 10-minute RunTimeout gives:

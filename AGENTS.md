@@ -548,14 +548,17 @@ timeout. The dedicated hourly `runner_smoke` CronJob currently resolves an
 destroy phase. The monitor adds 30 seconds for ordinary request overhead and
 reserves another 30 seconds for final cleanup, so the outer per-attempt context
 is 20 minutes 30 seconds. Two attempts with a 30-second backoff authorize a
-maximum 41-minute-30-second retry cycle. Its session JWT is minted for 44
-minutes, the Kubernetes Job deadline is 45 minutes, and the
-schedule is hourly.
+maximum 41-minute-30-second retry cycle. Its session JWT is minted for 46
+minutes so a SIGTERM at the 45-minute Kubernetes Job deadline can still issue
+the detached, 30-second-bounded cleanup DELETE. The pod has 60 seconds of
+termination grace, and the schedule is hourly.
 
-Those limits are one contract. A `401` before the retry cycle finishes, a
+Those limits are one contract. The JWT must outlive the Job deadline plus
+cleanup reserve while remaining shorter than the hourly schedule. A `401`
+before cleanup finishes, a
 `context deadline exceeded` before a configured phase can finish, or a Job
-deadline at or below the session TTL indicates deployment/runtime drift rather
-than an assessment authoring error. See
+deadline/schedule mismatch indicates deployment/runtime drift rather than an
+assessment authoring error. See
 [`docs/instructor/troubleshooting.md`](docs/instructor/troubleshooting.md#runner_smoke-synthetic-check-is-firing).
 
 ---

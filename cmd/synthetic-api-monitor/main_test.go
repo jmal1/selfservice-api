@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"maps"
 	"net/http"
 	"os"
 	"strconv"
@@ -300,6 +301,27 @@ func TestResolveRunnerConfig_RejectsUnparseableDurations(t *testing.T) {
 				t.Errorf("error %q must name the offending env var", err)
 			}
 		})
+	}
+}
+
+func TestResolveRunnerConfig_RejectsNonPositiveDurations(t *testing.T) {
+	for _, value := range []string{"0s", "-1s"} {
+		for _, key := range []string{
+			envRunnerReadyTimeout,
+			envRunnerRunTimeout,
+			envRunnerDestroyTimeout,
+		} {
+			t.Run(key+"="+value, func(t *testing.T) {
+				env := map[string]string{
+					envRunnerTemplate:   "synthetic-noop",
+					envRunnerPlaylistID: "0000-uuid",
+					key:                 value,
+				}
+				if _, _, err := resolveRunnerConfig(func(k string) string { return env[k] }); err == nil {
+					t.Fatalf("%s=%s must be rejected", key, value)
+				}
+			})
+		}
 	}
 }
 
@@ -650,6 +672,28 @@ func TestResolveRetryConfig_RejectsInvalid(t *testing.T) {
 	}
 }
 
+func TestResolveRunnerRuntimeConfig_RequiresJobBounds(t *testing.T) {
+	valid := map[string]string{
+		envRunnerTemplate:         "synthetic-noop",
+		envRunnerPlaylistID:       "0000-uuid",
+		envRunnerActiveDeadline:   "45m",
+		envRunnerScheduleInterval: "1h",
+	}
+	if _, _, err := resolveRunnerRuntimeConfig(func(k string) string { return valid[k] }); err != nil {
+		t.Fatalf("valid runner runtime config failed: %v", err)
+	}
+
+	for _, key := range []string{envRunnerActiveDeadline, envRunnerScheduleInterval} {
+		t.Run(key, func(t *testing.T) {
+			env := maps.Clone(valid)
+			delete(env, key)
+			if _, _, err := resolveRunnerRuntimeConfig(func(k string) string { return env[k] }); err == nil {
+				t.Fatalf("missing %s must fail closed", key)
+			}
+		})
+	}
+}
+
 // helmLifecycleValues holds the fields from deploy/helm/selfservice/values.yaml
 // (and values.prod.yaml) that govern pod_lifecycle retry and timeout behavior.
 // Used only in test to verify the deployed config satisfies both the
@@ -665,16 +709,19 @@ type helmLifecycleValues struct {
 // helmRunnerValues holds the runner_smoke fields from the Helm values files.
 type helmRunnerValues struct {
 	Schedule              string `yaml:"schedule"`
+	ScheduleInterval      string `yaml:"scheduleInterval"`
 	ReadyTimeout          string `yaml:"readyTimeout"`
 	RunTimeout            string `yaml:"runTimeout"`
 	DestroyTimeout        string `yaml:"destroyTimeout"`
 	MaxAttempts           int    `yaml:"maxAttempts"`
 	RetryBackoff          string `yaml:"retryBackoff"`
 	ActiveDeadlineSeconds int    `yaml:"activeDeadlineSeconds"`
+	TerminationGrace      int    `yaml:"terminationGracePeriodSeconds"`
 }
 
 type helmValuesFile struct {
 	Synthetic struct {
+		Schedule  string              `yaml:"schedule"`
 		Lifecycle helmLifecycleValues `yaml:"lifecycle"`
 		Runner    helmRunnerValues    `yaml:"runner"`
 	} `yaml:"synthetic"`
@@ -719,6 +766,9 @@ func mergeRunner(base, prod helmRunnerValues) helmRunnerValues {
 	if prod.Schedule != "" {
 		base.Schedule = prod.Schedule
 	}
+	if prod.ScheduleInterval != "" {
+		base.ScheduleInterval = prod.ScheduleInterval
+	}
 	if prod.ReadyTimeout != "" {
 		base.ReadyTimeout = prod.ReadyTimeout
 	}
@@ -736,6 +786,9 @@ func mergeRunner(base, prod helmRunnerValues) helmRunnerValues {
 	}
 	if prod.ActiveDeadlineSeconds != 0 {
 		base.ActiveDeadlineSeconds = prod.ActiveDeadlineSeconds
+	}
+	if prod.TerminationGrace != 0 {
+		base.TerminationGrace = prod.TerminationGrace
 	}
 	return base
 }
@@ -766,14 +819,14 @@ func parseDurField(t *testing.T, s, field string) time.Duration {
 //  2. < CronJob schedule interval (concurrencyPolicy:Forbid — exceeded schedule
 //     silently skips the next cycle)
 //
-// The bug this test was added to catch: values.prod.yaml had readyTimeout=3m,
-// giving 2×(180s+90s)+30s+60s = 630s = 10m30s > 10m schedule ✗.
+// Restoring the old */10 cadence fails because the exact production helper
+// authorizes 2×(150s+90s+60s)+30s = 630s = 10m30s.
 func TestPodLifecycleRetry_WorstCaseDerivedFromHelmValues(t *testing.T) {
 	const (
 		valuesBase          = "../../deploy/helm/selfservice/values.yaml"
 		valuesProd          = "../../deploy/helm/selfservice/values.prod.yaml"
-		cronJob             = 10 * time.Minute
 		defaultDeadlineHard = 900 * time.Second // template default when not set
+		baseCheckTimeout    = 30 * time.Second
 	)
 
 	base := loadHelmValues(t, valuesBase)
@@ -796,10 +849,29 @@ func TestPodLifecycleRetry_WorstCaseDerivedFromHelmValues(t *testing.T) {
 		deadline = time.Duration(eff.ActiveDeadlineSeconds) * time.Second
 	}
 
-	wc := synthetic.RetryCycleTimeout(
-		ready+destroy,
-		synthetic.RetryConfig{MaxAttempts: attempts, Backoff: backoff},
-	) + time.Minute
+	cfg := checks.PodLifecycleConfig{
+		TemplateName:   "synthetic-noop",
+		ReadyTimeout:   ready,
+		DestroyTimeout: destroy,
+	}
+	activeChecks := []synthetic.Check{checks.PodLifecycle(cfg)}
+	runner := synthetic.NewRunner(synthetic.NewClient("http://unused", ""), nil, activeChecks, nil)
+	retryCfg := synthetic.RetryConfig{MaxAttempts: attempts, Backoff: backoff}
+	wc := configureRunnerBudgets(
+		runner,
+		baseCheckTimeout,
+		activeChecks,
+		map[string]time.Duration{
+			"pod_lifecycle": synthetic.CheckAttemptTimeout(ready, destroy),
+		},
+		map[string]synthetic.RetryConfig{"pod_lifecycle": retryCfg},
+	)
+	if runner.CheckTimeout != 5*time.Minute {
+		t.Fatalf("production pod_lifecycle per-attempt timeout=%s, want 5m", runner.CheckTimeout)
+	}
+	if wc != 10*time.Minute+30*time.Second {
+		t.Fatalf("production pod_lifecycle retry cycle=%s, want 10m30s", wc)
+	}
 
 	if wc >= deadline {
 		t.Errorf(
@@ -811,15 +883,29 @@ func TestPodLifecycleRetry_WorstCaseDerivedFromHelmValues(t *testing.T) {
 			eff.ReadyTimeout, eff.DestroyTimeout, attempts, eff.RetryBackoff, eff.ActiveDeadlineSeconds,
 		)
 	}
+	scheduleExpression := base.Synthetic.Schedule
+	if prod.Synthetic.Schedule != "" {
+		scheduleExpression = prod.Synthetic.Schedule
+	}
+	cronJob, err := cronScheduleInterval(scheduleExpression)
+	if err != nil {
+		t.Fatalf("synthetic.schedule=%q: %v", scheduleExpression, err)
+	}
+	if cronJob != 12*time.Minute {
+		t.Fatalf("main synthetic schedule interval=%s, want 12m", cronJob)
+	}
 	if wc >= cronJob {
 		t.Errorf(
 			"Helm-effective worst-case pod_lifecycle cycle time %v >= CronJob schedule %v.\n"+
 				"  Effective Helm config: readyTimeout=%s destroyTimeout=%s maxAttempts=%d retryBackoff=%s\n"+
 				"  With concurrencyPolicy:Forbid the NEXT cycle is silently skipped.\n"+
-				"  Fix: lower readyTimeout or destroyTimeout in values.yaml / values.prod.yaml.",
+				"  Fix: increase synthetic.schedule; do not lower the telemetry-calibrated ready timeout.",
 			wc, cronJob,
 			eff.ReadyTimeout, eff.DestroyTimeout, attempts, eff.RetryBackoff,
 		)
+	}
+	if margin := cronJob - wc; margin != 90*time.Second {
+		t.Fatalf("pod_lifecycle schedule margin=%s, want 90s", margin)
 	}
 }
 
@@ -830,8 +916,8 @@ func TestPodLifecycleRetry_WorstCaseDerivedFromHelmValues(t *testing.T) {
 //  1. code defaults and Helm-effective phase/retry defaults agree;
 //  2. production Runner wiring uses the derived per-attempt context;
 //  3. the full retry cycle fits below the JWT TTL;
-//  4. the JWT TTL fits below activeDeadlineSeconds; and
-//  5. the active deadline fits below the hourly Forbid schedule.
+//  4. the JWT TTL outlives activeDeadlineSeconds plus cleanup; and
+//  5. the JWT TTL stays below the hourly Forbid schedule.
 //
 // Restoring the old 15-minute literal or the old per-attempt-only JWT formula
 // fails this test on the production Helm values.
@@ -848,13 +934,15 @@ func TestRunnerSmokeRetry_WorstCaseDerivedFromHelmValues(t *testing.T) {
 	eff := mergeRunner(base.Synthetic.Runner, prod.Synthetic.Runner)
 
 	env := map[string]string{
-		envRunnerTemplate:       "synthetic-noop",
-		envRunnerPlaylistID:     "00000000-0000-0000-0000-000000000001",
-		envRunnerReadyTimeout:   eff.ReadyTimeout,
-		envRunnerRunTimeout:     eff.RunTimeout,
-		envRunnerDestroyTimeout: eff.DestroyTimeout,
-		envRunnerMaxAttempts:    strconv.Itoa(eff.MaxAttempts),
-		envRunnerRetryBackoff:   eff.RetryBackoff,
+		envRunnerTemplate:         "synthetic-noop",
+		envRunnerPlaylistID:       "00000000-0000-0000-0000-000000000001",
+		envRunnerReadyTimeout:     eff.ReadyTimeout,
+		envRunnerRunTimeout:       eff.RunTimeout,
+		envRunnerDestroyTimeout:   eff.DestroyTimeout,
+		envRunnerMaxAttempts:      strconv.Itoa(eff.MaxAttempts),
+		envRunnerRetryBackoff:     eff.RetryBackoff,
+		envRunnerActiveDeadline:   strconv.Itoa(eff.ActiveDeadlineSeconds) + "s",
+		envRunnerScheduleInterval: eff.ScheduleInterval,
 	}
 	runtimeCfg, warnings, err := resolveRunnerRuntimeConfig(func(key string) string { return env[key] })
 	if err != nil {
@@ -890,7 +978,7 @@ func TestRunnerSmokeRetry_WorstCaseDerivedFromHelmValues(t *testing.T) {
 	const (
 		wantAttempt = 20*time.Minute + 30*time.Second
 		wantCycle   = 41*time.Minute + 30*time.Second
-		wantJWT     = 44 * time.Minute
+		wantJWT     = 46 * time.Minute
 	)
 	if runner.CheckTimeout != wantAttempt {
 		t.Fatalf("production per-attempt CheckTimeout=%s, want %s from resolved Helm phases plus overhead",
@@ -903,36 +991,48 @@ func TestRunnerSmokeRetry_WorstCaseDerivedFromHelmValues(t *testing.T) {
 		t.Fatalf("production retry policy=%+v, want resolved %+v", got, runtimeCfg.Retry)
 	}
 
-	sessionTTL := sessionTokenTTL(cycle, baseCheckTimeout, len(activeChecks))
+	sessionTTL, err := synthetic.RunnerSessionTokenTTL(
+		runtimeCfg.ActiveDeadline, runtimeCfg.ScheduleInterval,
+	)
+	if err != nil {
+		t.Fatalf("derive runner session JWT: %v", err)
+	}
 	if sessionTTL != wantJWT {
-		t.Fatalf("session JWT TTL=%s, want %s from full retry cycle plus bounded active/base overhead",
+		t.Fatalf("session JWT TTL=%s, want %s from Job deadline plus bounded cleanup/margin",
 			sessionTTL, wantJWT)
 	}
 	if sessionTTL <= cycle {
 		t.Fatalf("session JWT TTL %s does not outlive authorized retry cycle %s", sessionTTL, cycle)
 	}
 
-	deadline := defaultDeadlineHard
-	if eff.ActiveDeadlineSeconds != 0 {
-		deadline = time.Duration(eff.ActiveDeadlineSeconds) * time.Second
+	deadline := runtimeCfg.ActiveDeadline
+	if deadline == 0 {
+		deadline = defaultDeadlineHard
 	}
 	if deadline != 45*time.Minute {
 		t.Fatalf("Helm-effective activeDeadlineSeconds=%s, want production-pinned 45m", deadline)
 	}
-	if sessionTTL >= deadline {
-		t.Fatalf("session JWT TTL %s must stay below active deadline %s so it is bounded by the job lifetime",
-			sessionTTL, deadline)
+	if sessionTTL <= deadline+synthetic.CheckCleanupReserve {
+		t.Fatalf("session JWT TTL %s must outlive deadline+cleanup %s",
+			sessionTTL, deadline+synthetic.CheckCleanupReserve)
 	}
 
-	schedule, err := fixedMinuteScheduleInterval(eff.Schedule)
+	schedule, err := cronScheduleInterval(eff.Schedule)
 	if err != nil {
 		t.Fatalf("synthetic.runner.schedule=%q: %v", eff.Schedule, err)
 	}
 	if schedule != time.Hour {
 		t.Fatalf("runner schedule interval=%s, want hourly", schedule)
 	}
-	if deadline >= schedule {
-		t.Fatalf("active deadline %s must stay below Forbid schedule interval %s", deadline, schedule)
+	if runtimeCfg.ScheduleInterval != schedule {
+		t.Fatalf("runtime schedule interval=%s, want cron-derived %s", runtimeCfg.ScheduleInterval, schedule)
+	}
+	if sessionTTL >= schedule {
+		t.Fatalf("session JWT TTL %s must stay below schedule interval %s", sessionTTL, schedule)
+	}
+	if time.Duration(eff.TerminationGrace)*time.Second < synthetic.CheckCleanupReserve {
+		t.Fatalf("termination grace %ds is shorter than cleanup reserve %s",
+			eff.TerminationGrace, synthetic.CheckCleanupReserve)
 	}
 }
 
@@ -947,7 +1047,8 @@ func TestRunnerSmokeBudgetWiring_ProductionUsesDerivedCycleForJWT(t *testing.T) 
 		"attemptTimeouts[\"runner_smoke\"] = cfg.AttemptTimeout()",
 		"retryPolicies[\"runner_smoke\"] = runtimeCfg.Retry",
 		"longestCheckCycle := configureRunnerBudgets(",
-		"sessionTokenTTL(longestCheckCycle, checkTimeout, len(activeChecks))",
+		"runnerSessionTTL, err = synthetic.RunnerSessionTokenTTL(",
+		"sessionTTL = runnerSessionTTL",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("production runner_smoke budget wiring is missing %q", want)
@@ -963,6 +1064,7 @@ func TestRunnerSmokeHelmTemplate_WiresRequiredContractValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read runner CronJob template: %v", err)
 	}
+
 	body := string(data)
 	for _, want := range []string{
 		`schedule: {{ required "synthetic.runner.schedule is required" .Values.synthetic.runner.schedule | quote }}`,
@@ -972,6 +1074,9 @@ func TestRunnerSmokeHelmTemplate_WiresRequiredContractValues(t *testing.T) {
 		`value: {{ required "synthetic.runner.destroyTimeout is required" .Values.synthetic.runner.destroyTimeout | quote }}`,
 		`value: {{ required "synthetic.runner.maxAttempts is required" .Values.synthetic.runner.maxAttempts | quote }}`,
 		`value: {{ required "synthetic.runner.retryBackoff is required" .Values.synthetic.runner.retryBackoff | quote }}`,
+		`terminationGracePeriodSeconds: {{ required "synthetic.runner.terminationGracePeriodSeconds is required" .Values.synthetic.runner.terminationGracePeriodSeconds }}`,
+		`value: {{ printf "%ds" (int (required "synthetic.runner.activeDeadlineSeconds is required" .Values.synthetic.runner.activeDeadlineSeconds)) | quote }}`,
+		`value: {{ required "synthetic.runner.scheduleInterval is required" .Values.synthetic.runner.scheduleInterval | quote }}`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("runner CronJob template is missing required value wiring %q", want)
@@ -979,10 +1084,33 @@ func TestRunnerSmokeHelmTemplate_WiresRequiredContractValues(t *testing.T) {
 	}
 }
 
-func fixedMinuteScheduleInterval(schedule string) (time.Duration, error) {
+func TestMainSyntheticHelmTemplate_RequiresLifecycleCadenceBounds(t *testing.T) {
+	data, err := os.ReadFile("../../deploy/helm/selfservice/templates/synthetic-cronjob.yaml")
+	if err != nil {
+		t.Fatalf("read main synthetic CronJob template: %v", err)
+	}
+	body := string(data)
+	for _, want := range []string{
+		`schedule: {{ required "synthetic.schedule is required" .Values.synthetic.schedule | quote }}`,
+		`{{ required "synthetic.lifecycle.activeDeadlineSeconds is required" .Values.synthetic.lifecycle.activeDeadlineSeconds }}`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("main synthetic CronJob template is missing required cadence wiring %q", want)
+		}
+	}
+}
+
+func cronScheduleInterval(schedule string) (time.Duration, error) {
 	fields := strings.Fields(schedule)
 	if len(fields) != 5 || fields[1] != "*" || fields[2] != "*" || fields[3] != "*" || fields[4] != "*" {
-		return 0, fmt.Errorf("want a fixed-minute hourly cron expression")
+		return 0, fmt.Errorf("want an all-hours fixed-minute or step-minute cron expression")
+	}
+	if strings.HasPrefix(fields[0], "*/") {
+		minutes, err := strconv.Atoi(strings.TrimPrefix(fields[0], "*/"))
+		if err != nil || minutes < 1 || minutes > 59 || 60%minutes != 0 {
+			return 0, fmt.Errorf("invalid evenly dividing minute step %q", fields[0])
+		}
+		return time.Duration(minutes) * time.Minute, nil
 	}
 	minute, err := strconv.Atoi(fields[0])
 	if err != nil || minute < 0 || minute > 59 {

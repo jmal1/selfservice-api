@@ -541,6 +541,52 @@ func TestRunnerSmoke_PodDestroyedOnRunTimeout(t *testing.T) {
 	}
 }
 
+func TestRunnerSmoke_CancelledAncestorStillIssuesBoundedDelete(t *testing.T) {
+	fake := newRunnerSmokeFakeAPI()
+	fake.runTerminalAfter = 99999
+	baseHandler := fake.handler()
+	runCreated := make(chan struct{})
+	var once sync.Once
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		baseHandler.ServeHTTP(w, r)
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/testing/run") {
+			once.Do(func() { close(runCreated) })
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := RunnerSmoke(runnerSmokeTestCfg("")).Run(
+			ctx, synthetic.NewClient(srv.URL, ""),
+		)
+		done <- err
+	}()
+
+	select {
+	case <-runCreated:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runner_smoke did not create a run before cancellation")
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("cancelled runner_smoke unexpectedly passed")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled runner_smoke did not return within cleanup bound")
+	}
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.deleteCalls < 1 {
+		t.Fatal("ancestor cancellation suppressed deferred DELETE")
+	}
+}
+
 // ---- 409 on create run ---------------------------------------------------
 
 // TestRunnerSmoke_409OnCreateRun guards that a 409 from POST /testing/run is
@@ -691,6 +737,45 @@ func TestBoundedRunnerAttemptContexts_ReserveOperationAndCleanupOverhead(t *test
 	if got := attemptDeadline.Sub(start); got < cfg.AttemptTimeout()-10*time.Millisecond ||
 		got > cfg.AttemptTimeout()+10*time.Millisecond {
 		t.Fatalf("attempt budget=%s, want %s within timer setup tolerance", got, cfg.AttemptTimeout())
+	}
+}
+
+func TestRunnerCleanupContext_DetachesAndUsesShortestBound(t *testing.T) {
+	type contextKey string
+	const key contextKey = "runner-cleanup"
+
+	parent, cancelParent := context.WithCancel(context.WithValue(context.Background(), key, "preserved"))
+	attemptCtx, cancelAttempt := context.WithTimeout(parent, time.Hour)
+	cancelParent()
+	defer cancelAttempt()
+
+	for _, tc := range []struct {
+		name           string
+		destroyTimeout time.Duration
+		wantBound      time.Duration
+	}{
+		{"cleanup reserve binds", time.Minute, synthetic.CheckCleanupReserve},
+		{"destroy timeout binds", 10 * time.Millisecond, 10 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			start := time.Now()
+			cleanupCtx, cancelCleanup := runnerCleanupContext(attemptCtx, tc.destroyTimeout)
+			defer cancelCleanup()
+
+			if err := cleanupCtx.Err(); err != nil {
+				t.Fatalf("cleanup inherited ancestor cancellation: %v", err)
+			}
+			if got := cleanupCtx.Value(key); got != "preserved" {
+				t.Fatalf("cleanup context value=%v, want preserved", got)
+			}
+			deadline, ok := cleanupCtx.Deadline()
+			if !ok {
+				t.Fatal("cleanup context has no deadline")
+			}
+			if got := deadline.Sub(start); got < tc.wantBound-10*time.Millisecond || got > tc.wantBound+10*time.Millisecond {
+				t.Fatalf("cleanup bound=%s, want %s within timer tolerance", got, tc.wantBound)
+			}
+		})
 	}
 }
 

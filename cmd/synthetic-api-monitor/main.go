@@ -6,7 +6,7 @@
 // This binary is designed to run in two modes:
 //
 //   - One-shot (default): run all checks once, push results, exit with 0 even
-//     if checks failed. The K8s CronJob schedule (every 10 minutes in prod)
+//     if checks failed. The K8s CronJob schedule (every 12 minutes in prod)
 //     drives the cadence. Exit-0-on-check-failure is intentional: a check
 //     failure is signaled via the pushed metric, NOT the pod exit status,
 //     because K8s would otherwise mark the CronJob as failed and we'd lose
@@ -67,9 +67,9 @@ const (
 	// vcenter_template). The synthetic-noop template (see plan §Phase 2) is
 	// the intended value in production.
 	envLifecycleTemplate = "SYNTHETIC_LIFECYCLE_TEMPLATE"
-	// envLifecycleReadyTimeout overrides the default 2m timeout for waiting
-	// on PodStatusActive. The default (2m = 3.2× the ~37s observed median)
-	// leaves room for a full retry within the 10-minute CronJob schedule.
+	// envLifecycleReadyTimeout overrides the default 150s timeout for waiting
+	// on PodStatusActive. The default stays above the 125.2s observed maximum
+	// and leaves room for two attempts within the 12-minute CronJob schedule.
 	envLifecycleReadyTimeout = "SYNTHETIC_LIFECYCLE_READY_TIMEOUT"
 	// envLifecycleDestroyTimeout overrides the default 90s timeout for
 	// waiting on PodStatusDestroyed.
@@ -100,7 +100,7 @@ const (
 	// envRunnerMode, when truthy, replaces the entire check set with the
 	// single runner_smoke check. This lets a separate less-frequent CronJob
 	// reuse the same image/secrets/pushgateway plumbing as the regular
-	// monitor without running the cheap probes the */10 CronJob already
+	// monitor without running the cheap probes the */12 CronJob already
 	// covers.
 	//
 	// If SYNTHETIC_RUNNER_TEMPLATE or SYNTHETIC_RUNNER_PLAYLIST_ID is unset
@@ -140,6 +140,12 @@ const (
 	// envRunnerRetryBackoff overrides the default 30s pause between
 	// runner_smoke retry attempts.
 	envRunnerRetryBackoff = "SYNTHETIC_RUNNER_RETRY_BACKOFF"
+	// envRunnerActiveDeadline is the rendered Kubernetes Job hard deadline.
+	// Runner-mode JWTs must remain valid through that deadline plus cleanup.
+	envRunnerActiveDeadline = "SYNTHETIC_RUNNER_ACTIVE_DEADLINE"
+	// envRunnerScheduleInterval is the shortest gap between scheduled runner
+	// starts. It bounds runner-mode JWT exposure.
+	envRunnerScheduleInterval = "SYNTHETIC_RUNNER_SCHEDULE_INTERVAL"
 
 	// envInstructorUserID is the UUID of the dedicated instructor-role row
 	// (synthetic-instructor). When set, the monitor mints a SECOND session
@@ -238,6 +244,7 @@ func run(logger *slog.Logger) error {
 	}
 	attemptTimeouts := make(map[string]time.Duration)
 	retryPolicies := make(map[string]synthetic.RetryConfig)
+	var runnerSessionTTL time.Duration
 	activeChecks := checks.All()
 	if !expectedProvisioning {
 		activeChecks = checks.ReadOnly()
@@ -295,6 +302,12 @@ func run(logger *slog.Logger) error {
 		if err != nil {
 			return err
 		}
+		runnerSessionTTL, err = synthetic.RunnerSessionTokenTTL(
+			runtimeCfg.ActiveDeadline, runtimeCfg.ScheduleInterval,
+		)
+		if err != nil {
+			return err
+		}
 		cfg := runtimeCfg.Check
 		for _, w := range warnings {
 			logger.Warn(w.msg,
@@ -309,6 +322,8 @@ func run(logger *slog.Logger) error {
 			"ready_timeout", cfg.ReadyTimeout,
 			"run_timeout", cfg.RunTimeout,
 			"destroy_timeout", cfg.DestroyTimeout,
+			"active_deadline", runtimeCfg.ActiveDeadline,
+			"schedule_interval", runtimeCfg.ScheduleInterval,
 		)
 		activeChecks = []synthetic.Check{checks.RunnerSmoke(cfg)}
 		attemptTimeouts["runner_smoke"] = cfg.AttemptTimeout()
@@ -366,7 +381,7 @@ func run(logger *slog.Logger) error {
 	// student-side 403 assertions, which cannot distinguish "the route
 	// works" from "the route 503s because a dependency was never wired".
 	// Also skipped in runner mode: that CronJob is a dedicated runner sweep
-	// and elevated checks are already covered by the main */10 monitor.
+	// and elevated checks are already covered by the main */12 monitor.
 	if !envBool(envJanitorMode) && !envBool(envRunnerMode) {
 		elevatedCfg := checks.ElevatedConfig{Client: instructorClient}
 
@@ -408,6 +423,9 @@ func run(logger *slog.Logger) error {
 	// fresh pair is minted each cycle so a token leaked from a single run
 	// cannot be used long.
 	sessionTTL := sessionTokenTTL(longestCheckCycle, checkTimeout, len(activeChecks))
+	if mode.kind == modeRunner {
+		sessionTTL = runnerSessionTTL
+	}
 	mintSessions := func() error {
 		c, err := synthetic.MintSessionToken([]byte(jwtSecret), userID, username, role, sessionTTL)
 		if err != nil {
@@ -607,8 +625,8 @@ func resolveRunnerConfig(getenv func(string) string) (checks.RunnerSmokeConfig, 
 			continue
 		}
 		d, err := time.ParseDuration(v)
-		if err != nil {
-			return cfg, warnings, fmt.Errorf("invalid %s=%q: %w", o.env, v, err)
+		if err != nil || d <= 0 {
+			return cfg, warnings, fmt.Errorf("invalid %s=%q: must be a positive duration", o.env, v)
 		}
 		*o.target = d
 	}
@@ -617,8 +635,10 @@ func resolveRunnerConfig(getenv func(string) string) (checks.RunnerSmokeConfig, 
 }
 
 type runnerRuntimeConfig struct {
-	Check checks.RunnerSmokeConfig
-	Retry synthetic.RetryConfig
+	Check            checks.RunnerSmokeConfig
+	Retry            synthetic.RetryConfig
+	ActiveDeadline   time.Duration
+	ScheduleInterval time.Duration
 }
 
 // resolveRunnerRuntimeConfig resolves every runner_smoke value consumed by the
@@ -632,10 +652,32 @@ func resolveRunnerRuntimeConfig(getenv func(string) string) (runnerRuntimeConfig
 	if err != nil {
 		return runnerRuntimeConfig{}, warnings, err
 	}
-	return runnerRuntimeConfig{Check: cfg, Retry: retryCfg}, warnings, nil
+	activeDeadline, err := requiredPositiveDuration(getenv, envRunnerActiveDeadline)
+	if err != nil {
+		return runnerRuntimeConfig{}, warnings, err
+	}
+	scheduleInterval, err := requiredPositiveDuration(getenv, envRunnerScheduleInterval)
+	if err != nil {
+		return runnerRuntimeConfig{}, warnings, err
+	}
+	return runnerRuntimeConfig{
+		Check:            cfg,
+		Retry:            retryCfg,
+		ActiveDeadline:   activeDeadline,
+		ScheduleInterval: scheduleInterval,
+	}, warnings, nil
 }
 
-// mainLayer is the Pushgateway grouping used by the primary */10 monitor,
+func requiredPositiveDuration(getenv func(string) string, key string) (time.Duration, error) {
+	value := getenv(key)
+	duration, err := time.ParseDuration(value)
+	if err != nil || duration <= 0 {
+		return 0, fmt.Errorf("invalid %s=%q: must be a positive duration", key, value)
+	}
+	return duration, nil
+}
+
+// mainLayer is the Pushgateway grouping used by the primary */12 monitor,
 // which registers the full check catalog.
 const mainLayer = "api"
 
@@ -807,7 +849,7 @@ type resolvedMode struct {
 // make impossible.
 //
 // SYNTHETIC_LIFECYCLE_ENABLED=true is set once, globally, in values.yaml,
-// because the */10 monitor wants it. Any new CronJob built from the same env
+// because the */12 monitor wants it. Any new CronJob built from the same env
 // block inherits it. The old chain tested lifecycle BEFORE runner mode, so a
 // runner CronJob deployed exactly as intended would silently fall into the
 // lifecycle branch: SYNTHETIC_RUNNER_MODE was read, found true, and then never

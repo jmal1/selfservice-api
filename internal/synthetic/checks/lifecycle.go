@@ -21,7 +21,7 @@ import (
 const SyntheticPodNamePrefix = "synthetic-noop-"
 
 // PodLifecycleConfig controls the lifecycle check's behavior. Defaults are
-// chosen to fit comfortably inside a 10-minute CronJob cadence with the
+// chosen to fit comfortably inside a 12-minute CronJob cadence with the
 // existing Ubuntu 24.04 clone path (~5-7 min cold).
 type PodLifecycleConfig struct {
 	// TemplateName MUST match a row in templates.name (NOT vcenter_template).
@@ -55,8 +55,8 @@ type PodLifecycleConfig struct {
 // SUCCESSFUL pod_lifecycle run took 125.2 s (at the 100th percentile over
 // that window). The median is ~37 s. 150 s (2 m 30 s) gives a 25 s / 20%
 // margin above the observed peak — enough for normal variance — while
-// keeping the per-attempt budget well below what two retries need to fit
-// inside the 10-minute CronJob window.
+// keeping the per-attempt budget below what two attempts need to fit
+// inside the 12-minute CronJob window.
 //
 // The Helm chart (deploy/helm/selfservice/values.yaml, lifecycle.readyTimeout)
 // pins this to the same 150 s in the deployed CronJob. Code default and chart
@@ -66,7 +66,7 @@ type PodLifecycleConfig struct {
 // Worst-case pod_lifecycle cycle time with 2 attempts and 30 s backoff:
 //
 //	2 × (ReadyTimeout + DestroyTimeout + per-attempt overhead) + Backoff
-//	= 2 × (150 s + 90 s + 30 s) + 30 s = 570 s = 9 m 30 s < 10 min ✓
+//	= 2 × (150 s + 90 s + 60 s) + 30 s = 630 s = 10 m 30 s < 12 min
 func DefaultPodLifecycleConfig(templateName string) PodLifecycleConfig {
 	return PodLifecycleConfig{
 		TemplateName:   templateName,

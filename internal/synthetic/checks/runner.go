@@ -273,8 +273,10 @@ func runRunnerSmoke(ctx context.Context, c *synthetic.Client, cfg RunnerSmokeCon
 	// logged, never returned, so it cannot mask the primary failure. The work
 	// context expires first, reserving the shared overhead for this request.
 	defer func() {
+		cleanupCtx, cancelCleanup := runnerCleanupContext(attemptCtx, cfg.DestroyTimeout)
+		defer cancelCleanup()
 		log.Info("runner_smoke: deferred cleanup destroy")
-		s, err := destroyPod(attemptCtx, c, podID)
+		s, err := destroyPod(cleanupCtx, c, podID)
 		if err != nil {
 			log.Warn("runner_smoke: deferred destroy failed (best effort)", "http_status", s, "error", err.Error())
 		} else {
@@ -401,6 +403,14 @@ func boundedRunnerAttemptContexts(
 		cancelWork()
 		cancelAttempt()
 	}
+}
+
+func runnerCleanupContext(
+	attemptCtx context.Context,
+	destroyTimeout time.Duration,
+) (context.Context, context.CancelFunc) {
+	timeout := min(synthetic.CheckCleanupReserve, destroyTimeout)
+	return context.WithTimeout(context.WithoutCancel(attemptCtx), timeout)
 }
 
 // createTestingRun POSTs to /api/v1/pods/{podID}/testing/run with the given
