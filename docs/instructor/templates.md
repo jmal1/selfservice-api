@@ -224,9 +224,9 @@ Click **Create draft**. You'll land on the wizard page for the new template.
 
 ## Step 2 — Provision
 
-Click **Provision**. The worker clones the source VM into the
-Templates folder, attaches a NIC on the staging network, powers it on,
-and waits for VMware Tools. This is the slow step.
+Click **Provision**. The worker clones the source VM into the Templates folder, attaches a NIC on the staging network, powers it on, and waits for VMware Tools. This is the slow step.
+
+Retryable clone or ISO failures leave the template in `provisioning` while the job waits for its next attempt; the job detail preserves the first failure and updates the current failure on every attempt. If a later attempt succeeds, the template advances to `configuring` and the stale failure result is replaced by success. Only a non-retryable failure or an exhausted retry budget moves both the job and template to their terminal error states.
 
 Before creating anything, Crucible requires one explicitly allowlisted vCenter
 host that is compatible with the source/resource pool, connected, outside

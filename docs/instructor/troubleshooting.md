@@ -1281,35 +1281,19 @@ that unit, so it is a platform bug rather than something you did.
 
 ## "Template provisioning failed, but then it succeeded / failed again after a delay"
 
-Template creation jobs (clone, generalise, etc.) are automatically retried up
-to **three times** when vSphere returns a transient error — for example, a
-storage-inventory rejection that resolves itself in under a minute. While
-retries are in flight the template shows `pending`, and each attempt is
-recorded in the platform job log.
+Template creation jobs (clone, generalise, etc.) are automatically retried up to **three times** when vSphere returns a transient error — for example, a storage-inventory rejection that resolves itself in under a minute. During a retryable `template_provision` failure, the template remains `provisioning` while the job returns to `pending` for backoff; the job result keeps the compatible `error`, optional `raw_error`, and `attempts` fields and also preserves the originating `first_*` fields while refreshing the latest `current_*` fields.
 
 What this looks like in practice:
 
-- You request a template at 20:36 — vSphere rejects the clone in under a
-  second with a storage/inventory error.
-- The platform schedules a retry with exponential backoff (roughly 30 s, then
-  2 min, then 8 min).
-- By 20:37 the second attempt succeeds and the template continues to
-  `configuring`.
+- You request a template at 20:36 — vSphere rejects the clone in under a second with a storage/inventory error.
+- The platform schedules a retry with exponential backoff (roughly 30 s, then 60 s, then 120 s, with bounded jitter).
+- By 20:37 the second attempt succeeds, the stale failure result is replaced by success, and the template continues to `configuring`.
 
-If all three retries exhaust, the job moves to `error` and the status page
-shows a message like *"vSphere rejected the clone (transient storage/inventory
-error). Retried 3 times. If this persists, check datastore health."* The raw
-vCenter fault string is included for platform admins in the job detail view.
+If all retries exhaust, one atomic terminal update moves the job to `failed` and the matching template from `provisioning` to `error`; the status page shows the current actionable message while the job detail retains both the originating and latest raw faults for platform admins.
 
-**Errors that are never retried** (they indicate a configuration mistake, not
-a transient fault): invalid source ISO path, missing folder, ambiguous
-resource pool, guest-auth failure. These fail immediately so you see the real
-cause without waiting through three backoff cycles.
+**Errors that are never retried** (they indicate a configuration mistake, not a transient fault): invalid source ISO path, missing folder, ambiguous resource pool, guest-auth failure. These fail immediately so you see the real cause without waiting through three backoff cycles.
 
-If a template stays in `pending` longer than expected after an error, it is
-likely in a retry backoff window. Check the Jobs page for the next-attempt time.
-Only intervene (reset to `error`) for a deterministic configuration error, not
-a transient one.
+If a template stays in `provisioning` longer than expected after an error, its job is likely in a retry backoff window. Check the Jobs page for the `pending` job's next-attempt time and its preserved first/current failure details; do not reset the template while an owned retry is pending.
 
 ---
 

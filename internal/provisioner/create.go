@@ -58,6 +58,22 @@ type jobStatusUpdater interface {
 	) error
 }
 
+type templateProvisionJobStatusUpdater interface {
+	RetryTemplateProvisionJob(
+		ctx context.Context,
+		id uuid.UUID,
+		nextAt time.Time,
+		result []byte,
+		workerID string,
+	) error
+	FailTemplateProvisionJob(
+		ctx context.Context,
+		id uuid.UUID,
+		workerID string,
+		result []byte,
+	) (bool, error)
+}
+
 const (
 	cleanupRescheduleWriteTimeout = 10 * time.Second
 	cleanupRescheduleBackoffBase  = time.Second
@@ -328,6 +344,14 @@ func processJobLifecycle(
 		cleanupTarget := compensationRetryTarget(err)
 		if cleanupOnly {
 			nextAt, schedErr = persistCleanupRetry(ctx, db, job, workerID, cleanupTarget)
+		} else if job.Type == models.JobTypeTemplateProvision {
+			nextAt = time.Now().Add(RetryBackoff(job.RetryCount))
+			result := marshalTemplateProvisionFailure(job.Result, err, job.RetryCount, job.MaxRetries)
+			templateDB, ok := db.(templateProvisionJobStatusUpdater)
+			if !ok {
+				return fmt.Errorf("job store does not support template provision retry persistence")
+			}
+			schedErr = templateDB.RetryTemplateProvisionJob(ctx, job.ID, nextAt, result, workerID)
 		} else {
 			nextAt = time.Now().Add(RetryBackoff(job.RetryCount))
 			schedErr = db.RetryJob(ctx, job.ID, nextAt, false, cleanupTarget, workerID)
@@ -356,17 +380,20 @@ func processJobLifecycle(
 			// Startup recovery hands this in-progress row to the next worker.
 			return fmt.Errorf("reschedule durable cleanup: %w", schedErr)
 		}
+		if job.Type == models.JobTypeTemplateProvision {
+			return fmt.Errorf("persist template provision retry: %w", schedErr)
+		}
 		// RetryJob itself failed (DB problem) — fall through to terminal failure.
 	}
 
 	// Terminal failure.
-	if retryable && !cleanupOnly && job.RetryCount >= job.MaxRetries {
+	retryExhausted := retryable && !cleanupOnly && job.RetryCount >= job.MaxRetries
+	if retryExhausted && job.Type != models.JobTypeTemplateProvision {
 		if pipeline != nil {
 			pipeline.RecordJobRetryExhausted(job.Type)
 		}
 	}
 
-	friendly := FriendlyError(err, job.RetryCount, job.MaxRetries)
 	type jobResult struct {
 		Error                 string `json:"error"`
 		RawError              string `json:"raw_error,omitempty"`
@@ -374,6 +401,7 @@ func processJobLifecycle(
 		Compensated           bool   `json:"compensated,omitempty"`
 		ManualCleanupRequired bool   `json:"manual_cleanup_required,omitempty"`
 	}
+	friendly := FriendlyError(err, job.RetryCount, job.MaxRetries)
 	jr := jobResult{
 		Error:                 friendly,
 		Attempts:              job.RetryCount + 1,
@@ -384,7 +412,23 @@ func processJobLifecycle(
 		jr.RawError = err.Error()
 	}
 	result, _ := json.Marshal(jr)
-	if statusErr := db.UpdateJobStatus(ctx, job.ID, workerID, models.JobStatusFailed, result); statusErr != nil {
+	if job.Type == models.JobTypeTemplateProvision {
+		result = marshalTemplateProvisionFailure(job.Result, err, job.RetryCount, job.MaxRetries)
+		templateDB, ok := db.(templateProvisionJobStatusUpdater)
+		if !ok {
+			return fmt.Errorf("job store does not support terminal template provision persistence")
+		}
+		transitioned, statusErr := templateDB.FailTemplateProvisionJob(ctx, job.ID, workerID, result)
+		if statusErr != nil {
+			return fmt.Errorf("persist terminal template provision failure: %w", statusErr)
+		}
+		if transitioned && pipeline != nil {
+			pipeline.RecordTemplateTransition(models.TemplateStateProvisioning, models.TemplateStateError)
+		}
+		if retryExhausted && pipeline != nil {
+			pipeline.RecordJobRetryExhausted(job.Type)
+		}
+	} else if statusErr := db.UpdateJobStatus(ctx, job.ID, workerID, models.JobStatusFailed, result); statusErr != nil {
 		return fmt.Errorf("persist terminal job status: %w", statusErr)
 	}
 	if publish != nil {
@@ -397,6 +441,57 @@ func processJobLifecycle(
 		publish(job.ID, event, friendly)
 	}
 	return err
+}
+
+type templateProvisionFailureResult struct {
+	Error           string `json:"error"`
+	RawError        string `json:"raw_error,omitempty"`
+	Attempts        int    `json:"attempts"`
+	FirstError      string `json:"first_error"`
+	FirstRawError   string `json:"first_raw_error,omitempty"`
+	FirstAttempt    int    `json:"first_attempt"`
+	CurrentError    string `json:"current_error"`
+	CurrentRawError string `json:"current_raw_error,omitempty"`
+	CurrentAttempt  int    `json:"current_attempt"`
+}
+
+func marshalTemplateProvisionFailure(previous []byte, cause error, retryCount, maxRetries int) []byte {
+	currentError := FriendlyError(cause, retryCount, maxRetries)
+	currentRawError := ""
+	if cause != nil && currentError != cause.Error() {
+		currentRawError = cause.Error()
+	}
+	attempt := retryCount + 1
+	result := templateProvisionFailureResult{
+		Error:           currentError,
+		RawError:        currentRawError,
+		Attempts:        attempt,
+		FirstError:      currentError,
+		FirstRawError:   currentRawError,
+		FirstAttempt:    attempt,
+		CurrentError:    currentError,
+		CurrentRawError: currentRawError,
+		CurrentAttempt:  attempt,
+	}
+
+	var prior templateProvisionFailureResult
+	if len(previous) > 0 && json.Unmarshal(previous, &prior) == nil {
+		switch {
+		case prior.FirstError != "":
+			result.FirstError = prior.FirstError
+			result.FirstRawError = prior.FirstRawError
+			result.FirstAttempt = prior.FirstAttempt
+		case prior.Error != "":
+			result.FirstError = prior.Error
+			result.FirstRawError = prior.RawError
+			result.FirstAttempt = prior.Attempts
+		}
+	}
+	if result.FirstAttempt < 1 {
+		result.FirstAttempt = 1
+	}
+	encoded, _ := json.Marshal(result)
+	return encoded
 }
 
 func (p *Provisioner) publishProgress(jobID uuid.UUID, step, message string) {

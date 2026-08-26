@@ -975,6 +975,8 @@ template-staging/validation, and image-import jobs are excluded inside the
 atomic claim query and remain pending; destroy jobs and any withheld type marked
 `cleanup_only` remain claimable.
 
+`template_provision` owns template terminal state only through its lease-fenced job lifecycle: retryable clone or ISO failures keep `templates.template_state=provisioning` while one atomic job update records `error`/optional `raw_error`/`attempts` plus preserved `first_*` and refreshed `current_*` failure fields, increments `retry_count`, clears claim timestamps, and schedules `next_attempt_at`; a later claim preserves that result through `in_progress`, success replaces it with the success envelope, and only a non-retryable or exhausted owned attempt may atomically commit both `jobs.status=failed` and the matching payload-selected template's `provisioning`→`error` transition. Lease loss, retry-write failure, malformed ownership identity, or either failed terminal write must leave the template unchanged for stale-job recovery, and transition metrics are emitted only after the terminal transaction commits.
+
 `VCENTER_HOSTS` is the single canonical allowlist for both VM placement and
 standard-vSwitch portgroup mutation. Worker startup resolves every configured
 entry against the configured datacenter and fails if the list is empty, has
