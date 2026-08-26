@@ -40,13 +40,15 @@ synthetic:
   # Keep the non-mutating API monitor active. Destructive lifecycle coverage
   # remains independently gated below.
   suspend: false
+  schedule: "*/12 * * * *"
   provisioningExpectedEnabled: true
   lifecycle:
     enabled: false
     template: synthetic-noop
     # Pinned to the production-calibrated value. Must agree with
     # values.yaml and DefaultPodLifecycleConfig in lifecycle.go.
-    # Worst case: 2×(150s+90s)+30s+60s = 570s = 9m30s < 10min ✓
+    # Worst case: 2×(150s+90s+60s)+30s = 630s = 10m30s.
+    # The pinned */12 schedule leaves 90s before the next run.
     readyTimeout: 150s
     destroyTimeout: 90s
     maxAttempts: 2
@@ -59,9 +61,13 @@ synthetic:
   # deploy/sql/synthetic-runner-smoke-playlist.sql.
   runner:
     enabled: false
-    # Explicitly pin the deadline. WorstCaseCycle = 2430s = 40m30s;
+    schedule: "37 * * * *"
+    # Explicitly pin the deadline. The Runner-authorized retry cycle is
+    # 2490s = 41m30s and its bounded session JWT TTL is 46m;
     # 2700s (45 min) gives 270s margin and fits the hourly schedule.
     activeDeadlineSeconds: 2700
+    scheduleInterval: "1h"
+    terminationGracePeriodSeconds: 60
 
 # Template health checks (roadmap J-2) remain disabled during the initial
 # reopening. When enabled later, structural checks and the rotating deep

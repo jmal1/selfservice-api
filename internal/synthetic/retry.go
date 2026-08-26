@@ -3,6 +3,7 @@ package synthetic
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -32,21 +33,76 @@ type RetryConfig struct {
 	Backoff time.Duration
 }
 
+// CheckAttemptOverhead is the fixed allowance for HTTP round-trips, orphan
+// cleanup, result processing, and logging outside a check's configured polling
+// phases. Keeping this explicit and shared prevents per-attempt contexts from
+// drifting away from the phase timeouts they are intended to protect.
+const CheckAttemptOverhead = 60 * time.Second
+
+// CheckCleanupReserve is the portion of CheckAttemptOverhead reserved for the
+// final best-effort DELETE after ordinary work stops.
+const CheckCleanupReserve = 30 * time.Second
+
+// RunnerSessionTokenMargin keeps the runner-only JWT valid beyond the Job
+// deadline and final cleanup reserve without allowing it to reach the next
+// scheduled run.
+const RunnerSessionTokenMargin = 30 * time.Second
+
+// CheckAttemptTimeout returns the outer context budget for one check attempt.
+func CheckAttemptTimeout(phases ...time.Duration) time.Duration {
+	total := CheckAttemptOverhead
+	for _, phase := range phases {
+		total += phase
+	}
+	return total
+}
+
+// RetryCycleTimeout returns the maximum time the Runner can authorize for one
+// check, including every attempt context and each configured retry backoff.
+func RetryCycleTimeout(perAttempt time.Duration, cfg RetryConfig) time.Duration {
+	attempts := cfg.MaxAttempts
+	if attempts < 1 {
+		attempts = 1
+	}
+	return time.Duration(attempts)*perAttempt +
+		time.Duration(attempts-1)*cfg.Backoff
+}
+
+// RunnerSessionTokenTTL derives the runner-only JWT lifetime from the
+// Kubernetes Job deadline. The token must survive SIGTERM cleanup at the hard
+// deadline, but must expire before the next scheduled runner starts.
+func RunnerSessionTokenTTL(activeDeadline, scheduleInterval time.Duration) (time.Duration, error) {
+	if activeDeadline <= 0 {
+		return 0, fmt.Errorf("runner active deadline must be positive")
+	}
+	if scheduleInterval <= 0 {
+		return 0, fmt.Errorf("runner schedule interval must be positive")
+	}
+	ttl := activeDeadline + CheckCleanupReserve + RunnerSessionTokenMargin
+	if ttl >= scheduleInterval {
+		return 0, fmt.Errorf(
+			"runner session TTL %s must be shorter than schedule interval %s",
+			ttl, scheduleInterval,
+		)
+	}
+	return ttl, nil
+}
+
 // DefaultRetryConfig returns production-safe retry defaults for the expensive
 // vCenter-dependent checks.
 //
-// MaxAttempts=2 (one retry) combined with the 2-minute ReadyTimeout gives a
+// MaxAttempts=2 (one retry) combined with the 150-second ReadyTimeout gives a
 // worst-case pod_lifecycle cycle time of:
 //
-//	2 × (ReadyTimeout + DestroyTimeout) + Backoff + overhead
-//	= 2 × (120s + 90s) + 30s + 60s
-//	= 510s ≈ 8.5 minutes < 10-minute CronJob schedule
+//	2 × (ReadyTimeout + DestroyTimeout + per-attempt overhead) + Backoff
+//	= 2 × (150s + 90s + 60s) + 30s
+//	= 630s = 10.5 minutes < 12-minute CronJob schedule
 //
-// For runner_smoke (30-minute CronJob), the same config with a 10-minute
-// RunTimeout gives:
+// For runner_smoke (hourly CronJob), the same config with the chart-aligned
+// 8-minute ReadyTimeout and 10-minute RunTimeout gives:
 //
-//	2 × (120s + 600s + 90s) + 30s + 60s
-//	= 1710s ≈ 28.5 minutes < 30-minute CronJob schedule
+//	2 × (480s + 600s + 90s + 60s overhead) + 30s
+//	= 2490s = 41.5 minutes < 45-minute job deadline < hourly schedule
 func DefaultRetryConfig() RetryConfig {
 	return RetryConfig{
 		MaxAttempts: 2,

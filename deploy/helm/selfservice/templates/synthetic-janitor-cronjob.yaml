@@ -3,7 +3,7 @@
 #
 # Independent of the pod_lifecycle check's built-in pre-clean — runs from
 # its own (typically daily) schedule so orphan synthetic pods don't
-# accumulate even if the regular */10 monitor is paused, crash-looping,
+# accumulate even if the regular */12 monitor is paused, crash-looping,
 # or stuck. Reuses the same synthetic-api-monitor image, secrets, and
 # pushgateway plumbing as the regular monitor; SYNTHETIC_JANITOR_MODE=true
 # replaces the full check set with the single synthetic_janitor check.
@@ -53,7 +53,7 @@ spec:
                 - name: SYNTHETIC_JOB
                   value: {{ .Values.synthetic.job | quote }}
                 # Distinct layer label so janitor metrics don't blend
-                # with the */10 monitor's results in Pushgateway.
+                # with the */12 monitor's results in Pushgateway.
                 - name: SYNTHETIC_LAYER
                   value: {{ .Values.synthetic.janitor.layer | default "janitor" | quote }}
                 - name: SYNTHETIC_USERNAME

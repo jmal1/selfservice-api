@@ -3,6 +3,7 @@ package checks
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,7 +17,7 @@ import (
 // RunnerSmokeConfig controls the runner_smoke check's behaviour.
 // Defaults are chosen to cover the full Kali-runner path with room for a
 // slow vCenter clone, Multus interface attachment, DHCP lease, Kali image
-// pull, and action execution, all within a 30-minute CronJob cadence.
+// pull, and action execution, all within an hourly CronJob cadence.
 type RunnerSmokeConfig struct {
 	// TemplateName MUST match a row in templates.name (NOT vcenter_template).
 	// Empty disables the check entirely; the runner won't register it.
@@ -52,20 +53,28 @@ type RunnerSmokeConfig struct {
 	Logger *slog.Logger
 }
 
+// AttemptTimeout returns the outer Runner context needed for one fully
+// configured runner_smoke attempt.
+func (cfg RunnerSmokeConfig) AttemptTimeout() time.Duration {
+	return synthetic.CheckAttemptTimeout(cfg.ReadyTimeout, cfg.RunTimeout, cfg.DestroyTimeout)
+}
+
 // DefaultRunnerSmokeConfig returns production-tuned defaults.
 //
-// ReadyTimeout rationale: same as DefaultPodLifecycleConfig — the
-// synthetic-noop template reaches active in ~37 s on a healthy vCenter.
-// 2 minutes gives a 3.2× margin. With 2 attempts and 30 s backoff, worst-case
-// cycle time for the runner_smoke CronJob (30 min) is:
+// The Helm chart pins the same defaults into the dedicated runner CronJob.
+// Eight minutes covers cold clone and network attachment, while ten minutes
+// covers a cold Kali image pull and workflow execution. With two attempts and
+// a 30-second backoff, the Runner's maximum authorized cycle is:
 //
-//	2 × (ReadyTimeout + RunTimeout + DestroyTimeout) + Backoff + overhead
-//	= 2 × (120 s + 600 s + 90 s) + 30 s + 60 s = 1710 s ≈ 28.5 min < 30 min ✓
+//	2 × (ReadyTimeout + RunTimeout + DestroyTimeout + per-attempt overhead) + Backoff
+//	= 2 × (480 s + 600 s + 90 s + 60 s) + 30 s = 2490 s = 41.5 min
+//
+// That fits beneath the chart's 45-minute active deadline and hourly schedule.
 func DefaultRunnerSmokeConfig(templateName, playlistID string) RunnerSmokeConfig {
 	return RunnerSmokeConfig{
 		TemplateName:   templateName,
 		PlaylistID:     playlistID,
-		ReadyTimeout:   2 * time.Minute,
+		ReadyTimeout:   8 * time.Minute,
 		RunTimeout:     10 * time.Minute,
 		DestroyTimeout: 90 * time.Second,
 		PreCleanMaxAge: 5 * time.Minute,
@@ -201,6 +210,10 @@ func runRunnerSmoke(ctx context.Context, c *synthetic.Client, cfg RunnerSmokeCon
 		"playlist_id", cfg.PlaylistID,
 	)
 
+	attemptCtx, workCtx, cancelAttempt := boundedRunnerAttemptContexts(ctx, cfg)
+	defer cancelAttempt()
+	ctx = workCtx
+
 	// Fail fast, before any network call, on config the operator must fix.
 	//
 	// main.go deliberately registers this check even when these are unset
@@ -257,10 +270,11 @@ func runRunnerSmoke(ctx context.Context, c *synthetic.Client, cfg RunnerSmokeCon
 	// destroy issues DELETE only (no polling) — if the explicit destroy at
 	// step 9 already succeeded, destroyPod treats the resulting 404 as
 	// success, so double-firing is harmless. The deferred error is only
-	// logged, never returned, so it cannot mask the primary failure.
+	// logged, never returned, so it cannot mask the primary failure. The work
+	// context expires first, reserving the shared overhead for this request.
 	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), cfg.DestroyTimeout)
-		defer cancel()
+		cleanupCtx, cancelCleanup := runnerCleanupContext(attemptCtx, cfg.DestroyTimeout)
+		defer cancelCleanup()
 		log.Info("runner_smoke: deferred cleanup destroy")
 		s, err := destroyPod(cleanupCtx, c, podID)
 		if err != nil {
@@ -376,6 +390,29 @@ func runRunnerSmoke(ctx context.Context, c *synthetic.Client, cfg RunnerSmokeCon
 	return http.StatusOK, nil
 }
 
+func boundedRunnerAttemptContexts(
+	parent context.Context,
+	cfg RunnerSmokeConfig,
+) (context.Context, context.Context, context.CancelFunc) {
+	attemptDeadline := time.Now().Add(cfg.AttemptTimeout())
+	attemptCtx, cancelAttempt := context.WithDeadline(parent, attemptDeadline)
+	workCtx, cancelWork := context.WithDeadline(
+		attemptCtx, attemptDeadline.Add(-synthetic.CheckCleanupReserve),
+	)
+	return attemptCtx, workCtx, func() {
+		cancelWork()
+		cancelAttempt()
+	}
+}
+
+func runnerCleanupContext(
+	attemptCtx context.Context,
+	destroyTimeout time.Duration,
+) (context.Context, context.CancelFunc) {
+	timeout := min(synthetic.CheckCleanupReserve, destroyTimeout)
+	return context.WithTimeout(context.WithoutCancel(attemptCtx), timeout)
+}
+
 // createTestingRun POSTs to /api/v1/pods/{podID}/testing/run with the given
 // playlist UUID. Expects 202 with a run_id in the response body.
 //
@@ -440,6 +477,8 @@ func waitForRunTerminal(
 	podID, runID string,
 	timeout, interval time.Duration,
 ) (runnerRunResponse, int, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	deadline := time.Now().Add(timeout)
 	// Cap interval so short timeouts (tests, fast-fail configs) still get
 	// multiple poll attempts.
@@ -455,6 +494,11 @@ func waitForRunTerminal(
 	for {
 		resp, err := c.Do(ctx, http.MethodGet, path, nil)
 		if err != nil {
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return runnerRunResponse{}, lastStatus,
+					fmt.Errorf("timed out waiting for terminal run status (last seen %q) after %s",
+						lastRunStatus, timeout)
+			}
 			return runnerRunResponse{}, lastStatus, err
 		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -485,6 +529,11 @@ func waitForRunTerminal(
 
 		select {
 		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return runnerRunResponse{}, lastStatus,
+					fmt.Errorf("timed out waiting for terminal run status (last seen %q) after %s",
+						lastRunStatus, timeout)
+			}
 			return runnerRunResponse{}, lastStatus, ctx.Err()
 		case <-time.After(interval):
 		}

@@ -171,7 +171,7 @@ Use per-layer freshness rules derived from the chart schedule and deadline:
 (time() - (
   max by (layer) (crucible_synthetic_run_timestamp_seconds{layer="api"})
   or on(layer) label_replace(vector(0), "layer", "api", "", "")
-)) > 15 * 60
+)) > 17 * 60
 ```
 
 ```promql
@@ -184,7 +184,7 @@ Use per-layer freshness rules derived from the chart schedule and deadline:
 Use `for: 5m` on the alerting rule itself if you want scrape jitter damped, but
 keep the freshness threshold tied to the rendered Helm values:
 `synthetic.schedule` + `synthetic.runner.schedule` plus each CronJob's
-`activeDeadlineSeconds`. The API monitor's current values yield 15 minutes; the
+`activeDeadlineSeconds`. The API monitor's current values yield 17 minutes; the
 runner smoke CronJob yields 105 minutes.
 
 The required mutating producer now emits an explicit coverage signal. Alert on
@@ -776,6 +776,20 @@ Three things to check, in order:
 Job scheduling → Multus NAD attachment → macvlan DHCP lease → Kali image
 pull → action execution → callback → results persisted. When it fires, one
 of those links is broken.
+
+The deployed timeout envelope is intentionally layered: 8 minutes to reach an
+active pod, 10 minutes for the assessment run, 90 seconds to destroy, and a
+fixed 30-second allowance for ordinary requests plus a 30-second final-cleanup
+reserve per attempt. That yields a 20-minute-30-second outer context per
+attempt and a 41-minute-30-second maximum for two attempts plus the 30-second
+retry backoff. The synthetic session JWT lasts 46 minutes so a SIGTERM at the
+45-minute Kubernetes Job deadline can still issue the detached,
+30-second-bounded cleanup DELETE. Kubernetes grants the pod 60 seconds before
+SIGKILL, and the CronJob runs hourly. A `401` before cleanup completes or
+`context deadline exceeded` before a configured phase can finish means these
+limits have drifted; investigate the rendered CronJob and monitor image rather
+than rotating credentials or changing the assessment playlist. The token
+remains bounded below the next hourly start.
 
 **First three things to check:**
 

@@ -87,3 +87,37 @@ func TestDefaultRetryConfig_HasSensibleDefaults(t *testing.T) {
 		t.Errorf("Backoff = %v, want 30s", cfg.Backoff)
 	}
 }
+
+func TestRunnerSessionTokenTTL_CoversDeadlineCleanupAndStaysBelowSchedule(t *testing.T) {
+	ttl, err := RunnerSessionTokenTTL(45*time.Minute, time.Hour)
+	if err != nil {
+		t.Fatalf("RunnerSessionTokenTTL returned error: %v", err)
+	}
+	if ttl <= 45*time.Minute+CheckCleanupReserve {
+		t.Fatalf("TTL=%s does not outlive deadline+cleanup=%s", ttl, 45*time.Minute+CheckCleanupReserve)
+	}
+	if ttl >= time.Hour {
+		t.Fatalf("TTL=%s is not bounded below hourly schedule", ttl)
+	}
+	if ttl != 46*time.Minute {
+		t.Fatalf("TTL=%s, want 46m", ttl)
+	}
+}
+
+func TestRunnerSessionTokenTTL_RejectsUnboundedContract(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		deadline time.Duration
+		schedule time.Duration
+	}{
+		{"missing deadline", 0, time.Hour},
+		{"missing schedule", 45 * time.Minute, 0},
+		{"ttl reaches schedule", 59 * time.Minute, time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := RunnerSessionTokenTTL(tc.deadline, tc.schedule); err == nil {
+				t.Fatal("expected invalid runner JWT contract to fail")
+			}
+		})
+	}
+}

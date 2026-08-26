@@ -404,8 +404,28 @@ func TestPodLifecycle_AlwaysDestroysOnFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected timeout error")
 	}
+
 	if fake.deleteCalls < 1 {
 		t.Errorf("pod must be destroyed even on failure; deleteCalls=%d", fake.deleteCalls)
+	}
+}
+
+func TestWaitForPodStatus_BoundsInFlightRequest(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	start := time.Now()
+	_, err := waitForPodStatus(
+		context.Background(), synthetic.NewClient(srv.URL, ""), "pod-1",
+		[]string{"active"}, 50*time.Millisecond, time.Second,
+	)
+	if err == nil || !strings.Contains(err.Error(), "timed out waiting for status") {
+		t.Fatalf("waitForPodStatus error=%v, want phase timeout", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("in-flight pod request exceeded phase timeout: elapsed=%s", elapsed)
 	}
 }
 

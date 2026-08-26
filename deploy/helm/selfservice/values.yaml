@@ -333,7 +333,9 @@ synthetic:
   provisioningExpectedEnabled: true
   image: ghcr.io/jmal1/selfservice-synthetic-api-monitor
   imageTag: ""  # defaults to .Values.image.tag
-  schedule: "*/10 * * * *"
+  # The lifecycle-enabled monitor can consume 10m30s. A 12-minute cadence
+  # leaves 90 seconds before concurrencyPolicy=Forbid would skip the next run.
+  schedule: "*/12 * * * *"
   baseURL: "https://crucible.jmal.io"
   pushgatewayURL: "http://pushgateway.observability:9091"
   job: "crucible_synthetic_api"
@@ -376,8 +378,9 @@ synthetic:
     # readyTimeout: upper bound for waiting on PodStatusActive.
     # 150 s is calibrated to 24h production telemetry: longest successful
     # pod_lifecycle run was 125.2 s; 150 s adds a 20% margin. Worst-case
-    # cycle time with 2 attempts and 30 s backoff:
-    #   2 × (150 s + 90 s) + 30 s + 60 s = 570 s = 9 m 30 s < 10 min ✓
+    # cycle time with 2 attempts, 60 s per-attempt overhead, and 30 s backoff:
+    #   2 × (150 s + 90 s + 60 s) + 30 s = 630 s = 10 m 30 s.
+    # The */12 schedule leaves 90 s before the next run.
     # TestPodLifecycleRetry_WorstCaseDerivedFromHelmValues enforces this.
     readyTimeout: "150s"
     destroyTimeout: "90s"
@@ -387,11 +390,11 @@ synthetic:
     maxAttempts: 2
     retryBackoff: "30s"
     # activeDeadlineSeconds for the CronJob pod when lifecycle is enabled.
-    # Must exceed WorstCaseCycle(readyTimeout+destroyTimeout, retryBackoff, maxAttempts)
-    # = 570 s. 900 s (15 min) gives 5.5 min headroom.
+    # Must exceed the exact Runner-authorized 630 s cycle.
+    # 900 s (15 min) gives 4.5 min headroom.
     activeDeadlineSeconds: 900
   # Standalone orphan-pod janitor (defense-in-depth for synthetic monitoring).
-  # Runs independently of the */10 monitor so synthetic pods don't accumulate
+  # Runs independently of the */12 monitor so synthetic pods don't accumulate
   # even if pod_lifecycle is broken or paused. The check name is
   # `synthetic_janitor`; severity is warning. See checks/janitor.go.
   janitor:
@@ -407,14 +410,14 @@ synthetic:
     # is async (returns 202) so we don't poll; 2 minutes is generous.
     checkTimeout: "120s"
     # Distinct Pushgateway layer label keeps janitor results separate from
-    # the regular */10 monitor in dashboards and alerts.
+    # the regular */12 monitor in dashboards and alerts.
     layer: "janitor"  # Standalone Kali-runner smoke check. Provisions a real pod, runs a
   # 4-action playlist through the engine -> Multus macvlan -> Kali runner
   # path, asserts the results, and destroys the pod. This is the ONLY
   # continuous proof that path works end to end.
   #
   # Expensive (a full pod lifecycle plus a runner Job), so it runs hourly
-  # rather than every 10 minutes.
+  # rather than every 12 minutes.
   #
   # NOTE the layer label is deliberately NOT "api". runner mode registers a
   # strict SUBSET of the check family, and PushResults POSTs the whole
@@ -426,7 +429,7 @@ synthetic:
   # collision; this key exists to make the intent visible, not to enable it.
   runner:
     enabled: false
-    # Hourly at :37 -- offset from the */10 monitor and the 04:17 janitor so
+    # Hourly at :37 -- offset from the */12 monitor and the 04:17 janitor so
     # three synthetic pods never contend for the same vCenter clone slot.
     schedule: "37 * * * *"
     # templates.name to clone (NOT vcenter_template). Wrong value = every
@@ -445,15 +448,22 @@ synthetic:
     # Retry configuration. Mirrors lifecycle retry semantics.
     maxAttempts: 2
     retryBackoff: "30s"
-    # Must exceed WorstCaseCycle(readyTimeout+runTimeout+destroyTimeout, retryBackoff, maxAttempts)
-    # = 2×(480s+600s+90s) + 30s + 60s = 2430s = 40m30s.
+    # Must exceed the Runner-authorized retry cycle:
+    # 2×(480s+600s+90s+60s per-attempt overhead) + 30s = 2490s = 41m30s.
     # 2700s (45 min) leaves 270s margin and still fits the hourly schedule
     # (60 min - 45 min = 15 min gap before the next run).
-    # TestRunnerSmokeRetry_WorstCaseDerivedFromHelmValues enforces this.
-    # lifecycleSafeTimeout() independently widens the per-check budget; this
-    # is the outer Kubernetes bound. If this is smaller than WorstCaseCycle,
+    # TestRunnerSmokeRetry_WorstCaseDerivedFromHelmValues enforces this and the
+    # derived 20m30s per-attempt context plus 46-minute session JWT TTL.
+    # This is the outer Kubernetes bound. If it is smaller than the retry cycle,
     # the pod is SIGKILLed mid-attempt and pushes no metric (stale series).
     activeDeadlineSeconds: 2700
+    # Runtime derives a 46-minute runner-only JWT from the 45-minute Job
+    # deadline plus the 30-second cleanup reserve and 30-second token margin.
+    # The independently declared interval is guarded against the cron schedule.
+    scheduleInterval: "1h"
+    # ActiveDeadline termination may arrive while a synthetic pod still exists.
+    # Leave twice the 30-second cleanup reserve before Kubernetes sends SIGKILL.
+    terminationGracePeriodSeconds: 60
     layer: "runner"
 
 # Vault sidecar annotations (disabled for now)
