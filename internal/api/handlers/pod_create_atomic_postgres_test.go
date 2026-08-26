@@ -151,14 +151,14 @@ func (f *podCreatePostgresFixture) request(t *testing.T, publisher *recordingJob
 	return rec
 }
 
-func TestCreatePodRollsBackResourcesWhenInitialJobInsertFails(t *testing.T) {
-	fixture := newPodCreatePostgresFixture(t)
-	ctx := context.Background()
+func forcePodCreateJobInsertFailure(t *testing.T, pool *pgxpool.Pool, userID uuid.UUID) {
+	t.Helper()
+
 	triggerSuffix := strings.ReplaceAll(uuid.NewString(), "-", "")
 	triggerName := "fail_pod_create_job_" + triggerSuffix
 	functionName := triggerName + "_fn"
 
-	if _, err := fixture.pool.Exec(ctx, fmt.Sprintf(`
+	if _, err := pool.Exec(context.Background(), fmt.Sprintf(`
 		CREATE FUNCTION %s() RETURNS trigger AS $$
 		BEGIN
 			IF NEW.type = 'pod_create' AND NEW.payload->>'user_id' = '%s' THEN
@@ -167,19 +167,25 @@ func TestCreatePodRollsBackResourcesWhenInitialJobInsertFails(t *testing.T) {
 			RETURN NEW;
 		END;
 		$$ LANGUAGE plpgsql
-	`, functionName, fixture.userID.String())); err != nil {
+	`, functionName, userID.String())); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.pool.Exec(ctx, fmt.Sprintf(`
+	if _, err := pool.Exec(context.Background(), fmt.Sprintf(`
 		CREATE TRIGGER %s BEFORE INSERT ON jobs
 		FOR EACH ROW EXECUTE FUNCTION %s()
 	`, triggerName, functionName)); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_, _ = fixture.pool.Exec(context.Background(), fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON jobs", triggerName))
-		_, _ = fixture.pool.Exec(context.Background(), fmt.Sprintf("DROP FUNCTION IF EXISTS %s()", functionName))
+		_, _ = pool.Exec(context.Background(), fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON jobs", triggerName))
+		_, _ = pool.Exec(context.Background(), fmt.Sprintf("DROP FUNCTION IF EXISTS %s()", functionName))
 	})
+}
+
+func TestCreatePodRollsBackResourcesWhenInitialJobInsertFails(t *testing.T) {
+	fixture := newPodCreatePostgresFixture(t)
+	ctx := context.Background()
+	forcePodCreateJobInsertFailure(t, fixture.pool, fixture.userID)
 
 	publisher := &recordingJobCreatedPublisher{}
 	rec := fixture.request(t, publisher)

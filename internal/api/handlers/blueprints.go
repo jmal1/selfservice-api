@@ -306,27 +306,32 @@ func (h *Handler) DeployBlueprint(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	if err := tx.Commit(r.Context()); err != nil {
-		h.logger.Error("commit failed", "error", err)
-		respondError(w, r, http.StatusInternalServerError, "internal error")
-		return
-	}
-
 	// Queue provisioning job
-	payload, _ := json.Marshal(map[string]any{
+	payload, err := json.Marshal(map[string]any{
 		"pod_id":   podID.String(),
 		"pod_name": req.Name,
 		"user_id":  userID.String(),
 		"vms":      vmPayloads,
 	})
-	job, err := h.db.CreateJob(r.Context(), models.JobTypePodCreate, payload)
+	if err != nil {
+		h.logger.Error("marshal pod create job payload failed", "error", err)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
+		return
+	}
+	job, err := h.db.CreateJobTx(r.Context(), tx, models.JobTypePodCreate, payload)
 	if err != nil {
 		h.logger.Error("create job failed", "error", err)
 		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
-	if err := h.events.PublishJobCreated(job.ID, job.Type); err != nil {
+	if err := tx.Commit(r.Context()); err != nil {
+		h.logger.Error("commit failed", "error", err)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	if err := h.jobEvents.PublishJobCreated(job.ID, job.Type); err != nil {
 		h.logger.Warn("failed to publish job event", "error", err)
 	}
 
