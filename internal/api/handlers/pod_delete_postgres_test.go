@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/jmal1/selfservice-api/internal/audit"
 	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/models"
 	events "github.com/jmal1/selfservice-api/internal/nats"
@@ -140,28 +141,119 @@ func (f *podDeletePostgresFixture) cleanup(t *testing.T) {
 	t.Helper()
 	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cleanupCancel()
-	_, _ = f.pool.Exec(cleanupCtx, `DELETE FROM audit_log WHERE resource_id = $1`, f.podID)
-	for jobID := range f.jobIDs {
-		_, _ = f.pool.Exec(cleanupCtx, `DELETE FROM vm_placements WHERE job_id = $1`, jobID)
+	if err := f.cleanupErr(cleanupCtx); err != nil {
+		t.Fatalf("fixture cleanup failed: %v", err)
 	}
-	_, _ = f.pool.Exec(cleanupCtx, `DELETE FROM pod_portgroup_receipts WHERE pod_id = $1`, f.podID)
-	for jobID := range f.jobIDs {
-		_, _ = f.pool.Exec(cleanupCtx, `DELETE FROM jobs WHERE id = $1`, jobID)
+}
+
+func (f *podDeletePostgresFixture) cleanupErr(ctx context.Context) error {
+	if _, err := f.pool.Exec(ctx, `DELETE FROM audit_log WHERE resource_id = $1`, f.podID); err != nil {
+		return fmt.Errorf("delete audit log: %w", err)
 	}
+	for jobID := range f.jobIDs {
+		if _, err := f.pool.Exec(ctx, `DELETE FROM vm_placements WHERE job_id = $1`, jobID); err != nil {
+			return fmt.Errorf("delete VM placements for job %s: %w", jobID, err)
+		}
+	}
+	if _, err := f.pool.Exec(ctx, `DELETE FROM pod_portgroup_receipts WHERE pod_id = $1`, f.podID); err != nil {
+		return fmt.Errorf("delete pod port-group receipts: %w", err)
+	}
+	for jobID := range f.jobIDs {
+		if _, err := f.pool.Exec(ctx, `DELETE FROM jobs WHERE id = $1`, jobID); err != nil {
+			return fmt.Errorf("delete tracked job %s: %w", jobID, err)
+		}
+	}
+	if _, err := f.pool.Exec(ctx, `DELETE FROM pod_vms WHERE pod_id = $1`, f.podID); err != nil {
+		return fmt.Errorf("delete pod VMs: %w", err)
+	}
+	if _, err := f.pool.Exec(ctx, `UPDATE vlan_pool SET pod_id = NULL, allocated_at = NULL WHERE pod_id = $1`, f.podID); err != nil {
+		return fmt.Errorf("release VLAN allocation: %w", err)
+	}
+	if _, err := f.pool.Exec(ctx, `DELETE FROM pods WHERE id = $1`, f.podID); err != nil {
+		return fmt.Errorf("delete pod: %w", err)
+	}
+	if _, err := f.pool.Exec(ctx, `DELETE FROM templates WHERE id = $1`, f.templateID); err != nil {
+		return fmt.Errorf("delete template: %w", err)
+	}
+	if _, err := f.pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, f.ownerID); err != nil {
+		return fmt.Errorf("delete user: %w", err)
+	}
+
+	var auditCount int
+	if err := f.pool.QueryRow(ctx, `SELECT COUNT(*) FROM audit_log WHERE resource_id = $1`, f.podID).Scan(&auditCount); err != nil {
+		return fmt.Errorf("verify audit log cleanup: %w", err)
+	}
+	if auditCount != 0 {
+		return fmt.Errorf("audit log cleanup left %d row(s)", auditCount)
+	}
+
+	var receiptCount int
+	if err := f.pool.QueryRow(ctx, `SELECT COUNT(*) FROM pod_portgroup_receipts WHERE pod_id = $1`, f.podID).Scan(&receiptCount); err != nil {
+		return fmt.Errorf("verify pod port-group receipt cleanup: %w", err)
+	}
+	if receiptCount != 0 {
+		return fmt.Errorf("pod port-group receipt cleanup left %d row(s)", receiptCount)
+	}
+
+	var vmCount int
+	if err := f.pool.QueryRow(ctx, `SELECT COUNT(*) FROM pod_vms WHERE pod_id = $1`, f.podID).Scan(&vmCount); err != nil {
+		return fmt.Errorf("verify pod VM cleanup: %w", err)
+	}
+	if vmCount != 0 {
+		return fmt.Errorf("pod VM cleanup left %d row(s)", vmCount)
+	}
+
+	var podCount int
+	if err := f.pool.QueryRow(ctx, `SELECT COUNT(*) FROM pods WHERE id = $1`, f.podID).Scan(&podCount); err != nil {
+		return fmt.Errorf("verify pod cleanup: %w", err)
+	}
+	if podCount != 0 {
+		return fmt.Errorf("pod cleanup left %d row(s)", podCount)
+	}
+
+	var templateCount int
+	if err := f.pool.QueryRow(ctx, `SELECT COUNT(*) FROM templates WHERE id = $1`, f.templateID).Scan(&templateCount); err != nil {
+		return fmt.Errorf("verify template cleanup: %w", err)
+	}
+	if templateCount != 0 {
+		return fmt.Errorf("template cleanup left %d row(s)", templateCount)
+	}
+
+	var userCount int
+	if err := f.pool.QueryRow(ctx, `SELECT COUNT(*) FROM users WHERE id = $1`, f.ownerID).Scan(&userCount); err != nil {
+		return fmt.Errorf("verify user cleanup: %w", err)
+	}
+	if userCount != 0 {
+		return fmt.Errorf("user cleanup left %d row(s)", userCount)
+	}
+
+	var vlanPodID sql.NullString
+	var vlanAllocatedAt sql.NullTime
+	if err := f.pool.QueryRow(ctx, `
+		SELECT pod_id::text, allocated_at
+		FROM vlan_pool
+		WHERE vlan_tag = $1
+	`, f.vlanTag).Scan(&vlanPodID, &vlanAllocatedAt); err != nil {
+		return fmt.Errorf("verify VLAN cleanup: %w", err)
+	}
+	if vlanPodID.Valid && vlanPodID.String != "" {
+		return fmt.Errorf("VLAN allocation still attached to pod %s", vlanPodID.String)
+	}
+	if vlanAllocatedAt.Valid {
+		return fmt.Errorf("VLAN allocation retained timestamp %s", vlanAllocatedAt.Time)
+	}
+
 	for jobID := range f.jobIDs {
 		var remaining int
-		if err := f.pool.QueryRow(cleanupCtx, `SELECT COUNT(*) FROM jobs WHERE id = $1`, jobID).Scan(&remaining); err != nil {
-			t.Fatalf("count tracked fixture job %s during cleanup: %v", jobID, err)
+		if err := f.pool.QueryRow(ctx, `SELECT COUNT(*) FROM jobs WHERE id = $1`, jobID).Scan(&remaining); err != nil {
+			return fmt.Errorf("verify tracked job %s cleanup: %w", jobID, err)
 		}
 		if remaining != 0 {
-			t.Fatalf("fixture cleanup leaked tracked job %s", jobID)
+			return fmt.Errorf("tracked job %s still exists after cleanup", jobID)
 		}
 	}
-	_, _ = f.pool.Exec(cleanupCtx, `DELETE FROM pod_vms WHERE pod_id = $1`, f.podID)
-	_, _ = f.pool.Exec(cleanupCtx, `UPDATE vlan_pool SET pod_id = NULL, allocated_at = NULL WHERE pod_id = $1`, f.podID)
-	_, _ = f.pool.Exec(cleanupCtx, `DELETE FROM pods WHERE id = $1`, f.podID)
-	_, _ = f.pool.Exec(cleanupCtx, `DELETE FROM templates WHERE id = $1`, f.templateID)
-	_, _ = f.pool.Exec(cleanupCtx, `DELETE FROM users WHERE id = $1`, f.ownerID)
+
+	return nil
 }
 
 func (f *podDeletePostgresFixture) handler() *Handler {
@@ -825,4 +917,39 @@ func TestDeletePodFixtureCleanupLeavesSameUserSentinelJob(t *testing.T) {
 		t.Fatal("same-user sentinel job was deleted by fixture cleanup")
 	}
 	_, _ = fixture.pool.Exec(ctx, `DELETE FROM jobs WHERE id = $1`, sentinelJobID)
+}
+
+func TestDeletePodCleanupFailsLoudlyWhenAuditRowLocked(t *testing.T) {
+	fixture := newPodDeletePostgresFixture(t, 1)
+	ctx := context.Background()
+	audit.Log(ctx, fixture.queries, "pod.delete", audit.Resource("pod", fixture.podID))
+
+	lockCtx, lockCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer lockCancel()
+	tx, err := fixture.pool.Begin(lockCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lockedID int64
+	if err := tx.QueryRow(lockCtx, `
+		SELECT id
+		FROM audit_log
+		WHERE resource_id = $1
+		ORDER BY id DESC
+		LIMIT 1
+		FOR UPDATE
+	`, fixture.podID).Scan(&lockedID); err != nil {
+		_ = tx.Rollback(lockCtx)
+		t.Fatal(err)
+	}
+
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cleanupCancel()
+	if err := fixture.cleanupErr(cleanupCtx); err == nil {
+		_ = tx.Rollback(lockCtx)
+		t.Fatal("cleanupErr succeeded while audit row was locked")
+	}
+	if err := tx.Rollback(lockCtx); err != nil {
+		t.Fatal(err)
+	}
 }
