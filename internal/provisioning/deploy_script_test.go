@@ -926,6 +926,214 @@ func TestDeployScriptHelmOwnershipNormalizationLoadBearing(t *testing.T) {
 	}
 }
 
+func TestDeployScriptGeneratedAnnotationNormalizationLoadBearing(t *testing.T) {
+	requirePOSIXShell(t)
+
+	scriptDir := filepath.Join("..", "..", "deploy", "scripts")
+	deployPath := filepath.Join(scriptDir, "deploy.sh")
+	deployBody, err := os.ReadFile(deployPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	filterPath := filepath.Join(scriptDir, "canonicalize-workload-spec.jq")
+	filterBody, err := os.ReadFile(filterPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name       string
+		filterLine string
+		deployLine string
+		mode       string
+	}{
+		{
+			name:       "Deployment revision",
+			filterLine: `            del(."deployment.kubernetes.io/revision")`,
+			deployLine: `            del(.metadata.annotations."deployment.kubernetes.io/revision")`,
+			mode:       "deployment-revision",
+		},
+		{
+			name:       "DaemonSet generation",
+			filterLine: `            del(."deprecated.daemonset.template.generation")`,
+			deployLine: `            del(.metadata.annotations."deprecated.daemonset.template.generation")`,
+			mode:       "daemonset-generation",
+		},
+	} {
+		t.Run(test.name+" baseline", func(t *testing.T) {
+			if strings.Count(string(filterBody), test.filterLine) != 1 {
+				t.Fatalf("expected exactly one narrow %s baseline exception", test.name)
+			}
+			sabotagedFilterBody := strings.Replace(string(filterBody), test.filterLine, "            .", 1)
+			suffix := strings.ToLower(strings.ReplaceAll(test.name, " ", "-"))
+			sabotagedFilterPath := filepath.Join(
+				scriptDir,
+				"canonicalize-workload-spec-sabotaged-"+suffix+"-test.jq",
+			)
+			writeFile(t, sabotagedFilterPath, sabotagedFilterBody)
+			t.Cleanup(func() { os.Remove(sabotagedFilterPath) })
+
+			const filterAssignment = `CANONICALIZE_WORKLOAD_FILTER="$SCRIPT_DIR/canonicalize-workload-spec.jq"`
+			if strings.Count(string(deployBody), filterAssignment) != 1 {
+				t.Fatal("deploy script canonicalizer assignment is not unique")
+			}
+			sabotagedDeployBody := strings.Replace(
+				string(deployBody),
+				filterAssignment,
+				`CANONICALIZE_WORKLOAD_FILTER="$SCRIPT_DIR/`+filepath.Base(sabotagedFilterPath)+`"`,
+				1,
+			)
+			sabotagedDeployPath := filepath.Join(
+				scriptDir,
+				"deploy-sabotaged-"+suffix+"-baseline-test.sh",
+			)
+			writeExecutable(t, sabotagedDeployPath, sabotagedDeployBody)
+			t.Cleanup(func() { os.Remove(sabotagedDeployPath) })
+
+			manifest := baselineManifest(true, "*", "false")
+			env := newDeployScriptEnvironment(t, manifest, manifest)
+			env.scriptPath = sabotagedDeployPath
+			output, runErr := env.run(
+				"--prepare-claims-baseline",
+				"--baseline-chart-dir",
+				env.chartDir,
+			)
+			if runErr == nil {
+				t.Fatalf("baseline passed without the exact %s exception:\n%s", test.name, output)
+			}
+			if !strings.Contains(string(output), "spec drifts from the server-defaulted safe chart") {
+				t.Fatalf("baseline failed for the wrong reason without the %s exception:\n%s", test.name, output)
+			}
+		})
+
+		t.Run(test.name+" post-apply", func(t *testing.T) {
+			if strings.Count(string(deployBody), test.deployLine) != 1 {
+				t.Fatalf("expected exactly one narrow %s post-apply exception", test.name)
+			}
+			sabotagedDeployBody := strings.Replace(string(deployBody), test.deployLine, "            .", 1)
+			suffix := strings.ToLower(strings.ReplaceAll(test.name, " ", "-"))
+			sabotagedDeployPath := filepath.Join(
+				scriptDir,
+				"deploy-sabotaged-"+suffix+"-post-apply-test.sh",
+			)
+			writeExecutable(t, sabotagedDeployPath, sabotagedDeployBody)
+			t.Cleanup(func() { os.Remove(sabotagedDeployPath) })
+
+			live := baselineManifest(true, "", "false")
+			env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "false"))
+			env.postApplyAnnotationsMode = test.mode
+			env.scriptPath = sabotagedDeployPath
+			output, runErr := env.run("--no-pull")
+			if runErr == nil {
+				t.Fatalf("post-apply proof passed without the exact %s exception:\n%s", test.name, output)
+			}
+			if !strings.Contains(string(output), "deployed Helm object set differs") {
+				t.Fatalf("post-apply proof failed for the wrong reason without the %s exception:\n%s", test.name, output)
+			}
+			if _, statErr := os.Stat(env.lockFile); statErr != nil {
+				t.Fatalf("post-apply mismatch did not retain the release lock: %v", statErr)
+			}
+		})
+	}
+}
+
+func TestDeployScriptPostApplyGeneratedAnnotationHandling(t *testing.T) {
+	requirePOSIXShell(t)
+
+	live := baselineManifest(true, "", "false")
+	t.Run("ignores realistic generated annotations", func(t *testing.T) {
+		env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "false"))
+		env.postApplyAnnotationsMode = "generated"
+		output, err := env.run("--no-pull")
+		if err != nil {
+			t.Fatalf("post-apply proof rejected generated annotations: %v\n%s", err, output)
+		}
+		if !strings.Contains(string(output), "deployed exact source") {
+			t.Fatalf("deploy did not complete after generated annotation normalization:\n%s", output)
+		}
+	})
+
+	for _, test := range []struct {
+		name      string
+		mode      string
+		configure func(*deployScriptEnvironment)
+	}{
+		{name: "wrong-kind generated key", mode: "wrong-kind"},
+		{name: "template-level generated key", mode: "template-level"},
+		{name: "similarly named key", mode: "similarly-named"},
+		{name: "unrelated annotation", mode: "unrelated"},
+		{name: "wrong-kind key on DaemonSet", mode: "daemonset-wrong-kind"},
+		{name: "template-level key on DaemonSet", mode: "daemonset-template-level"},
+		{name: "similarly named key on DaemonSet", mode: "daemonset-similarly-named"},
+		{name: "unrelated annotation on DaemonSet", mode: "daemonset-unrelated"},
+		{
+			name: "ordinary spec drift",
+			configure: func(env *deployScriptEnvironment) {
+				env.postUpgradeObjectMutation = true
+			},
+		},
+	} {
+		t.Run("preserves "+test.name, func(t *testing.T) {
+			env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "false"))
+			env.postApplyAnnotationsMode = test.mode
+			if test.configure != nil {
+				test.configure(env)
+			}
+			output, err := env.run("--no-pull")
+			if err == nil {
+				t.Fatalf("post-apply proof ignored %s:\n%s", test.name, output)
+			}
+			if !strings.Contains(string(output), "deployed Helm object set differs") {
+				t.Fatalf("post-apply proof rejected %s for the wrong reason:\n%s", test.name, output)
+			}
+			if _, statErr := os.Stat(env.lockFile); statErr != nil {
+				t.Fatalf("post-apply mismatch did not retain the release lock: %v", statErr)
+			}
+		})
+	}
+
+	t.Run("broad annotation deletion hides preserved drift", func(t *testing.T) {
+		deployPath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
+		deployBody, err := os.ReadFile(deployPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		const narrowBlock = `          if .kind == "Deployment" and
+             (.metadata.annotations | type) == "object" and
+             (.metadata.annotations | has("deployment.kubernetes.io/revision")) then
+            del(.metadata.annotations."deployment.kubernetes.io/revision")
+          elif .kind == "DaemonSet" and
+               (.metadata.annotations | type) == "object" and
+               (.metadata.annotations | has("deprecated.daemonset.template.generation")) then
+            del(.metadata.annotations."deprecated.daemonset.template.generation")
+          else
+            .
+          end
+          |`
+		const broadBlock = `          del(.metadata.annotations)
+          |`
+		if strings.Count(string(deployBody), narrowBlock) != 1 {
+			t.Fatal("post-apply narrow annotation normalization block is not unique")
+		}
+		sabotagedBody := strings.Replace(string(deployBody), narrowBlock, broadBlock, 1)
+		scriptDir := filepath.Dir(deployPath)
+		sabotagedPath := filepath.Join(scriptDir, "deploy-sabotaged-broad-annotation-deletion-test.sh")
+		writeExecutable(t, sabotagedPath, sabotagedBody)
+		t.Cleanup(func() { os.Remove(sabotagedPath) })
+
+		env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "false"))
+		env.postApplyAnnotationsMode = "unrelated"
+		env.scriptPath = sabotagedPath
+		output, runErr := env.run("--no-pull")
+		if runErr != nil {
+			t.Fatalf("broad deletion sabotage did not hide unrelated annotation drift: %v\n%s", runErr, output)
+		}
+		if !strings.Contains(string(output), "deployed exact source") {
+			t.Fatalf("broad deletion sabotage did not reach false success:\n%s", output)
+		}
+	})
+}
+
 // kubectlServerApplyDryRunFunctionName is the single bash function in
 // deploy.sh that may ever invoke
 // `kubectl apply --server-side --dry-run=server --force-conflicts`. This
@@ -2808,6 +3016,22 @@ func TestDeployWorkloadCanonicalizerKubectlCompatibility(t *testing.T) {
   }
 }`, topAnnotations, replicas, templateAnnotations, testDigestA)
 	}
+	daemonSet := func(topAnnotations, templateAnnotations string) string {
+		return fmt.Sprintf(`{
+  "apiVersion": "apps/v1",
+  "kind": "DaemonSet",
+  "metadata": {"name": "fixture", "annotations": %s},
+  "spec": {
+    "selector": {"matchLabels": {"app": "fixture"}},
+    "template": {
+      "metadata": {"labels": {"app": "fixture"}, "annotations": %s},
+      "spec": {
+        "containers": [{"name": "fixture", "image": "example.invalid/fixture@sha256:%s"}]
+      }
+    }
+  }
+}`, topAnnotations, templateAnnotations, testDigestA)
+	}
 
 	t.Run("ignores expected Helm ownership and Deployment revision annotations", func(t *testing.T) {
 		live := deployment(`{
@@ -2849,6 +3073,49 @@ func TestDeployWorkloadCanonicalizerKubectlCompatibility(t *testing.T) {
 		}
 		if string(sabotagedLive) == string(sabotagedDesired) {
 			t.Fatal("removing the exact revision exception did not restore the false drift")
+		}
+	})
+
+	t.Run("ignores expected Helm ownership and DaemonSet generation annotations", func(t *testing.T) {
+		live := daemonSet(`{
+		  "deprecated.daemonset.template.generation":"7",
+		  "meta.helm.sh/release-name":"selfservice",
+		  "meta.helm.sh/release-namespace":"selfservice"
+		}`, `{}`)
+		desired := daemonSet(`{}`, `{}`)
+		liveOutput, liveErr := canonicalize(t, filter, "DaemonSet", live)
+		if liveErr != nil {
+			t.Fatalf("live DaemonSet canonicalization failed: %v\n%s", liveErr, liveOutput)
+		}
+		desiredOutput, desiredErr := canonicalize(t, filter, "DaemonSet", desired)
+		if desiredErr != nil {
+			t.Fatalf("desired DaemonSet canonicalization failed: %v\n%s", desiredErr, desiredOutput)
+		}
+		if string(liveOutput) != string(desiredOutput) {
+			t.Fatalf("top-level generation annotation caused false drift:\nlive: %s\ndesired: %s", liveOutput, desiredOutput)
+		}
+
+		filterBody, readErr := os.ReadFile(filter)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		const exception = `            del(."deprecated.daemonset.template.generation")`
+		if strings.Count(string(filterBody), exception) != 1 {
+			t.Fatalf("expected exactly one narrow DaemonSet generation exception")
+		}
+		withoutException := strings.Replace(string(filterBody), exception, `.`, 1)
+		sabotagedFilter := filepath.Join(t.TempDir(), "canonicalize-workload-spec.jq")
+		writeFile(t, sabotagedFilter, withoutException)
+		sabotagedLive, sabotagedLiveErr := canonicalize(t, sabotagedFilter, "DaemonSet", live)
+		if sabotagedLiveErr != nil {
+			t.Fatalf("sabotaged live canonicalization failed unexpectedly: %v\n%s", sabotagedLiveErr, sabotagedLive)
+		}
+		sabotagedDesired, sabotagedDesiredErr := canonicalize(t, sabotagedFilter, "DaemonSet", desired)
+		if sabotagedDesiredErr != nil {
+			t.Fatalf("sabotaged desired canonicalization failed unexpectedly: %v\n%s", sabotagedDesiredErr, sabotagedDesired)
+		}
+		if string(sabotagedLive) == string(sabotagedDesired) {
+			t.Fatal("removing the exact generation exception did not restore the false drift")
 		}
 	})
 
@@ -2911,9 +3178,45 @@ func TestDeployWorkloadCanonicalizerKubectlCompatibility(t *testing.T) {
 			desired: deployment(`{"meta.helm.sh/other":"desired"}`, `{}`, "1"),
 		},
 		{
+			name:    "preserves similarly named Deployment revision annotation drift",
+			live:    deployment(`{"deployment.kubernetes.io/revision-note":"live"}`, `{}`, "1"),
+			desired: deployment(`{"deployment.kubernetes.io/revision-note":"desired"}`, `{}`, "1"),
+		},
+		{
 			name:    "preserves pod-template revision annotation drift",
 			live:    deployment(`{}`, `{"deployment.kubernetes.io/revision":"163"}`, "1"),
 			desired: deployment(`{}`, `{"deployment.kubernetes.io/revision":"164"}`, "1"),
+		},
+		{
+			name: "preserves DaemonSet generation annotation on wrong kind",
+			live: deployment(
+				`{"deprecated.daemonset.template.generation":"7"}`,
+				`{}`,
+				"1",
+			),
+			desired: deployment(
+				`{"deprecated.daemonset.template.generation":"8"}`,
+				`{}`,
+				"1",
+			),
+		},
+		{
+			name:    "preserves pod-template DaemonSet generation annotation drift",
+			kind:    "DaemonSet",
+			live:    daemonSet(`{}`, `{"deprecated.daemonset.template.generation":"7"}`),
+			desired: daemonSet(`{}`, `{"deprecated.daemonset.template.generation":"8"}`),
+		},
+		{
+			name:    "preserves similarly named DaemonSet generation annotation drift",
+			kind:    "DaemonSet",
+			live:    daemonSet(`{"deprecated.daemonset.template.generation-note":"live"}`, `{}`),
+			desired: daemonSet(`{"deprecated.daemonset.template.generation-note":"desired"}`, `{}`),
+		},
+		{
+			name:    "preserves Deployment revision annotation on DaemonSet",
+			kind:    "DaemonSet",
+			live:    daemonSet(`{"deployment.kubernetes.io/revision":"163"}`, `{}`),
+			desired: daemonSet(`{"deployment.kubernetes.io/revision":"164"}`, `{}`),
 		},
 		{
 			name:    "preserves ordinary Deployment spec drift",
@@ -2951,7 +3254,7 @@ func TestDeployWorkloadCanonicalizerKubectlCompatibility(t *testing.T) {
 				t.Fatalf("desired %s canonicalization failed: %v\n%s", kind, desiredErr, desiredOutput)
 			}
 			if string(liveOutput) == string(desiredOutput) {
-				t.Fatal("canonicalizer ignored fail-closed Deployment drift")
+				t.Fatal("canonicalizer ignored fail-closed workload drift")
 			}
 		})
 	}
@@ -3421,6 +3724,7 @@ type deployScriptEnvironment struct {
 	atomicRollbackMismatch         string
 	postUpgradeMismatch            string
 	postUpgradeObjectMutation      bool
+	postApplyAnnotationsMode       string
 
 	// simulateOwnershipConflict makes the fake kubectl reject any
 	// `--server-side --dry-run=server` apply that lacks `--force-conflicts`
@@ -3693,7 +3997,7 @@ json_resource() {
   local manifest=$1
   local resource=$2
   local source=${3:-desired}
-  local resource_file canonical kind replicas revision
+  local resource_file canonical kind replicas revision daemonset_generation
   resource_file=$(mktemp)
   extract_resource "$manifest" "$resource" > "$resource_file"
   canonical=$(canonical_resource "$resource_file")
@@ -3712,6 +4016,10 @@ json_resource() {
   ' "$resource_file")
   if [ "$source" = live ] && [ "$kind" = Deployment ]; then
     revision=$FAKE_LIVE_DEPLOYMENT_REVISION
+  fi
+  daemonset_generation=
+  if [ "$source" = live ] && [ "$kind" = DaemonSet ]; then
+    daemonset_generation=$FAKE_LIVE_DAEMONSET_GENERATION
   fi
   server_yaml_count=$(count_logical_yaml_calls)
   if [ "$FAKE_MUTATE_FINAL_SERVER_OBJECT" = true ] &&
@@ -3734,7 +4042,9 @@ serverInjectedMutation: true"
       --arg kind "$kind" \
       --arg canonical "$canonical" \
       --arg revision "$revision" \
+      --arg daemonset_generation "$daemonset_generation" \
       --arg source "$source" \
+      --arg post_apply_mode "$FAKE_POST_APPLY_ANNOTATIONS_MODE" \
       --arg release "$FAKE_LIVE_HELM_RELEASE" \
       --arg namespace "$FAKE_LIVE_HELM_NAMESPACE" \
       --argjson replicas "$replicas" \
@@ -3750,23 +4060,60 @@ serverInjectedMutation: true"
               } + (
                 if $kind == "Deployment" then
                   {"deployment.kubernetes.io/revision":$revision}
+                elif $kind == "DaemonSet" then
+                  {"deprecated.daemonset.template.generation":$daemonset_generation}
                 else
                   {}
                 end
               )
+            elif $source == "post-apply" then
+              if ($post_apply_mode == "generated" or $post_apply_mode == "deployment-revision") and
+                 $kind == "Deployment" then
+                {"deployment.kubernetes.io/revision":"164"}
+              elif ($post_apply_mode == "generated" or $post_apply_mode == "daemonset-generation") and
+                   $kind == "DaemonSet" then
+                {"deprecated.daemonset.template.generation":"8"}
+              elif $post_apply_mode == "unrelated" and $kind == "Deployment" then
+                {"operations.example/owner":"live"}
+              elif $post_apply_mode == "similarly-named" and $kind == "Deployment" then
+                {"deployment.kubernetes.io/revision-note":"live"}
+              elif $post_apply_mode == "wrong-kind" and $kind == "Deployment" then
+                {"deprecated.daemonset.template.generation":"8"}
+              elif $post_apply_mode == "daemonset-unrelated" and $kind == "DaemonSet" then
+                {"operations.example/owner":"live"}
+              elif $post_apply_mode == "daemonset-similarly-named" and $kind == "DaemonSet" then
+                {"deprecated.daemonset.template.generation-note":"live"}
+              elif $post_apply_mode == "daemonset-wrong-kind" and $kind == "DaemonSet" then
+                {"deployment.kubernetes.io/revision":"164"}
+              else
+                null
+              end
             else
               null
             end
           )
         },
-        spec:{fixtureCanonical:$canonical,replicas:$replicas}
+        spec:(
+          {fixtureCanonical:$canonical,replicas:$replicas} +
+          if $source == "post-apply" and $post_apply_mode == "template-level" and
+             $kind == "Deployment" then
+            {template:{metadata:{annotations:{"deployment.kubernetes.io/revision":"164"}}}}
+          elif $source == "post-apply" and $post_apply_mode == "daemonset-template-level" and
+               $kind == "DaemonSet" then
+            {template:{metadata:{annotations:{"deprecated.daemonset.template.generation":"8"}}}}
+          else
+            {}
+          end
+        )
       }'
   else
     jq -cn \
       --arg kind "$kind" \
       --arg canonical "$canonical" \
       --arg revision "$revision" \
+      --arg daemonset_generation "$daemonset_generation" \
       --arg source "$source" \
+      --arg post_apply_mode "$FAKE_POST_APPLY_ANNOTATIONS_MODE" \
       --arg release "$FAKE_LIVE_HELM_RELEASE" \
       --arg namespace "$FAKE_LIVE_HELM_NAMESPACE" \
       '{
@@ -3781,16 +4128,51 @@ serverInjectedMutation: true"
               } + (
                 if $kind == "Deployment" then
                   {"deployment.kubernetes.io/revision":$revision}
+                elif $kind == "DaemonSet" then
+                  {"deprecated.daemonset.template.generation":$daemonset_generation}
                 else
                   {}
                 end
               )
+            elif $source == "post-apply" then
+              if ($post_apply_mode == "generated" or $post_apply_mode == "deployment-revision") and
+                 $kind == "Deployment" then
+                {"deployment.kubernetes.io/revision":"164"}
+              elif ($post_apply_mode == "generated" or $post_apply_mode == "daemonset-generation") and
+                   $kind == "DaemonSet" then
+                {"deprecated.daemonset.template.generation":"8"}
+              elif $post_apply_mode == "unrelated" and $kind == "Deployment" then
+                {"operations.example/owner":"live"}
+              elif $post_apply_mode == "similarly-named" and $kind == "Deployment" then
+                {"deployment.kubernetes.io/revision-note":"live"}
+              elif $post_apply_mode == "wrong-kind" and $kind == "Deployment" then
+                {"deprecated.daemonset.template.generation":"8"}
+              elif $post_apply_mode == "daemonset-unrelated" and $kind == "DaemonSet" then
+                {"operations.example/owner":"live"}
+              elif $post_apply_mode == "daemonset-similarly-named" and $kind == "DaemonSet" then
+                {"deprecated.daemonset.template.generation-note":"live"}
+              elif $post_apply_mode == "daemonset-wrong-kind" and $kind == "DaemonSet" then
+                {"deployment.kubernetes.io/revision":"164"}
+              else
+                null
+              end
             else
               null
             end
           )
         },
-        spec:{fixtureCanonical:$canonical}
+        spec:(
+          {fixtureCanonical:$canonical} +
+          if $source == "post-apply" and $post_apply_mode == "template-level" and
+             $kind == "Deployment" then
+            {template:{metadata:{annotations:{"deployment.kubernetes.io/revision":"164"}}}}
+          elif $source == "post-apply" and $post_apply_mode == "daemonset-template-level" and
+               $kind == "DaemonSet" then
+            {template:{metadata:{annotations:{"deprecated.daemonset.template.generation":"8"}}}}
+          else
+            {}
+          end
+        )
       }'
   fi
   rm -f "$resource_file"
@@ -4108,7 +4490,11 @@ case "$1" in
         }
       ' "$manifest")
       [ -n "$resource" ]
-      json_resource "$manifest" "$resource"
+      source=desired
+      if [ -f "$FAKE_UPGRADED_MARKER" ]; then
+        source=post-apply
+      fi
+      json_resource "$manifest" "$resource" "$source"
     else
       # Real kubectl does not return "---"-separated top-level documents
       # for a multi-document "-f" "-o yaml" apply: it collapses every
@@ -4397,6 +4783,7 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_LIVE_MANIFEST="+e.liveManifest,
 		"FAKE_LIVE_RESOURCE_MANIFEST="+e.liveResource,
 		"FAKE_LIVE_DEPLOYMENT_REVISION=163",
+		"FAKE_LIVE_DAEMONSET_GENERATION=7",
 		"FAKE_LIVE_HELM_RELEASE="+e.liveHelmRelease,
 		"FAKE_LIVE_HELM_NAMESPACE="+e.liveHelmNamespace,
 		"FAKE_CANDIDATE_MANIFEST="+e.candidateManifest,
@@ -4448,6 +4835,7 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_ATOMIC_ROLLBACK_MISMATCH="+e.atomicRollbackMismatch,
 		"FAKE_POST_UPGRADE_MISMATCH="+e.postUpgradeMismatch,
 		"FAKE_POST_UPGRADE_OBJECT_MUTATION="+strconv.FormatBool(e.postUpgradeObjectMutation),
+		"FAKE_POST_APPLY_ANNOTATIONS_MODE="+e.postApplyAnnotationsMode,
 		"FAKE_GIT_BRANCH="+e.gitBranch,
 		"FAKE_GIT_REMOTE_SHA="+e.gitRemoteSHA,
 		"FAKE_GIT_REMOTE_URL="+e.gitRemoteURL,
