@@ -417,6 +417,7 @@ func TestDeployScriptRollbackContainmentFinalRevisionFence(t *testing.T) {
 		name          string
 		finalRevision int
 		finalStatus   string
+		historyExit   int
 		wantOutput    string
 	}{
 		{
@@ -430,6 +431,11 @@ func TestDeployScriptRollbackContainmentFinalRevisionFence(t *testing.T) {
 			finalStatus: "pending-upgrade",
 			wantOutput:  "expected 165 deployed, found 165 pending-upgrade",
 		},
+		{
+			name:        "final history emits valid record then fails",
+			historyExit: 7,
+			wantOutput:  "could not re-read the latest Helm revision",
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			manifest := baselineManifest(true, "", "false")
@@ -437,6 +443,7 @@ func TestDeployScriptRollbackContainmentFinalRevisionFence(t *testing.T) {
 			env.helmRevision = 165
 			env.postLiveHelmRevision = test.finalRevision
 			env.postLiveHelmStatus = test.finalStatus
+			env.postLiveHelmHistoryExit = test.historyExit
 
 			output, err := env.run("--verify-rollback-containment")
 			if err == nil {
@@ -490,6 +497,45 @@ func TestDeployScriptRollbackContainmentFinalRevisionFenceLoadBearing(t *testing
 	}
 	if _, statErr := os.Stat(env.liveVerificationMark); statErr != nil {
 		t.Fatalf("fake Helm drift occurred before live verification began: %v", statErr)
+	}
+}
+
+func TestDeployScriptRollbackContainmentFinalRevisionReadStatusLoadBearing(t *testing.T) {
+	requirePOSIXShell(t)
+
+	deployPath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
+	deployBody, err := os.ReadFile(deployPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const checkedRead = `  if ! latest_record="$(latest_helm_revision_record)"; then
+    echo "ERROR: could not re-read the latest Helm revision after live rollback containment verification." >&2
+    return 1
+  fi
+`
+	const uncheckedRead = `  latest_record="$(latest_helm_revision_record)" || true
+`
+	if strings.Count(string(deployBody), checkedRead) != 1 {
+		t.Fatal("final post-live Helm history status check is not unique")
+	}
+	sabotagedBody := strings.Replace(string(deployBody), checkedRead, uncheckedRead, 1)
+	scriptDir := filepath.Dir(deployPath)
+	sabotagedPath := filepath.Join(scriptDir, "deploy-sabotaged-post-live-history-status-test.sh")
+	writeExecutable(t, sabotagedPath, sabotagedBody)
+	t.Cleanup(func() { os.Remove(sabotagedPath) })
+
+	manifest := baselineManifest(true, "", "false")
+	env := newDeployScriptEnvironment(t, manifest, manifest)
+	env.helmRevision = 165
+	env.postLiveHelmHistoryExit = 7
+	env.scriptPath = sabotagedPath
+
+	output, runErr := env.run("--verify-rollback-containment")
+	if runErr != nil {
+		t.Fatalf("removing the final history status check did not expose false acceptance: %v\n%s", runErr, output)
+	}
+	if !strings.Contains(string(output), "rollback containment verified: deployed revision 165") {
+		t.Fatalf("removing the final history status check did not reach false success:\n%s", output)
 	}
 }
 
@@ -4010,6 +4056,7 @@ type deployScriptEnvironment struct {
 	helmRevision              int
 	postLiveHelmRevision      int
 	postLiveHelmStatus        string
+	postLiveHelmHistoryExit   int
 	helmDescription           string
 	immutableRevisionMissing  bool
 	immutableHelmStatus       string
@@ -4188,6 +4235,10 @@ case "$1 $2" in
       status=$FAKE_POST_LIVE_HELM_STATUS
     fi
     printf '%s\n' '- app_version: test' "  description: $FAKE_HELM_DESCRIPTION" "  revision: $revision" "  status: $status"
+    if [ -f "$FAKE_LIVE_VERIFICATION_MARKER" ] &&
+       [ "$FAKE_POST_LIVE_HELM_HISTORY_EXIT" != 0 ]; then
+      exit "$FAKE_POST_LIVE_HELM_HISTORY_EXIT"
+    fi
     ;;
   "get manifest")
     revision=$(requested_revision "$@")
@@ -4716,7 +4767,8 @@ case "$1" in
     ;;
   rollout)
     if [ "$FAKE_POST_LIVE_HELM_REVISION" != 0 ] ||
-       [ -n "$FAKE_POST_LIVE_HELM_STATUS" ]; then
+       [ -n "$FAKE_POST_LIVE_HELM_STATUS" ] ||
+       [ "$FAKE_POST_LIVE_HELM_HISTORY_EXIT" != 0 ]; then
       : > "$FAKE_LIVE_VERIFICATION_MARKER"
     fi
     ;;
@@ -5235,6 +5287,7 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_HELM_REVISION="+strconv.Itoa(e.helmRevision),
 		"FAKE_POST_LIVE_HELM_REVISION="+strconv.Itoa(e.postLiveHelmRevision),
 		"FAKE_POST_LIVE_HELM_STATUS="+e.postLiveHelmStatus,
+		"FAKE_POST_LIVE_HELM_HISTORY_EXIT="+strconv.Itoa(e.postLiveHelmHistoryExit),
 		"FAKE_HELM_DESCRIPTION="+e.helmDescription,
 		"FAKE_IMMUTABLE_REVISION_MISSING="+strconv.FormatBool(e.immutableRevisionMissing),
 		"FAKE_IMMUTABLE_HELM_STATUS="+e.immutableHelmStatus,

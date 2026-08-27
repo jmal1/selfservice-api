@@ -1289,9 +1289,13 @@ canonicalize_helm_release_metadata() {
 
 require_helm_revision_still_deployed() {
   local expected_revision=$1
-  local observed_revision observed_status
-  if ! read -r observed_revision observed_status <<< "$(latest_helm_revision_record)"; then
+  local latest_record observed_revision observed_status
+  if ! latest_record="$(latest_helm_revision_record)"; then
     echo "ERROR: could not re-read the latest Helm revision after live rollback containment verification." >&2
+    return 1
+  fi
+  if ! read -r observed_revision observed_status <<< "$latest_record"; then
+    echo "ERROR: could not parse the latest Helm revision after live rollback containment verification." >&2
     return 1
   fi
   if [ "$observed_revision" != "$expected_revision" ] ||
