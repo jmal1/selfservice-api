@@ -3361,10 +3361,11 @@ if [ "$helm_upgrade_status" -ne 0 ]; then
   exit "$helm_upgrade_status"
 fi
 
+HELM_RELEASE_LOCK_PRESERVE=true
 if ! verify_deployed_candidate; then
-  HELM_RELEASE_LOCK_PRESERVE=true
   echo "ERROR: Helm reported success but exact candidate containment failed. The release lock is intentionally retained; manual intervention is required." >&2
   exit 1
 fi
+HELM_RELEASE_LOCK_PRESERVE=false
 release_helm_release_lock
 echo "==> deployed exact source $CANDIDATE_SOURCE_SHA with immutable workload and RUNNER_IMAGE digests"

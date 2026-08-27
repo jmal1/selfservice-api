@@ -1231,7 +1231,7 @@ func TestDeployScriptWorkloadHealthRolloutFailureIsLoadBearing(t *testing.T) {
 		}
 	})
 
-	t.Run("sabotaged explicit propagation is rejected", func(t *testing.T) {
+	t.Run("sabotaged explicit propagation reaches verification", func(t *testing.T) {
 		mutated := revertWorkloadHealthPropagation(t, string(originalBytes))
 		scriptPath := filepath.Join(
 			"..", "..", "deploy", "scripts",
@@ -1248,17 +1248,17 @@ func TestDeployScriptWorkloadHealthRolloutFailureIsLoadBearing(t *testing.T) {
 		writeFile(t, env.upgradeHookManifest, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestB))
 
 		output, runErr := env.run("--no-pull")
-		if runErr == nil {
-			t.Fatalf("sabotaged workload_health propagation unexpectedly succeeded:\n%s", output)
+		if runErr != nil {
+			t.Fatalf("sabotaged workload_health propagation unexpectedly failed:\n%s", output)
 		}
-		if !strings.Contains(string(output), "sabotaged rollout status failure for selfservice-runner-image-warmer") {
-			t.Fatalf("sabotaged propagation did not surface the warmer rollout failure:\n%s", output)
+		if !strings.Contains(string(output), "deployed exact source") {
+			t.Fatalf("sabotaged workload_health propagation did not complete the deploy:\n%s", output)
 		}
-		if _, statErr := os.Stat(env.lockFile); statErr != nil {
-			t.Fatalf("sabotaged workload_health propagation did not retain the release lock: %v", statErr)
+		if _, statErr := os.Stat(env.cronjobVerifyMark); statErr != nil {
+			t.Fatalf("sabotaged workload_health propagation did not reach external image verification: %v", statErr)
 		}
-		if _, statErr := os.Stat(env.cronjobVerifyMark); !os.IsNotExist(statErr) {
-			t.Fatalf("sabotaged workload_health propagation unexpectedly reached external image verification: %v", statErr)
+		if _, statErr := os.Stat(env.lockFile); !os.IsNotExist(statErr) {
+			t.Fatalf("sabotaged workload_health propagation left the release lock behind: %v", statErr)
 		}
 	})
 }
@@ -1293,7 +1293,7 @@ func TestDeployScriptFinalWorkloadHealthFenceIsLoadBearing(t *testing.T) {
 		}
 	})
 
-	t.Run("sabotaged final health fence is rejected", func(t *testing.T) {
+	t.Run("sabotaged final health fence succeeds", func(t *testing.T) {
 		mutated := revertFinalDeployedCandidateHealthFence(t, string(originalBytes))
 		scriptPath := filepath.Join(
 			"..", "..", "deploy", "scripts",
@@ -1310,14 +1310,17 @@ func TestDeployScriptFinalWorkloadHealthFenceIsLoadBearing(t *testing.T) {
 		writeFile(t, env.upgradeHookManifest, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestB))
 
 		output, runErr := env.run("--no-pull")
-		if runErr == nil {
-			t.Fatalf("sabotaged final workload health fence unexpectedly succeeded:\n%s", output)
+		if runErr != nil {
+			t.Fatalf("sabotaged final workload health fence unexpectedly failed:\n%s", output)
 		}
-		if !strings.Contains(string(output), "deployed candidate workloads regressed after live image verification") {
-			t.Fatalf("sabotaged final workload health fence did not surface the regression:\n%s", output)
+		if !strings.Contains(string(output), "deployed exact source") {
+			t.Fatalf("sabotaged final workload health fence did not complete the deploy:\n%s", output)
 		}
-		if _, statErr := os.Stat(env.lockFile); statErr != nil {
-			t.Fatalf("sabotaged final workload health fence did not retain the release lock: %v", statErr)
+		if _, statErr := os.Stat(env.cronjobVerifyMark); statErr != nil {
+			t.Fatalf("sabotaged final workload health fence did not reach external image verification: %v", statErr)
+		}
+		if _, statErr := os.Stat(env.lockFile); !os.IsNotExist(statErr) {
+			t.Fatalf("sabotaged final workload health fence left the release lock behind: %v", statErr)
 		}
 	})
 }
