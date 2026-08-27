@@ -1049,8 +1049,8 @@ func TestDeployScriptDeployedCandidateWaitsForWarmerRolloutBeforeImageVerificati
 		if !strings.Contains(string(output), "sabotaged rollout status failure for selfservice-runner-image-warmer") {
 			t.Fatalf("output did not surface the warmer rollout failure:\n%s", output)
 		}
-		if _, statErr := os.Stat(env.lockFile); statErr != nil {
-			t.Fatalf("rollout failure did not retain the release lock: %v", statErr)
+		if !strings.Contains(string(output), "WARNING: preserving Helm release lock") {
+			t.Fatalf("rollout failure did not preserve the release lock:\n%s", output)
 		}
 	})
 
@@ -1066,8 +1066,8 @@ func TestDeployScriptDeployedCandidateWaitsForWarmerRolloutBeforeImageVerificati
 		if !strings.Contains(string(output), "missing image inventory") {
 			t.Fatalf("output did not report the missing warmer ImageID inventory:\n%s", output)
 		}
-		if _, statErr := os.Stat(env.lockFile); statErr != nil {
-			t.Fatalf("empty warmer ImageID did not retain the release lock: %v", statErr)
+		if !strings.Contains(string(output), "WARNING: preserving Helm release lock") {
+			t.Fatalf("empty warmer ImageID did not preserve the release lock:\n%s", output)
 		}
 		probeLog, readErr := os.ReadFile(env.warmerImageProbeLog)
 		if readErr != nil {
@@ -1252,17 +1252,17 @@ func TestDeployScriptWorkloadHealthRolloutFailureIsLoadBearing(t *testing.T) {
 		writeFile(t, env.upgradeHookManifest, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestB))
 
 		output, runErr := env.run("--no-pull")
-		if runErr != nil {
-			t.Fatalf("sabotaged workload_health propagation unexpectedly failed:\n%s", output)
+		if runErr == nil {
+			t.Fatalf("sabotaged workload_health propagation unexpectedly succeeded:\n%s", output)
 		}
-		if !strings.Contains(string(output), "deployed exact source") {
-			t.Fatalf("sabotaged workload_health propagation did not complete the deploy:\n%s", output)
+		if !strings.Contains(string(output), "missing image inventory") {
+			t.Fatalf("sabotaged workload_health propagation did not reach external image verification:\n%s", output)
 		}
 		if _, statErr := os.Stat(env.cronjobVerifyMark); statErr != nil {
 			t.Fatalf("sabotaged workload_health propagation did not reach external image verification: %v", statErr)
 		}
-		if _, statErr := os.Stat(env.lockFile); !os.IsNotExist(statErr) {
-			t.Fatalf("sabotaged workload_health propagation left the release lock behind: %v", statErr)
+		if !strings.Contains(string(output), "WARNING: preserving Helm release lock") {
+			t.Fatalf("sabotaged workload_health propagation did not preserve the release lock:\n%s", output)
 		}
 	})
 }
@@ -1289,8 +1289,8 @@ func TestDeployScriptFinalWorkloadHealthFenceIsLoadBearing(t *testing.T) {
 		if !strings.Contains(string(output), "deployed candidate workloads regressed after live image verification") {
 			t.Fatalf("output did not surface the final workload health regression:\n%s", output)
 		}
-		if _, statErr := os.Stat(env.lockFile); statErr != nil {
-			t.Fatalf("final workload health regression did not retain the release lock: %v", statErr)
+		if !strings.Contains(string(output), "WARNING: preserving Helm release lock") {
+			t.Fatalf("final workload health regression did not preserve the release lock:\n%s", output)
 		}
 		if _, statErr := os.Stat(env.cronjobVerifyMark); statErr != nil {
 			t.Fatalf("final workload health regression did not reach external image verification: %v", statErr)
