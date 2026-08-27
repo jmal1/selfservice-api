@@ -1052,6 +1052,12 @@ func TestDeployScriptDeployedCandidateWaitsForWarmerRolloutBeforeImageVerificati
 		if !strings.Contains(string(output), "WARNING: preserving Helm release lock") {
 			t.Fatalf("rollout failure did not preserve the release lock:\n%s", output)
 		}
+		if _, statErr := os.Stat(env.candidateAppliedMark); statErr != nil {
+			t.Fatalf("rollout failure did not reach the candidate-applied boundary: %v", statErr)
+		}
+		if _, statErr := os.Stat(env.lockFile); statErr != nil {
+			t.Fatalf("rollout failure did not retain the release lock: %v", statErr)
+		}
 	})
 
 	t.Run("empty warmer image retains lock", func(t *testing.T) {
@@ -1068,6 +1074,12 @@ func TestDeployScriptDeployedCandidateWaitsForWarmerRolloutBeforeImageVerificati
 		}
 		if !strings.Contains(string(output), "WARNING: preserving Helm release lock") {
 			t.Fatalf("empty warmer ImageID did not preserve the release lock:\n%s", output)
+		}
+		if _, statErr := os.Stat(env.candidateAppliedMark); statErr != nil {
+			t.Fatalf("empty warmer ImageID did not reach the candidate-applied boundary: %v", statErr)
+		}
+		if _, statErr := os.Stat(env.lockFile); statErr != nil {
+			t.Fatalf("empty warmer ImageID did not retain the release lock: %v", statErr)
 		}
 		probeLog, readErr := os.ReadFile(env.warmerImageProbeLog)
 		if readErr != nil {
@@ -1263,6 +1275,12 @@ func TestDeployScriptWorkloadHealthRolloutFailureIsLoadBearing(t *testing.T) {
 		}
 		if !strings.Contains(string(output), "WARNING: preserving Helm release lock") {
 			t.Fatalf("sabotaged workload_health propagation did not preserve the release lock:\n%s", output)
+		}
+		if _, statErr := os.Stat(env.candidateAppliedMark); statErr != nil {
+			t.Fatalf("sabotaged workload_health propagation did not reach the candidate-applied boundary: %v", statErr)
+		}
+		if _, statErr := os.Stat(env.lockFile); statErr != nil {
+			t.Fatalf("sabotaged workload_health propagation did not retain the release lock: %v", statErr)
 		}
 	})
 }
