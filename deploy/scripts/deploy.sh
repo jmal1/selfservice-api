@@ -1287,6 +1287,20 @@ canonicalize_helm_release_metadata() {
     ' "$input" > "$output"
 }
 
+require_helm_revision_still_deployed() {
+  local expected_revision=$1
+  local observed_revision observed_status
+  if ! read -r observed_revision observed_status <<< "$(latest_helm_revision_record)"; then
+    echo "ERROR: could not re-read the latest Helm revision after live rollback containment verification." >&2
+    return 1
+  fi
+  if [ "$observed_revision" != "$expected_revision" ] ||
+     [ "$observed_status" != "deployed" ]; then
+    echo "ERROR: latest Helm revision changed after live rollback containment verification (expected $expected_revision deployed, found $observed_revision $observed_status)." >&2
+    return 1
+  fi
+}
+
 prove_immutable_rollback_release() {
   local required_revision=$1
   local tmp_dir=$2
@@ -1514,6 +1528,10 @@ verify_rollback_containment() {
   )"
   VERIFIED_BASELINE_RUNNER_IMAGE="$(runner_image_from_manifest < "$tmp_dir/manifest.yaml")"
   rm -rf "$tmp_dir"
+  if [ -n "$required_revision" ] &&
+     ! require_helm_revision_still_deployed "$revision"; then
+    return 1
+  fi
   VERIFIED_BASELINE_REVISION=$revision
   echo "==> rollback containment verified: deployed revision $revision pins every rendered workload image, keeps claims false with one worker, and matches healthy live workloads"
 }

@@ -410,6 +410,89 @@ func TestDeployScriptRollbackEquivalenceComparisonsLoadBearing(t *testing.T) {
 	}
 }
 
+func TestDeployScriptRollbackContainmentFinalRevisionFence(t *testing.T) {
+	requirePOSIXShell(t)
+
+	for _, test := range []struct {
+		name          string
+		finalRevision int
+		finalStatus   string
+		wantOutput    string
+	}{
+		{
+			name:          "revision advances during live verification",
+			finalRevision: 166,
+			finalStatus:   "deployed",
+			wantOutput:    "expected 165 deployed, found 166 deployed",
+		},
+		{
+			name:        "status changes during live verification",
+			finalStatus: "pending-upgrade",
+			wantOutput:  "expected 165 deployed, found 165 pending-upgrade",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manifest := baselineManifest(true, "", "false")
+			env := newDeployScriptEnvironment(t, manifest, manifest)
+			env.helmRevision = 165
+			env.postLiveHelmRevision = test.finalRevision
+			env.postLiveHelmStatus = test.finalStatus
+
+			output, err := env.run("--verify-rollback-containment")
+			if err == nil {
+				t.Fatalf("rollback containment ignored concurrent Helm %s drift:\n%s", test.name, output)
+			}
+			if !strings.Contains(string(output), test.wantOutput) {
+				t.Fatalf("output %q does not contain %q", output, test.wantOutput)
+			}
+			if _, statErr := os.Stat(env.liveVerificationMark); statErr != nil {
+				t.Fatalf("fake Helm drift occurred before live verification began: %v", statErr)
+			}
+		})
+	}
+}
+
+func TestDeployScriptRollbackContainmentFinalRevisionFenceLoadBearing(t *testing.T) {
+	requirePOSIXShell(t)
+
+	deployPath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
+	deployBody, err := os.ReadFile(deployPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const finalFence = `  if [ -n "$required_revision" ] &&
+     ! require_helm_revision_still_deployed "$revision"; then
+    return 1
+  fi
+`
+	if strings.Count(string(deployBody), finalFence) != 1 {
+		t.Fatal("final post-live Helm revision fence is not unique")
+	}
+	sabotagedBody := strings.Replace(string(deployBody), finalFence, "", 1)
+	scriptDir := filepath.Dir(deployPath)
+	sabotagedPath := filepath.Join(scriptDir, "deploy-sabotaged-post-live-revision-fence-test.sh")
+	writeExecutable(t, sabotagedPath, sabotagedBody)
+	t.Cleanup(func() { os.Remove(sabotagedPath) })
+
+	manifest := baselineManifest(true, "", "false")
+	env := newDeployScriptEnvironment(t, manifest, manifest)
+	env.helmRevision = 165
+	env.postLiveHelmRevision = 166
+	env.postLiveHelmStatus = "deployed"
+	env.scriptPath = sabotagedPath
+
+	output, runErr := env.run("--verify-rollback-containment")
+	if runErr != nil {
+		t.Fatalf("removing the final revision fence did not expose false acceptance: %v\n%s", runErr, output)
+	}
+	if !strings.Contains(string(output), "rollback containment verified: deployed revision 165") {
+		t.Fatalf("removing the final revision fence did not reach false success:\n%s", output)
+	}
+	if _, statErr := os.Stat(env.liveVerificationMark); statErr != nil {
+		t.Fatalf("fake Helm drift occurred before live verification began: %v", statErr)
+	}
+}
+
 func TestDeployScriptImmutableCandidate(t *testing.T) {
 	requirePOSIXShell(t)
 
@@ -3909,6 +3992,7 @@ type deployScriptEnvironment struct {
 	serverDryRunLog           string
 	serverDryRunMark          string
 	finalRollbackMark         string
+	liveVerificationMark      string
 	extraImageCount           string
 	atomicFailedMark          string
 	candidateAppliedMark      string
@@ -3924,6 +4008,8 @@ type deployScriptEnvironment struct {
 	claimsPausedMark          string
 	helmStatus                string
 	helmRevision              int
+	postLiveHelmRevision      int
+	postLiveHelmStatus        string
 	helmDescription           string
 	immutableRevisionMissing  bool
 	immutableHelmStatus       string
@@ -4001,6 +4087,7 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 		serverDryRunLog:           filepath.Join(root, "server-dry-run.log"),
 		serverDryRunMark:          filepath.Join(root, "server-dry-run.marker"),
 		finalRollbackMark:         filepath.Join(root, "final-rollback.marker"),
+		liveVerificationMark:      filepath.Join(root, "live-verification.marker"),
 		extraImageCount:           filepath.Join(root, "extra-image-count"),
 		atomicFailedMark:          filepath.Join(root, "atomic-failed"),
 		candidateAppliedMark:      filepath.Join(root, "candidate-applied"),
@@ -4067,6 +4154,11 @@ set -euo pipefail
 
 latest_revision() {
   local revision=$FAKE_HELM_REVISION
+  if [ -f "$FAKE_LIVE_VERIFICATION_MARKER" ] &&
+     [ "$FAKE_POST_LIVE_HELM_REVISION" != 0 ]; then
+    printf '%s' "$FAKE_POST_LIVE_HELM_REVISION"
+    return
+  fi
   if [ -f "$FAKE_ATOMIC_FAILED_MARKER" ]; then
     revision=$((FAKE_HELM_REVISION + 2))
   elif [ -f "$FAKE_UPGRADED_MARKER" ]; then
@@ -4090,7 +4182,12 @@ requested_revision() {
 case "$1 $2" in
   "history selfservice")
     revision=$(latest_revision)
-    printf '%s\n' '- app_version: test' "  description: $FAKE_HELM_DESCRIPTION" "  revision: $revision" "  status: $FAKE_HELM_STATUS"
+    status=$FAKE_HELM_STATUS
+    if [ -f "$FAKE_LIVE_VERIFICATION_MARKER" ] &&
+       [ -n "$FAKE_POST_LIVE_HELM_STATUS" ]; then
+      status=$FAKE_POST_LIVE_HELM_STATUS
+    fi
+    printf '%s\n' '- app_version: test' "  description: $FAKE_HELM_DESCRIPTION" "  revision: $revision" "  status: $status"
     ;;
   "get manifest")
     revision=$(requested_revision "$@")
@@ -4618,6 +4715,10 @@ case "$1" in
     fi
     ;;
   rollout)
+    if [ "$FAKE_POST_LIVE_HELM_REVISION" != 0 ] ||
+       [ -n "$FAKE_POST_LIVE_HELM_STATUS" ]; then
+      : > "$FAKE_LIVE_VERIFICATION_MARKER"
+    fi
     ;;
   exec)
     if [[ "$*" == *"pod_name"* ]]; then
@@ -5116,6 +5217,7 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_SERVER_DRY_RUN_LOG="+e.serverDryRunLog,
 		"FAKE_SERVER_DRY_RUN_MARKER="+e.serverDryRunMark,
 		"FAKE_FINAL_ROLLBACK_MARKER="+e.finalRollbackMark,
+		"FAKE_LIVE_VERIFICATION_MARKER="+e.liveVerificationMark,
 		"FAKE_EXTRA_IMAGE_COUNT="+e.extraImageCount,
 		"FAKE_ATOMIC_FAILED_MARKER="+e.atomicFailedMark,
 		"FAKE_CANDIDATE_APPLIED_MARKER="+e.candidateAppliedMark,
@@ -5131,6 +5233,8 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_CLAIMS_PAUSED_MARKER="+e.claimsPausedMark,
 		"FAKE_HELM_STATUS="+e.helmStatus,
 		"FAKE_HELM_REVISION="+strconv.Itoa(e.helmRevision),
+		"FAKE_POST_LIVE_HELM_REVISION="+strconv.Itoa(e.postLiveHelmRevision),
+		"FAKE_POST_LIVE_HELM_STATUS="+e.postLiveHelmStatus,
 		"FAKE_HELM_DESCRIPTION="+e.helmDescription,
 		"FAKE_IMMUTABLE_REVISION_MISSING="+strconv.FormatBool(e.immutableRevisionMissing),
 		"FAKE_IMMUTABLE_HELM_STATUS="+e.immutableHelmStatus,
