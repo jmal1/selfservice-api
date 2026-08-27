@@ -857,11 +857,14 @@ environment, volume, security-context, replica, service-account, or other
 workload drift blocks the baseline. The command never rolls a failed baseline
 back to a claims-enabled revision.
 
-Then run `--verify-rollback-containment`. It requires the latest revision to be
-the immutable revision **160**, deployed, claims to remain false, exactly one
-worker, every live declared image and ImageID to equal the persisted pin, all
-rollouts and retained CronJob/Job
-evidence to be healthy, and PostgreSQL to be migration 36 clean. Baseline
+Then run `--verify-rollback-containment`. Immutable revision **163** must remain
+readable. Because Helm rollback creates a new latest revision, a newer revision
+is accepted only when its manifest, hooks, complete effective values, and chart
+metadata exactly match revision 163; its description is never trusted as proof.
+The latest revision must be deployed, claims must remain false, there must be
+exactly one worker, every live declared image and ImageID must equal the
+persisted pin, all rollouts and retained CronJob/Job evidence must be healthy,
+and PostgreSQL must be at migration 36 clean. Baseline
 preparation proves the migration did not change. Stored, live, and newly
 prepared baseline manifests must also keep content-filter activation disabled
 with an empty feed. The normal deploy repeats the proof before pulling and
@@ -897,7 +900,8 @@ revision label. Exactly the UI container is replaced with that proven digest.
 If the stored rollback revision renders claims disabled but the live worker has
 a temporary claims-enabled override, candidate provenance, rendering, and its
 first server dry-run still happen without mutation. A real apply then acquires
-the release lock, proves revision 162 is immutable and claims-disabled,
+the release lock, proves immutable revision 163 remains present and the latest
+deployed revision is content-identical and claims-disabled,
 deliberately sets the live worker back to claims disabled, waits for that
 rollout and durable job drain, and only then runs the complete stored/live
 rollback proof. The override does not make the rollback baseline claims-enabled.
@@ -912,8 +916,9 @@ sha256 `RUNNER_IMAGE`, one worker, claims disabled, content-filter activation
 disabled, and an empty content-filter feed. Kubernetes server-side dry-run
 validates that final manifest before any lock or claims mutation, and `--dry-run`
 prints that pinned manifest even when live claims are temporarily enabled.
-For a real apply, the script then locks, proves revision 162 again, pauses live
-claims, keeps the API monitor unsuspended with lifecycle disabled, and suspends
+For a real apply, the script then locks, repeats the immutable revision-163
+content proof, pauses live claims, keeps the API monitor unsuspended with
+lifecycle disabled, and suspends
 the janitor/runner clone CronJobs before draining work. PostgreSQL must have
 zero `claimed`, `in_progress`, or `rollback` durable jobs and zero nonterminal
 synthetic `pod_create` or `pod_destroy` jobs, including `pending` rows left
@@ -921,7 +926,8 @@ after a CronJob has exited. Destroy rows may carry only `pod_id`, so the drain
 joins `pods` and checks the authoritative pod name rather than trusting
 `payload.pod_name`. Every Kubernetes Job in the namespace must also
 have `.status.active=0`. Immediately before apply,
-under the lock, it re-proves source identity, revision-160 containment,
+under the lock, it re-proves source identity, immutable revision-163
+equivalence and containment,
 migration and workload health, external live digests, and the final server
 dry-run. Initial and final server-defaulted objects are canonicalized and
 compared in full, so a changed command, environment, volume, or other non-image
@@ -953,10 +959,11 @@ host-level timer.
 
 An atomic Helm failure never falls through the EXIT trap. While retaining the
 release lock, the script forces claims disabled, immediately reapplies the
-current synthetic containment over revision 162's historical values, and proves
-that the latest deployed rollback revision has revision 162's exact immutable
-image inventory and `RUNNER_IMAGE`. Helm may record rollback as a newer revision;
-revision number alone is not treated as identity. The proof also requires
+current synthetic containment, and proves that the latest deployed rollback
+revision has immutable revision 163's exact manifest, hooks, complete effective
+values, chart metadata, image inventory, and `RUNNER_IMAGE`. Helm may record
+rollback as a newer revision; revision number and description alone are not
+treated as identity. The proof also requires
 readiness, migration, active non-lifecycle API-monitor intent, suspended clone
 CronJobs, zero nonterminal synthetic create/destroy work, and both durable and
 Kubernetes job drains. A complete

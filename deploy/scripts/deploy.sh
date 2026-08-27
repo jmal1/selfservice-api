@@ -1241,26 +1241,183 @@ latest_deployed_helm_revision() {
       '
 }
 
-verify_rollback_manifest_safety() {
-  local revision status manifest tmp_dir inventory image claims worker_replicas runner
-  if ! read -r revision status <<< "$(latest_helm_revision_record)"; then
+canonicalize_helm_release_values() {
+  local input=$1
+  local output=$2
+  jq -ceS '
+    if type != "object" then
+      error("Helm effective values must be a JSON object")
+    else
+      .
+    end
+  ' "$input" > "$output"
+}
+
+canonicalize_helm_release_metadata() {
+  local input=$1
+  local expected_revision=$2
+  local expected_status=$3
+  local output=$4
+  jq -ceS \
+    --arg release "$RELEASE" \
+    --arg namespace "$NAMESPACE" \
+    --argjson revision "$expected_revision" \
+    --arg status "$expected_status" '
+      if type != "object" then
+        error("Helm release metadata must be a JSON object")
+      elif .name != $release then
+        error("Helm release metadata has the wrong release name")
+      elif .namespace != $namespace then
+        error("Helm release metadata has the wrong namespace")
+      elif .revision != $revision then
+        error("Helm release metadata has the wrong revision")
+      elif (.status | type) != "string" or .status == "" then
+        error("Helm release metadata has no status")
+      elif $status != "" and .status != $status then
+        error("Helm release metadata has the wrong status")
+      elif (.deployedAt | type) != "string" or .deployedAt == "" then
+        error("Helm release metadata has no deployment timestamp")
+      elif (.chart | type) != "string" or .chart == "" or
+           (.version | type) != "string" or .version == "" or
+           (.appVersion | type) != "string" then
+        error("Helm release metadata has incomplete chart identity")
+      else
+        del(.revision, .status, .deployedAt)
+      end
+    ' "$input" > "$output"
+}
+
+require_helm_revision_still_deployed() {
+  local expected_revision=$1
+  local latest_record observed_revision observed_status
+  if ! latest_record="$(latest_helm_revision_record)"; then
+    echo "ERROR: could not re-read the latest Helm revision after live rollback containment verification." >&2
+    return 1
+  fi
+  if ! read -r observed_revision observed_status <<< "$latest_record"; then
+    echo "ERROR: could not parse the latest Helm revision after live rollback containment verification." >&2
+    return 1
+  fi
+  if [ "$observed_revision" != "$expected_revision" ] ||
+     [ "$observed_status" != "deployed" ]; then
+    echo "ERROR: latest Helm revision changed after live rollback containment verification (expected $expected_revision deployed, found $observed_revision $observed_status)." >&2
+    return 1
+  fi
+}
+
+prove_immutable_rollback_release() {
+  local required_revision=$1
+  local tmp_dir=$2
+  local current_revision status current_prefix immutable_prefix immutable_status
+  if ! read -r current_revision status <<< "$(latest_helm_revision_record)"; then
     echo "ERROR: could not determine the latest Helm revision and status." >&2
     return 1
   fi
+  if [[ ! "$current_revision" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: latest Helm revision is not numeric: $current_revision." >&2
+    return 1
+  fi
   if [ "$status" != "deployed" ]; then
-    echo "ERROR: latest Helm revision $revision status is $status, not deployed; it cannot be a rollback baseline." >&2
+    echo "ERROR: latest Helm revision $current_revision status is $status, not deployed; it cannot be a rollback baseline." >&2
     return 1
   fi
-  if [ "$revision" != "$REQUIRED_ROLLBACK_REVISION" ]; then
-    echo "ERROR: latest deployed Helm revision is $revision, not required immutable rollback revision $REQUIRED_ROLLBACK_REVISION." >&2
+  if [ "$current_revision" -lt "$required_revision" ]; then
+    echo "ERROR: latest deployed Helm revision $current_revision predates required immutable rollback revision $required_revision." >&2
     return 1
   fi
-  if ! manifest="$(helm get manifest "$RELEASE" -n "$NAMESPACE" --revision "$revision")"; then
-    echo "ERROR: could not read manifest for deployed Helm revision $revision." >&2
+  immutable_status=superseded
+  if [ "$current_revision" = "$required_revision" ]; then
+    immutable_status=deployed
+  fi
+
+  current_prefix="$tmp_dir/current-release"
+  immutable_prefix="$tmp_dir/immutable-release"
+  if ! helm get manifest "$RELEASE" -n "$NAMESPACE" \
+      --revision "$current_revision" > "$current_prefix.manifest"; then
+    echo "ERROR: could not read manifest for latest deployed Helm revision $current_revision." >&2
     return 1
   fi
+  if ! helm get hooks "$RELEASE" -n "$NAMESPACE" \
+      --revision "$current_revision" > "$current_prefix.hooks"; then
+    echo "ERROR: could not read hooks for latest deployed Helm revision $current_revision." >&2
+    return 1
+  fi
+  if ! helm get values "$RELEASE" -n "$NAMESPACE" \
+      --revision "$current_revision" --all -o json > "$current_prefix.values.json" ||
+     ! canonicalize_helm_release_values \
+      "$current_prefix.values.json" "$current_prefix.values.canonical"; then
+    echo "ERROR: could not read complete effective values for latest deployed Helm revision $current_revision." >&2
+    return 1
+  fi
+  if ! helm get metadata "$RELEASE" -n "$NAMESPACE" \
+      --revision "$current_revision" -o json > "$current_prefix.metadata.json" ||
+     ! canonicalize_helm_release_metadata \
+      "$current_prefix.metadata.json" "$current_revision" deployed \
+      "$current_prefix.metadata.canonical"; then
+    echo "ERROR: could not validate metadata for latest deployed Helm revision $current_revision." >&2
+    return 1
+  fi
+
+  if ! helm get manifest "$RELEASE" -n "$NAMESPACE" \
+      --revision "$required_revision" > "$immutable_prefix.manifest" ||
+     ! helm get hooks "$RELEASE" -n "$NAMESPACE" \
+      --revision "$required_revision" > "$immutable_prefix.hooks" ||
+     ! helm get values "$RELEASE" -n "$NAMESPACE" \
+      --revision "$required_revision" --all -o json > "$immutable_prefix.values.json" ||
+     ! helm get metadata "$RELEASE" -n "$NAMESPACE" \
+      --revision "$required_revision" -o json > "$immutable_prefix.metadata.json"; then
+    echo "ERROR: required immutable rollback revision $required_revision is absent or unreadable." >&2
+    return 1
+  fi
+  if ! canonicalize_helm_release_values \
+      "$immutable_prefix.values.json" "$immutable_prefix.values.canonical" ||
+     ! canonicalize_helm_release_metadata \
+      "$immutable_prefix.metadata.json" "$required_revision" "$immutable_status" \
+      "$immutable_prefix.metadata.canonical"; then
+    echo "ERROR: required immutable rollback revision $required_revision has invalid release data." >&2
+    return 1
+  fi
+
+  if ! cmp -s "$immutable_prefix.manifest" "$current_prefix.manifest"; then
+    echo "ERROR: latest deployed Helm revision $current_revision manifest differs from immutable rollback revision $required_revision." >&2
+    return 1
+  fi
+  if ! cmp -s "$immutable_prefix.hooks" "$current_prefix.hooks"; then
+    echo "ERROR: latest deployed Helm revision $current_revision hooks differ from immutable rollback revision $required_revision." >&2
+    return 1
+  fi
+  if ! cmp -s "$immutable_prefix.values.canonical" "$current_prefix.values.canonical"; then
+    echo "ERROR: latest deployed Helm revision $current_revision complete effective values differ from immutable rollback revision $required_revision." >&2
+    return 1
+  fi
+  if ! cmp -s "$immutable_prefix.metadata.canonical" "$current_prefix.metadata.canonical"; then
+    echo "ERROR: latest deployed Helm revision $current_revision chart metadata differs from immutable rollback revision $required_revision." >&2
+    return 1
+  fi
+  local final_revision final_status
+  if ! read -r final_revision final_status <<< "$(latest_helm_revision_record)" ||
+     [ "$final_revision" != "$current_revision" ] ||
+     [ "$final_status" != "deployed" ]; then
+    echo "ERROR: latest Helm revision changed while immutable rollback equivalence was being proven." >&2
+    return 1
+  fi
+
+  PROVEN_CURRENT_ROLLBACK_REVISION=$current_revision
+  PROVEN_CURRENT_ROLLBACK_MANIFEST="$current_prefix.manifest"
+  if [ "$current_revision" != "$required_revision" ]; then
+    echo "==> deployed Helm revision $current_revision exactly matches immutable rollback revision $required_revision manifest, hooks, complete effective values, and chart metadata"
+  fi
+}
+
+verify_rollback_manifest_safety() {
+  local revision tmp_dir inventory image claims worker_replicas runner
   tmp_dir="$(mktemp -d)"
-  printf '%s\n' "$manifest" > "$tmp_dir/manifest.yaml"
+  if ! prove_immutable_rollback_release "$REQUIRED_ROLLBACK_REVISION" "$tmp_dir"; then
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  revision=$PROVEN_CURRENT_ROLLBACK_REVISION
+  cp "$PROVEN_CURRENT_ROLLBACK_MANIFEST" "$tmp_dir/manifest.yaml"
   inventory="$tmp_dir/inventory.tsv"
   if ! manifest_workload_inventory "$tmp_dir/manifest.yaml" > "$inventory"; then
     rm -rf "$tmp_dir"
@@ -1302,8 +1459,9 @@ verify_rollback_manifest_safety() {
   )"
   STATIC_BASELINE_RUNNER_IMAGE=$runner
   rm -rf "$tmp_dir"
-  STATIC_BASELINE_REVISION=$revision
-  echo "==> stored rollback revision $revision is claims-disabled and pins every workload image plus RUNNER_IMAGE"
+  STATIC_BASELINE_REVISION=$REQUIRED_ROLLBACK_REVISION
+  STATIC_CURRENT_ROLLBACK_REVISION=$revision
+  echo "==> immutable rollback revision $REQUIRED_ROLLBACK_REVISION is present; deployed equivalent revision $revision is claims-disabled and pins every workload image plus RUNNER_IMAGE"
 }
 
 pause_live_provisioning_claims() {
@@ -1333,26 +1491,33 @@ pause_live_provisioning_claims() {
 verify_rollback_containment() {
   local expected_migration=${1:-}
   local required_revision=${2:-}
-  local revision status manifest inventory
-  if ! read -r revision status <<< "$(latest_helm_revision_record)"; then
-    echo "ERROR: could not determine the latest Helm revision and status." >&2
-    return 1
-  fi
-  if [ "$status" != "deployed" ]; then
-    echo "ERROR: latest Helm revision $revision status is $status, not deployed; it cannot be a rollback baseline." >&2
-    return 1
-  fi
-  if [ -n "$required_revision" ] && [ "$revision" != "$required_revision" ]; then
-    echo "ERROR: latest deployed Helm revision is $revision, not required immutable rollback revision $required_revision." >&2
-    return 1
-  fi
-  if ! manifest="$(helm get manifest "$RELEASE" -n "$NAMESPACE" --revision "$revision")"; then
-    echo "ERROR: could not read manifest for deployed Helm revision $revision." >&2
-    return 1
-  fi
-  local tmp_dir
+  local revision status inventory tmp_dir
   tmp_dir="$(mktemp -d)"
-  printf '%s\n' "$manifest" > "$tmp_dir/manifest.yaml"
+  if [ -n "$required_revision" ]; then
+    if ! prove_immutable_rollback_release "$required_revision" "$tmp_dir"; then
+      rm -rf "$tmp_dir"
+      return 1
+    fi
+    revision=$PROVEN_CURRENT_ROLLBACK_REVISION
+    cp "$PROVEN_CURRENT_ROLLBACK_MANIFEST" "$tmp_dir/manifest.yaml"
+  else
+    if ! read -r revision status <<< "$(latest_helm_revision_record)"; then
+      echo "ERROR: could not determine the latest Helm revision and status." >&2
+      rm -rf "$tmp_dir"
+      return 1
+    fi
+    if [ "$status" != "deployed" ]; then
+      echo "ERROR: latest Helm revision $revision status is $status, not deployed; it cannot be a rollback baseline." >&2
+      rm -rf "$tmp_dir"
+      return 1
+    fi
+    if ! helm get manifest "$RELEASE" -n "$NAMESPACE" \
+        --revision "$revision" > "$tmp_dir/manifest.yaml"; then
+      echo "ERROR: could not read manifest for deployed Helm revision $revision." >&2
+      rm -rf "$tmp_dir"
+      return 1
+    fi
+  fi
   if ! verify_manifest_and_live "$tmp_dir/manifest.yaml" "$expected_migration"; then
     rm -rf "$tmp_dir"
     return 1
@@ -1367,6 +1532,10 @@ verify_rollback_containment() {
   )"
   VERIFIED_BASELINE_RUNNER_IMAGE="$(runner_image_from_manifest < "$tmp_dir/manifest.yaml")"
   rm -rf "$tmp_dir"
+  if [ -n "$required_revision" ] &&
+     ! require_helm_revision_still_deployed "$revision"; then
+    return 1
+  fi
   VERIFIED_BASELINE_REVISION=$revision
   echo "==> rollback containment verified: deployed revision $revision pins every rendered workload image, keeps claims false with one worker, and matches healthy live workloads"
 }
@@ -2347,7 +2516,9 @@ verify_deployed_candidate() {
     echo "ERROR: could not determine the deployed candidate Helm revision." >&2
     return 1
   fi
-  if [ "$status" != "deployed" ] || [ "$revision" = "$ROLLBACK_BASELINE_REVISION" ]; then
+  if [ "$status" != "deployed" ] ||
+     [[ ! "$revision" =~ ^[0-9]+$ ]] ||
+     [ "$revision" -le "$ROLLBACK_CURRENT_REVISION" ]; then
     echo "ERROR: candidate Helm revision is $revision status $status after atomic upgrade." >&2
     return 1
   fi
@@ -2461,7 +2632,8 @@ contain_failed_atomic_upgrade() {
     return 1
   fi
   if ! verify_rollback_containment \
-      "$ROLLBACK_BASELINE_MIGRATION"; then
+      "$ROLLBACK_BASELINE_MIGRATION" \
+      "$ROLLBACK_BASELINE_REVISION"; then
     echo "ERROR: atomic rollback did not restore the approved immutable baseline." >&2
     return 1
   fi
@@ -3043,6 +3215,7 @@ fi
 # requiring a temporary live claims override to be paused for --dry-run.
 verify_rollback_manifest_safety
 ROLLBACK_BASELINE_REVISION=$STATIC_BASELINE_REVISION
+ROLLBACK_CURRENT_REVISION=$STATIC_CURRENT_ROLLBACK_REVISION
 
 # Refuse a dirty tree before pull so git cannot merge local state into the
 # candidate, then prove the exact source identity again after pull.
@@ -3084,8 +3257,9 @@ fi
 # claims; --dry-run remains useful while a temporary claims=true override exists.
 acquire_helm_release_lock
 verify_rollback_manifest_safety
-if [ "$STATIC_BASELINE_REVISION" != "$ROLLBACK_BASELINE_REVISION" ]; then
-  echo "ERROR: Helm revision changed from baseline $ROLLBACK_BASELINE_REVISION to $STATIC_BASELINE_REVISION before claims pause." >&2
+if [ "$STATIC_BASELINE_REVISION" != "$ROLLBACK_BASELINE_REVISION" ] ||
+   [ "$STATIC_CURRENT_ROLLBACK_REVISION" != "$ROLLBACK_CURRENT_REVISION" ]; then
+  echo "ERROR: deployed Helm revision changed from $ROLLBACK_CURRENT_REVISION to $STATIC_CURRENT_ROLLBACK_REVISION before claims pause." >&2
   exit 1
 fi
 pause_live_provisioning_claims
@@ -3093,8 +3267,8 @@ enforce_synthetic_rollback_containment
 require_no_active_jobs
 verify_rollback_containment "" "$REQUIRED_ROLLBACK_REVISION"
 ROLLBACK_BASELINE_MIGRATION=$VERIFIED_MIGRATION_STATE
-if [ "$VERIFIED_BASELINE_REVISION" != "$ROLLBACK_BASELINE_REVISION" ]; then
-  echo "ERROR: Helm revision changed from stored baseline $ROLLBACK_BASELINE_REVISION to $VERIFIED_BASELINE_REVISION while pausing claims." >&2
+if [ "$VERIFIED_BASELINE_REVISION" != "$ROLLBACK_CURRENT_REVISION" ]; then
+  echo "ERROR: deployed Helm revision changed from stored equivalent $ROLLBACK_CURRENT_REVISION to $VERIFIED_BASELINE_REVISION while pausing claims." >&2
   exit 1
 fi
 
@@ -3120,8 +3294,8 @@ fi
 verify_rollback_containment \
   "$ROLLBACK_BASELINE_MIGRATION" \
   "$REQUIRED_ROLLBACK_REVISION"
-if [ "$VERIFIED_BASELINE_REVISION" != "$ROLLBACK_BASELINE_REVISION" ]; then
-  echo "ERROR: Helm revision changed from baseline $ROLLBACK_BASELINE_REVISION to $VERIFIED_BASELINE_REVISION before the application upgrade." >&2
+if [ "$VERIFIED_BASELINE_REVISION" != "$ROLLBACK_CURRENT_REVISION" ]; then
+  echo "ERROR: deployed Helm revision changed from baseline equivalent $ROLLBACK_CURRENT_REVISION to $VERIFIED_BASELINE_REVISION before the application upgrade." >&2
   echo "Re-establish and re-verify the immutable all-workload baseline; refusing phase-1." >&2
   exit 1
 fi

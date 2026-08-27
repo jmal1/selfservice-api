@@ -37,6 +37,7 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 		configureRevision int
 		liveStatus        bool
 		liveResource      string
+		configure         func(*deployScriptEnvironment)
 	}{
 		{
 			name:              "immutable rollback revision 163 accepted",
@@ -46,6 +47,132 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			wantSuccess:       true,
 			wantOutput:        "pins every rendered workload image",
 			configureRevision: 163,
+		},
+		{
+			name:              "rollback revision 165 with immutable content accepted",
+			manifest:          baselineManifest(true, "", "false"),
+			helmStatus:        "deployed",
+			args:              []string{"--verify-rollback-containment"},
+			wantSuccess:       true,
+			wantOutput:        "pins every rendered workload image",
+			configureRevision: 165,
+		},
+		{
+			name:              "later exact-content revision accepted",
+			manifest:          baselineManifest(true, "", "false"),
+			helmStatus:        "deployed",
+			args:              []string{"--verify-rollback-containment"},
+			wantSuccess:       true,
+			wantOutput:        "exactly matches immutable rollback revision 163",
+			configureRevision: 166,
+		},
+		{
+			name:              "rollback values drift",
+			manifest:          baselineManifest(true, "", "false"),
+			helmStatus:        "deployed",
+			args:              []string{"--verify-rollback-containment"},
+			wantOutput:        "complete effective values differ",
+			configureRevision: 165,
+			configure: func(env *deployScriptEnvironment) {
+				writeFile(t, env.currentRollbackValues, `{"provisioning":{"workerClaimsEnabled":false},"drift":true}`+"\n")
+			},
+		},
+		{
+			name: "rollback manifest spec drift",
+			manifest: strings.Replace(
+				baselineManifest(true, "", "false"),
+				"      - name: api-gateway\n",
+				"      - name: api-gateway\n        command: [\"/drift\"]\n",
+				1,
+			),
+			helmStatus:        "deployed",
+			args:              []string{"--verify-rollback-containment"},
+			wantOutput:        "manifest differs",
+			configureRevision: 165,
+			configure: func(env *deployScriptEnvironment) {
+				writeFile(t, env.immutableRollbackManifest, baselineManifest(true, "", "false"))
+			},
+		},
+		{
+			name: "rollback manifest image drift",
+			manifest: strings.Replace(
+				baselineManifest(true, "", "false"),
+				"selfservice-api-gateway@sha256:"+testDigestA,
+				"selfservice-api-gateway@sha256:"+testDigestB,
+				1,
+			),
+			helmStatus:        "deployed",
+			args:              []string{"--verify-rollback-containment"},
+			wantOutput:        "manifest differs",
+			configureRevision: 165,
+			configure: func(env *deployScriptEnvironment) {
+				writeFile(t, env.immutableRollbackManifest, baselineManifest(true, "", "false"))
+				env.mismatchContainer = "api-gateway"
+			},
+		},
+		{
+			name:              "rollback hook drift",
+			manifest:          baselineManifest(true, "", "false"),
+			helmStatus:        "deployed",
+			args:              []string{"--verify-rollback-containment"},
+			wantOutput:        "hooks differ",
+			configureRevision: 165,
+			configure: func(env *deployScriptEnvironment) {
+				writeFile(t, env.currentRollbackHooks, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestA))
+			},
+		},
+		{
+			name:              "rollback chart metadata drift",
+			manifest:          baselineManifest(true, "", "false"),
+			helmStatus:        "deployed",
+			args:              []string{"--verify-rollback-containment"},
+			wantOutput:        "chart metadata differs",
+			configureRevision: 165,
+			configure: func(env *deployScriptEnvironment) {
+				env.currentChartVersion = "0.2.0"
+			},
+		},
+		{
+			name:              "pending latest revision",
+			manifest:          baselineManifest(true, "", "false"),
+			helmStatus:        "pending-upgrade",
+			args:              []string{"--verify-rollback-containment"},
+			wantOutput:        "status is pending-upgrade",
+			configureRevision: 165,
+		},
+		{
+			name:              "immutable rollback revision absent",
+			manifest:          baselineManifest(true, "", "false"),
+			helmStatus:        "deployed",
+			args:              []string{"--verify-rollback-containment"},
+			wantOutput:        "required immutable rollback revision 163 is absent",
+			configureRevision: 165,
+			configure: func(env *deployScriptEnvironment) {
+				env.immutableRevisionMissing = true
+			},
+		},
+		{
+			name:              "immutable rollback revision failed",
+			manifest:          baselineManifest(true, "", "false"),
+			helmStatus:        "deployed",
+			args:              []string{"--verify-rollback-containment"},
+			wantOutput:        "required immutable rollback revision 163 has invalid release data",
+			configureRevision: 165,
+			configure: func(env *deployScriptEnvironment) {
+				env.immutableHelmStatus = "failed"
+			},
+		},
+		{
+			name:              "misleading rollback description with drift",
+			manifest:          baselineManifest(true, "", "false"),
+			helmStatus:        "deployed",
+			args:              []string{"--verify-rollback-containment"},
+			wantOutput:        "complete effective values differ",
+			configureRevision: 165,
+			configure: func(env *deployScriptEnvironment) {
+				env.helmDescription = "Rollback to 163"
+				writeFile(t, env.currentRollbackValues, `{"misleading":true}`+"\n")
+			},
 		},
 		{
 			name:        "live worker status replicas ignored",
@@ -145,11 +272,11 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			wantOutput: "status is failed",
 		},
 		{
-			name:              "wrong immutable rollback revision",
+			name:              "latest revision predates immutable rollback revision",
 			manifest:          baselineManifest(true, "", "false"),
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
-			wantOutput:        "not required immutable rollback revision 163",
+			wantOutput:        "predates required immutable rollback revision 163",
 			configureRevision: 162,
 		},
 		{
@@ -166,6 +293,9 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			env.helmStatus = test.helmStatus
 			if test.configureRevision != 0 {
 				env.helmRevision = test.configureRevision
+			}
+			if test.configure != nil {
+				test.configure(env)
 			}
 			env.mismatchContainer = test.mismatchContainer
 			if test.liveStatus {
@@ -193,6 +323,222 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 	}
 }
 
+func TestDeployScriptRollbackEquivalenceComparisonsLoadBearing(t *testing.T) {
+	requirePOSIXShell(t)
+
+	scriptDir := filepath.Join("..", "..", "deploy", "scripts")
+	deployPath := filepath.Join(scriptDir, "deploy.sh")
+	deployBody, err := os.ReadFile(deployPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name       string
+		comparison string
+		latest     string
+		configure  func(*deployScriptEnvironment)
+	}{
+		{
+			name:       "manifest",
+			comparison: `if ! cmp -s "$immutable_prefix.manifest" "$current_prefix.manifest"; then`,
+			latest: strings.Replace(
+				baselineManifest(true, "", "false"),
+				"      - name: api-gateway\n",
+				"      - name: api-gateway\n        command: [\"/drift\"]\n",
+				1,
+			),
+			configure: func(env *deployScriptEnvironment) {
+				writeFile(t, env.immutableRollbackManifest, baselineManifest(true, "", "false"))
+			},
+		},
+		{
+			name:       "hooks",
+			comparison: `if ! cmp -s "$immutable_prefix.hooks" "$current_prefix.hooks"; then`,
+			latest:     baselineManifest(true, "", "false"),
+			configure: func(env *deployScriptEnvironment) {
+				writeFile(t, env.currentRollbackHooks, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestA))
+			},
+		},
+		{
+			name:       "complete effective values",
+			comparison: `if ! cmp -s "$immutable_prefix.values.canonical" "$current_prefix.values.canonical"; then`,
+			latest:     baselineManifest(true, "", "false"),
+			configure: func(env *deployScriptEnvironment) {
+				writeFile(t, env.currentRollbackValues, `{"drift":true}`+"\n")
+			},
+		},
+		{
+			name:       "chart metadata",
+			comparison: `if ! cmp -s "$immutable_prefix.metadata.canonical" "$current_prefix.metadata.canonical"; then`,
+			latest:     baselineManifest(true, "", "false"),
+			configure: func(env *deployScriptEnvironment) {
+				env.currentChartVersion = "0.2.0"
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if strings.Count(string(deployBody), test.comparison) != 1 {
+				t.Fatalf("expected exactly one %s comparison", test.name)
+			}
+			sabotagedBody := strings.Replace(
+				string(deployBody),
+				test.comparison,
+				"if false; then",
+				1,
+			)
+			suffix := strings.ReplaceAll(test.name, " ", "-")
+			sabotagedPath := filepath.Join(
+				scriptDir,
+				"deploy-sabotaged-rollback-"+suffix+"-comparison-test.sh",
+			)
+			writeExecutable(t, sabotagedPath, sabotagedBody)
+			t.Cleanup(func() { os.Remove(sabotagedPath) })
+
+			env := newDeployScriptEnvironment(t, test.latest, test.latest)
+			env.helmRevision = 165
+			env.scriptPath = sabotagedPath
+			test.configure(env)
+			output, runErr := env.run("--verify-rollback-containment")
+			if runErr != nil {
+				t.Fatalf("removing the %s comparison did not expose false acceptance: %v\n%s", test.name, runErr, output)
+			}
+			if !strings.Contains(string(output), "rollback containment verified") {
+				t.Fatalf("removing the %s comparison did not reach false success:\n%s", test.name, output)
+			}
+		})
+	}
+}
+
+func TestDeployScriptRollbackContainmentFinalRevisionFence(t *testing.T) {
+	requirePOSIXShell(t)
+
+	for _, test := range []struct {
+		name          string
+		finalRevision int
+		finalStatus   string
+		historyExit   int
+		wantOutput    string
+	}{
+		{
+			name:          "revision advances during live verification",
+			finalRevision: 166,
+			finalStatus:   "deployed",
+			wantOutput:    "expected 165 deployed, found 166 deployed",
+		},
+		{
+			name:        "status changes during live verification",
+			finalStatus: "pending-upgrade",
+			wantOutput:  "expected 165 deployed, found 165 pending-upgrade",
+		},
+		{
+			name:        "final history emits valid record then fails",
+			historyExit: 7,
+			wantOutput:  "could not re-read the latest Helm revision",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manifest := baselineManifest(true, "", "false")
+			env := newDeployScriptEnvironment(t, manifest, manifest)
+			env.helmRevision = 165
+			env.postLiveHelmRevision = test.finalRevision
+			env.postLiveHelmStatus = test.finalStatus
+			env.postLiveHelmHistoryExit = test.historyExit
+
+			output, err := env.run("--verify-rollback-containment")
+			if err == nil {
+				t.Fatalf("rollback containment ignored concurrent Helm %s drift:\n%s", test.name, output)
+			}
+			if !strings.Contains(string(output), test.wantOutput) {
+				t.Fatalf("output %q does not contain %q", output, test.wantOutput)
+			}
+			if _, statErr := os.Stat(env.liveVerificationMark); statErr != nil {
+				t.Fatalf("fake Helm drift occurred before live verification began: %v", statErr)
+			}
+		})
+	}
+}
+
+func TestDeployScriptRollbackContainmentFinalRevisionFenceLoadBearing(t *testing.T) {
+	requirePOSIXShell(t)
+
+	deployPath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
+	deployBody, err := os.ReadFile(deployPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const finalFence = `  if [ -n "$required_revision" ] &&
+     ! require_helm_revision_still_deployed "$revision"; then
+    return 1
+  fi
+`
+	if strings.Count(string(deployBody), finalFence) != 1 {
+		t.Fatal("final post-live Helm revision fence is not unique")
+	}
+	sabotagedBody := strings.Replace(string(deployBody), finalFence, "", 1)
+	scriptDir := filepath.Dir(deployPath)
+	sabotagedPath := filepath.Join(scriptDir, "deploy-sabotaged-post-live-revision-fence-test.sh")
+	writeExecutable(t, sabotagedPath, sabotagedBody)
+	t.Cleanup(func() { os.Remove(sabotagedPath) })
+
+	manifest := baselineManifest(true, "", "false")
+	env := newDeployScriptEnvironment(t, manifest, manifest)
+	env.helmRevision = 165
+	env.postLiveHelmRevision = 166
+	env.postLiveHelmStatus = "deployed"
+	env.scriptPath = sabotagedPath
+
+	output, runErr := env.run("--verify-rollback-containment")
+	if runErr != nil {
+		t.Fatalf("removing the final revision fence did not expose false acceptance: %v\n%s", runErr, output)
+	}
+	if !strings.Contains(string(output), "rollback containment verified: deployed revision 165") {
+		t.Fatalf("removing the final revision fence did not reach false success:\n%s", output)
+	}
+	if _, statErr := os.Stat(env.liveVerificationMark); statErr != nil {
+		t.Fatalf("fake Helm drift occurred before live verification began: %v", statErr)
+	}
+}
+
+func TestDeployScriptRollbackContainmentFinalRevisionReadStatusLoadBearing(t *testing.T) {
+	requirePOSIXShell(t)
+
+	deployPath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
+	deployBody, err := os.ReadFile(deployPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const checkedRead = `  if ! latest_record="$(latest_helm_revision_record)"; then
+    echo "ERROR: could not re-read the latest Helm revision after live rollback containment verification." >&2
+    return 1
+  fi
+`
+	const uncheckedRead = `  latest_record="$(latest_helm_revision_record)" || true
+`
+	if strings.Count(string(deployBody), checkedRead) != 1 {
+		t.Fatal("final post-live Helm history status check is not unique")
+	}
+	sabotagedBody := strings.Replace(string(deployBody), checkedRead, uncheckedRead, 1)
+	scriptDir := filepath.Dir(deployPath)
+	sabotagedPath := filepath.Join(scriptDir, "deploy-sabotaged-post-live-history-status-test.sh")
+	writeExecutable(t, sabotagedPath, sabotagedBody)
+	t.Cleanup(func() { os.Remove(sabotagedPath) })
+
+	manifest := baselineManifest(true, "", "false")
+	env := newDeployScriptEnvironment(t, manifest, manifest)
+	env.helmRevision = 165
+	env.postLiveHelmHistoryExit = 7
+	env.scriptPath = sabotagedPath
+
+	output, runErr := env.run("--verify-rollback-containment")
+	if runErr != nil {
+		t.Fatalf("removing the final history status check did not expose false acceptance: %v\n%s", runErr, output)
+	}
+	if !strings.Contains(string(output), "rollback containment verified: deployed revision 165") {
+		t.Fatalf("removing the final history status check did not reach false success:\n%s", output)
+	}
+}
+
 func TestDeployScriptImmutableCandidate(t *testing.T) {
 	requirePOSIXShell(t)
 
@@ -209,6 +555,17 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 		{
 			name:              "exact candidate apply",
 			transform:         func(manifest string) string { return baselineManifest(true, "*", "false") },
+			wantSuccess:       true,
+			wantOutput:        "deployed exact source",
+			wantUpgrade:       true,
+			expectBuiltDigest: true,
+		},
+		{
+			name:      "exact candidate after equivalent rollback revision",
+			transform: func(manifest string) string { return baselineManifest(true, "*", "false") },
+			configure: func(env *deployScriptEnvironment) {
+				env.helmRevision = 165
+			},
 			wantSuccess:       true,
 			wantOutput:        "deployed exact source",
 			wantUpgrade:       true,
@@ -499,7 +856,7 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 					baselineIndex := -1
 					pauseIndex := -1
 					if lockIndex >= 0 {
-						if relative := strings.Index(string(output)[lockIndex:], "stored rollback revision"); relative >= 0 {
+						if relative := strings.Index(string(output)[lockIndex:], "immutable rollback revision"); relative >= 0 {
 							baselineIndex = lockIndex + relative
 						}
 					}
@@ -554,6 +911,7 @@ func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 				writeFile(t, env.liveResource, rollbackManifestWithHistoricalSynthetics(true))
 				writeFile(t, env.atomicRollbackManifest, rollbackManifestWithHistoricalSynthetics(false))
 				writeFile(t, env.containedRollbackManifest, rollbackManifestWithHistoricalSynthetics(true))
+				writeFile(t, env.immutableRollbackManifest, rollbackManifestWithHistoricalSynthetics(false))
 			},
 			wantOutput: "revision-163 immutable image baseline via deployed revision 165",
 		},
@@ -566,6 +924,7 @@ func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 				writeFile(t, env.liveResource, rollbackManifestWithHistoricalSynthetics(true))
 				writeFile(t, env.atomicRollbackManifest, rollbackManifestWithHistoricalSynthetics(false))
 				writeFile(t, env.containedRollbackManifest, rollbackManifestWithHistoricalSynthetics(true))
+				writeFile(t, env.immutableRollbackManifest, rollbackManifestWithHistoricalSynthetics(false))
 			},
 			wantOutput:       "nonterminal storage-mutating synthetic pod",
 			wantLockRetained: true,
@@ -3679,16 +4038,30 @@ type deployScriptEnvironment struct {
 	serverDryRunLog           string
 	serverDryRunMark          string
 	finalRollbackMark         string
+	liveVerificationMark      string
 	extraImageCount           string
 	atomicFailedMark          string
 	candidateAppliedMark      string
 	syntheticContainedMark    string
 	atomicRollbackManifest    string
 	containedRollbackManifest string
+	immutableRollbackManifest string
+	immutableRollbackHooks    string
+	currentRollbackHooks      string
+	immutableRollbackValues   string
+	currentRollbackValues     string
 	cronjobVerifyMark         string
 	claimsPausedMark          string
 	helmStatus                string
 	helmRevision              int
+	postLiveHelmRevision      int
+	postLiveHelmStatus        string
+	postLiveHelmHistoryExit   int
+	helmDescription           string
+	immutableRevisionMissing  bool
+	immutableHelmStatus       string
+	immutableChartVersion     string
+	currentChartVersion       string
 	mismatchContainer         string
 	packageTag                string
 	packageAdditionalTag      string
@@ -3761,16 +4134,26 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 		serverDryRunLog:           filepath.Join(root, "server-dry-run.log"),
 		serverDryRunMark:          filepath.Join(root, "server-dry-run.marker"),
 		finalRollbackMark:         filepath.Join(root, "final-rollback.marker"),
+		liveVerificationMark:      filepath.Join(root, "live-verification.marker"),
 		extraImageCount:           filepath.Join(root, "extra-image-count"),
 		atomicFailedMark:          filepath.Join(root, "atomic-failed"),
 		candidateAppliedMark:      filepath.Join(root, "candidate-applied"),
 		syntheticContainedMark:    filepath.Join(root, "synthetic-contained"),
 		atomicRollbackManifest:    filepath.Join(root, "atomic-rollback.yaml"),
 		containedRollbackManifest: filepath.Join(root, "atomic-rollback-contained.yaml"),
+		immutableRollbackManifest: filepath.Join(root, "immutable-rollback.yaml"),
+		immutableRollbackHooks:    filepath.Join(root, "immutable-rollback-hooks.yaml"),
+		currentRollbackHooks:      filepath.Join(root, "current-rollback-hooks.yaml"),
+		immutableRollbackValues:   filepath.Join(root, "immutable-rollback-values.json"),
+		currentRollbackValues:     filepath.Join(root, "current-rollback-values.json"),
 		cronjobVerifyMark:         filepath.Join(root, "cronjob-verified"),
 		claimsPausedMark:          filepath.Join(root, "claims-paused.marker"),
 		helmStatus:                "deployed",
 		helmRevision:              163,
+		helmDescription:           "Upgrade complete",
+		immutableHelmStatus:       "superseded",
+		immutableChartVersion:     "0.1.0",
+		currentChartVersion:       "0.1.0",
 		packageTag:                testSourceSHA,
 		packageDigest:             testDigestB,
 		runArtifactDigest:         testDigestB,
@@ -3802,6 +4185,11 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 	writeFile(t, env.upgradeHookManifest, "")
 	writeFile(t, env.atomicRollbackManifest, live)
 	writeFile(t, env.containedRollbackManifest, live)
+	writeFile(t, env.immutableRollbackManifest, live)
+	writeFile(t, env.immutableRollbackHooks, "")
+	writeFile(t, env.currentRollbackHooks, "")
+	writeFile(t, env.immutableRollbackValues, `{"provisioning":{"workerClaimsEnabled":false}}`+"\n")
+	writeFile(t, env.currentRollbackValues, `{"provisioning":{"workerClaimsEnabled":false}}`+"\n")
 	env.writeCommands()
 	return env
 }
@@ -3810,18 +4198,55 @@ func (e *deployScriptEnvironment) writeCommands() {
 	e.t.Helper()
 	writeExecutable(e.t, filepath.Join(e.binDir, "helm"), `#!/bin/bash
 set -euo pipefail
+
+latest_revision() {
+  local revision=$FAKE_HELM_REVISION
+  if [ -f "$FAKE_LIVE_VERIFICATION_MARKER" ] &&
+     [ "$FAKE_POST_LIVE_HELM_REVISION" != 0 ]; then
+    printf '%s' "$FAKE_POST_LIVE_HELM_REVISION"
+    return
+  fi
+  if [ -f "$FAKE_ATOMIC_FAILED_MARKER" ]; then
+    revision=$((FAKE_HELM_REVISION + 2))
+  elif [ -f "$FAKE_UPGRADED_MARKER" ]; then
+    revision=$((FAKE_HELM_REVISION + 1))
+  fi
+  printf '%s' "$revision"
+}
+
+requested_revision() {
+  local previous=
+  for argument in "$@"; do
+    if [ "$previous" = --revision ]; then
+      printf '%s' "$argument"
+      return
+    fi
+    previous=$argument
+  done
+  latest_revision
+}
+
 case "$1 $2" in
   "history selfservice")
-    revision=$FAKE_HELM_REVISION
-    if [ -f "$FAKE_ATOMIC_FAILED_MARKER" ]; then
-      revision=$((FAKE_HELM_REVISION + 2))
-    elif [ -f "$FAKE_UPGRADED_MARKER" ]; then
-      revision=$((FAKE_HELM_REVISION + 1))
+    revision=$(latest_revision)
+    status=$FAKE_HELM_STATUS
+    if [ -f "$FAKE_LIVE_VERIFICATION_MARKER" ] &&
+       [ -n "$FAKE_POST_LIVE_HELM_STATUS" ]; then
+      status=$FAKE_POST_LIVE_HELM_STATUS
     fi
-    printf '%s\n' '- app_version: test' "  revision: $revision" "  status: $FAKE_HELM_STATUS"
+    printf '%s\n' '- app_version: test' "  description: $FAKE_HELM_DESCRIPTION" "  revision: $revision" "  status: $status"
+    if [ -f "$FAKE_LIVE_VERIFICATION_MARKER" ] &&
+       [ "$FAKE_POST_LIVE_HELM_HISTORY_EXIT" != 0 ]; then
+      exit "$FAKE_POST_LIVE_HELM_HISTORY_EXIT"
+    fi
     ;;
   "get manifest")
-    if [ -f "$FAKE_ATOMIC_FAILED_MARKER" ]; then
+    revision=$(requested_revision "$@")
+    latest=$(latest_revision)
+    if [ "$revision" = 163 ] && [ "$latest" != 163 ]; then
+      [ "$FAKE_IMMUTABLE_REVISION_MISSING" != true ] || exit 1
+      cat "$FAKE_IMMUTABLE_ROLLBACK_MANIFEST"
+    elif [ -f "$FAKE_ATOMIC_FAILED_MARKER" ]; then
       cat "$FAKE_ATOMIC_ROLLBACK_MANIFEST"
     elif [ -f "$FAKE_UPGRADED_MARKER" ]; then
       cat "$FAKE_BASELINE_MANIFEST"
@@ -3829,8 +4254,50 @@ case "$1 $2" in
       cat "$FAKE_LIVE_MANIFEST"
     fi
     ;;
+  "get hooks")
+    revision=$(requested_revision "$@")
+    latest=$(latest_revision)
+    if [ "$revision" = 163 ] && [ "$latest" != 163 ]; then
+      [ "$FAKE_IMMUTABLE_REVISION_MISSING" != true ] || exit 1
+      cat "$FAKE_IMMUTABLE_ROLLBACK_HOOKS"
+    else
+      cat "$FAKE_CURRENT_ROLLBACK_HOOKS"
+    fi
+    ;;
   "get values")
-    printf '{}\n'
+    if [[ "$*" == *"-o json"* ]] && [[ "$*" != *"--all"* ]]; then
+      echo "complete rollback equivalence values require --all" >&2
+      exit 93
+    fi
+    revision=$(requested_revision "$@")
+    latest=$(latest_revision)
+    if [ "$revision" = 163 ] && [ "$latest" != 163 ]; then
+      [ "$FAKE_IMMUTABLE_REVISION_MISSING" != true ] || exit 1
+      cat "$FAKE_IMMUTABLE_ROLLBACK_VALUES"
+    else
+      cat "$FAKE_CURRENT_ROLLBACK_VALUES"
+    fi
+    ;;
+  "get metadata")
+    revision=$(requested_revision "$@")
+    latest=$(latest_revision)
+    if [ "$revision" = 163 ] && [ "$latest" != 163 ]; then
+      [ "$FAKE_IMMUTABLE_REVISION_MISSING" != true ] || exit 1
+      chart_version=$FAKE_IMMUTABLE_CHART_VERSION
+      status=$FAKE_IMMUTABLE_HELM_STATUS
+    else
+      chart_version=$FAKE_CURRENT_CHART_VERSION
+      status=$FAKE_HELM_STATUS
+    fi
+    jq -cn \
+      --arg name selfservice \
+      --arg chart selfservice \
+      --arg version "$chart_version" \
+      --arg appVersion test \
+      --arg namespace selfservice \
+      --argjson revision "$revision" \
+      --arg status "$status" \
+      '{name:$name,chart:$chart,version:$version,appVersion:$appVersion,namespace:$namespace,revision:$revision,status:$status,deployedAt:"2026-08-27T00:00:00Z"}'
     ;;
   "dependency build"|"dep build")
     ;;
@@ -4299,6 +4766,11 @@ case "$1" in
     fi
     ;;
   rollout)
+    if [ "$FAKE_POST_LIVE_HELM_REVISION" != 0 ] ||
+       [ -n "$FAKE_POST_LIVE_HELM_STATUS" ] ||
+       [ "$FAKE_POST_LIVE_HELM_HISTORY_EXIT" != 0 ]; then
+      : > "$FAKE_LIVE_VERIFICATION_MARKER"
+    fi
     ;;
   exec)
     if [[ "$*" == *"pod_name"* ]]; then
@@ -4797,16 +5269,30 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_SERVER_DRY_RUN_LOG="+e.serverDryRunLog,
 		"FAKE_SERVER_DRY_RUN_MARKER="+e.serverDryRunMark,
 		"FAKE_FINAL_ROLLBACK_MARKER="+e.finalRollbackMark,
+		"FAKE_LIVE_VERIFICATION_MARKER="+e.liveVerificationMark,
 		"FAKE_EXTRA_IMAGE_COUNT="+e.extraImageCount,
 		"FAKE_ATOMIC_FAILED_MARKER="+e.atomicFailedMark,
 		"FAKE_CANDIDATE_APPLIED_MARKER="+e.candidateAppliedMark,
 		"FAKE_SYNTHETIC_CONTAINED_MARKER="+e.syntheticContainedMark,
 		"FAKE_ATOMIC_ROLLBACK_MANIFEST="+e.atomicRollbackManifest,
 		"FAKE_CONTAINED_ROLLBACK_MANIFEST="+e.containedRollbackManifest,
+		"FAKE_IMMUTABLE_ROLLBACK_MANIFEST="+e.immutableRollbackManifest,
+		"FAKE_IMMUTABLE_ROLLBACK_HOOKS="+e.immutableRollbackHooks,
+		"FAKE_CURRENT_ROLLBACK_HOOKS="+e.currentRollbackHooks,
+		"FAKE_IMMUTABLE_ROLLBACK_VALUES="+e.immutableRollbackValues,
+		"FAKE_CURRENT_ROLLBACK_VALUES="+e.currentRollbackValues,
 		"FAKE_CRONJOB_VERIFY_MARKER="+e.cronjobVerifyMark,
 		"FAKE_CLAIMS_PAUSED_MARKER="+e.claimsPausedMark,
 		"FAKE_HELM_STATUS="+e.helmStatus,
 		"FAKE_HELM_REVISION="+strconv.Itoa(e.helmRevision),
+		"FAKE_POST_LIVE_HELM_REVISION="+strconv.Itoa(e.postLiveHelmRevision),
+		"FAKE_POST_LIVE_HELM_STATUS="+e.postLiveHelmStatus,
+		"FAKE_POST_LIVE_HELM_HISTORY_EXIT="+strconv.Itoa(e.postLiveHelmHistoryExit),
+		"FAKE_HELM_DESCRIPTION="+e.helmDescription,
+		"FAKE_IMMUTABLE_REVISION_MISSING="+strconv.FormatBool(e.immutableRevisionMissing),
+		"FAKE_IMMUTABLE_HELM_STATUS="+e.immutableHelmStatus,
+		"FAKE_IMMUTABLE_CHART_VERSION="+e.immutableChartVersion,
+		"FAKE_CURRENT_CHART_VERSION="+e.currentChartVersion,
 		"FAKE_MISMATCH_CONTAINER="+e.mismatchContainer,
 		"FAKE_EXTERNAL_DRIFT_AFTER_SERVER_DRY_RUN="+strconv.FormatBool(e.externalDriftAfterServerDryRun),
 		"FAKE_FAIL_FINAL_SERVER_DRY_RUN="+strconv.FormatBool(e.failFinalServerDryRun),
