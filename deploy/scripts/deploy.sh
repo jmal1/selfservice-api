@@ -2515,6 +2515,7 @@ verify_external_candidate_images() {
 
 verify_deployed_candidate() {
   local revision status tmp_dir manifest inventory deployed_canonical workload_health_status
+  HELM_RELEASE_LOCK_PRESERVE=true
   if ! read -r revision status <<< "$(latest_helm_revision_record)"; then
     echo "ERROR: could not determine the deployed candidate Helm revision." >&2
     return 1
@@ -2570,6 +2571,7 @@ verify_deployed_candidate() {
   if ! require_no_active_jobs; then
     return 1
   fi
+  HELM_RELEASE_LOCK_PRESERVE=false
   echo "==> deployed candidate revision $revision matches every declared/live image and remains fully drained"
 }
 
@@ -3361,11 +3363,9 @@ if [ "$helm_upgrade_status" -ne 0 ]; then
   exit "$helm_upgrade_status"
 fi
 
-HELM_RELEASE_LOCK_PRESERVE=true
 if ! verify_deployed_candidate; then
   echo "ERROR: Helm reported success but exact candidate containment failed. The release lock is intentionally retained; manual intervention is required." >&2
   exit 1
 fi
-HELM_RELEASE_LOCK_PRESERVE=false
 release_helm_release_lock
 echo "==> deployed exact source $CANDIDATE_SOURCE_SHA with immutable workload and RUNNER_IMAGE digests"
