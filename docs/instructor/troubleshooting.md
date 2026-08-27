@@ -115,9 +115,15 @@ Before pulling upgrade code, building or pushing images, or running a migration:
    ./deploy/scripts/deploy.sh --verify-rollback-containment
    ```
 
-For this foundation rollout the proof requires the latest deployed Helm
-revision to be the immutable revision **160**. PostgreSQL must report migration
-**36 clean**. The script checks that against
+For this foundation rollout the immutable rollback target remains Helm revision
+**163**. A successful Helm rollback creates a new latest revision instead of
+making revision 163 numerically latest. The proof therefore requires revision
+163 to remain readable and requires the latest revision to be deployed with no
+pending operation. When the latest revision is newer than 163, its stored
+manifest, hooks, complete effective values, and chart metadata must exactly
+match revision 163 before any live-state checks run. A rollback description
+such as `Rollback to 163` is never sufficient evidence. PostgreSQL must report
+migration **36 clean**. The script checks that against
 the latest migration in the hotfix checkout and proves the version and dirty
 flag are unchanged across baseline preparation. Stop for incident recovery if
 it reports another state.
@@ -218,11 +224,12 @@ The live worker may temporarily have
 `WORKER_PROVISIONING_CLAIMS_ENABLED=true` even though the stored rollback
 revision correctly renders it as `false`. A real deploy does not misclassify
 that stored revision as claims-enabled. Under the release lock it first proves
-the stored revision is revision 162 with claims disabled and all immutable pins.
-Candidate provenance, digest resolution, rendering, and the first server dry-run
-all happen before the lock or claims mutation. For a real apply, the script then
-locks, proves revision 162 again, explicitly sets the live worker claims value
-back to `false`, waits for the rollout, and performs the complete
+immutable revision 163 remains present and the latest deployed revision is
+content-identical to it, with claims disabled and all immutable pins. Candidate
+provenance, digest resolution, rendering, and the first server dry-run all
+happen before the lock or claims mutation. For a real apply, the script then
+locks, repeats that immutable-content proof, explicitly sets the live worker
+claims value back to `false`, waits for the rollout, and performs the complete
 stored-manifest/live-state proof.
 
 The deploy renders the chart only as an intermediate input. It replaces the
@@ -263,9 +270,9 @@ janitor/runner clone CronJobs, and rejects every nonterminal synthetic
 originating CronJob has exited. Because an expiration destroy payload may have
 only `pod_id`, this check joins `pods` and filters on the authoritative pod name.
 It repeats both drains immediately before Helm. It then re-proves the
-source, revision-160 rollback containment, migration, workload health, external
-live digests, and final server dry-run immediately before
-`helm upgrade --atomic`. Initial and final server-defaulted objects are
+source, immutable revision-163 equivalence and rollback containment, migration,
+workload health, external live digests, and final server dry-run immediately
+before `helm upgrade --atomic`. Initial and final server-defaulted objects are
 canonicalized and compared in full, not just by image or selected environment
 values. The Helm
 post-renderer pins the apply-time render and byte-compares it to the validated
@@ -276,18 +283,18 @@ Helm revision is rejected, leaving the immutable all-workload baseline as the
 immediately previous successful rollback target.
 
 `helm upgrade --atomic` failure is handled explicitly while the release lock is
-still held. Revision 160 is the immutable image/workload baseline, but its
-historical values enabled lifecycle, janitor, and runner synthetics and are not
-safe rollback intent. The script forces claims disabled, immediately reapplies
-the current containment (API monitor unsuspended, lifecycle false,
-janitor/runner suspended), waits for the worker, and proves revision 162, its
-stored and live image identities (including `RUNNER_IMAGE`), workload health,
-migration state, zero nonterminal synthetic create/destroy work, and both job
-drains.
+still held. Revision 163 remains the immutable rollback target. The script
+forces claims disabled, immediately reapplies the current containment (API
+monitor unsuspended, lifecycle false, janitor/runner suspended), waits for the
+worker, and proves the newly deployed rollback revision has the exact revision
+163 manifest, hooks, complete effective values, and chart metadata. It then
+proves stored and live image identities (including `RUNNER_IMAGE`), workload
+health, migration state, zero nonterminal synthetic create/destroy work, and
+both job drains.
 Helm may record the successful atomic rollback as a newer deployed revision; the
-gate compares that revision's complete image inventory and runner identity with
-the approved revision-160 baseline instead of mistaking the new revision number
-for workload identity.
+gate proves that revision's complete release content is identical to immutable
+revision 163 instead of mistaking either a new revision number or a human-readable
+rollback description for workload identity.
 It releases the lock only when that rollback proof succeeds, while still
 returning the Helm failure. Any ambiguous or drifted rollback deliberately
 retains the lock for manual intervention. A reported Helm success receives the
