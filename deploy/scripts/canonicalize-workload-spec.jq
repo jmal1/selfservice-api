@@ -47,6 +47,8 @@ def validate_managed_annotation($key; $expected):
         | del(."meta.helm.sh/release-namespace")
         | (if $kind == "Deployment" then
             del(."deployment.kubernetes.io/revision")
+          elif $kind == "DaemonSet" then
+            del(."deprecated.daemonset.template.generation")
           else
             .
           end) as $normalized_annotations

@@ -293,6 +293,9 @@ returning the Helm failure. Any ambiguous or drifted rollback deliberately
 retains the lock for manual intervention. A reported Helm success receives the
 same strict treatment: the deployed manifest and every live ImageID must equal
 the validated candidate map, and the full server-canonical object set must match.
+That comparison ignores only Kubernetes' exact top-level Deployment revision and
+DaemonSet template-generation annotations; similarly named, template-level, and
+all other annotations remain part of the fail-closed comparison.
 For the API-monitor CronJob, the deploy creates and waits for a fresh contained
 Job so a retained execution from the old template cannot satisfy the ImageID
 proof. `RUNNER_IMAGE` must match, workloads must be healthy, and both drains

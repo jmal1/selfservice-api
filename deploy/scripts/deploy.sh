@@ -2204,8 +2204,28 @@ canonicalize_server_candidate() {
     # inseparably with --dry-run=server, for the same reason as
     # server_validate_candidate above: this is a per-document validation-only
     # SSA dry-run against already Helm-owned objects, not a mutating apply.
+    # Removing the sole generated annotation leaves {}, while kubectl may omit
+    # or null the empty map, so only empty containers are normalized afterward.
     kubectl_server_apply_dry_run crucible-production-deploy "$document" json \
       | jq -cS '
+          if .kind == "Deployment" and
+             (.metadata.annotations | type) == "object" and
+             (.metadata.annotations | has("deployment.kubernetes.io/revision")) then
+            del(.metadata.annotations."deployment.kubernetes.io/revision")
+          elif .kind == "DaemonSet" and
+               (.metadata.annotations | type) == "object" and
+               (.metadata.annotations | has("deprecated.daemonset.template.generation")) then
+            del(.metadata.annotations."deprecated.daemonset.template.generation")
+          else
+            .
+          end
+          |
+          if .metadata.annotations == null or .metadata.annotations == {} then
+            del(.metadata.annotations)
+          else
+            .
+          end
+          |
           del(
             .metadata.creationTimestamp,
             .metadata.deletionGracePeriodSeconds,
