@@ -1717,7 +1717,10 @@ workload_health() {
   while IFS=$'\t' read -r kind name; do
     case "$kind" in
       Deployment|DaemonSet|StatefulSet)
-        kubectl rollout status "$kind/$name" -n "$NAMESPACE" --timeout=5m
+        if ! kubectl rollout status "$kind/$name" -n "$NAMESPACE" --timeout=5m; then
+          echo "ERROR: $kind/$name did not stabilize during deployed candidate health verification." >&2
+          return 1
+        fi
         ;;
       CronJob)
         job_name="$(latest_cronjob_job "$name")"
@@ -2554,6 +2557,10 @@ verify_deployed_candidate() {
       "$CANDIDATE_IMAGE_MAP" \
       "$tmp_dir/live-images" \
       candidate; then
+    return 1
+  fi
+  if ! workload_health "$inventory"; then
+    echo "ERROR: deployed candidate workloads regressed after live image verification." >&2
     return 1
   fi
   if ! require_no_active_jobs; then

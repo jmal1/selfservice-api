@@ -1150,6 +1150,178 @@ func TestDeployScriptDeployedCandidateOrderingIsLoadBearing(t *testing.T) {
 	}
 }
 
+func revertWorkloadHealthPropagation(t *testing.T, source string) string {
+	t.Helper()
+	const fixedBlock = `      Deployment|DaemonSet|StatefulSet)
+        if ! kubectl rollout status "$kind/$name" -n "$NAMESPACE" --timeout=5m; then
+          echo "ERROR: $kind/$name did not stabilize during deployed candidate health verification." >&2
+          return 1
+        fi
+        ;;
+`
+	const oldBlock = `      Deployment|DaemonSet|StatefulSet)
+        kubectl rollout status "$kind/$name" -n "$NAMESPACE" --timeout=5m
+        ;;
+`
+	if !strings.Contains(source, fixedBlock) {
+		t.Fatal("could not locate the fixed workload_health rollout propagation")
+	}
+	return strings.Replace(source, fixedBlock, oldBlock, 1)
+}
+
+func revertFinalDeployedCandidateHealthFence(t *testing.T, source string) string {
+	t.Helper()
+	const fixedBlock = `  if ! verify_external_candidate_images \
+      "$CANDIDATE_IMAGE_MAP" \
+      "$tmp_dir/live-images" \
+      candidate; then
+    return 1
+  fi
+  if ! workload_health "$inventory"; then
+    echo "ERROR: deployed candidate workloads regressed after live image verification." >&2
+    return 1
+  fi
+  if ! require_no_active_jobs; then
+    return 1
+  fi
+`
+	const oldBlock = `  if ! verify_external_candidate_images \
+      "$CANDIDATE_IMAGE_MAP" \
+      "$tmp_dir/live-images" \
+      candidate; then
+    return 1
+  fi
+  if ! require_no_active_jobs; then
+    return 1
+  fi
+`
+	if !strings.Contains(source, fixedBlock) {
+		t.Fatal("could not locate the fixed final workload_health fence")
+	}
+	return strings.Replace(source, fixedBlock, oldBlock, 1)
+}
+
+func TestDeployScriptWorkloadHealthRolloutFailureIsLoadBearing(t *testing.T) {
+	requirePOSIXShell(t)
+	originalBytes, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	live := baselineManifest(true, "", "false")
+	candidate := baselineManifest(true, "*", "false")
+
+	t.Run("rollout failure retains lock", func(t *testing.T) {
+		env := newDeployScriptEnvironment(t, live, candidate)
+		env.warmerRolloutFailure = true
+		writeFile(t, env.upgradeHookManifest, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestB))
+
+		output, err := env.run("--no-pull")
+		if err == nil {
+			t.Fatalf("deploy unexpectedly succeeded despite the warmer rollout failure:\n%s", output)
+		}
+		if !strings.Contains(string(output), "sabotaged rollout status failure for selfservice-runner-image-warmer") {
+			t.Fatalf("output did not surface the warmer rollout failure:\n%s", output)
+		}
+		if _, statErr := os.Stat(env.lockFile); statErr != nil {
+			t.Fatalf("rollout failure did not retain the release lock: %v", statErr)
+		}
+		if _, statErr := os.Stat(env.cronjobVerifyMark); !os.IsNotExist(statErr) {
+			t.Fatalf("external image verification should not run after a rollout failure: %v", statErr)
+		}
+	})
+
+	t.Run("sabotaged explicit propagation is rejected", func(t *testing.T) {
+		mutated := revertWorkloadHealthPropagation(t, string(originalBytes))
+		scriptPath := filepath.Join(
+			"..", "..", "deploy", "scripts",
+			"deploy-sabotaged-workload-health-propagation-test.sh",
+		)
+		if err := os.WriteFile(scriptPath, []byte(mutated), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.Remove(scriptPath) })
+
+		env := newDeployScriptEnvironment(t, live, candidate)
+		env.warmerRolloutFailure = true
+		env.scriptPath = scriptPath
+		writeFile(t, env.upgradeHookManifest, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestB))
+
+		output, runErr := env.run("--no-pull")
+		if runErr == nil {
+			t.Fatalf("sabotaged workload_health propagation unexpectedly succeeded:\n%s", output)
+		}
+		if !strings.Contains(string(output), "sabotaged rollout status failure for selfservice-runner-image-warmer") {
+			t.Fatalf("sabotaged propagation did not surface the warmer rollout failure:\n%s", output)
+		}
+		if _, statErr := os.Stat(env.lockFile); statErr != nil {
+			t.Fatalf("sabotaged workload_health propagation did not retain the release lock: %v", statErr)
+		}
+		if _, statErr := os.Stat(env.cronjobVerifyMark); !os.IsNotExist(statErr) {
+			t.Fatalf("sabotaged workload_health propagation unexpectedly reached external image verification: %v", statErr)
+		}
+	})
+}
+
+func TestDeployScriptFinalWorkloadHealthFenceIsLoadBearing(t *testing.T) {
+	requirePOSIXShell(t)
+	originalBytes, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	live := baselineManifest(true, "", "false")
+	candidate := baselineManifest(true, "*", "false")
+
+	t.Run("final health regression retains lock", func(t *testing.T) {
+		env := newDeployScriptEnvironment(t, live, candidate)
+		env.finalWorkloadHealthRegression = true
+		writeFile(t, env.upgradeHookManifest, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestB))
+
+		output, err := env.run("--no-pull")
+		if err == nil {
+			t.Fatalf("deploy unexpectedly succeeded despite the final workload health regression:\n%s", output)
+		}
+		if !strings.Contains(string(output), "deployed candidate workloads regressed after live image verification") {
+			t.Fatalf("output did not surface the final workload health regression:\n%s", output)
+		}
+		if _, statErr := os.Stat(env.lockFile); statErr != nil {
+			t.Fatalf("final workload health regression did not retain the release lock: %v", statErr)
+		}
+		if _, statErr := os.Stat(env.cronjobVerifyMark); statErr != nil {
+			t.Fatalf("final workload health regression did not reach external image verification: %v", statErr)
+		}
+	})
+
+	t.Run("sabotaged final health fence is rejected", func(t *testing.T) {
+		mutated := revertFinalDeployedCandidateHealthFence(t, string(originalBytes))
+		scriptPath := filepath.Join(
+			"..", "..", "deploy", "scripts",
+			"deploy-sabotaged-final-workload-health-fence-test.sh",
+		)
+		if err := os.WriteFile(scriptPath, []byte(mutated), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.Remove(scriptPath) })
+
+		env := newDeployScriptEnvironment(t, live, candidate)
+		env.finalWorkloadHealthRegression = true
+		env.scriptPath = scriptPath
+		writeFile(t, env.upgradeHookManifest, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestB))
+
+		output, runErr := env.run("--no-pull")
+		if runErr == nil {
+			t.Fatalf("sabotaged final workload health fence unexpectedly succeeded:\n%s", output)
+		}
+		if !strings.Contains(string(output), "deployed candidate workloads regressed after live image verification") {
+			t.Fatalf("sabotaged final workload health fence did not surface the regression:\n%s", output)
+		}
+		if _, statErr := os.Stat(env.lockFile); statErr != nil {
+			t.Fatalf("sabotaged final workload health fence did not retain the release lock: %v", statErr)
+		}
+	})
+}
+
 func TestDeployScriptRejectsUntrustedSource(t *testing.T) {
 	requirePOSIXShell(t)
 
@@ -4241,6 +4413,7 @@ type deployScriptEnvironment struct {
 	mutateFinalServerObject        bool
 	warmerRolloutFailure           bool
 	warmerImageStaysEmpty          bool
+	finalWorkloadHealthRegression  bool
 	activeJobs                     int
 	activeKubernetesJobs           int
 	pendingSyntheticJobs           int
@@ -4943,14 +5116,20 @@ case "$1" in
   rollout)
     case "$*" in
       *"DaemonSet/selfservice-runner-image-warmer"*|*"daemonset/selfservice-runner-image-warmer"*)
-      if [ "$FAKE_WARMER_ROLLOUT_FAILURE" = true ]; then
-        echo "sabotaged rollout status failure for selfservice-runner-image-warmer" >&2
-        exit 94
-      fi
-      if [ -f "$FAKE_CANDIDATE_APPLIED_MARKER" ]; then
-        : > "$FAKE_WARMER_ROLLOUT_MARKER"
-      fi
-        ;;
+       if [ "$FAKE_WARMER_ROLLOUT_FAILURE" = true ]; then
+         echo "sabotaged rollout status failure for selfservice-runner-image-warmer" >&2
+         exit 94
+       fi
+       if [ "$FAKE_FINAL_WORKLOAD_HEALTH_REGRESSION" = true ] &&
+          [ -f "$FAKE_CANDIDATE_APPLIED_MARKER" ] &&
+          [ -f "$FAKE_CRONJOB_VERIFY_MARKER" ]; then
+         echo "sabotaged workload health regression after external verification for selfservice-runner-image-warmer" >&2
+         exit 95
+       fi
+       if [ -f "$FAKE_CANDIDATE_APPLIED_MARKER" ]; then
+         : > "$FAKE_WARMER_ROLLOUT_MARKER"
+       fi
+       ;;
     esac
     if [ "$FAKE_POST_LIVE_HELM_REVISION" != 0 ] ||
        [ -n "$FAKE_POST_LIVE_HELM_STATUS" ] ||
@@ -5473,6 +5652,7 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_WARMER_IMAGE_PROBE_LOG="+e.warmerImageProbeLog,
 		"FAKE_WARMER_ROLLOUT_FAILURE="+strconv.FormatBool(e.warmerRolloutFailure),
 		"FAKE_WARMER_IMAGE_STAYS_EMPTY="+strconv.FormatBool(e.warmerImageStaysEmpty),
+		"FAKE_FINAL_WORKLOAD_HEALTH_REGRESSION="+strconv.FormatBool(e.finalWorkloadHealthRegression),
 		"FAKE_HELM_STATUS="+e.helmStatus,
 		"FAKE_HELM_REVISION="+strconv.Itoa(e.helmRevision),
 		"FAKE_POST_LIVE_HELM_REVISION="+strconv.Itoa(e.postLiveHelmRevision),
