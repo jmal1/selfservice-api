@@ -226,6 +226,74 @@ func TestCIWorkflowConcurrencyUsesStablePROrRunID(t *testing.T) {
 	}
 }
 
+// Pull request branch filters match the target branch, so dependent PRs need
+// an unrestricted trigger while image-publishing pushes stay main-only.
+func TestCIWorkflowTriggersDependentPRsButPublishesOnlyFromMain(t *testing.T) {
+	workflow := loadCIWorkflow(t)
+	triggers := mustMap(t, workflow["on"], "on")
+
+	pullRequest := mustMap(t, triggers["pull_request"], "on.pull_request")
+	if branches, restricted := pullRequest["branches"]; restricted {
+		t.Fatalf("on.pull_request.branches = %v, want no target-branch restriction so dependent PRs run", branches)
+	}
+	if pathsIgnore, restricted := pullRequest["paths-ignore"]; restricted {
+		t.Fatalf("on.pull_request.paths-ignore = %v, want every PR to instantiate the required CI check", pathsIgnore)
+	}
+
+	push := mustMap(t, triggers["push"], "on.push")
+	branches := mustSlice(t, push["branches"], "on.push.branches")
+	if len(branches) != 1 || mustString(t, branches[0], "on.push.branches[0]") != "main" {
+		t.Fatalf("on.push.branches = %v, want exactly [main] so feature branches cannot publish images", branches)
+	}
+}
+
+func TestCIWorkflowRequiredPRCheckAggregatesConditionalJobs(t *testing.T) {
+	workflow := loadCIWorkflow(t)
+	required := workflowJob(t, workflow, "ci-required")
+
+	if got := mustString(t, required["if"], "jobs.ci-required.if"); got != "always() && github.event_name == 'pull_request'" {
+		t.Fatalf("jobs.ci-required.if = %q, want an always-evaluated PR-only gate", got)
+	}
+	if got := needsList(t, required, "jobs.ci-required.needs"); !reflect.DeepEqual(got, []string{"changes", "build-pr", "test"}) {
+		t.Fatalf("jobs.ci-required.needs = %v, want [changes build-pr test]", got)
+	}
+	if value, ok := required["continue-on-error"]; ok {
+		t.Fatalf("jobs.ci-required.continue-on-error = %v, want failures to remain blocking", value)
+	}
+
+	steps := mustSlice(t, required["steps"], "jobs.ci-required.steps")
+	if len(steps) != 1 {
+		t.Fatalf("jobs.ci-required.steps has %d entries, want one aggregation step", len(steps))
+	}
+	step := mustMap(t, steps[0], "jobs.ci-required.steps[0]")
+	if got := mustString(t, step["name"], "jobs.ci-required.steps[0].name"); got != "Require successful PR CI" {
+		t.Fatalf("jobs.ci-required.steps[0].name = %q, want %q", got, "Require successful PR CI")
+	}
+	if value, ok := step["continue-on-error"]; ok {
+		t.Fatalf("jobs.ci-required.steps[0].continue-on-error = %v, want failures to remain blocking", value)
+	}
+	wantEnv := map[string]any{
+		"CHANGES_RESULT":  "${{ needs.changes.result }}",
+		"BUILD_PR_RESULT": "${{ needs.build-pr.result }}",
+		"TEST_RESULT":     "${{ needs.test.result }}",
+	}
+	if got := mustMap(t, step["env"], "jobs.ci-required.steps[0].env"); !reflect.DeepEqual(got, wantEnv) {
+		t.Fatalf("jobs.ci-required.steps[0].env = %#v, want %#v", got, wantEnv)
+	}
+	const wantRun = `set -euo pipefail
+test "$CHANGES_RESULT" = "success"
+for result in "$BUILD_PR_RESULT" "$TEST_RESULT"; do
+  case "$result" in
+    success|skipped) ;;
+    *) echo "required PR job failed or was cancelled: $result" >&2; exit 1 ;;
+  esac
+done
+`
+	if got := mustString(t, step["run"], "jobs.ci-required.steps[0].run"); got != wantRun {
+		t.Fatalf("jobs.ci-required.steps[0].run = %q, want strict success/skipped aggregation", got)
+	}
+}
+
 func TestCIWorkflowBuildJobsSplitPRAndPush(t *testing.T) {
 	workflow := loadCIWorkflow(t)
 	buildPR := workflowJob(t, workflow, "build-pr")

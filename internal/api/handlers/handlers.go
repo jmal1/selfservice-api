@@ -30,6 +30,8 @@ import (
 type Handler struct {
 	db              *database.Queries
 	events          *events.Client
+	jobEvents       jobCreatedPublisher
+	jobStatusEvents jobStatusPublisher
 	vc              VCenterConsole
 	vcFolders       VCenterFolderEnumerator
 	logger          *slog.Logger
@@ -90,6 +92,24 @@ type Handler struct {
 	provisioningMetrics    provisioningAdmissionMetrics
 }
 
+type jobCreatedPublisher interface {
+	PublishJobCreated(jobID uuid.UUID, jobType string) error
+}
+
+func isNilJobCreatedPublisher(p jobCreatedPublisher) bool {
+	if p == nil {
+		return true
+	}
+	if client, ok := p.(*events.Client); ok {
+		return client == nil
+	}
+	return false
+}
+
+type jobStatusPublisher interface {
+	PublishRaw(subject string, evt events.Event) error
+}
+
 type imageUploadMetrics interface {
 	RecordImageUpload(kind, result string)
 }
@@ -132,7 +152,15 @@ type VCenterConsole interface {
 
 // NewHandler creates a new Handler.
 func NewHandler(db *database.Queries, events *events.Client, vc VCenterConsole, logger *slog.Logger, allowedOrigins []string) *Handler {
-	return &Handler{db: db, events: events, vc: vc, logger: logger, allowedOrigins: allowedOrigins}
+	return &Handler{
+		db:              db,
+		events:          events,
+		jobEvents:       events,
+		jobStatusEvents: events,
+		vc:              vc,
+		logger:          logger,
+		allowedOrigins:  allowedOrigins,
+	}
 }
 
 // WithProvisioningAdmission configures the API maintenance gate. When this
@@ -630,12 +658,6 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		h.logger.Error("commit tx failed", "error", err)
-		respondError(w, r, http.StatusInternalServerError, "internal error")
-		return
-	}
-
 	// Create job payload matching worker's CreatePodPayload struct
 	type jobPayload struct {
 		PodID   uuid.UUID      `json:"pod_id"`
@@ -643,30 +665,40 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 		VMs     []workerVMSpec `json:"vms"`
 		UserID  string         `json:"user_id"`
 	}
-	payload, _ := json.Marshal(jobPayload{
+	payload, err := json.Marshal(jobPayload{
 		PodID:   podID,
 		PodName: req.Name,
 		VMs:     vmSpecs,
 		UserID:  userID.String(),
 	})
+	if err != nil {
+		h.logger.Error("marshal pod create job payload failed", "error", err)
+		respondError(w, r, http.StatusInternalServerError, "failed to queue provisioning job")
+		return
+	}
 
-	// Insert job
-	job, err := h.db.CreateJob(ctx, models.JobTypePodCreate, payload)
+	job, err := h.db.CreatePodCreateJobTx(ctx, tx, podID, payload)
 	if err != nil {
 		h.logger.Error("create job failed", "error", err)
 		respondError(w, r, http.StatusInternalServerError, "failed to queue provisioning job")
 		return
 	}
 
+	if err := tx.Commit(ctx); err != nil {
+		h.logger.Error("commit tx failed", "error", err)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
+		return
+	}
+
 	// Notify workers via NATS
-	if err := h.events.PublishJobCreated(job.ID, job.Type); err != nil {
+	if err := h.jobEvents.PublishJobCreated(job.ID, job.Type); err != nil {
 		h.logger.Warn("failed to publish job created event", "error", err, "job_id", job.ID)
 	}
 
 	// Audit
 	audit.Log(r.Context(), h.db, "pod.create",
 		audit.Resource("job", job.ID),
-		audit.IP(r.RemoteAddr),
+		audit.FromRequest(r),
 		audit.Detail("pod_id", podID.String()),
 	)
 
@@ -677,7 +709,7 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// DeletePod queues a pod destruction job.
+// DeletePod cancels a never-started pending pod or queues a destruction job.
 func (h *Handler) DeletePod(w http.ResponseWriter, r *http.Request) {
 	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
 	if err != nil {
@@ -698,33 +730,99 @@ func (h *Handler) DeletePod(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if pod.Status == models.PodStatusDestroying || pod.Status == models.PodStatusDestroyed {
+	if pod.Status == models.PodStatusDestroying {
 		respondError(w, r, http.StatusConflict, "pod is already being destroyed")
 		return
 	}
 
+	if pod.Status == models.PodStatusDestroyed {
+		if pod.ErrorMessage == nil || *pod.ErrorMessage != models.PodErrorCancelledBeforeProvisioning {
+			respondError(w, r, http.StatusConflict, "pod is already destroyed")
+			return
+		}
+	}
+
+	if decision, err := h.db.CancelPendingPodIfNeverStarted(r.Context(), podID); err != nil {
+		h.logger.Error("cancel pod before start failed", "pod_id", podID, "error", err)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
+		return
+	} else if decision != nil && (decision.Outcome == database.PodDeletionOutcomeCancelled ||
+		decision.Outcome == database.PodDeletionOutcomeAlreadyCancelled) {
+		if decision.Outcome == database.PodDeletionOutcomeCancelled &&
+			h.jobStatusEvents != nil &&
+			decision.JobID != uuid.Nil {
+			if err := h.jobStatusEvents.PublishRaw(
+				fmt.Sprintf(events.SubjectJobStatus, decision.JobID),
+				events.Event{
+					Type:    "job.status",
+					JobID:   decision.JobID.String(),
+					Status:  models.JobStatusFailed,
+					Message: models.PodErrorCancelledBeforeProvisioning,
+				},
+			); err != nil {
+				h.logger.Warn("failed to publish job status event", "job_id", decision.JobID, "error", err)
+			}
+		}
+		audit.Log(r.Context(), h.db, "pod.delete",
+			audit.Resource("pod", podID),
+			audit.FromRequest(r),
+			audit.Detail("mode", "cancelled"),
+			audit.Detail("pod_name", pod.Name),
+			audit.Detail("pod_status", models.PodStatusDestroyed),
+			audit.Detail("job_id", decision.JobID.String()),
+		)
+		body := map[string]any{
+			"pod_id":     podID,
+			"status":     "cancelled",
+			"pod_status": models.PodStatusDestroyed,
+		}
+		if decision.JobID != uuid.Nil {
+			body["job_id"] = decision.JobID
+		}
+		respondJSON(w, http.StatusOK, body)
+		return
+	}
+
 	payload, _ := json.Marshal(map[string]string{"pod_id": podID.String(), "pod_name": pod.Name, "user_id": userID.String()})
-	job, err := h.db.CreateJob(r.Context(), models.JobTypePodDestroy, payload)
+	job, created, err := h.db.CreatePodDestroyJob(r.Context(), podID, payload)
 	if err != nil {
+		if errors.Is(err, database.ErrPodDestroyBlockedByMutator) {
+			respondError(w, r, http.StatusConflict, "pod has an operation in progress; retry deletion after it completes")
+			return
+		}
+		if errors.Is(err, database.ErrPodJobRejected) {
+			respondError(w, r, http.StatusConflict, "pod is already being destroyed")
+			return
+		}
 		h.logger.Error("create destroy job failed", "error", err)
 		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
-	if err := h.events.PublishJobCreated(job.ID, job.Type); err != nil {
-		h.logger.Warn("failed to publish job created event", "error", err)
+	jobCreatedPublisher := h.jobEvents
+	if isNilJobCreatedPublisher(jobCreatedPublisher) {
+		jobCreatedPublisher = h.events
+	}
+	if created && !isNilJobCreatedPublisher(jobCreatedPublisher) {
+		if err := jobCreatedPublisher.PublishJobCreated(job.ID, job.Type); err != nil {
+			h.logger.Warn("failed to publish job created event", "error", err)
+		}
 	}
 
 	audit.Log(r.Context(), h.db, "pod.delete",
 		audit.Resource("pod", podID),
-		audit.IP(r.RemoteAddr),
+		audit.FromRequest(r),
 		audit.Detail("pod_name", pod.Name),
 		audit.Detail("job_id", job.ID.String()),
 	)
 
-	respondJSON(w, http.StatusAccepted, map[string]any{
+	responseStatus := http.StatusAccepted
+	if !created && (job.Status == models.JobStatusCompleted || job.Status == models.JobStatusFailed) {
+		responseStatus = http.StatusOK
+	}
+	respondJSON(w, responseStatus, map[string]any{
 		"job_id": job.ID,
-		"status": "pending",
+		"status": job.Status,
 	})
 }
 
@@ -764,30 +862,21 @@ func (h *Handler) ExtendPod(w http.ResponseWriter, r *http.Request) {
 	}
 	newExpiry := time.Now().Add(extension)
 
-	// Record attestation
-	attestation := &models.PodAttestation{
-		PodID:             podID,
-		UserID:            userID,
-		PreviousExpiresAt: pod.ExpiresAt,
-		NewExpiresAt:      newExpiry,
-	}
-	if err := h.db.CreatePodAttestation(r.Context(), attestation); err != nil {
-		h.logger.Error("create attestation failed", "error", err)
-		respondError(w, r, http.StatusInternalServerError, "internal error")
-		return
-	}
-
-	// Update pod expiry
-	if err := h.db.UpdatePodExpiry(r.Context(), podID, newExpiry); err != nil {
-		h.logger.Error("update pod expiry failed", "error", err)
+	attestation, err := h.db.ExtendPod(r.Context(), podID, userID, newExpiry)
+	if err != nil {
+		if errors.Is(err, database.ErrPodExtensionRejected) {
+			respondError(w, r, http.StatusConflict, "pod cannot be extended after destruction is queued")
+			return
+		}
+		h.logger.Error("extend pod failed", "error", err)
 		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
 	audit.Log(r.Context(), h.db, "pod.extend",
 		audit.Resource("pod", podID),
-		audit.IP(r.RemoteAddr),
-		audit.Detail("previous_expires_at", fmt.Sprintf("%v", pod.ExpiresAt)),
+		audit.FromRequest(r),
+		audit.Detail("previous_expires_at", fmt.Sprintf("%v", attestation.PreviousExpiresAt)),
 		audit.Detail("new_expires_at", newExpiry.Format(time.RFC3339)),
 	)
 
@@ -820,27 +909,19 @@ func (h *Handler) AdminExtendPod(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.UserIDFromContext(r.Context())
 	newExpiry := time.Now().Add(30 * 24 * time.Hour)
 
-	attestation := &models.PodAttestation{
-		PodID:             podID,
-		UserID:            userID,
-		PreviousExpiresAt: pod.ExpiresAt,
-		NewExpiresAt:      newExpiry,
-	}
-	if err := h.db.CreatePodAttestation(r.Context(), attestation); err != nil {
-		h.logger.Error("create attestation failed", "error", err)
-		respondError(w, r, http.StatusInternalServerError, "internal error")
-		return
-	}
-
-	if err := h.db.UpdatePodExpiry(r.Context(), podID, newExpiry); err != nil {
-		h.logger.Error("update pod expiry failed", "error", err)
+	if _, err := h.db.ExtendPod(r.Context(), podID, userID, newExpiry); err != nil {
+		if errors.Is(err, database.ErrPodExtensionRejected) {
+			respondError(w, r, http.StatusConflict, "pod cannot be extended after destruction is queued")
+			return
+		}
+		h.logger.Error("admin extend pod failed", "error", err)
 		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
 	audit.Log(r.Context(), h.db, "pod.admin_extend",
 		audit.Resource("pod", podID),
-		audit.IP(r.RemoteAddr),
+		audit.FromRequest(r),
 		audit.Detail("new_expires_at", newExpiry.Format(time.RFC3339)),
 	)
 
@@ -899,8 +980,12 @@ func (h *Handler) DeleteVM(w http.ResponseWriter, r *http.Request) {
 		"vm_name":   vmName,
 		"user_id":   userID.String(),
 	})
-	job, err := h.db.CreateJob(r.Context(), models.JobTypeVMDestroy, payload)
+	job, err := h.db.CreateVMJob(r.Context(), podID, vmID, models.JobTypeVMDestroy, payload)
 	if err != nil {
+		if errors.Is(err, database.ErrPodJobRejected) {
+			respondError(w, r, http.StatusConflict, "pod is not available for VM operations")
+			return
+		}
 		h.logger.Error("create vm destroy job failed", "error", err)
 		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
@@ -912,7 +997,7 @@ func (h *Handler) DeleteVM(w http.ResponseWriter, r *http.Request) {
 
 	audit.Log(r.Context(), h.db, "vm.delete",
 		audit.Resource("vm", vmID),
-		audit.IP(r.RemoteAddr),
+		audit.FromRequest(r),
 		audit.Detail("job_id", job.ID.String()),
 	)
 
@@ -1027,6 +1112,7 @@ func (h *Handler) AddVM(w http.ResponseWriter, r *http.Request) {
 
 	// Create pod_vm record
 	vm := &models.PodVM{
+		ID:          uuid.New(),
 		PodID:       podID,
 		TemplateID:  req.TemplateID,
 		DisplayName: req.DisplayName,
@@ -1035,12 +1121,6 @@ func (h *Handler) AddVM(w http.ResponseWriter, r *http.Request) {
 		DiskGB:      diskGB,
 		Status:      models.VMStatusPending,
 	}
-	if err := h.db.CreatePodVM(r.Context(), vm); err != nil {
-		h.logger.Error("create pod vm failed", "error", err)
-		respondError(w, r, http.StatusInternalServerError, "internal error")
-		return
-	}
-
 	// Queue vm_add job
 	payload, _ := json.Marshal(map[string]string{
 		"pod_id":        podID.String(),
@@ -1050,8 +1130,12 @@ func (h *Handler) AddVM(w http.ResponseWriter, r *http.Request) {
 		"display_name":  req.DisplayName,
 		"user_id":       userID.String(),
 	})
-	job, err := h.db.CreateJob(r.Context(), models.JobTypeVMAdd, payload)
+	job, err := h.db.CreateVMAddJob(r.Context(), vm, payload)
 	if err != nil {
+		if errors.Is(err, database.ErrPodJobRejected) {
+			respondError(w, r, http.StatusConflict, "pod must be active to add VMs")
+			return
+		}
 		h.logger.Error("create vm add job failed", "error", err)
 		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
@@ -1063,7 +1147,7 @@ func (h *Handler) AddVM(w http.ResponseWriter, r *http.Request) {
 
 	audit.Log(r.Context(), h.db, "vm.add",
 		audit.Resource("vm", vm.ID),
-		audit.IP(r.RemoteAddr),
+		audit.FromRequest(r),
 		audit.Detail("job_id", job.ID.String()),
 	)
 
@@ -1135,8 +1219,12 @@ func (h *Handler) VMPowerAction(w http.ResponseWriter, r *http.Request) {
 		"vm_name":   vm.DisplayName,
 		"pod_name":  pod.Name,
 	})
-	job, err := h.db.CreateJob(r.Context(), jobType, payload)
+	job, err := h.db.CreateVMJob(r.Context(), podID, vmID, jobType, payload)
 	if err != nil {
+		if errors.Is(err, database.ErrPodJobRejected) {
+			respondError(w, r, http.StatusConflict, "pod is not available for VM operations")
+			return
+		}
 		h.logger.Error("create vm power job failed", "error", err)
 		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
@@ -1148,7 +1236,7 @@ func (h *Handler) VMPowerAction(w http.ResponseWriter, r *http.Request) {
 
 	audit.Log(r.Context(), h.db, "vm."+action,
 		audit.Resource("vm", vmID),
-		audit.IP(r.RemoteAddr),
+		audit.FromRequest(r),
 		audit.Detail("job_id", job.ID.String()),
 	)
 
@@ -1249,7 +1337,7 @@ func (h *Handler) AdminReorderTemplates(w http.ResponseWriter, r *http.Request) 
 	}
 
 	h.auditLog(r.Context(), "templates.reorder",
-		audit.IP(r.RemoteAddr),
+		audit.FromRequest(r),
 		audit.Detail("count", fmt.Sprintf("%d", len(req))),
 	)
 
@@ -1292,7 +1380,7 @@ func (h *Handler) AdminSetTemplatePin(w http.ResponseWriter, r *http.Request) {
 
 	h.auditLog(r.Context(), "template.pin",
 		audit.Resource("template", templateID),
-		audit.IP(r.RemoteAddr),
+		audit.FromRequest(r),
 		audit.Detail("pin_order", fmt.Sprintf("%d", req.PinOrder)),
 	)
 
@@ -1327,7 +1415,7 @@ func (h *Handler) AdminUnpinTemplate(w http.ResponseWriter, r *http.Request) {
 
 	h.auditLog(r.Context(), "template.unpin",
 		audit.Resource("template", templateID),
-		audit.IP(r.RemoteAddr),
+		audit.FromRequest(r),
 	)
 
 	respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -1645,7 +1733,7 @@ func (h *Handler) AdminDeleteTemplate(w http.ResponseWriter, r *http.Request) {
 			"template_id", tmpl.ID, "moref", tmpl.VCenterVMID, "error", destroyErr)
 		audit.Log(r.Context(), h.db, "template.delete_failed",
 			audit.Resource("template", tmpl.ID),
-			audit.IP(r.RemoteAddr),
+			audit.FromRequest(r),
 			audit.Detail("moref", tmpl.VCenterVMID),
 			audit.Detail("error", destroyErr.Error()),
 		)
@@ -1664,7 +1752,7 @@ func (h *Handler) AdminDeleteTemplate(w http.ResponseWriter, r *http.Request) {
 
 	audit.Log(r.Context(), h.db, "template.delete",
 		audit.Resource("template", tmpl.ID),
-		audit.IP(r.RemoteAddr),
+		audit.FromRequest(r),
 		audit.Detail("name", tmpl.Name),
 		audit.Detail("state", tmpl.TemplateState),
 		audit.Detail("moref", tmpl.VCenterVMID),

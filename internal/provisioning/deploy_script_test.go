@@ -39,12 +39,13 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 		liveResource      string
 	}{
 		{
-			name:        "all workload pinned success",
-			manifest:    baselineManifest(true, "", "false"),
-			helmStatus:  "deployed",
-			args:        []string{"--verify-rollback-containment"},
-			wantSuccess: true,
-			wantOutput:  "pins every rendered workload image",
+			name:              "immutable rollback revision 163 accepted",
+			manifest:          baselineManifest(true, "", "false"),
+			helmStatus:        "deployed",
+			args:              []string{"--verify-rollback-containment"},
+			wantSuccess:       true,
+			wantOutput:        "pins every rendered workload image",
+			configureRevision: 163,
 		},
 		{
 			name:        "live worker status replicas ignored",
@@ -148,8 +149,8 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			manifest:          baselineManifest(true, "", "false"),
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
-			wantOutput:        "not required immutable rollback revision 162",
-			configureRevision: 161,
+			wantOutput:        "not required immutable rollback revision 163",
+			configureRevision: 162,
 		},
 		{
 			name:       "standard deploy gates before git",
@@ -554,7 +555,7 @@ func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 				writeFile(t, env.atomicRollbackManifest, rollbackManifestWithHistoricalSynthetics(false))
 				writeFile(t, env.containedRollbackManifest, rollbackManifestWithHistoricalSynthetics(true))
 			},
-			wantOutput: "revision-162 immutable image baseline via deployed revision 164",
+			wantOutput: "revision-163 immutable image baseline via deployed revision 165",
 		},
 		{
 			name: "pending synthetic pod destroy after rollback retains lock",
@@ -773,11 +774,19 @@ func TestDeployScriptPreparesAllWorkloadBaseline(t *testing.T) {
 	requirePOSIXShell(t)
 
 	for _, test := range []struct {
-		name        string
-		live        string
-		wantSuccess bool
-		wantOutput  string
+		name              string
+		live              string
+		liveHelmRelease   string
+		liveHelmNamespace string
+		wantSuccess       bool
+		wantOutput        string
 	}{
+		{
+			name:        "expected Helm ownership and deployment revision annotations ignored",
+			live:        withAPITopLevelRevisionAnnotation(baselineManifest(true, "*", "false")),
+			wantSuccess: true,
+			wantOutput:  "immutable all-workload baseline complete",
+		},
 		{
 			name:        "rollout annotation drift with digest equivalence",
 			live:        withAPIRolloutAnnotation(baselineManifest(true, "*", "false")),
@@ -789,10 +798,28 @@ func TestDeployScriptPreparesAllWorkloadBaseline(t *testing.T) {
 			live:       withAPISubstantiveDrift(baselineManifest(true, "*", "false")),
 			wantOutput: "spec drifts from the server-defaulted safe chart",
 		},
+		{
+			name:            "wrong Helm release name",
+			live:            baselineManifest(true, "*", "false"),
+			liveHelmRelease: "other-release",
+			wantOutput:      `.metadata.annotations["meta.helm.sh/release-name"] must equal "selfservice"`,
+		},
+		{
+			name:              "wrong Helm release namespace",
+			live:              baselineManifest(true, "*", "false"),
+			liveHelmNamespace: "other-namespace",
+			wantOutput:        `.metadata.annotations["meta.helm.sh/release-namespace"] must equal "selfservice"`,
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			candidate := baselineManifest(true, "*", "false")
 			env := newDeployScriptEnvironment(t, test.live, candidate)
+			if test.liveHelmRelease != "" {
+				env.liveHelmRelease = test.liveHelmRelease
+			}
+			if test.liveHelmNamespace != "" {
+				env.liveHelmNamespace = test.liveHelmNamespace
+			}
 			output, err := env.run(
 				"--prepare-claims-baseline",
 				"--baseline-chart-dir",
@@ -818,6 +845,82 @@ func TestDeployScriptPreparesAllWorkloadBaseline(t *testing.T) {
 				}
 			} else if readErr == nil && len(upgradeBody) > 0 {
 				t.Fatalf("baseline invoked helm upgrade despite substantive drift: %s", upgradeBody)
+			}
+		})
+	}
+}
+
+func TestDeployScriptHelmOwnershipNormalizationLoadBearing(t *testing.T) {
+	requirePOSIXShell(t)
+
+	scriptDir := filepath.Join("..", "..", "deploy", "scripts")
+	deployPath := filepath.Join(scriptDir, "deploy.sh")
+	deployBody, err := os.ReadFile(deployPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	filterPath := filepath.Join(scriptDir, "canonicalize-workload-spec.jq")
+	filterBody, err := os.ReadFile(filterPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name string
+		line string
+	}{
+		{
+			name: "release name",
+			line: `        | del(."meta.helm.sh/release-name")` + "\n",
+		},
+		{
+			name: "release namespace",
+			line: `        | del(."meta.helm.sh/release-namespace")` + "\n",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if strings.Count(string(filterBody), test.line) != 1 {
+				t.Fatalf("expected exactly one %s normalization line", test.name)
+			}
+			sabotagedFilterBody := strings.Replace(string(filterBody), test.line, "", 1)
+			suffix := strings.ReplaceAll(test.name, " ", "-")
+			sabotagedFilterPath := filepath.Join(
+				scriptDir,
+				"canonicalize-workload-spec-sabotaged-"+suffix+"-test.jq",
+			)
+			writeFile(t, sabotagedFilterPath, sabotagedFilterBody)
+			t.Cleanup(func() { os.Remove(sabotagedFilterPath) })
+
+			const filterAssignment = `CANONICALIZE_WORKLOAD_FILTER="$SCRIPT_DIR/canonicalize-workload-spec.jq"`
+			if strings.Count(string(deployBody), filterAssignment) != 1 {
+				t.Fatal("deploy script canonicalizer assignment is not unique")
+			}
+			sabotagedDeployBody := strings.Replace(
+				string(deployBody),
+				filterAssignment,
+				`CANONICALIZE_WORKLOAD_FILTER="$SCRIPT_DIR/`+filepath.Base(sabotagedFilterPath)+`"`,
+				1,
+			)
+			sabotagedDeployPath := filepath.Join(
+				scriptDir,
+				"deploy-sabotaged-"+suffix+"-normalization-test.sh",
+			)
+			writeExecutable(t, sabotagedDeployPath, sabotagedDeployBody)
+			t.Cleanup(func() { os.Remove(sabotagedDeployPath) })
+
+			live := withAPITopLevelRevisionAnnotation(baselineManifest(true, "*", "false"))
+			env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "false"))
+			env.scriptPath = sabotagedDeployPath
+			output, runErr := env.run(
+				"--prepare-claims-baseline",
+				"--baseline-chart-dir",
+				env.chartDir,
+			)
+			if runErr == nil {
+				t.Fatalf("baseline passed without %s normalization:\n%s", test.name, output)
+			}
+			if !strings.Contains(string(output), "spec drifts from the server-defaulted safe chart") {
+				t.Fatalf("baseline failed for the wrong reason without %s normalization:\n%s", test.name, output)
 			}
 		})
 	}
@@ -2622,6 +2725,27 @@ func TestDeployWorkloadCanonicalizerKubectlCompatibility(t *testing.T) {
 }`)
 
 	filter := filepath.Join("..", "..", "deploy", "scripts", "canonicalize-workload-spec.jq")
+	canonicalize := func(t *testing.T, filterPath, kind, body string) ([]byte, error) {
+		t.Helper()
+		command := exec.Command(
+			jq,
+			"-cS",
+			"-e",
+			"--arg",
+			"kind",
+			kind,
+			"--arg",
+			"release",
+			"selfservice",
+			"--arg",
+			"namespace",
+			"selfservice",
+			"-f",
+			filterPath,
+		)
+		command.Stdin = strings.NewReader(body)
+		return command.CombinedOutput()
+	}
 	input := fixture
 	if kubectl, lookErr := exec.LookPath("kubectl"); lookErr == nil {
 		kubectlOutput, kubectlErr := exec.Command(
@@ -2650,6 +2774,12 @@ func TestDeployWorkloadCanonicalizerKubectlCompatibility(t *testing.T) {
 		"--arg",
 		"kind",
 		"Deployment",
+		"--arg",
+		"release",
+		"selfservice",
+		"--arg",
+		"namespace",
+		"selfservice",
 		"-f",
 		filter,
 		input,
@@ -2659,6 +2789,171 @@ func TestDeployWorkloadCanonicalizerKubectlCompatibility(t *testing.T) {
 	}
 	if !strings.Contains(string(output), `"containers"`) {
 		t.Fatalf("canonical output omitted the pod spec: %s", output)
+	}
+
+	deployment := func(topAnnotations, templateAnnotations, replicas string) string {
+		return fmt.Sprintf(`{
+  "apiVersion": "apps/v1",
+  "kind": "Deployment",
+  "metadata": {"name": "fixture", "annotations": %s},
+  "spec": {
+    "replicas": %s,
+    "selector": {"matchLabels": {"app": "fixture"}},
+    "template": {
+      "metadata": {"labels": {"app": "fixture"}, "annotations": %s},
+      "spec": {
+        "containers": [{"name": "fixture", "image": "example.invalid/fixture@sha256:%s"}]
+      }
+    }
+  }
+}`, topAnnotations, replicas, templateAnnotations, testDigestA)
+	}
+
+	t.Run("ignores expected Helm ownership and Deployment revision annotations", func(t *testing.T) {
+		live := deployment(`{
+		  "deployment.kubernetes.io/revision":"163",
+		  "meta.helm.sh/release-name":"selfservice",
+		  "meta.helm.sh/release-namespace":"selfservice"
+		}`, `{}`, "1")
+		desired := deployment(`{}`, `{}`, "1")
+		liveOutput, liveErr := canonicalize(t, filter, "Deployment", live)
+		if liveErr != nil {
+			t.Fatalf("live Deployment canonicalization failed: %v\n%s", liveErr, liveOutput)
+		}
+		desiredOutput, desiredErr := canonicalize(t, filter, "Deployment", desired)
+		if desiredErr != nil {
+			t.Fatalf("desired Deployment canonicalization failed: %v\n%s", desiredErr, desiredOutput)
+		}
+		if string(liveOutput) != string(desiredOutput) {
+			t.Fatalf("top-level revision annotation caused false drift:\nlive: %s\ndesired: %s", liveOutput, desiredOutput)
+		}
+
+		filterBody, readErr := os.ReadFile(filter)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		const exception = `            del(."deployment.kubernetes.io/revision")`
+		if strings.Count(string(filterBody), exception) != 1 {
+			t.Fatalf("expected exactly one narrow Deployment revision exception")
+		}
+		withoutException := strings.Replace(string(filterBody), exception, `.`, 1)
+		sabotagedFilter := filepath.Join(t.TempDir(), "canonicalize-workload-spec.jq")
+		writeFile(t, sabotagedFilter, withoutException)
+		sabotagedLive, sabotagedLiveErr := canonicalize(t, sabotagedFilter, "Deployment", live)
+		if sabotagedLiveErr != nil {
+			t.Fatalf("sabotaged live canonicalization failed unexpectedly: %v\n%s", sabotagedLiveErr, sabotagedLive)
+		}
+		sabotagedDesired, sabotagedDesiredErr := canonicalize(t, sabotagedFilter, "Deployment", desired)
+		if sabotagedDesiredErr != nil {
+			t.Fatalf("sabotaged desired canonicalization failed unexpectedly: %v\n%s", sabotagedDesiredErr, sabotagedDesired)
+		}
+		if string(sabotagedLive) == string(sabotagedDesired) {
+			t.Fatal("removing the exact revision exception did not restore the false drift")
+		}
+	})
+
+	for _, test := range []struct {
+		name        string
+		annotations string
+		wantOutput  string
+	}{
+		{
+			name:        "rejects wrong Helm release name",
+			annotations: `{"meta.helm.sh/release-name":"other-release"}`,
+			wantOutput:  `.metadata.annotations["meta.helm.sh/release-name"] must equal "selfservice"`,
+		},
+		{
+			name:        "rejects wrong Helm release namespace",
+			annotations: `{"meta.helm.sh/release-namespace":"other-namespace"}`,
+			wantOutput:  `.metadata.annotations["meta.helm.sh/release-namespace"] must equal "selfservice"`,
+		},
+		{
+			name:        "rejects non-string Helm release name",
+			annotations: `{"meta.helm.sh/release-name":163}`,
+			wantOutput:  `.metadata.annotations["meta.helm.sh/release-name"] must be a string`,
+		},
+		{
+			name:        "rejects non-string Helm release namespace",
+			annotations: `{"meta.helm.sh/release-namespace":[]}`,
+			wantOutput:  `.metadata.annotations["meta.helm.sh/release-namespace"] must be a string`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			output, canonicalErr := canonicalize(
+				t,
+				filter,
+				"Deployment",
+				deployment(test.annotations, `{}`, "1"),
+			)
+			if canonicalErr == nil {
+				t.Fatalf("canonicalizer accepted malformed Helm ownership: %s", output)
+			}
+			if !strings.Contains(string(output), test.wantOutput) {
+				t.Fatalf("canonicalizer output %q does not contain %q", output, test.wantOutput)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name    string
+		kind    string
+		live    string
+		desired string
+	}{
+		{
+			name:    "preserves different top-level annotation drift",
+			live:    deployment(`{"owner":"operations"}`, `{}`, "1"),
+			desired: deployment(`{"owner":"platform"}`, `{}`, "1"),
+		},
+		{
+			name:    "preserves arbitrary Helm annotation drift",
+			live:    deployment(`{"meta.helm.sh/other":"live"}`, `{}`, "1"),
+			desired: deployment(`{"meta.helm.sh/other":"desired"}`, `{}`, "1"),
+		},
+		{
+			name:    "preserves pod-template revision annotation drift",
+			live:    deployment(`{}`, `{"deployment.kubernetes.io/revision":"163"}`, "1"),
+			desired: deployment(`{}`, `{"deployment.kubernetes.io/revision":"164"}`, "1"),
+		},
+		{
+			name:    "preserves ordinary Deployment spec drift",
+			live:    deployment(`{}`, `{}`, "1"),
+			desired: deployment(`{}`, `{}`, "2"),
+		},
+		{
+			name: "preserves revision annotation drift on other kinds",
+			kind: "StatefulSet",
+			live: strings.Replace(
+				deployment(`{"deployment.kubernetes.io/revision":"163"}`, `{}`, "1"),
+				`"kind": "Deployment"`,
+				`"kind": "StatefulSet"`,
+				1,
+			),
+			desired: strings.Replace(
+				deployment(`{"deployment.kubernetes.io/revision":"164"}`, `{}`, "1"),
+				`"kind": "Deployment"`,
+				`"kind": "StatefulSet"`,
+				1,
+			),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			kind := test.kind
+			if kind == "" {
+				kind = "Deployment"
+			}
+			liveOutput, liveErr := canonicalize(t, filter, kind, test.live)
+			if liveErr != nil {
+				t.Fatalf("live %s canonicalization failed: %v\n%s", kind, liveErr, liveOutput)
+			}
+			desiredOutput, desiredErr := canonicalize(t, filter, kind, test.desired)
+			if desiredErr != nil {
+				t.Fatalf("desired %s canonicalization failed: %v\n%s", kind, desiredErr, desiredOutput)
+			}
+			if string(liveOutput) == string(desiredOutput) {
+				t.Fatal("canonicalizer ignored fail-closed Deployment drift")
+			}
+		})
 	}
 
 	liveJob := `{
@@ -2697,6 +2992,12 @@ func TestDeployWorkloadCanonicalizerKubectlCompatibility(t *testing.T) {
 			"--arg",
 			"kind",
 			"Job",
+			"--arg",
+			"release",
+			"selfservice",
+			"--arg",
+			"namespace",
+			"selfservice",
 			"-f",
 			filter,
 		)
@@ -2727,6 +3028,8 @@ func TestDeployWorkloadCanonicalizerKubectlCompatibility(t *testing.T) {
 		{kind: "Deployment", body: `{"kind":"Deployment"}`},
 		{kind: "Deployment", body: `{"kind":"Deployment","spec":null}`},
 		{kind: "Deployment", body: `{"kind":"CronJob","spec":{}}`},
+		{kind: "Deployment", body: `{"kind":"Deployment","metadata":[],"spec":{}}`},
+		{kind: "Deployment", body: `{"kind":"Deployment","metadata":{"annotations":[]},"spec":{}}`},
 		{kind: "Job", body: `{"kind":"Job","spec":{"template":{"metadata":{},"spec":null}}}`},
 		{kind: "Job", body: `{"kind":"Job","spec":{"template":{"metadata":{"labels":[]},"spec":{}}}}`},
 	} {
@@ -2739,6 +3042,12 @@ func TestDeployWorkloadCanonicalizerKubectlCompatibility(t *testing.T) {
 			"--arg",
 			"kind",
 			invalid.kind,
+			"--arg",
+			"release",
+			"selfservice",
+			"--arg",
+			"namespace",
+			"selfservice",
 			"-f",
 			filter,
 			invalidPath,
@@ -3098,6 +3407,9 @@ type deployScriptEnvironment struct {
 	commitVerified            bool
 	missingBuild              string
 	gitDirty                  bool
+	// Model Helm ownership metadata present live but absent from server-side dry-run objects.
+	liveHelmRelease   string
+	liveHelmNamespace string
 
 	failFinalServerDryRun          bool
 	externalDriftAfterServerDryRun bool
@@ -3154,7 +3466,7 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 		cronjobVerifyMark:         filepath.Join(root, "cronjob-verified"),
 		claimsPausedMark:          filepath.Join(root, "claims-paused.marker"),
 		helmStatus:                "deployed",
-		helmRevision:              162,
+		helmRevision:              163,
 		packageTag:                testSourceSHA,
 		packageDigest:             testDigestB,
 		runArtifactDigest:         testDigestB,
@@ -3170,6 +3482,8 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 		gitRemoteSHA:              testSourceSHA,
 		gitRemoteURL:              "git@github.com:jmal1/selfservice-api.git",
 		commitVerified:            true,
+		liveHelmRelease:           "selfservice",
+		liveHelmNamespace:         "selfservice",
 	}
 	if err := os.MkdirAll(env.binDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -3378,11 +3692,27 @@ canonical_resource() {
 json_resource() {
   local manifest=$1
   local resource=$2
-  local resource_file canonical kind replicas
+  local source=${3:-desired}
+  local resource_file canonical kind replicas revision
   resource_file=$(mktemp)
   extract_resource "$manifest" "$resource" > "$resource_file"
   canonical=$(canonical_resource "$resource_file")
   kind=${resource%%/*}
+  revision=$(awk '
+    /^metadata:[[:space:]]*$/ { metadata = 1; next }
+    metadata && /^  annotations:[[:space:]]*$/ { annotations = 1; next }
+    metadata && annotations && /^    deployment\.kubernetes\.io\/revision:[[:space:]]*/ {
+      value = $0
+      sub(/^    deployment\.kubernetes\.io\/revision:[[:space:]]*/, "", value)
+      gsub(/^["'"'"']|["'"'"']$/, "", value)
+      print value
+      exit
+    }
+    metadata && /^[^[:space:]]/ { exit }
+  ' "$resource_file")
+  if [ "$source" = live ] && [ "$kind" = Deployment ]; then
+    revision=$FAKE_LIVE_DEPLOYMENT_REVISION
+  fi
   server_yaml_count=$(count_logical_yaml_calls)
   if [ "$FAKE_MUTATE_FINAL_SERVER_OBJECT" = true ] &&
      [ "$server_yaml_count" -ge 2 ] &&
@@ -3400,11 +3730,68 @@ serverInjectedMutation: true"
     }
   ' "$resource_file")
   if [ -n "$replicas" ]; then
-    jq -cn --arg kind "$kind" --arg canonical "$canonical" --argjson replicas "$replicas" \
-      '{apiVersion:"fixture/v1",kind:$kind,spec:{fixtureCanonical:$canonical,replicas:$replicas}}'
+    jq -cn \
+      --arg kind "$kind" \
+      --arg canonical "$canonical" \
+      --arg revision "$revision" \
+      --arg source "$source" \
+      --arg release "$FAKE_LIVE_HELM_RELEASE" \
+      --arg namespace "$FAKE_LIVE_HELM_NAMESPACE" \
+      --argjson replicas "$replicas" \
+      '{
+        apiVersion:"fixture/v1",
+        kind:$kind,
+        metadata:{
+          annotations:(
+            if $source == "live" and $kind != "Job" then
+              {
+                "meta.helm.sh/release-name":$release,
+                "meta.helm.sh/release-namespace":$namespace
+              } + (
+                if $kind == "Deployment" then
+                  {"deployment.kubernetes.io/revision":$revision}
+                else
+                  {}
+                end
+              )
+            else
+              null
+            end
+          )
+        },
+        spec:{fixtureCanonical:$canonical,replicas:$replicas}
+      }'
   else
-    jq -cn --arg kind "$kind" --arg canonical "$canonical" \
-      '{apiVersion:"fixture/v1",kind:$kind,spec:{fixtureCanonical:$canonical}}'
+    jq -cn \
+      --arg kind "$kind" \
+      --arg canonical "$canonical" \
+      --arg revision "$revision" \
+      --arg source "$source" \
+      --arg release "$FAKE_LIVE_HELM_RELEASE" \
+      --arg namespace "$FAKE_LIVE_HELM_NAMESPACE" \
+      '{
+        apiVersion:"fixture/v1",
+        kind:$kind,
+        metadata:{
+          annotations:(
+            if $source == "live" and $kind != "Job" then
+              {
+                "meta.helm.sh/release-name":$release,
+                "meta.helm.sh/release-namespace":$namespace
+              } + (
+                if $kind == "Deployment" then
+                  {"deployment.kubernetes.io/revision":$revision}
+                else
+                  {}
+                end
+              )
+            else
+              null
+            end
+          )
+        },
+        spec:{fixtureCanonical:$canonical}
+      }'
   fi
   rm -f "$resource_file"
 }
@@ -3517,7 +3904,7 @@ case "$1" in
         fi
         rm -f "$resource_file"
       elif [[ "$*" == *"-o json"* ]]; then
-        json_resource "$(current_manifest)" "$2"
+        json_resource "$(current_manifest)" "$2" live
       else
         resource_file=$(mktemp)
         extract_resource "$(current_manifest)" "$2" > "$resource_file"
@@ -4009,6 +4396,9 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"KUBECONFIG=/dev/null",
 		"FAKE_LIVE_MANIFEST="+e.liveManifest,
 		"FAKE_LIVE_RESOURCE_MANIFEST="+e.liveResource,
+		"FAKE_LIVE_DEPLOYMENT_REVISION=163",
+		"FAKE_LIVE_HELM_RELEASE="+e.liveHelmRelease,
+		"FAKE_LIVE_HELM_NAMESPACE="+e.liveHelmNamespace,
 		"FAKE_CANDIDATE_MANIFEST="+e.candidateManifest,
 		"FAKE_UPGRADE_HOOK_MANIFEST="+e.upgradeHookManifest,
 		"FAKE_BASELINE_MANIFEST="+e.baselineManifest,
@@ -4357,6 +4747,22 @@ func withAPIRolloutAnnotation(manifest string) string {
         kubectl.kubernetes.io/restartedAt: "2026-08-23T00:00:00Z"
     spec:`
 	return strings.Replace(manifest, before, after, 1)
+}
+
+func withAPITopLevelRevisionAnnotation(manifest string) string {
+	const before = `metadata:
+  name: selfservice-api
+spec:`
+	const after = `metadata:
+  name: selfservice-api
+  annotations:
+    deployment.kubernetes.io/revision: "163"
+spec:`
+	result := strings.Replace(manifest, before, after, 1)
+	if result == manifest {
+		panic("API top-level revision annotation fixture did not match the manifest")
+	}
+	return result
 }
 
 func withAPISubstantiveDrift(manifest string) string {

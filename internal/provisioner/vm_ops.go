@@ -203,13 +203,14 @@ func (p *Provisioner) DestroyVM(ctx context.Context, job *models.Job) error {
 			err: fmt.Errorf("cleanup-only vm_destroy for VM %s has no exact vCenter MoRef; manual cleanup required", podVMID),
 		}
 	}
+	alreadyDeleted := podVM != nil && podVM.Status == models.VMStatusDeleted
 
 	// Power off VM if it has a vCenter reference
 	moref := payload.VCenterVMID
 	if moref == "" && podVM != nil && podVM.VCenterVMID != nil {
 		moref = *podVM.VCenterVMID
 	}
-	if moref != "" {
+	if moref != "" && !alreadyDeleted {
 
 		p.publishProgress(job.ID, "vm_poweroff", "Powering off VM")
 		if err := p.vc.PowerOffVM(ctx, moref); err != nil {
@@ -232,9 +233,11 @@ func (p *Provisioner) DestroyVM(ctx context.Context, job *models.Job) error {
 		return nil
 	}
 
-	// Mark VM as deleted
-	if err := p.db.UpdatePodVMStatus(ctx, podVMID, models.VMStatusDeleted); err != nil {
-		return fmt.Errorf("update VM status: %w", err)
+	if !alreadyDeleted {
+		// Mark VM as deleted before considering empty-pod cleanup.
+		if err := p.db.UpdatePodVMStatus(ctx, podVMID, models.VMStatusDeleted); err != nil {
+			return fmt.Errorf("update VM status: %w", err)
+		}
 	}
 	if moref != "" {
 		if _, err := p.db.ClearPodVMVCenterReference(ctx, podVMID, moref); err != nil {
@@ -255,13 +258,33 @@ func (p *Provisioner) DestroyVM(ctx context.Context, job *models.Job) error {
 		p.logger.Info("no remaining VMs in pod, queueing pod destruction", "pod_id", podID)
 		p.publishProgress(job.ID, "pod_auto_cleanup", "Pod has no VMs left — queueing cleanup")
 
-		destroyPayload, _ := json.Marshal(map[string]string{"pod_id": podID.String()})
-		destroyJob, err := p.db.CreateJob(ctx, models.JobTypePodDestroy, destroyPayload)
+		claimOwner, _, err := claimedJobLease(job)
 		if err != nil {
+			return err
+		}
+		destroyPayload, _ := json.Marshal(map[string]string{"pod_id": podID.String()})
+		destroyJob, created, err := p.db.CreateEmptyPodDestroyJob(
+			ctx,
+			podID,
+			destroyPayload,
+			&database.PodDestroyVMJobExclusion{
+				JobID:      job.ID,
+				PodVMID:    podVMID,
+				ClaimOwner: claimOwner,
+			},
+		)
+		if err != nil {
+			if errors.Is(err, database.ErrPodDestroyBlockedByMutator) {
+				return fmt.Errorf("defer empty-pod destroy until other mutator work completes: %w", err)
+			}
+			if errors.Is(err, database.ErrPodJobRejected) || errors.Is(err, database.ErrPodDestroyNotNeeded) {
+				p.logger.Info("pod auto-destroy no longer needed", "pod_id", podID, "error", err)
+				return nil
+			}
 			p.logger.Error("failed to queue pod auto-destroy", "pod_id", podID, "error", err)
 			return nil
 		}
-		if p.nats != nil {
+		if created && p.nats != nil {
 			_ = p.nats.PublishJobCreated(destroyJob.ID, destroyJob.Type)
 		}
 	}

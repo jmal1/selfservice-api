@@ -24,9 +24,9 @@ func validateDestroyHostIsolation(source string) error {
 
 	deleteStart := strings.Index(source, "WithVCenterPortGroupMutationLock")
 	deleteEnd := strings.Index(source[deleteStart:], "// --- Step 4")
-	releaseVLAN := strings.Index(source, "ReleaseVLAN")
-	if deleteStart < 0 || deleteEnd < 0 || releaseVLAN < 0 || deleteStart > releaseVLAN {
-		return fmt.Errorf("portgroup cleanup does not precede VLAN release")
+	finalizeDestroy := strings.Index(source, "FinalizePodDestroy")
+	if deleteStart < 0 || deleteEnd < 0 || finalizeDestroy < 0 || deleteStart > finalizeDestroy {
+		return fmt.Errorf("portgroup cleanup does not precede atomic pod/VLAN finalization")
 	}
 	deleteBlock := source[deleteStart : deleteStart+deleteEnd]
 	if !strings.Contains(deleteBlock, "return p.failPodDestroy(ctx, pod.ID, errors)") {

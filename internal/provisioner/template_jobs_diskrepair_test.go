@@ -102,8 +102,8 @@ func TestProvisionFromISO_NonDiskProbeErrorDoesNotRecreate(t *testing.T) {
 	if vc.powerOnCalls != 0 {
 		t.Errorf("must NOT power on after a probe error, got %d power-on calls", vc.powerOnCalls)
 	}
-	if got := db.finalState(); got != models.TemplateStateError {
-		t.Errorf("final template state = %q, want %q", got, models.TemplateStateError)
+	if got := db.finalState(); got != models.TemplateStateProvisioning {
+		t.Errorf("final template state = %q, want %q", got, models.TemplateStateProvisioning)
 	}
 }
 
@@ -162,8 +162,8 @@ func TestProvisionFromISO_RecreateIsOnceAcrossProbeAndPowerOn(t *testing.T) {
 	if vc.recreateCalls != 1 {
 		t.Errorf("recreate must happen exactly once across both triggers, got %d", vc.recreateCalls)
 	}
-	if got := db.finalState(); got != models.TemplateStateError {
-		t.Errorf("final template state = %q, want %q", got, models.TemplateStateError)
+	if got := db.finalState(); got != models.TemplateStateProvisioning {
+		t.Errorf("final template state = %q, want %q", got, models.TemplateStateProvisioning)
 	}
 }
 
@@ -183,8 +183,8 @@ func TestProvisionFromISO_NonDiskPowerOnErrorDoesNotRecreate(t *testing.T) {
 	if vc.recreateCalls != 0 {
 		t.Errorf("a non-disk power-on error must NOT trigger a recreate, got %d", vc.recreateCalls)
 	}
-	if got := db.finalState(); got != models.TemplateStateError {
-		t.Errorf("final template state = %q, want %q", got, models.TemplateStateError)
+	if got := db.finalState(); got != models.TemplateStateProvisioning {
+		t.Errorf("final template state = %q, want %q", got, models.TemplateStateProvisioning)
 	}
 }
 
@@ -208,7 +208,7 @@ func TestProvisionFromISO_StillBrokenAfterRecreateFails(t *testing.T) {
 	if vc.powerOnCalls != 0 {
 		t.Errorf("must NOT power on a disk that is still broken, got %d power-on calls", vc.powerOnCalls)
 	}
-	if got := db.finalState(); got != models.TemplateStateError {
-		t.Errorf("final template state = %q, want %q", got, models.TemplateStateError)
+	if got := db.finalState(); got != models.TemplateStateProvisioning {
+		t.Errorf("final template state = %q, want %q", got, models.TemplateStateProvisioning)
 	}
 }

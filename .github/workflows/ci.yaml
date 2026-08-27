@@ -3,17 +3,8 @@ name: Build and Push Images
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE'
-      - '.gitignore'
-      - '.editorconfig'
-      - 'CONTRIBUTING*'
-      - 'CODE_OF_CONDUCT*'
-      - '.helmignore'
+  # Stacked pull requests target parent branches, so PR CI intentionally has no target-branch filter.
+  pull_request: {}
 
 # Cancel in-flight PR runs for the same pull request number. Main pushes get a
 # unique run_id-based group so no distinct default-branch SHA can be canceled
@@ -206,3 +197,23 @@ jobs:
 
       - name: Test
         run: go test ./... -v -race
+
+  ci-required:
+    if: always() && github.event_name == 'pull_request'
+    needs: [changes, build-pr, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require successful PR CI
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          BUILD_PR_RESULT: ${{ needs.build-pr.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          set -euo pipefail
+          test "$CHANGES_RESULT" = "success"
+          for result in "$BUILD_PR_RESULT" "$TEST_RESULT"; do
+            case "$result" in
+              success|skipped) ;;
+              *) echo "required PR job failed or was cancelled: $result" >&2; exit 1 ;;
+            esac
+          done

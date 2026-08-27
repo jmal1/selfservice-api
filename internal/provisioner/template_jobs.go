@@ -114,8 +114,7 @@ type TemplateGeneralizePayload struct {
 // ProvisionTemplate implements JobTypeTemplateProvision.
 //
 // Flow:
-//  1. Read template row; verify it's in 'provisioning' state (advance to
-//     'error' on any irrecoverable failure).
+//  1. Read template row; verify it's in 'provisioning' state.
 //  2. Clone source VM into staging folder (idempotent — returns existing
 //     moref if name collision).
 //  3. Persist the new moref against the template row.
@@ -123,9 +122,8 @@ type TemplateGeneralizePayload struct {
 //  5. Power on, wait for VMware Tools (5 min).
 //  6. Transition template_state → 'configuring'.
 //
-// On error, sets template_state → 'error' and surfaces the cause via the
-// job result. The instructor can hit POST /admin/templates/:id/retry to
-// reset to 'draft' and re-run.
+// Attempt failures leave the template provisioning. The job lifecycle owns
+// retry persistence and the atomic terminal job/template transition.
 func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) error {
 	var payload TemplateProvisionPayload
 	if err := json.Unmarshal(job.Payload, &payload); err != nil {
@@ -169,8 +167,8 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 	// ISO installs diverge completely from the clone flow (create a blank
 	// VM, optionally attach a generated seed ISO, run the installer, then
 	// wait on a *long* deadline), so they get their own dependency-injected
-	// core rather than falling through to the clone steps below. It does its
-	// own error-state marking, so we return its result verbatim.
+	// core rather than falling through to the clone steps below. It returns its
+	// original cause so the job lifecycle can decide retry/terminal ownership.
 	if payload.SourceType == models.TemplateSourceISO {
 		return provisionTemplateFromISO(ctx, p.vc, p.db, p.pipeline, p.logger,
 			func(step, message string) { p.publishProgress(job.ID, step, message) }, payload)
@@ -187,7 +185,7 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 	// design exists to prevent — see internal/templates/source_resolve.go.
 	sourceMoref, resolveErr := templates.ResolveCloneSourceMoref(ctx, p.db, p.vc, payload.SourceType, payload.SourceRef)
 	if resolveErr != nil {
-		return p.markTemplateError(ctx, payload.TemplateID, resolveErr)
+		return resolveErr
 	}
 	p.logger.Info("resolved template clone source",
 		"source_type", payload.SourceType, "source_ref", payload.SourceRef, "moref", sourceMoref)
@@ -220,24 +218,24 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 	})
 	releaseLock()
 	if err != nil {
-		return p.markTemplateError(ctx, payload.TemplateID, fmt.Errorf("clone source VM: %w", err))
+		return fmt.Errorf("clone source VM: %w", err)
 	}
 
 	// Step 2: persist the moref so we can resume / cancel / generalize later
 	if err := p.db.SetTemplateVCenterVM(ctx, payload.TemplateID, moref); err != nil {
-		return p.markTemplateError(ctx, payload.TemplateID, fmt.Errorf("record vCenter VM ID: %w", err))
+		return fmt.Errorf("record vCenter VM ID: %w", err)
 	}
 
 	// Step 3: attach NIC to staging network (idempotent if already there)
 	p.publishProgress(job.ID, "attach_network", fmt.Sprintf("Attaching NIC to %s", payload.StagingNetwork))
 	if err := p.vc.AttachNetworkAdapter(ctx, moref, payload.StagingNetwork); err != nil {
-		return p.markTemplateError(ctx, payload.TemplateID, fmt.Errorf("attach NIC: %w", err))
+		return fmt.Errorf("attach NIC: %w", err)
 	}
 
 	// Step 4: power on
 	p.publishProgress(job.ID, "power_on", "Powering on VM")
 	if err := p.vc.PowerOnVM(ctx, moref); err != nil {
-		return p.markTemplateError(ctx, payload.TemplateID, fmt.Errorf("power on: %w", err))
+		return fmt.Errorf("power on: %w", err)
 	}
 
 	// Step 5: wait for VMware Tools to come up. This is an ordinary first boot;
@@ -245,10 +243,9 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 	p.publishProgress(job.ID, "wait_tools",
 		fmt.Sprintf("Waiting for VMware Tools (up to %s)", cloneFirstBootToolsTimeout))
 	if err := p.vc.WaitForTools(ctx, moref, cloneFirstBootToolsTimeout); err != nil {
-		return p.markTemplateError(ctx, payload.TemplateID,
-			fmt.Errorf("wait for VMware Tools: %w — the VM powered on but never reported tools. "+
-				"Either the guest is still booting (rare at this deadline), or open-vm-tools/VMware Tools "+
-				"is not installed and enabled on the source VM", err))
+		return fmt.Errorf("wait for VMware Tools: %w — the VM powered on but never reported tools. "+
+			"Either the guest is still booting (rare at this deadline), or open-vm-tools/VMware Tools "+
+			"is not installed and enabled on the source VM", err)
 	}
 
 	// Step 6: advance to 'configuring' so the instructor can start setup
@@ -267,7 +264,7 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 				return nil
 			}
 		}
-		return p.markTemplateError(ctx, payload.TemplateID, fmt.Errorf("advance to configuring: %w", err))
+		return fmt.Errorf("advance to configuring: %w", err)
 	}
 
 	return nil
@@ -365,7 +362,6 @@ type isoProvisionVCenter interface {
 
 // isoProvisionDB is the database subset the iso template-provision path needs.
 type isoProvisionDB interface {
-	GetTemplateByID(ctx context.Context, id uuid.UUID) (*models.Template, error)
 	SetTemplateVCenterVM(ctx context.Context, id uuid.UUID, vcenterVMID string) error
 	UpdateTemplateLifecycleState(ctx context.Context, id uuid.UUID, from, to string) error
 }
@@ -397,8 +393,8 @@ var (
 //   - On the unattended path it waits isoInstallToolsTimeout for Tools, then
 //     DetachCDROMs so the finished template holds no ISO lock on the datastore.
 //
-// It marks the template 'error' (via the injected db) on any failure and
-// returns the cause, so the caller returns its result verbatim.
+// It returns the original attempt cause without changing the template to
+// error. The job lifecycle owns retry and terminal-state persistence.
 func provisionTemplateFromISO(
 	ctx context.Context,
 	vc isoProvisionVCenter,
@@ -416,19 +412,15 @@ func provisionTemplateFromISO(
 			progress(step, message)
 		}
 	}
-	markErr := func(cause error) error {
-		return markTemplateErrorViaDB(ctx, db, metrics, logger, payload.TemplateID, cause)
-	}
-
 	// Validate the installer reference up front. ParseDatastorePath is strict
 	// and returns actionable text; doing it here guarantees a bad ref never
 	// reaches CreateBlankVM (so no orphaned VM) and surfaces the fix to the
 	// operator instead of an opaque vCenter fault.
 	isoDatastore, isoRemote, err := vcenter.ParseDatastorePath(payload.SourceRef)
 	if err != nil {
-		return markErr(fmt.Errorf(
+		return fmt.Errorf(
 			"source_ref %q is not a valid installer ISO datastore path for source_type=iso (want \"[datastore] path/to/installer.iso\"): %w",
-			payload.SourceRef, err))
+			payload.SourceRef, err)
 	}
 
 	// Decide whether this is an automated install. manual/empty means the
@@ -440,7 +432,7 @@ func provisionTemplateFromISO(
 	if unattended {
 		spec, serr := unattendSpecFromPayload(payload)
 		if serr != nil {
-			return markErr(fmt.Errorf("parse unattend_config for unattend_mode=%s: %w", mode, serr))
+			return fmt.Errorf("parse unattend_config for unattend_mode=%s: %w", mode, serr)
 		}
 
 		prog("build_seed", fmt.Sprintf("Building %s seed ISO", mode))
@@ -453,11 +445,11 @@ func provisionTemplateFromISO(
 			// downgrade makes the operator wait isoInstallToolsTimeout for an
 			// automation that was never going to run.
 			if errors.Is(berr, unattend.ErrPreseedRequiresRemaster) {
-				return markErr(fmt.Errorf(
+				return fmt.Errorf(
 					"unattend_mode=%s cannot be seeded in pure Go (debian-installer will not read a preseed from a second CD, and Crucible does not remaster the installer ISO here); set unattend_mode=manual and drive the installer over the VM console, or use an Ubuntu (cloudinit_cidata) / Windows (windows_autounattend) source instead: %w",
-					mode, berr))
+					mode, berr)
 			}
-			return markErr(fmt.Errorf("build seed ISO for unattend_mode=%s: %w", mode, berr))
+			return fmt.Errorf("build seed ISO for unattend_mode=%s: %w", mode, berr)
 		}
 
 		// Land the seed alongside the installer on the same datastore so both
@@ -467,7 +459,7 @@ func provisionTemplateFromISO(
 		prog("upload_seed", fmt.Sprintf("Uploading seed ISO to %s", vcenter.DatastorePath(isoDatastore, seedRemote)))
 		if uerr := vc.UploadToDatastore(ctx, isoDatastore, seedRemote,
 			bytes.NewReader(seedData), int64(len(seedData)), nil); uerr != nil {
-			return markErr(fmt.Errorf("upload seed ISO: %w", uerr))
+			return fmt.Errorf("upload seed ISO: %w", uerr)
 		}
 		seedISOPath = vcenter.DatastorePath(isoDatastore, seedRemote)
 	}
@@ -488,13 +480,13 @@ func provisionTemplateFromISO(
 		SeedISOPath: seedISOPath,
 	})
 	if err != nil {
-		return markErr(fmt.Errorf("create blank VM: %w", err))
+		return fmt.Errorf("create blank VM: %w", err)
 	}
 
 	// Persist the moref (mirrors the clone branch ordering) so a later
 	// generalize / cancel / resume can find the VM.
 	if err := db.SetTemplateVCenterVM(ctx, payload.TemplateID, moref); err != nil {
-		return markErr(fmt.Errorf("record vCenter VM ID: %w", err))
+		return fmt.Errorf("record vCenter VM ID: %w", err)
 	}
 
 	// Repair a broken system disk in place, at most once per provision. The NFS
@@ -534,10 +526,10 @@ func provisionTemplateFromISO(
 	prog("verify_disk", "Verifying the system disk allocated on the datastore")
 	if err := vc.ProbeSystemDiskReadable(ctx, moref); err != nil {
 		if !vcenter.IsDiskNotReadyErr(err) {
-			return markErr(fmt.Errorf("verify system disk: %w", err))
+			return fmt.Errorf("verify system disk: %w", err)
 		}
 		if rerr := repairSystemDisk(err); rerr != nil {
-			return markErr(rerr)
+			return rerr
 		}
 	}
 
@@ -548,13 +540,13 @@ func provisionTemplateFromISO(
 		// power-on rather than burning the probe-clean path's guarantee and
 		// erroring the template.
 		if !vcenter.IsDiskNotReadyErr(err) {
-			return markErr(fmt.Errorf("power on: %w", err))
+			return fmt.Errorf("power on: %w", err)
 		}
 		if rerr := repairSystemDisk(err); rerr != nil {
-			return markErr(rerr)
+			return rerr
 		}
 		if err := vc.PowerOnVM(ctx, moref); err != nil {
-			return markErr(fmt.Errorf("power on after disk recreate: %w", err))
+			return fmt.Errorf("power on after disk recreate: %w", err)
 		}
 	}
 
@@ -573,8 +565,8 @@ func provisionTemplateFromISO(
 		// target system.
 		prog("wait_install", fmt.Sprintf("Waiting up to %s for the unattended install to finish (the VM powers itself off when done)", isoInstallToolsTimeout))
 		if err := vc.WaitForPowerOff(ctx, moref, isoInstallToolsTimeout); err != nil {
-			return markErr(fmt.Errorf(
-				"wait for unattended install to finish: %w (check the VM console — the autoinstall may have stalled, or the seed was rejected)", err))
+			return fmt.Errorf(
+				"wait for unattended install to finish: %w (check the VM console — the autoinstall may have stalled, or the seed was rejected)", err)
 		}
 		// Drop the CD-ROMs now that the OS is installed: a lingering ISO mount
 		// keeps a lock on the datastore file that blocks deleting or replacing
@@ -582,7 +574,7 @@ func provisionTemplateFromISO(
 		// guarantees the next boot comes off the disk, not the installer.
 		prog("detach_cdrom", "Detaching installer and seed ISOs")
 		if err := vc.DetachCDROMs(ctx, moref); err != nil {
-			return markErr(fmt.Errorf("detach CD-ROMs after install: %w", err))
+			return fmt.Errorf("detach CD-ROMs after install: %w", err)
 		}
 		// Now boot the installed system and wait for its Tools. This is the
 		// first point at which "Tools are running" actually means the guest OS
@@ -590,12 +582,12 @@ func provisionTemplateFromISO(
 		// guest commands.
 		prog("boot_installed", "Booting the installed system")
 		if err := vc.PowerOnVM(ctx, moref); err != nil {
-			return markErr(fmt.Errorf("power on installed system: %w", err))
+			return fmt.Errorf("power on installed system: %w", err)
 		}
 		prog("wait_tools", fmt.Sprintf("Waiting up to %s for the installed system's VMware Tools", isoInstalledBootTimeout))
 		if err := vc.WaitForTools(ctx, moref, isoInstalledBootTimeout); err != nil {
-			return markErr(fmt.Errorf(
-				"wait for VMware Tools after first boot of the installed system: %w (the install completed but the guest did not come up with open-vm-tools running)", err))
+			return fmt.Errorf(
+				"wait for VMware Tools after first boot of the installed system: %w (the install completed but the guest did not come up with open-vm-tools running)", err)
 		}
 	} else {
 		// Manual install: the OS is NOT installed yet, so WaitForTools would
@@ -607,7 +599,7 @@ func provisionTemplateFromISO(
 	prog("update_state", "Marking template as configuring")
 	if err := transitionTemplateViaDB(ctx, db, metrics, payload.TemplateID,
 		models.TemplateStateProvisioning, models.TemplateStateConfiguring); err != nil {
-		return markErr(fmt.Errorf("advance to configuring: %w", err))
+		return fmt.Errorf("advance to configuring: %w", err)
 	}
 
 	return nil
@@ -648,31 +640,6 @@ func transitionTemplateViaDB(ctx context.Context, db isoProvisionDB, metrics pip
 		metrics.RecordTemplateTransition(from, to)
 	}
 	return nil
-}
-
-// markTemplateErrorViaDB is the db-interface twin of
-// (p *Provisioner).markTemplateError: best-effort move to 'error', returning the
-// original cause regardless so the job result surfaces the real problem.
-func markTemplateErrorViaDB(ctx context.Context, db isoProvisionDB, metrics pipelineMetricsSink, logger *slog.Logger, id uuid.UUID, cause error) error {
-	tmpl, err := db.GetTemplateByID(ctx, id)
-	if err != nil || tmpl == nil {
-		logger.Warn("could not load template for error transition", "template_id", id, "load_err", err)
-		return cause
-	}
-	if err := templates.CanTransition(tmpl.TemplateState, models.TemplateStateError); err != nil {
-		logger.Warn("cannot transition template to error", "template_id", id,
-			"current_state", tmpl.TemplateState, "err", err)
-		return cause
-	}
-	from := tmpl.TemplateState
-	if err := db.UpdateTemplateLifecycleState(ctx, id, from, models.TemplateStateError); err != nil {
-		logger.Warn("error transition failed", "template_id", id, "err", err)
-		return cause
-	}
-	if metrics != nil {
-		metrics.RecordTemplateTransition(from, models.TemplateStateError)
-	}
-	return cause
 }
 
 // GeneralizeTemplate implements JobTypeTemplateGeneralize.

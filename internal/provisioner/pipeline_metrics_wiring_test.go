@@ -272,21 +272,3 @@ func TestTransitionTemplateViaDB_RecordsTransitionMetric(t *testing.T) {
 		t.Fatalf("transition metrics = %v, want [provisioning|configuring]", metrics.templateTransitions)
 	}
 }
-
-func TestMarkTemplateErrorViaDB_RecordsTransitionMetric(t *testing.T) {
-	db := &fakeTransitionMetricsDB{
-		tmpl: &models.Template{TemplateState: models.TemplateStateProvisioning},
-	}
-	metrics := &pipelineMetricsSpy{}
-
-	cause := errors.New("boom")
-	if err := markTemplateErrorViaDB(context.Background(), db, metrics, discardLogger(), uuid.New(), cause); !errors.Is(err, cause) {
-		t.Fatalf("markTemplateErrorViaDB: %v", err)
-	}
-	if len(db.updates) != 1 || db.updates[0] != models.TemplateStateProvisioning+"->"+models.TemplateStateError {
-		t.Fatalf("db transitions = %v, want [provisioning->error]", db.updates)
-	}
-	if len(metrics.templateTransitions) != 1 || metrics.templateTransitions[0] != models.TemplateStateProvisioning+"|"+models.TemplateStateError {
-		t.Fatalf("transition metrics = %v, want [provisioning|error]", metrics.templateTransitions)
-	}
-}
