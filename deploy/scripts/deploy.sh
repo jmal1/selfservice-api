@@ -1717,7 +1717,10 @@ workload_health() {
   while IFS=$'\t' read -r kind name; do
     case "$kind" in
       Deployment|DaemonSet|StatefulSet)
-        kubectl rollout status "$kind/$name" -n "$NAMESPACE" --timeout=5m
+        kubectl rollout status "$kind/$name" -n "$NAMESPACE" --timeout=5m || {
+          echo "ERROR: $kind/$name did not stabilize during deployed candidate health verification." >&2
+          return 1
+        }
         ;;
       CronJob)
         job_name="$(latest_cronjob_job "$name")"
@@ -2511,7 +2514,7 @@ verify_external_candidate_images() {
 }
 
 verify_deployed_candidate() {
-  local revision status tmp_dir manifest inventory deployed_canonical
+  local revision status tmp_dir manifest inventory deployed_canonical workload_health_status
   if ! read -r revision status <<< "$(latest_helm_revision_record)"; then
     echo "ERROR: could not determine the deployed candidate Helm revision." >&2
     return 1
@@ -2546,19 +2549,28 @@ verify_deployed_candidate() {
   if ! require_no_active_jobs; then
     return 1
   fi
+  workload_health "$inventory"
+  workload_health_status=$?
+  if [ "$workload_health_status" -ne 0 ]; then
+    echo "ERROR: deployed candidate workloads are not healthy." >&2
+    return 1
+  fi
   if ! verify_external_candidate_images \
       "$CANDIDATE_IMAGE_MAP" \
       "$tmp_dir/live-images" \
       candidate; then
     return 1
   fi
-  if ! workload_health "$inventory"; then
-    echo "ERROR: deployed candidate workloads are not healthy." >&2
+  workload_health "$inventory"
+  workload_health_status=$?
+  if [ "$workload_health_status" -ne 0 ]; then
+    echo "ERROR: deployed candidate workloads regressed after live image verification." >&2
     return 1
   fi
   if ! require_no_active_jobs; then
     return 1
   fi
+  HELM_RELEASE_LOCK_PRESERVE=false
   echo "==> deployed candidate revision $revision matches every declared/live image and remains fully drained"
 }
 
@@ -3350,10 +3362,11 @@ if [ "$helm_upgrade_status" -ne 0 ]; then
   exit "$helm_upgrade_status"
 fi
 
+HELM_RELEASE_LOCK_PRESERVE=true
 if ! verify_deployed_candidate; then
-  HELM_RELEASE_LOCK_PRESERVE=true
   echo "ERROR: Helm reported success but exact candidate containment failed. The release lock is intentionally retained; manual intervention is required." >&2
   exit 1
 fi
+HELM_RELEASE_LOCK_PRESERVE=false
 release_helm_release_lock
 echo "==> deployed exact source $CANDIDATE_SOURCE_SHA with immutable workload and RUNNER_IMAGE digests"
