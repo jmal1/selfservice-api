@@ -5141,7 +5141,7 @@ case "$1" in
   rollout)
     case "$*" in
       *"DaemonSet/selfservice-runner-image-warmer"*|*"daemonset/selfservice-runner-image-warmer"*)
-       if [ "$FAKE_WARMER_ROLLOUT_FAILURE" = true ]; then
+       if [ "$FAKE_WARMER_ROLLOUT_FAILURE" = true ] && [ -f "$FAKE_CANDIDATE_APPLIED_MARKER" ]; then
          echo "sabotaged rollout status failure for selfservice-runner-image-warmer" >&2
          exit 94
        fi
