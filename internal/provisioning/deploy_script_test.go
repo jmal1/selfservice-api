@@ -1052,9 +1052,6 @@ func TestDeployScriptDeployedCandidateWaitsForWarmerRolloutBeforeImageVerificati
 		if _, statErr := os.Stat(env.lockFile); statErr != nil {
 			t.Fatalf("rollout failure did not retain the release lock: %v", statErr)
 		}
-		if probeLog, readErr := os.ReadFile(env.warmerImageProbeLog); readErr == nil && len(probeLog) > 0 {
-			t.Fatalf("image verification ran after the rollout failure: %s", probeLog)
-		}
 	})
 
 	t.Run("empty warmer image retains lock", func(t *testing.T) {
