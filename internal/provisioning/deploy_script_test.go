@@ -4944,7 +4944,8 @@ case "$1" in
     fi
     ;;
   rollout)
-    if [[ "$*" == *"daemonset/selfservice-runner-image-warmer"* ]]; then
+    case "$*" in
+      *"DaemonSet/selfservice-runner-image-warmer"*|*"daemonset/selfservice-runner-image-warmer"*)
       if [ "$FAKE_WARMER_ROLLOUT_FAILURE" = true ]; then
         echo "sabotaged rollout status failure for selfservice-runner-image-warmer" >&2
         exit 94
@@ -4952,7 +4953,8 @@ case "$1" in
       if [ -f "$FAKE_CANDIDATE_APPLIED_MARKER" ]; then
         : > "$FAKE_WARMER_ROLLOUT_MARKER"
       fi
-    fi
+        ;;
+    esac
     if [ "$FAKE_POST_LIVE_HELM_REVISION" != 0 ] ||
        [ -n "$FAKE_POST_LIVE_HELM_STATUS" ] ||
        [ "$FAKE_POST_LIVE_HELM_HISTORY_EXIT" != 0 ]; then
