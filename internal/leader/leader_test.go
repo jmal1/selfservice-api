@@ -229,9 +229,8 @@ func TestTransitionsCounter(t *testing.T) {
 	waitFor(t, 500*time.Millisecond, func() bool { return !elec.IsLeader() },
 		"did not lose leadership after cancel")
 
-	if elec.Transitions() != 2 {
-		t.Errorf("expected 2 transitions after release, got %d", elec.Transitions())
-	}
+	waitFor(t, 500*time.Millisecond, func() bool { return elec.Transitions() == 2 },
+		"did not record the release transition")
 }
 
 // --------------------------------------------------------------------------

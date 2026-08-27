@@ -1081,7 +1081,9 @@ func TestDeployScriptDeployedCandidateWaitsForWarmerRolloutBeforeImageVerificati
 
 func revertVerifyDeployedCandidateOrdering(t *testing.T, source string) string {
 	t.Helper()
-	const fixedBlock = `  if ! workload_health "$inventory"; then
+	const fixedBlock = `  workload_health "$inventory"
+  workload_health_status=$?
+  if [ "$workload_health_status" -ne 0 ]; then
     echo "ERROR: deployed candidate workloads are not healthy." >&2
     return 1
   fi
@@ -1153,10 +1155,10 @@ func TestDeployScriptDeployedCandidateOrderingIsLoadBearing(t *testing.T) {
 func revertWorkloadHealthPropagation(t *testing.T, source string) string {
 	t.Helper()
 	const fixedBlock = `      Deployment|DaemonSet|StatefulSet)
-        if ! kubectl rollout status "$kind/$name" -n "$NAMESPACE" --timeout=5m; then
+        kubectl rollout status "$kind/$name" -n "$NAMESPACE" --timeout=5m || {
           echo "ERROR: $kind/$name did not stabilize during deployed candidate health verification." >&2
           return 1
-        fi
+        }
         ;;
 `
 	const oldBlock = `      Deployment|DaemonSet|StatefulSet)
@@ -1177,7 +1179,9 @@ func revertFinalDeployedCandidateHealthFence(t *testing.T, source string) string
       candidate; then
     return 1
   fi
-  if ! workload_health "$inventory"; then
+  workload_health "$inventory"
+  workload_health_status=$?
+  if [ "$workload_health_status" -ne 0 ]; then
     echo "ERROR: deployed candidate workloads regressed after live image verification." >&2
     return 1
   fi
