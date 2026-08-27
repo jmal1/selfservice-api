@@ -1003,6 +1003,156 @@ func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 	}
 }
 
+func TestDeployScriptDeployedCandidateWaitsForWarmerRolloutBeforeImageVerification(t *testing.T) {
+	requirePOSIXShell(t)
+	live := baselineManifest(true, "", "false")
+	candidate := baselineManifest(true, "*", "false")
+
+	t.Run("succeeds after warmer rollout", func(t *testing.T) {
+		env := newDeployScriptEnvironment(t, live, candidate)
+		writeFile(t, env.upgradeHookManifest, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestB))
+
+		output, err := env.run("--no-pull")
+		if err != nil {
+			t.Fatalf("deploy failed despite the warmer rolling out before image verification: %v\n%s", err, output)
+		}
+		if !strings.Contains(string(output), "deployed exact source") {
+			t.Fatalf("output %q does not indicate a completed deploy", output)
+		}
+		if _, statErr := os.Stat(env.lockFile); !os.IsNotExist(statErr) {
+			t.Fatalf("successful deploy left the Helm release lock behind: %v", statErr)
+		}
+		if _, statErr := os.Stat(env.warmerRolloutMark); statErr != nil {
+			t.Fatalf("workload health never observed the warmer DaemonSet rollout: %v", statErr)
+		}
+		probeLog, readErr := os.ReadFile(env.warmerImageProbeLog)
+		if readErr != nil {
+			t.Fatalf("could not read warmer image probe log: %v", readErr)
+		}
+		if strings.Contains(string(probeLog), "before") {
+			t.Fatalf("warmer ImageID was inspected before rollout convergence:\n%s", probeLog)
+		}
+		if !strings.Contains(string(probeLog), "after") {
+			t.Fatalf("warmer ImageID was not observed after rollout convergence:\n%s", probeLog)
+		}
+	})
+
+	t.Run("rollout failure retains lock", func(t *testing.T) {
+		env := newDeployScriptEnvironment(t, live, candidate)
+		env.warmerRolloutFailure = true
+		writeFile(t, env.upgradeHookManifest, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestB))
+
+		output, err := env.run("--no-pull")
+		if err == nil {
+			t.Fatalf("deploy unexpectedly succeeded despite the warmer rollout failure:\n%s", output)
+		}
+		if !strings.Contains(string(output), "sabotaged rollout status failure for selfservice-runner-image-warmer") {
+			t.Fatalf("output did not surface the warmer rollout failure:\n%s", output)
+		}
+		if _, statErr := os.Stat(env.lockFile); statErr != nil {
+			t.Fatalf("rollout failure did not retain the release lock: %v", statErr)
+		}
+		if probeLog, readErr := os.ReadFile(env.warmerImageProbeLog); readErr == nil && len(probeLog) > 0 {
+			t.Fatalf("image verification ran after the rollout failure: %s", probeLog)
+		}
+	})
+
+	t.Run("empty warmer image retains lock", func(t *testing.T) {
+		env := newDeployScriptEnvironment(t, live, candidate)
+		env.warmerImageStaysEmpty = true
+		writeFile(t, env.upgradeHookManifest, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestB))
+
+		output, err := env.run("--no-pull")
+		if err == nil {
+			t.Fatalf("deploy unexpectedly succeeded despite an empty warmer ImageID after rollout:\n%s", output)
+		}
+		if !strings.Contains(string(output), "missing image inventory") {
+			t.Fatalf("output did not report the missing warmer ImageID inventory:\n%s", output)
+		}
+		if _, statErr := os.Stat(env.lockFile); statErr != nil {
+			t.Fatalf("empty warmer ImageID did not retain the release lock: %v", statErr)
+		}
+		probeLog, readErr := os.ReadFile(env.warmerImageProbeLog)
+		if readErr != nil {
+			t.Fatalf("could not read warmer image probe log: %v", readErr)
+		}
+		if !strings.Contains(string(probeLog), "after-empty") {
+			t.Fatalf("warmer ImageID did not remain empty after rollout:\n%s", probeLog)
+		}
+	})
+}
+
+func revertVerifyDeployedCandidateOrdering(t *testing.T, source string) string {
+	t.Helper()
+	const fixedBlock = `  if ! workload_health "$inventory"; then
+    echo "ERROR: deployed candidate workloads are not healthy." >&2
+    return 1
+  fi
+  if ! verify_external_candidate_images \
+      "$CANDIDATE_IMAGE_MAP" \
+      "$tmp_dir/live-images" \
+      candidate; then
+    return 1
+  fi
+`
+	const oldBlock = `  if ! verify_external_candidate_images \
+      "$CANDIDATE_IMAGE_MAP" \
+      "$tmp_dir/live-images" \
+      candidate; then
+    return 1
+  fi
+  if ! workload_health "$inventory"; then
+    echo "ERROR: deployed candidate workloads are not healthy." >&2
+    return 1
+  fi
+`
+	if !strings.Contains(source, fixedBlock) {
+		t.Fatal("could not locate the fixed verify_deployed_candidate ordering")
+	}
+	return strings.Replace(source, fixedBlock, oldBlock, 1)
+}
+
+func TestDeployScriptDeployedCandidateOrderingIsLoadBearing(t *testing.T) {
+	requirePOSIXShell(t)
+	originalBytes, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutated := revertVerifyDeployedCandidateOrdering(t, string(originalBytes))
+	scriptPath := filepath.Join(
+		"..", "..", "deploy", "scripts",
+		"deploy-sabotaged-deployed-candidate-ordering-test.sh",
+	)
+	if err := os.WriteFile(scriptPath, []byte(mutated), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(scriptPath) })
+
+	live := baselineManifest(true, "", "false")
+	candidate := baselineManifest(true, "*", "false")
+	env := newDeployScriptEnvironment(t, live, candidate)
+	env.scriptPath = scriptPath
+	writeFile(t, env.upgradeHookManifest, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestB))
+
+	output, runErr := env.run("--no-pull")
+	if runErr == nil {
+		t.Fatalf("sabotaged deployed-candidate ordering unexpectedly succeeded:\n%s", output)
+	}
+	if !strings.Contains(string(output), "missing image inventory") {
+		t.Fatalf("sabotaged ordering did not reproduce the missing ImageID failure:\n%s", output)
+	}
+	if _, statErr := os.Stat(env.lockFile); statErr != nil {
+		t.Fatalf("sabotaged ordering did not retain the release lock: %v", statErr)
+	}
+	probeLog, readErr := os.ReadFile(env.warmerImageProbeLog)
+	if readErr != nil {
+		t.Fatalf("could not read warmer image probe log: %v", readErr)
+	}
+	if !strings.Contains(string(probeLog), "before") {
+		t.Fatalf("sabotaged ordering never queried the warmer ImageID before rollout:\n%s", probeLog)
+	}
+}
+
 func TestDeployScriptRejectsUntrustedSource(t *testing.T) {
 	requirePOSIXShell(t)
 
@@ -4052,6 +4202,8 @@ type deployScriptEnvironment struct {
 	currentRollbackValues     string
 	cronjobVerifyMark         string
 	claimsPausedMark          string
+	warmerRolloutMark         string
+	warmerImageProbeLog       string
 	helmStatus                string
 	helmRevision              int
 	postLiveHelmRevision      int
@@ -4090,6 +4242,8 @@ type deployScriptEnvironment struct {
 	failFinalServerDryRun          bool
 	externalDriftAfterServerDryRun bool
 	mutateFinalServerObject        bool
+	warmerRolloutFailure           bool
+	warmerImageStaysEmpty          bool
 	activeJobs                     int
 	activeKubernetesJobs           int
 	pendingSyntheticJobs           int
@@ -4148,6 +4302,8 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 		currentRollbackValues:     filepath.Join(root, "current-rollback-values.json"),
 		cronjobVerifyMark:         filepath.Join(root, "cronjob-verified"),
 		claimsPausedMark:          filepath.Join(root, "claims-paused.marker"),
+		warmerRolloutMark:         filepath.Join(root, "warmer-rollout.marker"),
+		warmerImageProbeLog:       filepath.Join(root, "warmer-image-probe.log"),
 		helmStatus:                "deployed",
 		helmRevision:              163,
 		helmDescription:           "Upgrade complete",
@@ -4661,6 +4817,28 @@ image_for_container() {
     *) echo "unknown fake container $container" >&2; exit 91 ;;
   esac
   local digest=$FAKE_DIGEST_A
+  if [ "$container" = warmer ] &&
+     [ -f "$FAKE_CANDIDATE_APPLIED_MARKER" ]; then
+    if [ -f "$FAKE_WARMER_ROLLOUT_MARKER" ]; then
+      if [ "$FAKE_WARMER_IMAGE_STAYS_EMPTY" = true ]; then
+        if [ -n "$FAKE_WARMER_IMAGE_PROBE_LOG" ]; then
+          printf 'after-empty\n' >> "$FAKE_WARMER_IMAGE_PROBE_LOG"
+        fi
+        printf ''
+        return 0
+      fi
+      if [ -n "$FAKE_WARMER_IMAGE_PROBE_LOG" ]; then
+        printf 'after\n' >> "$FAKE_WARMER_IMAGE_PROBE_LOG"
+      fi
+      digest=$FAKE_DIGEST_B
+    else
+      if [ -n "$FAKE_WARMER_IMAGE_PROBE_LOG" ]; then
+        printf 'before\n' >> "$FAKE_WARMER_IMAGE_PROBE_LOG"
+      fi
+      printf ''
+      return 0
+    fi
+  fi
   if [ "$container" = synthetic-api-monitor ] &&
      [ -f "$FAKE_CRONJOB_VERIFY_MARKER" ]; then
     digest=$FAKE_DIGEST_B
@@ -4766,6 +4944,15 @@ case "$1" in
     fi
     ;;
   rollout)
+    if [[ "$*" == *"daemonset/selfservice-runner-image-warmer"* ]]; then
+      if [ "$FAKE_WARMER_ROLLOUT_FAILURE" = true ]; then
+        echo "sabotaged rollout status failure for selfservice-runner-image-warmer" >&2
+        exit 94
+      fi
+      if [ -f "$FAKE_CANDIDATE_APPLIED_MARKER" ]; then
+        : > "$FAKE_WARMER_ROLLOUT_MARKER"
+      fi
+    fi
     if [ "$FAKE_POST_LIVE_HELM_REVISION" != 0 ] ||
        [ -n "$FAKE_POST_LIVE_HELM_STATUS" ] ||
        [ "$FAKE_POST_LIVE_HELM_HISTORY_EXIT" != 0 ]; then
@@ -5283,6 +5470,10 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_CURRENT_ROLLBACK_VALUES="+e.currentRollbackValues,
 		"FAKE_CRONJOB_VERIFY_MARKER="+e.cronjobVerifyMark,
 		"FAKE_CLAIMS_PAUSED_MARKER="+e.claimsPausedMark,
+		"FAKE_WARMER_ROLLOUT_MARKER="+e.warmerRolloutMark,
+		"FAKE_WARMER_IMAGE_PROBE_LOG="+e.warmerImageProbeLog,
+		"FAKE_WARMER_ROLLOUT_FAILURE="+strconv.FormatBool(e.warmerRolloutFailure),
+		"FAKE_WARMER_IMAGE_STAYS_EMPTY="+strconv.FormatBool(e.warmerImageStaysEmpty),
 		"FAKE_HELM_STATUS="+e.helmStatus,
 		"FAKE_HELM_REVISION="+strconv.Itoa(e.helmRevision),
 		"FAKE_POST_LIVE_HELM_REVISION="+strconv.Itoa(e.postLiveHelmRevision),

@@ -2546,14 +2546,14 @@ verify_deployed_candidate() {
   if ! require_no_active_jobs; then
     return 1
   fi
+  if ! workload_health "$inventory"; then
+    echo "ERROR: deployed candidate workloads are not healthy." >&2
+    return 1
+  fi
   if ! verify_external_candidate_images \
       "$CANDIDATE_IMAGE_MAP" \
       "$tmp_dir/live-images" \
       candidate; then
-    return 1
-  fi
-  if ! workload_health "$inventory"; then
-    echo "ERROR: deployed candidate workloads are not healthy." >&2
     return 1
   fi
   if ! require_no_active_jobs; then
