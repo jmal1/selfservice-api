@@ -849,7 +849,7 @@ func (q *Queries) FinalizeOrphanedPodDestroy(ctx context.Context, actorUserID, p
 	if _, err := tx.Exec(ctx, `
 		UPDATE jobs
 		SET status = 'completed',
-		    result = jsonb_build_object('status', 'orphan_finalized', 'pod_id', $2::text, 'confirmation_token', $3)
+		    result = jsonb_build_object('status', 'orphan_finalized', 'pod_id', $2::text, 'confirmation_token', $3::text)
 		WHERE id = $1
 		  AND status = 'failed'
 	`, jobID, podID, attestation.ConfirmationToken); err != nil {
