@@ -900,12 +900,9 @@ See [troubleshooting.md](troubleshooting.md) for more general help.
 
 ---
 
-## L1 Template Revalidation
+## Template Credential Revalidation
 
-Active templates in the `l1` trust tier receive a full smoke-clone validation
-at least once every seven days. Revalidation is alert-only: a failed check
-records the failure and alerts operators, but does not automatically unpublish
-the template.
+Active `clone_with_customize` templates receive a full smoke-clone credential validation at least once every seven days, regardless of trust tier. This includes sandbox Windows templates marked `derived` or `untrusted`: new customized clones are blocked unless the template has a durable guest-credential marker, so every active customized template needs the same self-healing path. Revalidation is alert-only: a failed check records the failure and alerts operators, but does not automatically unpublish the template.
 
 The worker checks persisted `last_validated_at` timestamps every five minutes.
 It also checks immediately when an elected worker starts or a follower becomes
@@ -932,10 +929,10 @@ minutes):
   labels:
     severity: warning
   annotations:
-    title: L1 validation scheduler is stale
-    summary: Crucible L1 validation scheduler has not succeeded for 30 minutes
-    description: Check the elected provision-worker, database connectivity, and Pushgateway delivery before L1 template validation approaches its eight-day SLA.
-    runbook_url: https://github.com/jmal1/selfservice-api/blob/main/docs/instructor/templates.md#l1-template-revalidation
+    title: Template credential validation scheduler is stale
+    summary: Crucible template credential validation scheduler has not succeeded for 30 minutes
+    description: Check the elected provision-worker, database connectivity, and Pushgateway delivery before template credential validation approaches its eight-day SLA.
+    runbook_url: https://github.com/jmal1/selfservice-api/blob/main/docs/instructor/templates.md#template-credential-revalidation
 
 - alert: CrucibleL1ValidationSchedulerErrors
   expr: increase(crucible_l1_validation_scheduler_errors_total[15m]) > 0
@@ -943,10 +940,10 @@ minutes):
   labels:
     severity: warning
   annotations:
-    title: L1 validation scheduler is reporting errors
-    summary: Crucible L1 validation scheduler is failing
+    title: Template credential validation scheduler is reporting errors
+    summary: Crucible template credential validation scheduler is failing
     description: Inspect provision-worker logs for component=l1_validation_scheduler and resolve database, enqueue, leadership, or metrics-push errors.
-    runbook_url: https://github.com/jmal1/selfservice-api/blob/main/docs/instructor/templates.md#l1-template-revalidation
+    runbook_url: https://github.com/jmal1/selfservice-api/blob/main/docs/instructor/templates.md#template-credential-revalidation
 
 - alert: CrucibleL1TemplateValidationApproachingSLA
   expr: time() - crucible_template_last_validated_timestamp > 648000
@@ -954,14 +951,13 @@ minutes):
   labels:
     severity: warning
   annotations:
-    title: L1 template validation is approaching the SLA
-    summary: An L1 template has not completed validation for 7.5 days
+    title: Template credential validation is approaching the SLA
+    summary: A customized template has not completed credential validation for 7.5 days
     description: Identify the template_id series, inspect its active template_revalidate job, and resolve worker or vCenter failures before eight days.
-    runbook_url: https://github.com/jmal1/selfservice-api/blob/main/docs/instructor/templates.md#l1-template-revalidation
+    runbook_url: https://github.com/jmal1/selfservice-api/blob/main/docs/instructor/templates.md#template-credential-revalidation
 ```
 
-Scheduler metrics also expose the latest run timestamp, due-template count,
-and enqueued-job count as
+The metric and alert names retain their historical `l1` prefix for compatibility, but their scope is now active `clone_with_customize` templates. Scheduler metrics also expose the latest run timestamp, due-template count, and enqueued-job count as
 `crucible_l1_validation_scheduler_last_run_timestamp_seconds`,
 `crucible_l1_validation_scheduler_due_templates`, and
 `crucible_l1_validation_scheduler_enqueued_jobs`.

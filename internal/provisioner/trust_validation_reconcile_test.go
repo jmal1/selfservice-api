@@ -38,11 +38,11 @@ type fakeL1DB struct {
 	setValidationErr error
 }
 
-func (f *fakeL1DB) ListAllActiveL1Templates(_ context.Context) ([]models.Template, error) {
+func (f *fakeL1DB) ListAllActiveCredentialRevalidationTemplates(_ context.Context) ([]models.Template, error) {
 	return f.allL1, f.allL1Err
 }
 
-func (f *fakeL1DB) ListStaleL1Templates(_ context.Context, olderThan time.Duration) ([]models.Template, error) {
+func (f *fakeL1DB) ListStaleCredentialRevalidationTemplates(_ context.Context, olderThan time.Duration) ([]models.Template, error) {
 	if f.deriveStale {
 		var stale []models.Template
 		for _, tmpl := range f.allL1 {
@@ -121,7 +121,7 @@ func (f *fakeL1Metrics) Push(_ context.Context) error {
 	return f.pushErr
 }
 
-// makeL1Template returns an active L1 template with the given ID and
+// makeL1Template returns an active credential-revalidated template with the given ID and
 // optional last_validated_at.
 func makeL1Template(id uuid.UUID, lastValidated *time.Time) models.Template {
 	return models.Template{
@@ -142,9 +142,9 @@ func makeL1Template(id uuid.UUID, lastValidated *time.Time) models.Template {
 // TestReconcileL1_SelectsStaleAndIgnoresRecent verifies that only templates
 // whose last_validated_at is past the threshold are enqueued.
 //
-// NEGATIVE CONTROL: this test was verified to FAIL when ListStaleL1Templates
-// was patched to always return an empty slice (simulating a bug where the
-// reconciler selects nothing). The failure message was:
+// NEGATIVE CONTROL: this test was verified to FAIL when the stale-template
+// selector was patched to always return an empty slice (simulating a bug where
+// the reconciler selects nothing). The failure message was:
 //
 //	"enqueued 0 jobs, want 1"
 func TestReconcileL1_SelectsStaleAndIgnoresRecent(t *testing.T) {
@@ -212,6 +212,43 @@ func TestReconcileL1_NeverValidatedTemplateIncluded(t *testing.T) {
 	}
 	if counts.Enqueued != 1 {
 		t.Errorf("enqueued %d jobs for never-validated template, want 1", counts.Enqueued)
+	}
+}
+
+func TestReconcileL1_IncludesDerivedAndUntrustedCustomizedTemplates(t *testing.T) {
+	derivedID := uuid.New()
+	untrustedID := uuid.New()
+	derived := makeL1Template(derivedID, nil)
+	derived.TrustTier = models.TemplateTrustTierDerived
+	untrusted := makeL1Template(untrustedID, nil)
+	untrusted.TrustTier = models.TemplateTrustTierUntrusted
+
+	db := &fakeL1DB{
+		allL1:       []models.Template{derived, untrusted},
+		deriveStale: true,
+	}
+
+	counts, err := reconcileL1TrustValidation(context.Background(), db, nil, discardLogger(),
+		L1TrustValidationReconcilerConfig{Interval: 7 * 24 * time.Hour})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if counts.Enqueued != 2 {
+		t.Fatalf("enqueued %d jobs, want 2 for derived/untrusted customized templates", counts.Enqueued)
+	}
+
+	got := map[uuid.UUID]bool{}
+	for _, job := range db.createdJobs {
+		var payload TemplateRevalidatePayload
+		if err := json.Unmarshal(job.Payload, &payload); err != nil {
+			t.Fatalf("unmarshal payload: %v", err)
+		}
+		got[payload.TemplateID] = true
+	}
+	for _, want := range []uuid.UUID{derivedID, untrustedID} {
+		if !got[want] {
+			t.Fatalf("missing revalidation job for template %s", want)
+		}
 	}
 }
 
@@ -427,7 +464,8 @@ func TestReconcileL1_StalenessGaugeEmittedAfterRun(t *testing.T) {
 }
 
 // TestReconcileL1_ListAllErrorAbortsEarly verifies that a DB error on
-// ListAllActiveL1Templates aborts the pass before enqueuing any jobs.
+// ListAllActiveCredentialRevalidationTemplates aborts the pass before enqueuing
+// any jobs.
 func TestReconcileL1_ListAllErrorAbortsEarly(t *testing.T) {
 	db := &fakeL1DB{
 		allL1Err: errors.New("db down"),
@@ -438,7 +476,7 @@ func TestReconcileL1_ListAllErrorAbortsEarly(t *testing.T) {
 	_, err := reconcileL1TrustValidation(context.Background(), db, m, discardLogger(),
 		L1TrustValidationReconcilerConfig{Interval: 7 * 24 * time.Hour})
 	if err == nil {
-		t.Fatal("expected error when ListAllActiveL1Templates fails")
+		t.Fatal("expected error when ListAllActiveCredentialRevalidationTemplates fails")
 	}
 	if len(db.createdJobs) != 0 {
 		t.Errorf("created %d jobs despite DB error, want 0", len(db.createdJobs))

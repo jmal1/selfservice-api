@@ -1019,9 +1019,9 @@ resolver requires the destination host to be connected, outside maintenance
 mode, in the selected pool/source compute resource, able to access the target
 datastore, and equipped with the required standard portgroup and capacity. It
 does not fall back to `DefaultResourcePool` or unpinned DRS. Template staging,
-publish/L1 smoke clones, deep template-health clones, pod creation, and add-VM
-all use the same resolver. An existing, resumed, or recovered VM on a host
-outside the current allowlist is never reused, powered on, reconfigured, or
+publish/credential smoke clones, deep template-health clones, pod creation, and
+add-VM all use the same resolver. An existing, resumed, or recovered VM on a
+host outside the current allowlist is never reused, powered on, reconfigured, or
 destroyed automatically.
 
 Every production clone path inspects `config.hardware.device` on the source
@@ -1212,11 +1212,11 @@ so normal retry policy remains available. The pipeline exporter publishes
 `crucible_vm_placement_drift_total`, and
 `crucible_vm_placement_rejections_total`.
 
-Periodic template-health and L1 scheduling remain keyed to the logical template
-in this foundation. Replica registration and each placement resolve the source
-live, so a missing or moved source fails closed, but independently confirmed
-per-replica health/L1 cadence is a subsequent layer. Do not infer replica health
-from the logical-template health metric.
+Periodic template-health and credential revalidation scheduling remain keyed to
+the logical template in this foundation. Replica registration and each placement
+resolve the source live, so a missing or moved source fails closed, but
+independently confirmed per-replica health/credential cadence is a subsequent
+layer. Do not infer replica health from the logical-template health metric.
 
 Compensation intent is durable before clone submission. The fenced job first
 persists a per-attempt operation UUID, pod id, pod VM id, target name, source

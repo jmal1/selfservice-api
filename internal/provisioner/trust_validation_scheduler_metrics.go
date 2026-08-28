@@ -109,7 +109,7 @@ func (m *L1ValidationSchedulerMetrics) serialize() []byte {
 	)
 	writeSchedulerGauge(
 		"crucible_l1_validation_scheduler_due_templates",
-		"Active L1 templates due for validation during the latest scheduler reconciliation.",
+		"Active clone_with_customize templates due for validation during the latest scheduler reconciliation.",
 		m.dueTemplates,
 	)
 	writeSchedulerGauge(

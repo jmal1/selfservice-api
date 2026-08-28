@@ -1,21 +1,22 @@
-// trust_validation_reconcile.go — L1 trust-tier revalidation reconciler.
+// trust_validation_reconcile.go — template credential revalidation reconciler.
 //
-// Background: templates with trust_tier='l1' must be periodically smoke-clone
-// verified even after they are published. Without this loop a working template
-// at initial publish could silently break (e.g. the golden image gets
-// corrupted, a dependency becomes unavailable) and students would clone a
-// broken VM without any automated signal.
+// Background: active clone_with_customize templates must be periodically
+// smoke-clone verified even after they are published. Without this loop a
+// working template at initial publish could silently break (e.g. the golden
+// image gets corrupted, a dependency becomes unavailable) and students would
+// clone a broken VM without any automated signal.
 //
 // A short scheduler poll runs this reconciler; persisted last_validated_at state
 // and WORKER_L1_VALIDATION_INTERVAL (default weekly) decide what is due. Each
 // pass:
 //
-//  1. Queries ALL active L1 templates and emits the
+//  1. Queries ALL active clone_with_customize templates and emits the
 //     crucible_template_last_validated_timestamp gauge so the staleness alert
 //     has fresh data every pass, not just when a job runs.
 //
-//  2. Identifies L1 templates whose last_validated_at is NULL or older than
-//     the configured interval and enqueues a template_revalidate job for each.
+//  2. Identifies clone_with_customize templates whose last_validated_at is NULL
+//     or older than the configured interval and enqueues a template_revalidate
+//     job for each.
 //
 // On validation failure (handled by RevalidateL1Template in template_jobs.go)
 // the template STAYS published; only the metric and last_validation_result
@@ -51,7 +52,7 @@ type L1TrustValidationReconcilerConfig struct {
 
 // L1TrustValidationCounts summarises one pass for logs and tests.
 type L1TrustValidationCounts struct {
-	L1Templates int // total active L1 templates seen
+	L1Templates int // total active clone_with_customize templates seen
 	Due         int // templates whose persisted validation timestamp is overdue
 	Enqueued    int // new template_revalidate jobs created this pass
 }
@@ -62,8 +63,8 @@ var ErrL1ValidationLeadershipLost = errors.New("l1 validation scheduler lost lea
 
 // l1TrustValidationDB is the narrow DB surface the reconciler needs.
 type l1TrustValidationDB interface {
-	ListAllActiveL1Templates(ctx context.Context) ([]models.Template, error)
-	ListStaleL1Templates(ctx context.Context, olderThan time.Duration) ([]models.Template, error)
+	ListAllActiveCredentialRevalidationTemplates(ctx context.Context) ([]models.Template, error)
+	ListStaleCredentialRevalidationTemplates(ctx context.Context, olderThan time.Duration) ([]models.Template, error)
 	CreateTemplateRevalidateJobIfAbsent(ctx context.Context, templateID uuid.UUID, payload []byte) (*models.Job, bool, error)
 }
 
@@ -119,13 +120,13 @@ func reconcileL1TrustValidation(
 
 	var reconcileErr error
 
-	// Step 1: query ALL active L1 templates so we can update the staleness
-	// gauge for every one of them, even those recently validated. Without this
-	// the gauge would only refresh on stale templates and a recently-validated
-	// template would have a stale gauge reading.
-	all, err := db.ListAllActiveL1Templates(ctx)
+	// Step 1: query ALL active clone_with_customize templates so we can update
+	// the staleness gauge for every one of them, even those recently validated.
+	// Without this the gauge would only refresh on stale templates and a
+	// recently-validated template would have a stale gauge reading.
+	all, err := db.ListAllActiveCredentialRevalidationTemplates(ctx)
 	if err != nil {
-		return L1TrustValidationCounts{}, fmt.Errorf("list all l1 templates: %w", err)
+		return L1TrustValidationCounts{}, fmt.Errorf("list all credential revalidation templates: %w", err)
 	}
 
 	// Emit the staleness gauge. Never-validated templates get timestamp 0 so
@@ -147,9 +148,9 @@ func reconcileL1TrustValidation(
 	counts := L1TrustValidationCounts{L1Templates: len(all)}
 
 	// Step 2: find templates that are stale and enqueue revalidation jobs.
-	stale, err := db.ListStaleL1Templates(ctx, cfg.Interval)
+	stale, err := db.ListStaleCredentialRevalidationTemplates(ctx, cfg.Interval)
 	if err != nil {
-		return counts, errors.Join(reconcileErr, fmt.Errorf("list stale l1 templates: %w", err))
+		return counts, errors.Join(reconcileErr, fmt.Errorf("list stale credential revalidation templates: %w", err))
 	}
 	counts.Due = len(stale)
 
@@ -158,8 +159,8 @@ func reconcileL1TrustValidation(
 			return counts, errors.Join(reconcileErr, err)
 		}
 		if tmpl.VCenterVMID == "" && tmpl.VCenterTemplate == "" {
-			err := fmt.Errorf("l1 template %s (%s) has no vcenter_vm_id or vcenter_template", tmpl.ID, tmpl.Name)
-			log.Error("cannot enqueue l1 template revalidation", "error", err)
+			err := fmt.Errorf("template %s (%s) has no vcenter_vm_id or vcenter_template", tmpl.ID, tmpl.Name)
+			log.Error("cannot enqueue template revalidation", "error", err)
 			reconcileErr = errors.Join(reconcileErr, err)
 			continue
 		}
@@ -181,12 +182,12 @@ func reconcileL1TrustValidation(
 			continue
 		}
 		if !created {
-			log.Info("active l1 revalidation job already exists",
+			log.Info("active template revalidation job already exists",
 				"template_id", tmpl.ID, "name", tmpl.Name)
 			continue
 		}
 		counts.Enqueued++
-		log.Info("enqueued l1 revalidation job",
+		log.Info("enqueued template revalidation job",
 			"template_id", tmpl.ID, "name", tmpl.Name,
 			"last_validated_at", tmpl.LastValidatedAt)
 	}

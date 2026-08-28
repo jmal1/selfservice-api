@@ -422,7 +422,7 @@ func (m *PipelineMetrics) serialize() []byte {
 	}
 
 	writeCounter2(&b, "crucible_template_validation_total",
-		"L1 template revalidation outcomes by template_id and result (pass/fail).",
+		"Template credential revalidation outcomes by template_id and result (pass/fail).",
 		"template_id", "result", m.templateValidation)
 
 	// Omit the staleness gauge family until the L1 trust-validation reconciler
