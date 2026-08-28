@@ -1,0 +1,6 @@
+# Accepted immutable rollback baseline for the live Helm content equivalence gate.
+# Update this single file only after a new live Helm revision has been reviewed,
+# proven equivalent by the deploy script, and accepted as the new stable recovery
+# checkpoint. The value must be the exact Helm revision number of the accepted
+# baseline, not a guess and not a historical artifact.
+168

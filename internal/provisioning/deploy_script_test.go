@@ -22,8 +22,30 @@ const testSourceSHA = "cccccccccccccccccccccccccccccccccccccccc"
 const otherSourceSHA = "dddddddddddddddddddddddddddddddddddddddd"
 const testUISourceSHA = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 
+func acceptedRollbackBaselineRevision(t *testing.T) int {
+	t.Helper()
+
+	path := filepath.Join("..", "..", "deploy", "scripts", "phase1-rollback-baseline")
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read accepted rollback baseline: %v", err)
+	}
+	value := strings.TrimSpace(string(body))
+	value = strings.TrimSpace(strings.SplitN(value, "#", 2)[0])
+	if value == "" {
+		t.Fatal("accepted rollback baseline file is empty")
+	}
+	revision, err := strconv.Atoi(value)
+	if err != nil {
+		t.Fatalf("accepted rollback baseline revision %q is not an integer: %v", value, err)
+	}
+	return revision
+}
+
 func TestDeployScriptRollbackContainment(t *testing.T) {
 	requirePOSIXShell(t)
+
+	baselineRevision := acceptedRollbackBaselineRevision(t)
 
 	tests := []struct {
 		name              string
@@ -40,31 +62,31 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 		configure         func(*deployScriptEnvironment)
 	}{
 		{
-			name:              "immutable rollback revision 163 accepted",
+			name:              fmt.Sprintf("accepted baseline revision %d accepted", baselineRevision),
 			manifest:          baselineManifest(true, "", "false"),
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
 			wantSuccess:       true,
 			wantOutput:        "pins every rendered workload image",
-			configureRevision: 163,
+			configureRevision: baselineRevision,
 		},
 		{
-			name:              "rollback revision 165 with immutable content accepted",
+			name:              fmt.Sprintf("revision %d with immutable content accepted", baselineRevision-1),
 			manifest:          baselineManifest(true, "", "false"),
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
 			wantSuccess:       true,
 			wantOutput:        "pins every rendered workload image",
-			configureRevision: 165,
+			configureRevision: baselineRevision - 1,
 		},
 		{
-			name:              "later exact-content revision accepted",
+			name:              fmt.Sprintf("later exact-content revision %d accepted", baselineRevision+1),
 			manifest:          baselineManifest(true, "", "false"),
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
 			wantSuccess:       true,
-			wantOutput:        "exactly matches immutable rollback revision 163",
-			configureRevision: 166,
+			wantOutput:        fmt.Sprintf("exactly matches immutable rollback revision %d", baselineRevision),
+			configureRevision: baselineRevision + 1,
 		},
 		{
 			name:              "rollback values drift",
@@ -72,7 +94,7 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
 			wantOutput:        "complete effective values differ",
-			configureRevision: 165,
+			configureRevision: baselineRevision,
 			configure: func(env *deployScriptEnvironment) {
 				writeFile(t, env.currentRollbackValues, `{"provisioning":{"workerClaimsEnabled":false},"drift":true}`+"\n")
 			},
@@ -88,7 +110,7 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
 			wantOutput:        "manifest differs",
-			configureRevision: 165,
+			configureRevision: baselineRevision,
 			configure: func(env *deployScriptEnvironment) {
 				writeFile(t, env.immutableRollbackManifest, baselineManifest(true, "", "false"))
 			},
@@ -104,7 +126,7 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
 			wantOutput:        "manifest differs",
-			configureRevision: 165,
+			configureRevision: baselineRevision,
 			configure: func(env *deployScriptEnvironment) {
 				writeFile(t, env.immutableRollbackManifest, baselineManifest(true, "", "false"))
 				env.mismatchContainer = "api-gateway"
@@ -116,7 +138,7 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
 			wantOutput:        "hooks differ",
-			configureRevision: 165,
+			configureRevision: baselineRevision,
 			configure: func(env *deployScriptEnvironment) {
 				writeFile(t, env.currentRollbackHooks, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestA))
 			},
@@ -127,7 +149,7 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
 			wantOutput:        "chart metadata differs",
-			configureRevision: 165,
+			configureRevision: baselineRevision,
 			configure: func(env *deployScriptEnvironment) {
 				env.currentChartVersion = "0.2.0"
 			},
@@ -138,15 +160,15 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			helmStatus:        "pending-upgrade",
 			args:              []string{"--verify-rollback-containment"},
 			wantOutput:        "status is pending-upgrade",
-			configureRevision: 165,
+			configureRevision: baselineRevision,
 		},
 		{
 			name:              "immutable rollback revision absent",
 			manifest:          baselineManifest(true, "", "false"),
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
-			wantOutput:        "required immutable rollback revision 163 is absent",
-			configureRevision: 165,
+			wantOutput:        fmt.Sprintf("required immutable rollback revision %d is absent", baselineRevision),
+			configureRevision: baselineRevision,
 			configure: func(env *deployScriptEnvironment) {
 				env.immutableRevisionMissing = true
 			},
@@ -156,8 +178,8 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			manifest:          baselineManifest(true, "", "false"),
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
-			wantOutput:        "required immutable rollback revision 163 has invalid release data",
-			configureRevision: 165,
+			wantOutput:        fmt.Sprintf("required immutable rollback revision %d has invalid release data", baselineRevision),
+			configureRevision: baselineRevision,
 			configure: func(env *deployScriptEnvironment) {
 				env.immutableHelmStatus = "failed"
 			},
@@ -168,9 +190,9 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
 			wantOutput:        "complete effective values differ",
-			configureRevision: 165,
+			configureRevision: baselineRevision,
 			configure: func(env *deployScriptEnvironment) {
-				env.helmDescription = "Rollback to 163"
+				env.helmDescription = fmt.Sprintf("Rollback to %d", baselineRevision)
 				writeFile(t, env.currentRollbackValues, `{"misleading":true}`+"\n")
 			},
 		},
@@ -276,8 +298,8 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			manifest:          baselineManifest(true, "", "false"),
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
-			wantOutput:        "predates required immutable rollback revision 163",
-			configureRevision: 162,
+			wantOutput:        fmt.Sprintf("predates required immutable rollback revision %d", baselineRevision),
+			configureRevision: baselineRevision - 1,
 		},
 		{
 			name:       "standard deploy gates before git",
@@ -413,6 +435,8 @@ func TestDeployScriptRollbackEquivalenceComparisonsLoadBearing(t *testing.T) {
 func TestDeployScriptRollbackContainmentFinalRevisionFence(t *testing.T) {
 	requirePOSIXShell(t)
 
+	baselineRevision := acceptedRollbackBaselineRevision(t)
+
 	for _, test := range []struct {
 		name          string
 		finalRevision int
@@ -422,14 +446,14 @@ func TestDeployScriptRollbackContainmentFinalRevisionFence(t *testing.T) {
 	}{
 		{
 			name:          "revision advances during live verification",
-			finalRevision: 166,
+			finalRevision: baselineRevision + 1,
 			finalStatus:   "deployed",
-			wantOutput:    "expected 165 deployed, found 166 deployed",
+			wantOutput:    fmt.Sprintf("expected %d deployed, found %d deployed", baselineRevision, baselineRevision+1),
 		},
 		{
 			name:        "status changes during live verification",
 			finalStatus: "pending-upgrade",
-			wantOutput:  "expected 165 deployed, found 165 pending-upgrade",
+			wantOutput:  fmt.Sprintf("expected %d deployed, found %d pending-upgrade", baselineRevision, baselineRevision),
 		},
 		{
 			name:        "final history emits valid record then fails",
@@ -440,7 +464,7 @@ func TestDeployScriptRollbackContainmentFinalRevisionFence(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			manifest := baselineManifest(true, "", "false")
 			env := newDeployScriptEnvironment(t, manifest, manifest)
-			env.helmRevision = 165
+			env.helmRevision = baselineRevision
 			env.postLiveHelmRevision = test.finalRevision
 			env.postLiveHelmStatus = test.finalStatus
 			env.postLiveHelmHistoryExit = test.historyExit
@@ -461,6 +485,8 @@ func TestDeployScriptRollbackContainmentFinalRevisionFence(t *testing.T) {
 
 func TestDeployScriptRollbackContainmentFinalRevisionFenceLoadBearing(t *testing.T) {
 	requirePOSIXShell(t)
+
+	baselineRevision := acceptedRollbackBaselineRevision(t)
 
 	deployPath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
 	deployBody, err := os.ReadFile(deployPath)
@@ -483,8 +509,8 @@ func TestDeployScriptRollbackContainmentFinalRevisionFenceLoadBearing(t *testing
 
 	manifest := baselineManifest(true, "", "false")
 	env := newDeployScriptEnvironment(t, manifest, manifest)
-	env.helmRevision = 165
-	env.postLiveHelmRevision = 166
+	env.helmRevision = baselineRevision
+	env.postLiveHelmRevision = baselineRevision + 1
 	env.postLiveHelmStatus = "deployed"
 	env.scriptPath = sabotagedPath
 
@@ -492,7 +518,7 @@ func TestDeployScriptRollbackContainmentFinalRevisionFenceLoadBearing(t *testing
 	if runErr != nil {
 		t.Fatalf("removing the final revision fence did not expose false acceptance: %v\n%s", runErr, output)
 	}
-	if !strings.Contains(string(output), "rollback containment verified: deployed revision 165") {
+	if !strings.Contains(string(output), fmt.Sprintf("rollback containment verified: deployed revision %d", baselineRevision)) {
 		t.Fatalf("removing the final revision fence did not reach false success:\n%s", output)
 	}
 	if _, statErr := os.Stat(env.liveVerificationMark); statErr != nil {
@@ -502,6 +528,8 @@ func TestDeployScriptRollbackContainmentFinalRevisionFenceLoadBearing(t *testing
 
 func TestDeployScriptRollbackContainmentFinalRevisionReadStatusLoadBearing(t *testing.T) {
 	requirePOSIXShell(t)
+
+	baselineRevision := acceptedRollbackBaselineRevision(t)
 
 	deployPath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
 	deployBody, err := os.ReadFile(deployPath)
@@ -526,7 +554,7 @@ func TestDeployScriptRollbackContainmentFinalRevisionReadStatusLoadBearing(t *te
 
 	manifest := baselineManifest(true, "", "false")
 	env := newDeployScriptEnvironment(t, manifest, manifest)
-	env.helmRevision = 165
+	env.helmRevision = baselineRevision
 	env.postLiveHelmHistoryExit = 7
 	env.scriptPath = sabotagedPath
 
@@ -534,7 +562,7 @@ func TestDeployScriptRollbackContainmentFinalRevisionReadStatusLoadBearing(t *te
 	if runErr != nil {
 		t.Fatalf("removing the final history status check did not expose false acceptance: %v\n%s", runErr, output)
 	}
-	if !strings.Contains(string(output), "rollback containment verified: deployed revision 165") {
+	if !strings.Contains(string(output), fmt.Sprintf("rollback containment verified: deployed revision %d", baselineRevision)) {
 		t.Fatalf("removing the final history status check did not reach false success:\n%s", output)
 	}
 }
@@ -564,7 +592,7 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 			name:      "exact candidate after equivalent rollback revision",
 			transform: func(manifest string) string { return baselineManifest(true, "*", "false") },
 			configure: func(env *deployScriptEnvironment) {
-				env.helmRevision = 165
+				env.helmRevision = acceptedRollbackBaselineRevision(t)
 			},
 			wantSuccess:       true,
 			wantOutput:        "deployed exact source",
@@ -895,6 +923,7 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 
 func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 	requirePOSIXShell(t)
+	baselineRevision := acceptedRollbackBaselineRevision(t)
 	live := baselineManifest(true, "", "false")
 	for _, test := range []struct {
 		name                   string
@@ -913,7 +942,7 @@ func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 				writeFile(t, env.containedRollbackManifest, rollbackManifestWithHistoricalSynthetics(true))
 				writeFile(t, env.immutableRollbackManifest, rollbackManifestWithHistoricalSynthetics(false))
 			},
-			wantOutput: "revision-163 immutable image baseline via deployed revision 165",
+			wantOutput: fmt.Sprintf("revision-%d immutable image baseline via deployed revision %d", baselineRevision, baselineRevision),
 		},
 		{
 			name: "pending synthetic pod destroy after rollback retains lock",

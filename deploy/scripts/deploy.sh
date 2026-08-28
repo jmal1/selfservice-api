@@ -91,8 +91,34 @@ SOURCE_BRANCH=main
 SOURCE_WORKFLOW=ci.yaml
 UI_IMAGE_REPOSITORY=ghcr.io/jmal1/selfservice-ui
 UI_SOURCE_BRANCH=master
-REQUIRED_ROLLBACK_REVISION=163
+REQUIRED_ROLLBACK_REVISION_FILE="$SCRIPT_DIR/phase1-rollback-baseline"
+REQUIRED_ROLLBACK_REVISION=
 REPOSITORY_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+load_required_rollback_revision() {
+  local baseline_file="${1:-$REQUIRED_ROLLBACK_REVISION_FILE}"
+  local value
+  if [ ! -f "$baseline_file" ]; then
+    echo "ERROR: required accepted rollback baseline file $baseline_file is missing." >&2
+    return 1
+  fi
+  value="$({
+    awk '
+      /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+      { print; exit }
+    ' "$baseline_file"
+  } 2>/dev/null)" || {
+    echo "ERROR: required accepted rollback baseline file $baseline_file does not contain an integer revision number." >&2
+    return 1
+  }
+  if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: required accepted rollback baseline file $baseline_file must contain an integer Helm revision, found $value." >&2
+    return 1
+  fi
+  REQUIRED_ROLLBACK_REVISION="$value"
+}
+
+load_required_rollback_revision || exit 1
 HELM_RELEASE_LOCK_HELD=false
 HELM_RELEASE_LOCK_HOLDER=
 HELM_RELEASE_LOCK_PRESERVE=false
