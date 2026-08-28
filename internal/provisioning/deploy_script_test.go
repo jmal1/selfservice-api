@@ -858,6 +858,14 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 			wantUpgrade:       true,
 			expectBuiltDigest: true,
 		},
+		{
+			name:              "candidate can restore missing synthetic producer CronJobs",
+			transform:         func(manifest string) string { return rollbackManifestWithHistoricalSynthetics(false) },
+			wantSuccess:       true,
+			wantOutput:        "deployed exact source",
+			wantUpgrade:       true,
+			expectBuiltDigest: true,
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			candidate := test.transform(live)
@@ -5166,7 +5174,7 @@ image_for_container() {
   [ "$container" = "$FAKE_MISMATCH_CONTAINER" ] && digest=$FAKE_DIGEST_B
   if [ -f "$FAKE_CANDIDATE_APPLIED_MARKER" ]; then
     case "$container" in
-      warmer|api-gateway|provision-worker|engine|ui)
+      warmer|api-gateway|provision-worker|engine|ui|synthetic-janitor|synthetic-runner)
         digest=$FAKE_DIGEST_B
         ;;
     esac
