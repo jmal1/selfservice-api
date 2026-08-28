@@ -156,14 +156,7 @@ Buildx `.dockerbuild` record. The record must bind the exported digest to the
 repository, full source revision, expected short-SHA tag, and exact run attempt.
 The selected GHCR digest's immutable OCI revision label must match too.
 
-During the NFS41/UI containment window, the production API-monitor CronJob
-remains active with `spec.suspend=false`, but it must render
-`SYNTHETIC_LIFECYCLE_ENABLED=false`. The production values and deploy validation
-enforce both values in the candidate and live rollback state so non-mutating API
-monitoring continues without creating lifecycle pods. The external
-`synthetic-ui.timer` on `netbirdv01` remains disabled, but it is outside
-Kubernetes and Helm: verify that host-level state independently before and after
-this procedure.
+Production API synthetic feedback keeps the API-monitor CronJob active with `spec.suspend=false` and intentionally renders `SYNTHETIC_LIFECYCLE_ENABLED=true` after cleanup safety has been proven. Deploy rollback containment still forces lifecycle off and suspends clone-producing synthetic CronJobs before accepting rollback state. The external `synthetic-ui.timer` on `netbirdv01` is outside Kubernetes and Helm: verify that host-level state independently before and after this procedure.
 
 ### Synthetic producer coverage alerts
 

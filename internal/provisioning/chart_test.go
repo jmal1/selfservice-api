@@ -134,13 +134,13 @@ func TestChartProvisioningDefaultsRemainCompatible(t *testing.T) {
 	}
 }
 
-func TestProductionProvisioningReopensConservatively(t *testing.T) {
+func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T) {
 	values := loadChartValues(t, "values.prod.yaml")
 	if values.ReplicaCount.Worker != 1 {
-		t.Errorf("production worker replicas = %d, want exactly 1 during initial reopening", values.ReplicaCount.Worker)
+		t.Errorf("production worker replicas = %d, want exactly 1 while ESXi2 remains quarantined", values.ReplicaCount.Worker)
 	}
 	if !values.Provisioning.Enabled || values.Provisioning.WorkerClaimsEnabled {
-		t.Fatalf("production provisioning controls = %+v, want admission on and initial worker claims gated", values.Provisioning)
+		t.Fatalf("production provisioning controls = %+v, want admission on and chart-rendered worker claims gated", values.Provisioning)
 	}
 	if !values.Synthetic.ProvisioningExpectedEnabled {
 		t.Fatal("production synthetic must expect provisioning enabled")
@@ -148,8 +148,8 @@ func TestProductionProvisioningReopensConservatively(t *testing.T) {
 	if values.Synthetic.Suspend {
 		t.Fatal("production non-mutating API monitor CronJob must remain active")
 	}
-	if values.Synthetic.Lifecycle.Enabled || values.Synthetic.Runner.Enabled || values.Synthetic.Janitor.Enabled {
-		t.Fatal("production lifecycle, runner, and destructive janitor synthetics must remain disabled during initial reopening")
+	if !values.Synthetic.Lifecycle.Enabled || !values.Synthetic.Runner.Enabled || !values.Synthetic.Janitor.Enabled {
+		t.Fatalf("production mutating synthetics must remain enabled after the live provisioning proof: %+v", values.Synthetic)
 	}
 	if values.VCenter.Hosts != "esxi1.lab.jmal.io" {
 		t.Fatalf("production VCENTER_HOSTS = %q, want ESXi1 only", values.VCenter.Hosts)
@@ -165,28 +165,28 @@ func TestProductionProvisioningReopensConservatively(t *testing.T) {
 	}
 	if values.Worker.OrphanReconciler.Enabled ||
 		values.Worker.NetworkReconciler.Enabled ||
-		values.Worker.L1Validation.Enabled ||
+		!values.Worker.L1Validation.Enabled ||
 		values.Worker.TemplateHealth.Enabled ||
 		values.Worker.IdleEvaluator.Enabled ||
 		values.Worker.PipelineReconciler.Enabled ||
 		!values.Worker.IdleEvaluator.DryRun {
-		t.Fatalf("production worker background mutation controls are not conservatively disabled: %+v", values.Worker)
+		t.Fatalf("production worker background controls are not in the expected guarded-feedback state: %+v", values.Worker)
 	}
 	for path, want := range map[string]string{
 		"replicaCount.worker":                   "1",
 		"provisioning.enabled":                  "true",
 		"provisioning.workerClaimsEnabled":      "false",
 		"synthetic.provisioningExpectedEnabled": "true",
-		"synthetic.lifecycle.enabled":           "false",
-		"synthetic.janitor.enabled":             "false",
-		"synthetic.runner.enabled":              "false",
+		"synthetic.lifecycle.enabled":           "true",
+		"synthetic.janitor.enabled":             "true",
+		"synthetic.runner.enabled":              "true",
 		"vcenter.hosts":                         "esxi1.lab.jmal.io",
 		"vcenter.resourcePools":                 "/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs",
 		"vcenter.insecure":                      "false",
 		"vcenter.placementReservedMemoryMB":     "esxi1.lab.jmal.io=8192",
 		"worker.orphanReconciler.enabled":       "false",
 		"worker.networkReconciler.enabled":      "false",
-		"worker.l1Validation.enabled":           "false",
+		"worker.l1Validation.enabled":           "true",
 		"worker.templateHealth.enabled":         "false",
 		"worker.idleEvaluator.enabled":          "false",
 		"worker.idleEvaluator.dryRun":           "true",

@@ -2351,7 +2351,7 @@ validate_candidate_manifest() {
     echo "ERROR: final candidate RUNNER_IMAGE is not the commit-bound runner digest." >&2
     return 1
   fi
-  validate_foundation_intent "$manifest"
+  validate_foundation_intent "$manifest" true false
   validate_synthetic_monitor_active "$manifest"
 }
 
