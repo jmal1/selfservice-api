@@ -1931,6 +1931,18 @@ build_live_image_maps() {
   fi
 }
 
+allow_new_candidate_workload() {
+  local kind=$1
+  local name=$2
+  case "$kind/$name" in
+    "CronJob/$RELEASE-synthetic-janitor" | \
+    "CronJob/$RELEASE-synthetic-runner")
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 build_candidate_image_maps() {
   local candidate_manifest=$1
   local candidate_inventory=$2
@@ -1953,6 +1965,31 @@ build_candidate_image_maps() {
   while IFS=$'\t' read -r kind name; do
     live_manifest="$live_dir/${kind}-${name}.yaml"
     if ! kubectl get "$kind/$name" -n "$NAMESPACE" -o yaml > "$live_manifest"; then
+      if allow_new_candidate_workload "$kind" "$name"; then
+        while IFS=$'\t' read -r _ _ candidate_type candidate_container candidate_image; do
+          candidate_repository="$(canonical_image_repository "$candidate_image")"
+          resolved_row="$(
+            awk -F '\t' -v repository="$candidate_repository" '
+              $2 == repository { print; matches++ }
+              END { if (matches > 1) exit 3 }
+            ' "$resolved_images"
+          )"
+          if [ -z "$resolved_row" ]; then
+            echo "ERROR: new candidate workload $kind/$name $candidate_type/$candidate_container does not use a commit-built image repository: $candidate_image." >&2
+            return 1
+          fi
+          resolved_component="$(printf '%s\n' "$resolved_row" | cut -f1)"
+          resolved_image="$(printf '%s\n' "$resolved_row" | cut -f3)"
+          printf '%s\n' "$resolved_component" >> "$used_components"
+          printf '%s\t%s\t%s\t%s\t%s\n' \
+            "$kind" "$name" "$candidate_type" "$candidate_container" "$resolved_image" >> "$desired_map"
+        done < <(
+          awk -F '\t' -v kind="$kind" -v name="$name" '
+            $1 == kind && $2 == name { print }
+          ' "$candidate_inventory"
+        )
+        continue
+      fi
       echo "ERROR: rendered candidate workload $kind/$name is missing from the proven live release." >&2
       return 1
     fi
