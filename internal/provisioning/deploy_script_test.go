@@ -96,13 +96,18 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			wantOutput:        fmt.Sprintf("exactly matches immutable rollback revision %d", baselineRevision),
 			configureRevision: baselineRevision + 1,
 		},
+		// The immutable-release comparison in prove_immutable_rollback_release compares
+		// the currently deployed revision against a different historical baseline. The
+		// fake Helm harness must therefore set current > required; otherwise both
+		// revisions resolve to the same synthetic fixture and the drift falls through to
+		// the later image-digest verification instead of the intended guard.
 		{
 			name:              "rollback values drift",
 			manifest:          baselineManifest(true, "", "false"),
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
 			wantOutput:        "complete effective values differ",
-			configureRevision: baselineRevision,
+			configureRevision: baselineRevision + 1,
 			configure: func(env *deployScriptEnvironment) {
 				writeFile(t, env.currentRollbackValues, `{"provisioning":{"workerClaimsEnabled":false},"drift":true}`+"\n")
 			},
@@ -118,7 +123,7 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
 			wantOutput:        "manifest differs",
-			configureRevision: baselineRevision,
+			configureRevision: baselineRevision + 1,
 			configure: func(env *deployScriptEnvironment) {
 				writeFile(t, env.immutableRollbackManifest, baselineManifest(true, "", "false"))
 			},
@@ -134,7 +139,7 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
 			wantOutput:        "manifest differs",
-			configureRevision: baselineRevision,
+			configureRevision: baselineRevision + 1,
 			configure: func(env *deployScriptEnvironment) {
 				writeFile(t, env.immutableRollbackManifest, baselineManifest(true, "", "false"))
 				env.mismatchContainer = "api-gateway"
@@ -146,7 +151,7 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
 			wantOutput:        "hooks differ",
-			configureRevision: baselineRevision,
+			configureRevision: baselineRevision + 1,
 			configure: func(env *deployScriptEnvironment) {
 				writeFile(t, env.currentRollbackHooks, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestA))
 			},
@@ -157,7 +162,7 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
 			wantOutput:        "chart metadata differs",
-			configureRevision: baselineRevision,
+			configureRevision: baselineRevision + 1,
 			configure: func(env *deployScriptEnvironment) {
 				env.currentChartVersion = "0.2.0"
 			},
@@ -198,7 +203,7 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
 			wantOutput:        "complete effective values differ",
-			configureRevision: baselineRevision,
+			configureRevision: baselineRevision + 1,
 			configure: func(env *deployScriptEnvironment) {
 				env.helmDescription = fmt.Sprintf("Rollback to %d", baselineRevision)
 				writeFile(t, env.currentRollbackValues, `{"misleading":true}`+"\n")
