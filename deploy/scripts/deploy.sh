@@ -1499,9 +1499,11 @@ pause_live_provisioning_claims() {
   rm -f "$live_worker"
   case "$live_claims" in
     false)
+      PRE_DEPLOY_LIVE_CLAIMS=false
       echo "==> live worker provisioning claims are already paused"
       ;;
     true)
+      PRE_DEPLOY_LIVE_CLAIMS=true
       echo "==> pausing live worker provisioning claims before the guarded apply"
       kubectl set env "deployment/$RELEASE-worker" \
         -n "$NAMESPACE" \
@@ -1513,6 +1515,54 @@ pause_live_provisioning_claims() {
       return 1
       ;;
   esac
+}
+
+# Symmetric counterpart to pause_live_provisioning_claims.
+#
+# pause_live_provisioning_claims runs unconditionally before every guarded
+# apply. Without this resume, nothing ever set the flag back, so a live worker
+# that was serving traffic stayed at WORKER_PROVISIONING_CLAIMS_ENABLED=false
+# indefinitely after a fully successful deploy: it claimed no
+# pod_create/pod_destroy work, and because cloneSchedulerEnabled() gates the L1
+# trust-validation reconciler on claims, no template_revalidate ran either.
+# templates.guest_credentials_verified_at then went stale and
+# requireTemplateGuestCredentialAcceptanceForNewClone rejected every new
+# clone_with_customize pod as "not credential-ready".
+#
+# That is not hypothetical: it silently halted all provisioning for three days
+# (2026-08-25 -> 2026-08-28) while every workload reported healthy, because a
+# worker that claims nothing is indistinguishable from an idle one.
+#
+# The restored value is the observed PRE-DEPLOY LIVE state, deliberately not the
+# rendered chart value: validate_foundation_intent, verify_rollback_containment,
+# and the baseline check all REQUIRE the rendered candidate to be claims=false
+# so every rollback target is uniformly claims-disabled. Claims are therefore
+# enabled operationally on the live Deployment, never through the chart, and
+# reading intent from the manifest would resume nothing at all.
+#
+# Resume runs only after verify_deployed_candidate passes, so a failed or
+# contained rollback correctly leaves claims paused.
+resume_live_provisioning_claims() {
+  local live_worker live_claims
+  if [ "${PRE_DEPLOY_LIVE_CLAIMS:-false}" != "true" ]; then
+    echo "==> live worker provisioning claims were already paused before this deploy; leaving them paused"
+    return 0
+  fi
+
+  echo "==> restoring live worker provisioning claims paused for the guarded apply"
+  kubectl set env "deployment/$RELEASE-worker" \
+    -n "$NAMESPACE" \
+    WORKER_PROVISIONING_CLAIMS_ENABLED=true
+  kubectl rollout status "deployment/$RELEASE-worker" -n "$NAMESPACE" --timeout=5m
+
+  live_worker="$(mktemp)"
+  kubectl get "Deployment/$RELEASE-worker" -n "$NAMESPACE" -o yaml > "$live_worker"
+  live_claims="$(claims_from_manifest < "$live_worker")"
+  rm -f "$live_worker"
+  if [ "$live_claims" != "true" ]; then
+    echo "ERROR: live worker provisioning claims did not resume (observed: ${live_claims:-<empty>})." >&2
+    return 1
+  fi
 }
 
 verify_rollback_containment() {
@@ -3395,5 +3445,10 @@ if ! verify_deployed_candidate; then
   exit 1
 fi
 HELM_RELEASE_LOCK_PRESERVE=false
+if ! resume_live_provisioning_claims; then
+  HELM_RELEASE_LOCK_PRESERVE=true
+  echo "ERROR: deployed candidate verified but provisioning claims could not be resumed; the worker will claim no jobs until this is corrected. The release lock is intentionally retained; manual intervention is required." >&2
+  exit 1
+fi
 release_helm_release_lock
 echo "==> deployed exact source $CANDIDATE_SOURCE_SHA with immutable workload and RUNNER_IMAGE digests"
