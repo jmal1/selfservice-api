@@ -111,6 +111,7 @@ load_required_rollback_revision() {
     echo "ERROR: required accepted rollback baseline file $baseline_file does not contain an integer revision number." >&2
     return 1
   }
+  value="${value//$'\r'/}"
   if [[ ! "$value" =~ ^[0-9]+$ ]]; then
     echo "ERROR: required accepted rollback baseline file $baseline_file must contain an integer Helm revision, found $value." >&2
     return 1
