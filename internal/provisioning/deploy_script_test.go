@@ -181,7 +181,7 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
 			wantOutput:        fmt.Sprintf("required immutable rollback revision %d is absent", baselineRevision),
-			configureRevision: baselineRevision,
+			configureRevision: baselineRevision + 1,
 			configure: func(env *deployScriptEnvironment) {
 				env.immutableRevisionMissing = true
 			},
@@ -192,7 +192,7 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
 			wantOutput:        fmt.Sprintf("required immutable rollback revision %d has invalid release data", baselineRevision),
-			configureRevision: baselineRevision,
+			configureRevision: baselineRevision + 1,
 			configure: func(env *deployScriptEnvironment) {
 				env.immutableHelmStatus = "failed"
 			},
@@ -372,6 +372,7 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 func TestDeployScriptRollbackEquivalenceComparisonsLoadBearing(t *testing.T) {
 	requirePOSIXShell(t)
 
+	baselineRevision := acceptedRollbackBaselineRevision(t)
 	scriptDir := filepath.Join("..", "..", "deploy", "scripts")
 	deployPath := filepath.Join(scriptDir, "deploy.sh")
 	deployBody, err := os.ReadFile(deployPath)
@@ -442,7 +443,7 @@ func TestDeployScriptRollbackEquivalenceComparisonsLoadBearing(t *testing.T) {
 			t.Cleanup(func() { os.Remove(sabotagedPath) })
 
 			env := newDeployScriptEnvironment(t, test.latest, test.latest)
-			env.helmRevision = 165
+			env.helmRevision = baselineRevision + 1
 			env.scriptPath = sabotagedPath
 			test.configure(env)
 			output, runErr := env.run("--verify-rollback-containment")
@@ -966,7 +967,7 @@ func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 				writeFile(t, env.containedRollbackManifest, rollbackManifestWithHistoricalSynthetics(true))
 				writeFile(t, env.immutableRollbackManifest, rollbackManifestWithHistoricalSynthetics(false))
 			},
-			wantOutput: fmt.Sprintf("revision-%d immutable image baseline via deployed revision %d", baselineRevision, baselineRevision),
+			wantOutput: fmt.Sprintf("revision-%d immutable image baseline via deployed revision %d", baselineRevision, baselineRevision+2),
 		},
 		{
 			name: "pending synthetic pod destroy after rollback retains lock",
