@@ -30,8 +30,16 @@ func acceptedRollbackBaselineRevision(t *testing.T) int {
 	if err != nil {
 		t.Fatalf("read accepted rollback baseline: %v", err)
 	}
-	value := strings.TrimSpace(string(body))
-	value = strings.TrimSpace(strings.SplitN(value, "#", 2)[0])
+
+	var value string
+	for _, line := range strings.Split(string(body), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		value = line
+		break
+	}
 	if value == "" {
 		t.Fatal("accepted rollback baseline file is empty")
 	}
