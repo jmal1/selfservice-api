@@ -8,13 +8,16 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/models"
 	"github.com/jmal1/selfservice-api/internal/unattend"
 	"github.com/jmal1/selfservice-api/internal/vcenter"
@@ -158,6 +161,100 @@ func TestTemplateProvisionedBeyond(t *testing.T) {
 			t.Errorf("state %q must NOT count as provisioned-beyond", s)
 		}
 	}
+}
+
+func newTemplateProvisionRetryDB(t *testing.T) (*database.Queries, *pgxpool.Pool, uuid.UUID) {
+	t.Helper()
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set TEST_DATABASE_URL to an isolated PostgreSQL database to run template provision retry tests")
+	}
+	if err := database.RunMigrations(dsn); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	queries := database.NewQueries(pool)
+	id := uuid.New()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO templates (
+			id, name, vcenter_template, os_type, template_state,
+			source_type, source_ref, staging_network
+		)
+		VALUES ($1, $2, $3, 'linux', 'provisioning', 'clone_vcenter', 'vm-source', 'staging')
+	`, id, "retry-"+id.String(), "source-"+id.String()); err != nil {
+		t.Fatal(err)
+	}
+	return queries, pool, id
+}
+
+func TestProvisionTemplateFailTemplateStep_RespectsRetryBudget(t *testing.T) {
+	transientErr := errors.New("The virtual disk is either corrupted or not a supported format.")
+	queries, _, id := newTemplateProvisionRetryDB(t)
+	ctx := context.Background()
+
+	t.Run("retryable-error-with-retries-remaining-keeps-template-in-provisioning", func(t *testing.T) {
+		p := &Provisioner{db: queries, logger: discardLogger()}
+		job := &models.Job{Type: models.JobTypeTemplateProvision, RetryCount: 0, MaxRetries: 3}
+
+		gotErr := p.failTemplateStep(ctx, job, id, transientErr)
+		if gotErr == nil || gotErr.Error() != transientErr.Error() {
+			t.Fatalf("failTemplateStep returned %v, want %v", gotErr, transientErr)
+		}
+		fresh, err := queries.GetTemplateByID(ctx, id)
+		if err != nil {
+			t.Fatalf("GetTemplateByID: %v", err)
+		}
+		if fresh == nil || fresh.TemplateState != models.TemplateStateProvisioning {
+			t.Fatalf("template state = %#v, want %q after retryable failure with retries remaining", fresh, models.TemplateStateProvisioning)
+		}
+	})
+
+	t.Run("retryable-error-at-max-retries-transitions-to-error", func(t *testing.T) {
+		if err := queries.UpdateTemplateLifecycleState(ctx, id, models.TemplateStateProvisioning, models.TemplateStateProvisioning); err != nil {
+			t.Fatalf("reset template state: %v", err)
+		}
+		p := &Provisioner{db: queries, logger: discardLogger()}
+		job := &models.Job{Type: models.JobTypeTemplateProvision, RetryCount: 2, MaxRetries: 2}
+
+		gotErr := p.failTemplateStep(ctx, job, id, transientErr)
+		if gotErr == nil || gotErr.Error() != transientErr.Error() {
+			t.Fatalf("failTemplateStep returned %v, want %v", gotErr, transientErr)
+		}
+		fresh, err := queries.GetTemplateByID(ctx, id)
+		if err != nil {
+			t.Fatalf("GetTemplateByID: %v", err)
+		}
+		if fresh == nil || fresh.TemplateState != models.TemplateStateError {
+			t.Fatalf("template state = %#v, want %q after retryable failure exhausted retries", fresh, models.TemplateStateError)
+		}
+	})
+
+	t.Run("nonretryable-error-transitions-immediately", func(t *testing.T) {
+		if err := queries.UpdateTemplateLifecycleState(ctx, id, models.TemplateStateError, models.TemplateStateProvisioning); err != nil {
+			t.Fatalf("reset template state: %v", err)
+		}
+		p := &Provisioner{db: queries, logger: discardLogger()}
+		job := &models.Job{Type: models.JobTypeTemplateProvision, RetryCount: 0, MaxRetries: 3}
+		nonRetryable := errors.New("template_id is required")
+
+		gotErr := p.failTemplateStep(ctx, job, id, nonRetryable)
+		if gotErr == nil || gotErr.Error() != nonRetryable.Error() {
+			t.Fatalf("failTemplateStep returned %v, want %v", gotErr, nonRetryable)
+		}
+		fresh, err := queries.GetTemplateByID(ctx, id)
+		if err != nil {
+			t.Fatalf("GetTemplateByID: %v", err)
+		}
+		if fresh == nil || fresh.TemplateState != models.TemplateStateError {
+			t.Fatalf("template state = %#v, want %q after nonretryable failure", fresh, models.TemplateStateError)
+		}
+	})
 }
 
 // TestTemplateProvisionPayload_JSONRoundTrip locks in the wire shape of

@@ -141,10 +141,10 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 
 	tmpl, err := p.db.GetTemplateByID(ctx, payload.TemplateID)
 	if err != nil {
-		return fmt.Errorf("load template %s: %w", payload.TemplateID, err)
+		return p.failTemplateStep(ctx, job, payload.TemplateID, fmt.Errorf("load template %s: %w", payload.TemplateID, err))
 	}
 	if tmpl == nil {
-		return fmt.Errorf("template %s not found", payload.TemplateID)
+		return p.failTemplateStep(ctx, job, payload.TemplateID, fmt.Errorf("template %s not found", payload.TemplateID))
 	}
 	if tmpl.TemplateState != models.TemplateStateProvisioning {
 		// Idempotency guard. A prior or duplicate provision job for this
@@ -158,8 +158,8 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 				"template_id", payload.TemplateID, "state", tmpl.TemplateState)
 			return nil
 		}
-		return fmt.Errorf("template %s is in state %q, expected %q",
-			payload.TemplateID, tmpl.TemplateState, models.TemplateStateProvisioning)
+		return p.failTemplateStep(ctx, job, payload.TemplateID, fmt.Errorf("template %s is in state %q, expected %q",
+			payload.TemplateID, tmpl.TemplateState, models.TemplateStateProvisioning))
 	}
 
 	// Source dispatch.
@@ -170,8 +170,11 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 	// core rather than falling through to the clone steps below. It returns its
 	// original cause so the job lifecycle can decide retry/terminal ownership.
 	if payload.SourceType == models.TemplateSourceISO {
-		return provisionTemplateFromISO(ctx, p.vc, p.db, p.pipeline, p.logger,
-			func(step, message string) { p.publishProgress(job.ID, step, message) }, payload)
+		if err := provisionTemplateFromISO(ctx, p.vc, p.db, p.pipeline, p.logger,
+			func(step, message string) { p.publishProgress(job.ID, step, message) }, payload); err != nil {
+			return p.failTemplateStep(ctx, job, payload.TemplateID, err)
+		}
+		return nil
 	}
 
 	// clone_template / clone_vcenter: resolve the source to a live vCenter
@@ -185,7 +188,7 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 	// design exists to prevent — see internal/templates/source_resolve.go.
 	sourceMoref, resolveErr := templates.ResolveCloneSourceMoref(ctx, p.db, p.vc, payload.SourceType, payload.SourceRef)
 	if resolveErr != nil {
-		return resolveErr
+		return p.failTemplateStep(ctx, job, payload.TemplateID, resolveErr)
 	}
 	p.logger.Info("resolved template clone source",
 		"source_type", payload.SourceType, "source_ref", payload.SourceRef, "moref", sourceMoref)
@@ -218,24 +221,24 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 	})
 	releaseLock()
 	if err != nil {
-		return fmt.Errorf("clone source VM: %w", err)
+		return p.failTemplateStep(ctx, job, payload.TemplateID, fmt.Errorf("clone source VM: %w", err))
 	}
 
 	// Step 2: persist the moref so we can resume / cancel / generalize later
 	if err := p.db.SetTemplateVCenterVM(ctx, payload.TemplateID, moref); err != nil {
-		return fmt.Errorf("record vCenter VM ID: %w", err)
+		return p.failTemplateStep(ctx, job, payload.TemplateID, fmt.Errorf("record vCenter VM ID: %w", err))
 	}
 
 	// Step 3: attach NIC to staging network (idempotent if already there)
 	p.publishProgress(job.ID, "attach_network", fmt.Sprintf("Attaching NIC to %s", payload.StagingNetwork))
 	if err := p.vc.AttachNetworkAdapter(ctx, moref, payload.StagingNetwork); err != nil {
-		return fmt.Errorf("attach NIC: %w", err)
+		return p.failTemplateStep(ctx, job, payload.TemplateID, fmt.Errorf("attach NIC: %w", err))
 	}
 
 	// Step 4: power on
 	p.publishProgress(job.ID, "power_on", "Powering on VM")
 	if err := p.vc.PowerOnVM(ctx, moref); err != nil {
-		return fmt.Errorf("power on: %w", err)
+		return p.failTemplateStep(ctx, job, payload.TemplateID, fmt.Errorf("power on: %w", err))
 	}
 
 	// Step 5: wait for VMware Tools to come up. This is an ordinary first boot;
@@ -243,9 +246,9 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 	p.publishProgress(job.ID, "wait_tools",
 		fmt.Sprintf("Waiting for VMware Tools (up to %s)", cloneFirstBootToolsTimeout))
 	if err := p.vc.WaitForTools(ctx, moref, cloneFirstBootToolsTimeout); err != nil {
-		return fmt.Errorf("wait for VMware Tools: %w — the VM powered on but never reported tools. "+
+		return p.failTemplateStep(ctx, job, payload.TemplateID, fmt.Errorf("wait for VMware Tools: %w — the VM powered on but never reported tools. "+
 			"Either the guest is still booting (rare at this deadline), or open-vm-tools/VMware Tools "+
-			"is not installed and enabled on the source VM", err)
+			"is not installed and enabled on the source VM", err))
 	}
 
 	// Step 6: advance to 'configuring' so the instructor can start setup
@@ -264,7 +267,7 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 				return nil
 			}
 		}
-		return fmt.Errorf("advance to configuring: %w", err)
+		return p.failTemplateStep(ctx, job, payload.TemplateID, fmt.Errorf("advance to configuring: %w", err))
 	}
 
 	return nil
@@ -287,6 +290,30 @@ func templateProvisionedBeyond(state string) bool {
 	default:
 		return false
 	}
+}
+
+// failTemplateStep decides whether a failed template-provision step should keep
+// the template in 'provisioning' so the job can retry, or whether this is a
+// terminal error that must flip the template to 'error'.
+//
+// The job lifecycle owns retry scheduling; the template must not be moved to
+// 'error' for a retryable failure while retries remain. If the error is
+// non-retryable, or the retry budget is exhausted, we transition to 'error' so
+// the template stays visible as failed rather than stuck in provisioning.
+func (p *Provisioner) failTemplateStep(ctx context.Context, job *models.Job, templateID uuid.UUID, stepErr error) error {
+	if stepErr == nil {
+		return nil
+	}
+	if templateID == uuid.Nil {
+		return stepErr
+	}
+	if job != nil {
+		retryable, _ := ClassifyError(stepErr, job.Type)
+		if retryable && job.RetryCount < job.MaxRetries {
+			return stepErr
+		}
+	}
+	return p.markTemplateError(ctx, templateID, stepErr)
 }
 
 // isoInstallToolsTimeout bounds how long the unattended-install path waits for
