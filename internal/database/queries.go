@@ -2675,15 +2675,19 @@ func (q *Queries) SetTemplateValidationState(ctx context.Context, id uuid.UUID, 
 	return err
 }
 
-// ListStaleL1Templates returns active templates with trust_tier='l1' whose
-// last_validated_at is NULL or older than olderThan. These are candidates for
-// a new template_revalidate job enqueued by the L1 trust-validation reconciler.
-func (q *Queries) ListStaleL1Templates(ctx context.Context, olderThan time.Duration) ([]models.Template, error) {
+const credentialRevalidationTemplateWhereSQL = `
+		WHERE is_active = true
+		  AND kind = 'clone_with_customize'`
+
+// ListStaleCredentialRevalidationTemplates returns active clone_with_customize
+// templates whose last_validated_at is NULL or older than olderThan. These are
+// candidates for a new template_revalidate job enqueued by the trust-validation
+// reconciler.
+func (q *Queries) ListStaleCredentialRevalidationTemplates(ctx context.Context, olderThan time.Duration) ([]models.Template, error) {
 	rows, err := q.pool.Query(ctx, `
 		SELECT `+templateSelectCols+`
 		FROM templates
-		WHERE trust_tier = 'l1'
-		  AND is_active = true
+		`+credentialRevalidationTemplateWhereSQL+`
 		  AND (
 		      last_validated_at IS NULL
 		      OR last_validated_at < now() - $1::interval
@@ -2706,14 +2710,15 @@ func (q *Queries) ListStaleL1Templates(ctx context.Context, olderThan time.Durat
 	return out, rows.Err()
 }
 
-// ListAllActiveL1Templates returns all active templates with trust_tier='l1'.
-// Used by the L1 trust-validation reconciler to populate the per-template
-// staleness gauge on every pass — not just for templates that are overdue.
-func (q *Queries) ListAllActiveL1Templates(ctx context.Context) ([]models.Template, error) {
+// ListAllActiveCredentialRevalidationTemplates returns all active
+// clone_with_customize templates. Used by the trust-validation reconciler to
+// populate the per-template staleness gauge on every pass — not just for
+// templates that are overdue.
+func (q *Queries) ListAllActiveCredentialRevalidationTemplates(ctx context.Context) ([]models.Template, error) {
 	rows, err := q.pool.Query(ctx, `
 		SELECT `+templateSelectCols+`
 		FROM templates
-		WHERE trust_tier = 'l1' AND is_active = true
+		`+credentialRevalidationTemplateWhereSQL+`
 		ORDER BY name
 	`)
 	if err != nil {

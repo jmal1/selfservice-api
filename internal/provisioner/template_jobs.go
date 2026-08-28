@@ -1416,7 +1416,7 @@ func (p *Provisioner) VerifyTemplate(ctx context.Context, job *models.Job) (err 
 }
 
 // TemplateRevalidatePayload is the payload for a JobTypeTemplateRevalidate job.
-// Manual L1 templates may enqueue this without a VM moref; RevalidateL1Template
+// Manual templates may enqueue this without a VM moref; RevalidateL1Template
 // resolves template.VCenterTemplate by name at run time when needed.
 type TemplateRevalidatePayload struct {
 	TemplateID     uuid.UUID                `json:"template_id"`
@@ -1453,7 +1453,7 @@ type revalidateL1CorePipeline interface {
 }
 
 // revalidateL1TemplateCore records the outcome of a completed smoke check for
-// an L1 template. It is a pure function (no vCenter dependency) so tests can
+// a template. It is a pure function (no vCenter dependency) so tests can
 // inject fakes for both the DB and metrics and verify the alert-only policy.
 //
 // INVARIANT: this function NEVER calls db.SetTemplateActive — revalidation
@@ -1617,7 +1617,7 @@ func revalidateL1TemplateJob(
 //   - does NOT touch is_active — the template STAYS published on failure
 //
 // When the job payload does not already carry a moref, it resolves the source
-// VM by the template's vcenter_template name at run time so legacy/manual L1
+// VM by the template's vcenter_template name at run time so legacy/manual
 // templates can still be revalidated.
 //
 // On failure it records the result in last_validation_result and emits the

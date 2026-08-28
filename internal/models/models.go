@@ -170,19 +170,20 @@ var AllTemplateStates = []string{
 // TemplateTrustTier constants — keep in sync with the CHECK constraint
 // added by migration 000027_l1_trust_tier.up.sql.
 const (
-	// TemplateTrustTierL1 enables periodic smoke-clone revalidation.
-	// The reconciler (internal/provisioner/trust_validation_reconcile.go)
-	// enqueues a template_revalidate job whenever last_validated_at is NULL
-	// or older than the configured interval. On failure, an alert fires but
-	// the template remains published (alert-only policy).
+	// TemplateTrustTierL1 marks a first-class template. Periodic smoke-clone
+	// revalidation now covers every active clone_with_customize template because
+	// the clone gate depends on a durable guest credential marker regardless of
+	// trust tier.
 	TemplateTrustTierL1 = "l1"
 
 	// TemplateTrustTierDerived indicates the template inherits its quality
-	// signal from a parent template. Reserved for future use.
+	// signal from a parent template. Its guest credential marker is still
+	// periodically smoke-validated when the template uses clone_with_customize.
 	TemplateTrustTierDerived = "derived"
 
-	// TemplateTrustTierUntrusted is the default for all templates; no
-	// automated revalidation is performed.
+	// TemplateTrustTierUntrusted is the default for all templates. Sandbox
+	// clone_with_customize templates still get guest credential smoke
+	// revalidation so new clones are not permanently blocked by a missing marker.
 	TemplateTrustTierUntrusted = "untrusted"
 )
 

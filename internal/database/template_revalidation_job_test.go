@@ -77,3 +77,47 @@ func TestTemplateRevalidationDedupSQLContractRejectsSabotage(t *testing.T) {
 		})
 	}
 }
+
+func TestCredentialRevalidationTemplateSelectorIncludesAllCustomizedTemplates(t *testing.T) {
+	predicate := strings.ToLower(credentialRevalidationTemplateWhereSQL)
+	if !strings.Contains(predicate, "is_active = true") {
+		t.Fatal("credential revalidation selector must only include active templates")
+	}
+	if !strings.Contains(predicate, "kind = 'clone_with_customize'") {
+		t.Fatal("credential revalidation selector must include clone_with_customize templates")
+	}
+	if strings.Contains(predicate, "trust_tier") {
+		t.Fatal("credential revalidation selector must not depend on trust_tier; derived/untrusted sandbox Windows templates need credential smoke validation too")
+	}
+}
+
+func TestCredentialRevalidationTemplateSelectorRejectsSabotage(t *testing.T) {
+	tests := []struct {
+		name      string
+		predicate string
+	}{
+		{
+			name:      "missing active filter",
+			predicate: strings.Replace(credentialRevalidationTemplateWhereSQL, "is_active = true", "true", 1),
+		},
+		{
+			name:      "missing clone_with_customize filter",
+			predicate: strings.Replace(credentialRevalidationTemplateWhereSQL, "AND kind = 'clone_with_customize'", "", 1),
+		},
+		{
+			name:      "trust tier filter reintroduced",
+			predicate: credentialRevalidationTemplateWhereSQL + "\n\t\t  AND trust_tier = 'l1'",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			predicate := strings.ToLower(tc.predicate)
+			valid := strings.Contains(predicate, "is_active = true") &&
+				strings.Contains(predicate, "kind = 'clone_with_customize'") &&
+				!strings.Contains(predicate, "trust_tier")
+			if valid {
+				t.Fatal("sabotaged credential revalidation selector unexpectedly satisfied the contract")
+			}
+		})
+	}
+}

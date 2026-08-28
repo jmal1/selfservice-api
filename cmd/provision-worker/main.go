@@ -478,10 +478,10 @@ func main() {
 		Pusher: idleEvalPusher,
 	}
 
-	// L1 trust-tier revalidation reconciler. A short scheduler poll queries
-	// persisted due state and enqueues
-	// template_revalidate jobs for active L1 templates whose last_validated_at
-	// is NULL or older than the configured interval.
+	// Template credential revalidation reconciler. A short scheduler poll
+	// queries persisted due state and enqueues template_revalidate jobs for
+	// active clone_with_customize templates whose last_validated_at is NULL or
+	// older than the configured interval.
 	// Enabled by default; set WORKER_L1_VALIDATION_ENABLED=false to opt out.
 	// WORKER_L1_VALIDATION_INTERVAL overrides the default 168h (weekly) cadence.
 	// WORKER_L1_VALIDATION_SCHEDULER_INTERVAL controls the persisted-state poll
