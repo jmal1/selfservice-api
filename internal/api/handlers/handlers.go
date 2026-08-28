@@ -826,6 +826,57 @@ func (h *Handler) DeletePod(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *Handler) AdminFinalizeOrphanedPodDestroy(w http.ResponseWriter, r *http.Request) {
+	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
+	if err != nil {
+		respondError(w, r, http.StatusBadRequest, "invalid pod id")
+		return
+	}
+	var req struct {
+		VLANID            int    `json:"vlan_id"`
+		Subnet            string `json:"subnet"`
+		ConfirmationToken string `json:"confirmation_token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	userID := middleware.UserIDFromContext(r.Context())
+	role := middleware.RoleFromContext(r.Context())
+	if role != models.RoleAdmin || userID == uuid.Nil {
+		respondError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
+	snapshot, err := h.db.FinalizeOrphanedPodDestroy(r.Context(), userID, podID, database.PodDestroyRecoveryAttestation{
+		VLANID:            req.VLANID,
+		Subnet:            req.Subnet,
+		ConfirmationToken: req.ConfirmationToken,
+	})
+	if err != nil {
+		if errors.Is(err, database.ErrPodDestroyRecoveryPrecondition) {
+			respondError(w, r, http.StatusConflict, err.Error())
+			return
+		}
+		h.logger.Error("finalize orphaned destroy failed", "pod_id", podID, "error", err)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
+		return
+	}
+	audit.Log(r.Context(), h.db, "pod.finalize_orphaned_destroy",
+		audit.Resource("pod", podID),
+		audit.FromRequest(r),
+		audit.Detail("vlan_id", req.VLANID),
+		audit.Detail("subnet", req.Subnet),
+		audit.Detail("confirmation_token", req.ConfirmationToken),
+		audit.Detail("destroy_job_id", snapshot.DestroyJobID.String()),
+	)
+	respondJSON(w, http.StatusOK, map[string]any{
+		"pod_id":         podID,
+		"status":         models.PodStatusDestroyed,
+		"destroy_job_id": snapshot.DestroyJobID,
+		"snapshot":       snapshot,
+	})
+}
+
 // ExtendPod allows a user to extend their pod's expiration (attestation).
 func (h *Handler) ExtendPod(w http.ResponseWriter, r *http.Request) {
 	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
