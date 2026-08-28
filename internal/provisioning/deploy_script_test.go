@@ -4453,7 +4453,8 @@ type deployScriptEnvironment struct {
 	warmerImageProbeLog       string
 	helmStatus                string
 	helmRevision              int
-	immutableRevision        int
+	immutableRevision         int
+	immutableBaselineRevision int
 	postLiveHelmRevision      int
 	postLiveHelmStatus        string
 	postLiveHelmHistoryExit   int
@@ -4556,7 +4557,8 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 		warmerImageProbeLog:       filepath.Join(root, "warmer-image-probe.log"),
 		helmStatus:                "deployed",
 		helmRevision:              baselineRevision,
-		immutableRevision:        baselineRevision,
+		immutableRevision:         baselineRevision,
+		immutableBaselineRevision: baselineRevision,
 		helmDescription:           "Upgrade complete",
 		immutableHelmStatus:       "superseded",
 		immutableChartVersion:     "0.1.0",
@@ -4650,7 +4652,7 @@ case "$1 $2" in
   "get manifest")
     revision=$(requested_revision "$@")
     latest=$(latest_revision)
-    if [ "$revision" = "$FAKE_IMMUTABLE_REVISION" ] && [ "$latest" != "$FAKE_IMMUTABLE_REVISION" ]; then
+    if [ "$revision" = "$FAKE_IMMUTABLE_BASELINE_REVISION" ] && [ "$latest" != "$FAKE_IMMUTABLE_BASELINE_REVISION" ]; then
       [ "$FAKE_IMMUTABLE_REVISION_MISSING" != true ] || exit 1
       cat "$FAKE_IMMUTABLE_ROLLBACK_MANIFEST"
     elif [ -f "$FAKE_ATOMIC_FAILED_MARKER" ]; then
@@ -4664,7 +4666,7 @@ case "$1 $2" in
   "get hooks")
     revision=$(requested_revision "$@")
     latest=$(latest_revision)
-    if [ "$revision" = "$FAKE_IMMUTABLE_REVISION" ] && [ "$latest" != "$FAKE_IMMUTABLE_REVISION" ]; then
+    if [ "$revision" = "$FAKE_IMMUTABLE_BASELINE_REVISION" ] && [ "$latest" != "$FAKE_IMMUTABLE_BASELINE_REVISION" ]; then
       [ "$FAKE_IMMUTABLE_REVISION_MISSING" != true ] || exit 1
       cat "$FAKE_IMMUTABLE_ROLLBACK_HOOKS"
     else
@@ -4678,7 +4680,7 @@ case "$1 $2" in
     fi
     revision=$(requested_revision "$@")
     latest=$(latest_revision)
-    if [ "$revision" = "$FAKE_IMMUTABLE_REVISION" ] && [ "$latest" != "$FAKE_IMMUTABLE_REVISION" ]; then
+    if [ "$revision" = "$FAKE_IMMUTABLE_BASELINE_REVISION" ] && [ "$latest" != "$FAKE_IMMUTABLE_BASELINE_REVISION" ]; then
       [ "$FAKE_IMMUTABLE_REVISION_MISSING" != true ] || exit 1
       cat "$FAKE_IMMUTABLE_ROLLBACK_VALUES"
     else
@@ -4688,7 +4690,7 @@ case "$1 $2" in
   "get metadata")
     revision=$(requested_revision "$@")
     latest=$(latest_revision)
-    if [ "$revision" = "$FAKE_IMMUTABLE_REVISION" ] && [ "$latest" != "$FAKE_IMMUTABLE_REVISION" ]; then
+    if [ "$revision" = "$FAKE_IMMUTABLE_BASELINE_REVISION" ] && [ "$latest" != "$FAKE_IMMUTABLE_BASELINE_REVISION" ]; then
       [ "$FAKE_IMMUTABLE_REVISION_MISSING" != true ] || exit 1
       chart_version=$FAKE_IMMUTABLE_CHART_VERSION
       status=$FAKE_IMMUTABLE_HELM_STATUS
@@ -5737,6 +5739,7 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_HELM_STATUS="+e.helmStatus,
 		"FAKE_HELM_REVISION="+strconv.Itoa(e.helmRevision),
 		"FAKE_IMMUTABLE_REVISION="+strconv.Itoa(e.immutableRevision),
+		"FAKE_IMMUTABLE_BASELINE_REVISION="+strconv.Itoa(e.immutableBaselineRevision),
 		"FAKE_POST_LIVE_HELM_REVISION="+strconv.Itoa(e.postLiveHelmRevision),
 		"FAKE_POST_LIVE_HELM_STATUS="+e.postLiveHelmStatus,
 		"FAKE_POST_LIVE_HELM_HISTORY_EXIT="+strconv.Itoa(e.postLiveHelmHistoryExit),
