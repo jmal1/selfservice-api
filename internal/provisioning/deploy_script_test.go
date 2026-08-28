@@ -844,7 +844,7 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 			wantUpgrade: false,
 		},
 		{
-			name: "API monitor lifecycle changed",
+			name: "candidate can intentionally enable API monitor lifecycle",
 			transform: func(manifest string) string {
 				return replaceEnvValue(
 					manifest,
@@ -853,8 +853,10 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 					"true",
 				)
 			},
-			wantOutput:  "SYNTHETIC_LIFECYCLE_ENABLED=false",
-			wantUpgrade: false,
+			wantSuccess:       true,
+			wantOutput:        "deployed exact source",
+			wantUpgrade:       true,
+			expectBuiltDigest: true,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {

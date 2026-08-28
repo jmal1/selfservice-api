@@ -946,16 +946,7 @@ deployment. Its separately proven merge
 `b61ca0c5a353d112b5ef8f97666ee528da115442` is not rendered, validated, or
 deployed by this Helm workflow.
 
-During NFS41/UI containment, the non-mutating API-monitor CronJob remains
-unsuspended while `SYNTHETIC_LIFECYCLE_ENABLED=false` in the candidate and live
-rollback state. Revision 160 is the immutable image/workload baseline, but its
-historical values enabled lifecycle, janitor, and runner synthetics and are not
-safe rollback intent. The deploy overrides those values under the lock by
-keeping the API monitor active/non-lifecycle and suspending janitor/runner before
-it will accept rollback containment. The external `synthetic-ui.timer` on
-`netbirdv01` must remain
-disabled and be verified independently; Helm never mutates or proves that
-host-level timer.
+Production API synthetic feedback includes the mutating `pod_lifecycle` check, so the final candidate may intentionally render `SYNTHETIC_LIFECYCLE_ENABLED=true` once cleanup safety has been proven. Rollback containment still forces the API monitor back to active/non-lifecycle mode and suspends janitor/runner before it will accept rollback containment. The external `synthetic-ui.timer` on `netbirdv01` remains outside Helm and must be verified independently; Helm never mutates or proves that host-level timer.
 
 An atomic Helm failure never falls through the EXIT trap. While retaining the
 release lock, the script forces claims disabled, immediately reapplies the

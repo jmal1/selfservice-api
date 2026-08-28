@@ -34,8 +34,10 @@ vcenter:
   # chain. Keep hostname verification enabled in every production process.
   insecure: "false"
 
-# Synthetic monitoring remains non-destructive during the initial reopening.
-# Lifecycle, janitor, and runner creation checks stay disabled.
+# Synthetic monitoring includes the non-mutating API monitor plus the
+# clone-producing lifecycle, janitor, and runner checks. deploy.sh still
+# contains rollback safety by forcing clone-producing CronJobs off before a
+# guarded apply and after a failed atomic rollback.
 synthetic:
   # Keep the non-mutating API monitor active. Destructive lifecycle coverage
   # remains independently gated below.
@@ -43,7 +45,7 @@ synthetic:
   schedule: "*/12 * * * *"
   provisioningExpectedEnabled: true
   lifecycle:
-    enabled: false
+    enabled: true
     template: synthetic-noop
     # Pinned to the production-calibrated value. Must agree with
     # values.yaml and DefaultPodLifecycleConfig in lifecycle.go.
@@ -54,13 +56,13 @@ synthetic:
     maxAttempts: 2
     retryBackoff: 30s
   janitor:
-    enabled: false
+    enabled: true
   # Hourly end-to-end proof of the Kali runner path (Multus NAD, CNI dhcp lease,
   # pod-VLAN L3 reachability, nmap). Chart defaults already match prod: it clones
   # the synthetic-noop template and runs the version-controlled playlist seeded by
   # deploy/sql/synthetic-runner-smoke-playlist.sql.
   runner:
-    enabled: false
+    enabled: true
     schedule: "37 * * * *"
     # Explicitly pin the deadline. The Runner-authorized retry cycle is
     # 2490s = 41m30s and its bounded session JWT TTL is 46m;
@@ -80,10 +82,11 @@ worker:
     # validates these exact values in the final server-defaulted manifest.
     enabled: false
     categoryFeedBaseURL: ""
-  # Poll persisted L1 validation due state every 5m. Any template older than
-  # seven days is enqueued immediately after startup or leader failover.
+  # Poll persisted credential-validation due state every 5m. Any active
+  # clone_with_customize template older than seven days is enqueued immediately
+  # after startup or leader failover.
   l1Validation:
-    enabled: false
+    enabled: true
     validationInterval: "168h"
     schedulerInterval: "5m"
   templateHealth:

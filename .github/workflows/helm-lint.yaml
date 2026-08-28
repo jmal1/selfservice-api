@@ -54,10 +54,9 @@ jobs:
       # Guards the 2026-08-25 dry-run failure: deploy.sh's
       # validate_foundation_intent requires SYNTHETIC_LIFECYCLE_ENABLED to
       # render EXACTLY ONCE with an explicit boolean. Wrapping it in the
-      # synthetic.lifecycle.enabled conditional makes it disappear entirely
-      # from this disabled render, which `helm template ... > /dev/null`
-      # alone does not catch.
-      - name: assert SYNTHETIC_LIFECYCLE_ENABLED=false in prod render
+      # synthetic.lifecycle.enabled conditional makes it disappear entirely,
+      # which `helm template ... > /dev/null` alone does not catch.
+      - name: assert SYNTHETIC_LIFECYCLE_ENABLED=true in prod render
         working-directory: deploy/helm/selfservice
         run: |
           set -euo pipefail
@@ -67,8 +66,8 @@ jobs:
             exit 1
           fi
           value=$(grep -A1 '^\s*- name: SYNTHETIC_LIFECYCLE_ENABLED$' rendered-prod.yaml | tail -1)
-          if ! echo "$value" | grep -qx '\s*value: "false"'; then
-            echo "ERROR: prod render's SYNTHETIC_LIFECYCLE_ENABLED is not explicit false: $value" >&2
+          if ! echo "$value" | grep -qx '\s*value: "true"'; then
+            echo "ERROR: prod render's SYNTHETIC_LIFECYCLE_ENABLED is not explicit true: $value" >&2
             exit 1
           fi
 
