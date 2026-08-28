@@ -304,6 +304,7 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 
 				// Admin pod management
 				r.Post("/pods/{podID}/extend", h.AdminExtendPod)
+				r.Post("/pods/{podID}/finalize-orphaned-destroy", h.AdminFinalizeOrphanedPodDestroy)
 
 				// Workflows (assessment scripts)
 				r.Route("/workflows", func(r chi.Router) {

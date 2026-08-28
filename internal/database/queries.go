@@ -48,6 +48,7 @@ var ErrBlueprintNotFound = errors.New("blueprint not found")
 var ErrUnsafePodCreateCleanupState = errors.New("pod state is unsafe for pod-create cleanup")
 var ErrJobLeaseLost = errors.New("job lease ownership lost")
 var ErrVMCloneAlreadyDestroyed = errors.New("exact VM clone was already destroyed")
+var ErrPodDestroyRecoveryPrecondition = errors.New("pod destroy recovery precondition failed")
 
 // TemplatePinOrderClause is the canonical ordering for template lists (migration 000030).
 // Pinned items appear first (ordered by pin_order, then pinned_at), then unpinned items (by name).
@@ -725,6 +726,176 @@ func (q *Queries) FinalizePodDestroy(
 		return fmt.Errorf("commit pod destroy finalization for %s: %w", podID, err)
 	}
 	return nil
+}
+
+type PodDestroyRecoverySnapshot struct {
+	PodID            uuid.UUID
+	PodStatus        string
+	PodError         string
+	VLANID           int
+	Subnet           string
+	DestroyJobID     uuid.UUID
+	DestroyJobStatus string
+	DestroyJobReason string
+}
+
+type PodDestroyRecoveryAttestation struct {
+	VLANID            int    `json:"vlan_id"`
+	Subnet            string `json:"subnet"`
+	ConfirmationToken string `json:"confirmation_token"`
+}
+
+func (q *Queries) FinalizeOrphanedPodDestroy(ctx context.Context, actorUserID, podID uuid.UUID, attestation PodDestroyRecoveryAttestation) (*PodDestroyRecoverySnapshot, error) {
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin orphaned destroy recovery: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var (
+		podStatus string
+		podError  string
+		vlanID    int
+		subnet    string
+	)
+	if err := tx.QueryRow(ctx, `
+		SELECT status, COALESCE(error_message, ''), vlan_id, subnet
+		FROM pods
+		WHERE id = $1
+		FOR UPDATE
+	`, podID).Scan(&podStatus, &podError, &vlanID, &subnet); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("%w: pod %s not found", ErrPodDestroyRecoveryPrecondition, podID)
+		}
+		return nil, fmt.Errorf("lock pod for orphaned destroy recovery: %w", err)
+	}
+	if podStatus != models.PodStatusDestroyFailed || podError != models.PodErrorManualCleanupRequiredPrefix {
+		return nil, fmt.Errorf("%w: pod %s status=%s", ErrPodDestroyRecoveryPrecondition, podID, podStatus)
+	}
+	if attestation.VLANID != vlanID || attestation.Subnet != subnet {
+		return nil, fmt.Errorf("%w: attestation mismatch for pod %s", ErrPodDestroyRecoveryPrecondition, podID)
+	}
+
+	var jobID uuid.UUID
+	var jobStatus, jobReason string
+	if err := tx.QueryRow(ctx, `
+		SELECT id, status, COALESCE(result->>'status', '')
+		FROM jobs
+		WHERE type = 'pod_destroy'
+		  AND payload->>'pod_id' = $1::text
+		ORDER BY created_at ASC, id ASC
+		FOR UPDATE
+		LIMIT 1
+	`, podID).Scan(&jobID, &jobStatus, &jobReason); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("%w: missing pod_destroy job for pod %s", ErrPodDestroyRecoveryPrecondition, podID)
+		}
+		return nil, fmt.Errorf("lock pod destroy job for orphaned recovery: %w", err)
+	}
+	if jobStatus != models.JobStatusFailed || jobReason != "manual_cleanup_required" {
+		return nil, fmt.Errorf("%w: pod destroy job %s status=%s", ErrPodDestroyRecoveryPrecondition, jobID, jobStatus)
+	}
+
+	var placements int
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*)
+		FROM vm_placements vp
+		JOIN pod_vms pv ON pv.id = vp.pod_vm_id
+		WHERE pv.pod_id = $1
+	`, podID).Scan(&placements); err != nil {
+		return nil, fmt.Errorf("count pod placements for orphaned recovery: %w", err)
+	}
+	if placements != 0 {
+		return nil, fmt.Errorf("%w: pod %s has placements", ErrPodDestroyRecoveryPrecondition, podID)
+	}
+
+	var receiptCount int
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*)
+		FROM pod_portgroup_receipts
+		WHERE pod_id = $1
+		  AND removed_at IS NULL
+	`, podID).Scan(&receiptCount); err != nil {
+		return nil, fmt.Errorf("count pod receipts for orphaned recovery: %w", err)
+	}
+	if receiptCount != 0 {
+		return nil, fmt.Errorf("%w: pod %s has receipts", ErrPodDestroyRecoveryPrecondition, podID)
+	}
+
+	var activeJobs int
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*)
+		FROM jobs
+		WHERE payload->>'pod_id' = $1::text
+		  AND type <> 'pod_destroy'
+		  AND status NOT IN ('completed', 'failed')
+	`, podID).Scan(&activeJobs); err != nil {
+		return nil, fmt.Errorf("count competing jobs for orphaned recovery: %w", err)
+	}
+	if activeJobs != 0 {
+		return nil, fmt.Errorf("%w: pod %s has competing jobs", ErrPodDestroyRecoveryPrecondition, podID)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE pods
+		SET status = 'destroyed',
+		    error_message = '',
+		    updated_at = now()
+		WHERE id = $1
+		  AND status = 'destroy_failed'
+	`, podID); err != nil {
+		return nil, fmt.Errorf("mark orphaned pod destroyed: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE jobs
+		SET status = 'completed',
+		    result = jsonb_build_object('status', 'orphan_finalized', 'pod_id', $2::text, 'confirmation_token', $3::text)
+		WHERE id = $1
+		  AND status = 'failed'
+	`, jobID, podID, attestation.ConfirmationToken); err != nil {
+		return nil, fmt.Errorf("mark orphaned destroy job finalized: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE vlan_pool
+		SET pod_id = NULL,
+		    allocated_at = NULL
+		WHERE pod_id = $1
+	`, podID); err != nil {
+		return nil, fmt.Errorf("release orphaned VLAN: %w", err)
+	}
+	beforeState := map[string]any{
+		"status":        podStatus,
+		"error_message": podError,
+		"vlan_id":       vlanID,
+		"subnet":        subnet,
+	}
+	afterState := map[string]any{
+		"status":  models.PodStatusDestroyed,
+		"vlan_id": vlanID,
+		"subnet":  subnet,
+	}
+	beforeJSON, err := json.Marshal(beforeState)
+	if err != nil {
+		return nil, fmt.Errorf("marshal orphaned destroy before state: %w", err)
+	}
+	afterJSON, err := json.Marshal(afterState)
+	if err != nil {
+		return nil, fmt.Errorf("marshal orphaned destroy after state: %w", err)
+	}
+	attestationJSON, err := json.Marshal(attestation)
+	if err != nil {
+		return nil, fmt.Errorf("marshal orphaned destroy attestation: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO pod_destroy_recovery_audit (pod_id, job_id, actor_user_id, attestation, before_state, after_state)
+		VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb)
+	`, podID, jobID, actorUserID, attestationJSON, beforeJSON, afterJSON); err != nil {
+		return nil, fmt.Errorf("insert orphaned destroy audit: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit orphaned destroy recovery: %w", err)
+	}
+	return &PodDestroyRecoverySnapshot{PodID: podID, PodStatus: podStatus, PodError: podError, VLANID: vlanID, Subnet: subnet, DestroyJobID: jobID, DestroyJobStatus: jobStatus, DestroyJobReason: jobReason}, nil
 }
 
 // CreatePod inserts a pod record with a checked-out VLAN.
