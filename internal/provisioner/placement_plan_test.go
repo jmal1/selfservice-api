@@ -81,6 +81,56 @@ func TestPlacementPlanningPreservesOperationalRetriesAndTerminalizesDrift(t *tes
 	}
 }
 
+func TestCreatePodPowerOnFailuresEnterCleanup(t *testing.T) {
+	source, err := os.ReadFile("create.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(source)
+	powerOnStart := strings.Index(body, "// --- Step 7: Power on VMs")
+	if powerOnStart < 0 {
+		t.Fatal("power-on phase is missing")
+	}
+	powerOnBody := body[powerOnStart:]
+	getVM := strings.Index(powerOnBody, "podVM, err := p.db.GetPodVM(ctx, vmSpec.PodVMID)")
+	if getVM < 0 {
+		t.Fatal("power-on VM lookup is missing")
+	}
+	nextVMCheck := strings.Index(powerOnBody[getVM:], "if podVM.VCenterVMID == nil")
+	if nextVMCheck < 0 {
+		t.Fatal("power-on VM identity check is missing")
+	}
+	getVMBlock := powerOnBody[getVM : getVM+nextVMCheck]
+	if !strings.Contains(getVMBlock, "return p.failPodCreateWithCleanup(") {
+		t.Fatal("power-on VM lookup failure does not enter pod cleanup")
+	}
+	identityCheck := strings.Index(powerOnBody, "if podVM.VCenterVMID == nil")
+	if identityCheck < 0 {
+		t.Fatal("power-on identity preflight is missing")
+	}
+	nextPlacementCheck := strings.Index(powerOnBody[identityCheck:], "placement, ok :=")
+	if nextPlacementCheck < 0 {
+		t.Fatal("power-on placement lookup is missing")
+	}
+	identityBlock := powerOnBody[identityCheck : identityCheck+nextPlacementCheck]
+	if !strings.Contains(identityBlock, "return p.failPodCreateWithCleanup(") {
+		t.Fatal("missing VM identity does not enter pod cleanup")
+	}
+	dhcpStart := strings.Index(body, "if err := p.opn.AddDHCPInterface")
+	if dhcpStart < 0 {
+		t.Fatal("DHCP interface setup is missing")
+	}
+	dhcpEnd := strings.Index(body[dhcpStart:], "// Wait for interface")
+	if dhcpEnd < 0 {
+		t.Fatal("DHCP interface setup boundary is missing")
+	}
+	dhcpBlock := body[dhcpStart : dhcpStart+dhcpEnd]
+	if !strings.Contains(dhcpBlock, "return p.failPodCreateWithCleanup(") ||
+		!strings.Contains(dhcpBlock, `"add DHCP interface"`) {
+		t.Fatal("DHCP interface failure is still swallowed")
+	}
+}
+
 func TestClassifyCloneOperationFailurePreservesPriority(t *testing.T) {
 	t.Parallel()
 
