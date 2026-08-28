@@ -1057,6 +1057,66 @@ func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 	}
 }
 
+// TestDeployScriptResumesProvisioningClaimsAfterSuccessfulDeploy pins the
+// symmetry of pause_live_provisioning_claims / resume_live_provisioning_claims.
+//
+// pause_live_provisioning_claims runs unconditionally before every guarded
+// apply. Before the resume existed, nothing ever set the flag back, so a live
+// worker that had been serving traffic stayed at
+// WORKER_PROVISIONING_CLAIMS_ENABLED=false indefinitely after a completely
+// successful deploy: it claimed no pod_create/pod_destroy jobs, and because
+// cloneSchedulerEnabled() gates the L1 trust-validation reconciler on claims,
+// no template_revalidate ran either, so templates.guest_credentials_verified_at
+// went stale and every new clone_with_customize pod was rejected as "not
+// credential-ready". This silently halted all provisioning for three days while
+// every workload reported healthy, which is exactly why a green deploy is not
+// sufficient evidence on its own.
+//
+// The restored value must come from the observed pre-deploy LIVE state, not the
+// rendered chart: validate_foundation_intent and the rollback-containment gates
+// all require the candidate to render claims=false, so claims are only ever
+// enabled operationally on the live Deployment.
+//
+// The assertion is behavioral, not textual: it runs the real deploy.sh against
+// the fake kubectl and inspects the resulting live claims state.
+func TestDeployScriptResumesProvisioningClaimsAfterSuccessfulDeploy(t *testing.T) {
+	requirePOSIXShell(t)
+	candidate := baselineManifest(true, "*", "false")
+
+	t.Run("restores claims that were live before the deploy", func(t *testing.T) {
+		env := newDeployScriptEnvironment(t, baselineManifest(true, "", "false"), candidate)
+		// Claims are enabled operationally on the live Deployment only; the
+		// rendered/rollback manifests must stay claims=false, which is exactly
+		// why the resume cannot read its intent from the chart.
+		writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
+
+		output, err := env.run("--no-pull")
+		if err != nil {
+			t.Fatalf("successful deploy failed: %v\n%s", err, output)
+		}
+		if _, statErr := os.Stat(env.claimsResumedMark); statErr != nil {
+			t.Fatalf("successful deploy never restored provisioning claims; the worker would claim no jobs: %v\n%s", statErr, output)
+		}
+		if !strings.Contains(string(output), "restoring live worker provisioning claims") {
+			t.Fatalf("output %q does not report the claims restore", output)
+		}
+	})
+
+	t.Run("leaves claims paused when they were already paused", func(t *testing.T) {
+		// A deploy must not turn provisioning on for a cluster that was
+		// deliberately quiesced before the deploy started.
+		env := newDeployScriptEnvironment(t, baselineManifest(true, "", "false"), candidate)
+
+		output, err := env.run("--no-pull")
+		if err != nil {
+			t.Fatalf("successful deploy failed: %v\n%s", err, output)
+		}
+		if _, statErr := os.Stat(env.claimsResumedMark); !os.IsNotExist(statErr) {
+			t.Fatalf("deploy enabled claims that were paused before it started (stat: %v)\n%s", statErr, output)
+		}
+	})
+}
+
 func TestDeployScriptDeployedCandidateWaitsForWarmerRolloutBeforeImageVerification(t *testing.T) {
 	requirePOSIXShell(t)
 	live := baselineManifest(true, "", "false")
@@ -4450,6 +4510,7 @@ type deployScriptEnvironment struct {
 	currentRollbackValues     string
 	cronjobVerifyMark         string
 	claimsPausedMark          string
+	claimsResumedMark         string
 	warmerRolloutMark         string
 	warmerImageProbeLog       string
 	helmStatus                string
@@ -4554,6 +4615,7 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 		currentRollbackValues:     filepath.Join(root, "current-rollback-values.json"),
 		cronjobVerifyMark:         filepath.Join(root, "cronjob-verified"),
 		claimsPausedMark:          filepath.Join(root, "claims-paused.marker"),
+		claimsResumedMark:         filepath.Join(root, "claims-resumed.marker"),
 		warmerRolloutMark:         filepath.Join(root, "warmer-rollout.marker"),
 		warmerImageProbeLog:       filepath.Join(root, "warmer-image-probe.log"),
 		helmStatus:                "deployed",
@@ -4765,7 +4827,9 @@ esac
 set -euo pipefail
 
 current_manifest() {
-  if [ -f "$FAKE_UPGRADED_MARKER" ]; then
+  if [ -f "$FAKE_CLAIMS_RESUMED_MARKER" ]; then
+    printf '%s' "$FAKE_LIVE_RESOURCE_MANIFEST"
+  elif [ -f "$FAKE_UPGRADED_MARKER" ]; then
     printf '%s' "$FAKE_BASELINE_MANIFEST"
   elif [ -f "$FAKE_ATOMIC_FAILED_MARKER" ]; then
     if [ -f "$FAKE_SYNTHETIC_CONTAINED_MARKER" ]; then
@@ -5452,9 +5516,35 @@ case "$1" in
       echo "claims pause attempted without the release lock" >&2
       exit 97
     }
-    sed '/- name: WORKER_PROVISIONING_CLAIMS_ENABLED/{n;s/value: "true"/value: "false"/;}' \
-      "$FAKE_LIVE_RESOURCE_MANIFEST" > "$FAKE_LIVE_RESOURCE_MANIFEST.paused"
-    : > "$FAKE_CLAIMS_PAUSED_MARKER"
+    # Honor the requested value rather than assuming a pause: deploy.sh both
+    # pauses (=false) before the guarded apply and resumes (=true) after the
+    # candidate verifies, and a fake that always pauses would make a broken
+    # resume look successful.
+    claims_value=
+    for arg in "$@"; do
+      case "$arg" in
+        WORKER_PROVISIONING_CLAIMS_ENABLED=*)
+          claims_value="${arg#WORKER_PROVISIONING_CLAIMS_ENABLED=}"
+          ;;
+      esac
+    done
+    case "$claims_value" in
+      false)
+        sed '/- name: WORKER_PROVISIONING_CLAIMS_ENABLED/{n;s/value: "true"/value: "false"/;}' \
+          "$FAKE_LIVE_RESOURCE_MANIFEST" > "$FAKE_LIVE_RESOURCE_MANIFEST.paused"
+        : > "$FAKE_CLAIMS_PAUSED_MARKER"
+        ;;
+      true)
+        sed '/- name: WORKER_PROVISIONING_CLAIMS_ENABLED/{n;s/value: "false"/value: "true"/;}' \
+          "$FAKE_LIVE_RESOURCE_MANIFEST" > "$FAKE_LIVE_RESOURCE_MANIFEST.resumed"
+        mv "$FAKE_LIVE_RESOURCE_MANIFEST.resumed" "$FAKE_LIVE_RESOURCE_MANIFEST"
+        : > "$FAKE_CLAIMS_RESUMED_MARKER"
+        ;;
+      *)
+        echo "unexpected claims value: $*" >&2
+        exit 96
+        ;;
+    esac
     ;;
   *)
     echo "unexpected kubectl invocation: $*" >&2
@@ -5736,6 +5826,7 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_CURRENT_ROLLBACK_VALUES="+e.currentRollbackValues,
 		"FAKE_CRONJOB_VERIFY_MARKER="+e.cronjobVerifyMark,
 		"FAKE_CLAIMS_PAUSED_MARKER="+e.claimsPausedMark,
+		"FAKE_CLAIMS_RESUMED_MARKER="+e.claimsResumedMark,
 		"FAKE_WARMER_ROLLOUT_MARKER="+e.warmerRolloutMark,
 		"FAKE_WARMER_IMAGE_PROBE_LOG="+e.warmerImageProbeLog,
 		"FAKE_WARMER_ROLLOUT_FAILURE="+strconv.FormatBool(e.warmerRolloutFailure),
