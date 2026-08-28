@@ -5702,7 +5702,11 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"KUBECONFIG=/dev/null",
 		"FAKE_LIVE_MANIFEST="+e.liveManifest,
 		"FAKE_LIVE_RESOURCE_MANIFEST="+e.liveResource,
-		"FAKE_LIVE_DEPLOYMENT_REVISION=163",
+		// Keep the fake live Deployment revision in sync with the active test fixture,
+		// not the stale historical 163 baseline. Otherwise unrelated tests trip the
+		// immutable rollback-equivalence gate simply because the synthetic live state
+		// is still pegged to the old baseline number.
+		"FAKE_LIVE_DEPLOYMENT_REVISION="+strconv.Itoa(e.helmRevision),
 		"FAKE_LIVE_DAEMONSET_GENERATION=7",
 		"FAKE_LIVE_HELM_RELEASE="+e.liveHelmRelease,
 		"FAKE_LIVE_HELM_NAMESPACE="+e.liveHelmNamespace,
