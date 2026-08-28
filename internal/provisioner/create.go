@@ -1443,7 +1443,14 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr er
 	// ReconfigureDHCP regenerates config and restarts Kea, so the interface must
 	// be in the config before that happens.
 	if err := p.opn.AddDHCPInterface(ctx, ifName); err != nil {
-		p.logger.Warn("failed to add DHCP interface", "interface", ifName, "error", err)
+		return p.failPodCreateWithCleanup(
+			ctx,
+			job,
+			payload,
+			rb,
+			"add DHCP interface",
+			fmt.Errorf("add DHCP interface %s: %w", ifName, err),
+		)
 	}
 
 	// Wait for interface to fully stabilize before restarting Kea.
@@ -1916,18 +1923,24 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr er
 			vmSpec := payload.VMs[i]
 			podVM, err := p.db.GetPodVM(ctx, vmSpec.PodVMID)
 			if err != nil {
-				p.logger.Error("failed to get pod VM for power-on", "vm", vmSpec.VMName, "error", err)
-				continue
+				return p.failPodCreateWithCleanup(
+					ctx,
+					job,
+					payload,
+					rb,
+					"load pod VM for power-on",
+					fmt.Errorf("get pod VM %s for power-on: %w", vmSpec.PodVMID, err),
+				)
 			}
 			if podVM.VCenterVMID == nil || *podVM.VCenterVMID == "" {
-				p.logger.Error("pod VM has no moref", "vm", vmSpec.VMName)
-				_, _ = p.db.UpdatePodVMStatusFrom(
+				return p.failPodCreateWithCleanup(
 					ctx,
-					vmSpec.PodVMID,
-					[]string{"cloned", models.VMStatusCloning, models.VMStatusConfiguring},
-					models.VMStatusError,
+					job,
+					payload,
+					rb,
+					"power-on identity preflight",
+					fmt.Errorf("pod VM %s has no vCenter identity", vmSpec.PodVMID),
 				)
-				continue
 			}
 			placement, ok := placementsByVM[vmSpec.PodVMID]
 			if !ok {
