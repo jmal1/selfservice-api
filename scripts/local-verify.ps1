@@ -34,7 +34,8 @@ function Quote-BashSingleQuoted {
     }
 
     $text = [string]$Value
-    return '"' + $text.Replace('`', '``').Replace('"', '`"').Replace('$', '`$') + '"'
+    $replacement = [string]::Concat("'", '"', "'", '"', "'")
+    return "'" + $text.Replace("'", $replacement) + "'"
 }
 
 function Normalize-WslPath {
@@ -92,12 +93,12 @@ function Convert-WindowsPathToWsl {
         [string]$WindowsPath
     )
 
-    $result = & wsl.exe @('-e', 'wslpath', '-u', '--', $WindowsPath) 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "wsl.exe could not translate the Windows repo path '$WindowsPath': $(Format-TrimmedOutput ($result | Out-String))"
+    $result = & wsl.exe @('-e', 'wslpath', '-u', '--', $WindowsPath) 2>&1 | Out-String
+    if ((Get-LastExitCodeValue) -ne 0) {
+        throw "wsl.exe could not translate the Windows repo path '$WindowsPath'."
     }
 
-    return Normalize-WslPath -Value (Format-TrimmedOutput ($result | Out-String))
+    return Normalize-WslPath -Value (Format-TrimmedOutput $result)
 }
 
 function Get-GoFormattingTargets {
@@ -120,7 +121,7 @@ function Get-GoFormattingTargets {
             @('ls-files', '--others', '--exclude-standard', '--', '*.go')
         )) {
             $output = & git @args 2>$null
-            if ($LASTEXITCODE -ne 0) {
+            if ((Get-LastExitCodeValue) -ne 0) {
                 continue
             }
 
@@ -292,6 +293,14 @@ function Get-ToolCommand {
     return Get-Command -Name $ToolName -ErrorAction SilentlyContinue
 }
 
+function Get-LastExitCodeValue {
+    $value = Get-Variable -Name LASTEXITCODE -ValueOnly -ErrorAction SilentlyContinue
+    if ($null -eq $value) {
+        return 0
+    }
+    return [int]$value
+}
+
 function Format-TrimmedOutput {
     param(
         [Parameter(ValueFromPipeline = $true)]
@@ -339,8 +348,8 @@ function Test-GoFormattedText {
         [System.IO.File]::WriteAllText($tempPath, $normalized, [System.Text.UTF8Encoding]::new($false))
         $beforeBytes = [System.IO.File]::ReadAllBytes($tempPath)
         $gofmtOutput = & gofmt -w $tempPath 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            return "gofmt exited ${LASTEXITCODE} for ${Label}: $(Format-TrimmedOutput ($gofmtOutput | Out-String))"
+        if ((Get-LastExitCodeValue) -ne 0) {
+            return "gofmt exited $(Get-LastExitCodeValue) for ${Label}: $(Format-TrimmedOutput ($gofmtOutput | Out-String))"
         }
 
         $afterBytes = [System.IO.File]::ReadAllBytes($tempPath)
@@ -355,6 +364,37 @@ function Test-GoFormattedText {
         }
 
         return $null
+    }
+    finally {
+        Remove-Item -Path $tempPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-GitIndexBlobText {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Root,
+        [Parameter(Mandatory = $true)]
+        [string]$GitPath
+    )
+
+    $tempPath = Join-Path ([System.IO.Path]::GetTempPath()) ("git-index-" + [System.Guid]::NewGuid().ToString("N") + ".blob")
+    try {
+        & git -C $Root show (":" + $GitPath) 2>$null > $tempPath
+        if ((Get-LastExitCodeValue) -ne 0) {
+            return $null
+        }
+
+        if (-not (Test-Path -Path $tempPath -PathType Leaf)) {
+            return $null
+        }
+
+        $bytes = [System.IO.File]::ReadAllBytes($tempPath)
+        if ($bytes.Length -eq 0) {
+            return ""
+        }
+
+        return [System.Text.Encoding]::UTF8.GetString($bytes)
     }
     finally {
         Remove-Item -Path $tempPath -Force -ErrorAction SilentlyContinue
@@ -384,9 +424,8 @@ function Get-GoFormattingProblems {
             }
         }
 
-        $gitShowOutput = @(& git -C $Root show (":" + $gitPath) 2>$null)
-        if ($LASTEXITCODE -eq 0) {
-            $stagedContent = ($gitShowOutput | Out-String)
+        $stagedContent = Get-GitIndexBlobText -Root $Root -GitPath $gitPath
+        if ($null -ne $stagedContent) {
             $issue = Test-GoFormattedText -Content $stagedContent -Label "$gitPath (staged/index)"
             if ($null -ne $issue) {
                 $problems.Add($issue)
@@ -490,13 +529,19 @@ if ($Tier -eq "4") {
 
 if ($selectedTiers -contains 0) {
     $explicit = ($Tier -ne "all")
-    if (-not (Get-ToolCommand -ToolName "go")) {
+    $goCmd = Get-ToolCommand -ToolName "go"
+    $gofmtCmd = Get-ToolCommand -ToolName "gofmt"
+    if (-not $goCmd -or -not $gofmtCmd) {
+        $missing = @()
+        if (-not $goCmd) { $missing += "Go toolchain" }
+        if (-not $gofmtCmd) { $missing += "gofmt" }
+        $detail = ($missing -join " and ") + " is required for the explicit tier 0 check but is not installed on PATH."
         if ($explicit) {
-            Write-TierResult -Index 0 -Name "gofmt + go vet + short Go tests" -State "FAIL" -Details "Go toolchain is required for the explicit tier 0 check but is not installed on PATH."
+            Write-TierResult -Index 0 -Name "gofmt + go vet + short Go tests" -State "FAIL" -Details $detail
             $script:AnyFail = $true
         }
         else {
-            Write-TierResult -Index 0 -Name "gofmt + go vet + short Go tests" -State "SKIP" -Details "Go toolchain not installed; auto-detected tier 0 is skipped."
+            Write-TierResult -Index 0 -Name "gofmt + go vet + short Go tests" -State "SKIP" -Details ($missing -join ", ") + " not detected; auto-detected tier 0 is skipped."
         }
     }
     else {
@@ -518,19 +563,19 @@ if ($selectedTiers -contains 0) {
                 }
                 else {
                     $buildOutput = & go build ./... 2>&1
-                    if ($LASTEXITCODE -ne 0) {
+                    if ((Get-LastExitCodeValue) -ne 0) {
                         Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details (Format-TrimmedOutput ($buildOutput | Out-String))
                         $script:AnyFail = $true
                     }
                     else {
                         $vetOutput = & go vet ./... 2>&1
-                        if ($LASTEXITCODE -ne 0) {
+                        if ((Get-LastExitCodeValue) -ne 0) {
                             Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details (Format-TrimmedOutput ($vetOutput | Out-String))
                             $script:AnyFail = $true
                         }
                         else {
                             $testOutput = & go test ./... -short -count=1 2>&1
-                            if ($LASTEXITCODE -ne 0) {
+                            if ((Get-LastExitCodeValue) -ne 0) {
                                 Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details (Format-TrimmedOutput ($testOutput | Out-String))
                                 $script:AnyFail = $true
                             }
@@ -543,19 +588,19 @@ if ($selectedTiers -contains 0) {
             }
             else {
                 $buildOutput = & go build ./... 2>&1
-                if ($LASTEXITCODE -ne 0) {
+                if ((Get-LastExitCodeValue) -ne 0) {
                     Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details (Format-TrimmedOutput ($buildOutput | Out-String))
                     $script:AnyFail = $true
                 }
                 else {
                     $vetOutput = & go vet ./... 2>&1
-                    if ($LASTEXITCODE -ne 0) {
+                    if ((Get-LastExitCodeValue) -ne 0) {
                         Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details (Format-TrimmedOutput ($vetOutput | Out-String))
                         $script:AnyFail = $true
                     }
                     else {
                         $testOutput = & go test ./... -short -count=1 2>&1
-                        if ($LASTEXITCODE -ne 0) {
+                        if ((Get-LastExitCodeValue) -ne 0) {
                             Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details (Format-TrimmedOutput ($testOutput | Out-String))
                             $script:AnyFail = $true
                         }
@@ -611,7 +656,7 @@ if ($selectedTiers -contains 1) {
             $env:CGO_ENABLED = "0"
 
             $compileOutput = & go test -c -o $binaryPath ./internal/provisioning 2>&1
-            if ($LASTEXITCODE -ne 0) {
+            if ((Get-LastExitCodeValue) -ne 0) {
                 Write-TierResult -Index 1 -Name "internal/provisioning Linux deploy-script tests" -State "FAIL" -Details (Format-TrimmedOutput ($compileOutput | Out-String))
                 $script:AnyFail = $true
             }
@@ -619,11 +664,10 @@ if ($selectedTiers -contains 1) {
                 $wslRepo = Convert-WindowsPathToWsl -WindowsPath $repoRoot
                 $wslPkgDir = Join-WslPath -Segments @($wslRepo, 'internal', 'provisioning')
                 $wslBinary = Join-WslPath -Segments @($wslRepo, '.tmp', 'provisioning-linux.test')
-                $quotedPkgDir = Quote-BashSingleQuoted -Value $wslPkgDir
-                $quotedBinary = Quote-BashSingleQuoted -Value $wslBinary
-                $runOutput = & wsl.exe @('bash', '-lc', "cd $quotedPkgDir && chmod +x $quotedBinary && $quotedBinary -test.v") 2>&1
-                if ($LASTEXITCODE -ne 0) {
-                    Write-TierResult -Index 1 -Name "internal/provisioning Linux deploy-script tests" -State "FAIL" -Details (Format-TrimmedOutput ($runOutput | Out-String))
+                $bashScript = 'cd "$1" && chmod +x "$2" && "$2" -test.v'
+                $runOutput = & wsl.exe @('-e', 'bash', '-lc', $bashScript, '_', $wslPkgDir, $wslBinary) 2>&1 | Out-String
+                if ((Get-LastExitCodeValue) -ne 0) {
+                    Write-TierResult -Index 1 -Name "internal/provisioning Linux deploy-script tests" -State "FAIL" -Details (Format-TrimmedOutput $runOutput)
                     $script:AnyFail = $true
                 }
                 else {
@@ -673,7 +717,7 @@ if ($selectedTiers -contains 2) {
         Push-Location $repoRoot
         try {
             $bundleOutput = & go @bundleArgs 2>&1
-            if ($LASTEXITCODE -ne 0) {
+            if ((Get-LastExitCodeValue) -ne 0) {
                 Write-TierResult -Index 2 -Name "wiki bundle + byte-verify" -State "FAIL" -Details (Format-TrimmedOutput ($bundleOutput | Out-String))
                 $script:AnyFail = $true
             }
@@ -716,7 +760,7 @@ if ($selectedTiers -contains 3) {
         Push-Location $repoRoot
         try {
             $composeOutput = & docker compose -f docker-compose.dev.yaml up -d --wait 2>&1
-            if ($LASTEXITCODE -ne 0) {
+            if ((Get-LastExitCodeValue) -ne 0) {
                 Write-TierResult -Index 3 -Name "docker-compose.dev plus integration tests" -State "FAIL" -Details (Format-TrimmedOutput ($composeOutput | Out-String))
                 $script:AnyFail = $true
             }
@@ -735,7 +779,7 @@ if ($selectedTiers -contains 3) {
                 }
                 else {
                     $testOutput = & go test -tags=integration ./... 2>&1
-                    if ($LASTEXITCODE -ne 0) {
+                    if ((Get-LastExitCodeValue) -ne 0) {
                         Write-TierResult -Index 3 -Name "docker-compose.dev plus integration tests" -State "FAIL" -Details (Format-TrimmedOutput ($testOutput | Out-String))
                         $script:AnyFail = $true
                     }
@@ -751,7 +795,7 @@ if ($selectedTiers -contains 3) {
         }
         finally {
             $downOutput = & docker compose -f docker-compose.dev.yaml down -v 2>&1
-            if ($LASTEXITCODE -ne 0) {
+            if ((Get-LastExitCodeValue) -ne 0) {
                 Write-TierResult -Index 3 -Name "docker-compose.dev plus integration tests" -State "FAIL" -Details ("Docker cleanup failed: " + (Format-TrimmedOutput ($downOutput | Out-String)))
                 $script:AnyFail = $true
             }
@@ -798,7 +842,7 @@ if ! printf '%s\n' "$value" | grep -Eq '^[[:space:]]*value: "true"$'; then
 fi
 "@
                 $remoteOutput = & ssh $remoteTarget $remoteScript 2>&1
-                if ($LASTEXITCODE -ne 0) {
+                if ((Get-LastExitCodeValue) -ne 0) {
                     Write-TierResult -Index 4 -Name "production Helm render + lint via Vault SSH" -State "FAIL" -Details (Format-TrimmedOutput ($remoteOutput | Out-String))
                     $script:AnyFail = $true
                 }

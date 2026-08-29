@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -221,22 +222,7 @@ func TestLocalVerifyConvertWindowsPathToWslPreservesLiteralArgv(t *testing.T) {
 	}
 	capturePath := filepath.Join(binDir, "fake-wsl.capture")
 	wslPath := filepath.Join(binDir, "wsl.exe")
-	program := `package main
-
-import (
-    "fmt"
-    "os"
-    "strings"
-)
-
-func main() {
-    capture := os.Getenv("FAKE_WSL_CAPTURE")
-    if capture != "" {
-        _ = os.WriteFile(capture, []byte(strings.Join(os.Args[1:], "\n")), 0o600)
-    }
-    fmt.Println("/mnt/c/Users/jmal1/Repo With Spaces/demo")
-}
-`
+	program := "package main\n\nimport (\n    \"fmt\"\n    \"os\"\n    \"strings\"\n)\n\nfunc main() {\n    capture := os.Getenv(\"FAKE_WSL_CAPTURE\")\n    if capture != \"\" {\n        _ = os.WriteFile(capture, []byte(strings.Join(os.Args[1:], \"\\n\")), 0o600)\n    }\n    fmt.Println(\"/mnt/c/Users/jmal1/Repo $with 'quotes' and `backtick`/demo\")\n}\n"
 	if err := os.WriteFile(filepath.Join(binDir, "main.go"), []byte(program), 0o600); err != nil {
 		t.Fatalf("write fake wsl source: %v", err)
 	}
@@ -246,10 +232,12 @@ func main() {
 		t.Fatalf("build fake wsl.exe: %v (%s)", err, out)
 	}
 
-	wantWindowsPath := `C:\Users\jmal1\Repo With Spaces\demo`
-	wantLinuxPath := "/mnt/c/Users/jmal1/Repo With Spaces/demo"
+	wantWindowsPath := "C:\\Users\\jmal1\\Repo $with 'quotes' and `backtick`\\demo"
+	wantLinuxPath := "/mnt/c/Users/jmal1/Repo $with 'quotes' and `backtick`/demo"
 	pathSep := string(os.PathListSeparator)
-	command := fmt.Sprintf("$ErrorActionPreference='Stop'; $env:PATH='%s%s' + $env:PATH; . '%s'; $actual = Convert-WindowsPathToWsl -WindowsPath '%s'; if ($actual -ne '%s') { throw \"unexpected WSL path: $actual\" }; 'OK'", binDir, pathSep, scriptPath, wantWindowsPath, wantLinuxPath)
+	escapedWindowsPath := strings.ReplaceAll(wantWindowsPath, "'", "''")
+	escapedLinuxPath := strings.ReplaceAll(wantLinuxPath, "'", "''")
+	command := fmt.Sprintf("$ErrorActionPreference='Stop'; $env:PATH='%s%s' + $env:PATH; . '%s'; $actual = Convert-WindowsPathToWsl -WindowsPath '%s'; if ($actual -ne '%s') { throw \"unexpected WSL path: $actual\" }; 'OK'", binDir, pathSep, scriptPath, escapedWindowsPath, escapedLinuxPath)
 	output, err := runPwshCommand(t, command, "FAKE_WSL_CAPTURE="+capturePath)
 	if err != nil {
 		t.Fatalf("Convert-WindowsPathToWsl failed: %v\n%s", err, output)
@@ -265,6 +253,183 @@ func main() {
 	}
 	if !strings.Contains(output, "OK") {
 		t.Fatalf("Convert-WindowsPathToWsl did not return the converted WSL path; output: %s", output)
+	}
+}
+
+func TestLocalVerifyTier1UsesPositionalBashArgsForSpecialCharacters(t *testing.T) {
+	if _, err := exec.LookPath("pwsh"); err != nil {
+		t.Skip("pwsh not installed")
+	}
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not installed")
+	}
+
+	baseDir := filepath.Join(t.TempDir(), "repo $with 'quotes' and `backtick`")
+	repoRoot := filepath.Join(baseDir, "project")
+	if err := os.MkdirAll(filepath.Join(repoRoot, "internal", "provisioning"), 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "go.mod"), []byte("module example.com/localverify\n\ngo 1.22\n"), 0o600); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "internal", "provisioning", "provisioning_test.go"), []byte("package provisioning\n\nfunc TestNoop(t *testing.T) {}\n"), 0o600); err != nil {
+		t.Fatalf("write provisioning test: %v", err)
+	}
+	scriptPath := filepath.Join(repoRoot, "scripts", "local-verify.ps1")
+	if err := os.MkdirAll(filepath.Dir(scriptPath), 0o755); err != nil {
+		t.Fatalf("mkdir scripts dir: %v", err)
+	}
+	originalScript, err := os.ReadFile(filepath.Join(findRepoRoot(t), "scripts", "local-verify.ps1"))
+	if err != nil {
+		t.Fatalf("read verifier script: %v", err)
+	}
+	if err := os.WriteFile(scriptPath, originalScript, 0o600); err != nil {
+		t.Fatalf("copy verifier script: %v", err)
+	}
+
+	binDir := filepath.Join(t.TempDir(), "fake-bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir fake bin: %v", err)
+	}
+	capturePath := filepath.Join(binDir, "fake-wsl.capture")
+	buildFakeTool := func(name, source string) {
+		t.Helper()
+		srcPath := filepath.Join(binDir, name+"-stub.go")
+		if err := os.WriteFile(srcPath, []byte(source), 0o600); err != nil {
+			t.Fatalf("write %s stub: %v", name, err)
+		}
+		outPath := filepath.Join(binDir, name)
+		if runtime.GOOS == "windows" {
+			outPath += ".exe"
+		}
+		cmd := exec.Command("go", "build", "-o", outPath, srcPath)
+		cmd.Dir = binDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("build fake %s: %v\n%s", name, err, out)
+		}
+	}
+	fakeGoSource := `package main
+import (
+    "fmt"
+    "os"
+)
+func main() {
+    if len(os.Args) > 2 && os.Args[1] == "test" && os.Args[2] == "-c" {
+        for i := 1; i+1 < len(os.Args); i++ {
+            if os.Args[i] == "-o" {
+                _ = os.WriteFile(os.Args[i+1], []byte("stub"), 0o755)
+                return
+            }
+        }
+        return
+    }
+    if len(os.Args) > 1 && os.Args[1] == "version" {
+        fmt.Fprintln(os.Stdout, "go version devel fake")
+        return
+    }
+}
+`
+	// Avoid relying on shell scripts or platform-specific file extensions; build native stubs instead.
+	buildFakeTool("go", fakeGoSource)
+	fakeWslSource := `package main
+import (
+    "fmt"
+    "os"
+    "strings"
+)
+func windowsPathToWsl(value string) string {
+    value = strings.ReplaceAll(value, "\\", "/")
+    value = strings.TrimSpace(value)
+    if len(value) >= 2 && value[1] == ':' {
+        drive := strings.ToLower(value[:1])
+        remainder := strings.TrimPrefix(value[2:], "/")
+        if remainder == "" {
+            return "/mnt/" + drive
+        }
+        return "/mnt/" + drive + "/" + remainder
+    }
+    if strings.HasPrefix(value, "/") {
+        return value
+    }
+    return "/" + value
+}
+func appendCapture(value string) {
+    capture := os.Getenv("FAKE_WSL_CAPTURE")
+    if capture == "" {
+        return
+    }
+    f, err := os.OpenFile(capture, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+    if err != nil {
+        return
+    }
+    defer f.Close()
+    _, _ = f.WriteString(value)
+    _, _ = f.WriteString("\n---\n")
+}
+func main() {
+    if len(os.Args) >= 4 && os.Args[1] == "-e" && os.Args[2] == "bash" {
+        appendCapture(strings.Join(os.Args[1:], "\n"))
+        return
+    }
+    if len(os.Args) >= 6 && os.Args[1] == "-e" && os.Args[2] == "wslpath" && os.Args[3] == "-u" && os.Args[4] == "--" {
+        appendCapture(strings.Join(os.Args[1:], "\n"))
+        fmt.Print(windowsPathToWsl(os.Args[5]))
+        return
+    }
+}
+`
+	buildFakeTool("wsl", fakeWslSource)
+
+	windowsPathToWsl := func(value string) string {
+		value = strings.ReplaceAll(value, "\\", "/")
+		value = strings.TrimSpace(value)
+		if len(value) >= 2 && value[1] == ':' {
+			drive := strings.ToLower(value[:1])
+			remainder := strings.TrimPrefix(value[2:], "/")
+			if remainder == "" {
+				return "/mnt/" + drive
+			}
+			return "/mnt/" + drive + "/" + remainder
+		}
+		if strings.HasPrefix(value, "/") {
+			return value
+		}
+		return "/" + value
+	}
+	linuxRepo := windowsPathToWsl(repoRoot)
+	linuxPkgDir := windowsPathToWsl(filepath.Join(repoRoot, "internal", "provisioning"))
+	linuxBinary := windowsPathToWsl(filepath.Join(repoRoot, ".tmp", "provisioning-linux.test"))
+	cmd := exec.Command("pwsh", "-NoProfile", "-File", scriptPath, "-Tier", "1")
+	cmd.Env = append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"), "FAKE_WSL_CAPTURE="+capturePath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Tier 1 verifier failed with special-character path: %v\n%s", err, out)
+	}
+	capture, err := os.ReadFile(capturePath)
+	if err != nil {
+		t.Fatalf("read captured Tier 1 argv: %v", err)
+	}
+	blocks := strings.Split(strings.TrimSpace(string(capture)), "\n---\n")
+	var bashBlock string
+	for _, block := range blocks {
+		trimmed := strings.TrimSpace(block)
+		trimmed = strings.TrimSuffix(trimmed, "---")
+		trimmed = strings.TrimSpace(trimmed)
+		if strings.Contains(trimmed, "bash\n-lc") || strings.Contains(trimmed, "bash\r\n-lc") {
+			bashBlock = trimmed
+			break
+		}
+	}
+	if bashBlock == "" {
+		t.Fatalf("Tier 1 bash invocation was not recorded; capture was %q", string(capture))
+	}
+	gotArgs := strings.Split(bashBlock, "\n")
+	wantArgs := []string{"-e", "bash", "-lc", "cd \"$1\" && chmod +x \"$2\" && \"$2\" -test.v", "_", linuxPkgDir, linuxBinary}
+	if strings.Join(gotArgs, "\n") != strings.Join(wantArgs, "\n") {
+		t.Fatalf("Tier 1 bash argv mismatch: got %q want %q (repo=%q)", strings.Join(gotArgs, "\n"), strings.Join(wantArgs, "\n"), linuxRepo)
+	}
+	if !strings.Contains(string(out), "[PASS] TIER 1") && !strings.Contains(string(out), "OVERALL: PASS") {
+		t.Fatalf("Tier 1 verifier did not pass using special-character path: %s", out)
 	}
 }
 
@@ -459,7 +624,7 @@ func TestLocalVerifyGoFormattingRejectsStagedSabotage(t *testing.T) {
 		}
 	}
 
-	malformed := "package main\n\nfunc main(){println(\"staged bad\")}\n"
+	malformed := "package main\n\nfunc main(){println(\"staged bad\")}"
 	blobCmd := exec.Command("git", "hash-object", "-w", "--stdin")
 	blobCmd.Dir = repoRoot
 	blobCmd.Stdin = strings.NewReader(malformed)
@@ -507,6 +672,7 @@ func TestLocalVerifyExplicitMissingToolFails(t *testing.T) {
 		env  []string
 	}{
 		{name: "tier0-missing-go", args: []string{"-Tier", "0"}, env: []string{"LOCAL_VERIFY_FORCE_MISSING_TOOLS=go"}},
+		{name: "tier0-missing-gofmt", args: []string{"-Tier", "0"}, env: []string{"LOCAL_VERIFY_FORCE_MISSING_TOOLS=gofmt"}},
 		{name: "tier1-missing-go-and-wsl", args: []string{"-Tier", "1"}, env: []string{"LOCAL_VERIFY_FORCE_MISSING_TOOLS=go,wsl"}},
 		{name: "tier3-missing-docker", args: []string{"-Tier", "3"}, env: []string{"LOCAL_VERIFY_FORCE_MISSING_TOOLS=docker"}},
 		{name: "tier4-missing-ssh", args: []string{"-Tier", "4", "-RemoteHelm", "-RemoteHost", "k3sv01.lab.jmal.io"}, env: []string{"LOCAL_VERIFY_FORCE_MISSING_TOOLS=ssh"}},
@@ -534,7 +700,7 @@ func mustPwshPath(t *testing.T) string {
 }
 
 func TestLocalVerifyAutoDetectMissingToolSkips(t *testing.T) {
-	code, output := runLocalVerifyWithEnvironment(t, []string{"LOCAL_VERIFY_FORCE_MISSING_TOOLS=go,wsl,docker,ssh"}, "-Tier", "all")
+	code, output := runLocalVerifyWithEnvironment(t, []string{"LOCAL_VERIFY_FORCE_MISSING_TOOLS=go,gofmt,wsl,docker,ssh"}, "-Tier", "all")
 	if code != 0 {
 		t.Fatalf("auto-detected all tiers should be non-fatal when tools are missing: %s", output)
 	}
