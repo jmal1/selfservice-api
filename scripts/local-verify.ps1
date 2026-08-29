@@ -144,7 +144,7 @@ function Get-GoFormattingTargets {
     foreach ($path in ($candidates | Sort-Object)) {
         $result.Add($path)
     }
-    Write-Output -NoEnumerate $result
+    Write-Output -NoEnumerate @($result)
 }
 
 function Write-TierResult {
@@ -206,7 +206,7 @@ function Get-WikiSeedPaths {
         throw "Could not parse WIKI_SEEDS from $makefilePath"
     }
 
-    Write-Output -NoEnumerate $seedList
+    Write-Output -NoEnumerate @($seedList)
 }
 
 function Assert-WikiSeedSetMatchesMakefile {
@@ -311,6 +311,92 @@ function Format-TrimmedOutput {
     return $text.Trim()
 }
 
+function Normalize-LfText {
+    param(
+        [AllowEmptyString()]
+        [string]$Value
+    )
+
+    if ($null -eq $Value) {
+        return ""
+    }
+
+    $text = [string]$Value
+    return $text.Replace("`r`n", "`n").Replace("`r", "`n")
+}
+
+function Test-GoFormattedText {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Content,
+        [Parameter(Mandatory = $true)]
+        [string]$Label
+    )
+
+    $normalized = Normalize-LfText -Value $Content
+    $tempPath = Join-Path ([System.IO.Path]::GetTempPath()) ("gofmt-check-" + [System.Guid]::NewGuid().ToString("N") + ".go")
+    try {
+        [System.IO.File]::WriteAllText($tempPath, $normalized, [System.Text.UTF8Encoding]::new($false))
+        $beforeBytes = [System.IO.File]::ReadAllBytes($tempPath)
+        $gofmtOutput = & gofmt -w $tempPath 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            return "gofmt exited ${LASTEXITCODE} for ${Label}: $(Format-TrimmedOutput ($gofmtOutput | Out-String))"
+        }
+
+        $afterBytes = [System.IO.File]::ReadAllBytes($tempPath)
+        if ($beforeBytes.Length -ne $afterBytes.Length) {
+            return "gofmt would rewrite $Label"
+        }
+
+        for ($i = 0; $i -lt $beforeBytes.Length; $i++) {
+            if ($beforeBytes[$i] -ne $afterBytes[$i]) {
+                return "gofmt would rewrite $Label"
+            }
+        }
+
+        return $null
+    }
+    finally {
+        Remove-Item -Path $tempPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-GoFormattingProblems {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Root,
+        [string[]]$Targets = @()
+    )
+
+    $problems = [System.Collections.Generic.List[string]]::new()
+    foreach ($target in $Targets) {
+        $actualPath = if ([System.IO.Path]::IsPathRooted($target)) { [System.IO.Path]::GetFullPath($target) } else { Join-Path $Root $target }
+        $relativePath = if ([System.IO.Path]::IsPathRooted($target)) { [System.IO.Path]::GetRelativePath($Root, $actualPath) } else { $target }
+        $gitPath = $relativePath.Replace('\\', '/').Replace('\', '/')
+
+        if (Test-Path -Path $actualPath -PathType Leaf) {
+            $workingContent = Get-Content -Path $actualPath -Raw -ErrorAction SilentlyContinue
+            if ($null -ne $workingContent) {
+                $issue = Test-GoFormattedText -Content ([string]$workingContent) -Label "$gitPath (working tree)"
+                if ($null -ne $issue) {
+                    $problems.Add($issue)
+                }
+            }
+        }
+
+        $gitShowOutput = @(& git -C $Root show (":" + $gitPath) 2>$null)
+        if ($LASTEXITCODE -eq 0) {
+            $stagedContent = ($gitShowOutput | Out-String)
+            $issue = Test-GoFormattedText -Content $stagedContent -Label "$gitPath (staged/index)"
+            if ($null -ne $issue) {
+                $problems.Add($issue)
+            }
+        }
+    }
+
+    Write-Output -NoEnumerate @($problems)
+}
+
 function Resolve-RemoteTarget {
     param(
         [string]$HostValue,
@@ -369,7 +455,7 @@ function Compare-BundleDirectories {
         }
     }
 
-    Write-Output -NoEnumerate $mismatchList
+    Write-Output -NoEnumerate @($mismatchList)
 }
 
 function Get-SelectedTiers {
@@ -390,7 +476,7 @@ function Get-SelectedTiers {
         $wanted += 4
     }
 
-    return @($wanted | Sort-Object -Unique)
+    Write-Output -NoEnumerate @($wanted | Sort-Object -Unique)
 }
 
 if ($MyInvocation.InvocationName -eq ".") {
@@ -418,17 +504,15 @@ if ($selectedTiers -contains 0) {
         try {
             $gofmtTargets = [System.Collections.Generic.List[string]]::new()
             foreach ($candidate in (Get-GoFormattingTargets -Root $repoRoot)) {
-                $resolved = Join-Path $repoRoot $candidate
-                if ($resolved -and -not [string]::IsNullOrWhiteSpace([string]$resolved)) {
-                    $gofmtTargets.Add($resolved)
+                if ($candidate -and -not [string]::IsNullOrWhiteSpace([string]$candidate)) {
+                    $gofmtTargets.Add($candidate)
                 }
             }
 
             if ($gofmtTargets.Count -gt 0) {
-                $gofmtOutput = & gofmt -l @($gofmtTargets) 2>&1
-                $gofmtProblems = @($gofmtOutput | Where-Object { $_ -and -not [string]::IsNullOrWhiteSpace([string]$_) })
-                if ($LASTEXITCODE -ne 0 -or $gofmtProblems.Count -gt 0) {
-                    $detail = if ($gofmtProblems.Count -gt 0) { Format-TrimmedOutput ($gofmtProblems | Out-String) } else { "gofmt reported unformatted files." }
+                $gofmtProblems = Get-GoFormattingProblems -Root $repoRoot -Targets @($gofmtTargets)
+                if ($gofmtProblems.Count -gt 0) {
+                    $detail = Format-TrimmedOutput ($gofmtProblems | Out-String)
                     Write-TierResult -Index 0 -Name "gofmt + go vet + short Go tests" -State "FAIL" -Details "gofmt failed: $detail"
                     $script:AnyFail = $true
                 }

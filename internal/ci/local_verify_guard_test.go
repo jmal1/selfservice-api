@@ -248,7 +248,8 @@ func main() {
 
 	wantWindowsPath := `C:\Users\jmal1\Repo With Spaces\demo`
 	wantLinuxPath := "/mnt/c/Users/jmal1/Repo With Spaces/demo"
-	command := fmt.Sprintf("$ErrorActionPreference='Stop'; $env:PATH='%s;' + $env:PATH; . '%s'; $actual = Convert-WindowsPathToWsl -WindowsPath '%s'; if ($actual -ne '%s') { throw \"unexpected WSL path: $actual\" }; 'OK'", binDir, scriptPath, wantWindowsPath, wantLinuxPath)
+	pathSep := string(os.PathListSeparator)
+	command := fmt.Sprintf("$ErrorActionPreference='Stop'; $env:PATH='%s%s' + $env:PATH; . '%s'; $actual = Convert-WindowsPathToWsl -WindowsPath '%s'; if ($actual -ne '%s') { throw \"unexpected WSL path: $actual\" }; 'OK'", binDir, pathSep, scriptPath, wantWindowsPath, wantLinuxPath)
 	output, err := runPwshCommand(t, command, "FAKE_WSL_CAPTURE="+capturePath)
 	if err != nil {
 		t.Fatalf("Convert-WindowsPathToWsl failed: %v\n%s", err, output)
@@ -366,6 +367,136 @@ func TestLocalVerifyGetGoFormattingTargetsOnlyIncludesChangedFiles(t *testing.T)
 	}
 	if !strings.Contains(output, "OK") {
 		t.Fatalf("Get-GoFormattingTargets did not report the changed file as expected; output: %s", output)
+	}
+}
+
+func TestLocalVerifyGoFormattingNormalizesCRLFAndRejectsMalformedCRLF(t *testing.T) {
+	repoRoot := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(repoRoot, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	for _, cmd := range [][]string{
+		{"git", "init"},
+		{"git", "config", "user.name", "Local Verifier"},
+		{"git", "config", "user.email", "local-verifier@example.com"},
+	} {
+		performed := exec.Command(cmd[0], cmd[1:]...)
+		performed.Dir = repoRoot
+		if out, err := performed.CombinedOutput(); err != nil {
+			t.Fatalf("run %v: %v\n%s", cmd, err, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "go.mod"), []byte("module example.com/localverify\n\ngo 1.22\n"), 0o600); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	formatted := "package main\n\nfunc main() {\n\tprintln(\"ok\")\n}\n"
+	if err := os.WriteFile(filepath.Join(repoRoot, "main.go"), []byte(formatted), 0o600); err != nil {
+		t.Fatalf("write main.go before commit: %v", err)
+	}
+	for _, cmd := range [][]string{{"git", "add", "."}, {"git", "commit", "-m", "init"}} {
+		performed := exec.Command(cmd[0], cmd[1:]...)
+		performed.Dir = repoRoot
+		if out, err := performed.CombinedOutput(); err != nil {
+			t.Fatalf("run %v: %v\n%s", cmd, err, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "main.go"), []byte(strings.ReplaceAll(formatted, "\n", "\r\n")), 0o600); err != nil {
+		t.Fatalf("rewrite main.go with CRLF: %v", err)
+	}
+
+	scriptPath := filepath.Join(findRepoRoot(t), "scripts", "local-verify.ps1")
+	command := fmt.Sprintf("$ErrorActionPreference='Stop'; . '%s'; $targets = Get-GoFormattingTargets -Root '%s'; if ($targets.Count -ne 1) { throw ('expected one changed Go file, got: ' + ($targets -join ', ')) }; $problems = Get-GoFormattingProblems -Root '%s' -Targets $targets; if ($problems.Count -ne 0) { throw ('expected CRLF-formatted Go file to pass, got: ' + ($problems -join '; ')) }; 'OK'", scriptPath, repoRoot, repoRoot)
+	output, err := runPwshCommand(t, command)
+	if err != nil {
+		t.Fatalf("Get-GoFormattingProblems incorrectly rejected a correctly gofmt'd CRLF file: %v\n%s", err, output)
+	}
+	if !strings.Contains(output, "OK") {
+		t.Fatalf("CRLF-formatted Go file did not pass formatting check as expected; output: %s", output)
+	}
+
+	bad := "package main\n\nfunc main(){println(\"bad\")}\n"
+	if err := os.WriteFile(filepath.Join(repoRoot, "main.go"), []byte(strings.ReplaceAll(bad, "\n", "\r\n")), 0o600); err != nil {
+		t.Fatalf("rewrite main.go to intentionally malformed CRLF state: %v", err)
+	}
+	command = fmt.Sprintf("$ErrorActionPreference='Stop'; . '%s'; $targets = Get-GoFormattingTargets -Root '%s'; $problems = Get-GoFormattingProblems -Root '%s' -Targets $targets; if ($problems.Count -lt 1) { throw 'expected malformed CRLF Go file to fail formatting checks' }; 'OK'", scriptPath, repoRoot, repoRoot)
+	output, err = runPwshCommand(t, command)
+	if err != nil {
+		t.Fatalf("Get-GoFormattingProblems failed to reject an intentionally malformed CRLF file: %v\n%s", err, output)
+	}
+	if !strings.Contains(output, "OK") {
+		t.Fatalf("Malformed CRLF Go file did not fail formatting detection as expected; output: %s", output)
+	}
+}
+
+func TestLocalVerifyGoFormattingRejectsStagedSabotage(t *testing.T) {
+	repoRoot := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(repoRoot, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	for _, cmd := range [][]string{
+		{"git", "init"},
+		{"git", "config", "user.name", "Local Verifier"},
+		{"git", "config", "user.email", "local-verifier@example.com"},
+	} {
+		performed := exec.Command(cmd[0], cmd[1:]...)
+		performed.Dir = repoRoot
+		if out, err := performed.CombinedOutput(); err != nil {
+			t.Fatalf("run %v: %v\n%s", cmd, err, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "go.mod"), []byte("module example.com/localverify\n\ngo 1.22\n"), 0o600); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	formatted := "package main\n\nfunc main() {\n\tprintln(\"ok\")\n}\n"
+	if err := os.WriteFile(filepath.Join(repoRoot, "main.go"), []byte(formatted), 0o600); err != nil {
+		t.Fatalf("write main.go: %v", err)
+	}
+	for _, cmd := range [][]string{{"git", "add", "."}, {"git", "commit", "-m", "init"}} {
+		performed := exec.Command(cmd[0], cmd[1:]...)
+		performed.Dir = repoRoot
+		if out, err := performed.CombinedOutput(); err != nil {
+			t.Fatalf("run %v: %v\n%s", cmd, err, out)
+		}
+	}
+
+	malformed := "package main\n\nfunc main(){println(\"staged bad\")}\n"
+	blobCmd := exec.Command("git", "hash-object", "-w", "--stdin")
+	blobCmd.Dir = repoRoot
+	blobCmd.Stdin = strings.NewReader(malformed)
+	blobOut, err := blobCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("hash malformed staged blob: %v\n%s", err, blobOut)
+	}
+	blobHash := strings.TrimSpace(string(blobOut))
+	updateCmd := exec.Command("git", "update-index", "--add", "--cacheinfo", "100644,"+blobHash+",main.go")
+	updateCmd.Dir = repoRoot
+	if out, err := updateCmd.CombinedOutput(); err != nil {
+		t.Fatalf("stage malformed blob in index: %v\n%s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "main.go"), []byte(formatted), 0o600); err != nil {
+		t.Fatalf("restore formatted working tree while leaving malformed staged index content: %v", err)
+	}
+
+	scriptPath := filepath.Join(findRepoRoot(t), "scripts", "local-verify.ps1")
+	command := fmt.Sprintf("$ErrorActionPreference='Stop'; . '%s'; $targets = Get-GoFormattingTargets -Root '%s'; $problems = Get-GoFormattingProblems -Root '%s' -Targets $targets; if ($problems.Count -lt 1) { throw 'expected staged malformed content to fail formatting checks even when the working tree is clean' }; 'OK'", scriptPath, repoRoot, repoRoot)
+	output, err := runPwshCommand(t, command)
+	if err != nil {
+		t.Fatalf("Get-GoFormattingProblems did not reject staged malformed content when the worktree was formatted: %v\n%s", err, output)
+	}
+	if !strings.Contains(output, "OK") {
+		t.Fatalf("staged malformed Go file did not trigger formatting failure; output: %s", output)
+	}
+}
+
+func TestLocalVerifyOptionalDependencyNamesAreIgnored(t *testing.T) {
+	scriptPath := filepath.Join(findRepoRoot(t), "scripts", "local-verify.ps1")
+	command := fmt.Sprintf("$ErrorActionPreference='Stop'; $env:LOCAL_VERIFY_FORCE_MISSING_TOOLS='jq,kubectl'; . '%s'; $go = Get-ToolCommand -ToolName 'go'; if ($null -eq $go) { throw 'go should remain available to the verifier even when optional tooling is forced missing' }; $jq = Get-ToolCommand -ToolName 'jq'; if ($null -ne $jq) { throw 'jq was unexpectedly recognized as a required verifier dependency' }; $kubectl = Get-ToolCommand -ToolName 'kubectl'; if ($null -ne $kubectl) { throw 'kubectl was unexpectedly recognized as a required verifier dependency' }; 'OK'", scriptPath)
+	output, err := runPwshCommand(t, command)
+	if err != nil {
+		t.Fatalf("Get-ToolCommand should ignore optional dependency names like jq and kubectl: %v\n%s", err, output)
+	}
+	if !strings.Contains(output, "OK") {
+		t.Fatalf("optional dependency check did not pass; output: %s", output)
 	}
 }
 
