@@ -123,6 +123,11 @@ load_required_rollback_revision || exit 1
 HELM_RELEASE_LOCK_HELD=false
 HELM_RELEASE_LOCK_HOLDER=
 HELM_RELEASE_LOCK_PRESERVE=false
+HELM_RELEASE_LOCK_TTL_SECONDS="${HELM_RELEASE_LOCK_TTL_SECONDS:-900}"
+HELM_RELEASE_LOCK_BACKUP_DIR="${HELM_RELEASE_LOCK_BACKUP_DIR:-$SCRIPT_DIR/.lock-backups}"
+LIVE_PROVISIONING_CLAIMS_PAUSED=false
+LIVE_PROVISIONING_CLAIMS_RESTORE_INSTALLED=false
+LIVE_PROVISIONING_CLAIMS_RESTORE_DONE=false
 BASELINE_TMP_DIR=
 
 release_helm_release_lock() {
@@ -148,6 +153,17 @@ release_helm_release_lock() {
 
 cleanup_on_exit() {
   local exit_code=$?
+  local restore_failed=false
+  trap - EXIT INT TERM HUP
+
+  if [ "$LIVE_PROVISIONING_CLAIMS_RESTORE_INSTALLED" = true ] && [ "$LIVE_PROVISIONING_CLAIMS_RESTORE_DONE" != true ]; then
+    if ! restore_live_provisioning_claims_on_exit; then
+      restore_failed=true
+      echo "ERROR: live worker provisioning claims could not be restored on exit; preserving the Helm release lock." >&2
+      HELM_RELEASE_LOCK_PRESERVE=true
+    fi
+  fi
+
   if [ -n "$BASELINE_TMP_DIR" ]; then
     rm -rf "$BASELINE_TMP_DIR"
   fi
@@ -156,12 +172,110 @@ cleanup_on_exit() {
   else
     release_helm_release_lock
   fi
+  if [ "$restore_failed" = true ] && [ "$exit_code" -eq 0 ]; then
+    exit_code=1
+  fi
   exit "$exit_code"
+}
+
+restore_live_provisioning_claims_on_exit() {
+  if [ "$DO_DRY_RUN" = true ]; then
+    return 0
+  fi
+  if [ "$LIVE_PROVISIONING_CLAIMS_RESTORE_INSTALLED" != true ] || [ "$LIVE_PROVISIONING_CLAIMS_RESTORE_DONE" = true ]; then
+    return 0
+  fi
+  if [ "${PRE_DEPLOY_LIVE_CLAIMS:-false}" != "true" ]; then
+    LIVE_PROVISIONING_CLAIMS_RESTORE_DONE=true
+    return 0
+  fi
+  if ! resume_live_provisioning_claims; then
+    return 1
+  fi
+  LIVE_PROVISIONING_CLAIMS_RESTORE_DONE=true
+  return 0
+}
+
+install_live_provisioning_claims_exit_trap() {
+  if [ "$DO_DRY_RUN" = true ]; then
+    LIVE_PROVISIONING_CLAIMS_RESTORE_INSTALLED=false
+    return 0
+  fi
+  if [ "$LIVE_PROVISIONING_CLAIMS_PAUSED" != true ]; then
+    LIVE_PROVISIONING_CLAIMS_RESTORE_INSTALLED=false
+    return 0
+  fi
+  LIVE_PROVISIONING_CLAIMS_RESTORE_INSTALLED=true
+  trap cleanup_on_exit EXIT
+  trap 'cleanup_on_exit' INT TERM HUP
+}
+
+reclaim_stale_helm_release_lock() {
+  local lock_json holder created holder_pid now_epoch lock_age backup_path
+  local current_holder current_created
+
+  if ! lock_json="$(kubectl get "configmap/$HELM_RELEASE_LOCK" -n "$NAMESPACE" -o json 2>/dev/null)"; then
+    return 0
+  fi
+  if [ -z "$lock_json" ] || [ "$lock_json" = "null" ]; then
+    return 0
+  fi
+  holder="$(jq -er '.metadata.annotations["crucible.jmal.io/holder"] // empty' <<< "$lock_json" 2>/dev/null || true)"
+  created="$(jq -er '.metadata.creationTimestamp // empty' <<< "$lock_json" 2>/dev/null || true)"
+  if [ -z "$holder" ] || [ -z "$created" ]; then
+    echo "ERROR: Helm release lock configmap/$HELM_RELEASE_LOCK is malformed; missing holder or creationTimestamp. Refusing to steal it." >&2
+    return 1
+  fi
+  if [[ "$holder" =~ ^.*-([0-9]+)-[0-9]{8}T[0-9]{6}Z$ ]]; then
+    holder_pid="${BASH_REMATCH[1]}"
+  else
+    holder_pid=""
+  fi
+  if [ -z "$holder_pid" ]; then
+    echo "ERROR: Helm release lock holder identity $holder is not parseable. Refusing to reclaim the lock." >&2
+    return 1
+  fi
+  if command -v ps >/dev/null 2>&1 && ps -p "$holder_pid" -o pid= >/dev/null 2>&1; then
+    echo "ERROR: existing Helm release lock configmap/$HELM_RELEASE_LOCK is still held by live process $holder_pid ($holder); refusing to steal it." >&2
+    return 1
+  fi
+  if ! now_epoch="$(date -u +%s)"; then
+    echo "ERROR: could not read the current UTC epoch when evaluating the stale Helm release lock." >&2
+    return 1
+  fi
+  local created_epoch
+  if ! created_epoch="$(date -u -d "$created" +%s 2>/dev/null)"; then
+    echo "ERROR: Helm release lock configmap/$HELM_RELEASE_LOCK has an invalid creationTimestamp $created; refusing to reclaim it." >&2
+    return 1
+  fi
+  lock_age=$((now_epoch - created_epoch))
+  if [ "$lock_age" -le "$HELM_RELEASE_LOCK_TTL_SECONDS" ]; then
+    echo "WARNING: Helm release lock configmap/$HELM_RELEASE_LOCK holder process is absent but the lock is still within the TTL. Reclaiming the exact lock because the holder is no longer alive." >&2
+  else
+    echo "WARNING: Helm release lock configmap/$HELM_RELEASE_LOCK is older than $HELM_RELEASE_LOCK_TTL_SECONDS seconds and the holder process is absent. Backing up the lock and reclaiming it." >&2
+  fi
+  mkdir -p "$HELM_RELEASE_LOCK_BACKUP_DIR"
+  backup_path="$HELM_RELEASE_LOCK_BACKUP_DIR/${HELM_RELEASE_LOCK}-$(date -u +%Y%m%dT%H%M%SZ).yaml"
+  kubectl get "configmap/$HELM_RELEASE_LOCK" -n "$NAMESPACE" -o yaml > "$backup_path"
+  current_holder="$(kubectl get "configmap/$HELM_RELEASE_LOCK" -n "$NAMESPACE" -o go-template='{{index .metadata.annotations "crucible.jmal.io/holder"}}' 2>/dev/null || true)"
+  current_created="$(kubectl get "configmap/$HELM_RELEASE_LOCK" -n "$NAMESPACE" -o jsonpath='{.metadata.creationTimestamp}' 2>/dev/null || true)"
+  if [ "$current_holder" != "$holder" ] || [ "$current_created" != "$created" ]; then
+    echo "ERROR: Helm release lock changed between inspection and reclaim. Refusing to steal it." >&2
+    return 1
+  fi
+  if ! kubectl delete "configmap/$HELM_RELEASE_LOCK" -n "$NAMESPACE" --wait=true >/dev/null 2>&1; then
+    echo "ERROR: failed to delete stale Helm release lock configmap/$HELM_RELEASE_LOCK after backing it up." >&2
+    return 1
+  fi
+  echo "==> reclaimed stale Helm release lock $HELM_RELEASE_LOCK from dead holder $holder"
 }
 
 trap cleanup_on_exit EXIT
 
 acquire_helm_release_lock() {
+  if ! reclaim_stale_helm_release_lock; then
+    return 1
+  fi
   HELM_RELEASE_LOCK_HOLDER="$(hostname)-$$-$(date -u +%Y%m%dT%H%M%SZ)"
   if ! cat <<EOF | kubectl create -f - >/dev/null
 apiVersion: v1
@@ -1500,15 +1614,19 @@ pause_live_provisioning_claims() {
   case "$live_claims" in
     false)
       PRE_DEPLOY_LIVE_CLAIMS=false
+      LIVE_PROVISIONING_CLAIMS_PAUSED=false
+      LIVE_PROVISIONING_CLAIMS_RESTORE_INSTALLED=false
       echo "==> live worker provisioning claims are already paused"
       ;;
     true)
       PRE_DEPLOY_LIVE_CLAIMS=true
+      LIVE_PROVISIONING_CLAIMS_PAUSED=true
       echo "==> pausing live worker provisioning claims before the guarded apply"
       kubectl set env "deployment/$RELEASE-worker" \
         -n "$NAMESPACE" \
         WORKER_PROVISIONING_CLAIMS_ENABLED=false
       kubectl rollout status "deployment/$RELEASE-worker" -n "$NAMESPACE" --timeout=5m
+      install_live_provisioning_claims_exit_trap
       ;;
     *)
       echo "ERROR: live worker provisioning claims have invalid value $live_claims." >&2
@@ -1545,6 +1663,8 @@ pause_live_provisioning_claims() {
 resume_live_provisioning_claims() {
   local live_worker live_claims
   if [ "${PRE_DEPLOY_LIVE_CLAIMS:-false}" != "true" ]; then
+    LIVE_PROVISIONING_CLAIMS_PAUSED=false
+    LIVE_PROVISIONING_CLAIMS_RESTORE_DONE=true
     echo "==> live worker provisioning claims were already paused before this deploy; leaving them paused"
     return 0
   fi
@@ -1563,6 +1683,8 @@ resume_live_provisioning_claims() {
     echo "ERROR: live worker provisioning claims did not resume (observed: ${live_claims:-<empty>})." >&2
     return 1
   fi
+  LIVE_PROVISIONING_CLAIMS_PAUSED=false
+  LIVE_PROVISIONING_CLAIMS_RESTORE_DONE=true
 }
 
 verify_rollback_containment() {
@@ -3532,10 +3654,6 @@ if ! verify_deployed_candidate; then
   exit 1
 fi
 HELM_RELEASE_LOCK_PRESERVE=false
-if ! resume_live_provisioning_claims; then
-  HELM_RELEASE_LOCK_PRESERVE=true
-  echo "ERROR: deployed candidate verified but provisioning claims could not be resumed; the worker will claim no jobs until this is corrected. The release lock is intentionally retained; manual intervention is required." >&2
-  exit 1
-fi
-release_helm_release_lock
+# cleanup_on_exit resumes claims and releases the lock once the deploy exits,
+# while preserving the lock when a later verification or resume fails.
 echo "==> deployed exact source $CANDIDATE_SOURCE_SHA with immutable workload and RUNNER_IMAGE digests"
