@@ -48,6 +48,23 @@ remain available so existing environments can be made safe. The worker also
 continues compensation-only retries for cleanup that began before maintenance;
 those retries cannot resume pod or VM creation.
 
+## Local verification tiers
+
+Before opening a PR, run the Windows-first local mirror in the repo root:
+
+```powershell
+pwsh ./scripts/local-verify.ps1
+# or target a single tier explicitly
+pwsh ./scripts/local-verify.ps1 -Tier 2
+# remote Helm render is opt-in and never mutates production
+pwsh ./scripts/local-verify.ps1 -RemoteHelm -RemoteHost k3sv01.lab.jmal.io -RemoteUser deploy
+```
+
+The script runs the local CI checks in ordered tiers and prints a clear
+`PASS`/`FAIL`/`SKIP` result for each tier. Tier 4 is intentionally gated behind
+`-RemoteHelm` and only runs `helm lint` / `helm template` over SSH; it never
+runs `helm upgrade`, `helm install`, or any other mutating production action.
+
 ### Rollback-safe immutable baseline before a phase-1 upgrade
 
 A live Deployment override is not a rollback control. Helm rollback restores
