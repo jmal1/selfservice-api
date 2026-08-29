@@ -58,8 +58,8 @@ pwsh ./scripts/local-verify.ps1
 pwsh ./scripts/local-verify.ps1 -Tier 2
 # remote Helm render is opt-in and never mutates production
 pwsh ./scripts/local-verify.ps1 -RemoteHelm -RemoteHost k3sv01.lab.jmal.io
-# or provide user@host explicitly; the script normalizes it without double-prefixing
-pwsh ./scripts/local-verify.ps1 -RemoteHelm -RemoteHost deploy@k3sv01.lab.jmal.io
+# or provide the vault user explicitly; the script normalizes it without double-prefixing
+pwsh ./scripts/local-verify.ps1 -RemoteHelm -RemoteHost jmal@k3sv01.lab.jmal.io
 ```
 
 The script runs the local CI checks in ordered tiers and prints a clear

@@ -261,14 +261,24 @@ if ($selectedTiers -contains 0) {
 
 if ($selectedTiers -contains 1) {
     $explicit = ($Tier -ne "all")
-    $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
-    if (-not $wsl) {
+    $goCmd = Get-Command go -ErrorAction SilentlyContinue
+    $wslCmd = Get-Command wsl.exe -ErrorAction SilentlyContinue
+
+    if (-not $goCmd -or -not $wslCmd) {
         if ($explicit) {
-            Write-TierResult -Index 1 -Name "internal/provisioning Linux deploy-script tests" -State "FAIL" -Details "WSL is required for the explicit tier 1 check but is not installed on PATH."
+            $missing = @()
+            if (-not $goCmd) { $missing += "Go toolchain" }
+            if (-not $wslCmd) { $missing += "WSL" }
+            $detail = ($missing -join " and ") + " is required for the explicit tier 1 check but is not installed on PATH."
+            Write-TierResult -Index 1 -Name "internal/provisioning Linux deploy-script tests" -State "FAIL" -Details $detail
             $script:AnyFail = $true
         }
         else {
-            Write-TierResult -Index 1 -Name "internal/provisioning Linux deploy-script tests" -State "SKIP" -Details "WSL not detected; auto-detected tier 1 is skipped."
+            $missing = @()
+            if (-not $goCmd) { $missing += "Go toolchain" }
+            if (-not $wslCmd) { $missing += "WSL" }
+            $detail = ($missing -join " and ") + " not detected; auto-detected tier 1 is skipped."
+            Write-TierResult -Index 1 -Name "internal/provisioning Linux deploy-script tests" -State "SKIP" -Details $detail
         }
     }
     else {
@@ -444,7 +454,7 @@ if ($selectedTiers -contains 4) {
     else {
         $resolvedRemote = Resolve-RemoteTarget -HostValue $RemoteHost -UserValue $RemoteUser
         if ([string]::IsNullOrWhiteSpace($resolvedRemote.Host)) {
-            Write-TierResult -Index 4 -Name "production Helm render + lint via Vault SSH" -State "FAIL" -Details "-RemoteHelm requires -RemoteHost (for example, k3sv01.lab.jmal.io or deploy@k3sv01.lab.jmal.io)."
+            Write-TierResult -Index 4 -Name "production Helm render + lint via Vault SSH" -State "FAIL" -Details "-RemoteHelm requires -RemoteHost (for example, k3sv01.lab.jmal.io or jmal@k3sv01.lab.jmal.io)."
             $script:AnyFail = $true
         }
         else {

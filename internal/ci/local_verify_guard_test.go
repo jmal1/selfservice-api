@@ -200,15 +200,16 @@ func TestLocalVerifyExplicitMissingToolFails(t *testing.T) {
 	testCases := []struct {
 		name string
 		args []string
+		env  []string
 	}{
-		{name: "tier0-missing-go", args: []string{"-Tier", "0"}},
-		{name: "tier1-missing-wsl", args: []string{"-Tier", "1"}},
-		{name: "tier3-missing-docker", args: []string{"-Tier", "3"}},
-		{name: "tier4-missing-ssh", args: []string{"-RemoteHelm", "-RemoteHost", "k3sv01.lab.jmal.io"}},
+		{name: "tier0-missing-go", args: []string{"-Tier", "0"}, env: []string{"PATH=" + t.TempDir()}},
+		{name: "tier1-missing-go-and-wsl", args: []string{"-Tier", "1"}, env: []string{"PATH=" + filepath.Dir(mustPwshPath(t))}},
+		{name: "tier3-missing-docker", args: []string{"-Tier", "3"}, env: []string{"PATH=" + t.TempDir()}},
+		{name: "tier4-missing-ssh", args: []string{"-RemoteHelm", "-RemoteHost", "k3sv01.lab.jmal.io"}, env: []string{"PATH=" + t.TempDir()}},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			code, output := runLocalVerifyWithEnvironment(t, []string{"PATH=" + t.TempDir()}, tc.args...)
+			code, output := runLocalVerifyWithEnvironment(t, tc.env, tc.args...)
 			if code == 0 {
 				t.Fatalf("explicit missing-tool tier returned success unexpectedly: %s", output)
 			}
@@ -219,8 +220,17 @@ func TestLocalVerifyExplicitMissingToolFails(t *testing.T) {
 	}
 }
 
+func mustPwshPath(t *testing.T) string {
+	t.Helper()
+	pwshPath, err := exec.LookPath("pwsh")
+	if err != nil {
+		t.Skip("pwsh not installed")
+	}
+	return pwshPath
+}
+
 func TestLocalVerifyAutoDetectMissingToolSkips(t *testing.T) {
-	code, output := runLocalVerifyWithEnvironment(t, []string{"PATH=" + t.TempDir()}, "-Tier", "all")
+	code, output := runLocalVerifyWithEnvironment(t, []string{"PATH=" + filepath.Dir(mustPwshPath(t))}, "-Tier", "all")
 	if code != 0 {
 		t.Fatalf("auto-detected all tiers should be non-fatal when tools are missing: %s", output)
 	}
