@@ -10,7 +10,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $script:AnyFail = $false
 $script:ExpectedWikiSeeds = @(
     "docs/instructor/overview.md",
@@ -47,13 +47,13 @@ function Get-WikiSeedPaths {
     )
 
     $makefilePath = Join-Path $Root "Makefile"
-    if (-not (Test-Path $makefilePath)) {
+    if (-not (Test-Path -LiteralPath $makefilePath)) {
         throw "Makefile not found at $makefilePath"
     }
 
     $collect = $false
     $seeds = @()
-    foreach ($line in Get-Content -Path $makefilePath) {
+    foreach ($line in Get-Content -LiteralPath $makefilePath) {
         if (-not $collect) {
             if ($line -match '^\s*WIKI_SEEDS\s*:=\s*\\\s*$') {
                 $collect = $true
@@ -82,7 +82,7 @@ function Get-WikiSeedPaths {
         throw "Could not parse WIKI_SEEDS from $makefilePath"
     }
 
-    return $seeds
+    return ,$seeds
 }
 
 function Assert-WikiSeedSetMatchesMakefile {
@@ -162,6 +162,171 @@ function Format-TrimmedOutput {
     return $text.Trim()
 }
 
+function Invoke-GitBytes {
+    param(
+        [string]$Root,
+        [string[]]$Arguments
+    )
+
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = "git"
+    $startInfo.WorkingDirectory = $Root
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in $Arguments) {
+        $startInfo.ArgumentList.Add($argument)
+    }
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $buffer = [System.IO.MemoryStream]::new()
+    try {
+        if (-not $process.Start()) {
+            throw "Could not start git $($Arguments -join ' ')."
+        }
+        $errorTask = $process.StandardError.ReadToEndAsync()
+        $process.StandardOutput.BaseStream.CopyTo($buffer)
+        $process.WaitForExit()
+        $errorText = $errorTask.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0) {
+            throw "git $($Arguments -join ' ') failed: $(Format-TrimmedOutput $errorText)"
+        }
+        return ,$buffer.ToArray()
+    }
+    finally {
+        $buffer.Dispose()
+        $process.Dispose()
+    }
+}
+
+function Get-GitPathList {
+    param(
+        [string]$Root,
+        [string[]]$Arguments
+    )
+
+    $bytes = Invoke-GitBytes -Root $Root -Arguments $Arguments
+    $paths = [System.Collections.Generic.List[string]]::new()
+    $start = 0
+    for ($index = 0; $index -lt $bytes.Length; $index++) {
+        if ($bytes[$index] -ne 0) {
+            continue
+        }
+        if ($index -gt $start) {
+            $paths.Add([System.Text.Encoding]::UTF8.GetString($bytes, $start, $index - $start))
+        }
+        $start = $index + 1
+    }
+    if ($start -ne $bytes.Length) {
+        throw "git path output was not NUL-terminated."
+    }
+    return ,$paths.ToArray()
+}
+
+function Get-GitIndexBlobBytes {
+    param(
+        [string]$Root,
+        [string]$RepoPath
+    )
+
+    return ,(Invoke-GitBytes -Root $Root -Arguments @("show", "--no-textconv", ":$RepoPath"))
+}
+
+function Get-CRLFNormalizedBytes {
+    param(
+        [byte[]]$Bytes
+    )
+
+    $normalized = [System.IO.MemoryStream]::new()
+    try {
+        for ($index = 0; $index -lt $Bytes.Length; $index++) {
+            if ($Bytes[$index] -eq 13 -and ($index + 1) -lt $Bytes.Length -and $Bytes[$index + 1] -eq 10) {
+                continue
+            }
+            $normalized.WriteByte($Bytes[$index])
+        }
+        return ,$normalized.ToArray()
+    }
+    finally {
+        $normalized.Dispose()
+    }
+}
+
+function Test-ByteArraysEqual {
+    param(
+        [byte[]]$Left,
+        [byte[]]$Right
+    )
+
+    if ($Left.Length -ne $Right.Length) {
+        return $false
+    }
+    for ($index = 0; $index -lt $Left.Length; $index++) {
+        if ($Left[$index] -ne $Right[$index]) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Test-GoSourceIsFormatted {
+    param(
+        [byte[]]$Source,
+        [string]$DisplayPath
+    )
+
+    $tempPath = Join-Path ([System.IO.Path]::GetTempPath()) ("local-verify-gofmt-" + [System.Guid]::NewGuid().ToString() + ".go")
+    [System.IO.File]::WriteAllBytes($tempPath, $Source)
+    try {
+        $gofmtOutput = @(& gofmt -w $tempPath 2>&1)
+        if ($LASTEXITCODE -ne 0) {
+            throw "gofmt failed for $DisplayPath`: $(Format-TrimmedOutput ($gofmtOutput | Out-String))"
+        }
+        $formatted = [System.IO.File]::ReadAllBytes($tempPath)
+        $normalizedSource = Get-CRLFNormalizedBytes -Bytes $Source
+        $normalizedFormatted = Get-CRLFNormalizedBytes -Bytes $formatted
+        return Test-ByteArraysEqual -Left $normalizedSource -Right $normalizedFormatted
+    }
+    finally {
+        Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-GoFormattingProblems {
+    param(
+        [string]$Root
+    )
+
+    $stagedPaths = Get-GitPathList -Root $Root -Arguments @("diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR", "--", "*.go")
+    $worktreePaths = @(
+        (Get-GitPathList -Root $Root -Arguments @("diff", "--name-only", "-z", "--diff-filter=ACMR", "--", "*.go")) +
+        (Get-GitPathList -Root $Root -Arguments @("ls-files", "--others", "--exclude-standard", "-z", "--", "*.go")) |
+            Sort-Object -Unique
+    )
+    $problems = @()
+
+    foreach ($path in $stagedPaths) {
+        $source = Get-GitIndexBlobBytes -Root $Root -RepoPath $path
+        if (-not (Test-GoSourceIsFormatted -Source $source -DisplayPath "$path (staged)")) {
+            $problems += "$path (staged)"
+        }
+    }
+
+    foreach ($path in $worktreePaths) {
+        $fullPath = [System.IO.Path]::GetFullPath((Join-Path $Root $path))
+        if (-not [System.IO.File]::Exists($fullPath)) {
+            continue
+        }
+        $source = [System.IO.File]::ReadAllBytes($fullPath)
+        if (-not (Test-GoSourceIsFormatted -Source $source -DisplayPath $path)) {
+            $problems += $path
+        }
+    }
+
+    return ,$problems
+}
+
 function Resolve-RemoteTarget {
     param(
         [string]$HostValue,
@@ -187,9 +352,9 @@ function Get-FileHashes {
     )
 
     $map = @{}
-    foreach ($file in Get-ChildItem -Path $Root -Recurse -File) {
+    foreach ($file in Get-ChildItem -LiteralPath $Root -Recurse -File) {
         $rel = [System.IO.Path]::GetRelativePath($Root, $file.FullName)
-        $hash = (Get-FileHash -Path $file.FullName -Algorithm SHA256).Hash
+        $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
         $map[$rel] = $hash
     }
     return $map
@@ -220,7 +385,7 @@ function Compare-BundleDirectories {
         }
     }
 
-    return $mismatches
+    return ,$mismatches
 }
 
 function Get-SelectedTiers {
@@ -251,52 +416,49 @@ if ($Tier -eq "4") {
 
 if ($selectedTiers -contains 0) {
     $explicit = ($Tier -ne "all")
-    if (-not (Get-ToolCommand -ToolName "go")) {
+    # Tier 0 uses Git from the current checkout and requires only Go plus gofmt as additional tools.
+    $goCmd = Get-ToolCommand -ToolName "go"
+    $gofmtCmd = Get-ToolCommand -ToolName "gofmt"
+    if (-not $goCmd -or -not $gofmtCmd) {
+        $missing = @()
+        if (-not $goCmd) { $missing += "Go toolchain" }
+        if (-not $gofmtCmd) { $missing += "gofmt" }
         if ($explicit) {
-            Write-TierResult -Index 0 -Name "gofmt + go vet + short Go tests" -State "FAIL" -Details "Go toolchain is required for the explicit tier 0 check but is not installed on PATH."
+            Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details (($missing -join " and ") + " is required for the explicit tier 0 check but is not installed on PATH.")
             $script:AnyFail = $true
         }
         else {
-            Write-TierResult -Index 0 -Name "gofmt + go vet + short Go tests" -State "SKIP" -Details "Go toolchain not installed; auto-detected tier 0 is skipped."
+            Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "SKIP" -Details (($missing -join " and ") + " not installed; auto-detected tier 0 is skipped.")
         }
     }
     else {
-        Push-Location $repoRoot
+        Push-Location -LiteralPath $repoRoot
         try {
-            $gofmtDirs = & go list -f "{{.Dir}}" ./internal/... 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                Write-TierResult -Index 0 -Name "gofmt + go vet + short Go tests" -State "FAIL" -Details (Format-TrimmedOutput ($gofmtDirs | Out-String))
+            $gofmtProblems = Get-GoFormattingProblems -Root $repoRoot
+            if ($gofmtProblems.Count -gt 0) {
+                Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details ("gofmt failed: " + (Format-TrimmedOutput ($gofmtProblems | Out-String)))
                 $script:AnyFail = $true
             }
             else {
-                $gofmtOutput = & gofmt -l @($gofmtDirs | Where-Object { $_ -and -not [string]::IsNullOrWhiteSpace([string]$_) }) 2>&1
-                $gofmtProblems = @($gofmtOutput | Where-Object { $_ -and -not [string]::IsNullOrWhiteSpace([string]$_) })
-                if ($LASTEXITCODE -ne 0 -or $gofmtProblems.Count -gt 0) {
-                    $detail = if ($gofmtProblems.Count -gt 0) { Format-TrimmedOutput ($gofmtProblems | Out-String) } else { "gofmt reported unformatted files." }
-                    Write-TierResult -Index 0 -Name "gofmt + go vet + short Go tests" -State "FAIL" -Details "gofmt failed: $detail"
+                $buildOutput = & go build ./... 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details (Format-TrimmedOutput ($buildOutput | Out-String))
                     $script:AnyFail = $true
                 }
                 else {
-                    $buildOutput = & go build ./... 2>&1
+                    $vetOutput = & go vet ./... 2>&1
                     if ($LASTEXITCODE -ne 0) {
-                        Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details (Format-TrimmedOutput ($buildOutput | Out-String))
+                        Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details (Format-TrimmedOutput ($vetOutput | Out-String))
                         $script:AnyFail = $true
                     }
                     else {
-                        $vetOutput = & go vet ./... 2>&1
+                        $testOutput = & go test ./... -short -count=1 2>&1
                         if ($LASTEXITCODE -ne 0) {
-                            Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details (Format-TrimmedOutput ($vetOutput | Out-String))
+                            Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details (Format-TrimmedOutput ($testOutput | Out-String))
                             $script:AnyFail = $true
                         }
                         else {
-                            $testOutput = & go test ./... -short -count=1 2>&1
-                            if ($LASTEXITCODE -ne 0) {
-                                Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details (Format-TrimmedOutput ($testOutput | Out-String))
-                                $script:AnyFail = $true
-                            }
-                            else {
-                                Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "PASS" -Details "gofmt, build, vet, and short Go tests succeeded."
-                            }
+                            Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "PASS" -Details "gofmt, build, vet, and short Go tests succeeded."
                         }
                     }
                 }
@@ -336,8 +498,9 @@ if ($selectedTiers -contains 1) {
     }
     else {
         $tmpDir = Join-Path $repoRoot ".tmp"
-        New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
+        [System.IO.Directory]::CreateDirectory($tmpDir) | Out-Null
         $binaryPath = Join-Path $tmpDir "provisioning-linux.test"
+        $pkgPath = Join-Path $repoRoot "internal/provisioning"
         $savedGOOS = $env:GOOS
         $savedGOARCH = $env:GOARCH
         $savedCGO = $env:CGO_ENABLED
@@ -352,20 +515,28 @@ if ($selectedTiers -contains 1) {
                 $script:AnyFail = $true
             }
             else {
-                $wslRepo = & wsl.exe wslpath -u $repoRoot 2>&1
+                $wslPkgPath = & wsl.exe -e wslpath -u -- $pkgPath 2>&1
                 if ($LASTEXITCODE -ne 0) {
-                    Write-TierResult -Index 1 -Name "internal/provisioning Linux deploy-script tests" -State "FAIL" -Details (Format-TrimmedOutput ($wslRepo | Out-String))
+                    Write-TierResult -Index 1 -Name "internal/provisioning Linux deploy-script tests" -State "FAIL" -Details (Format-TrimmedOutput ($wslPkgPath | Out-String))
                     $script:AnyFail = $true
                 }
                 else {
-                    $wslRepo = Format-TrimmedOutput ($wslRepo | Out-String)
-                    $runOutput = & wsl.exe bash -lc "cd '$wslRepo' && chmod +x .tmp/provisioning-linux.test && ./.tmp/provisioning-linux.test -test.v" 2>&1
+                    $wslBinaryPath = & wsl.exe -e wslpath -u -- $binaryPath 2>&1
                     if ($LASTEXITCODE -ne 0) {
-                        Write-TierResult -Index 1 -Name "internal/provisioning Linux deploy-script tests" -State "FAIL" -Details (Format-TrimmedOutput ($runOutput | Out-String))
+                        Write-TierResult -Index 1 -Name "internal/provisioning Linux deploy-script tests" -State "FAIL" -Details (Format-TrimmedOutput ($wslBinaryPath | Out-String))
                         $script:AnyFail = $true
                     }
                     else {
-                        Write-TierResult -Index 1 -Name "internal/provisioning Linux deploy-script tests" -State "PASS" -Details "Linux cross-compile and POSIX deploy-script tests passed under WSL."
+                        $wslPkgPath = Format-TrimmedOutput ($wslPkgPath | Out-String)
+                        $wslBinaryPath = Format-TrimmedOutput ($wslBinaryPath | Out-String)
+                        $runOutput = & wsl.exe -e bash -lc 'cd "$1" && chmod +x "$2" && "$2" -test.v' _ $wslPkgPath $wslBinaryPath 2>&1
+                        if ($LASTEXITCODE -ne 0) {
+                            Write-TierResult -Index 1 -Name "internal/provisioning Linux deploy-script tests" -State "FAIL" -Details (Format-TrimmedOutput ($runOutput | Out-String))
+                            $script:AnyFail = $true
+                        }
+                        else {
+                            Write-TierResult -Index 1 -Name "internal/provisioning Linux deploy-script tests" -State "PASS" -Details "Linux cross-compile and POSIX deploy-script tests passed under WSL."
+                        }
                     }
                 }
             }
@@ -375,8 +546,8 @@ if ($selectedTiers -contains 1) {
             $script:AnyFail = $true
         }
         finally {
-            if (Test-Path $binaryPath) {
-                Remove-Item -Path $binaryPath -Force
+            if (Test-Path -LiteralPath $binaryPath) {
+                Remove-Item -LiteralPath $binaryPath -Force
             }
             if ($null -ne $savedGOOS) { $env:GOOS = $savedGOOS } else { Remove-Item Env:GOOS -ErrorAction SilentlyContinue }
             if ($null -ne $savedGOARCH) { $env:GOARCH = $savedGOARCH } else { Remove-Item Env:GOARCH -ErrorAction SilentlyContinue }
@@ -402,14 +573,14 @@ if ($selectedTiers -contains 2) {
         Assert-WikiSeedSetMatchesMakefile -SeedPaths $seedPaths -ExpectedSeeds $script:ExpectedWikiSeeds
 
         $tempBundleDir = Join-Path ([System.IO.Path]::GetTempPath()) ("wiki-bundle-" + [System.Guid]::NewGuid().ToString())
-        New-Item -ItemType Directory -Path $tempBundleDir -Force | Out-Null
+        [System.IO.Directory]::CreateDirectory($tempBundleDir) | Out-Null
 
         $bundleArgs = @("run","./cmd/wiki-bundler","-repo-root",".","-out",$tempBundleDir)
         foreach ($seed in $seedPaths) {
             $bundleArgs += @("-seed", $seed)
         }
 
-        Push-Location $repoRoot
+        Push-Location -LiteralPath $repoRoot
         try {
             $bundleOutput = & go @bundleArgs 2>&1
             if ($LASTEXITCODE -ne 0) {
@@ -433,7 +604,7 @@ if ($selectedTiers -contains 2) {
             $script:AnyFail = $true
         }
         finally {
-            Remove-Item -Path $tempBundleDir -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $tempBundleDir -Recurse -Force -ErrorAction SilentlyContinue
             Pop-Location
         }
     }
@@ -452,7 +623,7 @@ if ($selectedTiers -contains 3) {
         }
     }
     else {
-        Push-Location $repoRoot
+        Push-Location -LiteralPath $repoRoot
         try {
             $composeOutput = & docker compose -f docker-compose.dev.yaml up -d --wait 2>&1
             if ($LASTEXITCODE -ne 0) {
@@ -461,8 +632,8 @@ if ($selectedTiers -contains 3) {
             }
             else {
                 $hasIntegrationBuild = $false
-                foreach ($file in Get-ChildItem -Path $repoRoot -Recurse -Filter *.go) {
-                    $content = Get-Content -Path $file.FullName -Raw -ErrorAction SilentlyContinue
+                foreach ($file in Get-ChildItem -LiteralPath $repoRoot -Recurse -Filter *.go) {
+                    $content = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction SilentlyContinue
                     if ($content -match '(?m)//go:build integration|// \+build integration') {
                         $hasIntegrationBuild = $true
                         break
