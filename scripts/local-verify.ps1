@@ -4,7 +4,7 @@ param(
     [string]$Tier = "all",
     [switch]$RemoteHelm,
     [string]$RemoteHost = "",
-    [string]$RemoteUser = "deploy"
+    [string]$RemoteUser = "jmal"
 )
 
 Set-StrictMode -Version Latest
@@ -12,6 +12,16 @@ $ErrorActionPreference = "Stop"
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $script:AnyFail = $false
+$script:ExpectedWikiSeeds = @(
+    "docs/instructor/overview.md",
+    "docs/instructor/templates.md",
+    "docs/instructor/os-recipes.md",
+    "docs/instructor/playlists.md",
+    "AGENTS.md",
+    "docs/ai-prompts/build-workflow.md",
+    "docs/ai-prompts/create-a-template.md",
+    "docs/ai/build-workflow-prompt.md"
+)
 
 function Write-TierResult {
     param(
@@ -29,6 +39,93 @@ function Write-TierResult {
     }
 
     Write-Host "$prefix TIER $Index - $Name - $Details"
+}
+
+function Get-WikiSeedPaths {
+    param(
+        [string]$Root
+    )
+
+    $makefilePath = Join-Path $Root "Makefile"
+    if (-not (Test-Path $makefilePath)) {
+        throw "Makefile not found at $makefilePath"
+    }
+
+    $collect = $false
+    $seeds = @()
+    foreach ($line in Get-Content -Path $makefilePath) {
+        if (-not $collect) {
+            if ($line -match '^\s*WIKI_SEEDS\s*:=\s*\\\s*$') {
+                $collect = $true
+            }
+            continue
+        }
+
+        if ($line -match '^\s*WIKI_OUT\s*:=' ) {
+            break
+        }
+
+        $trimmed = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmed)) {
+            continue
+        }
+
+        foreach ($chunk in ($trimmed -split '\\')) {
+            $seed = $chunk.Trim()
+            if (-not [string]::IsNullOrWhiteSpace($seed)) {
+                $seeds += $seed
+            }
+        }
+    }
+
+    if ($seeds.Count -eq 0) {
+        throw "Could not parse WIKI_SEEDS from $makefilePath"
+    }
+
+    return $seeds
+}
+
+function Assert-WikiSeedSetMatchesMakefile {
+    param(
+        [string[]]$SeedPaths,
+        [string[]]$ExpectedSeeds
+    )
+
+    if ($SeedPaths.Count -ne $ExpectedSeeds.Count) {
+        throw "WIKI_SEEDS drifted: Makefile defines $($SeedPaths.Count) seeds but the local verifier expects $($ExpectedSeeds.Count)."
+    }
+
+    $normalizedActual = @($SeedPaths | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+    $normalizedExpected = @($ExpectedSeeds | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+
+    $missing = @($normalizedExpected | Where-Object { $normalizedActual -notcontains $_ })
+    if ($missing.Count -gt 0) {
+        throw "WIKI_SEEDS drifted: missing expected seed(s): $($missing -join ', ')"
+    }
+
+    $extra = @($normalizedActual | Where-Object { $normalizedExpected -notcontains $_ })
+    if ($extra.Count -gt 0) {
+        throw "WIKI_SEEDS drifted: unexpected seed(s): $($extra -join ', ')"
+    }
+}
+
+function Resolve-RemoteTarget {
+    param(
+        [string]$HostValue,
+        [string]$UserValue
+    )
+
+    $hostText = ($HostValue ?? "").Trim()
+    if ([string]::IsNullOrWhiteSpace($hostText)) {
+        return @{ User = $UserValue; Host = ""; Target = "" }
+    }
+
+    $parts = $hostText -split '@', 2
+    if ($parts.Count -gt 1 -and -not [string]::IsNullOrWhiteSpace($parts[0]) -and -not [string]::IsNullOrWhiteSpace($parts[1])) {
+        return @{ User = $parts[0].Trim(); Host = $parts[1].Trim(); Target = ($parts[0].Trim() + "@" + $parts[1].Trim()) }
+    }
+
+    return @{ User = $UserValue; Host = $hostText; Target = ($UserValue + "@" + $hostText) }
 }
 
 function Get-FileHashes {
@@ -87,7 +184,7 @@ function Get-SelectedTiers {
         $wanted = @([int]$SelectedTier)
     }
 
-    if ($RemoteCheckRequested) {
+    if ($RemoteCheckRequested -or $SelectedTier -eq "4") {
         $wanted += 4
     }
 
@@ -95,14 +192,20 @@ function Get-SelectedTiers {
 }
 
 $selectedTiers = Get-SelectedTiers -SelectedTier $Tier -RemoteCheckRequested ([bool]$RemoteHelm)
-
 if ($Tier -eq "4") {
     $selectedTiers = @(4)
 }
 
 if ($selectedTiers -contains 0) {
+    $explicit = ($Tier -ne "all")
     if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
-        Write-TierResult -Index 0 -Name "gofmt + go vet + short Go tests" -State "SKIP" -Details "Go toolchain not installed; tier 0 cannot run."
+        if ($explicit) {
+            Write-TierResult -Index 0 -Name "gofmt + go vet + short Go tests" -State "FAIL" -Details "Go toolchain is required for the explicit tier 0 check but is not installed on PATH."
+            $script:AnyFail = $true
+        }
+        else {
+            Write-TierResult -Index 0 -Name "gofmt + go vet + short Go tests" -State "SKIP" -Details "Go toolchain not installed; auto-detected tier 0 is skipped."
+        }
     }
     else {
         Push-Location $repoRoot
@@ -157,9 +260,16 @@ if ($selectedTiers -contains 0) {
 }
 
 if ($selectedTiers -contains 1) {
+    $explicit = ($Tier -ne "all")
     $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
     if (-not $wsl) {
-        Write-TierResult -Index 1 -Name "internal/provisioning Linux deploy-script tests" -State "SKIP" -Details "WSL not detected; POSIX deploy-script tests are not runnable on this host."
+        if ($explicit) {
+            Write-TierResult -Index 1 -Name "internal/provisioning Linux deploy-script tests" -State "FAIL" -Details "WSL is required for the explicit tier 1 check but is not installed on PATH."
+            $script:AnyFail = $true
+        }
+        else {
+            Write-TierResult -Index 1 -Name "internal/provisioning Linux deploy-script tests" -State "SKIP" -Details "WSL not detected; auto-detected tier 1 is skipped."
+        }
     }
     else {
         $tmpDir = Join-Path $repoRoot ".tmp"
@@ -213,58 +323,70 @@ if ($selectedTiers -contains 1) {
 }
 
 if ($selectedTiers -contains 2) {
-    $seedPaths = @(
-        "docs/instructor/overview.md",
-        "docs/instructor/templates.md",
-        "docs/instructor/os-recipes.md",
-        "docs/instructor/playlists.md",
-        "AGENTS.md",
-        "docs/ai-prompts/build-workflow.md",
-        "docs/ai-prompts/create-a-template.md",
-        "docs/ai/build-workflow-prompt.md"
-    )
-
-    $tempBundleDir = Join-Path ([System.IO.Path]::GetTempPath()) ("wiki-bundle-" + [System.Guid]::NewGuid().ToString())
-    New-Item -ItemType Directory -Path $tempBundleDir -Force | Out-Null
-
-    $bundleArgs = @("run","./cmd/wiki-bundler","-repo-root",".","-out",$tempBundleDir)
-    foreach ($seed in $seedPaths) {
-        $bundleArgs += @("-seed", $seed)
-    }
-
-    Push-Location $repoRoot
-    try {
-        $bundleOutput = & go @bundleArgs 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            Write-TierResult -Index 2 -Name "wiki bundle + byte-verify" -State "FAIL" -Details (($bundleOutput | Out-String).Trim())
+    $explicit = ($Tier -ne "all")
+    $goCmd = Get-Command go -ErrorAction SilentlyContinue
+    if (-not $goCmd) {
+        if ($explicit) {
+            Write-TierResult -Index 2 -Name "wiki bundle + byte-verify" -State "FAIL" -Details "Go toolchain is required for the explicit tier 2 check but is not installed on PATH."
             $script:AnyFail = $true
         }
         else {
-            $expectedBundle = Join-Path $repoRoot "internal/docs/_bundle"
-            $diffs = Compare-BundleDirectories -Actual $tempBundleDir -Expected $expectedBundle
-            if ($diffs.Count -gt 0) {
-                Write-TierResult -Index 2 -Name "wiki bundle + byte-verify" -State "FAIL" -Details (("Bundle mismatch: " + ($diffs | Select-Object -First 10) -join "; "))
+            Write-TierResult -Index 2 -Name "wiki bundle + byte-verify" -State "SKIP" -Details "Go toolchain not installed; auto-detected tier 2 is skipped."
+        }
+    }
+    else {
+        $seedPaths = Get-WikiSeedPaths -Root $repoRoot
+        Assert-WikiSeedSetMatchesMakefile -SeedPaths $seedPaths -ExpectedSeeds $script:ExpectedWikiSeeds
+
+        $tempBundleDir = Join-Path ([System.IO.Path]::GetTempPath()) ("wiki-bundle-" + [System.Guid]::NewGuid().ToString())
+        New-Item -ItemType Directory -Path $tempBundleDir -Force | Out-Null
+
+        $bundleArgs = @("run","./cmd/wiki-bundler","-repo-root",".","-out",$tempBundleDir)
+        foreach ($seed in $seedPaths) {
+            $bundleArgs += @("-seed", $seed)
+        }
+
+        Push-Location $repoRoot
+        try {
+            $bundleOutput = & go @bundleArgs 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                Write-TierResult -Index 2 -Name "wiki bundle + byte-verify" -State "FAIL" -Details (($bundleOutput | Out-String).Trim())
                 $script:AnyFail = $true
             }
             else {
-                Write-TierResult -Index 2 -Name "wiki bundle + byte-verify" -State "PASS" -Details "Wiki bundle rebuilt and byte-verified against the checked-in bundle."
+                $expectedBundle = Join-Path $repoRoot "internal/docs/_bundle"
+                $diffs = Compare-BundleDirectories -Actual $tempBundleDir -Expected $expectedBundle
+                if ($diffs.Count -gt 0) {
+                    Write-TierResult -Index 2 -Name "wiki bundle + byte-verify" -State "FAIL" -Details (("Bundle mismatch: " + ($diffs | Select-Object -First 10) -join "; "))
+                    $script:AnyFail = $true
+                }
+                else {
+                    Write-TierResult -Index 2 -Name "wiki bundle + byte-verify" -State "PASS" -Details "Wiki bundle rebuilt and byte-verified against the checked-in bundle."
+                }
             }
         }
-    }
-    catch {
-        Write-TierResult -Index 2 -Name "wiki bundle + byte-verify" -State "FAIL" -Details $_.Exception.Message
-        $script:AnyFail = $true
-    }
-    finally {
-        Remove-Item -Path $tempBundleDir -Recurse -Force -ErrorAction SilentlyContinue
-        Pop-Location
+        catch {
+            Write-TierResult -Index 2 -Name "wiki bundle + byte-verify" -State "FAIL" -Details $_.Exception.Message
+            $script:AnyFail = $true
+        }
+        finally {
+            Remove-Item -Path $tempBundleDir -Recurse -Force -ErrorAction SilentlyContinue
+            Pop-Location
+        }
     }
 }
 
 if ($selectedTiers -contains 3) {
+    $explicit = ($Tier -ne "all")
     $docker = Get-Command docker -ErrorAction SilentlyContinue
     if (-not $docker) {
-        Write-TierResult -Index 3 -Name "docker-compose.dev plus integration tests" -State "SKIP" -Details "Docker is not installed, so the integration tier cannot run here."
+        if ($explicit) {
+            Write-TierResult -Index 3 -Name "docker-compose.dev plus integration tests" -State "FAIL" -Details "Docker is required for the explicit tier 3 check but is not installed on PATH."
+            $script:AnyFail = $true
+        }
+        else {
+            Write-TierResult -Index 3 -Name "docker-compose.dev plus integration tests" -State "SKIP" -Details "Docker is not installed; auto-detected tier 3 is skipped."
+        }
     }
     else {
         Push-Location $repoRoot
@@ -306,7 +428,8 @@ if ($selectedTiers -contains 3) {
         finally {
             $downOutput = & docker compose -f docker-compose.dev.yaml down -v 2>&1
             if ($LASTEXITCODE -ne 0) {
-                Write-TierResult -Index 3 -Name "docker-compose.dev plus integration tests" -State "SKIP" -Details ("Docker cleanup reported a warning: " + (($downOutput | Out-String).Trim()))
+                Write-TierResult -Index 3 -Name "docker-compose.dev plus integration tests" -State "FAIL" -Details ("Docker cleanup failed: " + (($downOutput | Out-String).Trim()))
+                $script:AnyFail = $true
             }
             Pop-Location
         }
@@ -314,35 +437,50 @@ if ($selectedTiers -contains 3) {
 }
 
 if ($selectedTiers -contains 4) {
-    if (-not $RemoteHelm) {
+    $remoteRequested = $RemoteHelm -or ($Tier -eq "4")
+    if (-not $remoteRequested) {
         Write-TierResult -Index 4 -Name "production Helm render + lint via Vault SSH" -State "SKIP" -Details "Tier 4 is opt-in: pass -RemoteHelm to render/lint the production chart remotely without mutation."
     }
-    elseif ([string]::IsNullOrWhiteSpace($RemoteHost)) {
-        Write-TierResult -Index 4 -Name "production Helm render + lint via Vault SSH" -State "FAIL" -Details "-RemoteHelm requires -RemoteHost (for example, user@k3sv01.lab.jmal.io)."
-        $script:AnyFail = $true
-    }
     else {
-        $ssh = Get-Command ssh -ErrorAction SilentlyContinue
-        if (-not $ssh) {
-            Write-TierResult -Index 4 -Name "production Helm render + lint via Vault SSH" -State "SKIP" -Details "SSH client is not installed, so tier 4 cannot run here."
+        $resolvedRemote = Resolve-RemoteTarget -HostValue $RemoteHost -UserValue $RemoteUser
+        if ([string]::IsNullOrWhiteSpace($resolvedRemote.Host)) {
+            Write-TierResult -Index 4 -Name "production Helm render + lint via Vault SSH" -State "FAIL" -Details "-RemoteHelm requires -RemoteHost (for example, k3sv01.lab.jmal.io or deploy@k3sv01.lab.jmal.io)."
+            $script:AnyFail = $true
         }
         else {
-            $remoteTarget = "$RemoteUser@$RemoteHost"
-            $remoteScript = @"
-set -euo pipefail
-cd /opt/selfservice 2>/dev/null || cd /srv/selfservice 2>/dev/null || cd /home/$RemoteUser/selfservice
-helm lint deploy/helm/selfservice -f deploy/helm/selfservice/values.yaml
-helm lint deploy/helm/selfservice -f deploy/helm/selfservice/values.yaml -f deploy/helm/selfservice/values.prod.yaml
-helm template selfservice deploy/helm/selfservice -f deploy/helm/selfservice/values.yaml -f deploy/helm/selfservice/values.prod.yaml > /tmp/rendered-selfservice-prod.yaml
-grep -q 'SYNTHETIC_LIFECYCLE_ENABLED' /tmp/rendered-selfservice-prod.yaml
-"@
-            $remoteOutput = & ssh $remoteTarget $remoteScript 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                Write-TierResult -Index 4 -Name "production Helm render + lint via Vault SSH" -State "FAIL" -Details (($remoteOutput | Out-String).Trim())
+            $ssh = Get-Command ssh -ErrorAction SilentlyContinue
+            if (-not $ssh) {
+                Write-TierResult -Index 4 -Name "production Helm render + lint via Vault SSH" -State "FAIL" -Details "SSH client is required for the explicit tier 4 check but is not installed on PATH."
                 $script:AnyFail = $true
             }
             else {
-                Write-TierResult -Index 4 -Name "production Helm render + lint via Vault SSH" -State "PASS" -Details "Remote helm lint + template checks succeeded without mutating production."
+                $remoteTarget = $resolvedRemote.Target
+                $remoteScript = @"
+set -euo pipefail
+trap 'rm -f /tmp/rendered-selfservice-prod.yaml' EXIT
+cd "$HOME/selfservice-api-helm"
+helm lint deploy/helm/selfservice -f deploy/helm/selfservice/values.yaml
+helm lint deploy/helm/selfservice -f deploy/helm/selfservice/values.yaml -f deploy/helm/selfservice/values.prod.yaml
+helm template selfservice deploy/helm/selfservice -f deploy/helm/selfservice/values.yaml -f deploy/helm/selfservice/values.prod.yaml > /tmp/rendered-selfservice-prod.yaml
+count=$(grep -c '^[[:space:]]*- name: SYNTHETIC_LIFECYCLE_ENABLED$' /tmp/rendered-selfservice-prod.yaml)
+if [ "$count" -ne 1 ]; then
+  echo "ERROR: prod render has SYNTHETIC_LIFECYCLE_ENABLED $count times, want exactly 1" >&2
+  exit 1
+fi
+value=$(grep -A1 '^[[:space:]]*- name: SYNTHETIC_LIFECYCLE_ENABLED$' /tmp/rendered-selfservice-prod.yaml | tail -1)
+if ! printf '%s\n' "$value" | grep -Eq '^[[:space:]]*value: "true"$'; then
+  echo "ERROR: prod render's SYNTHETIC_LIFECYCLE_ENABLED is not explicit true: $value" >&2
+  exit 1
+fi
+"@
+                $remoteOutput = & ssh $remoteTarget $remoteScript 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    Write-TierResult -Index 4 -Name "production Helm render + lint via Vault SSH" -State "FAIL" -Details (($remoteOutput | Out-String).Trim())
+                    $script:AnyFail = $true
+                }
+                else {
+                    Write-TierResult -Index 4 -Name "production Helm render + lint via Vault SSH" -State "PASS" -Details "Remote helm lint + template checks succeeded without mutating production."
+                }
             }
         }
     }
@@ -351,13 +489,6 @@ grep -q 'SYNTHETIC_LIFECYCLE_ENABLED' /tmp/rendered-selfservice-prod.yaml
 if ($script:AnyFail) {
     Write-Host "OVERALL: FAIL - at least one runnable tier failed."
     exit 1
-}
-
-$skipped = 0
-foreach ($tier in $selectedTiers) {
-    # Result is only tracked via stdout, so use the current set of tier invocations,
-    # which is sufficient for a final summary.
-    $skipped += 0
 }
 
 Write-Host "OVERALL: PASS - all selected tiers succeeded or were intentionally skipped."

@@ -3,7 +3,9 @@ package ci
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -84,6 +86,43 @@ func isLocalVerificationCoverageComplete(actual map[string]int, expected map[str
 	return true
 }
 
+func parseMakefileWIKISeeds(t *testing.T) []string {
+	t.Helper()
+	root := findRepoRoot(t)
+	data, err := os.ReadFile(filepath.Join(root, "Makefile"))
+	if err != nil {
+		t.Fatalf("read Makefile: %v", err)
+	}
+	var seeds []string
+	inSeeds := false
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !inSeeds {
+			if strings.HasPrefix(trimmed, "WIKI_SEEDS") && strings.Contains(trimmed, ":=") {
+				inSeeds = true
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "WIKI_OUT") && strings.Contains(trimmed, ":=") {
+			break
+		}
+		if trimmed == "" {
+			continue
+		}
+		for _, chunk := range strings.Split(trimmed, "\\") {
+			seed := strings.TrimSpace(chunk)
+			if seed == "" || strings.HasPrefix(seed, "#") {
+				continue
+			}
+			seeds = append(seeds, seed)
+		}
+	}
+	if len(seeds) == 0 {
+		t.Fatal("Makefile WIKI_SEEDS is empty")
+	}
+	return seeds
+}
+
 func TestLocalVerificationCoverageMatchesRequiredCI(t *testing.T) {
 	actual := localCoverageFromWorkflows(t)
 	for key, tier := range requiredLocalVerificationTiers {
@@ -113,5 +152,79 @@ func TestLocalVerificationCoverageRejectsSabotage(t *testing.T) {
 	delete(sabotaged, "ci.yaml|test|Verify wiki bundle")
 	if isLocalVerificationCoverageComplete(sabotaged, requiredLocalVerificationTiers) {
 		t.Fatal("sabotage proof failed: removing a required check from the coverage map still passed")
+	}
+}
+
+func TestLocalVerifyWIKISeedsDeriveFromMakefile(t *testing.T) {
+	root := findRepoRoot(t)
+	scriptText, err := os.ReadFile(filepath.Join(root, "scripts/local-verify.ps1"))
+	if err != nil {
+		t.Fatalf("read local-verify.ps1: %v", err)
+	}
+	if !strings.Contains(string(scriptText), "Get-WikiSeedPaths") {
+		t.Fatal("scripts/local-verify.ps1 must derive tier 2 seeds from Makefile WIKI_SEEDS")
+	}
+	seeds := parseMakefileWIKISeeds(t)
+	if len(seeds) == 0 {
+		t.Fatal("Makefile WIKI_SEEDS should contain at least one seed")
+	}
+	for _, seed := range seeds {
+		if !strings.Contains(string(scriptText), seed) {
+			t.Fatalf("scripts/local-verify.ps1 must include the Makefile seed %q when deriving tier-2 bundle inputs", seed)
+		}
+	}
+}
+
+func runLocalVerifyWithEnvironment(t *testing.T, env []string, args ...string) (int, string) {
+	t.Helper()
+	pwshPath, err := exec.LookPath("pwsh")
+	if err != nil {
+		t.Skip("pwsh not installed")
+	}
+	root := findRepoRoot(t)
+	scriptPath := filepath.Join(root, "scripts/local-verify.ps1")
+	cmd := exec.Command(pwshPath, append([]string{"-NoProfile", "-File", scriptPath}, args...)...)
+	cmd.Env = append(os.Environ(), env...)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return 0, string(out)
+	}
+	var exitCode = 1
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		exitCode = exitErr.ExitCode()
+	}
+	return exitCode, string(out)
+}
+
+func TestLocalVerifyExplicitMissingToolFails(t *testing.T) {
+	testCases := []struct {
+		name string
+		args []string
+	}{
+		{name: "tier0-missing-go", args: []string{"-Tier", "0"}},
+		{name: "tier1-missing-wsl", args: []string{"-Tier", "1"}},
+		{name: "tier3-missing-docker", args: []string{"-Tier", "3"}},
+		{name: "tier4-missing-ssh", args: []string{"-RemoteHelm", "-RemoteHost", "k3sv01.lab.jmal.io"}},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, output := runLocalVerifyWithEnvironment(t, []string{"PATH=" + t.TempDir()}, tc.args...)
+			if code == 0 {
+				t.Fatalf("explicit missing-tool tier returned success unexpectedly: %s", output)
+			}
+			if !strings.Contains(output, "[FAIL]") {
+				t.Fatalf("explicit missing-tool tier should fail, got output: %s", output)
+			}
+		})
+	}
+}
+
+func TestLocalVerifyAutoDetectMissingToolSkips(t *testing.T) {
+	code, output := runLocalVerifyWithEnvironment(t, []string{"PATH=" + t.TempDir()}, "-Tier", "all")
+	if code != 0 {
+		t.Fatalf("auto-detected all tiers should be non-fatal when tools are missing: %s", output)
+	}
+	if !strings.Contains(output, "[SKIP]") || !strings.Contains(output, "OVERALL: PASS") {
+		t.Fatalf("auto-detected missing tools should skip and still pass; got output: %s", output)
 	}
 }
