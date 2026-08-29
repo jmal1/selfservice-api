@@ -1275,6 +1275,13 @@ func TestDeployScriptReleasePreflightGuards(t *testing.T) {
 			wantOutput: "key user-id is not a valid UUID",
 		},
 		{
+			name: "synthetic user secret UUID has trailing NUL",
+			configure: func(env *deployScriptEnvironment) {
+				env.syntheticSecretValue = base64.StdEncoding.EncodeToString(append([]byte(testSyntheticUserID), 0))
+			},
+			wantOutput: "key user-id is not a valid UUID",
+		},
+		{
 			name: "synthetic user UUID is unknown",
 			configure: func(env *deployScriptEnvironment) {
 				env.syntheticUserKnown = false

@@ -2267,7 +2267,7 @@ require_no_pending_provisioning_jobs() {
 }
 
 require_synthetic_pod_quota() {
-  local encoded_synthetic_user_id synthetic_user_id_with_sentinel synthetic_user_id
+  local encoded_synthetic_user_id decoded_synthetic_user_id_length synthetic_user_id_with_sentinel synthetic_user_id
   local postgres_pod quota_state max_pods active_pods
   if ! encoded_synthetic_user_id="$(
     kubectl get secret selfservice-synthetic-user -n "$NAMESPACE" \
@@ -2278,6 +2278,16 @@ require_synthetic_pod_quota() {
   fi
   if [ -z "$encoded_synthetic_user_id" ]; then
     echo "ERROR: Kubernetes Secret selfservice-synthetic-user is missing required key user-id." >&2
+    return 1
+  fi
+  if ! decoded_synthetic_user_id_length="$(
+    printf '%s' "$encoded_synthetic_user_id" | base64 --decode | wc -c
+  )"; then
+    echo "ERROR: Kubernetes Secret selfservice-synthetic-user key user-id is not valid base64." >&2
+    return 1
+  fi
+  if [ "$decoded_synthetic_user_id_length" != "36" ]; then
+    echo "ERROR: Kubernetes Secret selfservice-synthetic-user key user-id is not a valid UUID." >&2
     return 1
   fi
   if ! synthetic_user_id_with_sentinel="$(
