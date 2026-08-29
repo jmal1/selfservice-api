@@ -2490,10 +2490,51 @@ canonicalize_server_candidate() {
     # inseparably with --dry-run=server, for the same reason as
     # server_validate_candidate above: this is a per-document validation-only
     # SSA dry-run against already Helm-owned objects, not a mutating apply.
-    # Removing the sole generated annotation leaves {}, while kubectl may omit
-    # or null the empty map, so only empty containers are normalized afterward.
+    # Removing generated ownership/revision metadata can leave empty maps,
+    # while kubectl may omit or null them, so only empty containers are
+    # normalized afterward.
     kubectl_server_apply_dry_run crucible-production-deploy "$document" json \
-      | jq -cS '
+      | jq -cS --arg release "$RELEASE" --arg namespace "$NAMESPACE" '
+          def validate_top_level_metadata_value($container; $path; $key; $expected):
+            if ($container | type) == "object" and ($container | has($key)) then
+              $container[$key] as $actual
+              | if ($actual | type) != "string" then
+                  error($path + "[" + ($key | tojson) + "] must be a string")
+                elif $actual != $expected then
+                  error(
+                    $path + "[" + ($key | tojson) + "] must equal " +
+                    ($expected | tojson)
+                  )
+                else
+                  .
+                end
+            else
+              .
+            end;
+
+          .
+          | validate_top_level_metadata_value(
+              .metadata.annotations;
+              ".metadata.annotations";
+              "meta.helm.sh/release-name";
+              $release
+            )
+          | del(.metadata.annotations."meta.helm.sh/release-name")
+          | validate_top_level_metadata_value(
+              .metadata.annotations;
+              ".metadata.annotations";
+              "meta.helm.sh/release-namespace";
+              $namespace
+            )
+          | del(.metadata.annotations."meta.helm.sh/release-namespace")
+          | validate_top_level_metadata_value(
+              .metadata.labels;
+              ".metadata.labels";
+              "app.kubernetes.io/managed-by";
+              "Helm"
+            )
+          | del(.metadata.labels."app.kubernetes.io/managed-by")
+          |
           if .kind == "Deployment" and
              (.metadata.annotations | type) == "object" and
              (.metadata.annotations | has("deployment.kubernetes.io/revision")) then
@@ -2512,6 +2553,12 @@ canonicalize_server_candidate() {
             .
           end
           |
+          if .metadata.labels == null or .metadata.labels == {} then
+            del(.metadata.labels)
+          else
+            .
+          end
+          |
           del(
             .metadata.creationTimestamp,
             .metadata.deletionGracePeriodSeconds,
@@ -2523,7 +2570,10 @@ canonicalize_server_candidate() {
             .metadata.uid,
             .status
           )
-        ' >> "$rows"
+        ' >> "$rows" || {
+      rm -rf "$document_dir" "$rows"
+      return 1
+    }
   done
   LC_ALL=C sort "$rows" > "$output"
   rm -rf "$document_dir" "$rows"

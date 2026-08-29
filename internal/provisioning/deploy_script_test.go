@@ -1961,6 +1961,170 @@ func TestDeployScriptPostApplyGeneratedAnnotationHandling(t *testing.T) {
 	})
 }
 
+func TestDeployScriptPostApplyHelmOwnershipHandling(t *testing.T) {
+	requirePOSIXShell(t)
+
+	live := baselineManifest(true, "", "false")
+	candidate := rollbackManifestWithHistoricalSynthetics(false)
+
+	t.Run("expected top-level ownership on newly created CronJobs compares equal", func(t *testing.T) {
+		env := newDeployScriptEnvironment(t, live, candidate)
+		env.postApplyAnnotationsMode = "helm-ownership"
+		output, err := env.run("--no-pull")
+		if err != nil {
+			t.Fatalf("post-apply proof rejected expected Helm ownership metadata: %v\n%s", err, output)
+		}
+		if !strings.Contains(string(output), "deployed exact source") {
+			t.Fatalf("deploy did not complete after Helm ownership normalization:\n%s", output)
+		}
+	})
+
+	for _, test := range []struct {
+		name                 string
+		mode                 string
+		wantOutput           string
+		wantCanonicalFailure bool
+	}{
+		{
+			name:                 "wrong release name fails closed",
+			mode:                 "helm-wrong-release-name",
+			wantOutput:           `.metadata.annotations["meta.helm.sh/release-name"] must equal "selfservice"`,
+			wantCanonicalFailure: true,
+		},
+		{
+			name:                 "wrong release namespace fails closed",
+			mode:                 "helm-wrong-release-namespace",
+			wantOutput:           `.metadata.annotations["meta.helm.sh/release-namespace"] must equal "selfservice"`,
+			wantCanonicalFailure: true,
+		},
+		{
+			name:                 "non-string release name fails closed",
+			mode:                 "helm-nonstring-release-name",
+			wantOutput:           `.metadata.annotations["meta.helm.sh/release-name"] must be a string`,
+			wantCanonicalFailure: true,
+		},
+		{
+			name:                 "non-string release namespace fails closed",
+			mode:                 "helm-nonstring-release-namespace",
+			wantOutput:           `.metadata.annotations["meta.helm.sh/release-namespace"] must be a string`,
+			wantCanonicalFailure: true,
+		},
+		{
+			name:                 "wrong managed-by fails closed",
+			mode:                 "helm-wrong-managed-by",
+			wantOutput:           `.metadata.labels["app.kubernetes.io/managed-by"] must equal "Helm"`,
+			wantCanonicalFailure: true,
+		},
+		{
+			name:                 "non-string managed-by fails closed",
+			mode:                 "helm-nonstring-managed-by",
+			wantOutput:           `.metadata.labels["app.kubernetes.io/managed-by"] must be a string`,
+			wantCanonicalFailure: true,
+		},
+		{
+			name:       "arbitrary top-level annotation drift remains compared",
+			mode:       "helm-top-annotation-drift",
+			wantOutput: "deployed Helm object set differs from the exact validated candidate",
+		},
+		{
+			name:       "arbitrary top-level label drift remains compared",
+			mode:       "helm-top-label-drift",
+			wantOutput: "deployed Helm object set differs from the exact validated candidate",
+		},
+		{
+			name:       "pod-template managed-by drift remains compared",
+			mode:       "helm-template-managed-by-drift",
+			wantOutput: "deployed Helm object set differs from the exact validated candidate",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			env := newDeployScriptEnvironment(t, live, candidate)
+			env.postApplyAnnotationsMode = test.mode
+			output, err := env.run("--no-pull")
+			if err == nil {
+				t.Fatalf("post-apply proof ignored %s:\n%s", test.name, output)
+			}
+			if !strings.Contains(string(output), test.wantOutput) {
+				t.Fatalf("post-apply proof rejected %s for the wrong reason:\n%s", test.name, output)
+			}
+			if test.wantCanonicalFailure {
+				if !strings.Contains(string(output), "could not canonicalize the deployed Helm object set") {
+					t.Fatalf("malformed ownership did not fail canonicalization:\n%s", output)
+				}
+			} else if !strings.Contains(string(output), "deployed Helm object set differs") {
+				t.Fatalf("metadata drift did not fail the deployed-candidate comparison:\n%s", output)
+			}
+			if _, statErr := os.Stat(env.upgradedMarker); statErr != nil {
+				t.Fatalf("failure occurred before the post-apply comparison: %v", statErr)
+			}
+			if _, statErr := os.Stat(env.lockFile); statErr != nil {
+				t.Fatalf("post-apply ownership failure did not retain the release lock: %v", statErr)
+			}
+		})
+	}
+}
+
+func TestDeployScriptPostApplyHelmOwnershipNormalizationLoadBearing(t *testing.T) {
+	requirePOSIXShell(t)
+
+	deployPath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
+	deployBody, err := os.ReadFile(deployPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name string
+		line string
+	}{
+		{
+			name: "release name",
+			line: `          | del(.metadata.annotations."meta.helm.sh/release-name")` + "\n",
+		},
+		{
+			name: "release namespace",
+			line: `          | del(.metadata.annotations."meta.helm.sh/release-namespace")` + "\n",
+		},
+		{
+			name: "managed-by",
+			line: `          | del(.metadata.labels."app.kubernetes.io/managed-by")` + "\n",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if strings.Count(string(deployBody), test.line) != 1 {
+				t.Fatalf("expected exactly one narrow post-apply %s normalization", test.name)
+			}
+			sabotagedBody := strings.Replace(string(deployBody), test.line, "", 1)
+			suffix := strings.ReplaceAll(test.name, " ", "-")
+			sabotagedPath := filepath.Join(
+				filepath.Dir(deployPath),
+				"deploy-sabotaged-"+suffix+"-post-apply-ownership-test.sh",
+			)
+			writeExecutable(t, sabotagedPath, sabotagedBody)
+			t.Cleanup(func() { os.Remove(sabotagedPath) })
+
+			live := baselineManifest(true, "", "false")
+			candidate := rollbackManifestWithHistoricalSynthetics(false)
+			env := newDeployScriptEnvironment(t, live, candidate)
+			env.postApplyAnnotationsMode = "helm-ownership"
+			env.scriptPath = sabotagedPath
+			output, runErr := env.run("--no-pull")
+			if runErr == nil {
+				t.Fatalf("revision-170-shaped post-apply proof passed without %s normalization:\n%s", test.name, output)
+			}
+			if !strings.Contains(string(output), "deployed Helm object set differs from the exact validated candidate") {
+				t.Fatalf("sabotage failed for the wrong reason without %s normalization:\n%s", test.name, output)
+			}
+			if _, statErr := os.Stat(env.upgradedMarker); statErr != nil {
+				t.Fatalf("sabotage did not reach the post-apply comparator: %v", statErr)
+			}
+			if _, statErr := os.Stat(env.lockFile); statErr != nil {
+				t.Fatalf("post-apply mismatch did not retain the release lock: %v", statErr)
+			}
+		})
+	}
+}
+
 // kubectlServerApplyDryRunFunctionName is the single bash function in
 // deploy.sh that may ever invoke
 // `kubectl apply --server-side --dry-run=server --force-conflicts`. This
@@ -4996,6 +5160,7 @@ serverInjectedMutation: true"
       --arg daemonset_generation "$daemonset_generation" \
       --arg source "$source" \
       --arg post_apply_mode "$FAKE_POST_APPLY_ANNOTATIONS_MODE" \
+      --arg resource "$resource" \
       --arg release "$FAKE_LIVE_HELM_RELEASE" \
       --arg namespace "$FAKE_LIVE_HELM_NAMESPACE" \
       --argjson replicas "$replicas" \
@@ -5018,27 +5183,89 @@ serverInjectedMutation: true"
                 end
               )
             elif $source == "post-apply" then
-              if ($post_apply_mode == "generated" or $post_apply_mode == "deployment-revision") and
-                 $kind == "Deployment" then
-                {"deployment.kubernetes.io/revision":"164"}
-              elif ($post_apply_mode == "generated" or $post_apply_mode == "daemonset-generation") and
-                   $kind == "DaemonSet" then
-                {"deprecated.daemonset.template.generation":"8"}
-              elif $post_apply_mode == "unrelated" and $kind == "Deployment" then
-                {"operations.example/owner":"live"}
-              elif $post_apply_mode == "similarly-named" and $kind == "Deployment" then
-                {"deployment.kubernetes.io/revision-note":"live"}
-              elif $post_apply_mode == "wrong-kind" and $kind == "Deployment" then
-                {"deprecated.daemonset.template.generation":"8"}
-              elif $post_apply_mode == "daemonset-unrelated" and $kind == "DaemonSet" then
-                {"operations.example/owner":"live"}
-              elif $post_apply_mode == "daemonset-similarly-named" and $kind == "DaemonSet" then
-                {"deprecated.daemonset.template.generation-note":"live"}
-              elif $post_apply_mode == "daemonset-wrong-kind" and $kind == "DaemonSet" then
-                {"deployment.kubernetes.io/revision":"164"}
-              else
-                null
-              end
+              (
+                if ($post_apply_mode == "generated" or $post_apply_mode == "deployment-revision") and
+                   $kind == "Deployment" then
+                  {"deployment.kubernetes.io/revision":"164"}
+                elif ($post_apply_mode == "generated" or $post_apply_mode == "daemonset-generation") and
+                     $kind == "DaemonSet" then
+                  {"deprecated.daemonset.template.generation":"8"}
+                elif $post_apply_mode == "unrelated" and $kind == "Deployment" then
+                  {"operations.example/owner":"live"}
+                elif $post_apply_mode == "similarly-named" and $kind == "Deployment" then
+                  {"deployment.kubernetes.io/revision-note":"live"}
+                elif $post_apply_mode == "wrong-kind" and $kind == "Deployment" then
+                  {"deprecated.daemonset.template.generation":"8"}
+                elif $post_apply_mode == "daemonset-unrelated" and $kind == "DaemonSet" then
+                  {"operations.example/owner":"live"}
+                elif $post_apply_mode == "daemonset-similarly-named" and $kind == "DaemonSet" then
+                  {"deprecated.daemonset.template.generation-note":"live"}
+                elif $post_apply_mode == "daemonset-wrong-kind" and $kind == "DaemonSet" then
+                  {"deployment.kubernetes.io/revision":"164"}
+                else
+                  {}
+                end
+              ) + (
+                if ($post_apply_mode | startswith("helm-")) and
+                   ($resource == "CronJob/selfservice-synthetic-janitor" or
+                    $resource == "CronJob/selfservice-synthetic-runner") then
+                  {
+                    "meta.helm.sh/release-name":(
+                      if $post_apply_mode == "helm-nonstring-release-name" then
+                        170
+                      elif $post_apply_mode == "helm-wrong-release-name" then
+                        "other-release"
+                      else
+                        "selfservice"
+                      end
+                    ),
+                    "meta.helm.sh/release-namespace":(
+                      if $post_apply_mode == "helm-nonstring-release-namespace" then
+                        []
+                      elif $post_apply_mode == "helm-wrong-release-namespace" then
+                        "other-namespace"
+                      else
+                        "selfservice"
+                      end
+                    )
+                  } + (
+                    if $post_apply_mode == "helm-top-annotation-drift" then
+                      {"operations.example/owner":"live"}
+                    else
+                      {}
+                    end
+                  )
+                else
+                  {}
+                end
+              )
+              | if length == 0 then null else . end
+            else
+              null
+            end
+          ),
+          labels:(
+            if $source == "post-apply" and
+               ($post_apply_mode | startswith("helm-")) and
+               ($resource == "CronJob/selfservice-synthetic-janitor" or
+                $resource == "CronJob/selfservice-synthetic-runner") then
+              {
+                "app.kubernetes.io/managed-by":(
+                  if $post_apply_mode == "helm-nonstring-managed-by" then
+                    170
+                  elif $post_apply_mode == "helm-wrong-managed-by" then
+                    "Other"
+                  else
+                    "Helm"
+                  end
+                )
+              } + (
+                if $post_apply_mode == "helm-top-label-drift" then
+                  {"operations.example/owner":"live"}
+                else
+                  {}
+                end
+              )
             else
               null
             end
@@ -5052,6 +5279,11 @@ serverInjectedMutation: true"
           elif $source == "post-apply" and $post_apply_mode == "daemonset-template-level" and
                $kind == "DaemonSet" then
             {template:{metadata:{annotations:{"deprecated.daemonset.template.generation":"8"}}}}
+          elif $source == "post-apply" and
+               $post_apply_mode == "helm-template-managed-by-drift" and
+               ($resource == "CronJob/selfservice-synthetic-janitor" or
+                $resource == "CronJob/selfservice-synthetic-runner") then
+            {jobTemplate:{spec:{template:{metadata:{labels:{"app.kubernetes.io/managed-by":"Other"}}}}}}
           else
             {}
           end
@@ -5065,6 +5297,7 @@ serverInjectedMutation: true"
       --arg daemonset_generation "$daemonset_generation" \
       --arg source "$source" \
       --arg post_apply_mode "$FAKE_POST_APPLY_ANNOTATIONS_MODE" \
+      --arg resource "$resource" \
       --arg release "$FAKE_LIVE_HELM_RELEASE" \
       --arg namespace "$FAKE_LIVE_HELM_NAMESPACE" \
       '{
@@ -5086,27 +5319,89 @@ serverInjectedMutation: true"
                 end
               )
             elif $source == "post-apply" then
-              if ($post_apply_mode == "generated" or $post_apply_mode == "deployment-revision") and
-                 $kind == "Deployment" then
-                {"deployment.kubernetes.io/revision":"164"}
-              elif ($post_apply_mode == "generated" or $post_apply_mode == "daemonset-generation") and
-                   $kind == "DaemonSet" then
-                {"deprecated.daemonset.template.generation":"8"}
-              elif $post_apply_mode == "unrelated" and $kind == "Deployment" then
-                {"operations.example/owner":"live"}
-              elif $post_apply_mode == "similarly-named" and $kind == "Deployment" then
-                {"deployment.kubernetes.io/revision-note":"live"}
-              elif $post_apply_mode == "wrong-kind" and $kind == "Deployment" then
-                {"deprecated.daemonset.template.generation":"8"}
-              elif $post_apply_mode == "daemonset-unrelated" and $kind == "DaemonSet" then
-                {"operations.example/owner":"live"}
-              elif $post_apply_mode == "daemonset-similarly-named" and $kind == "DaemonSet" then
-                {"deprecated.daemonset.template.generation-note":"live"}
-              elif $post_apply_mode == "daemonset-wrong-kind" and $kind == "DaemonSet" then
-                {"deployment.kubernetes.io/revision":"164"}
-              else
-                null
-              end
+              (
+                if ($post_apply_mode == "generated" or $post_apply_mode == "deployment-revision") and
+                   $kind == "Deployment" then
+                  {"deployment.kubernetes.io/revision":"164"}
+                elif ($post_apply_mode == "generated" or $post_apply_mode == "daemonset-generation") and
+                     $kind == "DaemonSet" then
+                  {"deprecated.daemonset.template.generation":"8"}
+                elif $post_apply_mode == "unrelated" and $kind == "Deployment" then
+                  {"operations.example/owner":"live"}
+                elif $post_apply_mode == "similarly-named" and $kind == "Deployment" then
+                  {"deployment.kubernetes.io/revision-note":"live"}
+                elif $post_apply_mode == "wrong-kind" and $kind == "Deployment" then
+                  {"deprecated.daemonset.template.generation":"8"}
+                elif $post_apply_mode == "daemonset-unrelated" and $kind == "DaemonSet" then
+                  {"operations.example/owner":"live"}
+                elif $post_apply_mode == "daemonset-similarly-named" and $kind == "DaemonSet" then
+                  {"deprecated.daemonset.template.generation-note":"live"}
+                elif $post_apply_mode == "daemonset-wrong-kind" and $kind == "DaemonSet" then
+                  {"deployment.kubernetes.io/revision":"164"}
+                else
+                  {}
+                end
+              ) + (
+                if ($post_apply_mode | startswith("helm-")) and
+                   ($resource == "CronJob/selfservice-synthetic-janitor" or
+                    $resource == "CronJob/selfservice-synthetic-runner") then
+                  {
+                    "meta.helm.sh/release-name":(
+                      if $post_apply_mode == "helm-nonstring-release-name" then
+                        170
+                      elif $post_apply_mode == "helm-wrong-release-name" then
+                        "other-release"
+                      else
+                        "selfservice"
+                      end
+                    ),
+                    "meta.helm.sh/release-namespace":(
+                      if $post_apply_mode == "helm-nonstring-release-namespace" then
+                        []
+                      elif $post_apply_mode == "helm-wrong-release-namespace" then
+                        "other-namespace"
+                      else
+                        "selfservice"
+                      end
+                    )
+                  } + (
+                    if $post_apply_mode == "helm-top-annotation-drift" then
+                      {"operations.example/owner":"live"}
+                    else
+                      {}
+                    end
+                  )
+                else
+                  {}
+                end
+              )
+              | if length == 0 then null else . end
+            else
+              null
+            end
+          ),
+          labels:(
+            if $source == "post-apply" and
+               ($post_apply_mode | startswith("helm-")) and
+               ($resource == "CronJob/selfservice-synthetic-janitor" or
+                $resource == "CronJob/selfservice-synthetic-runner") then
+              {
+                "app.kubernetes.io/managed-by":(
+                  if $post_apply_mode == "helm-nonstring-managed-by" then
+                    170
+                  elif $post_apply_mode == "helm-wrong-managed-by" then
+                    "Other"
+                  else
+                    "Helm"
+                  end
+                )
+              } + (
+                if $post_apply_mode == "helm-top-label-drift" then
+                  {"operations.example/owner":"live"}
+                else
+                  {}
+                end
+              )
             else
               null
             end
@@ -5120,6 +5415,11 @@ serverInjectedMutation: true"
           elif $source == "post-apply" and $post_apply_mode == "daemonset-template-level" and
                $kind == "DaemonSet" then
             {template:{metadata:{annotations:{"deprecated.daemonset.template.generation":"8"}}}}
+          elif $source == "post-apply" and
+               $post_apply_mode == "helm-template-managed-by-drift" and
+               ($resource == "CronJob/selfservice-synthetic-janitor" or
+                $resource == "CronJob/selfservice-synthetic-runner") then
+            {jobTemplate:{spec:{template:{metadata:{labels:{"app.kubernetes.io/managed-by":"Other"}}}}}}
           else
             {}
           end
