@@ -910,6 +910,10 @@ API/UI source SHA; and firing Prometheus alert names that are a subset of
 Prometheus-safe alert name per line, rejects duplicates, and remains empty
 unless a current firing alert is explicitly justified. Every query, read,
 parse, malformed, missing, or unknown result fails before lock acquisition.
+After claims are paused and all longer locked validation completes, the
+provisioning-job and firing-alert guards run again directly adjacent to Helm.
+A late pending job or newly firing unallowlisted alert restores prior claims
+state and exits without invoking the upgrade.
 Homelab Roadmap rows are outside this repository's authority, so the deployment
 coordinator must prove that cross-repository gate before invoking `deploy.sh`;
 there is no in-repo checkbox that pretends to prove it.

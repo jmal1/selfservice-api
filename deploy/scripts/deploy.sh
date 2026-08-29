@@ -2520,6 +2520,11 @@ run_release_preflight() {
   echo "==> release preflight passed"
 }
 
+require_volatile_release_preflight() {
+  require_no_pending_provisioning_jobs
+  require_known_firing_alerts
+}
+
 require_core_workloads() {
   local inventory=$1
   local required
@@ -4256,6 +4261,10 @@ if [ "$(sha256sum "$CANDIDATE_MANIFEST" | awk '{print $1}')" != "$CANDIDATE_SHA2
 fi
 require_no_active_jobs
 
+# Volatile gates run again after claims are paused and all other validation is
+# complete. Keep this directly adjacent to Helm so pending provisioning work or
+# a newly firing alert cannot hide behind the longer immutable-candidate proof.
+require_volatile_release_preflight
 echo "==> helm upgrade $RELEASE with exact digest-pinned candidate (atomic, timeout=$TIMEOUT)"
 HELM_RELEASE_LOCK_PRESERVE=true
 set +e

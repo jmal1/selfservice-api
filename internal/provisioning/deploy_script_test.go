@@ -1400,6 +1400,138 @@ func pointDeployAtKnownFiringAlerts(t *testing.T, env *deployScriptEnvironment) 
 	env.scriptPath = scriptPath
 }
 
+func TestDeployScriptVolatileReleasePreflightBlocksLateRegressions(t *testing.T) {
+	requirePOSIXShell(t)
+	tests := []struct {
+		name       string
+		configure  func(*deployScriptEnvironment)
+		wantOutput string
+	}{
+		{
+			name: "pending provisioning job appears after claims pause",
+			configure: func(env *deployScriptEnvironment) {
+				env.provisioningJobsAfterInitial = "1"
+			},
+			wantOutput: "provisioning jobs are nonterminal or have unknown status",
+		},
+		{
+			name: "alert starts firing after claims pause",
+			configure: func(env *deployScriptEnvironment) {
+				env.prometheusResponseAfterInitial = `{"status":"success","data":{"alerts":[{"state":"firing","labels":{"alertname":"LateFailure"}}]}}`
+			},
+			wantOutput: "unallowlisted Prometheus alerts are firing",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			env := newDeployScriptEnvironment(
+				t,
+				baselineManifest(true, "", "false"),
+				baselineManifest(true, "*", "false"),
+			)
+			writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
+			test.configure(env)
+
+			output, err := env.run("--no-pull")
+			if err == nil {
+				t.Fatalf("late volatile regression unexpectedly reached Helm:\n%s", output)
+			}
+			if !strings.Contains(string(output), test.wantOutput) {
+				t.Fatalf("output %q does not contain %q", output, test.wantOutput)
+			}
+			for _, marker := range []string{env.claimsPausedMark, env.claimsResumedMark, env.syntheticContainedMark} {
+				if _, statErr := os.Stat(marker); statErr != nil {
+					t.Fatalf("late guard failure missed expected pause/restore marker %s: %v\n%s", marker, statErr, output)
+				}
+			}
+			if body, readErr := os.ReadFile(env.upgradeLog); readErr == nil && len(body) > 0 {
+				t.Fatalf("late guard failure invoked Helm upgrade: %s\n%s", body, output)
+			}
+			for _, marker := range []string{env.candidateAppliedMark, env.upgradedMarker, env.lockFile} {
+				if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+					t.Fatalf("late guard failure left mutation marker %s: %v\n%s", marker, statErr, output)
+				}
+			}
+		})
+	}
+}
+
+func TestDeployScriptVolatileReleasePreflightIsOrderedAndLoadBearing(t *testing.T) {
+	requirePOSIXShell(t)
+	deployPath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
+	source, err := os.ReadFile(deployPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const boundary = `require_volatile_release_preflight
+echo "==> helm upgrade $RELEASE with exact digest-pinned candidate (atomic, timeout=$TIMEOUT)"`
+	if strings.Count(string(source), boundary) != 1 {
+		t.Fatal("volatile preflight is not directly adjacent to the final Helm upgrade announcement")
+	}
+	const helper = `require_volatile_release_preflight() {
+  require_no_pending_provisioning_jobs
+  require_known_firing_alerts
+}`
+	if strings.Count(string(source), helper) != 1 {
+		t.Fatal("volatile preflight helper does not contain the exact two final guards")
+	}
+
+	tests := []struct {
+		name      string
+		guardCall string
+		configure func(*deployScriptEnvironment)
+	}{
+		{
+			name:      "provisioning recheck",
+			guardCall: "  require_no_pending_provisioning_jobs\n",
+			configure: func(env *deployScriptEnvironment) {
+				env.provisioningJobsAfterInitial = "1"
+			},
+		},
+		{
+			name:      "alert recheck",
+			guardCall: "  require_known_firing_alerts\n",
+			configure: func(env *deployScriptEnvironment) {
+				env.prometheusResponseAfterInitial = `{"status":"success","data":{"alerts":[{"state":"firing","labels":{"alertname":"LateFailure"}}]}}`
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			mutatedHelper := strings.Replace(helper, test.guardCall, "", 1)
+			mutated := strings.Replace(string(source), helper, mutatedHelper, 1)
+			scriptPath := filepath.Join(
+				filepath.Dir(deployPath),
+				"deploy-sabotaged-gate-a4-final-"+strings.ReplaceAll(test.name, " ", "-")+"-test.sh",
+			)
+			writeExecutable(t, scriptPath, mutated)
+			t.Cleanup(func() { os.Remove(scriptPath) })
+
+			env := newDeployScriptEnvironment(
+				t,
+				baselineManifest(true, "", "false"),
+				baselineManifest(true, "*", "false"),
+			)
+			writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
+			env.scriptPath = scriptPath
+			test.configure(env)
+
+			output, runErr := env.run("--no-pull")
+			if runErr != nil {
+				t.Fatalf("removing final %s did not expose the staged regression: %v\n%s", test.name, runErr, output)
+			}
+			if _, statErr := os.Stat(env.upgradedMarker); statErr != nil {
+				t.Fatalf("removing final %s did not reach Helm mutation: %v\n%s", test.name, statErr, output)
+			}
+			if _, statErr := os.Stat(env.claimsResumedMark); statErr != nil {
+				t.Fatalf("sabotaged successful deploy did not restore claims: %v\n%s", statErr, output)
+			}
+		})
+	}
+}
+
 func TestDeployScriptReleasePreflightPredicatesAreLoadBearing(t *testing.T) {
 	requirePOSIXShell(t)
 	deployPath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
@@ -5819,6 +5951,8 @@ type deployScriptEnvironment struct {
 	lockFile                  string
 	lockBackupDir             string
 	knownFiringAlerts         string
+	provisioningQueryCount    string
+	prometheusQueryCount      string
 	lockDeleteRaceMark        string
 	serverDryRunLog           string
 	serverDryRunMark          string
@@ -5892,10 +6026,12 @@ type deployScriptEnvironment struct {
 	pendingSyntheticJobs           int
 	migrationState                 string
 	provisioningJobs               string
+	provisioningJobsAfterInitial   string
 	unknownProvisioningJobStatus   bool
 	syntheticQuotaState            string
 	malformedJobsJSON              bool
 	prometheusResponse             string
+	prometheusResponseAfterInitial string
 	prometheusURL                  string
 	preflightQueryFailure          string
 	failJobsList                   bool
@@ -5950,6 +6086,8 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 		lockFile:                  filepath.Join(root, "helm.lock"),
 		lockBackupDir:             filepath.Join(root, "lock-backups"),
 		knownFiringAlerts:         filepath.Join(root, "known-firing-alerts.txt"),
+		provisioningQueryCount:    filepath.Join(root, "provisioning-query-count"),
+		prometheusQueryCount:      filepath.Join(root, "prometheus-query-count"),
 		lockDeleteRaceMark:        filepath.Join(root, "lock-delete-race.marker"),
 		serverDryRunLog:           filepath.Join(root, "server-dry-run.log"),
 		serverDryRunMark:          filepath.Join(root, "server-dry-run.marker"),
@@ -6827,6 +6965,10 @@ case "$1" in
   exec)
     if [[ "$*" == *"gate_a4_provisioning_preflight"* ]]; then
       [ "$FAKE_PREFLIGHT_QUERY_FAILURE" != provisioning ] || exit 97
+      query_count=0
+      [ ! -f "$FAKE_PROVISIONING_QUERY_COUNT" ] || query_count=$(cat "$FAKE_PROVISIONING_QUERY_COUNT")
+      query_count=$((query_count + 1))
+      printf '%s' "$query_count" > "$FAKE_PROVISIONING_QUERY_COUNT"
       if [ "$FAKE_UNKNOWN_PROVISIONING_JOB_STATUS" = true ]; then
         if [[ "$*" == *"status NOT IN ('completed', 'failed')"* ]]; then
           printf '1\n'
@@ -6834,7 +6976,11 @@ case "$1" in
           printf '0\n'
         fi
       else
-        printf '%s\n' "$FAKE_PROVISIONING_JOBS"
+        jobs=$FAKE_PROVISIONING_JOBS
+        if [ "$query_count" -gt 1 ] && [ -n "$FAKE_PROVISIONING_JOBS_AFTER_INITIAL" ]; then
+          jobs=$FAKE_PROVISIONING_JOBS_AFTER_INITIAL
+        fi
+        printf '%s\n' "$jobs"
       fi
     elif [[ "$*" == *"synthetic-monitor-no-oidc"* ]]; then
       [ "$FAKE_PREFLIGHT_QUERY_FAILURE" != quota ] || exit 97
@@ -7330,7 +7476,15 @@ set -euo pipefail
 case "$*" in
 	  *"/api/v1/alerts"*)
 	    [ "$FAKE_FAIL_PROMETHEUS" != true ] || exit 97
-	    printf '%s\n' "$FAKE_PROMETHEUS_RESPONSE"
+	    query_count=0
+	    [ ! -f "$FAKE_PROMETHEUS_QUERY_COUNT" ] || query_count=$(cat "$FAKE_PROMETHEUS_QUERY_COUNT")
+	    query_count=$((query_count + 1))
+	    printf '%s' "$query_count" > "$FAKE_PROMETHEUS_QUERY_COUNT"
+	    response=$FAKE_PROMETHEUS_RESPONSE
+	    if [ "$query_count" -gt 1 ] && [ -n "$FAKE_PROMETHEUS_RESPONSE_AFTER_INITIAL" ]; then
+	      response=$FAKE_PROMETHEUS_RESPONSE_AFTER_INITIAL
+	    fi
+	    printf '%s\n' "$response"
 	    ;;
 	  *"ghcr.io/token"*)
     printf '{"token":"registry-token"}\n'
@@ -7506,6 +7660,8 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_FINAL_WORKLOAD_HEALTH_REGRESSION="+strconv.FormatBool(e.finalWorkloadHealthRegression),
 		"FAKE_MIGRATION_STATE="+e.migrationState,
 		"FAKE_PROVISIONING_JOBS="+e.provisioningJobs,
+		"FAKE_PROVISIONING_JOBS_AFTER_INITIAL="+e.provisioningJobsAfterInitial,
+		"FAKE_PROVISIONING_QUERY_COUNT="+e.provisioningQueryCount,
 		"FAKE_UNKNOWN_PROVISIONING_JOB_STATUS="+strconv.FormatBool(e.unknownProvisioningJobStatus),
 		"FAKE_SYNTHETIC_QUOTA_STATE="+e.syntheticQuotaState,
 		"FAKE_ACTIVE_MUTATING_SYNTHETIC_JOBS="+strconv.Itoa(e.activeMutatingSyntheticJobs),
@@ -7514,6 +7670,8 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_PREFLIGHT_QUERY_FAILURE="+e.preflightQueryFailure,
 		"FAKE_FAIL_JOBS_LIST="+strconv.FormatBool(e.failJobsList),
 		"FAKE_PROMETHEUS_RESPONSE="+e.prometheusResponse,
+		"FAKE_PROMETHEUS_RESPONSE_AFTER_INITIAL="+e.prometheusResponseAfterInitial,
+		"FAKE_PROMETHEUS_QUERY_COUNT="+e.prometheusQueryCount,
 		"FAKE_FAIL_PROMETHEUS="+strconv.FormatBool(e.failPrometheus),
 		"FAKE_IMAGE_REVISION_PROBE_COUNT="+e.imageRevisionProbeCount,
 		"FAKE_IMAGE_REVISION_DRIFT_AFTER="+strconv.Itoa(e.imageRevisionDriftAfter),

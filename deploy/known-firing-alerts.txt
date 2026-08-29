@@ -1,2 +1,0 @@
-# One exact Prometheus alertname per line. Keep empty unless the firing alert is
-# explicitly justified for this deployment; malformed and duplicate names fail.

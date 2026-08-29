@@ -200,7 +200,11 @@ The firing-alert allowlist accepts one Prometheus-safe `alertname` per line and
 rejects malformed or duplicate entries. It is intentionally empty until a
 specific firing alert is justified for a deployment. Query failures, missing
 records, malformed responses, and unknown states all stop before lock
-acquisition. Homelab Roadmap approval rows are owned outside this repository;
+acquisition. Because job and alert state can change during the longer locked
+validation phase, the provisioning-job and firing-alert checks run again after
+claims are paused and directly before Helm; either late regression restores
+the prior claims state and stops without an upgrade. Homelab Roadmap approval
+rows are owned outside this repository;
 the deployment coordinator must prove that cross-repository gate before
 invoking `deploy.sh` rather than relying on a tautological in-repo marker.
 
