@@ -196,6 +196,179 @@ func runLocalVerifyWithEnvironment(t *testing.T, env []string, args ...string) (
 	return exitCode, string(out)
 }
 
+func runPwshCommand(t *testing.T, command string, env ...string) (string, error) {
+	t.Helper()
+	pwshPath, err := exec.LookPath("pwsh")
+	if err != nil {
+		t.Skip("pwsh not installed")
+	}
+	cmd := exec.Command(pwshPath, "-NoProfile", "-Command", command)
+	cmd.Env = append(os.Environ(), env...)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+func TestLocalVerifyConvertWindowsPathToWslPreservesLiteralArgv(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not installed")
+	}
+
+	root := findRepoRoot(t)
+	scriptPath := filepath.Join(root, "scripts", "local-verify.ps1")
+	binDir := filepath.Join(t.TempDir(), "fake-bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir fake bin: %v", err)
+	}
+	capturePath := filepath.Join(binDir, "fake-wsl.capture")
+	wslPath := filepath.Join(binDir, "wsl.exe")
+	program := `package main
+
+import (
+    "fmt"
+    "os"
+    "strings"
+)
+
+func main() {
+    capture := os.Getenv("FAKE_WSL_CAPTURE")
+    if capture != "" {
+        _ = os.WriteFile(capture, []byte(strings.Join(os.Args[1:], "\n")), 0o600)
+    }
+    fmt.Println("/mnt/c/Users/jmal1/Repo With Spaces/demo")
+}
+`
+	if err := os.WriteFile(filepath.Join(binDir, "main.go"), []byte(program), 0o600); err != nil {
+		t.Fatalf("write fake wsl source: %v", err)
+	}
+	build := exec.Command("go", "build", "-o", wslPath, filepath.Join(binDir, "main.go"))
+	build.Dir = binDir
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build fake wsl.exe: %v (%s)", err, out)
+	}
+
+	wantWindowsPath := `C:\Users\jmal1\Repo With Spaces\demo`
+	wantLinuxPath := "/mnt/c/Users/jmal1/Repo With Spaces/demo"
+	command := fmt.Sprintf("$ErrorActionPreference='Stop'; $env:PATH='%s;' + $env:PATH; . '%s'; $actual = Convert-WindowsPathToWsl -WindowsPath '%s'; if ($actual -ne '%s') { throw \"unexpected WSL path: $actual\" }; 'OK'", binDir, scriptPath, wantWindowsPath, wantLinuxPath)
+	output, err := runPwshCommand(t, command, "FAKE_WSL_CAPTURE="+capturePath)
+	if err != nil {
+		t.Fatalf("Convert-WindowsPathToWsl failed: %v\n%s", err, output)
+	}
+	capture, err := os.ReadFile(capturePath)
+	if err != nil {
+		t.Fatalf("read captured WSL argv: %v", err)
+	}
+	gotArgs := strings.Split(strings.TrimSpace(string(capture)), "\n")
+	wantArgs := []string{"-e", "wslpath", "-u", "--", wantWindowsPath}
+	if strings.Join(gotArgs, "\n") != strings.Join(wantArgs, "\n") {
+		t.Fatalf("WSL argv mismatch: got %q want %q", strings.Join(gotArgs, "\n"), strings.Join(wantArgs, "\n"))
+	}
+	if !strings.Contains(output, "OK") {
+		t.Fatalf("Convert-WindowsPathToWsl did not return the converted WSL path; output: %s", output)
+	}
+}
+
+func TestLocalVerifyCompareBundleDirectoriesHandlesZeroOneAndMultipleMismatches(t *testing.T) {
+	root := findRepoRoot(t)
+	scriptPath := filepath.Join(root, "scripts", "local-verify.ps1")
+	cases := []struct {
+		name     string
+		actual   map[string]string
+		expected map[string]string
+		want     int
+	}{
+		{name: "zero", actual: map[string]string{"alpha.txt": "one"}, expected: map[string]string{"alpha.txt": "one"}, want: 0},
+		{name: "one", actual: map[string]string{"alpha.txt": "one"}, expected: map[string]string{"alpha.txt": "two"}, want: 1},
+		{name: "multiple", actual: map[string]string{"alpha.txt": "one", "beta.txt": "two"}, expected: map[string]string{"alpha.txt": "three", "beta.txt": "four"}, want: 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			baseDir := t.TempDir()
+			actualDir := filepath.Join(baseDir, "actual")
+			expectedDir := filepath.Join(baseDir, "expected")
+			if err := os.MkdirAll(actualDir, 0o755); err != nil {
+				t.Fatalf("mkdir actual: %v", err)
+			}
+			if err := os.MkdirAll(expectedDir, 0o755); err != nil {
+				t.Fatalf("mkdir expected: %v", err)
+			}
+			for rel, content := range tc.actual {
+				if err := os.MkdirAll(filepath.Dir(filepath.Join(actualDir, rel)), 0o755); err != nil {
+					t.Fatalf("mkdir actual parent for %s: %v", rel, err)
+				}
+				if err := os.WriteFile(filepath.Join(actualDir, rel), []byte(content), 0o600); err != nil {
+					t.Fatalf("write actual %s: %v", rel, err)
+				}
+			}
+			for rel, content := range tc.expected {
+				if err := os.MkdirAll(filepath.Dir(filepath.Join(expectedDir, rel)), 0o755); err != nil {
+					t.Fatalf("mkdir expected parent for %s: %v", rel, err)
+				}
+				if err := os.WriteFile(filepath.Join(expectedDir, rel), []byte(content), 0o600); err != nil {
+					t.Fatalf("write expected %s: %v", rel, err)
+				}
+			}
+			command := fmt.Sprintf("$ErrorActionPreference='Stop'; . '%s'; $diffs = Compare-BundleDirectories -Actual '%s' -Expected '%s'; if ($diffs.Count -ne %d) { throw ('unexpected mismatch count: ' + ($diffs -join '; ')) }; 'OK'", scriptPath, actualDir, expectedDir, tc.want)
+			output, err := runPwshCommand(t, command)
+			if err != nil {
+				t.Fatalf("Compare-BundleDirectories failed for %s: %v\n%s", tc.name, err, output)
+			}
+			if !strings.Contains(output, "OK") {
+				t.Fatalf("Compare-BundleDirectories did not report the expected count for %s; output: %s", tc.name, output)
+			}
+		})
+	}
+}
+
+func TestLocalVerifyGetGoFormattingTargetsOnlyIncludesChangedFiles(t *testing.T) {
+	repoRoot := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(repoRoot, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	for _, cmd := range [][]string{
+		{"git", "init"},
+		{"git", "config", "user.name", "Local Verifier"},
+		{"git", "config", "user.email", "local-verifier@example.com"},
+	} {
+		performed := exec.Command(cmd[0], cmd[1:]...)
+		performed.Dir = repoRoot
+		if out, err := performed.CombinedOutput(); err != nil {
+			t.Fatalf("run %v: %v\n%s", cmd, err, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "go.mod"), []byte("module example.com/localverify\n\ngo 1.22\n"), 0o600); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o600); err != nil {
+		t.Fatalf("write main.go: %v", err)
+	}
+	for _, cmd := range [][]string{{"git", "add", "."}, {"git", "commit", "-m", "init"}} {
+		performed := exec.Command(cmd[0], cmd[1:]...)
+		performed.Dir = repoRoot
+		if out, err := performed.CombinedOutput(); err != nil {
+			t.Fatalf("run %v: %v\n%s", cmd, err, out)
+		}
+	}
+
+	scriptPath := filepath.Join(findRepoRoot(t), "scripts", "local-verify.ps1")
+	command := fmt.Sprintf("$ErrorActionPreference='Stop'; . '%s'; $targets = Get-GoFormattingTargets -Root '%s'; if ($targets.Count -ne 0) { throw ('expected unmodified repo to have zero formatting targets, got: ' + ($targets -join ', ')) }; 'OK'", scriptPath, repoRoot)
+	output, err := runPwshCommand(t, command)
+	if err != nil {
+		t.Fatalf("Get-GoFormattingTargets unexpectedly saw unmodified files: %v\n%s", err, output)
+	}
+
+	if err := os.WriteFile(filepath.Join(repoRoot, "main.go"), []byte("package main\n\nfunc main(){println(\"demo\")}\n"), 0o600); err != nil {
+		t.Fatalf("rewrite main.go to intentionally unformatted state: %v", err)
+	}
+	command = fmt.Sprintf("$ErrorActionPreference='Stop'; . '%s'; $targets = Get-GoFormattingTargets -Root '%s'; if ($targets.Count -ne 1) { throw ('expected one changed Go file, got: ' + ($targets -join ', ')) }; if ($targets[0] -ne 'main.go') { throw ('expected main.go to be the changed file, got: ' + ($targets -join ', ')) }; 'OK'", scriptPath, repoRoot)
+	output, err = runPwshCommand(t, command)
+	if err != nil {
+		t.Fatalf("Get-GoFormattingTargets failed to pick up intentionally unformatted Go changes: %v\n%s", err, output)
+	}
+	if !strings.Contains(output, "OK") {
+		t.Fatalf("Get-GoFormattingTargets did not report the changed file as expected; output: %s", output)
+	}
+}
+
 func TestLocalVerifyExplicitMissingToolFails(t *testing.T) {
 	testCases := []struct {
 		name string
@@ -205,7 +378,7 @@ func TestLocalVerifyExplicitMissingToolFails(t *testing.T) {
 		{name: "tier0-missing-go", args: []string{"-Tier", "0"}, env: []string{"LOCAL_VERIFY_FORCE_MISSING_TOOLS=go"}},
 		{name: "tier1-missing-go-and-wsl", args: []string{"-Tier", "1"}, env: []string{"LOCAL_VERIFY_FORCE_MISSING_TOOLS=go,wsl"}},
 		{name: "tier3-missing-docker", args: []string{"-Tier", "3"}, env: []string{"LOCAL_VERIFY_FORCE_MISSING_TOOLS=docker"}},
-		{name: "tier4-missing-ssh", args: []string{"-RemoteHelm", "-RemoteHost", "k3sv01.lab.jmal.io"}, env: []string{"LOCAL_VERIFY_FORCE_MISSING_TOOLS=ssh"}},
+		{name: "tier4-missing-ssh", args: []string{"-Tier", "4", "-RemoteHelm", "-RemoteHost", "k3sv01.lab.jmal.io"}, env: []string{"LOCAL_VERIFY_FORCE_MISSING_TOOLS=ssh"}},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {

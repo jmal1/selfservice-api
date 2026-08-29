@@ -23,6 +23,130 @@ $script:ExpectedWikiSeeds = @(
     "docs/ai/build-workflow-prompt.md"
 )
 
+function Quote-BashSingleQuoted {
+    param(
+        [AllowEmptyString()]
+        [string]$Value
+    )
+
+    if ($null -eq $Value) {
+        return "''"
+    }
+
+    $text = [string]$Value
+    return '"' + $text.Replace('`', '``').Replace('"', '`"').Replace('$', '`$') + '"'
+}
+
+function Normalize-WslPath {
+    param(
+        [AllowEmptyString()]
+        [string]$Value
+    )
+
+    if ($null -eq $Value) {
+        return ""
+    }
+
+    $text = [string]$Value
+    $text = $text.Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return ""
+    }
+
+    return $text.Replace('\\', '/').TrimEnd('/')
+}
+
+function Join-WslPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Segments
+    )
+
+    $parts = [System.Collections.Generic.List[string]]::new()
+    foreach ($segment in $Segments) {
+        if ($null -eq $segment) {
+            continue
+        }
+
+        $text = [string]$segment
+        if ([string]::IsNullOrWhiteSpace($text)) {
+            continue
+        }
+
+        $text = $text.Trim().TrimEnd('/').TrimEnd('\\')
+        if (-not [string]::IsNullOrWhiteSpace($text)) {
+            $parts.Add($text)
+        }
+    }
+
+    if ($parts.Count -eq 0) {
+        return ""
+    }
+
+    return (Normalize-WslPath -Value ([string]::Join('/', $parts)))
+}
+
+function Convert-WindowsPathToWsl {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$WindowsPath
+    )
+
+    $result = & wsl.exe @('-e', 'wslpath', '-u', '--', $WindowsPath) 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "wsl.exe could not translate the Windows repo path '$WindowsPath': $(Format-TrimmedOutput ($result | Out-String))"
+    }
+
+    return Normalize-WslPath -Value (Format-TrimmedOutput ($result | Out-String))
+}
+
+function Get-GoFormattingTargets {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Root
+    )
+
+    $gitCmd = Get-Command -Name git -ErrorAction SilentlyContinue
+    if (-not $gitCmd) {
+        return @()
+    }
+
+    $candidates = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    Push-Location $Root
+    try {
+        foreach ($args in @(
+            @('diff', '--name-only', '--diff-filter=ACMR', '--', '*.go'),
+            @('diff', '--cached', '--name-only', '--diff-filter=ACMR', '--', '*.go'),
+            @('ls-files', '--others', '--exclude-standard', '--', '*.go')
+        )) {
+            $output = & git @args 2>$null
+            if ($LASTEXITCODE -ne 0) {
+                continue
+            }
+
+            foreach ($line in @($output)) {
+                $path = [string]$line
+                if ([string]::IsNullOrWhiteSpace($path)) {
+                    continue
+                }
+                $path = $path.Trim()
+                if ($path.EndsWith('.go', [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $null = $candidates.Add($path)
+                }
+            }
+        }
+    }
+    finally {
+        Pop-Location
+    }
+
+    $result = [System.Collections.Generic.List[string]]::new()
+    foreach ($path in ($candidates | Sort-Object)) {
+        $result.Add($path)
+    }
+    Write-Output -NoEnumerate $result
+}
+
 function Write-TierResult {
     param(
         [int]$Index,
@@ -52,7 +176,7 @@ function Get-WikiSeedPaths {
     }
 
     $collect = $false
-    $seeds = @()
+    $seedList = [System.Collections.Generic.List[string]]::new()
     foreach ($line in Get-Content -Path $makefilePath) {
         if (-not $collect) {
             if ($line -match '^\s*WIKI_SEEDS\s*:=\s*\\\s*$') {
@@ -73,16 +197,16 @@ function Get-WikiSeedPaths {
         foreach ($chunk in ($trimmed -split '\\')) {
             $seed = $chunk.Trim()
             if (-not [string]::IsNullOrWhiteSpace($seed)) {
-                $seeds += $seed
+                $seedList.Add($seed)
             }
         }
     }
 
-    if ($seeds.Count -eq 0) {
+    if ($seedList.Count -eq 0) {
         throw "Could not parse WIKI_SEEDS from $makefilePath"
     }
 
-    return $seeds
+    Write-Output -NoEnumerate $seedList
 }
 
 function Assert-WikiSeedSetMatchesMakefile {
@@ -95,15 +219,40 @@ function Assert-WikiSeedSetMatchesMakefile {
         throw "WIKI_SEEDS drifted: Makefile defines $($SeedPaths.Count) seeds but the local verifier expects $($ExpectedSeeds.Count)."
     }
 
-    $normalizedActual = @($SeedPaths | ForEach-Object { [string]$_ } | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
-    $normalizedExpected = @($ExpectedSeeds | ForEach-Object { [string]$_ } | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+    $normalizedActual = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($seed in $SeedPaths) {
+        $value = [string]$seed
+        $value = $value.Trim()
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            $null = $normalizedActual.Add($value)
+        }
+    }
 
-    $missing = @($normalizedExpected | Where-Object { $normalizedActual -notcontains $_ })
+    $normalizedExpected = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($seed in $ExpectedSeeds) {
+        $value = [string]$seed
+        $value = $value.Trim()
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            $null = $normalizedExpected.Add($value)
+        }
+    }
+
+    $missing = [System.Collections.Generic.List[string]]::new()
+    foreach ($expected in $normalizedExpected) {
+        if (-not $normalizedActual.Contains($expected)) {
+            $missing.Add($expected)
+        }
+    }
     if ($missing.Count -gt 0) {
         throw "WIKI_SEEDS drifted: missing expected seed(s): $($missing -join ', ')"
     }
 
-    $extra = @($normalizedActual | Where-Object { $normalizedExpected -notcontains $_ })
+    $extra = [System.Collections.Generic.List[string]]::new()
+    foreach ($actual in $normalizedActual) {
+        if (-not $normalizedExpected.Contains($actual)) {
+            $extra.Add($actual)
+        }
+    }
     if ($extra.Count -gt 0) {
         throw "WIKI_SEEDS drifted: unexpected seed(s): $($extra -join ', ')"
     }
@@ -203,24 +352,24 @@ function Compare-BundleDirectories {
 
     $actualMap = Get-FileHashes -Root $Actual
     $expectedMap = Get-FileHashes -Root $Expected
-    $allKeys = @($actualMap.Keys + $expectedMap.Keys | Select-Object -Unique)
-    $mismatches = @()
+    $allKeys = @(@($actualMap.Keys) + @($expectedMap.Keys) | Select-Object -Unique)
+    $mismatchList = [System.Collections.Generic.List[string]]::new()
 
     foreach ($key in $allKeys) {
         if (-not $actualMap.ContainsKey($key)) {
-            $mismatches += "$key (missing in generated bundle)"
+            $mismatchList.Add("$key (missing in generated bundle)")
             continue
         }
         if (-not $expectedMap.ContainsKey($key)) {
-            $mismatches += "$key (missing in committed bundle)"
+            $mismatchList.Add("$key (missing in committed bundle)")
             continue
         }
         if ($actualMap[$key] -ne $expectedMap[$key]) {
-            $mismatches += "$key (sha256 mismatch)"
+            $mismatchList.Add("$key (sha256 mismatch)")
         }
     }
 
-    return $mismatches
+    Write-Output -NoEnumerate $mismatchList
 }
 
 function Get-SelectedTiers {
@@ -244,6 +393,10 @@ function Get-SelectedTiers {
     return @($wanted | Sort-Object -Unique)
 }
 
+if ($MyInvocation.InvocationName -eq ".") {
+    return
+}
+
 $selectedTiers = Get-SelectedTiers -SelectedTier $Tier -RemoteCheckRequested ([bool]$RemoteHelm)
 if ($Tier -eq "4") {
     $selectedTiers = @(4)
@@ -263,13 +416,16 @@ if ($selectedTiers -contains 0) {
     else {
         Push-Location $repoRoot
         try {
-            $gofmtDirs = & go list -f "{{.Dir}}" ./internal/... 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                Write-TierResult -Index 0 -Name "gofmt + go vet + short Go tests" -State "FAIL" -Details (Format-TrimmedOutput ($gofmtDirs | Out-String))
-                $script:AnyFail = $true
+            $gofmtTargets = [System.Collections.Generic.List[string]]::new()
+            foreach ($candidate in (Get-GoFormattingTargets -Root $repoRoot)) {
+                $resolved = Join-Path $repoRoot $candidate
+                if ($resolved -and -not [string]::IsNullOrWhiteSpace([string]$resolved)) {
+                    $gofmtTargets.Add($resolved)
+                }
             }
-            else {
-                $gofmtOutput = & gofmt -l @($gofmtDirs | Where-Object { $_ -and -not [string]::IsNullOrWhiteSpace([string]$_) }) 2>&1
+
+            if ($gofmtTargets.Count -gt 0) {
+                $gofmtOutput = & gofmt -l @($gofmtTargets) 2>&1
                 $gofmtProblems = @($gofmtOutput | Where-Object { $_ -and -not [string]::IsNullOrWhiteSpace([string]$_) })
                 if ($LASTEXITCODE -ne 0 -or $gofmtProblems.Count -gt 0) {
                     $detail = if ($gofmtProblems.Count -gt 0) { Format-TrimmedOutput ($gofmtProblems | Out-String) } else { "gofmt reported unformatted files." }
@@ -297,6 +453,30 @@ if ($selectedTiers -contains 0) {
                             else {
                                 Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "PASS" -Details "gofmt, build, vet, and short Go tests succeeded."
                             }
+                        }
+                    }
+                }
+            }
+            else {
+                $buildOutput = & go build ./... 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details (Format-TrimmedOutput ($buildOutput | Out-String))
+                    $script:AnyFail = $true
+                }
+                else {
+                    $vetOutput = & go vet ./... 2>&1
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details (Format-TrimmedOutput ($vetOutput | Out-String))
+                        $script:AnyFail = $true
+                    }
+                    else {
+                        $testOutput = & go test ./... -short -count=1 2>&1
+                        if ($LASTEXITCODE -ne 0) {
+                            Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details (Format-TrimmedOutput ($testOutput | Out-String))
+                            $script:AnyFail = $true
+                        }
+                        else {
+                            Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "PASS" -Details "No changed/untracked Go files required formatting; build, vet, and short Go tests succeeded."
                         }
                     }
                 }
@@ -352,21 +532,18 @@ if ($selectedTiers -contains 1) {
                 $script:AnyFail = $true
             }
             else {
-                $wslRepo = & wsl.exe wslpath -u $repoRoot 2>&1
+                $wslRepo = Convert-WindowsPathToWsl -WindowsPath $repoRoot
+                $wslPkgDir = Join-WslPath -Segments @($wslRepo, 'internal', 'provisioning')
+                $wslBinary = Join-WslPath -Segments @($wslRepo, '.tmp', 'provisioning-linux.test')
+                $quotedPkgDir = Quote-BashSingleQuoted -Value $wslPkgDir
+                $quotedBinary = Quote-BashSingleQuoted -Value $wslBinary
+                $runOutput = & wsl.exe @('bash', '-lc', "cd $quotedPkgDir && chmod +x $quotedBinary && $quotedBinary -test.v") 2>&1
                 if ($LASTEXITCODE -ne 0) {
-                    Write-TierResult -Index 1 -Name "internal/provisioning Linux deploy-script tests" -State "FAIL" -Details (Format-TrimmedOutput ($wslRepo | Out-String))
+                    Write-TierResult -Index 1 -Name "internal/provisioning Linux deploy-script tests" -State "FAIL" -Details (Format-TrimmedOutput ($runOutput | Out-String))
                     $script:AnyFail = $true
                 }
                 else {
-                    $wslRepo = Format-TrimmedOutput ($wslRepo | Out-String)
-                    $runOutput = & wsl.exe bash -lc "cd '$wslRepo' && chmod +x .tmp/provisioning-linux.test && ./.tmp/provisioning-linux.test -test.v" 2>&1
-                    if ($LASTEXITCODE -ne 0) {
-                        Write-TierResult -Index 1 -Name "internal/provisioning Linux deploy-script tests" -State "FAIL" -Details (Format-TrimmedOutput ($runOutput | Out-String))
-                        $script:AnyFail = $true
-                    }
-                    else {
-                        Write-TierResult -Index 1 -Name "internal/provisioning Linux deploy-script tests" -State "PASS" -Details "Linux cross-compile and POSIX deploy-script tests passed under WSL."
-                    }
+                    Write-TierResult -Index 1 -Name "internal/provisioning Linux deploy-script tests" -State "PASS" -Details "Linux cross-compile and POSIX deploy-script tests passed under WSL."
                 }
             }
         }
