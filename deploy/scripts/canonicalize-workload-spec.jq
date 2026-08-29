@@ -30,6 +30,23 @@ def validate_managed_annotation($key; $expected):
     .
   end;
 
+def validate_managed_label($key; $expected):
+  if has($key) then
+    .[$key] as $actual
+    | if ($actual | type) != "string" then
+        error(".metadata.labels[" + ($key | tojson) + "] must be a string")
+      elif $actual != $expected then
+        error(
+          ".metadata.labels[" + ($key | tojson) + "] must equal " +
+          ($expected | tojson)
+        )
+      else
+        .
+      end
+  else
+    .
+  end;
+
 . | require_object("resource") as $resource
 | if $resource.kind != $kind then
     error("resource kind must be " + $kind)
@@ -40,6 +57,7 @@ def validate_managed_annotation($key; $expected):
       else
         $resource.metadata | require_object(".metadata") as $metadata
         | $metadata.annotations | optional_object(".metadata.annotations") as $annotations
+        | $metadata.labels | optional_object(".metadata.labels") as $labels
         | ($annotations // {})
         | validate_managed_annotation("meta.helm.sh/release-name"; $release)
         | validate_managed_annotation("meta.helm.sh/release-namespace"; $namespace)
@@ -52,6 +70,10 @@ def validate_managed_annotation($key; $expected):
           else
             .
           end) as $normalized_annotations
+        | ($labels // {})
+        | validate_managed_label("app.kubernetes.io/managed-by"; "Helm")
+        | del(."app.kubernetes.io/managed-by")
+        | . as $normalized_labels
         | {
             metadata: {
               annotations: $normalized_annotations
@@ -69,12 +91,16 @@ def validate_managed_annotation($key; $expected):
     | $template.spec | require_object(".spec.template.spec") as $pod_spec
     | $metadata.annotations | optional_object(".spec.template.metadata.annotations") as $annotations
     | $metadata.labels | optional_object(".spec.template.metadata.labels") as $labels
+    | ($labels // {})
+    | validate_managed_label("app.kubernetes.io/managed-by"; "Helm")
+    | del(."app.kubernetes.io/managed-by")
+    | . as $normalized_labels
     | $metadata.finalizers | optional_array(".spec.template.metadata.finalizers") as $finalizers
     | {
         templateSpec: $pod_spec,
         templateMetadata: {
           annotations: $annotations,
-          labels: (($labels // {}) | del(
+          labels: ($normalized_labels | del(
             ."batch.kubernetes.io/controller-uid",
             ."batch.kubernetes.io/job-name",
             ."controller-uid",
