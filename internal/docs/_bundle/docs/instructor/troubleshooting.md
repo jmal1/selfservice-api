@@ -178,6 +178,32 @@ Buildx `.dockerbuild` record. The record must bind the exported digest to the
 repository, full source revision, expected short-SHA tag, and exact run attempt.
 The selected GHCR digest's immutable OCI revision label must match too.
 
+For a real apply, set `DEPLOY_PROMETHEUS_URL` to the Prometheus base URL. After
+candidate rendering and server dry-run, but before the release lock or any live
+mutation, `deploy.sh` runs the Gate A4 preflight. It fails closed unless:
+
+- migration files are contiguous from version 1, every up migration has a
+  matching down migration, and PostgreSQL reports the exact latest version
+  clean;
+- no create/import-capable provisioning job is pending, claimed, in progress,
+  or rolling back;
+- the active `synthetic` user has pod quota for one more pod;
+- no nonterminal Kubernetes Job is owned by the API-monitor, janitor, or
+  runner synthetic CronJobs, including the controller window before a new Job
+  reports an active pod;
+- every source-built candidate image is digest-pinned and its OCI revision
+  matches the exact API or UI source SHA; and
+- every firing Prometheus alert name appears exactly in
+  `deploy/known-firing-alerts.txt`.
+
+The firing-alert allowlist accepts one Prometheus-safe `alertname` per line and
+rejects malformed or duplicate entries. It is intentionally empty until a
+specific firing alert is justified for a deployment. Query failures, missing
+records, malformed responses, and unknown states all stop before lock
+acquisition. Homelab Roadmap approval rows are owned outside this repository;
+the deployment coordinator must prove that cross-repository gate before
+invoking `deploy.sh` rather than relying on a tautological in-repo marker.
+
 Production API synthetic feedback keeps the API-monitor CronJob active with `spec.suspend=false` and intentionally renders `SYNTHETIC_LIFECYCLE_ENABLED=true` after cleanup safety has been proven. Deploy rollback containment still forces lifecycle off and suspends clone-producing synthetic CronJobs before accepting rollback state. The external `synthetic-ui.timer` on `netbirdv01` is outside Kubernetes and Helm: verify that host-level state independently before and after this procedure.
 
 ### Synthetic producer coverage alerts

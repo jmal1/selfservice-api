@@ -897,6 +897,23 @@ repository, source revision, expected short-SHA tag, and builder run attempt
 must agree, and the selected GHCR digest must carry the same immutable OCI
 revision label. Exactly the UI container is replaced with that proven digest.
 
+A real apply also requires `DEPLOY_PROMETHEUS_URL`. After immutable candidate
+rendering and server validation, but before the release lock, claims pause, or
+any live mutation, the Gate A4 preflight requires contiguous paired migrations
+with PostgreSQL at the exact clean head; zero pending, claimed, in-progress, or
+rollback create/import-capable provisioning jobs; one free pod slot for the
+active primary synthetic user; no nonterminal Job owned by the API-monitor,
+janitor, or runner synthetic CronJobs (including the pre-pod controller
+window); digest-pinned candidate images whose OCI revision matches the exact
+API/UI source SHA; and firing Prometheus alert names that are a subset of
+`deploy/known-firing-alerts.txt`. The allowlist is one exact
+Prometheus-safe alert name per line, rejects duplicates, and remains empty
+unless a current firing alert is explicitly justified. Every query, read,
+parse, malformed, missing, or unknown result fails before lock acquisition.
+Homelab Roadmap rows are outside this repository's authority, so the deployment
+coordinator must prove that cross-repository gate before invoking `deploy.sh`;
+there is no in-repo checkbox that pretends to prove it.
+
 If the stored rollback revision renders claims disabled but the live worker has
 a temporary claims-enabled override, candidate provenance, rendering, and its
 first server dry-run still happen without mutation. A real apply then acquires
