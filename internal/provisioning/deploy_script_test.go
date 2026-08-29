@@ -4905,6 +4905,32 @@ func writeDeployLockFixture(
 ) {
 	t.Helper()
 	holder := fmt.Sprintf("%s|%d|%s", hostname, pid, created.UTC().Format("2006-01-02T15:04:05Z"))
+	writeDeployLockFixtureWithHolder(t, env, holder, created, uid, resourceVersion)
+}
+
+func writeLegacyDeployLockFixture(
+	t *testing.T,
+	env *deployScriptEnvironment,
+	hostname string,
+	pid int,
+	created time.Time,
+	uid string,
+	resourceVersion string,
+) {
+	t.Helper()
+	holder := fmt.Sprintf("%s-%d-%s", hostname, pid, created.UTC().Format("20060102T150405Z"))
+	writeDeployLockFixtureWithHolder(t, env, holder, created, uid, resourceVersion)
+}
+
+func writeDeployLockFixtureWithHolder(
+	t *testing.T,
+	env *deployScriptEnvironment,
+	holder string,
+	created time.Time,
+	uid string,
+	resourceVersion string,
+) {
+	t.Helper()
 	writeFile(t, env.lockFile, fmt.Sprintf(`{
   "apiVersion": "v1",
   "kind": "ConfigMap",
@@ -5006,22 +5032,112 @@ func TestDeployScriptStaleReleaseLockRecovery(t *testing.T) {
 		assertNoUpgrade(t, env)
 	})
 
-	t.Run("expired lock reclaims despite same-host PID collision", func(t *testing.T) {
+	t.Run("expired same-host live holder blocks", func(t *testing.T) {
 		env := newDeployScriptEnvironment(t, manifest, manifest)
 		writeDeployLockFixture(t, env, localHostname, os.Getpid(), now.Add(-7*time.Hour), "expired-lock-uid", "44")
+		output, runErr := runPrepare(env)
+		if runErr == nil {
+			t.Fatalf("expired same-host live lock was reclaimed:\n%s", output)
+		}
+		if !strings.Contains(string(output), "regardless of lease age") {
+			t.Fatalf("failure did not document the live-PID safety override:\n%s", output)
+		}
+		assertNoUpgrade(t, env)
+	})
+
+	t.Run("expired remote-host holder backs up and reclaims", func(t *testing.T) {
+		env := newDeployScriptEnvironment(t, manifest, manifest)
+		writeDeployLockFixture(t, env, "other-deploy-host", deadPID, now.Add(-7*time.Hour), "expired-remote-lock-uid", "44a")
 		expected, readErr := os.ReadFile(env.lockFile)
 		if readErr != nil {
 			t.Fatal(readErr)
 		}
 		output, runErr := runPrepare(env)
 		if runErr != nil {
-			t.Fatalf("expired lock was not reclaimed: %v\n%s", runErr, output)
+			t.Fatalf("expired remote lock was not reclaimed: %v\n%s", runErr, output)
 		}
 		if !strings.Contains(string(output), "lease expired") {
-			t.Fatalf("recovery did not document lease expiry:\n%s", output)
+			t.Fatalf("recovery did not document remote lease expiry:\n%s", output)
 		}
 		assertBackup(t, env, expected)
 	})
+
+	t.Run("legacy young same-host live holder blocks", func(t *testing.T) {
+		env := newDeployScriptEnvironment(t, manifest, manifest)
+		writeLegacyDeployLockFixture(t, env, localHostname, os.Getpid(), now, "legacy-live-lock-uid", "44b")
+		output, runErr := runPrepare(env)
+		if runErr == nil {
+			t.Fatalf("legacy live lock was reclaimed:\n%s", output)
+		}
+		if !strings.Contains(string(output), "live local PID") {
+			t.Fatalf("failure did not identify legacy live same-host holder:\n%s", output)
+		}
+		assertNoUpgrade(t, env)
+	})
+
+	t.Run("legacy young same-host dead holder backs up and reclaims", func(t *testing.T) {
+		env := newDeployScriptEnvironment(t, manifest, manifest)
+		writeLegacyDeployLockFixture(t, env, localHostname, deadPID, now, "legacy-dead-lock-uid", "44c")
+		expected, readErr := os.ReadFile(env.lockFile)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		output, runErr := runPrepare(env)
+		if runErr != nil {
+			t.Fatalf("legacy dead same-host lock was not reclaimed: %v\n%s", runErr, output)
+		}
+		assertBackup(t, env, expected)
+	})
+
+	t.Run("legacy expired same-host live holder blocks", func(t *testing.T) {
+		env := newDeployScriptEnvironment(t, manifest, manifest)
+		writeLegacyDeployLockFixture(t, env, localHostname, os.Getpid(), now.Add(-7*time.Hour), "legacy-expired-live-lock-uid", "44d")
+		output, runErr := runPrepare(env)
+		if runErr == nil {
+			t.Fatalf("legacy expired same-host live lock was reclaimed:\n%s", output)
+		}
+		if !strings.Contains(string(output), "regardless of lease age") {
+			t.Fatalf("failure did not document the legacy live-PID safety override:\n%s", output)
+		}
+		assertNoUpgrade(t, env)
+	})
+
+	t.Run("legacy expired remote-host holder backs up and reclaims", func(t *testing.T) {
+		env := newDeployScriptEnvironment(t, manifest, manifest)
+		writeLegacyDeployLockFixture(t, env, "legacy-remote-deploy-host", deadPID, now.Add(-7*time.Hour), "legacy-expired-remote-lock-uid", "44e")
+		expected, readErr := os.ReadFile(env.lockFile)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		output, runErr := runPrepare(env)
+		if runErr != nil {
+			t.Fatalf("legacy expired remote lock was not reclaimed: %v\n%s", runErr, output)
+		}
+		assertBackup(t, env, expected)
+	})
+
+	for _, malformedHolder := range []struct {
+		name   string
+		holder string
+	}{
+		{name: "legacy missing PID", holder: "legacyhost-20260101T000000Z"},
+		{name: "legacy zero PID", holder: "legacyhost-0-20260101T000000Z"},
+		{name: "legacy timestamp separators", holder: "legacyhost-99999999-2026-01-01T00:00:00Z"},
+		{name: "legacy impossible timestamp", holder: "legacyhost-99999999-20269999T999999Z"},
+	} {
+		t.Run("malformed "+malformedHolder.name+" blocks", func(t *testing.T) {
+			env := newDeployScriptEnvironment(t, manifest, manifest)
+			writeDeployLockFixtureWithHolder(t, env, malformedHolder.holder, now, "legacy-malformed-uid", "44f")
+			output, runErr := runPrepare(env)
+			if runErr == nil {
+				t.Fatalf("malformed legacy lock was reclaimed:\n%s", output)
+			}
+			if !strings.Contains(string(output), "malformed") {
+				t.Fatalf("malformed legacy lock failed for wrong reason:\n%s", output)
+			}
+			assertNoUpgrade(t, env)
+		})
+	}
 
 	for _, malformed := range []struct {
 		name            string
@@ -5210,8 +5326,10 @@ func TestDeployScriptStaleLockGuardsAreLoadBearing(t *testing.T) {
 	t.Run("lease TTL", func(t *testing.T) {
 		runSabotage(
 			t,
-			`  if [ "$lock_age" -lt "$HELM_RELEASE_LOCK_TTL_SECONDS" ]; then`,
-			"  if false; then",
+			`  else
+    if [ "$lock_age" -lt "$HELM_RELEASE_LOCK_TTL_SECONDS" ]; then`,
+			`  else
+    if false; then`,
 			func(env *deployScriptEnvironment) {
 				writeDeployLockFixture(t, env, "remote-deploy-host", 99999999, time.Now(), "ttl-sabotage-uid", "52")
 			},

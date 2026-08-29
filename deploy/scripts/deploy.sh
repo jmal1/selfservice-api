@@ -128,7 +128,8 @@ HELM_RELEASE_LOCK_PRESERVE=false
 HELM_RELEASE_LOCK_CREATE_PENDING=false
 # A guarded deploy can perform several sequential five-minute workload-health
 # passes around the Helm timeout. Six hours stays above the current worst-case
-# envelope while still giving an abandoned cross-host lock an explicit expiry.
+# envelope while giving an abandoned cross-host lock an explicit expiry. A
+# same-host holder with a live PID never expires because there is no heartbeat.
 HELM_RELEASE_LOCK_TTL_SECONDS="${HELM_RELEASE_LOCK_TTL_SECONDS:-21600}"
 HELM_RELEASE_LOCK_BACKUP_DIR="${HELM_RELEASE_LOCK_BACKUP_DIR:-/home/jmal/selfservice-deploy-backups}"
 LIVE_CLAIMS_RESTORE_PENDING=false
@@ -172,7 +173,7 @@ validate_helm_release_lock_settings() {
 }
 
 lock_identity_from_json() {
-  local lock_json=$1 identity holder holder_timestamp
+  local lock_json=$1 identity holder holder_hostname holder_pid holder_timestamp
   identity="$(
     jq -er \
       --arg name "$HELM_RELEASE_LOCK" \
@@ -201,9 +202,14 @@ lock_identity_from_json() {
   }
   IFS=$'\t' read -r holder HELM_RELEASE_LOCK_OBSERVED_TIMESTAMP HELM_RELEASE_LOCK_OBSERVED_UID HELM_RELEASE_LOCK_OBSERVED_RESOURCE_VERSION <<< "$identity"
   if [[ "$holder" =~ ^([A-Za-z0-9._-]+)\|([1-9][0-9]*)\|([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z)$ ]]; then
-    HELM_RELEASE_LOCK_OBSERVED_HOSTNAME=${BASH_REMATCH[1]}
-    HELM_RELEASE_LOCK_OBSERVED_PID=${BASH_REMATCH[2]}
+    holder_hostname=${BASH_REMATCH[1]}
+    holder_pid=${BASH_REMATCH[2]}
     holder_timestamp=${BASH_REMATCH[3]}
+  elif [[ "$holder" =~ ^([A-Za-z0-9._-]+)-([1-9][0-9]*)-([0-9]{8}T[0-9]{6}Z)$ ]]; then
+    holder_hostname=${BASH_REMATCH[1]}
+    holder_pid=${BASH_REMATCH[2]}
+    holder_timestamp=${BASH_REMATCH[3]}
+    holder_timestamp="${holder_timestamp:0:4}-${holder_timestamp:4:2}-${holder_timestamp:6:2}T${holder_timestamp:9:2}:${holder_timestamp:11:2}:${holder_timestamp:13:2}Z"
   else
     echo "ERROR: Helm release lock configmap/$HELM_RELEASE_LOCK has malformed holder identity; refusing mutation." >&2
     return 1
@@ -215,6 +221,8 @@ lock_identity_from_json() {
     return 1
   fi
   HELM_RELEASE_LOCK_OBSERVED_HOLDER=$holder
+  HELM_RELEASE_LOCK_OBSERVED_HOSTNAME=$holder_hostname
+  HELM_RELEASE_LOCK_OBSERVED_PID=$holder_pid
   HELM_RELEASE_LOCK_OBSERVED_HOLDER_TIMESTAMP=$holder_timestamp
 }
 
@@ -380,19 +388,23 @@ reclaim_stale_helm_release_lock() {
     return 1
   fi
 
-  if [ "$lock_age" -lt "$HELM_RELEASE_LOCK_TTL_SECONDS" ]; then
-    if [ "$HELM_RELEASE_LOCK_OBSERVED_HOSTNAME" != "$local_hostname" ]; then
+  if [ "$HELM_RELEASE_LOCK_OBSERVED_HOSTNAME" = "$local_hostname" ]; then
+    if [ -d "/proc/$HELM_RELEASE_LOCK_OBSERVED_PID" ] ||
+       kill -0 "$HELM_RELEASE_LOCK_OBSERVED_PID" 2>/dev/null; then
+      echo "ERROR: Helm release lock $HELM_RELEASE_LOCK is $lock_age seconds old and belongs to live local PID $HELM_RELEASE_LOCK_OBSERVED_PID; refusing concurrent mutation regardless of lease age." >&2
+      return 1
+    fi
+    if [ "$lock_age" -lt "$HELM_RELEASE_LOCK_TTL_SECONDS" ]; then
+      echo "WARNING: reclaiming young Helm release lock $HELM_RELEASE_LOCK because same-host PID $HELM_RELEASE_LOCK_OBSERVED_PID is no longer alive." >&2
+    else
+      echo "WARNING: reclaiming expired Helm release lock $HELM_RELEASE_LOCK because same-host PID $HELM_RELEASE_LOCK_OBSERVED_PID is no longer alive." >&2
+    fi
+  else
+    if [ "$lock_age" -lt "$HELM_RELEASE_LOCK_TTL_SECONDS" ]; then
       echo "ERROR: Helm release lock $HELM_RELEASE_LOCK is $lock_age seconds old and belongs to remote host $HELM_RELEASE_LOCK_OBSERVED_HOSTNAME; remote liveness is ambiguous until the ${HELM_RELEASE_LOCK_TTL_SECONDS}-second lease expires." >&2
       return 1
     fi
-    if [ -d "/proc/$HELM_RELEASE_LOCK_OBSERVED_PID" ] ||
-       kill -0 "$HELM_RELEASE_LOCK_OBSERVED_PID" 2>/dev/null; then
-      echo "ERROR: Helm release lock $HELM_RELEASE_LOCK is $lock_age seconds old and belongs to live local PID $HELM_RELEASE_LOCK_OBSERVED_PID; refusing concurrent mutation." >&2
-      return 1
-    fi
-    echo "WARNING: reclaiming young Helm release lock $HELM_RELEASE_LOCK because same-host PID $HELM_RELEASE_LOCK_OBSERVED_PID is no longer alive." >&2
-  else
-    echo "WARNING: reclaiming Helm release lock $HELM_RELEASE_LOCK because its explicit ${HELM_RELEASE_LOCK_TTL_SECONDS}-second lease expired at age $lock_age, regardless of holder PID state." >&2
+    echo "WARNING: reclaiming remote Helm release lock $HELM_RELEASE_LOCK because its explicit ${HELM_RELEASE_LOCK_TTL_SECONDS}-second lease expired at age $lock_age." >&2
   fi
 
   backup_stale_helm_release_lock "$lock_json" || return 1
@@ -864,9 +876,15 @@ verify_image_revision() (
   set -euo pipefail
   local image=$1
   local source_sha=$2
-  local tmp_dir
+  local tmp_dir tmp_parent cleanup_tmp_parent=false
   local repository digest repository_path github_token basic_config bearer_config
   local token_json registry_token manifest media_type child_digest config_digest config revision
+  cleanup_owned_image_revision_tmp() {
+    if [ "$cleanup_tmp_parent" = true ]; then
+      trap - ERR INT TERM HUP
+      rm -rf "$tmp_parent"
+    fi
+  }
   repository="$(canonical_image_repository "$image")"
   digest=${image##*@}
   repository_path=${repository#ghcr.io/}
@@ -878,12 +896,20 @@ verify_image_revision() (
     echo "ERROR: curl is required to verify OCI image revision labels." >&2
     return 1
   fi
-  if [ -z "${BASELINE_TMP_DIR:-}" ] || [ ! -d "$BASELINE_TMP_DIR" ]; then
-    echo "ERROR: revision proof requires the candidate temporary directory." >&2
+  tmp_parent=${BASELINE_TMP_DIR:-}
+  if [ -z "$tmp_parent" ]; then
+    tmp_parent="$(mktemp -d)"
+    cleanup_tmp_parent=true
+    trap 'status=$?; cleanup_owned_image_revision_tmp; exit "$status"' ERR
+    trap 'cleanup_owned_image_revision_tmp; exit 130' INT
+    trap 'cleanup_owned_image_revision_tmp; exit 143' TERM
+    trap 'cleanup_owned_image_revision_tmp; exit 129' HUP
+  elif [ ! -d "$tmp_parent" ]; then
+    echo "ERROR: candidate temporary directory $tmp_parent does not exist." >&2
     return 1
   fi
   github_token="$(gh auth token)"
-  tmp_dir="$(mktemp -d "$BASELINE_TMP_DIR/image-revision.XXXXXX")"
+  tmp_dir="$(mktemp -d "$tmp_parent/image-revision.XXXXXX")"
   basic_config="$tmp_dir/github-auth.curl"
   bearer_config="$tmp_dir/registry-auth.curl"
   umask 077
@@ -938,6 +964,7 @@ verify_image_revision() (
     *)
       echo "ERROR: unsupported OCI manifest media type $media_type for $image." >&2
       rm -rf "$tmp_dir"
+      cleanup_owned_image_revision_tmp
       return 1
       ;;
   esac
@@ -966,9 +993,11 @@ verify_image_revision() (
   if [ "$revision" != "$source_sha" ]; then
     echo "ERROR: OCI image $image declares revision $revision, not source commit $source_sha." >&2
     rm -rf "$tmp_dir"
+    cleanup_owned_image_revision_tmp
     return 1
   fi
   rm -rf "$tmp_dir"
+  cleanup_owned_image_revision_tmp
 )
 
 require_clean_source_tree() {
