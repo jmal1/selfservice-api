@@ -20,6 +20,7 @@
 #   - unzip
 #   - gh authenticated for source workflow artifacts and private GHCR packages
 #   - SSH key (deploy key) allowing `git pull` from the repo
+#   - DEPLOY_PROMETHEUS_URL set to the Prometheus base URL for firing-alert checks
 
 set -euo pipefail
 
@@ -92,6 +93,7 @@ SOURCE_WORKFLOW=ci.yaml
 UI_IMAGE_REPOSITORY=ghcr.io/jmal1/selfservice-ui
 UI_SOURCE_BRANCH=master
 REQUIRED_ROLLBACK_REVISION_FILE="$SCRIPT_DIR/phase1-rollback-baseline"
+KNOWN_FIRING_ALERTS_FILE="$SCRIPT_DIR/../known-firing-alerts.txt"
 REQUIRED_ROLLBACK_REVISION=
 REPOSITORY_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
@@ -1993,25 +1995,83 @@ verify_rollback_containment() {
 }
 
 required_migration_version() {
-  find "$SCRIPT_DIR/../../internal/database/migrations" -maxdepth 1 -type f -name '*.up.sql' -print \
-    | sed -E 's#^.*/([0-9]+)_.*#\1#' \
-    | sort -n \
-    | tail -n 1 \
-    | sed -E 's/^0+//'
+  local migration_dir="$SCRIPT_DIR/../../internal/database/migrations"
+  local inventory base raw name direction version expected max_version=0
+  local -A migration_names=()
+  local -A migration_up=()
+  local -A migration_down=()
+  if ! inventory="$(
+    find "$migration_dir" -maxdepth 1 -type f -name '*.sql' -printf '%f\n' |
+      LC_ALL=C sort
+  )"; then
+    echo "ERROR: could not enumerate database migrations in $migration_dir." >&2
+    return 1
+  fi
+  if [ -z "$inventory" ]; then
+    echo "ERROR: no database migrations were found in $migration_dir." >&2
+    return 1
+  fi
+  while IFS= read -r base; do
+    if [[ ! "$base" =~ ^([0-9]{6})_([a-z0-9_]+)\.(up|down)\.sql$ ]]; then
+      echo "ERROR: malformed migration filename $base; expected NNNNNN_name.up.sql or NNNNNN_name.down.sql." >&2
+      return 1
+    fi
+    raw=${BASH_REMATCH[1]}
+    name=${BASH_REMATCH[2]}
+    direction=${BASH_REMATCH[3]}
+    version=$((10#$raw))
+    if [ -n "${migration_names[$version]:-}" ] &&
+       [ "${migration_names[$version]}" != "$name" ]; then
+      echo "ERROR: migration version $version has conflicting names ${migration_names[$version]} and $name." >&2
+      return 1
+    fi
+    migration_names[$version]=$name
+    if [ "$direction" = up ]; then
+      if [ -n "${migration_up[$version]:-}" ]; then
+        echo "ERROR: migration version $version has duplicate up migrations." >&2
+        return 1
+      fi
+      migration_up[$version]=true
+    else
+      if [ -n "${migration_down[$version]:-}" ]; then
+        echo "ERROR: migration version $version has duplicate down migrations." >&2
+        return 1
+      fi
+      migration_down[$version]=true
+    fi
+    if [ "$version" -gt "$max_version" ]; then
+      max_version=$version
+    fi
+  done <<< "$inventory"
+  for ((expected = 1; expected <= max_version; expected++)); do
+    if [ -z "${migration_names[$expected]:-}" ]; then
+      echo "ERROR: migrations are not contiguous: version $expected is missing." >&2
+      return 1
+    fi
+    if [ -z "${migration_up[$expected]:-}" ] ||
+       [ -z "${migration_down[$expected]:-}" ]; then
+      echo "ERROR: migration version $expected (${migration_names[$expected]}) must have exactly one up and one down file." >&2
+      return 1
+    fi
+  done
+  printf '%s' "$max_version"
 }
 
 current_migration_state() {
   local postgres_pod state
-  postgres_pod="$(
+  if ! postgres_pod="$(
     kubectl get pods -n "$NAMESPACE" \
       -l "app.kubernetes.io/name=postgresql,app.kubernetes.io/instance=$RELEASE" \
       -o jsonpath='{.items[0].metadata.name}'
-  )"
+  )"; then
+    echo "ERROR: failed to query the release PostgreSQL pod while verifying migration state." >&2
+    return 1
+  fi
   if [ -z "$postgres_pod" ]; then
     echo "ERROR: cannot locate the release PostgreSQL pod to verify migration state." >&2
     return 1
   fi
-  state="$(
+  if ! state="$(
     kubectl exec -n "$NAMESPACE" "$postgres_pod" -c postgresql -- sh -ec '
       password_file=${POSTGRES_PASSWORD_FILE:-}
       if [ -n "$password_file" ]; then
@@ -2021,16 +2081,23 @@ current_migration_state() {
         -v ON_ERROR_STOP=1 \
         -U "${POSTGRES_USER:-postgres}" \
         -d "${POSTGRES_DATABASE:-${POSTGRES_DB:-postgres}}" \
-        -Atc "SELECT version::text || '"'"':'"'"' || dirty::text FROM schema_migrations LIMIT 1"
+        -Atc "SELECT count(*)::text || '"'"':'"'"' ||
+                     COALESCE(max(version)::text, '"'"''"'"') || '"'"':'"'"' ||
+                     COALESCE(bool_or(dirty)::text, '"'"''"'"')
+              FROM schema_migrations"
     '
-  )"
-  case "$state" in
-    *:false|*:f) printf '%s:false' "${state%%:*}" ;;
-    *:true|*:t) printf '%s:true' "${state%%:*}" ;;
-    *)
-      echo "ERROR: invalid migration state returned by PostgreSQL: $state" >&2
-      return 1
-      ;;
+  )"; then
+    echo "ERROR: PostgreSQL migration-state query failed; refusing deployment." >&2
+    return 1
+  fi
+  if [[ ! "$state" =~ ^1:([0-9]+):(false|f|true|t)$ ]] ||
+     [ "${#BASH_REMATCH[1]}" -gt 9 ]; then
+    echo "ERROR: invalid migration state returned by PostgreSQL: ${state:-<empty>}." >&2
+    return 1
+  fi
+  case "${BASH_REMATCH[2]}" in
+    false|f) printf '%s:false' "${BASH_REMATCH[1]}" ;;
+    true|t) printf '%s:true' "${BASH_REMATCH[1]}" ;;
   esac
 }
 
@@ -2133,13 +2200,329 @@ require_clean_migration() {
   fi
   if [ -z "$expected" ]; then
     local required
-    required="$(required_migration_version)"
-    if [ -z "$required" ] || [ "$state" != "$required:false" ]; then
+    if ! required="$(required_migration_version)"; then
+      return 1
+    fi
+    if [ "$state" != "$required:false" ]; then
       echo "ERROR: database migration is $state; this checkout requires $required:false before phase-1." >&2
       return 1
     fi
   fi
   VERIFIED_MIGRATION_STATE=$state
+}
+
+require_no_pending_provisioning_jobs() {
+  local postgres_pod provisioning_jobs
+  if ! postgres_pod="$(
+    kubectl get pods -n "$NAMESPACE" \
+      -l "app.kubernetes.io/name=postgresql,app.kubernetes.io/instance=$RELEASE" \
+      -o jsonpath='{.items[0].metadata.name}'
+  )"; then
+    echo "ERROR: failed to query the release PostgreSQL pod while checking provisioning jobs." >&2
+    return 1
+  fi
+  if [ -z "$postgres_pod" ]; then
+    echo "ERROR: cannot locate the release PostgreSQL pod to check provisioning jobs." >&2
+    return 1
+  fi
+  if ! provisioning_jobs="$(
+    kubectl exec -n "$NAMESPACE" "$postgres_pod" -c postgresql -- sh -ec '
+      password_file=${POSTGRES_PASSWORD_FILE:-}
+      if [ -n "$password_file" ]; then
+        export PGPASSWORD="$(cat "$password_file")"
+      fi
+      exec psql \
+        -v ON_ERROR_STOP=1 \
+        -U "${POSTGRES_USER:-postgres}" \
+        -d "${POSTGRES_DATABASE:-${POSTGRES_DB:-postgres}}" \
+        -Atc "SELECT count(*) /* gate_a4_provisioning_preflight */
+              FROM jobs
+              WHERE type IN (
+                '"'"'pod_create'"'"',
+                '"'"'vm_add'"'"',
+                '"'"'template_provision'"'"',
+                '"'"'template_generalize'"'"',
+                '"'"'template_verify'"'"',
+                '"'"'template_revalidate'"'"',
+                '"'"'template_health_confirm'"'"',
+                '"'"'template_replica_build'"'"',
+                '"'"'image_import'"'"'
+              )
+                AND status NOT IN ('"'"'completed'"'"', '"'"'failed'"'"')"
+    '
+  )"; then
+    echo "ERROR: PostgreSQL provisioning-job preflight query failed; refusing deployment." >&2
+    return 1
+  fi
+  if [[ ! "$provisioning_jobs" =~ ^[0-9]+$ ]] ||
+     [ "${#provisioning_jobs}" -gt 9 ]; then
+    echo "ERROR: invalid provisioning-job preflight count returned by PostgreSQL: ${provisioning_jobs:-<empty>}." >&2
+    return 1
+  fi
+  if [ "$provisioning_jobs" != "0" ]; then
+    echo "ERROR: $provisioning_jobs provisioning jobs are nonterminal or have unknown status; drain or resolve them before deployment." >&2
+    return 1
+  fi
+}
+
+require_synthetic_pod_quota() {
+  local postgres_pod quota_state max_pods active_pods
+  if ! postgres_pod="$(
+    kubectl get pods -n "$NAMESPACE" \
+      -l "app.kubernetes.io/name=postgresql,app.kubernetes.io/instance=$RELEASE" \
+      -o jsonpath='{.items[0].metadata.name}'
+  )"; then
+    echo "ERROR: failed to query the release PostgreSQL pod while checking synthetic-user quota." >&2
+    return 1
+  fi
+  if [ -z "$postgres_pod" ]; then
+    echo "ERROR: cannot locate the release PostgreSQL pod to check synthetic-user quota." >&2
+    return 1
+  fi
+  if ! quota_state="$(
+    kubectl exec -n "$NAMESPACE" "$postgres_pod" -c postgresql -- sh -ec '
+      password_file=${POSTGRES_PASSWORD_FILE:-}
+      if [ -n "$password_file" ]; then
+        export PGPASSWORD="$(cat "$password_file")"
+      fi
+      exec psql \
+        -v ON_ERROR_STOP=1 \
+        -U "${POSTGRES_USER:-postgres}" \
+        -d "${POSTGRES_DATABASE:-${POSTGRES_DB:-postgres}}" \
+        -Atc "SELECT u.max_pods::text || '"'"':'"'"' || count(DISTINCT p.id)::text
+              FROM users AS u
+              LEFT JOIN pods AS p
+                ON p.owner_id = u.id
+               AND p.status NOT IN ('"'"'destroyed'"'"', '"'"'error'"'"')
+              WHERE u.oidc_sub = '"'"'synthetic-monitor-no-oidc'"'"'
+                AND u.username = '"'"'synthetic'"'"'
+                AND u.is_active IS TRUE
+              GROUP BY u.id, u.max_pods"
+    '
+  )"; then
+    echo "ERROR: PostgreSQL synthetic-user quota preflight query failed; refusing deployment." >&2
+    return 1
+  fi
+  if [[ ! "$quota_state" =~ ^([0-9]+):([0-9]+)$ ]] ||
+     [ "${#BASH_REMATCH[1]}" -gt 9 ] ||
+     [ "${#BASH_REMATCH[2]}" -gt 9 ]; then
+    echo "ERROR: synthetic-user quota query returned invalid or missing max_pods:active_pods data: ${quota_state:-<empty>}." >&2
+    return 1
+  fi
+  max_pods=$((10#${BASH_REMATCH[1]}))
+  active_pods=$((10#${BASH_REMATCH[2]}))
+  if [ "$active_pods" -ge "$max_pods" ]; then
+    echo "ERROR: synthetic user has no quota for one more pod: active_pods=$active_pods max_pods=$max_pods." >&2
+    return 1
+  fi
+}
+
+require_no_active_mutating_synthetics() {
+  local jobs_json active_names
+  if ! jobs_json="$(kubectl get jobs -n "$NAMESPACE" -o json)"; then
+    echo "ERROR: failed to list Kubernetes Jobs while checking scheduled mutating synthetics." >&2
+    return 1
+  fi
+  if ! active_names="$(
+    jq -er --arg release "$RELEASE" '
+      if (.items | type) != "array" then
+        error("items must be an array")
+      else
+        [
+          .items[]
+          | if (.metadata.name | type) != "string" or
+               ((.metadata.ownerReferences // []) | type) != "array" or
+               ((.metadata.ownerReferences // []) | all(
+                 type == "object" and
+                 (.kind | type) == "string" and
+                 (.name | type) == "string"
+               ) | not) or
+               ((.status.conditions // []) | type) != "array" or
+               ((.status.conditions // []) | all(
+                 type == "object" and
+                 (.type | type) == "string" and
+                 (.status | type) == "string"
+               ) | not) or
+               ((.status.active // 0) | type) != "number" or
+               ((.status.active // 0) < 0) or
+               ((.status.active // 0) != ((.status.active // 0) | floor)) then
+              error("malformed Job record")
+            else .
+            end
+          | select(any(
+              (.metadata.ownerReferences // [])[];
+              .kind == "CronJob" and
+              (
+                .name == ($release + "-synthetic-api-monitor") or
+                .name == ($release + "-synthetic-janitor") or
+                .name == ($release + "-synthetic-runner")
+              )
+            ))
+          | select(
+              any(
+                (.status.conditions // [])[];
+                (.type == "Complete" or .type == "Failed") and .status == "True"
+              )
+              | not
+            )
+          | .metadata.name
+        ]
+        | unique
+        | join(",")
+      end
+    ' <<< "$jobs_json"
+  )"; then
+    echo "ERROR: Kubernetes Job data is malformed while checking scheduled mutating synthetics." >&2
+    return 1
+  fi
+  if [ -n "$active_names" ]; then
+    echo "ERROR: scheduled mutating synthetic execution is active: $active_names." >&2
+    return 1
+  fi
+}
+
+require_candidate_image_provenance() {
+  local component repository image count=0 seen=,
+  if [ ! -r "$CANDIDATE_RESOLVED_IMAGES" ]; then
+    echo "ERROR: candidate source-image provenance file is missing or unreadable." >&2
+    return 1
+  fi
+  while IFS=$'\t' read -r component repository image; do
+    case "$component" in
+      api-gateway|provision-worker|crucible-engine|synthetic-api-monitor|crucible-runner) ;;
+      *)
+        echo "ERROR: candidate image provenance contains unknown component: ${component:-<empty>}." >&2
+        return 1
+        ;;
+    esac
+    if [[ "$seen" == *",$component,"* ]]; then
+      echo "ERROR: candidate image provenance contains duplicate component $component." >&2
+      return 1
+    fi
+    seen="$seen$component,"
+    if [[ ! "$repository" =~ ^ghcr\.io/[^[:space:]@]+$ ]] ||
+       [[ ! "$image" =~ ^ghcr\.io/[^[:space:]@]+@sha256:[a-f0-9]{64}$ ]] ||
+       [[ "$image" != "$repository@"* ]]; then
+      echo "ERROR: candidate image record is malformed or mutable: $component $repository $image." >&2
+      return 1
+    fi
+    verify_image_revision "$image" "$CANDIDATE_SOURCE_SHA" || return 1
+    count=$((count + 1))
+  done < "$CANDIDATE_RESOLVED_IMAGES"
+  if [ "$count" -ne 5 ]; then
+    echo "ERROR: candidate provenance contains $count source images; expected exactly 5." >&2
+    return 1
+  fi
+  if [[ ! "$CANDIDATE_UI_IMAGE" =~ ^ghcr\.io/[^[:space:]@]+@sha256:[a-f0-9]{64}$ ]] ||
+     [[ "$CANDIDATE_UI_IMAGE" != "$UI_IMAGE_REPOSITORY@"* ]]; then
+    echo "ERROR: UI candidate image is mutable or malformed: $CANDIDATE_UI_IMAGE." >&2
+    return 1
+  fi
+  verify_image_revision "$CANDIDATE_UI_IMAGE" "$UI_SOURCE_SHA"
+}
+
+require_known_firing_alerts() {
+  local prometheus_url=${DEPLOY_PROMETHEUS_URL:-}
+  local allowlist_file=$KNOWN_FIRING_ALERTS_FILE
+  local tmp_dir response line normalized
+  local -A allowed_seen=()
+  if [[ ! "$prometheus_url" =~ ^https?://[^[:space:]]+$ ]]; then
+    echo "ERROR: DEPLOY_PROMETHEUS_URL must be an explicit http(s) Prometheus base URL." >&2
+    return 1
+  fi
+  if [ ! -r "$allowlist_file" ]; then
+    echo "ERROR: firing-alert allowlist $allowlist_file is missing or unreadable." >&2
+    return 1
+  fi
+  tmp_dir="$(mktemp -d)"
+  : > "$tmp_dir/allowlist"
+  while IFS= read -r line || [ -n "$line" ]; do
+    normalized="${line//$'\r'/}"
+    normalized="${normalized#"${normalized%%[![:space:]]*}"}"
+    normalized="${normalized%"${normalized##*[![:space:]]}"}"
+    [ -n "$normalized" ] || continue
+    [[ "$normalized" != \#* ]] || continue
+    if [[ ! "$normalized" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      echo "ERROR: malformed firing-alert allowlist entry: $normalized." >&2
+      rm -rf "$tmp_dir"
+      return 1
+    fi
+    if [ -n "${allowed_seen[$normalized]:-}" ]; then
+      echo "ERROR: firing-alert allowlist contains duplicate entry $normalized." >&2
+      rm -rf "$tmp_dir"
+      return 1
+    fi
+    allowed_seen[$normalized]=true
+    printf '%s\n' "$normalized" >> "$tmp_dir/allowlist"
+  done < "$allowlist_file"
+  if ! LC_ALL=C sort "$tmp_dir/allowlist" -o "$tmp_dir/allowlist"; then
+    echo "ERROR: could not sort the firing-alert allowlist." >&2
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  if ! response="$(
+    curl --fail --silent --show-error --max-time 15 \
+      "${prometheus_url%/}/api/v1/alerts"
+  )"; then
+    echo "ERROR: Prometheus firing-alert query failed at ${prometheus_url%/}/api/v1/alerts." >&2
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  if ! jq -r '
+      if .status != "success" or (.data.alerts | type) != "array" then
+        error("invalid Prometheus response envelope")
+      else
+        [
+          .data.alerts[]
+          | if (.state != "pending" and .state != "firing") or
+               (.labels | type) != "object" or
+               (.labels.alertname | type) != "string" then
+              error("malformed Prometheus alert")
+            else .
+            end
+          | select(.state == "firing")
+          | .labels.alertname
+          | if test("^[A-Za-z_][A-Za-z0-9_]*$") then
+              .
+            else
+              error("malformed alertname")
+            end
+        ]
+        | unique[]
+      end
+    ' <<< "$response" > "$tmp_dir/firing"; then
+    echo "ERROR: Prometheus returned malformed or unknown alert data; refusing deployment." >&2
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  if ! line="$(LC_ALL=C comm -23 "$tmp_dir/firing" "$tmp_dir/allowlist")"; then
+    echo "ERROR: could not compare firing alerts with the strict allowlist." >&2
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  if [ -n "$line" ]; then
+    echo "ERROR: unallowlisted Prometheus alerts are firing:" >&2
+    printf '%s\n' "$line" >&2
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  rm -rf "$tmp_dir"
+}
+
+run_release_preflight() {
+  echo "==> running fail-closed release preflight before lock acquisition or live mutation"
+  require_clean_migration
+  require_no_pending_provisioning_jobs
+  require_synthetic_pod_quota
+  require_no_active_mutating_synthetics
+  require_candidate_image_provenance
+  require_known_firing_alerts
+  echo "==> release preflight passed"
+}
+
+require_volatile_release_preflight() {
+  require_no_pending_provisioning_jobs
+  require_known_firing_alerts
 }
 
 require_core_workloads() {
@@ -3808,6 +4191,7 @@ fi
 # Candidate provenance, rendering, and the first server validation happen
 # before claims pause. Only a real apply acquires the lock and mutates live
 # claims; --dry-run remains useful while a temporary claims=true override exists.
+run_release_preflight
 acquire_helm_release_lock
 verify_rollback_manifest_safety
 if [ "$STATIC_BASELINE_REVISION" != "$ROLLBACK_BASELINE_REVISION" ] ||
@@ -3877,6 +4261,10 @@ if [ "$(sha256sum "$CANDIDATE_MANIFEST" | awk '{print $1}')" != "$CANDIDATE_SHA2
 fi
 require_no_active_jobs
 
+# Volatile gates run again after claims are paused and all other validation is
+# complete. Keep this directly adjacent to Helm so pending provisioning work or
+# a newly firing alert cannot hide behind the longer immutable-candidate proof.
+require_volatile_release_preflight
 echo "==> helm upgrade $RELEASE with exact digest-pinned candidate (atomic, timeout=$TIMEOUT)"
 HELM_RELEASE_LOCK_PRESERVE=true
 set +e

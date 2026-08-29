@@ -1128,6 +1128,523 @@ func TestDeployScriptResumesProvisioningClaimsAfterSuccessfulDeploy(t *testing.T
 	})
 }
 
+func TestDeployScriptPreflightFailureCannotMutate(t *testing.T) {
+	requirePOSIXShell(t)
+	env := newDeployScriptEnvironment(
+		t,
+		baselineManifest(true, "", "false"),
+		baselineManifest(true, "*", "false"),
+	)
+	env.migrationState = "1:37:true"
+
+	output, err := env.run("--no-pull")
+	if err == nil {
+		t.Fatalf("dirty migration preflight unexpectedly succeeded:\n%s", output)
+	}
+	if !strings.Contains(string(output), "database migration state is dirty: 37:true") {
+		t.Fatalf("preflight failure was not actionable:\n%s", output)
+	}
+	assertNoPreflightMutation(t, env, output)
+}
+
+func TestDeployScriptReleasePreflightGuards(t *testing.T) {
+	requirePOSIXShell(t)
+	tests := []struct {
+		name       string
+		configure  func(*deployScriptEnvironment)
+		wantOutput string
+		wantPass   bool
+	}{
+		{name: "all guards pass", wantOutput: "release preflight passed", wantPass: true},
+		{
+			name: "allowlisted firing alert passes",
+			configure: func(env *deployScriptEnvironment) {
+				env.prometheusResponse = `{"status":"success","data":{"alerts":[{"state":"firing","labels":{"alertname":"KnownFailure"}}]}}`
+				writeFile(t, env.knownFiringAlerts, "KnownFailure\n")
+				pointDeployAtKnownFiringAlerts(t, env)
+			},
+			wantOutput: "release preflight passed",
+			wantPass:   true,
+		},
+		{
+			name: "dirty migration",
+			configure: func(env *deployScriptEnvironment) {
+				env.migrationState = "1:37:true"
+			},
+			wantOutput: "database migration state is dirty",
+		},
+		{
+			name: "migration state malformed",
+			configure: func(env *deployScriptEnvironment) {
+				env.migrationState = "2:38:false"
+			},
+			wantOutput: "invalid migration state returned by PostgreSQL",
+		},
+		{
+			name: "migration query failure",
+			configure: func(env *deployScriptEnvironment) {
+				env.preflightQueryFailure = "migration"
+			},
+			wantOutput: "migration-state query failed",
+		},
+		{
+			name: "pending provisioning job",
+			configure: func(env *deployScriptEnvironment) {
+				env.provisioningJobs = "1"
+			},
+			wantOutput: "provisioning jobs are nonterminal or have unknown status",
+		},
+		{
+			name: "unknown provisioning job status",
+			configure: func(env *deployScriptEnvironment) {
+				env.unknownProvisioningJobStatus = true
+			},
+			wantOutput: "provisioning jobs are nonterminal or have unknown status",
+		},
+		{
+			name: "provisioning job query failure",
+			configure: func(env *deployScriptEnvironment) {
+				env.preflightQueryFailure = "provisioning"
+			},
+			wantOutput: "provisioning-job preflight query failed",
+		},
+		{
+			name: "malformed provisioning job count",
+			configure: func(env *deployScriptEnvironment) {
+				env.provisioningJobs = "unknown"
+			},
+			wantOutput: "invalid provisioning-job preflight count",
+		},
+		{
+			name: "synthetic quota exhausted",
+			configure: func(env *deployScriptEnvironment) {
+				env.syntheticQuotaState = "1:1"
+			},
+			wantOutput: "synthetic user has no quota for one more pod",
+		},
+		{
+			name: "synthetic quota query failure",
+			configure: func(env *deployScriptEnvironment) {
+				env.preflightQueryFailure = "quota"
+			},
+			wantOutput: "synthetic-user quota preflight query failed",
+		},
+		{
+			name: "synthetic quota malformed",
+			configure: func(env *deployScriptEnvironment) {
+				env.syntheticQuotaState = "missing"
+			},
+			wantOutput: "quota query returned invalid or missing",
+		},
+		{
+			name: "mutating synthetic active",
+			configure: func(env *deployScriptEnvironment) {
+				env.activeMutatingSyntheticJobs = 1
+			},
+			wantOutput: "scheduled mutating synthetic execution is active",
+		},
+		{
+			name: "completed mutating synthetic passes",
+			configure: func(env *deployScriptEnvironment) {
+				env.completedMutatingSyntheticJob = true
+			},
+			wantOutput: "release preflight passed",
+			wantPass:   true,
+		},
+		{
+			name: "Kubernetes jobs malformed",
+			configure: func(env *deployScriptEnvironment) {
+				env.malformedJobsJSON = true
+			},
+			wantOutput: "Kubernetes Job data is malformed",
+		},
+		{
+			name: "Kubernetes jobs query failure",
+			configure: func(env *deployScriptEnvironment) {
+				env.failJobsList = true
+			},
+			wantOutput: "failed to list Kubernetes Jobs",
+		},
+		{
+			name: "candidate revision mismatch",
+			configure: func(env *deployScriptEnvironment) {
+				env.imageRevision = otherSourceSHA
+			},
+			wantOutput: "not source commit",
+		},
+		{
+			name: "unallowlisted firing alert",
+			configure: func(env *deployScriptEnvironment) {
+				env.prometheusResponse = `{"status":"success","data":{"alerts":[{"state":"firing","labels":{"alertname":"UnexpectedFailure"}}]}}`
+			},
+			wantOutput: "unallowlisted Prometheus alerts are firing",
+		},
+		{
+			name: "Prometheus response malformed",
+			configure: func(env *deployScriptEnvironment) {
+				env.prometheusResponse = `{"status":"success","data":{"alerts":[{"state":"unknown","labels":{"alertname":"UnexpectedFailure"}}]}}`
+			},
+			wantOutput: "Prometheus returned malformed or unknown alert data",
+		},
+		{
+			name: "Prometheus query failure",
+			configure: func(env *deployScriptEnvironment) {
+				env.failPrometheus = true
+			},
+			wantOutput: "Prometheus firing-alert query failed",
+		},
+		{
+			name: "Prometheus URL missing",
+			configure: func(env *deployScriptEnvironment) {
+				env.prometheusURL = ""
+			},
+			wantOutput: "DEPLOY_PROMETHEUS_URL must be an explicit",
+		},
+		{
+			name: "Prometheus URL malformed",
+			configure: func(env *deployScriptEnvironment) {
+				env.prometheusURL = "not a URL"
+			},
+			wantOutput: "DEPLOY_PROMETHEUS_URL must be an explicit",
+		},
+		{
+			name: "allowlist missing",
+			configure: func(env *deployScriptEnvironment) {
+				if err := os.Remove(env.knownFiringAlerts); err != nil {
+					t.Fatal(err)
+				}
+				pointDeployAtKnownFiringAlerts(t, env)
+			},
+			wantOutput: "firing-alert allowlist",
+		},
+		{
+			name: "allowlist entry malformed",
+			configure: func(env *deployScriptEnvironment) {
+				writeFile(t, env.knownFiringAlerts, "bad alert name\n")
+				pointDeployAtKnownFiringAlerts(t, env)
+			},
+			wantOutput: "malformed firing-alert allowlist entry",
+		},
+		{
+			name: "allowlist duplicate",
+			configure: func(env *deployScriptEnvironment) {
+				writeFile(t, env.knownFiringAlerts, "KnownFailure\nKnownFailure\n")
+				pointDeployAtKnownFiringAlerts(t, env)
+			},
+			wantOutput: "allowlist contains duplicate entry",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			env := newDeployScriptEnvironment(
+				t,
+				baselineManifest(true, "", "false"),
+				baselineManifest(true, "*", "false"),
+			)
+			if test.configure != nil {
+				test.configure(env)
+			}
+			output, err := env.run("--no-pull")
+			if test.wantPass {
+				if err != nil {
+					t.Fatalf("preflight unexpectedly failed: %v\n%s", err, output)
+				}
+				if _, statErr := os.Stat(env.upgradedMarker); statErr != nil {
+					t.Fatalf("passing preflight did not reach Helm upgrade: %v\n%s", statErr, output)
+				}
+			} else {
+				if err == nil {
+					t.Fatalf("failing preflight unexpectedly succeeded:\n%s", output)
+				}
+				assertNoPreflightMutation(t, env, output)
+			}
+			if !strings.Contains(string(output), test.wantOutput) {
+				t.Fatalf("output %q does not contain %q", output, test.wantOutput)
+			}
+		})
+	}
+}
+
+func assertNoPreflightMutation(t *testing.T, env *deployScriptEnvironment, output []byte) {
+	t.Helper()
+	for _, marker := range []string{
+		env.lockFile,
+		env.claimsPausedMark,
+		env.claimsResumedMark,
+		env.syntheticContainedMark,
+		env.candidateAppliedMark,
+		env.upgradedMarker,
+	} {
+		if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+			t.Fatalf("preflight failure wrote mutation marker %s: %v\n%s", marker, statErr, output)
+		}
+	}
+}
+
+func pointDeployAtKnownFiringAlerts(t *testing.T, env *deployScriptEnvironment) {
+	t.Helper()
+	deployPath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
+	source, err := os.ReadFile(deployPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const original = `KNOWN_FIRING_ALERTS_FILE="$SCRIPT_DIR/../known-firing-alerts.txt"`
+	replacement := `KNOWN_FIRING_ALERTS_FILE="` + env.knownFiringAlerts + `"`
+	if strings.Count(string(source), original) != 1 {
+		t.Fatal("known firing-alert path assignment is not unique")
+	}
+	scriptPath := filepath.Join(filepath.Dir(deployPath), "deploy-sabotaged-gate-a4-alert-file-test.sh")
+	writeExecutable(t, scriptPath, strings.Replace(string(source), original, replacement, 1))
+	t.Cleanup(func() { os.Remove(scriptPath) })
+	env.scriptPath = scriptPath
+}
+
+func TestDeployScriptVolatileReleasePreflightBlocksLateRegressions(t *testing.T) {
+	requirePOSIXShell(t)
+	tests := []struct {
+		name       string
+		configure  func(*deployScriptEnvironment)
+		wantOutput string
+	}{
+		{
+			name: "pending provisioning job appears after claims pause",
+			configure: func(env *deployScriptEnvironment) {
+				env.provisioningJobsAfterInitial = "1"
+			},
+			wantOutput: "provisioning jobs are nonterminal or have unknown status",
+		},
+		{
+			name: "alert starts firing after claims pause",
+			configure: func(env *deployScriptEnvironment) {
+				env.prometheusResponseAfterInitial = `{"status":"success","data":{"alerts":[{"state":"firing","labels":{"alertname":"LateFailure"}}]}}`
+			},
+			wantOutput: "unallowlisted Prometheus alerts are firing",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			env := newDeployScriptEnvironment(
+				t,
+				baselineManifest(true, "", "false"),
+				baselineManifest(true, "*", "false"),
+			)
+			writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
+			test.configure(env)
+
+			output, err := env.run("--no-pull")
+			if err == nil {
+				t.Fatalf("late volatile regression unexpectedly reached Helm:\n%s", output)
+			}
+			if !strings.Contains(string(output), test.wantOutput) {
+				t.Fatalf("output %q does not contain %q", output, test.wantOutput)
+			}
+			for _, marker := range []string{env.claimsPausedMark, env.claimsResumedMark, env.syntheticContainedMark} {
+				if _, statErr := os.Stat(marker); statErr != nil {
+					t.Fatalf("late guard failure missed expected pause/restore marker %s: %v\n%s", marker, statErr, output)
+				}
+			}
+			if body, readErr := os.ReadFile(env.upgradeLog); readErr == nil && len(body) > 0 {
+				t.Fatalf("late guard failure invoked Helm upgrade: %s\n%s", body, output)
+			}
+			for _, marker := range []string{env.candidateAppliedMark, env.upgradedMarker, env.lockFile} {
+				if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+					t.Fatalf("late guard failure left mutation marker %s: %v\n%s", marker, statErr, output)
+				}
+			}
+		})
+	}
+}
+
+func TestDeployScriptVolatileReleasePreflightIsOrderedAndLoadBearing(t *testing.T) {
+	requirePOSIXShell(t)
+	deployPath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
+	source, err := os.ReadFile(deployPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const boundary = `require_volatile_release_preflight
+echo "==> helm upgrade $RELEASE with exact digest-pinned candidate (atomic, timeout=$TIMEOUT)"`
+	if strings.Count(string(source), boundary) != 1 {
+		t.Fatal("volatile preflight is not directly adjacent to the final Helm upgrade announcement")
+	}
+	const helper = `require_volatile_release_preflight() {
+  require_no_pending_provisioning_jobs
+  require_known_firing_alerts
+}`
+	if strings.Count(string(source), helper) != 1 {
+		t.Fatal("volatile preflight helper does not contain the exact two final guards")
+	}
+
+	tests := []struct {
+		name      string
+		guardCall string
+		configure func(*deployScriptEnvironment)
+	}{
+		{
+			name:      "provisioning recheck",
+			guardCall: "  require_no_pending_provisioning_jobs\n",
+			configure: func(env *deployScriptEnvironment) {
+				env.provisioningJobsAfterInitial = "1"
+			},
+		},
+		{
+			name:      "alert recheck",
+			guardCall: "  require_known_firing_alerts\n",
+			configure: func(env *deployScriptEnvironment) {
+				env.prometheusResponseAfterInitial = `{"status":"success","data":{"alerts":[{"state":"firing","labels":{"alertname":"LateFailure"}}]}}`
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			mutatedHelper := strings.Replace(helper, test.guardCall, "", 1)
+			mutated := strings.Replace(string(source), helper, mutatedHelper, 1)
+			scriptPath := filepath.Join(
+				filepath.Dir(deployPath),
+				"deploy-sabotaged-gate-a4-final-"+strings.ReplaceAll(test.name, " ", "-")+"-test.sh",
+			)
+			writeExecutable(t, scriptPath, mutated)
+			t.Cleanup(func() { os.Remove(scriptPath) })
+
+			env := newDeployScriptEnvironment(
+				t,
+				baselineManifest(true, "", "false"),
+				baselineManifest(true, "*", "false"),
+			)
+			writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
+			env.scriptPath = scriptPath
+			test.configure(env)
+
+			output, runErr := env.run("--no-pull")
+			if runErr != nil {
+				t.Fatalf("removing final %s did not expose the staged regression: %v\n%s", test.name, runErr, output)
+			}
+			if _, statErr := os.Stat(env.upgradedMarker); statErr != nil {
+				t.Fatalf("removing final %s did not reach Helm mutation: %v\n%s", test.name, statErr, output)
+			}
+			if _, statErr := os.Stat(env.claimsResumedMark); statErr != nil {
+				t.Fatalf("sabotaged successful deploy did not restore claims: %v\n%s", statErr, output)
+			}
+		})
+	}
+}
+
+func TestDeployScriptReleasePreflightPredicatesAreLoadBearing(t *testing.T) {
+	requirePOSIXShell(t)
+	deployPath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
+	source, err := os.ReadFile(deployPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const preflightStart = "run_release_preflight() {\n"
+	start := strings.Index(string(source), preflightStart)
+	if start < 0 {
+		t.Fatal("run_release_preflight definition is missing")
+	}
+	end := strings.Index(string(source)[start:], "\n}\n")
+	if end < 0 {
+		t.Fatal("run_release_preflight definition is unterminated")
+	}
+	end = start + end + len("\n}\n")
+	block := string(source)[start:end]
+
+	tests := []struct {
+		name      string
+		guardCall string
+		configure func(*deployScriptEnvironment)
+	}{
+		{name: "migration", guardCall: "  require_clean_migration\n", configure: func(env *deployScriptEnvironment) { env.migrationState = "1:37:true" }},
+		{name: "provisioning jobs", guardCall: "  require_no_pending_provisioning_jobs\n", configure: func(env *deployScriptEnvironment) { env.provisioningJobs = "1" }},
+		{name: "synthetic quota", guardCall: "  require_synthetic_pod_quota\n", configure: func(env *deployScriptEnvironment) { env.syntheticQuotaState = "1:1" }},
+		{name: "mutating synthetics", guardCall: "  require_no_active_mutating_synthetics\n", configure: func(env *deployScriptEnvironment) { env.activeMutatingSyntheticJobs = 1 }},
+		{name: "candidate provenance", guardCall: "  require_candidate_image_provenance\n", configure: func(env *deployScriptEnvironment) { env.imageRevisionDriftAfter = 6 }},
+		{
+			name:      "firing alerts",
+			guardCall: "  require_known_firing_alerts\n",
+			configure: func(env *deployScriptEnvironment) {
+				env.prometheusResponse = `{"status":"success","data":{"alerts":[{"state":"firing","labels":{"alertname":"UnexpectedFailure"}}]}}`
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if strings.Count(block, test.guardCall) != 1 {
+				t.Fatalf("preflight guard call %q is not unique", test.guardCall)
+			}
+			mutatedBlock := strings.Replace(block, test.guardCall, "", 1)
+			mutated := strings.Replace(string(source), block, mutatedBlock, 1)
+			scriptPath := filepath.Join(filepath.Dir(deployPath), "deploy-sabotaged-gate-a4-"+strings.ReplaceAll(test.name, " ", "-")+"-test.sh")
+			writeExecutable(t, scriptPath, mutated)
+			t.Cleanup(func() { os.Remove(scriptPath) })
+
+			env := newDeployScriptEnvironment(t, baselineManifest(true, "", "false"), baselineManifest(true, "*", "false"))
+			writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
+			env.scriptPath = scriptPath
+			test.configure(env)
+			output, _ := env.run("--no-pull")
+			if _, statErr := os.Stat(env.claimsPausedMark); statErr != nil {
+				t.Fatalf("removing %s guard did not expose live mutation: %v\n%s", test.name, statErr, output)
+			}
+		})
+	}
+}
+
+func TestDeployScriptMigrationContiguityIsLoadBearing(t *testing.T) {
+	requirePOSIXShell(t)
+	deployPath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
+	source, err := os.ReadFile(deployPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const correct = "local inventory base raw name direction version expected max_version=0"
+	const sabotaged = "local inventory base raw name direction version expected max_version=38"
+	if strings.Count(string(source), correct) != 1 {
+		t.Fatal("migration contiguity sequence initializer is not unique")
+	}
+	mutated := strings.Replace(string(source), correct, sabotaged, 1)
+	scriptPath := filepath.Join(filepath.Dir(deployPath), "deploy-sabotaged-gate-a4-migration-gap-test.sh")
+	writeExecutable(t, scriptPath, mutated)
+	t.Cleanup(func() { os.Remove(scriptPath) })
+
+	env := newDeployScriptEnvironment(t, baselineManifest(true, "", "false"), baselineManifest(true, "*", "false"))
+	env.scriptPath = scriptPath
+	output, err := env.run("--no-pull")
+	if err == nil || !strings.Contains(string(output), "migrations are not contiguous") {
+		t.Fatalf("migration-gap sabotage did not fail closed: %v\n%s", err, output)
+	}
+	assertNoPreflightMutation(t, env, output)
+}
+
+func TestDeployScriptMigrationPairingIsLoadBearing(t *testing.T) {
+	requirePOSIXShell(t)
+	deployPath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
+	source, err := os.ReadFile(deployPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const correct = `find "$migration_dir" -maxdepth 1 -type f -name '*.sql' -printf '%f\n' |`
+	const sabotaged = `{ find "$migration_dir" -maxdepth 1 -type f -name '*.sql' -printf '%f\n'; printf '000038_orphan.down.sql\n'; } |`
+	if strings.Count(string(source), correct) != 1 {
+		t.Fatal("migration file enumeration command is not unique")
+	}
+	mutated := strings.Replace(string(source), correct, sabotaged, 1)
+	scriptPath := filepath.Join(filepath.Dir(deployPath), "deploy-sabotaged-gate-a4-migration-pair-test.sh")
+	writeExecutable(t, scriptPath, mutated)
+	t.Cleanup(func() { os.Remove(scriptPath) })
+
+	env := newDeployScriptEnvironment(t, baselineManifest(true, "", "false"), baselineManifest(true, "*", "false"))
+	env.scriptPath = scriptPath
+	output, err := env.run("--no-pull")
+	if err == nil || !strings.Contains(string(output), "must have exactly one up and one down file") {
+		t.Fatalf("orphan migration sabotage did not fail closed: %v\n%s", err, output)
+	}
+	assertNoPreflightMutation(t, env, output)
+}
+
 func TestDeployScriptRestoresProvisioningClaimsOnEveryPostPauseExit(t *testing.T) {
 	requirePOSIXShell(t)
 	candidate := baselineManifest(true, "*", "false")
@@ -5433,6 +5950,9 @@ type deployScriptEnvironment struct {
 	gitLog                    string
 	lockFile                  string
 	lockBackupDir             string
+	knownFiringAlerts         string
+	provisioningQueryCount    string
+	prometheusQueryCount      string
 	lockDeleteRaceMark        string
 	serverDryRunLog           string
 	serverDryRunMark          string
@@ -5472,6 +5992,8 @@ type deployScriptEnvironment struct {
 	packageDigest             string
 	runArtifactDigest         string
 	imageRevision             string
+	imageRevisionProbeCount   string
+	imageRevisionDriftAfter   int
 	uiBuildRecord             string
 	uiSourceSHA               string
 	uiArtifactSHA             string
@@ -5499,7 +6021,21 @@ type deployScriptEnvironment struct {
 	finalWorkloadHealthRegression  bool
 	activeJobs                     int
 	activeKubernetesJobs           int
+	activeMutatingSyntheticJobs    int
+	completedMutatingSyntheticJob  bool
 	pendingSyntheticJobs           int
+	migrationState                 string
+	provisioningJobs               string
+	provisioningJobsAfterInitial   string
+	unknownProvisioningJobStatus   bool
+	syntheticQuotaState            string
+	malformedJobsJSON              bool
+	prometheusResponse             string
+	prometheusResponseAfterInitial string
+	prometheusURL                  string
+	preflightQueryFailure          string
+	failJobsList                   bool
+	failPrometheus                 bool
 	failAtomicUpgrade              bool
 	atomicRollbackMismatch         string
 	postUpgradeMismatch            string
@@ -5549,6 +6085,9 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 		gitLog:                    filepath.Join(root, "git.log"),
 		lockFile:                  filepath.Join(root, "helm.lock"),
 		lockBackupDir:             filepath.Join(root, "lock-backups"),
+		knownFiringAlerts:         filepath.Join(root, "known-firing-alerts.txt"),
+		provisioningQueryCount:    filepath.Join(root, "provisioning-query-count"),
+		prometheusQueryCount:      filepath.Join(root, "prometheus-query-count"),
 		lockDeleteRaceMark:        filepath.Join(root, "lock-delete-race.marker"),
 		serverDryRunLog:           filepath.Join(root, "server-dry-run.log"),
 		serverDryRunMark:          filepath.Join(root, "server-dry-run.marker"),
@@ -5582,6 +6121,7 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 		packageDigest:             testDigestB,
 		runArtifactDigest:         testDigestB,
 		imageRevision:             testSourceSHA,
+		imageRevisionProbeCount:   filepath.Join(root, "image-revision-probe-count"),
 		uiBuildRecord:             filepath.Join(root, "ui-build-record.dockerbuild"),
 		uiSourceSHA:               testUISourceSHA,
 		uiArtifactSHA:             testUISourceSHA,
@@ -5593,6 +6133,11 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 		gitRemoteSHA:              testSourceSHA,
 		gitRemoteURL:              "git@github.com:jmal1/selfservice-api.git",
 		commitVerified:            true,
+		migrationState:            "1:37:false",
+		provisioningJobs:          "0",
+		syntheticQuotaState:       "1:0",
+		prometheusResponse:        `{"status":"success","data":{"alerts":[]}}`,
+		prometheusURL:             "http://prometheus.test",
 		liveHelmRelease:           "selfservice",
 		liveHelmNamespace:         "selfservice",
 	}
@@ -5614,6 +6159,7 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 	writeFile(t, env.currentRollbackHooks, "")
 	writeFile(t, env.immutableRollbackValues, `{"provisioning":{"workerClaimsEnabled":false}}`+"\n")
 	writeFile(t, env.currentRollbackValues, `{"provisioning":{"workerClaimsEnabled":false}}`+"\n")
+	writeFile(t, env.knownFiringAlerts, "")
 	env.writeCommands()
 	return env
 }
@@ -6291,8 +6837,43 @@ case "$1" in
       printf 'selfservice-postgresql-0'
     elif [ "$2" = "jobs" ]; then
       if [[ "$*" == *"-o json"* ]]; then
-        jq -cn --argjson active "$FAKE_ACTIVE_KUBERNETES_JOBS" \
-          '{items:(if $active > 0 then [{metadata:{name:"active-fixture"},status:{active:$active}}] else [] end)}'
+        if [ "$FAKE_FAIL_JOBS_LIST" = true ]; then
+          echo "sabotaged jobs list failure" >&2
+          exit 97
+        fi
+        if [ "$FAKE_MALFORMED_JOBS_JSON" = true ]; then
+          printf '{"items":"not-an-array"}\n'
+        else
+          jq -cn \
+            --argjson active "$FAKE_ACTIVE_KUBERNETES_JOBS" \
+            --argjson synthetic "$FAKE_ACTIVE_MUTATING_SYNTHETIC_JOBS" \
+            --argjson completed "$FAKE_COMPLETED_MUTATING_SYNTHETIC_JOB" \
+            '{
+              items: (
+                (if $active > 0 then
+                   [{metadata:{name:"active-fixture"},status:{active:$active}}]
+                 else [] end) +
+                (if $synthetic > 0 then
+                   [{
+                     metadata:{
+                       name:"synthetic-runner-active",
+                       ownerReferences:[{kind:"CronJob",name:"selfservice-synthetic-runner"}]
+                     },
+                     status:{active:$synthetic}
+                   }]
+                 else [] end) +
+                (if $completed then
+                   [{
+                     metadata:{
+                       name:"synthetic-runner-complete",
+                       ownerReferences:[{kind:"CronJob",name:"selfservice-synthetic-runner"}]
+                     },
+                     status:{conditions:[{type:"Complete",status:"True"}]}
+                   }]
+                 else [] end)
+              )
+            }'
+        fi
       else
         printf 'selfservice-synthetic-api-monitor-1\n'
       fi
@@ -6382,7 +6963,29 @@ case "$1" in
     fi
     ;;
   exec)
-    if [[ "$*" == *"pod_name"* ]]; then
+    if [[ "$*" == *"gate_a4_provisioning_preflight"* ]]; then
+      [ "$FAKE_PREFLIGHT_QUERY_FAILURE" != provisioning ] || exit 97
+      query_count=0
+      [ ! -f "$FAKE_PROVISIONING_QUERY_COUNT" ] || query_count=$(cat "$FAKE_PROVISIONING_QUERY_COUNT")
+      query_count=$((query_count + 1))
+      printf '%s' "$query_count" > "$FAKE_PROVISIONING_QUERY_COUNT"
+      if [ "$FAKE_UNKNOWN_PROVISIONING_JOB_STATUS" = true ]; then
+        if [[ "$*" == *"status NOT IN ('completed', 'failed')"* ]]; then
+          printf '1\n'
+        else
+          printf '0\n'
+        fi
+      else
+        jobs=$FAKE_PROVISIONING_JOBS
+        if [ "$query_count" -gt 1 ] && [ -n "$FAKE_PROVISIONING_JOBS_AFTER_INITIAL" ]; then
+          jobs=$FAKE_PROVISIONING_JOBS_AFTER_INITIAL
+        fi
+        printf '%s\n' "$jobs"
+      fi
+    elif [[ "$*" == *"synthetic-monitor-no-oidc"* ]]; then
+      [ "$FAKE_PREFLIGHT_QUERY_FAILURE" != quota ] || exit 97
+      printf '%s\n' "$FAKE_SYNTHETIC_QUOTA_STATE"
+    elif [[ "$*" == *"pod_name"* ]]; then
       [[ "$*" == *"pod_create"* && "$*" == *"pod_destroy"* ]] || {
         echo "synthetic durable drain omitted create or destroy jobs" >&2
         exit 96
@@ -6399,7 +7002,8 @@ case "$1" in
     elif [[ "$*" == *"FROM jobs"* ]]; then
       printf '%s\n' "$FAKE_ACTIVE_JOBS"
     else
-      printf '37:false\n'
+      [ "$FAKE_PREFLIGHT_QUERY_FAILURE" != migration ] || exit 97
+      printf '%s\n' "$FAKE_MIGRATION_STATE"
     fi
     ;;
   create)
@@ -6870,12 +7474,32 @@ esac
 	writeExecutable(e.t, filepath.Join(e.binDir, "curl"), `#!/bin/bash
 set -euo pipefail
 case "$*" in
-  *"ghcr.io/token"*)
+	  *"/api/v1/alerts"*)
+	    [ "$FAKE_FAIL_PROMETHEUS" != true ] || exit 97
+	    query_count=0
+	    [ ! -f "$FAKE_PROMETHEUS_QUERY_COUNT" ] || query_count=$(cat "$FAKE_PROMETHEUS_QUERY_COUNT")
+	    query_count=$((query_count + 1))
+	    printf '%s' "$query_count" > "$FAKE_PROMETHEUS_QUERY_COUNT"
+	    response=$FAKE_PROMETHEUS_RESPONSE
+	    if [ "$query_count" -gt 1 ] && [ -n "$FAKE_PROMETHEUS_RESPONSE_AFTER_INITIAL" ]; then
+	      response=$FAKE_PROMETHEUS_RESPONSE_AFTER_INITIAL
+	    fi
+	    printf '%s\n' "$response"
+	    ;;
+	  *"ghcr.io/token"*)
     printf '{"token":"registry-token"}\n'
     ;;
   *"/blobs/"*)
     revision=$FAKE_IMAGE_REVISION
     [[ "$*" != *"/jmal1/selfservice-ui/"* ]] || revision=$FAKE_UI_IMAGE_REVISION
+    count=0
+    [ ! -f "$FAKE_IMAGE_REVISION_PROBE_COUNT" ] || count=$(cat "$FAKE_IMAGE_REVISION_PROBE_COUNT")
+    count=$((count + 1))
+    printf '%s' "$count" > "$FAKE_IMAGE_REVISION_PROBE_COUNT"
+    if [ "$FAKE_IMAGE_REVISION_DRIFT_AFTER" -gt 0 ] &&
+       [ "$count" -gt "$FAKE_IMAGE_REVISION_DRIFT_AFTER" ]; then
+      revision=$FAKE_OTHER_SOURCE_SHA
+    fi
     jq -cn --arg revision "$revision" \
       '{config:{Labels:{"org.opencontainers.image.revision":$revision}}}'
     ;;
@@ -7001,6 +7625,7 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_GIT_LOG="+e.gitLog,
 		"FAKE_LOCK_FILE="+e.lockFile,
 		"FAKE_LOCK_BACKUP_DIR="+e.lockBackupDir,
+		"DEPLOY_PROMETHEUS_URL="+e.prometheusURL,
 		"FAKE_LOCK_DELETE_RACE_MODE="+e.lockDeleteRaceMode,
 		"FAKE_LOCK_DELETE_RACE_MARKER="+e.lockDeleteRaceMark,
 		"FAKE_SIGNAL_DURING_LOCK_CREATE="+e.signalDuringLockCreate,
@@ -7033,6 +7658,24 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_WARMER_ROLLOUT_FAILURE="+strconv.FormatBool(e.warmerRolloutFailure),
 		"FAKE_WARMER_IMAGE_STAYS_EMPTY="+strconv.FormatBool(e.warmerImageStaysEmpty),
 		"FAKE_FINAL_WORKLOAD_HEALTH_REGRESSION="+strconv.FormatBool(e.finalWorkloadHealthRegression),
+		"FAKE_MIGRATION_STATE="+e.migrationState,
+		"FAKE_PROVISIONING_JOBS="+e.provisioningJobs,
+		"FAKE_PROVISIONING_JOBS_AFTER_INITIAL="+e.provisioningJobsAfterInitial,
+		"FAKE_PROVISIONING_QUERY_COUNT="+e.provisioningQueryCount,
+		"FAKE_UNKNOWN_PROVISIONING_JOB_STATUS="+strconv.FormatBool(e.unknownProvisioningJobStatus),
+		"FAKE_SYNTHETIC_QUOTA_STATE="+e.syntheticQuotaState,
+		"FAKE_ACTIVE_MUTATING_SYNTHETIC_JOBS="+strconv.Itoa(e.activeMutatingSyntheticJobs),
+		"FAKE_COMPLETED_MUTATING_SYNTHETIC_JOB="+strconv.FormatBool(e.completedMutatingSyntheticJob),
+		"FAKE_MALFORMED_JOBS_JSON="+strconv.FormatBool(e.malformedJobsJSON),
+		"FAKE_PREFLIGHT_QUERY_FAILURE="+e.preflightQueryFailure,
+		"FAKE_FAIL_JOBS_LIST="+strconv.FormatBool(e.failJobsList),
+		"FAKE_PROMETHEUS_RESPONSE="+e.prometheusResponse,
+		"FAKE_PROMETHEUS_RESPONSE_AFTER_INITIAL="+e.prometheusResponseAfterInitial,
+		"FAKE_PROMETHEUS_QUERY_COUNT="+e.prometheusQueryCount,
+		"FAKE_FAIL_PROMETHEUS="+strconv.FormatBool(e.failPrometheus),
+		"FAKE_IMAGE_REVISION_PROBE_COUNT="+e.imageRevisionProbeCount,
+		"FAKE_IMAGE_REVISION_DRIFT_AFTER="+strconv.Itoa(e.imageRevisionDriftAfter),
+		"FAKE_OTHER_SOURCE_SHA="+otherSourceSHA,
 		"FAKE_HELM_STATUS="+e.helmStatus,
 		"FAKE_HELM_REVISION="+strconv.Itoa(e.helmRevision),
 		"FAKE_IMMUTABLE_REVISION="+strconv.Itoa(e.immutableRevision),
