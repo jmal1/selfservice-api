@@ -122,32 +122,190 @@ load_required_rollback_revision() {
 load_required_rollback_revision || exit 1
 HELM_RELEASE_LOCK_HELD=false
 HELM_RELEASE_LOCK_HOLDER=
+HELM_RELEASE_LOCK_UID=
+HELM_RELEASE_LOCK_RESOURCE_VERSION=
 HELM_RELEASE_LOCK_PRESERVE=false
+HELM_RELEASE_LOCK_CREATE_PENDING=false
+# A guarded deploy can perform several sequential five-minute workload-health
+# passes around the Helm timeout. Six hours stays above the current worst-case
+# envelope while still giving an abandoned cross-host lock an explicit expiry.
+HELM_RELEASE_LOCK_TTL_SECONDS="${HELM_RELEASE_LOCK_TTL_SECONDS:-21600}"
+HELM_RELEASE_LOCK_BACKUP_DIR="${HELM_RELEASE_LOCK_BACKUP_DIR:-/home/jmal/selfservice-deploy-backups}"
+LIVE_CLAIMS_RESTORE_PENDING=false
 BASELINE_TMP_DIR=
+
+validate_helm_release_lock_settings() {
+  if [[ ! "$HELM_RELEASE_LOCK_TTL_SECONDS" =~ ^[0-9]+$ ]] ||
+     [ "${#HELM_RELEASE_LOCK_TTL_SECONDS}" -gt 6 ]; then
+    echo "ERROR: HELM_RELEASE_LOCK_TTL_SECONDS must be an integer from 21600 through 604800 seconds." >&2
+    return 1
+  fi
+  if [ "$HELM_RELEASE_LOCK_TTL_SECONDS" -lt 21600 ] ||
+     [ "$HELM_RELEASE_LOCK_TTL_SECONDS" -gt 604800 ]; then
+    echo "ERROR: HELM_RELEASE_LOCK_TTL_SECONDS must be from 21600 through 604800 seconds so the lease exceeds the guarded deploy's sequential rollout envelope without becoming unbounded." >&2
+    return 1
+  fi
+  case "$HELM_RELEASE_LOCK_BACKUP_DIR" in
+    /*) ;;
+    *)
+      echo "ERROR: HELM_RELEASE_LOCK_BACKUP_DIR must be an absolute path outside the source checkout." >&2
+      return 1
+      ;;
+  esac
+  case "$HELM_RELEASE_LOCK_BACKUP_DIR/" in
+    "$REPOSITORY_ROOT/"*)
+      echo "ERROR: HELM_RELEASE_LOCK_BACKUP_DIR must be outside the source checkout $REPOSITORY_ROOT." >&2
+      return 1
+      ;;
+  esac
+  if ! command -v realpath >/dev/null 2>&1; then
+    echo "ERROR: realpath is required to prove the Helm release lock backup directory is outside the source checkout." >&2
+    return 1
+  fi
+  HELM_RELEASE_LOCK_BACKUP_DIR="$(realpath -m "$HELM_RELEASE_LOCK_BACKUP_DIR")"
+  case "$HELM_RELEASE_LOCK_BACKUP_DIR/" in
+    "$REPOSITORY_ROOT/"*)
+      echo "ERROR: HELM_RELEASE_LOCK_BACKUP_DIR resolves inside the source checkout $REPOSITORY_ROOT." >&2
+      return 1
+      ;;
+  esac
+}
+
+lock_identity_from_json() {
+  local lock_json=$1 identity holder holder_timestamp
+  identity="$(
+    jq -er \
+      --arg name "$HELM_RELEASE_LOCK" \
+      --arg namespace "$NAMESPACE" \
+      '
+        if .apiVersion == "v1" and
+           .kind == "ConfigMap" and
+           .metadata.name == $name and
+           .metadata.namespace == $namespace and
+           (.metadata.annotations["crucible.jmal.io/holder"] | type) == "string" and
+           (.metadata.creationTimestamp | type) == "string" and
+           (.metadata.uid | type) == "string" and
+           (.metadata.resourceVersion | type) == "string"
+        then [
+          .metadata.annotations["crucible.jmal.io/holder"],
+          .metadata.creationTimestamp,
+          .metadata.uid,
+          .metadata.resourceVersion
+        ] | @tsv
+        else error("malformed release lock")
+        end
+      ' <<< "$lock_json"
+  )" || {
+    echo "ERROR: Helm release lock configmap/$HELM_RELEASE_LOCK has malformed holder, UID, or resourceVersion metadata; refusing mutation." >&2
+    return 1
+  }
+  IFS=$'\t' read -r holder HELM_RELEASE_LOCK_OBSERVED_TIMESTAMP HELM_RELEASE_LOCK_OBSERVED_UID HELM_RELEASE_LOCK_OBSERVED_RESOURCE_VERSION <<< "$identity"
+  if [[ "$holder" =~ ^([A-Za-z0-9._-]+)\|([1-9][0-9]*)\|([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z)$ ]]; then
+    HELM_RELEASE_LOCK_OBSERVED_HOSTNAME=${BASH_REMATCH[1]}
+    HELM_RELEASE_LOCK_OBSERVED_PID=${BASH_REMATCH[2]}
+    holder_timestamp=${BASH_REMATCH[3]}
+  else
+    echo "ERROR: Helm release lock configmap/$HELM_RELEASE_LOCK has malformed holder identity; refusing mutation." >&2
+    return 1
+  fi
+  if [[ ! "$HELM_RELEASE_LOCK_OBSERVED_TIMESTAMP" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] ||
+     [[ ! "$HELM_RELEASE_LOCK_OBSERVED_UID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+     [[ ! "$HELM_RELEASE_LOCK_OBSERVED_RESOURCE_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    echo "ERROR: Helm release lock configmap/$HELM_RELEASE_LOCK has malformed holder, timestamp, UID, or resourceVersion metadata; refusing mutation." >&2
+    return 1
+  fi
+  HELM_RELEASE_LOCK_OBSERVED_HOLDER=$holder
+  HELM_RELEASE_LOCK_OBSERVED_HOLDER_TIMESTAMP=$holder_timestamp
+}
+
+delete_helm_release_lock_with_preconditions() {
+  local uid=$1 resource_version=$2 delete_options
+  delete_options="$(mktemp)"
+  if ! jq -n \
+      --arg uid "$uid" \
+      --arg resource_version "$resource_version" \
+      '{
+        apiVersion: "v1",
+        kind: "DeleteOptions",
+        preconditions: {
+          uid: $uid,
+          resourceVersion: $resource_version
+        }
+      }' > "$delete_options"; then
+    rm -f "$delete_options"
+    echo "ERROR: could not construct preconditioned deletion for Helm release lock $HELM_RELEASE_LOCK." >&2
+    return 1
+  fi
+  if ! kubectl delete \
+      --raw="/api/v1/namespaces/$NAMESPACE/configmaps/$HELM_RELEASE_LOCK" \
+      -f "$delete_options" \
+      >/dev/null; then
+    rm -f "$delete_options"
+    echo "ERROR: Helm release lock $HELM_RELEASE_LOCK changed or could not be deleted with its exact UID/resourceVersion preconditions." >&2
+    return 1
+  fi
+  rm -f "$delete_options"
+}
 
 release_helm_release_lock() {
   if [ "$HELM_RELEASE_LOCK_HELD" != true ]; then
-    return
+    return 0
   fi
-  local live_holder
-  set +e
-  live_holder="$(
-    kubectl get "configmap/$HELM_RELEASE_LOCK" \
-      -n "$NAMESPACE" \
-      -o go-template='{{index .metadata.annotations "crucible.jmal.io/holder"}}' \
-      2>/dev/null
-  )"
-  if [ "$live_holder" = "$HELM_RELEASE_LOCK_HOLDER" ]; then
-    kubectl delete "configmap/$HELM_RELEASE_LOCK" -n "$NAMESPACE" --wait=true >/dev/null
-  else
-    echo "WARNING: not deleting Helm release lock $HELM_RELEASE_LOCK because its holder changed to $live_holder." >&2
+  if ! delete_helm_release_lock_with_preconditions \
+      "$HELM_RELEASE_LOCK_UID" \
+      "$HELM_RELEASE_LOCK_RESOURCE_VERSION"; then
+    echo "ERROR: preserving Helm release lock $HELM_RELEASE_LOCK because safe release failed." >&2
+    return 1
   fi
-  set -e
   HELM_RELEASE_LOCK_HELD=false
+  return 0
+}
+
+reconcile_created_helm_release_lock() {
+  local lock_json
+  if [ "$HELM_RELEASE_LOCK_CREATE_PENDING" != true ]; then
+    return 0
+  fi
+  lock_json="$(kubectl get "configmap/$HELM_RELEASE_LOCK" -n "$NAMESPACE" -o json)" || {
+    echo "ERROR: Helm release lock creation was interrupted and its result cannot be inspected; leaving any orphaned lock for stale-lock recovery." >&2
+    return 1
+  }
+  lock_identity_from_json "$lock_json" || return 1
+  if [ "$HELM_RELEASE_LOCK_OBSERVED_HOLDER" != "$HELM_RELEASE_LOCK_HOLDER" ]; then
+    HELM_RELEASE_LOCK_CREATE_PENDING=false
+    return 0
+  fi
+  HELM_RELEASE_LOCK_UID=$HELM_RELEASE_LOCK_OBSERVED_UID
+  HELM_RELEASE_LOCK_RESOURCE_VERSION=$HELM_RELEASE_LOCK_OBSERVED_RESOURCE_VERSION
+  HELM_RELEASE_LOCK_HELD=true
+  HELM_RELEASE_LOCK_CREATE_PENDING=false
 }
 
 cleanup_on_exit() {
   local exit_code=$?
+  local reconcile_status=0 resume_status=0 release_status=0
+  trap - EXIT
+  trap '' INT TERM HUP
+  set +e
+  reconcile_created_helm_release_lock
+  reconcile_status=$?
+  if [ "$reconcile_status" -ne 0 ] && [ "$exit_code" -eq 0 ]; then
+    exit_code=$reconcile_status
+  fi
+  if [ "$LIVE_CLAIMS_RESTORE_PENDING" = true ]; then
+    resume_live_provisioning_claims
+    resume_status=$?
+    if [ "$resume_status" -eq 0 ]; then
+      LIVE_CLAIMS_RESTORE_PENDING=false
+    else
+      HELM_RELEASE_LOCK_PRESERVE=true
+      echo "ERROR: failed to restore the pre-deploy live provisioning claims state during EXIT cleanup (original exit code: $exit_code, resume exit code: $resume_status)." >&2
+      if [ "$exit_code" -eq 0 ]; then
+        exit_code=$resume_status
+        [ "$exit_code" -ne 0 ] || exit_code=1
+      fi
+    fi
+  fi
   if [ -n "$BASELINE_TMP_DIR" ]; then
     rm -rf "$BASELINE_TMP_DIR"
   fi
@@ -155,15 +313,100 @@ cleanup_on_exit() {
     echo "WARNING: preserving Helm release lock $HELM_RELEASE_LOCK for manual containment recovery." >&2
   else
     release_helm_release_lock
+    release_status=$?
+    if [ "$release_status" -ne 0 ]; then
+      if [ "$exit_code" -eq 0 ]; then
+        exit_code=$release_status
+        [ "$exit_code" -ne 0 ] || exit_code=1
+      fi
+    fi
   fi
   exit "$exit_code"
 }
 
 trap cleanup_on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
-acquire_helm_release_lock() {
-  HELM_RELEASE_LOCK_HOLDER="$(hostname)-$$-$(date -u +%Y%m%dT%H%M%SZ)"
-  if ! cat <<EOF | kubectl create -f - >/dev/null
+backup_stale_helm_release_lock() {
+  local lock_json=$1 backup_tmp backup_path
+  if ! mkdir -p "$HELM_RELEASE_LOCK_BACKUP_DIR"; then
+    echo "ERROR: could not create external Helm release lock backup directory $HELM_RELEASE_LOCK_BACKUP_DIR; refusing stale-lock deletion." >&2
+    return 1
+  fi
+  umask 077
+  backup_tmp="$(mktemp "$HELM_RELEASE_LOCK_BACKUP_DIR/.${HELM_RELEASE_LOCK}.XXXXXX")" || {
+    echo "ERROR: could not create an external Helm release lock backup in $HELM_RELEASE_LOCK_BACKUP_DIR; refusing stale-lock deletion." >&2
+    return 1
+  }
+  backup_path="$HELM_RELEASE_LOCK_BACKUP_DIR/${HELM_RELEASE_LOCK}-${HELM_RELEASE_LOCK_OBSERVED_UID}-${HELM_RELEASE_LOCK_OBSERVED_RESOURCE_VERSION}.json"
+  if ! printf '%s\n' "$lock_json" > "$backup_tmp" ||
+     ! mv "$backup_tmp" "$backup_path"; then
+    rm -f "$backup_tmp"
+    echo "ERROR: could not persist the external Helm release lock backup $backup_path; refusing stale-lock deletion." >&2
+    return 1
+  fi
+  echo "==> backed up stale Helm release lock evidence to $backup_path"
+}
+
+reclaim_stale_helm_release_lock() {
+  local lock_json local_hostname now_epoch created_epoch holder_epoch lock_age
+  lock_json="$(kubectl get "configmap/$HELM_RELEASE_LOCK" -n "$NAMESPACE" -o json)" || {
+    echo "ERROR: Helm release lock creation failed and the existing lock could not be inspected." >&2
+    return 1
+  }
+  lock_identity_from_json "$lock_json" || return 1
+  local_hostname="$(hostname)"
+  now_epoch="$(date -u +%s)" || {
+    echo "ERROR: could not read current UTC time while evaluating Helm release lock $HELM_RELEASE_LOCK." >&2
+    return 1
+  }
+  created_epoch="$(date -u -d "$HELM_RELEASE_LOCK_OBSERVED_TIMESTAMP" +%s 2>/dev/null)" || {
+    echo "ERROR: Helm release lock $HELM_RELEASE_LOCK has invalid holder timestamp $HELM_RELEASE_LOCK_OBSERVED_TIMESTAMP; refusing mutation." >&2
+    return 1
+  }
+  holder_epoch="$(date -u -d "$HELM_RELEASE_LOCK_OBSERVED_HOLDER_TIMESTAMP" +%s 2>/dev/null)" || {
+    echo "ERROR: Helm release lock $HELM_RELEASE_LOCK has malformed embedded holder timestamp $HELM_RELEASE_LOCK_OBSERVED_HOLDER_TIMESTAMP; refusing mutation." >&2
+    return 1
+  }
+  if [ "$holder_epoch" -lt 0 ]; then
+    echo "ERROR: Helm release lock $HELM_RELEASE_LOCK has malformed embedded holder timestamp $HELM_RELEASE_LOCK_OBSERVED_HOLDER_TIMESTAMP; refusing mutation." >&2
+    return 1
+  fi
+  lock_age=$((now_epoch - created_epoch))
+  if [ "$lock_age" -lt 0 ]; then
+    echo "ERROR: Helm release lock $HELM_RELEASE_LOCK has a future holder timestamp $HELM_RELEASE_LOCK_OBSERVED_TIMESTAMP; refusing mutation." >&2
+    return 1
+  fi
+
+  if [ "$lock_age" -lt "$HELM_RELEASE_LOCK_TTL_SECONDS" ]; then
+    if [ "$HELM_RELEASE_LOCK_OBSERVED_HOSTNAME" != "$local_hostname" ]; then
+      echo "ERROR: Helm release lock $HELM_RELEASE_LOCK is $lock_age seconds old and belongs to remote host $HELM_RELEASE_LOCK_OBSERVED_HOSTNAME; remote liveness is ambiguous until the ${HELM_RELEASE_LOCK_TTL_SECONDS}-second lease expires." >&2
+      return 1
+    fi
+    if [ -d "/proc/$HELM_RELEASE_LOCK_OBSERVED_PID" ] ||
+       kill -0 "$HELM_RELEASE_LOCK_OBSERVED_PID" 2>/dev/null; then
+      echo "ERROR: Helm release lock $HELM_RELEASE_LOCK is $lock_age seconds old and belongs to live local PID $HELM_RELEASE_LOCK_OBSERVED_PID; refusing concurrent mutation." >&2
+      return 1
+    fi
+    echo "WARNING: reclaiming young Helm release lock $HELM_RELEASE_LOCK because same-host PID $HELM_RELEASE_LOCK_OBSERVED_PID is no longer alive." >&2
+  else
+    echo "WARNING: reclaiming Helm release lock $HELM_RELEASE_LOCK because its explicit ${HELM_RELEASE_LOCK_TTL_SECONDS}-second lease expired at age $lock_age, regardless of holder PID state." >&2
+  fi
+
+  backup_stale_helm_release_lock "$lock_json" || return 1
+  delete_helm_release_lock_with_preconditions \
+    "$HELM_RELEASE_LOCK_OBSERVED_UID" \
+    "$HELM_RELEASE_LOCK_OBSERVED_RESOURCE_VERSION"
+}
+
+create_helm_release_lock() {
+  local created_at lock_json create_status
+  created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  HELM_RELEASE_LOCK_HOLDER="$(hostname)|$$|$created_at"
+  HELM_RELEASE_LOCK_CREATE_PENDING=true
+  cat <<EOF | kubectl create -f - >/dev/null
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -173,13 +416,44 @@ metadata:
     crucible.jmal.io/holder: "$HELM_RELEASE_LOCK_HOLDER"
     crucible.jmal.io/purpose: "serialize phase-1 Helm baseline and application upgrades"
 EOF
-  then
-    echo "ERROR: Helm release lock configmap/$HELM_RELEASE_LOCK already exists or could not be created." >&2
-    kubectl get "configmap/$HELM_RELEASE_LOCK" -n "$NAMESPACE" -o yaml >&2 || true
-    echo "Another release mutation may be active. Inspect the holder; never delete this lock without proving it is stale." >&2
-    return 1
+  create_status=$?
+  if [ "$create_status" -ne 0 ]; then
+    if reconcile_created_helm_release_lock &&
+       [ "$HELM_RELEASE_LOCK_HELD" = true ]; then
+      return 0
+    fi
+    return "$create_status"
   fi
   HELM_RELEASE_LOCK_HELD=true
+  lock_json="$(kubectl get "configmap/$HELM_RELEASE_LOCK" -n "$NAMESPACE" -o json)" || {
+    HELM_RELEASE_LOCK_PRESERVE=true
+    echo "ERROR: created Helm release lock $HELM_RELEASE_LOCK but could not read back its immutable identity; preserving it for manual recovery." >&2
+    return 1
+  }
+  lock_identity_from_json "$lock_json" || {
+    HELM_RELEASE_LOCK_PRESERVE=true
+    return 1
+  }
+  if [ "$HELM_RELEASE_LOCK_OBSERVED_HOLDER" != "$HELM_RELEASE_LOCK_HOLDER" ]; then
+    HELM_RELEASE_LOCK_PRESERVE=true
+    echo "ERROR: created Helm release lock $HELM_RELEASE_LOCK read back with a different holder; preserving it for manual recovery." >&2
+    return 1
+  fi
+  HELM_RELEASE_LOCK_UID=$HELM_RELEASE_LOCK_OBSERVED_UID
+  HELM_RELEASE_LOCK_RESOURCE_VERSION=$HELM_RELEASE_LOCK_OBSERVED_RESOURCE_VERSION
+  HELM_RELEASE_LOCK_CREATE_PENDING=false
+}
+
+acquire_helm_release_lock() {
+  validate_helm_release_lock_settings || return 1
+  if ! create_helm_release_lock; then
+    echo "==> Helm release lock $HELM_RELEASE_LOCK already exists; evaluating its host-fenced six-hour lease" >&2
+    reclaim_stale_helm_release_lock || return 1
+    create_helm_release_lock || {
+      echo "ERROR: stale Helm release lock $HELM_RELEASE_LOCK was safely removed, but a new holder won the creation race." >&2
+      return 1
+    }
+  fi
   echo "==> acquired Helm release lock $HELM_RELEASE_LOCK as $HELM_RELEASE_LOCK_HOLDER"
 }
 
@@ -590,7 +864,8 @@ verify_image_revision() (
   set -euo pipefail
   local image=$1
   local source_sha=$2
-  local repository digest repository_path github_token tmp_dir basic_config bearer_config
+  local tmp_dir
+  local repository digest repository_path github_token basic_config bearer_config
   local token_json registry_token manifest media_type child_digest config_digest config revision
   repository="$(canonical_image_repository "$image")"
   digest=${image##*@}
@@ -603,9 +878,12 @@ verify_image_revision() (
     echo "ERROR: curl is required to verify OCI image revision labels." >&2
     return 1
   fi
+  if [ -z "${BASELINE_TMP_DIR:-}" ] || [ ! -d "$BASELINE_TMP_DIR" ]; then
+    echo "ERROR: revision proof requires the candidate temporary directory." >&2
+    return 1
+  fi
   github_token="$(gh auth token)"
-  tmp_dir="$(mktemp -d)"
-  trap 'rm -rf "$tmp_dir"' EXIT
+  tmp_dir="$(mktemp -d "$BASELINE_TMP_DIR/image-revision.XXXXXX")"
   basic_config="$tmp_dir/github-auth.curl"
   bearer_config="$tmp_dir/registry-auth.curl"
   umask 077
@@ -659,6 +937,7 @@ verify_image_revision() (
       ;;
     *)
       echo "ERROR: unsupported OCI manifest media type $media_type for $image." >&2
+      rm -rf "$tmp_dir"
       return 1
       ;;
   esac
@@ -686,8 +965,10 @@ verify_image_revision() (
   revision="$(jq -er '.config.Labels["org.opencontainers.image.revision"]' <<< "$config")"
   if [ "$revision" != "$source_sha" ]; then
     echo "ERROR: OCI image $image declares revision $revision, not source commit $source_sha." >&2
+    rm -rf "$tmp_dir"
     return 1
   fi
+  rm -rf "$tmp_dir"
 )
 
 require_clean_source_tree() {
@@ -890,18 +1171,23 @@ resolve_ui_candidate_image() (
     return 1
   }
   IFS=$'\t' read -r artifact_id artifact_name <<< "$artifact_row"
-  tmp_dir="$(mktemp -d)"
-  trap 'rm -rf "$tmp_dir"' EXIT
+  if [ -z "${BASELINE_TMP_DIR:-}" ] || [ ! -d "$BASELINE_TMP_DIR" ]; then
+    echo "ERROR: UI image proof requires the candidate temporary directory." >&2
+    return 1
+  fi
+  tmp_dir="$(mktemp -d "$BASELINE_TMP_DIR/ui-image.XXXXXX")"
   download="$tmp_dir/artifact-download"
   record="$tmp_dir/$artifact_name"
   if ! gh api "repos/$UI_SOURCE_REPOSITORY/actions/artifacts/$artifact_id/zip" > "$download"; then
     echo "ERROR: could not download UI build record $artifact_name from workflow run $run_id." >&2
+    rm -rf "$tmp_dir"
     return 1
   fi
   magic="$(od -An -tx1 -N4 "$download" | tr -d ' \n')"
   if [[ "$magic" == 504b0304* ]]; then
     if ! command -v unzip >/dev/null 2>&1; then
       echo "ERROR: unzip is required to read GitHub workflow artifact archives." >&2
+      rm -rf "$tmp_dir"
       return 1
     fi
     zip_entries="$(unzip -Z1 "$download")"
@@ -912,6 +1198,7 @@ resolve_ui_candidate_image() (
     if [ "$(printf '%s\n' "$zip_entry" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')" != "1" ] ||
        ! unzip -p "$download" "$zip_entry" > "$record"; then
       echo "ERROR: UI workflow artifact must contain exactly one safe .dockerbuild record." >&2
+      rm -rf "$tmp_dir"
       return 1
     fi
   else
@@ -919,6 +1206,7 @@ resolve_ui_candidate_image() (
   fi
   if ! tar -tf "$record" >/dev/null; then
     echo "ERROR: could not download or read UI build record $artifact_name from workflow run $run_id." >&2
+    rm -rf "$tmp_dir"
     return 1
   fi
   index_json="$(tar -xOf "$record" index.json)"
@@ -944,6 +1232,7 @@ resolve_ui_candidate_image() (
   )"
   if [[ ! "$result_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
     echo "ERROR: UI build record returned invalid image digest $result_digest." >&2
+    rm -rf "$tmp_dir"
     return 1
   fi
   expected_builder="https://github.com/$UI_SOURCE_REPOSITORY/actions/runs/$run_id/attempts/$run_attempt"
@@ -963,10 +1252,12 @@ resolve_ui_candidate_image() (
         )
       ' >/dev/null <<< "$config_json"; then
     echo "ERROR: UI build record is not bound to repository, run, source commit, and expected commit tag." >&2
+    rm -rf "$tmp_dir"
     return 1
   fi
   image="$UI_IMAGE_REPOSITORY@$result_digest"
   verify_image_revision "$image" "$source_sha"
+  rm -rf "$tmp_dir"
   printf '%s' "$image"
 )
 
@@ -1500,11 +1791,16 @@ pause_live_provisioning_claims() {
   case "$live_claims" in
     false)
       PRE_DEPLOY_LIVE_CLAIMS=false
+      LIVE_CLAIMS_RESTORE_PENDING=false
       echo "==> live worker provisioning claims are already paused"
       ;;
     true)
       PRE_DEPLOY_LIVE_CLAIMS=true
       echo "==> pausing live worker provisioning claims before the guarded apply"
+      # Arm before the API call so a signal or lost response after server-side
+      # mutation still reconciles the live Deployment. The EXIT path reads the
+      # live value first, so a call that failed before mutation causes no resume.
+      LIVE_CLAIMS_RESTORE_PENDING=true
       kubectl set env "deployment/$RELEASE-worker" \
         -n "$NAMESPACE" \
         WORKER_PROVISIONING_CLAIMS_ENABLED=false
@@ -1540,24 +1836,74 @@ pause_live_provisioning_claims() {
 # enabled operationally on the live Deployment, never through the chart, and
 # reading intent from the manifest would resume nothing at all.
 #
-# Resume runs only after verify_deployed_candidate passes, so a failed or
-# contained rollback correctly leaves claims paused.
+# EXIT cleanup owns the resume after any successful live pause mutation. This
+# covers normal success, set -e failures, contained Helm failures, comparator
+# failures, and signals without duplicating restoration across branches.
 resume_live_provisioning_claims() {
-  local live_worker live_claims
+  local live_worker live_claims command_status
   if [ "${PRE_DEPLOY_LIVE_CLAIMS:-false}" != "true" ]; then
     echo "==> live worker provisioning claims were already paused before this deploy; leaving them paused"
     return 0
   fi
 
+  live_worker="$(mktemp)"
+  kubectl get "Deployment/$RELEASE-worker" -n "$NAMESPACE" -o yaml > "$live_worker"
+  command_status=$?
+  if [ "$command_status" -ne 0 ]; then
+    rm -f "$live_worker"
+    echo "ERROR: could not inspect live worker provisioning claims during restoration." >&2
+    return "$command_status"
+  fi
+  live_claims="$(claims_from_manifest < "$live_worker")"
+  command_status=$?
+  rm -f "$live_worker"
+  if [ "$command_status" -ne 0 ]; then
+    echo "ERROR: could not parse live worker provisioning claims during restoration." >&2
+    return "$command_status"
+  fi
+  case "$live_claims" in
+    true)
+      echo "==> live worker provisioning claims already match the pre-deploy state; no restore mutation needed"
+      return 0
+      ;;
+    false) ;;
+    *)
+      echo "ERROR: live worker provisioning claims have invalid value $live_claims during restoration." >&2
+      return 1
+      ;;
+  esac
+
   echo "==> restoring live worker provisioning claims paused for the guarded apply"
   kubectl set env "deployment/$RELEASE-worker" \
     -n "$NAMESPACE" \
     WORKER_PROVISIONING_CLAIMS_ENABLED=true
+  command_status=$?
+  if [ "$command_status" -ne 0 ]; then
+    echo "ERROR: could not restore WORKER_PROVISIONING_CLAIMS_ENABLED=true on the live worker." >&2
+    return "$command_status"
+  fi
   kubectl rollout status "deployment/$RELEASE-worker" -n "$NAMESPACE" --timeout=5m
+  command_status=$?
+  if [ "$command_status" -ne 0 ]; then
+    echo "ERROR: live worker provisioning claims restore did not stabilize." >&2
+    return "$command_status"
+  fi
 
   live_worker="$(mktemp)"
   kubectl get "Deployment/$RELEASE-worker" -n "$NAMESPACE" -o yaml > "$live_worker"
+  command_status=$?
+  if [ "$command_status" -ne 0 ]; then
+    rm -f "$live_worker"
+    echo "ERROR: could not read back live worker provisioning claims after restoration." >&2
+    return "$command_status"
+  fi
   live_claims="$(claims_from_manifest < "$live_worker")"
+  command_status=$?
+  if [ "$command_status" -ne 0 ]; then
+    rm -f "$live_worker"
+    echo "ERROR: could not parse live worker provisioning claims after restoration." >&2
+    return "$command_status"
+  fi
   rm -f "$live_worker"
   if [ "$live_claims" != "true" ]; then
     echo "ERROR: live worker provisioning claims did not resume (observed: ${live_claims:-<empty>})." >&2
@@ -3265,6 +3611,7 @@ prepare_claims_baseline() {
   require_clean_migration "$migration_before"
 
   echo "==> creating claims-disabled Helm baseline with every rendered workload and RUNNER_IMAGE pinned to live effective digests"
+  HELM_RELEASE_LOCK_PRESERVE=true
   if ! BASELINE_IMAGE_MAP="$desired_map" BASELINE_RUNNER_IMAGE="$BASELINE_RUNNER_IMAGE" \
       helm upgrade "$RELEASE" "$BASELINE_CHART_DIR" \
       --namespace "$NAMESPACE" \
@@ -3283,6 +3630,7 @@ prepare_claims_baseline() {
 
   verify_rollback_containment "$migration_before"
   require_clean_migration "$migration_before"
+  HELM_RELEASE_LOCK_PRESERVE=false
   rm -rf "$tmp_dir"
   BASELINE_TMP_DIR=
   release_helm_release_lock
@@ -3501,6 +3849,7 @@ fi
 require_no_active_jobs
 
 echo "==> helm upgrade $RELEASE with exact digest-pinned candidate (atomic, timeout=$TIMEOUT)"
+HELM_RELEASE_LOCK_PRESERVE=true
 set +e
 CANDIDATE_IMAGE_MAP="$CANDIDATE_IMAGE_MAP" \
 CANDIDATE_RUNNER_IMAGE="$CANDIDATE_RUNNER_IMAGE" \
@@ -3518,7 +3867,7 @@ helm_upgrade_status=$?
 set -e
 if [ "$helm_upgrade_status" -ne 0 ]; then
   if contain_failed_atomic_upgrade; then
-    release_helm_release_lock
+    HELM_RELEASE_LOCK_PRESERVE=false
   else
     HELM_RELEASE_LOCK_PRESERVE=true
     echo "ERROR: atomic upgrade failed and rollback containment could not be proven. The release lock is intentionally retained; manual intervention is required." >&2
@@ -3532,10 +3881,4 @@ if ! verify_deployed_candidate; then
   exit 1
 fi
 HELM_RELEASE_LOCK_PRESERVE=false
-if ! resume_live_provisioning_claims; then
-  HELM_RELEASE_LOCK_PRESERVE=true
-  echo "ERROR: deployed candidate verified but provisioning claims could not be resumed; the worker will claim no jobs until this is corrected. The release lock is intentionally retained; manual intervention is required." >&2
-  exit 1
-fi
-release_helm_release_lock
 echo "==> deployed exact source $CANDIDATE_SOURCE_SHA with immutable workload and RUNNER_IMAGE digests"

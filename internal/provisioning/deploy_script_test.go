@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 const testDigestA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -1125,6 +1126,246 @@ func TestDeployScriptResumesProvisioningClaimsAfterSuccessfulDeploy(t *testing.T
 			t.Fatalf("deploy enabled claims that were paused before it started (stat: %v)\n%s", statErr, output)
 		}
 	})
+}
+
+func TestDeployScriptRestoresProvisioningClaimsOnEveryPostPauseExit(t *testing.T) {
+	requirePOSIXShell(t)
+	candidate := baselineManifest(true, "*", "false")
+
+	newLiveClaimsEnvironment := func(t *testing.T) *deployScriptEnvironment {
+		t.Helper()
+		env := newDeployScriptEnvironment(t, baselineManifest(true, "", "false"), candidate)
+		writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
+		return env
+	}
+	exitCode := func(t *testing.T, err error) int {
+		t.Helper()
+		if err == nil {
+			return 0
+		}
+		exitErr, ok := err.(*exec.ExitError)
+		if !ok {
+			t.Fatalf("command returned non-exit error: %v", err)
+		}
+		return exitErr.ExitCode()
+	}
+	assertRestored := func(t *testing.T, env *deployScriptEnvironment, output []byte) {
+		t.Helper()
+		if _, err := os.Stat(env.claimsPausedMark); err != nil {
+			t.Fatalf("test never reached the real claims pause: %v\n%s", err, output)
+		}
+		if _, err := os.Stat(env.claimsResumedMark); err != nil {
+			t.Fatalf("EXIT cleanup did not restore claims: %v\n%s", err, output)
+		}
+	}
+
+	t.Run("normal success", func(t *testing.T) {
+		env := newLiveClaimsEnvironment(t)
+		output, err := env.run("--no-pull")
+		if err != nil {
+			t.Fatalf("deploy failed: %v\n%s", err, output)
+		}
+		assertRestored(t, env, output)
+		if _, err := os.Stat(env.lockFile); !os.IsNotExist(err) {
+			t.Fatalf("successful restore did not release the lock: %v\n%s", err, output)
+		}
+	})
+
+	t.Run("early post-pause set-e failure", func(t *testing.T) {
+		env := newLiveClaimsEnvironment(t)
+		env.activeJobs = 1
+		output, err := env.run("--no-pull")
+		if got := exitCode(t, err); got != 1 {
+			t.Fatalf("post-pause failure exit code = %d, want 1\n%s", got, output)
+		}
+		assertRestored(t, env, output)
+	})
+
+	t.Run("Helm failure preserves Helm exit code", func(t *testing.T) {
+		env := newLiveClaimsEnvironment(t)
+		env.failAtomicUpgrade = true
+		output, err := env.run("--no-pull")
+		if got := exitCode(t, err); got != 99 {
+			t.Fatalf("Helm failure exit code = %d, want 99\n%s", got, output)
+		}
+		assertRestored(t, env, output)
+		if _, err := os.Stat(env.lockFile); !os.IsNotExist(err) {
+			t.Fatalf("contained Helm failure did not release the lock after restoration: %v\n%s", err, output)
+		}
+	})
+
+	t.Run("post-apply comparator failure", func(t *testing.T) {
+		env := newLiveClaimsEnvironment(t)
+		env.postUpgradeObjectMutation = true
+		output, err := env.run("--no-pull")
+		if got := exitCode(t, err); got != 1 {
+			t.Fatalf("comparator failure exit code = %d, want 1\n%s", got, output)
+		}
+		assertRestored(t, env, output)
+		if _, err := os.Stat(env.lockFile); err != nil {
+			t.Fatalf("comparator failure did not retain its containment lock: %v\n%s", err, output)
+		}
+	})
+
+	t.Run("resume failure after otherwise successful deploy", func(t *testing.T) {
+		env := newLiveClaimsEnvironment(t)
+		env.failClaimsResume = true
+		output, err := env.run("--no-pull")
+		if got := exitCode(t, err); got != 86 {
+			t.Fatalf("resume failure exit code = %d, want 86\n%s", got, output)
+		}
+		if _, err := os.Stat(env.claimsResumedMark); !os.IsNotExist(err) {
+			t.Fatalf("failed resume wrote a success marker: %v\n%s", err, output)
+		}
+		if _, err := os.Stat(env.lockFile); err != nil {
+			t.Fatalf("resume failure did not preserve the lock: %v\n%s", err, output)
+		}
+		if !strings.Contains(string(output), "original exit code: 0, resume exit code: 86") {
+			t.Fatalf("resume failure did not log both statuses:\n%s", output)
+		}
+	})
+
+	t.Run("resume failure preserves an existing failure", func(t *testing.T) {
+		env := newLiveClaimsEnvironment(t)
+		env.activeJobs = 1
+		env.failClaimsResume = true
+		output, err := env.run("--no-pull")
+		if got := exitCode(t, err); got != 1 {
+			t.Fatalf("existing failure was replaced by resume status: got %d want 1\n%s", got, output)
+		}
+		if _, err := os.Stat(env.lockFile); err != nil {
+			t.Fatalf("resume failure did not preserve the lock: %v\n%s", err, output)
+		}
+		if !strings.Contains(string(output), "original exit code: 1, resume exit code: 86") {
+			t.Fatalf("combined failure did not log both statuses:\n%s", output)
+		}
+	})
+
+	t.Run("dry-run never pauses or resumes", func(t *testing.T) {
+		env := newLiveClaimsEnvironment(t)
+		output, err := env.run("--no-pull", "--dry-run")
+		if err != nil {
+			t.Fatalf("dry-run failed: %v\n%s", err, output)
+		}
+		for _, marker := range []string{env.claimsPausedMark, env.claimsResumedMark} {
+			if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+				t.Fatalf("dry-run mutated claims marker %s: %v\n%s", marker, statErr, output)
+			}
+		}
+	})
+
+	t.Run("pre-pause failure never resumes", func(t *testing.T) {
+		env := newLiveClaimsEnvironment(t)
+		env.failServerValidateDocument = "selfservice-worker"
+		output, err := env.run("--no-pull")
+		if err == nil {
+			t.Fatalf("pre-pause sabotage unexpectedly succeeded:\n%s", output)
+		}
+		for _, marker := range []string{env.claimsPausedMark, env.claimsResumedMark} {
+			if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+				t.Fatalf("pre-pause failure mutated claims marker %s: %v\n%s", marker, statErr, output)
+			}
+		}
+	})
+
+	t.Run("signal after pause mutation but before response", func(t *testing.T) {
+		env := newLiveClaimsEnvironment(t)
+		env.signalDuringClaimsPause = "INT"
+		output, err := env.run("--no-pull")
+		if got := exitCode(t, err); got != 130 {
+			t.Fatalf("mid-pause signal exit code = %d, want 130\n%s", got, output)
+		}
+		assertRestored(t, env, output)
+	})
+
+	t.Run("failure before pause mutation causes no restore mutation", func(t *testing.T) {
+		env := newLiveClaimsEnvironment(t)
+		env.failClaimsPauseBeforeMutation = true
+		output, err := env.run("--no-pull")
+		if got := exitCode(t, err); got != 85 {
+			t.Fatalf("pre-mutation pause failure exit code = %d, want 85\n%s", got, output)
+		}
+		for _, marker := range []string{env.claimsPausedMark, env.claimsResumedMark} {
+			if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+				t.Fatalf("pre-mutation pause failure wrote marker %s: %v\n%s", marker, statErr, output)
+			}
+		}
+	})
+
+	t.Run("signal during Helm retains containment lock", func(t *testing.T) {
+		env := newLiveClaimsEnvironment(t)
+		env.signalDuringHelm = "TERM"
+		output, err := env.run("--no-pull")
+		if got := exitCode(t, err); got != 143 {
+			t.Fatalf("during-Helm signal exit code = %d, want 143\n%s", got, output)
+		}
+		assertRestored(t, env, output)
+		if _, statErr := os.Stat(env.lockFile); statErr != nil {
+			t.Fatalf("signal during Helm did not retain the unknown-state lock: %v\n%s", statErr, output)
+		}
+	})
+
+	for _, signal := range []struct {
+		name string
+		send string
+		code int
+	}{
+		{name: "INT", send: "INT", code: 130},
+		{name: "TERM", send: "TERM", code: 143},
+		{name: "HUP", send: "HUP", code: 129},
+	} {
+		t.Run("signal "+signal.name, func(t *testing.T) {
+			env := newLiveClaimsEnvironment(t)
+			env.signalAfterClaimsPause = signal.send
+			output, err := env.run("--no-pull")
+			if got := exitCode(t, err); got != signal.code {
+				t.Fatalf("%s exit code = %d, want %d\n%s", signal.name, got, signal.code, output)
+			}
+			assertRestored(t, env, output)
+		})
+	}
+}
+
+func TestDeployScriptClaimsExitRestorationIsLoadBearing(t *testing.T) {
+	requirePOSIXShell(t)
+	sourcePath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
+	source, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const restorationHook = `  if [ "$LIVE_CLAIMS_RESTORE_PENDING" = true ]; then`
+	if strings.Count(string(source), restorationHook) != 1 {
+		t.Fatalf("expected exactly one EXIT restoration hook %q", restorationHook)
+	}
+	sabotaged := strings.Replace(string(source), restorationHook, "  if false; then", 1)
+	scriptPath := filepath.Join(
+		"..", "..", "deploy", "scripts",
+		"deploy-sabotaged-without-exit-restoration-test.sh",
+	)
+	writeFile(t, scriptPath, sabotaged)
+	t.Cleanup(func() { os.Remove(scriptPath) })
+	if err := os.Chmod(scriptPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	env := newDeployScriptEnvironment(
+		t,
+		baselineManifest(true, "", "false"),
+		baselineManifest(true, "*", "false"),
+	)
+	writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
+	env.activeJobs = 1
+	env.scriptPath = scriptPath
+	output, runErr := env.run("--no-pull")
+	if runErr == nil {
+		t.Fatalf("sabotaged post-pause failure unexpectedly succeeded:\n%s", output)
+	}
+	if _, err := os.Stat(env.claimsPausedMark); err != nil {
+		t.Fatalf("sabotage never reached claims pause: %v\n%s", err, output)
+	}
+	if _, err := os.Stat(env.claimsResumedMark); !os.IsNotExist(err) {
+		t.Fatalf("sabotage unexpectedly restored claims: %v\n%s", err, output)
+	}
 }
 
 func TestDeployScriptDeployedCandidateWaitsForWarmerRolloutBeforeImageVerification(t *testing.T) {
@@ -4653,6 +4894,412 @@ func TestDeployScriptRejectsConcurrentReleaseMutation(t *testing.T) {
 	}
 }
 
+func writeDeployLockFixture(
+	t *testing.T,
+	env *deployScriptEnvironment,
+	hostname string,
+	pid int,
+	created time.Time,
+	uid string,
+	resourceVersion string,
+) {
+	t.Helper()
+	holder := fmt.Sprintf("%s|%d|%s", hostname, pid, created.UTC().Format("2006-01-02T15:04:05Z"))
+	writeFile(t, env.lockFile, fmt.Sprintf(`{
+  "apiVersion": "v1",
+  "kind": "ConfigMap",
+  "metadata": {
+    "name": "selfservice-phase1-deploy-lock",
+    "namespace": "selfservice",
+    "creationTimestamp": %q,
+    "uid": %q,
+    "resourceVersion": %q,
+    "annotations": {
+      "crucible.jmal.io/holder": %q
+    }
+  }
+}
+`, created.UTC().Format("2006-01-02T15:04:05Z"), uid, resourceVersion, holder))
+}
+
+func TestDeployScriptStaleReleaseLockRecovery(t *testing.T) {
+	requirePOSIXShell(t)
+	manifest := baselineManifest(true, "*", "false")
+	localHostname, err := os.Hostname()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	const deadPID = 99999999
+
+	runPrepare := func(env *deployScriptEnvironment) ([]byte, error) {
+		return env.run(
+			"--prepare-claims-baseline",
+			"--baseline-chart-dir",
+			env.chartDir,
+		)
+	}
+	assertNoUpgrade := func(t *testing.T, env *deployScriptEnvironment) {
+		t.Helper()
+		if body, readErr := os.ReadFile(env.upgradeLog); readErr == nil && len(body) > 0 {
+			t.Fatalf("unsafe lock recovery reached Helm upgrade: %s", body)
+		}
+	}
+	assertBackup := func(t *testing.T, env *deployScriptEnvironment, expected []byte) {
+		t.Helper()
+		entries, readErr := os.ReadDir(env.lockBackupDir)
+		if readErr != nil {
+			t.Fatalf("stale lock was not backed up: %v", readErr)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("stale lock backup count = %d, want 1", len(entries))
+		}
+		backup, readErr := os.ReadFile(filepath.Join(env.lockBackupDir, entries[0].Name()))
+		if readErr != nil {
+			t.Fatalf("read stale lock backup: %v", readErr)
+		}
+		if !bytes.Equal(bytes.TrimSpace(backup), bytes.TrimSpace(expected)) {
+			t.Fatalf("stale lock backup differs from the exact observed ConfigMap:\nwant:\n%s\ngot:\n%s", expected, backup)
+		}
+	}
+
+	t.Run("young same-host live holder blocks", func(t *testing.T) {
+		env := newDeployScriptEnvironment(t, manifest, manifest)
+		writeDeployLockFixture(t, env, localHostname, os.Getpid(), now, "live-lock-uid", "41")
+		output, runErr := runPrepare(env)
+		if runErr == nil {
+			t.Fatalf("young live lock was reclaimed:\n%s", output)
+		}
+		if !strings.Contains(string(output), "live local PID") {
+			t.Fatalf("failure did not identify live same-host holder:\n%s", output)
+		}
+		assertNoUpgrade(t, env)
+	})
+
+	t.Run("young same-host dead holder backs up and reclaims", func(t *testing.T) {
+		env := newDeployScriptEnvironment(t, manifest, manifest)
+		writeDeployLockFixture(t, env, localHostname, deadPID, now, "dead-lock-uid", "42")
+		expected, readErr := os.ReadFile(env.lockFile)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		output, runErr := runPrepare(env)
+		if runErr != nil {
+			t.Fatalf("dead same-host lock was not reclaimed: %v\n%s", runErr, output)
+		}
+		assertBackup(t, env, expected)
+	})
+
+	t.Run("young remote-host holder blocks", func(t *testing.T) {
+		env := newDeployScriptEnvironment(t, manifest, manifest)
+		writeDeployLockFixture(t, env, "other-deploy-host", deadPID, now, "remote-lock-uid", "43")
+		output, runErr := runPrepare(env)
+		if runErr == nil {
+			t.Fatalf("young remote lock was reclaimed:\n%s", output)
+		}
+		if !strings.Contains(string(output), "remote liveness is ambiguous") {
+			t.Fatalf("failure did not identify ambiguous remote holder:\n%s", output)
+		}
+		if !strings.Contains(string(output), "21600-second lease") {
+			t.Fatalf("default six-hour TTL is not load-bearing in remote-host fencing:\n%s", output)
+		}
+		assertNoUpgrade(t, env)
+	})
+
+	t.Run("expired lock reclaims despite same-host PID collision", func(t *testing.T) {
+		env := newDeployScriptEnvironment(t, manifest, manifest)
+		writeDeployLockFixture(t, env, localHostname, os.Getpid(), now.Add(-7*time.Hour), "expired-lock-uid", "44")
+		expected, readErr := os.ReadFile(env.lockFile)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		output, runErr := runPrepare(env)
+		if runErr != nil {
+			t.Fatalf("expired lock was not reclaimed: %v\n%s", runErr, output)
+		}
+		if !strings.Contains(string(output), "lease expired") {
+			t.Fatalf("recovery did not document lease expiry:\n%s", output)
+		}
+		assertBackup(t, env, expected)
+	})
+
+	for _, malformed := range []struct {
+		name            string
+		hostname        string
+		pid             int
+		created         time.Time
+		uid             string
+		resourceVersion string
+		mutate          func(string) string
+	}{
+		{name: "holder", hostname: "bad|host", pid: deadPID, created: now, uid: "uid", resourceVersion: "45"},
+		{
+			name:            "timestamp",
+			hostname:        localHostname,
+			pid:             deadPID,
+			created:         now,
+			uid:             "uid",
+			resourceVersion: "46",
+			mutate: func(body string) string {
+				return strings.Replace(body, now.Format("2006-01-02T15:04:05Z"), "not-a-time", 1)
+			},
+		},
+		{
+			name:            "holder timestamp",
+			hostname:        localHostname,
+			pid:             deadPID,
+			created:         now,
+			uid:             "uid",
+			resourceVersion: "46a",
+			mutate: func(body string) string {
+				index := strings.LastIndex(body, now.Format("2006-01-02T15:04:05Z"))
+				if index < 0 {
+					t.Fatal("holder timestamp fixture missing")
+				}
+				return body[:index] + "2026-99-99T99:99:99Z" + body[index+len(now.Format("2006-01-02T15:04:05Z")):]
+			},
+		},
+		{name: "uid", hostname: localHostname, pid: deadPID, created: now, uid: "", resourceVersion: "47"},
+		{name: "resourceVersion", hostname: localHostname, pid: deadPID, created: now, uid: "uid", resourceVersion: ""},
+	} {
+		t.Run("malformed "+malformed.name+" blocks", func(t *testing.T) {
+			env := newDeployScriptEnvironment(t, manifest, manifest)
+			writeDeployLockFixture(t, env, malformed.hostname, malformed.pid, malformed.created, malformed.uid, malformed.resourceVersion)
+			if malformed.mutate != nil {
+				body, readErr := os.ReadFile(env.lockFile)
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				writeFile(t, env.lockFile, malformed.mutate(string(body)))
+			}
+			output, runErr := runPrepare(env)
+			if runErr == nil {
+				t.Fatalf("malformed lock was reclaimed:\n%s", output)
+			}
+			if !strings.Contains(string(output), "malformed") {
+				t.Fatalf("malformed lock failed for wrong reason:\n%s", output)
+			}
+			assertNoUpgrade(t, env)
+		})
+	}
+
+	t.Run("backup failure blocks deletion", func(t *testing.T) {
+		env := newDeployScriptEnvironment(t, manifest, manifest)
+		writeDeployLockFixture(t, env, localHostname, deadPID, now, "backup-lock-uid", "48")
+		writeFile(t, env.lockBackupDir, "not a directory")
+		output, runErr := runPrepare(env)
+		if runErr == nil {
+			t.Fatalf("backup failure did not block stale-lock deletion:\n%s", output)
+		}
+		if _, statErr := os.Stat(env.lockFile); statErr != nil {
+			t.Fatalf("backup failure deleted the lock: %v\n%s", statErr, output)
+		}
+		assertNoUpgrade(t, env)
+	})
+
+	t.Run("UID resourceVersion race blocks deletion", func(t *testing.T) {
+		env := newDeployScriptEnvironment(t, manifest, manifest)
+		writeDeployLockFixture(t, env, localHostname, deadPID, now, "raced-lock-uid", "49")
+		expected, readErr := os.ReadFile(env.lockFile)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		env.lockDeleteRaceMode = "both"
+		output, runErr := runPrepare(env)
+		if runErr == nil {
+			t.Fatalf("lock replacement race was deleted:\n%s", output)
+		}
+		body, readErr := os.ReadFile(env.lockFile)
+		if readErr != nil {
+			t.Fatalf("replacement lock was deleted: %v\n%s", readErr, output)
+		}
+		if !strings.Contains(string(body), "replacement-lock-uid") {
+			t.Fatalf("race did not preserve the replacement lock:\n%s\n%s", body, output)
+		}
+		assertBackup(t, env, expected)
+		assertNoUpgrade(t, env)
+	})
+
+	t.Run("TTL below guarded runtime is rejected", func(t *testing.T) {
+		env := newDeployScriptEnvironment(t, manifest, manifest)
+		env.lockTTLSeconds = "21599"
+		output, runErr := runPrepare(env)
+		if runErr == nil {
+			t.Fatalf("undersized lock TTL was accepted:\n%s", output)
+		}
+		if !strings.Contains(string(output), "21600 through 604800") {
+			t.Fatalf("undersized TTL failed for the wrong reason:\n%s", output)
+		}
+		assertNoUpgrade(t, env)
+	})
+
+	t.Run("oversized TTL cannot overflow into stale classification", func(t *testing.T) {
+		env := newDeployScriptEnvironment(t, manifest, manifest)
+		writeDeployLockFixture(t, env, localHostname, os.Getpid(), now, "overflow-lock-uid", "50")
+		env.lockTTLSeconds = "999999999999999999999999999999999999"
+		output, runErr := runPrepare(env)
+		if runErr == nil {
+			t.Fatalf("oversized lock TTL was accepted:\n%s", output)
+		}
+		if !strings.Contains(string(output), "21600 through 604800") {
+			t.Fatalf("oversized TTL failed for the wrong reason:\n%s", output)
+		}
+		body, readErr := os.ReadFile(env.lockFile)
+		if readErr != nil || !strings.Contains(string(body), "overflow-lock-uid") {
+			t.Fatalf("oversized TTL deleted or replaced the live lock: err=%v body=%s\n%s", readErr, body, output)
+		}
+		assertNoUpgrade(t, env)
+	})
+}
+
+func TestDeployScriptStaleLockGuardsAreLoadBearing(t *testing.T) {
+	requirePOSIXShell(t)
+	sourcePath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
+	sourceBytes, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(sourceBytes)
+	manifest := baselineManifest(true, "*", "false")
+	localHostname, err := os.Hostname()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runPrepare := func(env *deployScriptEnvironment) ([]byte, error) {
+		return env.run(
+			"--prepare-claims-baseline",
+			"--baseline-chart-dir",
+			env.chartDir,
+		)
+	}
+	runSabotage := func(t *testing.T, old, replacement string, configure func(*deployScriptEnvironment)) {
+		t.Helper()
+		if strings.Count(source, old) != 1 {
+			t.Fatalf("sabotage target %q count != 1", old)
+		}
+		scriptPath := filepath.Join(
+			"..", "..", "deploy", "scripts",
+			"deploy-sabotaged-lock-"+strings.ReplaceAll(t.Name(), "/", "-")+".sh",
+		)
+		writeFile(t, scriptPath, strings.Replace(source, old, replacement, 1))
+		t.Cleanup(func() { os.Remove(scriptPath) })
+		if err := os.Chmod(scriptPath, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		env := newDeployScriptEnvironment(t, manifest, manifest)
+		env.scriptPath = scriptPath
+		configure(env)
+		output, runErr := runPrepare(env)
+		if runErr != nil {
+			t.Fatalf("sabotaged guard did not permit the unsafe mutation, so the load-bearing test is not exercising it: %v\n%s", runErr, output)
+		}
+	}
+
+	t.Run("same-host liveness", func(t *testing.T) {
+		runSabotage(
+			t,
+			`    if [ -d "/proc/$HELM_RELEASE_LOCK_OBSERVED_PID" ] ||
+       kill -0 "$HELM_RELEASE_LOCK_OBSERVED_PID" 2>/dev/null; then`,
+			"    if false; then",
+			func(env *deployScriptEnvironment) {
+				writeDeployLockFixture(t, env, localHostname, os.Getpid(), time.Now(), "live-sabotage-uid", "51")
+			},
+		)
+	})
+
+	t.Run("lease TTL", func(t *testing.T) {
+		runSabotage(
+			t,
+			`  if [ "$lock_age" -lt "$HELM_RELEASE_LOCK_TTL_SECONDS" ]; then`,
+			"  if false; then",
+			func(env *deployScriptEnvironment) {
+				writeDeployLockFixture(t, env, "remote-deploy-host", 99999999, time.Now(), "ttl-sabotage-uid", "52")
+			},
+		)
+	})
+
+	t.Run("all UID resourceVersion preconditions", func(t *testing.T) {
+		runSabotage(
+			t,
+			`        preconditions: {
+          uid: $uid,
+          resourceVersion: $resource_version
+        }`,
+			"        preconditions: {}",
+			func(env *deployScriptEnvironment) {
+				writeDeployLockFixture(t, env, localHostname, 99999999, time.Now(), "precondition-sabotage-uid", "53")
+				env.lockDeleteRaceMode = "both"
+			},
+		)
+	})
+
+	t.Run("UID precondition", func(t *testing.T) {
+		runSabotage(
+			t,
+			`          uid: $uid,
+`,
+			"",
+			func(env *deployScriptEnvironment) {
+				writeDeployLockFixture(t, env, localHostname, 99999999, time.Now(), "uid-sabotage", "54")
+				env.lockDeleteRaceMode = "uid"
+			},
+		)
+	})
+
+	t.Run("resourceVersion precondition", func(t *testing.T) {
+		runSabotage(
+			t,
+			`          uid: $uid,
+          resourceVersion: $resource_version`,
+			"          uid: $uid",
+			func(env *deployScriptEnvironment) {
+				writeDeployLockFixture(t, env, localHostname, 99999999, time.Now(), "rv-sabotage", "55")
+				env.lockDeleteRaceMode = "resourceVersion"
+			},
+		)
+	})
+}
+
+func TestDeployScriptInterruptedLockCreationIsReconciled(t *testing.T) {
+	requirePOSIXShell(t)
+	manifest := baselineManifest(true, "*", "false")
+	env := newDeployScriptEnvironment(t, manifest, manifest)
+	env.signalDuringLockCreate = "HUP"
+	output, err := env.run(
+		"--prepare-claims-baseline",
+		"--baseline-chart-dir",
+		env.chartDir,
+	)
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok || exitErr.ExitCode() != 129 {
+		t.Fatalf("interrupted lock creation exit = %v, want 129\n%s", err, output)
+	}
+	if _, statErr := os.Stat(env.lockFile); !os.IsNotExist(statErr) {
+		t.Fatalf("interrupted lock creation left an orphaned owned lock: %v\n%s", statErr, output)
+	}
+}
+
+func TestDeployScriptAmbiguousLockCreationIsReconciled(t *testing.T) {
+	requirePOSIXShell(t)
+	manifest := baselineManifest(true, "*", "false")
+	env := newDeployScriptEnvironment(t, manifest, manifest)
+	env.failLockCreateAfterMutation = true
+	output, err := env.run(
+		"--prepare-claims-baseline",
+		"--baseline-chart-dir",
+		env.chartDir,
+	)
+	if err != nil {
+		t.Fatalf("server-created lock with lost response was not adopted: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "acquired Helm release lock") {
+		t.Fatalf("ambiguous creation was not reconciled as owned:\n%s", output)
+	}
+	if _, statErr := os.Stat(env.lockFile); !os.IsNotExist(statErr) {
+		t.Fatalf("reconciled lock was not released after success: %v\n%s", statErr, output)
+	}
+}
+
 type deployScriptEnvironment struct {
 	t                         *testing.T
 	binDir                    string
@@ -4667,6 +5314,8 @@ type deployScriptEnvironment struct {
 	upgradeLog                string
 	gitLog                    string
 	lockFile                  string
+	lockBackupDir             string
+	lockDeleteRaceMark        string
 	serverDryRunLog           string
 	serverDryRunMark          string
 	finalRollbackMark         string
@@ -4738,6 +5387,15 @@ type deployScriptEnvironment struct {
 	postUpgradeMismatch            string
 	postUpgradeObjectMutation      bool
 	postApplyAnnotationsMode       string
+	failClaimsResume               bool
+	lockDeleteRaceMode             string
+	lockTTLSeconds                 string
+	signalAfterClaimsPause         string
+	signalDuringClaimsPause        string
+	failClaimsPauseBeforeMutation  bool
+	signalDuringHelm               string
+	signalDuringLockCreate         string
+	failLockCreateAfterMutation    bool
 
 	// simulateOwnershipConflict makes the fake kubectl reject any
 	// `--server-side --dry-run=server` apply that lacks `--force-conflicts`
@@ -4772,6 +5430,8 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 		upgradeLog:                filepath.Join(root, "upgrade.log"),
 		gitLog:                    filepath.Join(root, "git.log"),
 		lockFile:                  filepath.Join(root, "helm.lock"),
+		lockBackupDir:             filepath.Join(root, "lock-backups"),
+		lockDeleteRaceMark:        filepath.Join(root, "lock-delete-race.marker"),
 		serverDryRunLog:           filepath.Join(root, "server-dry-run.log"),
 		serverDryRunMark:          filepath.Join(root, "server-dry-run.marker"),
 		finalRollbackMark:         filepath.Join(root, "final-rollback.marker"),
@@ -4971,6 +5631,11 @@ case "$1 $2" in
       "$post_renderer" < "$FAKE_CANDIDATE_MANIFEST" > "$FAKE_BASELINE_MANIFEST"
     fi
     printf '%s\n' "$original_args" >> "$FAKE_UPGRADE_LOG"
+    if [ -n "${EXPECTED_CANDIDATE_MANIFEST:-}" ] &&
+       [ -n "$FAKE_SIGNAL_DURING_HELM" ]; then
+      kill -s "$FAKE_SIGNAL_DURING_HELM" "$PPID"
+      sleep 1
+    fi
     if [ -n "${EXPECTED_CANDIDATE_MANIFEST:-}" ] && [ "$FAKE_FAIL_ATOMIC_UPGRADE" = true ]; then
       rm -f "$FAKE_SYNTHETIC_CONTAINED_MARKER"
       : > "$FAKE_ATOMIC_FAILED_MARKER"
@@ -5503,11 +6168,7 @@ case "$1" in
       if [ ! -f "$FAKE_LOCK_FILE" ]; then
         exit 1
       fi
-      if [[ "$*" == *"-o yaml"* ]]; then
-        printf 'holder: %s\n' "$(cat "$FAKE_LOCK_FILE")"
-      else
-        cat "$FAKE_LOCK_FILE"
-      fi
+      cat "$FAKE_LOCK_FILE"
     elif [[ "$*" == *"app.kubernetes.io/name=postgresql,app.kubernetes.io/instance=selfservice"* ]]; then
       printf 'selfservice-postgresql-0'
     elif [ "$2" = "jobs" ]; then
@@ -5572,6 +6233,13 @@ case "$1" in
     fi
     ;;
   rollout)
+    if [[ "$*" == *"deployment/selfservice-worker"* ]] &&
+       [ -n "$FAKE_SIGNAL_AFTER_CLAIMS_PAUSE" ] &&
+       [ -f "$FAKE_CLAIMS_PAUSED_MARKER" ] &&
+       [ ! -f "$FAKE_CLAIMS_RESUMED_MARKER" ]; then
+      kill -s "$FAKE_SIGNAL_AFTER_CLAIMS_PAUSE" "$PPID"
+      sleep 1
+    fi
     case "$*" in
       *"DaemonSet/selfservice-runner-image-warmer"*|*"daemonset/selfservice-runner-image-warmer"*)
        if [ "$FAKE_WARMER_ROLLOUT_FAILURE" = true ] && [ -f "$FAKE_CANDIDATE_APPLIED_MARKER" ]; then
@@ -5650,7 +6318,29 @@ case "$1" in
       body=$(cat)
       holder=$(printf '%s\n' "$body" | sed -n 's/.*crucible.jmal.io\/holder: "\(.*\)"/\1/p')
       [ -n "$holder" ]
-      printf '%s' "$holder" > "$FAKE_LOCK_FILE"
+      jq -cn \
+        --arg holder "$holder" \
+        --arg created_at "${holder##*|}" \
+        '{
+          apiVersion:"v1",
+          kind:"ConfigMap",
+          metadata:{
+            name:"selfservice-phase1-deploy-lock",
+            namespace:"selfservice",
+            creationTimestamp:$created_at,
+            uid:"11111111-1111-1111-1111-111111111111",
+            resourceVersion:"100",
+            annotations:{"crucible.jmal.io/holder":$holder}
+          }
+        }' > "$FAKE_LOCK_FILE"
+      if [ -n "$FAKE_SIGNAL_DURING_LOCK_CREATE" ]; then
+        kill -s "$FAKE_SIGNAL_DURING_LOCK_CREATE" "$PPID"
+        sleep 1
+      fi
+      if [ "$FAKE_FAIL_LOCK_CREATE_AFTER_MUTATION" = true ]; then
+        echo "sabotaged lost lock creation response" >&2
+        exit 88
+      fi
     fi
     ;;
   wait)
@@ -5816,7 +6506,68 @@ case "$1" in
     fi
     ;;
   delete)
-    rm -f "$FAKE_LOCK_FILE"
+    if [[ "$*" == *"--raw="* ]]; then
+      delete_options=
+      previous=
+      for argument in "$@"; do
+        if [ "$previous" = "-f" ]; then
+          delete_options=$argument
+          break
+        fi
+        previous=$argument
+      done
+      [ -n "$delete_options" ]
+      expected_uid=$(jq -r '.preconditions.uid // empty' "$delete_options")
+      expected_resource_version=$(jq -r '.preconditions.resourceVersion // empty' "$delete_options")
+      if [ -n "$FAKE_LOCK_DELETE_RACE_MODE" ] &&
+         [ ! -f "$FAKE_LOCK_DELETE_RACE_MARKER" ]; then
+        case "$FAKE_LOCK_DELETE_RACE_MODE" in
+          both)
+            mutation='.metadata.uid = "replacement-lock-uid" | .metadata.resourceVersion = "999"'
+            ;;
+          uid)
+            mutation='.metadata.uid = "replacement-lock-uid"'
+            ;;
+          resourceVersion)
+            mutation='.metadata.resourceVersion = "999"'
+            ;;
+          *)
+            echo "unexpected lock race mode $FAKE_LOCK_DELETE_RACE_MODE" >&2
+            exit 98
+            ;;
+        esac
+        jq "$mutation" "$FAKE_LOCK_FILE" > "$FAKE_LOCK_FILE.replacement"
+        mv "$FAKE_LOCK_FILE.replacement" "$FAKE_LOCK_FILE"
+        : > "$FAKE_LOCK_DELETE_RACE_MARKER"
+      fi
+      if [ "$(jq -r '.apiVersion' "$delete_options")" != "v1" ] ||
+         [ "$(jq -r '.kind' "$delete_options")" != "DeleteOptions" ]; then
+        echo "invalid raw DeleteOptions envelope" >&2
+        exit 1
+      fi
+      expected_uri="/api/v1/namespaces/selfservice/configmaps/selfservice-phase1-deploy-lock"
+      actual_uri=
+      for argument in "$@"; do
+        case "$argument" in
+          --raw=*) actual_uri=${argument#--raw=} ;;
+        esac
+      done
+      if [ "$actual_uri" != "$expected_uri" ]; then
+        echo "invalid raw lock deletion URI $actual_uri" >&2
+        exit 1
+      fi
+      current_uid=$(jq -er '.metadata.uid' "$FAKE_LOCK_FILE")
+      current_resource_version=$(jq -er '.metadata.resourceVersion' "$FAKE_LOCK_FILE")
+      if { [ -n "$expected_uid" ] && [ "$expected_uid" != "$current_uid" ]; } ||
+         { [ -n "$expected_resource_version" ] &&
+           [ "$expected_resource_version" != "$current_resource_version" ]; }; then
+        echo "Conflict: lock precondition failed" >&2
+        exit 1
+      fi
+      rm -f "$FAKE_LOCK_FILE"
+    else
+      rm -f "$FAKE_LOCK_FILE"
+    fi
     ;;
   patch)
     : > "$FAKE_SYNTHETIC_CONTAINED_MARKER"
@@ -5840,11 +6591,23 @@ case "$1" in
     done
     case "$claims_value" in
       false)
+        if [ "$FAKE_FAIL_CLAIMS_PAUSE_BEFORE_MUTATION" = true ]; then
+          echo "sabotaged claims pause failure before mutation" >&2
+          exit 85
+        fi
         sed '/- name: WORKER_PROVISIONING_CLAIMS_ENABLED/{n;s/value: "true"/value: "false"/;}' \
           "$FAKE_LIVE_RESOURCE_MANIFEST" > "$FAKE_LIVE_RESOURCE_MANIFEST.paused"
         : > "$FAKE_CLAIMS_PAUSED_MARKER"
+        if [ -n "$FAKE_SIGNAL_DURING_CLAIMS_PAUSE" ]; then
+          kill -s "$FAKE_SIGNAL_DURING_CLAIMS_PAUSE" "$PPID"
+          sleep 1
+        fi
         ;;
       true)
+        if [ "$FAKE_FAIL_CLAIMS_RESUME" = true ]; then
+          echo "sabotaged claims resume failure" >&2
+          exit 86
+        fi
         sed '/- name: WORKER_PROVISIONING_CLAIMS_ENABLED/{n;s/value: "false"/value: "true"/;}' \
           "$FAKE_LIVE_RESOURCE_MANIFEST" > "$FAKE_LIVE_RESOURCE_MANIFEST.resumed"
         mv "$FAKE_LIVE_RESOURCE_MANIFEST.resumed" "$FAKE_LIVE_RESOURCE_MANIFEST"
@@ -6119,6 +6882,11 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_UPGRADE_LOG="+e.upgradeLog,
 		"FAKE_GIT_LOG="+e.gitLog,
 		"FAKE_LOCK_FILE="+e.lockFile,
+		"FAKE_LOCK_BACKUP_DIR="+e.lockBackupDir,
+		"FAKE_LOCK_DELETE_RACE_MODE="+e.lockDeleteRaceMode,
+		"FAKE_LOCK_DELETE_RACE_MARKER="+e.lockDeleteRaceMark,
+		"FAKE_SIGNAL_DURING_LOCK_CREATE="+e.signalDuringLockCreate,
+		"FAKE_FAIL_LOCK_CREATE_AFTER_MUTATION="+strconv.FormatBool(e.failLockCreateAfterMutation),
 		"FAKE_SERVER_DRY_RUN_LOG="+e.serverDryRunLog,
 		"FAKE_SERVER_DRY_RUN_MARKER="+e.serverDryRunMark,
 		"FAKE_FINAL_ROLLBACK_MARKER="+e.finalRollbackMark,
@@ -6137,6 +6905,11 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_CRONJOB_VERIFY_MARKER="+e.cronjobVerifyMark,
 		"FAKE_CLAIMS_PAUSED_MARKER="+e.claimsPausedMark,
 		"FAKE_CLAIMS_RESUMED_MARKER="+e.claimsResumedMark,
+		"FAKE_FAIL_CLAIMS_RESUME="+strconv.FormatBool(e.failClaimsResume),
+		"FAKE_FAIL_CLAIMS_PAUSE_BEFORE_MUTATION="+strconv.FormatBool(e.failClaimsPauseBeforeMutation),
+		"FAKE_SIGNAL_AFTER_CLAIMS_PAUSE="+e.signalAfterClaimsPause,
+		"FAKE_SIGNAL_DURING_CLAIMS_PAUSE="+e.signalDuringClaimsPause,
+		"FAKE_SIGNAL_DURING_HELM="+e.signalDuringHelm,
 		"FAKE_WARMER_ROLLOUT_MARKER="+e.warmerRolloutMark,
 		"FAKE_WARMER_IMAGE_PROBE_LOG="+e.warmerImageProbeLog,
 		"FAKE_WARMER_ROLLOUT_FAILURE="+strconv.FormatBool(e.warmerRolloutFailure),
@@ -6189,6 +6962,8 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_GIT_DIRTY="+strconv.FormatBool(e.gitDirty),
 		"FAKE_COMMIT_VERIFIED="+strconv.FormatBool(e.commitVerified),
 		"FAKE_MISSING_BUILD="+e.missingBuild,
+		"HELM_RELEASE_LOCK_BACKUP_DIR="+e.lockBackupDir,
+		"HELM_RELEASE_LOCK_TTL_SECONDS="+e.lockTTLSeconds,
 	)
 	return cmd.CombinedOutput()
 }
