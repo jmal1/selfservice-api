@@ -18,6 +18,7 @@
 #   - curl
 #   - tar
 #   - unzip
+#   - base64
 #   - gh authenticated for source workflow artifacts and private GHCR packages
 #   - SSH key (deploy key) allowing `git pull` from the repo
 #   - DEPLOY_PROMETHEUS_URL set to the Prometheus base URL for firing-alert checks
@@ -2266,7 +2267,41 @@ require_no_pending_provisioning_jobs() {
 }
 
 require_synthetic_pod_quota() {
+  local encoded_synthetic_user_id decoded_synthetic_user_id_length synthetic_user_id_with_sentinel synthetic_user_id
   local postgres_pod quota_state max_pods active_pods
+  if ! encoded_synthetic_user_id="$(
+    kubectl get secret selfservice-synthetic-user -n "$NAMESPACE" \
+      -o jsonpath='{.data.user-id}'
+  )"; then
+    echo "ERROR: failed to read the authoritative synthetic user ID from Kubernetes Secret selfservice-synthetic-user." >&2
+    return 1
+  fi
+  if [ -z "$encoded_synthetic_user_id" ]; then
+    echo "ERROR: Kubernetes Secret selfservice-synthetic-user is missing required key user-id." >&2
+    return 1
+  fi
+  if ! decoded_synthetic_user_id_length="$(
+    printf '%s' "$encoded_synthetic_user_id" | base64 --decode | wc -c
+  )"; then
+    echo "ERROR: Kubernetes Secret selfservice-synthetic-user key user-id is not valid base64." >&2
+    return 1
+  fi
+  if [ "$decoded_synthetic_user_id_length" != "36" ]; then
+    echo "ERROR: Kubernetes Secret selfservice-synthetic-user key user-id is not a valid UUID." >&2
+    return 1
+  fi
+  if ! synthetic_user_id_with_sentinel="$(
+    printf '%s' "$encoded_synthetic_user_id" | base64 --decode &&
+    printf .
+  )"; then
+    echo "ERROR: Kubernetes Secret selfservice-synthetic-user key user-id is not valid base64." >&2
+    return 1
+  fi
+  synthetic_user_id=${synthetic_user_id_with_sentinel%.}
+  if [[ ! "$synthetic_user_id" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+    echo "ERROR: Kubernetes Secret selfservice-synthetic-user key user-id is not a valid UUID." >&2
+    return 1
+  fi
   if ! postgres_pod="$(
     kubectl get pods -n "$NAMESPACE" \
       -l "app.kubernetes.io/name=postgresql,app.kubernetes.io/instance=$RELEASE" \
@@ -2280,22 +2315,24 @@ require_synthetic_pod_quota() {
     return 1
   fi
   if ! quota_state="$(
-    kubectl exec -n "$NAMESPACE" "$postgres_pod" -c postgresql -- sh -ec '
+    printf '%s\n' "$synthetic_user_id" |
+    kubectl exec -i -n "$NAMESPACE" "$postgres_pod" -c postgresql -- sh -ec '
+      IFS= read -r synthetic_user_id
       password_file=${POSTGRES_PASSWORD_FILE:-}
       if [ -n "$password_file" ]; then
         export PGPASSWORD="$(cat "$password_file")"
       fi
       exec psql \
         -v ON_ERROR_STOP=1 \
+        -v "synthetic_user_id=$synthetic_user_id" \
         -U "${POSTGRES_USER:-postgres}" \
         -d "${POSTGRES_DATABASE:-${POSTGRES_DB:-postgres}}" \
-        -Atc "SELECT u.max_pods::text || '"'"':'"'"' || count(DISTINCT p.id)::text
+        -Atc "SELECT u.max_pods::text || '"'"':'"'"' || count(DISTINCT p.id)::text /* gate_a4_synthetic_quota_preflight */
               FROM users AS u
               LEFT JOIN pods AS p
                 ON p.owner_id = u.id
                AND p.status NOT IN ('"'"'destroyed'"'"', '"'"'error'"'"')
-              WHERE u.oidc_sub = '"'"'synthetic-monitor-no-oidc'"'"'
-                AND u.username = '"'"'synthetic'"'"'
+              WHERE u.id = :'"'"'synthetic_user_id'"'"'::uuid
                 AND u.is_active IS TRUE
               GROUP BY u.id, u.max_pods"
     '

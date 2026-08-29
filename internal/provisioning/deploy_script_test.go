@@ -5,6 +5,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"compress/gzip"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"os/exec"
@@ -22,6 +23,8 @@ const testDigestB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 const testSourceSHA = "cccccccccccccccccccccccccccccccccccccccc"
 const otherSourceSHA = "dddddddddddddddddddddddddddddddddddddddd"
 const testUISourceSHA = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+const testSyntheticUserID = "9f68fd44-60dc-4a59-b16f-6670c33971e5"
+const testSyntheticOIDCSub = "f4ed39c8c1bcbd12aac73c64ef58a0a753014ba9b13f7d4f313c99a0511f5a0e"
 
 func acceptedRollbackBaselineRevision(t *testing.T) int {
 	t.Helper()
@@ -1155,7 +1158,7 @@ func TestDeployScriptReleasePreflightGuards(t *testing.T) {
 		wantOutput string
 		wantPass   bool
 	}{
-		{name: "all guards pass", wantOutput: "release preflight passed", wantPass: true},
+		{name: "valid synthetic quota uses UUID despite hashed OIDC subject", wantOutput: "release preflight passed", wantPass: true},
 		{
 			name: "allowlisted firing alert passes",
 			configure: func(env *deployScriptEnvironment) {
@@ -1228,6 +1231,62 @@ func TestDeployScriptReleasePreflightGuards(t *testing.T) {
 				env.preflightQueryFailure = "quota"
 			},
 			wantOutput: "synthetic-user quota preflight query failed",
+		},
+		{
+			name: "synthetic user secret missing",
+			configure: func(env *deployScriptEnvironment) {
+				env.syntheticSecretExists = false
+			},
+			wantOutput: "failed to read the authoritative synthetic user ID",
+		},
+		{
+			name: "synthetic user secret read failure",
+			configure: func(env *deployScriptEnvironment) {
+				env.failSyntheticSecretRead = true
+			},
+			wantOutput: "failed to read the authoritative synthetic user ID",
+		},
+		{
+			name: "synthetic user secret key missing",
+			configure: func(env *deployScriptEnvironment) {
+				env.syntheticSecretKeyPresent = false
+			},
+			wantOutput: "missing required key user-id",
+		},
+		{
+			name: "synthetic user secret value malformed base64",
+			configure: func(env *deployScriptEnvironment) {
+				env.syntheticSecretValue = "not-valid-base64%%%"
+			},
+			wantOutput: "key user-id is not valid base64",
+		},
+		{
+			name: "synthetic user secret value malformed UUID",
+			configure: func(env *deployScriptEnvironment) {
+				env.syntheticSecretValue = base64.StdEncoding.EncodeToString([]byte("not-a-uuid"))
+			},
+			wantOutput: "key user-id is not a valid UUID",
+		},
+		{
+			name: "synthetic user secret UUID has trailing newline",
+			configure: func(env *deployScriptEnvironment) {
+				env.syntheticSecretValue = base64.StdEncoding.EncodeToString([]byte(testSyntheticUserID + "\n"))
+			},
+			wantOutput: "key user-id is not a valid UUID",
+		},
+		{
+			name: "synthetic user secret UUID has trailing NUL",
+			configure: func(env *deployScriptEnvironment) {
+				env.syntheticSecretValue = base64.StdEncoding.EncodeToString(append([]byte(testSyntheticUserID), 0))
+			},
+			wantOutput: "key user-id is not a valid UUID",
+		},
+		{
+			name: "synthetic user UUID is unknown",
+			configure: func(env *deployScriptEnvironment) {
+				env.syntheticUserKnown = false
+			},
+			wantOutput: "quota query returned invalid or missing",
 		},
 		{
 			name: "synthetic quota malformed",
@@ -1361,6 +1420,10 @@ func TestDeployScriptReleasePreflightGuards(t *testing.T) {
 			}
 			if !strings.Contains(string(output), test.wantOutput) {
 				t.Fatalf("output %q does not contain %q", output, test.wantOutput)
+			}
+			if strings.Contains(string(output), env.syntheticUserID) ||
+				strings.Contains(string(output), env.syntheticSecretValue) {
+				t.Fatalf("preflight output exposed the synthetic user Secret value:\n%s", output)
 			}
 		})
 	}
@@ -1539,6 +1602,7 @@ func TestDeployScriptReleasePreflightPredicatesAreLoadBearing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	const preflightStart = "run_release_preflight() {\n"
 	start := strings.Index(string(source), preflightStart)
 	if start < 0 {
@@ -1589,6 +1653,68 @@ func TestDeployScriptReleasePreflightPredicatesAreLoadBearing(t *testing.T) {
 			if _, statErr := os.Stat(env.claimsPausedMark); statErr != nil {
 				t.Fatalf("removing %s guard did not expose live mutation: %v\n%s", test.name, statErr, output)
 			}
+		})
+	}
+}
+
+func TestDeployScriptSyntheticQuotaIdentityIsLoadBearing(t *testing.T) {
+	requirePOSIXShell(t)
+	deployPath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
+	source, err := os.ReadFile(deployPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const authoritativeLookup = `kubectl get secret selfservice-synthetic-user -n "$NAMESPACE" \
+      -o jsonpath='{.data.user-id}'`
+	const uuidPredicate = `WHERE u.id = :'"'"'synthetic_user_id'"'"'::uuid`
+	tests := []struct {
+		name        string
+		original    string
+		replacement string
+		wantOutput  string
+	}{
+		{
+			name:        "authoritative secret",
+			original:    authoritativeLookup,
+			replacement: strings.Replace(authoritativeLookup, "selfservice-synthetic-user", "wrong-synthetic-user", 1),
+			wantOutput:  "failed to read the authoritative synthetic user ID",
+		},
+		{
+			name:        "authoritative secret key",
+			original:    authoritativeLookup,
+			replacement: strings.Replace(authoritativeLookup, ".data.user-id", ".data.wrong-user-id", 1),
+			wantOutput:  "failed to read the authoritative synthetic user ID",
+		},
+		{
+			name:     "UUID predicate",
+			original: uuidPredicate,
+			replacement: `WHERE u.oidc_sub = '"'"'synthetic-monitor-no-oidc'"'"'
+                AND u.username = '"'"'synthetic'"'"'`,
+			wantOutput: "quota query returned invalid or missing",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if strings.Count(string(source), test.original) != 1 {
+				t.Fatalf("synthetic quota identity fragment %q is not unique", test.original)
+			}
+			mutated := strings.Replace(string(source), test.original, test.replacement, 1)
+			scriptPath := filepath.Join(
+				filepath.Dir(deployPath),
+				"deploy-sabotaged-gate-a4-synthetic-identity-"+strings.ReplaceAll(test.name, " ", "-")+"-test.sh",
+			)
+			writeExecutable(t, scriptPath, mutated)
+			t.Cleanup(func() { os.Remove(scriptPath) })
+
+			env := newDeployScriptEnvironment(t, baselineManifest(true, "", "false"), baselineManifest(true, "*", "false"))
+			env.scriptPath = scriptPath
+			output, runErr := env.run("--no-pull")
+			if runErr == nil || !strings.Contains(string(output), test.wantOutput) {
+				t.Fatalf("synthetic identity sabotage did not fail closed: %v\n%s", runErr, output)
+			}
+			assertNoPreflightMutation(t, env, output)
 		})
 	}
 }
@@ -6029,6 +6155,13 @@ type deployScriptEnvironment struct {
 	provisioningJobsAfterInitial   string
 	unknownProvisioningJobStatus   bool
 	syntheticQuotaState            string
+	syntheticUserID                string
+	syntheticOIDCSub               string
+	syntheticSecretValue           string
+	syntheticSecretExists          bool
+	syntheticSecretKeyPresent      bool
+	failSyntheticSecretRead        bool
+	syntheticUserKnown             bool
 	malformedJobsJSON              bool
 	prometheusResponse             string
 	prometheusResponseAfterInitial string
@@ -6136,6 +6269,12 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 		migrationState:            "1:37:false",
 		provisioningJobs:          "0",
 		syntheticQuotaState:       "1:0",
+		syntheticUserID:           testSyntheticUserID,
+		syntheticOIDCSub:          testSyntheticOIDCSub,
+		syntheticSecretValue:      base64.StdEncoding.EncodeToString([]byte(testSyntheticUserID)),
+		syntheticSecretExists:     true,
+		syntheticSecretKeyPresent: true,
+		syntheticUserKnown:        true,
 		prometheusResponse:        `{"status":"success","data":{"alerts":[]}}`,
 		prometheusURL:             "http://prometheus.test",
 		liveHelmRelease:           "selfservice",
@@ -6833,6 +6972,23 @@ case "$1" in
         exit 1
       fi
       cat "$FAKE_LOCK_FILE"
+    elif [ "$2" = secret ]; then
+      if [ "${3:-}" != selfservice-synthetic-user ] ||
+         [[ "$*" != *"jsonpath={.data.user-id}"* ]]; then
+        echo "unexpected synthetic user Secret lookup" >&2
+        exit 96
+      fi
+      if [ "$FAKE_FAIL_SYNTHETIC_SECRET_READ" = true ]; then
+        echo "sabotaged synthetic user Secret read failure" >&2
+        exit 97
+      fi
+      if [ "$FAKE_SYNTHETIC_SECRET_EXISTS" != true ]; then
+        echo "Error from server (NotFound): secrets \"selfservice-synthetic-user\" not found" >&2
+        exit 1
+      fi
+      if [ "$FAKE_SYNTHETIC_SECRET_KEY_PRESENT" = true ]; then
+        printf '%s' "$FAKE_SYNTHETIC_SECRET_VALUE"
+      fi
     elif [[ "$*" == *"app.kubernetes.io/name=postgresql,app.kubernetes.io/instance=selfservice"* ]]; then
       printf 'selfservice-postgresql-0'
     elif [ "$2" = "jobs" ]; then
@@ -6982,8 +7138,18 @@ case "$1" in
         fi
         printf '%s\n' "$jobs"
       fi
-    elif [[ "$*" == *"synthetic-monitor-no-oidc"* ]]; then
+    elif [[ "$*" == *"gate_a4_synthetic_quota_preflight"* ]]; then
       [ "$FAKE_PREFLIGHT_QUERY_FAILURE" != quota ] || exit 97
+      IFS= read -r synthetic_user_id || exit 96
+      if [[ "$*" != *"WHERE u.id = :'synthetic_user_id'::uuid"* ]] ||
+         [[ "$*" != *'synthetic_user_id=$synthetic_user_id'* ]] ||
+         [[ "$*" == *"u.oidc_sub"* ]] ||
+         [[ "$*" == *"u.username"* ]] ||
+         [ "$synthetic_user_id" != "$FAKE_SYNTHETIC_USER_ID" ] ||
+         [ "$FAKE_SYNTHETIC_USER_KNOWN" != true ]; then
+        exit 0
+      fi
+      [ "$FAKE_SYNTHETIC_OIDC_SUB" != synthetic-monitor-no-oidc ] || exit 96
       printf '%s\n' "$FAKE_SYNTHETIC_QUOTA_STATE"
     elif [[ "$*" == *"pod_name"* ]]; then
       [[ "$*" == *"pod_create"* && "$*" == *"pod_destroy"* ]] || {
@@ -7664,6 +7830,13 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_PROVISIONING_QUERY_COUNT="+e.provisioningQueryCount,
 		"FAKE_UNKNOWN_PROVISIONING_JOB_STATUS="+strconv.FormatBool(e.unknownProvisioningJobStatus),
 		"FAKE_SYNTHETIC_QUOTA_STATE="+e.syntheticQuotaState,
+		"FAKE_SYNTHETIC_USER_ID="+e.syntheticUserID,
+		"FAKE_SYNTHETIC_OIDC_SUB="+e.syntheticOIDCSub,
+		"FAKE_SYNTHETIC_SECRET_VALUE="+e.syntheticSecretValue,
+		"FAKE_SYNTHETIC_SECRET_EXISTS="+strconv.FormatBool(e.syntheticSecretExists),
+		"FAKE_SYNTHETIC_SECRET_KEY_PRESENT="+strconv.FormatBool(e.syntheticSecretKeyPresent),
+		"FAKE_FAIL_SYNTHETIC_SECRET_READ="+strconv.FormatBool(e.failSyntheticSecretRead),
+		"FAKE_SYNTHETIC_USER_KNOWN="+strconv.FormatBool(e.syntheticUserKnown),
 		"FAKE_ACTIVE_MUTATING_SYNTHETIC_JOBS="+strconv.Itoa(e.activeMutatingSyntheticJobs),
 		"FAKE_COMPLETED_MUTATING_SYNTHETIC_JOB="+strconv.FormatBool(e.completedMutatingSyntheticJob),
 		"FAKE_MALFORMED_JOBS_JSON="+strconv.FormatBool(e.malformedJobsJSON),
