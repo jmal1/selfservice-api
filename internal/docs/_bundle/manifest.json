@@ -203,8 +203,8 @@
     {
       "path": "docs/instructor/troubleshooting.md",
       "title": "Troubleshooting",
-      "size": 65971,
-      "sha256": "3f2ef7b76ac2b08b46e87c8ea2299238f5e1eb68bff9fc83ffce8bacc44118e2",
+      "size": 67008,
+      "sha256": "e7bd891ea1654437e4bc595baa6fd610fdaf5c977ac56fc5e963903c97bc7477",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/actions.md",
@@ -386,5 +386,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 421332
+  "total_bytes": 422369
 }
