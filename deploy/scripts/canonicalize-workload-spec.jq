@@ -91,10 +91,7 @@ def validate_managed_label($key; $expected):
     | $template.spec | require_object(".spec.template.spec") as $pod_spec
     | $metadata.annotations | optional_object(".spec.template.metadata.annotations") as $annotations
     | $metadata.labels | optional_object(".spec.template.metadata.labels") as $labels
-    | ($labels // {})
-    | validate_managed_label("app.kubernetes.io/managed-by"; "Helm")
-    | del(."app.kubernetes.io/managed-by")
-    | . as $normalized_labels
+    | ($labels // {}) as $normalized_labels
     | $metadata.finalizers | optional_array(".spec.template.metadata.finalizers") as $finalizers
     | {
         templateSpec: $pod_spec,

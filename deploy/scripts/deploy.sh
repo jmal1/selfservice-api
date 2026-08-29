@@ -2527,22 +2527,6 @@ canonicalize_server_candidate() {
             .
           end
           |
-          if .kind == "CronJob" and
-             (.spec.jobTemplate.spec.template.metadata.labels | type) == "object" and
-             (.spec.jobTemplate.spec.template.metadata.labels | has("app.kubernetes.io/managed-by")) then
-            del(.spec.jobTemplate.spec.template.metadata.labels."app.kubernetes.io/managed-by")
-          else
-            .
-          end
-          |
-          if .kind == "Job" and
-             (.spec.template.metadata.labels | type) == "object" and
-             (.spec.template.metadata.labels | has("app.kubernetes.io/managed-by")) then
-            del(.spec.template.metadata.labels."app.kubernetes.io/managed-by")
-          else
-            .
-          end
-          |
           if .metadata.annotations == null or .metadata.annotations == {} then
             del(.metadata.annotations)
           else
