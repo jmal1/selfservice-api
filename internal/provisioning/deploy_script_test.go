@@ -7143,6 +7143,9 @@ case "$1" in
       IFS= read -r synthetic_user_id || exit 96
       if [[ "$*" != *"WHERE u.id = :'synthetic_user_id'::uuid"* ]] ||
          [[ "$*" != *'synthetic_user_id=$synthetic_user_id'* ]] ||
+         [[ "$*" != *'printf "%s\n" "SELECT '* ]] ||
+         [[ "$*" != *"-At"* ]] ||
+         [[ "$*" == *"-Atc"* ]] ||
          [[ "$*" == *"u.oidc_sub"* ]] ||
          [[ "$*" == *"u.username"* ]] ||
          [ "$synthetic_user_id" != "$FAKE_SYNTHETIC_USER_ID" ] ||

@@ -2322,19 +2322,20 @@ require_synthetic_pod_quota() {
       if [ -n "$password_file" ]; then
         export PGPASSWORD="$(cat "$password_file")"
       fi
-      exec psql \
-        -v ON_ERROR_STOP=1 \
-        -v "synthetic_user_id=$synthetic_user_id" \
-        -U "${POSTGRES_USER:-postgres}" \
-        -d "${POSTGRES_DATABASE:-${POSTGRES_DB:-postgres}}" \
-        -Atc "SELECT u.max_pods::text || '"'"':'"'"' || count(DISTINCT p.id)::text /* gate_a4_synthetic_quota_preflight */
+      printf "%s\n" "SELECT u.max_pods::text || '"'"':'"'"' || count(DISTINCT p.id)::text /* gate_a4_synthetic_quota_preflight */
               FROM users AS u
               LEFT JOIN pods AS p
                 ON p.owner_id = u.id
                AND p.status NOT IN ('"'"'destroyed'"'"', '"'"'error'"'"')
               WHERE u.id = :'"'"'synthetic_user_id'"'"'::uuid
                 AND u.is_active IS TRUE
-              GROUP BY u.id, u.max_pods"
+              GROUP BY u.id, u.max_pods" |
+      psql \
+        -v ON_ERROR_STOP=1 \
+        -v "synthetic_user_id=$synthetic_user_id" \
+        -U "${POSTGRES_USER:-postgres}" \
+        -d "${POSTGRES_DATABASE:-${POSTGRES_DB:-postgres}}" \
+        -At
     '
   )"; then
     echo "ERROR: PostgreSQL synthetic-user quota preflight query failed; refusing deployment." >&2
