@@ -95,8 +95,8 @@ function Assert-WikiSeedSetMatchesMakefile {
         throw "WIKI_SEEDS drifted: Makefile defines $($SeedPaths.Count) seeds but the local verifier expects $($ExpectedSeeds.Count)."
     }
 
-    $normalizedActual = @($SeedPaths | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
-    $normalizedExpected = @($ExpectedSeeds | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+    $normalizedActual = @($SeedPaths | ForEach-Object { [string]$_ } | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+    $normalizedExpected = @($ExpectedSeeds | ForEach-Object { [string]$_ } | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
 
     $missing = @($normalizedExpected | Where-Object { $normalizedActual -notcontains $_ })
     if ($missing.Count -gt 0) {
@@ -107,6 +107,59 @@ function Assert-WikiSeedSetMatchesMakefile {
     if ($extra.Count -gt 0) {
         throw "WIKI_SEEDS drifted: unexpected seed(s): $($extra -join ', ')"
     }
+}
+
+function Get-ToolCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ToolName
+    )
+
+    $normalized = [string]$ToolName
+    if (-not [string]::IsNullOrWhiteSpace($normalized)) {
+        $normalized = $normalized.Trim()
+        if ($normalized.EndsWith('.exe', [System.StringComparison]::OrdinalIgnoreCase)) {
+            $normalized = $normalized.Substring(0, $normalized.Length - 4)
+        }
+        $normalized = $normalized.ToLowerInvariant()
+
+        $forcedMissing = [Environment]::GetEnvironmentVariable('LOCAL_VERIFY_FORCE_MISSING_TOOLS')
+        if (-not [string]::IsNullOrWhiteSpace($forcedMissing)) {
+            foreach ($forced in ($forcedMissing -split ',')) {
+                $candidate = ($forced.Trim())
+                if ([string]::IsNullOrWhiteSpace($candidate)) {
+                    continue
+                }
+                if ($candidate.EndsWith('.exe', [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $candidate = $candidate.Substring(0, $candidate.Length - 4)
+                }
+                if ($candidate.ToLowerInvariant() -eq $normalized) {
+                    return $null
+                }
+            }
+        }
+    }
+
+    return Get-Command -Name $ToolName -ErrorAction SilentlyContinue
+}
+
+function Format-TrimmedOutput {
+    param(
+        [Parameter(ValueFromPipeline = $true)]
+        [AllowNull()]
+        $Value
+    )
+
+    if ($null -eq $Value) {
+        return ""
+    }
+
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return ""
+    }
+
+    return $text.Trim()
 }
 
 function Resolve-RemoteTarget {
@@ -198,7 +251,7 @@ if ($Tier -eq "4") {
 
 if ($selectedTiers -contains 0) {
     $explicit = ($Tier -ne "all")
-    if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
+    if (-not (Get-ToolCommand -ToolName "go")) {
         if ($explicit) {
             Write-TierResult -Index 0 -Name "gofmt + go vet + short Go tests" -State "FAIL" -Details "Go toolchain is required for the explicit tier 0 check but is not installed on PATH."
             $script:AnyFail = $true
@@ -212,33 +265,33 @@ if ($selectedTiers -contains 0) {
         try {
             $gofmtDirs = & go list -f "{{.Dir}}" ./internal/... 2>&1
             if ($LASTEXITCODE -ne 0) {
-                Write-TierResult -Index 0 -Name "gofmt + go vet + short Go tests" -State "FAIL" -Details (($gofmtDirs | Out-String).Trim())
+                Write-TierResult -Index 0 -Name "gofmt + go vet + short Go tests" -State "FAIL" -Details (Format-TrimmedOutput ($gofmtDirs | Out-String))
                 $script:AnyFail = $true
             }
             else {
-                $gofmtOutput = & gofmt -l @($gofmtDirs | Where-Object { $_ -and $_.Trim() }) 2>&1
-                $gofmtProblems = @($gofmtOutput | Where-Object { $_ -and $_.Trim().Length -gt 0 })
+                $gofmtOutput = & gofmt -l @($gofmtDirs | Where-Object { $_ -and -not [string]::IsNullOrWhiteSpace([string]$_) }) 2>&1
+                $gofmtProblems = @($gofmtOutput | Where-Object { $_ -and -not [string]::IsNullOrWhiteSpace([string]$_) })
                 if ($LASTEXITCODE -ne 0 -or $gofmtProblems.Count -gt 0) {
-                    $detail = if ($gofmtProblems.Count -gt 0) { ($gofmtProblems | Out-String).Trim() } else { "gofmt reported unformatted files." }
+                    $detail = if ($gofmtProblems.Count -gt 0) { Format-TrimmedOutput ($gofmtProblems | Out-String) } else { "gofmt reported unformatted files." }
                     Write-TierResult -Index 0 -Name "gofmt + go vet + short Go tests" -State "FAIL" -Details "gofmt failed: $detail"
                     $script:AnyFail = $true
                 }
                 else {
                     $buildOutput = & go build ./... 2>&1
                     if ($LASTEXITCODE -ne 0) {
-                        Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details (($buildOutput | Out-String).Trim())
+                        Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details (Format-TrimmedOutput ($buildOutput | Out-String))
                         $script:AnyFail = $true
                     }
                     else {
                         $vetOutput = & go vet ./... 2>&1
                         if ($LASTEXITCODE -ne 0) {
-                            Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details (($vetOutput | Out-String).Trim())
+                            Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details (Format-TrimmedOutput ($vetOutput | Out-String))
                             $script:AnyFail = $true
                         }
                         else {
                             $testOutput = & go test ./... -short -count=1 2>&1
                             if ($LASTEXITCODE -ne 0) {
-                                Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details (($testOutput | Out-String).Trim())
+                                Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details (Format-TrimmedOutput ($testOutput | Out-String))
                                 $script:AnyFail = $true
                             }
                             else {
@@ -261,8 +314,8 @@ if ($selectedTiers -contains 0) {
 
 if ($selectedTiers -contains 1) {
     $explicit = ($Tier -ne "all")
-    $goCmd = Get-Command go -ErrorAction SilentlyContinue
-    $wslCmd = Get-Command wsl.exe -ErrorAction SilentlyContinue
+    $goCmd = Get-ToolCommand -ToolName "go"
+    $wslCmd = Get-ToolCommand -ToolName "wsl.exe"
 
     if (-not $goCmd -or -not $wslCmd) {
         if ($explicit) {
@@ -295,20 +348,20 @@ if ($selectedTiers -contains 1) {
 
             $compileOutput = & go test -c -o $binaryPath ./internal/provisioning 2>&1
             if ($LASTEXITCODE -ne 0) {
-                Write-TierResult -Index 1 -Name "internal/provisioning Linux deploy-script tests" -State "FAIL" -Details (($compileOutput | Out-String).Trim())
+                Write-TierResult -Index 1 -Name "internal/provisioning Linux deploy-script tests" -State "FAIL" -Details (Format-TrimmedOutput ($compileOutput | Out-String))
                 $script:AnyFail = $true
             }
             else {
                 $wslRepo = & wsl.exe wslpath -u $repoRoot 2>&1
                 if ($LASTEXITCODE -ne 0) {
-                    Write-TierResult -Index 1 -Name "internal/provisioning Linux deploy-script tests" -State "FAIL" -Details (($wslRepo | Out-String).Trim())
+                    Write-TierResult -Index 1 -Name "internal/provisioning Linux deploy-script tests" -State "FAIL" -Details (Format-TrimmedOutput ($wslRepo | Out-String))
                     $script:AnyFail = $true
                 }
                 else {
-                    $wslRepo = ($wslRepo | Out-String).Trim()
+                    $wslRepo = Format-TrimmedOutput ($wslRepo | Out-String)
                     $runOutput = & wsl.exe bash -lc "cd '$wslRepo' && chmod +x .tmp/provisioning-linux.test && ./.tmp/provisioning-linux.test -test.v" 2>&1
                     if ($LASTEXITCODE -ne 0) {
-                        Write-TierResult -Index 1 -Name "internal/provisioning Linux deploy-script tests" -State "FAIL" -Details (($runOutput | Out-String).Trim())
+                        Write-TierResult -Index 1 -Name "internal/provisioning Linux deploy-script tests" -State "FAIL" -Details (Format-TrimmedOutput ($runOutput | Out-String))
                         $script:AnyFail = $true
                     }
                     else {
@@ -334,7 +387,7 @@ if ($selectedTiers -contains 1) {
 
 if ($selectedTiers -contains 2) {
     $explicit = ($Tier -ne "all")
-    $goCmd = Get-Command go -ErrorAction SilentlyContinue
+    $goCmd = Get-ToolCommand -ToolName "go"
     if (-not $goCmd) {
         if ($explicit) {
             Write-TierResult -Index 2 -Name "wiki bundle + byte-verify" -State "FAIL" -Details "Go toolchain is required for the explicit tier 2 check but is not installed on PATH."
@@ -360,7 +413,7 @@ if ($selectedTiers -contains 2) {
         try {
             $bundleOutput = & go @bundleArgs 2>&1
             if ($LASTEXITCODE -ne 0) {
-                Write-TierResult -Index 2 -Name "wiki bundle + byte-verify" -State "FAIL" -Details (($bundleOutput | Out-String).Trim())
+                Write-TierResult -Index 2 -Name "wiki bundle + byte-verify" -State "FAIL" -Details (Format-TrimmedOutput ($bundleOutput | Out-String))
                 $script:AnyFail = $true
             }
             else {
@@ -388,7 +441,7 @@ if ($selectedTiers -contains 2) {
 
 if ($selectedTiers -contains 3) {
     $explicit = ($Tier -ne "all")
-    $docker = Get-Command docker -ErrorAction SilentlyContinue
+    $docker = Get-ToolCommand -ToolName "docker"
     if (-not $docker) {
         if ($explicit) {
             Write-TierResult -Index 3 -Name "docker-compose.dev plus integration tests" -State "FAIL" -Details "Docker is required for the explicit tier 3 check but is not installed on PATH."
@@ -403,7 +456,7 @@ if ($selectedTiers -contains 3) {
         try {
             $composeOutput = & docker compose -f docker-compose.dev.yaml up -d --wait 2>&1
             if ($LASTEXITCODE -ne 0) {
-                Write-TierResult -Index 3 -Name "docker-compose.dev plus integration tests" -State "FAIL" -Details (($composeOutput | Out-String).Trim())
+                Write-TierResult -Index 3 -Name "docker-compose.dev plus integration tests" -State "FAIL" -Details (Format-TrimmedOutput ($composeOutput | Out-String))
                 $script:AnyFail = $true
             }
             else {
@@ -422,7 +475,7 @@ if ($selectedTiers -contains 3) {
                 else {
                     $testOutput = & go test -tags=integration ./... 2>&1
                     if ($LASTEXITCODE -ne 0) {
-                        Write-TierResult -Index 3 -Name "docker-compose.dev plus integration tests" -State "FAIL" -Details (($testOutput | Out-String).Trim())
+                        Write-TierResult -Index 3 -Name "docker-compose.dev plus integration tests" -State "FAIL" -Details (Format-TrimmedOutput ($testOutput | Out-String))
                         $script:AnyFail = $true
                     }
                     else {
@@ -438,7 +491,7 @@ if ($selectedTiers -contains 3) {
         finally {
             $downOutput = & docker compose -f docker-compose.dev.yaml down -v 2>&1
             if ($LASTEXITCODE -ne 0) {
-                Write-TierResult -Index 3 -Name "docker-compose.dev plus integration tests" -State "FAIL" -Details ("Docker cleanup failed: " + (($downOutput | Out-String).Trim()))
+                Write-TierResult -Index 3 -Name "docker-compose.dev plus integration tests" -State "FAIL" -Details ("Docker cleanup failed: " + (Format-TrimmedOutput ($downOutput | Out-String)))
                 $script:AnyFail = $true
             }
             Pop-Location
@@ -458,7 +511,7 @@ if ($selectedTiers -contains 4) {
             $script:AnyFail = $true
         }
         else {
-            $ssh = Get-Command ssh -ErrorAction SilentlyContinue
+            $ssh = Get-ToolCommand -ToolName "ssh"
             if (-not $ssh) {
                 Write-TierResult -Index 4 -Name "production Helm render + lint via Vault SSH" -State "FAIL" -Details "SSH client is required for the explicit tier 4 check but is not installed on PATH."
                 $script:AnyFail = $true
@@ -485,7 +538,7 @@ fi
 "@
                 $remoteOutput = & ssh $remoteTarget $remoteScript 2>&1
                 if ($LASTEXITCODE -ne 0) {
-                    Write-TierResult -Index 4 -Name "production Helm render + lint via Vault SSH" -State "FAIL" -Details (($remoteOutput | Out-String).Trim())
+                    Write-TierResult -Index 4 -Name "production Helm render + lint via Vault SSH" -State "FAIL" -Details (Format-TrimmedOutput ($remoteOutput | Out-String))
                     $script:AnyFail = $true
                 }
                 else {

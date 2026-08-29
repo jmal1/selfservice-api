@@ -202,10 +202,10 @@ func TestLocalVerifyExplicitMissingToolFails(t *testing.T) {
 		args []string
 		env  []string
 	}{
-		{name: "tier0-missing-go", args: []string{"-Tier", "0"}, env: []string{"PATH=" + t.TempDir()}},
-		{name: "tier1-missing-go-and-wsl", args: []string{"-Tier", "1"}, env: []string{"PATH=" + filepath.Dir(mustPwshPath(t))}},
-		{name: "tier3-missing-docker", args: []string{"-Tier", "3"}, env: []string{"PATH=" + t.TempDir()}},
-		{name: "tier4-missing-ssh", args: []string{"-RemoteHelm", "-RemoteHost", "k3sv01.lab.jmal.io"}, env: []string{"PATH=" + t.TempDir()}},
+		{name: "tier0-missing-go", args: []string{"-Tier", "0"}, env: []string{"LOCAL_VERIFY_FORCE_MISSING_TOOLS=go"}},
+		{name: "tier1-missing-go-and-wsl", args: []string{"-Tier", "1"}, env: []string{"LOCAL_VERIFY_FORCE_MISSING_TOOLS=go,wsl"}},
+		{name: "tier3-missing-docker", args: []string{"-Tier", "3"}, env: []string{"LOCAL_VERIFY_FORCE_MISSING_TOOLS=docker"}},
+		{name: "tier4-missing-ssh", args: []string{"-RemoteHelm", "-RemoteHost", "k3sv01.lab.jmal.io"}, env: []string{"LOCAL_VERIFY_FORCE_MISSING_TOOLS=ssh"}},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -230,7 +230,7 @@ func mustPwshPath(t *testing.T) string {
 }
 
 func TestLocalVerifyAutoDetectMissingToolSkips(t *testing.T) {
-	code, output := runLocalVerifyWithEnvironment(t, []string{"PATH=" + filepath.Dir(mustPwshPath(t))}, "-Tier", "all")
+	code, output := runLocalVerifyWithEnvironment(t, []string{"LOCAL_VERIFY_FORCE_MISSING_TOOLS=go,wsl,docker,ssh"}, "-Tier", "all")
 	if code != 0 {
 		t.Fatalf("auto-detected all tiers should be non-fatal when tools are missing: %s", output)
 	}
