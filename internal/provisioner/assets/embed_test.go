@@ -33,4 +33,9 @@ func TestWindowsUnattendXML_Embedded(t *testing.T) {
 		t.Error("unattend.xml contains the sysprep scrub marker — someone copied a " +
 			"post-sysprep file into the repo. Re-create from a clean source.")
 	}
+	if !strings.Contains(body, "sc config cloudbase-init start= delayed-auto") {
+		t.Error("unattend.xml is missing the Server-SKU cloudbase-init delayed-auto enablement. " +
+			"Windows Server 2022/2025 skip FirstLogonCommands during OOBE, so the service " +
+			"must be re-enabled in the specialize pass or the generated Student password never applies.")
+	}
 }
