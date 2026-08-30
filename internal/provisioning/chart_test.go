@@ -1,6 +1,8 @@
 package provisioning
 
 import (
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -446,8 +448,91 @@ func TestSyntheticCronJobLifecycleEnabledRendersAcrossOverlays(t *testing.T) {
 		}
 	}
 
-	assertExactlyOne(t, render("values.prod.yaml"), "values.prod.yaml", "false")
+	assertExactlyOne(t, render("values.prod.yaml"), "values.prod.yaml", "true")
 	assertExactlyOne(t, render("values.full-fleet.yaml"), "values.full-fleet.yaml", "true")
+}
+
+func TestCloneSyntheticCronJobsRenderExplicitUnsuspendedState(t *testing.T) {
+	helmPath, err := exec.LookPath("helm")
+	if err != nil {
+		t.Skip("helm not available")
+	}
+	chartDir := filepath.Join("..", "..", "deploy", "helm", "selfservice")
+	if _, err := os.Stat(filepath.Join(chartDir, "charts")); err != nil {
+		t.Skip("chart dependencies not vendored; run `helm dependency build` in deploy/helm/selfservice first")
+	}
+
+	assertUnsuspended := func(rendered, wantName string) error {
+		var document struct {
+			Kind     string `yaml:"kind"`
+			Metadata struct {
+				Name string `yaml:"name"`
+			} `yaml:"metadata"`
+			Spec struct {
+				Suspend *bool `yaml:"suspend"`
+			} `yaml:"spec"`
+		}
+		decoder := yaml.NewDecoder(strings.NewReader(rendered))
+		for {
+			document = struct {
+				Kind     string `yaml:"kind"`
+				Metadata struct {
+					Name string `yaml:"name"`
+				} `yaml:"metadata"`
+				Spec struct {
+					Suspend *bool `yaml:"suspend"`
+				} `yaml:"spec"`
+			}{}
+			if err := decoder.Decode(&document); err != nil {
+				if err == io.EOF {
+					break
+				}
+				return err
+			}
+			if document.Kind != "CronJob" || document.Metadata.Name != wantName {
+				continue
+			}
+			if document.Spec.Suspend == nil {
+				return fmt.Errorf("%s omits spec.suspend", wantName)
+			}
+			if *document.Spec.Suspend {
+				return fmt.Errorf("%s renders spec.suspend=true", wantName)
+			}
+			return nil
+		}
+		return fmt.Errorf("did not render CronJob/%s", wantName)
+	}
+
+	t.Run("sabotage predicate rejects omitted or true suspension", func(t *testing.T) {
+		for _, test := range []struct {
+			name     string
+			manifest string
+		}{
+			{name: "selfservice-synthetic-janitor", manifest: "kind: CronJob\nmetadata:\n  name: selfservice-synthetic-janitor\nspec: {}\n"},
+			{name: "selfservice-synthetic-runner", manifest: "kind: CronJob\nmetadata:\n  name: selfservice-synthetic-runner\nspec:\n  suspend: true\n"},
+		} {
+			if err := assertUnsuspended(test.manifest, test.name); err == nil {
+				t.Fatalf("sabotaged CronJob manifest unexpectedly passed: %s", test.manifest)
+			}
+		}
+	})
+
+	for _, overlay := range []string{"values.prod.yaml", "values.full-fleet.yaml"} {
+		t.Run(overlay, func(t *testing.T) {
+			args := []string{"template", "selfservice", ".", "-f", "values.yaml", "-f", overlay}
+			cmd := exec.Command(helmPath, args...)
+			cmd.Dir = chartDir
+			rendered, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("helm template: %v\n%s", err, rendered)
+			}
+			for _, name := range []string{"selfservice-synthetic-janitor", "selfservice-synthetic-runner"} {
+				if err := assertUnsuspended(string(rendered), name); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
 }
 
 func TestSyntheticCronJobRunnerExpectedEnabledRendersAcrossOverlays(t *testing.T) {
@@ -498,6 +583,6 @@ func TestSyntheticCronJobRunnerExpectedEnabledRendersAcrossOverlays(t *testing.T
 		}
 	}
 
-	assertExactlyOne(t, render("values.prod.yaml"), "values.prod.yaml", "false")
+	assertExactlyOne(t, render("values.prod.yaml"), "values.prod.yaml", "true")
 	assertExactlyOne(t, render("values.full-fleet.yaml"), "values.full-fleet.yaml", "true")
 }
