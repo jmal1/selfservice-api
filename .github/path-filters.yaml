@@ -25,6 +25,7 @@ shared:
   - '.github/workflows/ci.yaml'
   - '.github/scripts/compute-image-matrix.sh'
   - '.github/path-filters.yaml'
+  - 'deploy/known-firing-alerts.txt'
   - 'internal/actionlibrary/**'
   - 'internal/config/**'
   - 'internal/database/**'

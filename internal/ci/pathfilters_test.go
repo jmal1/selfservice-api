@@ -235,6 +235,18 @@ func TestPathFilters_CoverAllInternalPackages(t *testing.T) {
 // ci.yaml's authoritative list is the shell line:
 //
 //	all='["api-gateway",...,"crucible-runner"]'
+func TestPathFilters_KnownFiringAlertsShared(t *testing.T) {
+	root := findRepoRoot(t)
+	filters := loadFilters(t, root)
+	shared := filters["shared"]
+	if !isCovered(shared, "deploy/known-firing-alerts.txt") {
+		t.Fatalf(
+			"deploy/known-firing-alerts.txt is missing from the shared channel in .github/path-filters.yaml; " +
+				"changes to this allowlist affect every release candidate and must force all image builds to rebuild.",
+		)
+	}
+}
+
 func TestPathFilters_BinaryChannelsCoversCIMatrix(t *testing.T) {
 	root := findRepoRoot(t)
 
