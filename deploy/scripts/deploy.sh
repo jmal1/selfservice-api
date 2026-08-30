@@ -3446,16 +3446,64 @@ verify_candidate_cronjob_image() {
   local container_type=$2
   local container_name=$3
   local expected=$4
-  local verification_job actual
+  local verification_job source_manifest verification_manifest contain_lifecycle actual
   if [ "$container_type" != containers ]; then
     echo "ERROR: candidate CronJob/$name uses unsupported $container_type/$container_name for verification." >&2
     return 1
   fi
   verification_job="${name}-deploy-verify-$(date -u +%s)-$$"
   verification_job="${verification_job:0:63}"
+  source_manifest="$CANDIDATE_TMP_DIR/${verification_job}-source.json"
+  verification_manifest="$CANDIDATE_TMP_DIR/${verification_job}.json"
   if ! kubectl create job \
       "$verification_job" \
       --from="cronjob/$name" \
+      -n "$NAMESPACE" \
+      --dry-run=client \
+      -o json > "$source_manifest"; then
+    echo "ERROR: could not render contained image-verification Job from CronJob/$name." >&2
+    return 1
+  fi
+  contain_lifecycle=false
+  if [ "$name" = "$RELEASE-synthetic-api-monitor" ]; then
+    contain_lifecycle=true
+  fi
+  if ! jq -e \
+      --arg container "$container_name" \
+      --argjson contain_lifecycle "$contain_lifecycle" \
+      '
+        if (.spec.template.spec.containers | type) != "array" then
+          error("verification Job containers must be an array")
+        elif ([.spec.template.spec.containers[] | select(.name == $container)] | length) != 1 then
+          error("verification Job must contain exactly one target container")
+        elif $contain_lifecycle then
+          .spec.template.spec.containers |= map(
+            if .name == $container then
+              if ((.env // []) | type) != "array" then
+                error("verification Job target env must be an array")
+              else
+                .env = (
+                  (.env // [] | map(select(
+                    (type != "object") or
+                    .name != "SYNTHETIC_LIFECYCLE_ENABLED"
+                  ))) +
+                  [{name:"SYNTHETIC_LIFECYCLE_ENABLED",value:"false"}]
+                )
+              end
+            else
+              .
+            end
+          )
+        else
+          .
+        end
+      ' \
+      "$source_manifest" > "$verification_manifest"; then
+    echo "ERROR: could not contain image-verification Job for CronJob/$name $container_type/$container_name." >&2
+    return 1
+  fi
+  if ! kubectl create \
+      -f "$verification_manifest" \
       -n "$NAMESPACE" >/dev/null; then
     echo "ERROR: could not create contained image-verification Job from CronJob/$name." >&2
     return 1

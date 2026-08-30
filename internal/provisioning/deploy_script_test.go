@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -1481,6 +1482,166 @@ func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 				t.Fatalf("success-verification sabotage did not reach deployed revision: %v", upgradedErr)
 			}
 		})
+	}
+}
+
+func TestDeployScriptCandidateCronJobVerificationIsContained(t *testing.T) {
+	requirePOSIXShell(t)
+	live := baselineManifest(true, "", "false")
+	candidate := replaceEnvValue(
+		baselineManifest(true, "*", "false"),
+		"SYNTHETIC_LIFECYCLE_ENABLED",
+		"false",
+		"true",
+	)
+
+	for _, test := range []struct {
+		name  string
+		shape string
+	}{
+		{name: "overrides enabled lifecycle while candidate CronJob stays enabled"},
+		{name: "adds missing lifecycle while candidate CronJob stays enabled", shape: "missing-lifecycle"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			env := newDeployScriptEnvironment(t, live, candidate)
+			writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
+			env.cronjobVerificationShape = test.shape
+			output, err := env.run("--no-pull")
+			if err != nil {
+				t.Fatalf("contained candidate verification failed: %v\n%s", err, output)
+			}
+			if _, statErr := os.Stat(env.claimsPausedMark); statErr != nil {
+				t.Fatalf("verification did not run while worker claims were paused: %v", statErr)
+			}
+			jobBody, readErr := os.ReadFile(env.cronjobVerifyManifest)
+			if readErr != nil {
+				t.Fatalf("read created verification Job: %v", readErr)
+			}
+			var job struct {
+				Spec struct {
+					Template struct {
+						Spec struct {
+							Containers []struct {
+								Name string `json:"name"`
+								Env  []struct {
+									Name  string `json:"name"`
+									Value string `json:"value"`
+								} `json:"env"`
+							} `json:"containers"`
+						} `json:"spec"`
+					} `json:"template"`
+				} `json:"spec"`
+			}
+			if err := json.Unmarshal(jobBody, &job); err != nil {
+				t.Fatalf("decode created verification Job: %v", err)
+			}
+			var lifecycleValues []string
+			for _, container := range job.Spec.Template.Spec.Containers {
+				if container.Name != "synthetic-api-monitor" {
+					continue
+				}
+				for _, envVar := range container.Env {
+					if envVar.Name == "SYNTHETIC_LIFECYCLE_ENABLED" {
+						lifecycleValues = append(lifecycleValues, envVar.Value)
+					}
+				}
+			}
+			if len(lifecycleValues) != 1 || lifecycleValues[0] != "false" {
+				t.Fatalf("verification Job lifecycle values = %v, want exactly [false]", lifecycleValues)
+			}
+			applied, readErr := os.ReadFile(env.appliedManifest)
+			if readErr != nil {
+				t.Fatalf("read applied candidate manifest: %v", readErr)
+			}
+			if got := manifestEnvValue(t, string(applied), "SYNTHETIC_LIFECYCLE_ENABLED"); got != "true" {
+				t.Fatalf("candidate CronJob lifecycle = %q, want true", got)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name       string
+		shape      string
+		wantOutput string
+	}{
+		{
+			name:       "missing target container fails closed",
+			shape:      "missing-target",
+			wantOutput: "could not contain image-verification Job for CronJob/selfservice-synthetic-api-monitor containers/synthetic-api-monitor",
+		},
+		{
+			name:       "malformed target container list fails closed",
+			shape:      "malformed-containers",
+			wantOutput: "could not contain image-verification Job for CronJob/selfservice-synthetic-api-monitor containers/synthetic-api-monitor",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			env := newDeployScriptEnvironment(t, live, candidate)
+			writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
+			env.cronjobVerificationShape = test.shape
+			output, err := env.run("--no-pull")
+			if err == nil {
+				t.Fatalf("malformed verification Job unexpectedly passed:\n%s", output)
+			}
+			if !strings.Contains(string(output), test.wantOutput) {
+				t.Fatalf("output %q does not contain %q", output, test.wantOutput)
+			}
+			if _, statErr := os.Stat(env.cronjobVerifyManifest); !os.IsNotExist(statErr) {
+				t.Fatalf("malformed verification Job was created: %v", statErr)
+			}
+			if _, statErr := os.Stat(env.lockFile); statErr != nil {
+				t.Fatalf("verification failure did not retain the release lock: %v", statErr)
+			}
+		})
+	}
+}
+
+func TestDeployScriptCandidateCronJobLifecycleOverrideIsLoadBearing(t *testing.T) {
+	requirePOSIXShell(t)
+	sourcePath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
+	source, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const override = `                  [{name:"SYNTHETIC_LIFECYCLE_ENABLED",value:"false"}]`
+	if strings.Count(string(source), override) != 1 {
+		t.Fatalf("expected exactly one verification Job lifecycle override")
+	}
+	sabotaged := strings.Replace(
+		string(source),
+		override,
+		`                  [{name:"SYNTHETIC_LIFECYCLE_ENABLED",value:"true"}]`,
+		1,
+	)
+	scriptPath := filepath.Join(
+		"..", "..", "deploy", "scripts",
+		"deploy-sabotaged-verification-lifecycle-test.sh",
+	)
+	writeFile(t, scriptPath, sabotaged)
+	t.Cleanup(func() { os.Remove(scriptPath) })
+	if err := os.Chmod(scriptPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	live := baselineManifest(true, "", "false")
+	candidate := replaceEnvValue(
+		baselineManifest(true, "*", "false"),
+		"SYNTHETIC_LIFECYCLE_ENABLED",
+		"false",
+		"true",
+	)
+	env := newDeployScriptEnvironment(t, live, candidate)
+	writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
+	env.scriptPath = scriptPath
+	output, runErr := env.run("--no-pull")
+	if runErr == nil {
+		t.Fatalf("verification Job without lifecycle containment unexpectedly passed:\n%s", output)
+	}
+	if !strings.Contains(string(output), "verification Job inherited SYNTHETIC_LIFECYCLE_ENABLED=true while claims were paused") {
+		t.Fatalf("sabotage did not fail for the expected lifecycle reason:\n%s", output)
+	}
+	if _, statErr := os.Stat(env.lockFile); statErr != nil {
+		t.Fatalf("sabotaged verification did not retain the release lock: %v", statErr)
 	}
 }
 
@@ -6509,6 +6670,7 @@ type deployScriptEnvironment struct {
 	immutableRollbackValues   string
 	currentRollbackValues     string
 	cronjobVerifyMark         string
+	cronjobVerifyManifest     string
 	claimsPausedMark          string
 	claimsResumedMark         string
 	warmerRolloutMark         string
@@ -6598,6 +6760,7 @@ type deployScriptEnvironment struct {
 	signalDuringHelm               string
 	signalDuringLockCreate         string
 	failLockCreateAfterMutation    bool
+	cronjobVerificationShape       string
 
 	// simulateOwnershipConflict makes the fake kubectl reject any
 	// `--server-side --dry-run=server` apply that lacks `--force-conflicts`
@@ -6653,6 +6816,7 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 		immutableRollbackValues:   filepath.Join(root, "immutable-rollback-values.json"),
 		currentRollbackValues:     filepath.Join(root, "current-rollback-values.json"),
 		cronjobVerifyMark:         filepath.Join(root, "cronjob-verified"),
+		cronjobVerifyManifest:     filepath.Join(root, "cronjob-verification-job.json"),
 		claimsPausedMark:          filepath.Join(root, "claims-paused.marker"),
 		claimsResumedMark:         filepath.Join(root, "claims-resumed.marker"),
 		warmerRolloutMark:         filepath.Join(root, "warmer-rollout.marker"),
@@ -7599,9 +7763,127 @@ case "$1" in
     fi
     ;;
   create)
-    if [ "${2:-}" = job ] && [[ "$*" == *"--from=cronjob/"* ]]; then
+    if [ "${2:-}" = job ] && [[ "$*" == *"--from=cronjob/"* ]] &&
+       [[ "$*" == *"--dry-run=client"* ]] && [[ "$*" == *"-o json"* ]]; then
+      source_cronjob=
+      for argument in "$@"; do
+        case "$argument" in
+          --from=cronjob/*) source_cronjob=${argument#--from=cronjob/} ;;
+        esac
+      done
+      case "$source_cronjob" in
+        selfservice-synthetic-api-monitor) target_container=synthetic-api-monitor ;;
+        selfservice-synthetic-janitor) target_container=synthetic-janitor ;;
+        selfservice-synthetic-runner) target_container=synthetic-runner ;;
+        *)
+          echo "unknown fake source CronJob: $source_cronjob" >&2
+          exit 96
+          ;;
+      esac
+      resource_file=$(mktemp)
+      extract_resource "$(current_manifest)" "CronJob/$source_cronjob" > "$resource_file"
+      lifecycle=
+      if [ "$target_container" = synthetic-api-monitor ]; then
+        lifecycle=$(awk '
+          /- name: SYNTHETIC_LIFECYCLE_ENABLED/ { wanted = 1; next }
+          wanted && /value:/ {
+            value = $0
+            sub(/^[[:space:]]*value:[[:space:]]*"?/, "", value)
+            sub(/"?[[:space:]]*$/, "", value)
+            print value
+            found = 1
+            exit
+          }
+          END { if (!found) exit 3 }
+        ' "$resource_file")
+      fi
+      image=$(awk -v target="$target_container" '
+        $0 ~ "- name: " target "$" { wanted = 1; next }
+        wanted && /image:/ {
+          value = $0
+          sub(/^[[:space:]]*image:[[:space:]]*"?/, "", value)
+          sub(/"?[[:space:]]*$/, "", value)
+          print value
+          found = 1
+          exit
+        }
+        END { if (!found) exit 3 }
+      ' "$resource_file")
+      rm -f "$resource_file"
+      case "$FAKE_CRONJOB_VERIFICATION_SHAPE" in
+        "")
+          jq -cn \
+            --arg name "$3" \
+            --arg image "$image" \
+            --arg target "$target_container" \
+            --arg lifecycle "$lifecycle" \
+            '{
+              apiVersion:"batch/v1",
+              kind:"Job",
+              metadata:{name:$name},
+              spec:{template:{spec:{
+                restartPolicy:"Never",
+                containers:[{
+                  name:$target,
+                  image:$image
+                } + (
+                  if $target == "synthetic-api-monitor" then
+                    {env:[
+                      {name:"SYNTHETIC_CONTENT_FILTER_EXPECTED",value:"false"},
+                      {name:"SYNTHETIC_LIFECYCLE_ENABLED",value:$lifecycle}
+                    ]}
+                  else
+                    {}
+                  end
+                )]
+              }}}
+            }'
+          ;;
+        missing-target)
+          jq -cn \
+            --arg name "$3" \
+            --arg image "$image" \
+            '{apiVersion:"batch/v1",kind:"Job",metadata:{name:$name},spec:{template:{spec:{containers:[{name:"wrong-container",image:$image}]}}}}'
+          ;;
+        missing-lifecycle)
+          jq -cn \
+            --arg name "$3" \
+            --arg image "$image" \
+            '{apiVersion:"batch/v1",kind:"Job",metadata:{name:$name},spec:{template:{spec:{containers:[{name:"synthetic-api-monitor",image:$image}]}}}}'
+          ;;
+        malformed-containers)
+          jq -cn \
+            --arg name "$3" \
+            '{apiVersion:"batch/v1",kind:"Job",metadata:{name:$name},spec:{template:{spec:{containers:"not-an-array"}}}}'
+          ;;
+        *)
+          echo "unknown fake verification Job shape: $FAKE_CRONJOB_VERIFICATION_SHAPE" >&2
+          exit 96
+          ;;
+      esac
+    elif [ "${2:-}" = "-f" ] && [ "${3:-}" != "-" ]; then
+      manifest=$3
+      if [ -f "$FAKE_CLAIMS_PAUSED_MARKER" ] &&
+         jq -e '.spec.template.spec.containers[]? | select(.name == "synthetic-api-monitor")' \
+           "$manifest" >/dev/null; then
+        lifecycle=$(jq -er '
+          [
+            .spec.template.spec.containers[]? |
+            select(.name == "synthetic-api-monitor") |
+            .env[]? |
+            select(.name == "SYNTHETIC_LIFECYCLE_ENABLED") |
+            .value
+          ] |
+          if length == 1 then .[0] else error("expected one lifecycle value") end
+        ' "$manifest")
+        if [ "$lifecycle" != false ]; then
+          echo "verification Job inherited SYNTHETIC_LIFECYCLE_ENABLED=$lifecycle while claims were paused" >&2
+          exit 98
+        fi
+      fi
+      cp "$manifest" "$FAKE_CRONJOB_VERIFY_MANIFEST"
       : > "$FAKE_CRONJOB_VERIFY_MARKER"
-      printf 'job.batch/%s created\n' "$3"
+      printf 'job.batch/%s created\n' "$(jq -r '.metadata.name' "$manifest")"
     elif [[ "$*" == *"--dry-run=server"* ]]; then
       manifest=
       while [ "$#" -gt 0 ]; do
@@ -8238,6 +8520,8 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_IMMUTABLE_ROLLBACK_VALUES="+e.immutableRollbackValues,
 		"FAKE_CURRENT_ROLLBACK_VALUES="+e.currentRollbackValues,
 		"FAKE_CRONJOB_VERIFY_MARKER="+e.cronjobVerifyMark,
+		"FAKE_CRONJOB_VERIFY_MANIFEST="+e.cronjobVerifyManifest,
+		"FAKE_CRONJOB_VERIFICATION_SHAPE="+e.cronjobVerificationShape,
 		"FAKE_CLAIMS_PAUSED_MARKER="+e.claimsPausedMark,
 		"FAKE_CLAIMS_RESUMED_MARKER="+e.claimsResumedMark,
 		"FAKE_FAIL_CLAIMS_RESUME="+strconv.FormatBool(e.failClaimsResume),
@@ -8568,6 +8852,21 @@ func replaceEnvValue(manifest, name, oldValue, newValue string) string {
 	}
 	valueIndex := nameIndex + len(nameMarker) + valueOffset
 	return manifest[:valueIndex] + `value: "` + newValue + `"` + manifest[valueIndex+len(valueMarker):]
+}
+
+func manifestEnvValue(t *testing.T, manifest, name string) string {
+	t.Helper()
+	nameMarker := "- name: " + name
+	nameIndex := strings.Index(manifest, nameMarker)
+	if nameIndex < 0 {
+		t.Fatalf("manifest does not contain environment variable %s", name)
+	}
+	valuePattern := regexp.MustCompile(`(?m)^[[:space:]]*value:[[:space:]]*"?([^"\r\n]*)"?[[:space:]]*$`)
+	match := valuePattern.FindStringSubmatch(manifest[nameIndex+len(nameMarker):])
+	if len(match) != 2 {
+		t.Fatalf("manifest environment variable %s has no scalar value", name)
+	}
+	return strings.TrimSpace(match[1])
 }
 
 func withWorkerStatus(manifest string) string {
