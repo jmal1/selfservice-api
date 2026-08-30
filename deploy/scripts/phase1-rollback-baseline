@@ -3,4 +3,4 @@
 # proven equivalent by the deploy script, and accepted as the new stable recovery
 # checkpoint. The value must be the exact Helm revision number of the accepted
 # baseline, not a guess and not a historical artifact.
-170
+171
