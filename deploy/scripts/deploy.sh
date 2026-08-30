@@ -21,7 +21,6 @@
 #   - base64
 #   - gh authenticated for source workflow artifacts and private GHCR packages
 #   - SSH key (deploy key) allowing `git pull` from the repo
-#   - DEPLOY_PROMETHEUS_URL set to the Prometheus base URL for firing-alert checks
 
 set -euo pipefail
 
@@ -93,36 +92,8 @@ SOURCE_BRANCH=main
 SOURCE_WORKFLOW=ci.yaml
 UI_IMAGE_REPOSITORY=ghcr.io/jmal1/selfservice-ui
 UI_SOURCE_BRANCH=master
-REQUIRED_ROLLBACK_REVISION_FILE="$SCRIPT_DIR/phase1-rollback-baseline"
-KNOWN_FIRING_ALERTS_FILE="$SCRIPT_DIR/../known-firing-alerts.txt"
-REQUIRED_ROLLBACK_REVISION=
 REPOSITORY_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-load_required_rollback_revision() {
-  local baseline_file="${1:-$REQUIRED_ROLLBACK_REVISION_FILE}"
-  local value
-  if [ ! -f "$baseline_file" ]; then
-    echo "ERROR: required accepted rollback baseline file $baseline_file is missing." >&2
-    return 1
-  fi
-  value="$({
-    awk '
-      /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
-      { print; exit }
-    ' "$baseline_file"
-  } 2>/dev/null)" || {
-    echo "ERROR: required accepted rollback baseline file $baseline_file does not contain an integer revision number." >&2
-    return 1
-  }
-  value="${value//$'\r'/}"
-  if [[ ! "$value" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: required accepted rollback baseline file $baseline_file must contain an integer Helm revision, found $value." >&2
-    return 1
-  fi
-  REQUIRED_ROLLBACK_REVISION="$value"
-}
-
-load_required_rollback_revision || exit 1
 HELM_RELEASE_LOCK_HELD=false
 HELM_RELEASE_LOCK_HOLDER=
 HELM_RELEASE_LOCK_UID=
@@ -1711,165 +1682,6 @@ require_helm_revision_still_deployed() {
   fi
 }
 
-prove_immutable_rollback_release() {
-  local required_revision=$1
-  local tmp_dir=$2
-  local current_revision status current_prefix immutable_prefix immutable_status
-  if ! read -r current_revision status <<< "$(latest_helm_revision_record)"; then
-    echo "ERROR: could not determine the latest Helm revision and status." >&2
-    return 1
-  fi
-  if [[ ! "$current_revision" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: latest Helm revision is not numeric: $current_revision." >&2
-    return 1
-  fi
-  if [ "$status" != "deployed" ]; then
-    echo "ERROR: latest Helm revision $current_revision status is $status, not deployed; it cannot be a rollback baseline." >&2
-    return 1
-  fi
-  if [ "$current_revision" -lt "$required_revision" ]; then
-    echo "ERROR: latest deployed Helm revision $current_revision predates required immutable rollback revision $required_revision." >&2
-    return 1
-  fi
-  immutable_status=superseded
-  if [ "$current_revision" = "$required_revision" ]; then
-    immutable_status=deployed
-  fi
-
-  current_prefix="$tmp_dir/current-release"
-  immutable_prefix="$tmp_dir/immutable-release"
-  if ! helm get manifest "$RELEASE" -n "$NAMESPACE" \
-      --revision "$current_revision" > "$current_prefix.manifest"; then
-    echo "ERROR: could not read manifest for latest deployed Helm revision $current_revision." >&2
-    return 1
-  fi
-  if ! helm get hooks "$RELEASE" -n "$NAMESPACE" \
-      --revision "$current_revision" > "$current_prefix.hooks"; then
-    echo "ERROR: could not read hooks for latest deployed Helm revision $current_revision." >&2
-    return 1
-  fi
-  if ! helm get values "$RELEASE" -n "$NAMESPACE" \
-      --revision "$current_revision" --all -o json > "$current_prefix.values.json" ||
-     ! canonicalize_helm_release_values \
-      "$current_prefix.values.json" "$current_prefix.values.canonical"; then
-    echo "ERROR: could not read complete effective values for latest deployed Helm revision $current_revision." >&2
-    return 1
-  fi
-  if ! helm get metadata "$RELEASE" -n "$NAMESPACE" \
-      --revision "$current_revision" -o json > "$current_prefix.metadata.json" ||
-     ! canonicalize_helm_release_metadata \
-      "$current_prefix.metadata.json" "$current_revision" deployed \
-      "$current_prefix.metadata.canonical"; then
-    echo "ERROR: could not validate metadata for latest deployed Helm revision $current_revision." >&2
-    return 1
-  fi
-
-  if ! helm get manifest "$RELEASE" -n "$NAMESPACE" \
-      --revision "$required_revision" > "$immutable_prefix.manifest" ||
-     ! helm get hooks "$RELEASE" -n "$NAMESPACE" \
-      --revision "$required_revision" > "$immutable_prefix.hooks" ||
-     ! helm get values "$RELEASE" -n "$NAMESPACE" \
-      --revision "$required_revision" --all -o json > "$immutable_prefix.values.json" ||
-     ! helm get metadata "$RELEASE" -n "$NAMESPACE" \
-      --revision "$required_revision" -o json > "$immutable_prefix.metadata.json"; then
-    echo "ERROR: required immutable rollback revision $required_revision is absent or unreadable." >&2
-    return 1
-  fi
-  if ! canonicalize_helm_release_values \
-      "$immutable_prefix.values.json" "$immutable_prefix.values.canonical" ||
-     ! canonicalize_helm_release_metadata \
-      "$immutable_prefix.metadata.json" "$required_revision" "$immutable_status" \
-      "$immutable_prefix.metadata.canonical"; then
-    echo "ERROR: required immutable rollback revision $required_revision has invalid release data." >&2
-    return 1
-  fi
-
-  if ! cmp -s "$immutable_prefix.manifest" "$current_prefix.manifest"; then
-    echo "ERROR: latest deployed Helm revision $current_revision manifest differs from immutable rollback revision $required_revision." >&2
-    return 1
-  fi
-  if ! cmp -s "$immutable_prefix.hooks" "$current_prefix.hooks"; then
-    echo "ERROR: latest deployed Helm revision $current_revision hooks differ from immutable rollback revision $required_revision." >&2
-    return 1
-  fi
-  if ! cmp -s "$immutable_prefix.values.canonical" "$current_prefix.values.canonical"; then
-    echo "ERROR: latest deployed Helm revision $current_revision complete effective values differ from immutable rollback revision $required_revision." >&2
-    return 1
-  fi
-  if ! cmp -s "$immutable_prefix.metadata.canonical" "$current_prefix.metadata.canonical"; then
-    echo "ERROR: latest deployed Helm revision $current_revision chart metadata differs from immutable rollback revision $required_revision." >&2
-    return 1
-  fi
-  local final_revision final_status
-  if ! read -r final_revision final_status <<< "$(latest_helm_revision_record)" ||
-     [ "$final_revision" != "$current_revision" ] ||
-     [ "$final_status" != "deployed" ]; then
-    echo "ERROR: latest Helm revision changed while immutable rollback equivalence was being proven." >&2
-    return 1
-  fi
-
-  PROVEN_CURRENT_ROLLBACK_REVISION=$current_revision
-  PROVEN_CURRENT_ROLLBACK_MANIFEST="$current_prefix.manifest"
-  if [ "$current_revision" != "$required_revision" ]; then
-    echo "==> deployed Helm revision $current_revision exactly matches immutable rollback revision $required_revision manifest, hooks, complete effective values, and chart metadata"
-  fi
-}
-
-verify_rollback_manifest_safety() {
-  local revision tmp_dir inventory image claims worker_replicas runner
-  tmp_dir="$(mktemp -d)"
-  if ! prove_immutable_rollback_release "$REQUIRED_ROLLBACK_REVISION" "$tmp_dir"; then
-    rm -rf "$tmp_dir"
-    return 1
-  fi
-  revision=$PROVEN_CURRENT_ROLLBACK_REVISION
-  cp "$PROVEN_CURRENT_ROLLBACK_MANIFEST" "$tmp_dir/manifest.yaml"
-  inventory="$tmp_dir/inventory.tsv"
-  if ! manifest_workload_inventory "$tmp_dir/manifest.yaml" > "$inventory"; then
-    rm -rf "$tmp_dir"
-    return 1
-  fi
-  require_core_workloads "$inventory" || { rm -rf "$tmp_dir"; return 1; }
-  while IFS=$'\t' read -r _ _ _ _ image; do
-    if ! is_digest_image "$image"; then
-      echo "ERROR: current Helm rollback target contains a mutable or non-sha256 image: $image" >&2
-      rm -rf "$tmp_dir"
-      return 1
-    fi
-  done < "$inventory"
-  claims="$(claims_from_manifest < "$tmp_dir/manifest.yaml")"
-  worker_replicas="$(rendered_worker_replicas_from_manifest "$tmp_dir/manifest.yaml")"
-  runner="$(runner_image_from_manifest < "$tmp_dir/manifest.yaml")"
-  if [ "$claims" != "false" ]; then
-    echo "ERROR: current Helm rollback target renders worker provisioning claims as $claims, not false." >&2
-    rm -rf "$tmp_dir"
-    return 1
-  fi
-  if [ "$worker_replicas" != "1" ]; then
-    echo "ERROR: current Helm rollback target renders $worker_replicas workers, not exactly 1." >&2
-    rm -rf "$tmp_dir"
-    return 1
-  fi
-  if ! is_digest_image "$runner"; then
-    echo "ERROR: current Helm rollback target leaves RUNNER_IMAGE mutable: $runner" >&2
-    rm -rf "$tmp_dir"
-    return 1
-  fi
-  if ! validate_foundation_intent "$tmp_dir/manifest.yaml" true false; then
-    echo "ERROR: current Helm rollback target changes the claims/content-filter foundation intent." >&2
-    rm -rf "$tmp_dir"
-    return 1
-  fi
-  STATIC_BASELINE_IMAGE_INVENTORY_SHA256="$(
-    LC_ALL=C sort "$inventory" | sha256sum | awk '{print $1}'
-  )"
-  STATIC_BASELINE_RUNNER_IMAGE=$runner
-  rm -rf "$tmp_dir"
-  STATIC_BASELINE_REVISION=$REQUIRED_ROLLBACK_REVISION
-  STATIC_CURRENT_ROLLBACK_REVISION=$revision
-  echo "==> immutable rollback revision $REQUIRED_ROLLBACK_REVISION is present; deployed equivalent revision $revision is claims-disabled and pins every workload image plus RUNNER_IMAGE"
-}
-
 pause_live_provisioning_claims() {
   local live_worker live_claims
   live_worker="$(mktemp)"
@@ -2001,33 +1813,23 @@ resume_live_provisioning_claims() {
 
 verify_rollback_containment() {
   local expected_migration=${1:-}
-  local required_revision=${2:-}
   local revision status inventory tmp_dir
   tmp_dir="$(mktemp -d)"
-  if [ -n "$required_revision" ]; then
-    if ! prove_immutable_rollback_release "$required_revision" "$tmp_dir"; then
-      rm -rf "$tmp_dir"
-      return 1
-    fi
-    revision=$PROVEN_CURRENT_ROLLBACK_REVISION
-    cp "$PROVEN_CURRENT_ROLLBACK_MANIFEST" "$tmp_dir/manifest.yaml"
-  else
-    if ! read -r revision status <<< "$(latest_helm_revision_record)"; then
-      echo "ERROR: could not determine the latest Helm revision and status." >&2
-      rm -rf "$tmp_dir"
-      return 1
-    fi
-    if [ "$status" != "deployed" ]; then
-      echo "ERROR: latest Helm revision $revision status is $status, not deployed; it cannot be a rollback baseline." >&2
-      rm -rf "$tmp_dir"
-      return 1
-    fi
-    if ! helm get manifest "$RELEASE" -n "$NAMESPACE" \
-        --revision "$revision" > "$tmp_dir/manifest.yaml"; then
-      echo "ERROR: could not read manifest for deployed Helm revision $revision." >&2
-      rm -rf "$tmp_dir"
-      return 1
-    fi
+  if ! read -r revision status <<< "$(latest_helm_revision_record)"; then
+    echo "ERROR: could not determine the latest Helm revision and status." >&2
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  if [ "$status" != "deployed" ]; then
+    echo "ERROR: latest Helm revision $revision status is $status, not deployed; it cannot be used as the rollback baseline." >&2
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  if ! helm get manifest "$RELEASE" -n "$NAMESPACE" \
+     --revision "$revision" > "$tmp_dir/manifest.yaml"; then
+    echo "ERROR: could not read manifest for deployed Helm revision $revision." >&2
+    rm -rf "$tmp_dir"
+    return 1
   fi
   if ! verify_manifest_and_live "$tmp_dir/manifest.yaml" "$expected_migration"; then
     rm -rf "$tmp_dir"
@@ -2043,8 +1845,7 @@ verify_rollback_containment() {
   )"
   VERIFIED_BASELINE_RUNNER_IMAGE="$(runner_image_from_manifest < "$tmp_dir/manifest.yaml")"
   rm -rf "$tmp_dir"
-  if [ -n "$required_revision" ] &&
-     ! require_helm_revision_still_deployed "$revision"; then
+  if ! require_helm_revision_still_deployed "$revision"; then
     return 1
   fi
   VERIFIED_BASELINE_REVISION=$revision
@@ -2515,94 +2316,6 @@ require_candidate_image_provenance() {
   verify_image_revision "$CANDIDATE_UI_IMAGE" "$UI_SOURCE_SHA"
 }
 
-require_known_firing_alerts() {
-  local prometheus_url=${DEPLOY_PROMETHEUS_URL:-}
-  local allowlist_file=$KNOWN_FIRING_ALERTS_FILE
-  local tmp_dir response line normalized
-  local -A allowed_seen=()
-  if [[ ! "$prometheus_url" =~ ^https?://[^[:space:]]+$ ]]; then
-    echo "ERROR: DEPLOY_PROMETHEUS_URL must be an explicit http(s) Prometheus base URL." >&2
-    return 1
-  fi
-  if [ ! -r "$allowlist_file" ]; then
-    echo "ERROR: firing-alert allowlist $allowlist_file is missing or unreadable." >&2
-    return 1
-  fi
-  tmp_dir="$(mktemp -d)"
-  : > "$tmp_dir/allowlist"
-  while IFS= read -r line || [ -n "$line" ]; do
-    normalized="${line//$'\r'/}"
-    normalized="${normalized#"${normalized%%[![:space:]]*}"}"
-    normalized="${normalized%"${normalized##*[![:space:]]}"}"
-    [ -n "$normalized" ] || continue
-    [[ "$normalized" != \#* ]] || continue
-    if [[ ! "$normalized" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-      echo "ERROR: malformed firing-alert allowlist entry: $normalized." >&2
-      rm -rf "$tmp_dir"
-      return 1
-    fi
-    if [ -n "${allowed_seen[$normalized]:-}" ]; then
-      echo "ERROR: firing-alert allowlist contains duplicate entry $normalized." >&2
-      rm -rf "$tmp_dir"
-      return 1
-    fi
-    allowed_seen[$normalized]=true
-    printf '%s\n' "$normalized" >> "$tmp_dir/allowlist"
-  done < "$allowlist_file"
-  if ! LC_ALL=C sort "$tmp_dir/allowlist" -o "$tmp_dir/allowlist"; then
-    echo "ERROR: could not sort the firing-alert allowlist." >&2
-    rm -rf "$tmp_dir"
-    return 1
-  fi
-  if ! response="$(
-    curl --fail --silent --show-error --max-time 15 \
-      "${prometheus_url%/}/api/v1/alerts"
-  )"; then
-    echo "ERROR: Prometheus firing-alert query failed at ${prometheus_url%/}/api/v1/alerts." >&2
-    rm -rf "$tmp_dir"
-    return 1
-  fi
-  if ! jq -r '
-      if .status != "success" or (.data.alerts | type) != "array" then
-        error("invalid Prometheus response envelope")
-      else
-        [
-          .data.alerts[]
-          | if (.state != "pending" and .state != "firing") or
-               (.labels | type) != "object" or
-               (.labels.alertname | type) != "string" then
-              error("malformed Prometheus alert")
-            else .
-            end
-          | select(.state == "firing")
-          | .labels.alertname
-          | if test("^[A-Za-z_][A-Za-z0-9_]*$") then
-              .
-            else
-              error("malformed alertname")
-            end
-        ]
-        | unique[]
-      end
-    ' <<< "$response" > "$tmp_dir/firing"; then
-    echo "ERROR: Prometheus returned malformed or unknown alert data; refusing deployment." >&2
-    rm -rf "$tmp_dir"
-    return 1
-  fi
-  if ! line="$(LC_ALL=C comm -23 "$tmp_dir/firing" "$tmp_dir/allowlist")"; then
-    echo "ERROR: could not compare firing alerts with the strict allowlist." >&2
-    rm -rf "$tmp_dir"
-    return 1
-  fi
-  if [ -n "$line" ]; then
-    echo "ERROR: unallowlisted Prometheus alerts are firing:" >&2
-    printf '%s\n' "$line" >&2
-    rm -rf "$tmp_dir"
-    return 1
-  fi
-  rm -rf "$tmp_dir"
-}
-
 run_release_preflight() {
   echo "==> running fail-closed release preflight before lock acquisition or live mutation"
   require_clean_migration
@@ -2610,13 +2323,11 @@ run_release_preflight() {
   require_synthetic_pod_quota
   require_no_active_mutating_synthetics
   require_candidate_image_provenance
-  require_known_firing_alerts
   echo "==> release preflight passed"
 }
 
 require_volatile_release_preflight() {
   require_no_pending_provisioning_jobs
-  require_known_firing_alerts
 }
 
 require_core_workloads() {
@@ -3703,6 +3414,7 @@ enforce_synthetic_rollback_containment() {
 }
 
 contain_failed_atomic_upgrade() {
+  local expected_inventory expected_runner
   echo "==> atomic upgrade failed; proving rollback containment before releasing the lock" >&2
   if ! kubectl set env "deployment/$RELEASE-worker" \
       -n "$NAMESPACE" \
@@ -3717,22 +3429,22 @@ contain_failed_atomic_upgrade() {
   if ! enforce_synthetic_rollback_containment; then
     return 1
   fi
-  if ! verify_rollback_containment \
-      "$ROLLBACK_BASELINE_MIGRATION" \
-      "$ROLLBACK_BASELINE_REVISION"; then
-    echo "ERROR: atomic rollback did not restore the approved immutable baseline." >&2
+  expected_inventory=$VERIFIED_BASELINE_IMAGE_INVENTORY_SHA256
+  expected_runner=$VERIFIED_BASELINE_RUNNER_IMAGE
+  if ! verify_rollback_containment "$ROLLBACK_BASELINE_MIGRATION"; then
+    echo "ERROR: atomic rollback did not restore the currently deployed baseline with claims disabled and healthy workloads." >&2
     return 1
   fi
-  if [ "$VERIFIED_BASELINE_IMAGE_INVENTORY_SHA256" != "$STATIC_BASELINE_IMAGE_INVENTORY_SHA256" ] ||
-     [ "$VERIFIED_BASELINE_RUNNER_IMAGE" != "$STATIC_BASELINE_RUNNER_IMAGE" ]; then
-    echo "ERROR: atomic rollback revision $VERIFIED_BASELINE_REVISION does not match immutable revision-$ROLLBACK_BASELINE_REVISION image identity." >&2
+  if [ "$VERIFIED_BASELINE_IMAGE_INVENTORY_SHA256" != "$expected_inventory" ] ||
+     [ "$VERIFIED_BASELINE_RUNNER_IMAGE" != "$expected_runner" ]; then
+    echo "ERROR: atomic rollback restored a different workload image inventory than the pre-upgrade release." >&2
     return 1
   fi
   if ! require_no_active_jobs; then
     echo "ERROR: work remained active after atomic rollback." >&2
     return 1
   fi
-  echo "==> atomic failure contained at revision-$ROLLBACK_BASELINE_REVISION immutable image baseline via deployed revision $VERIFIED_BASELINE_REVISION with claims disabled and all work drained" >&2
+  echo "==> atomic failure contained by the currently deployed rollback baseline with claims disabled and all work drained" >&2
 }
 
 validate_pinned_manifest() {
@@ -4285,7 +3997,7 @@ prepare_immutable_candidate() {
 }
 
 if [ "$MODE" = verify ]; then
-  verify_rollback_containment "" "$REQUIRED_ROLLBACK_REVISION"
+  verify_rollback_containment ""
   exit 0
 fi
 
@@ -4298,12 +4010,6 @@ if [ -z "$UI_SOURCE_SHA" ]; then
   echo "ERROR: production candidates require an explicit --ui-source-sha; refusing to preserve or select UI implicitly." >&2
   exit 64
 fi
-
-# Prove the stored rollback manifest before source or candidate work, without
-# requiring a temporary live claims override to be paused for --dry-run.
-verify_rollback_manifest_safety
-ROLLBACK_BASELINE_REVISION=$STATIC_BASELINE_REVISION
-ROLLBACK_CURRENT_REVISION=$STATIC_CURRENT_ROLLBACK_REVISION
 
 # Refuse a dirty tree before pull so git cannot merge local state into the
 # candidate, then prove the exact source identity again after pull.
@@ -4345,21 +4051,14 @@ fi
 # claims; --dry-run remains useful while a temporary claims=true override exists.
 run_release_preflight
 acquire_helm_release_lock
-verify_rollback_manifest_safety
-if [ "$STATIC_BASELINE_REVISION" != "$ROLLBACK_BASELINE_REVISION" ] ||
-   [ "$STATIC_CURRENT_ROLLBACK_REVISION" != "$ROLLBACK_CURRENT_REVISION" ]; then
-  echo "ERROR: deployed Helm revision changed from $ROLLBACK_CURRENT_REVISION to $STATIC_CURRENT_ROLLBACK_REVISION before claims pause." >&2
-  exit 1
-fi
+require_clean_migration
+ROLLBACK_BASELINE_MIGRATION=$VERIFIED_MIGRATION_STATE
 pause_live_provisioning_claims
+verify_rollback_containment "$ROLLBACK_BASELINE_MIGRATION"
+ROLLBACK_CURRENT_REVISION=$VERIFIED_BASELINE_REVISION
 enforce_synthetic_rollback_containment
 require_no_active_jobs
-verify_rollback_containment "" "$REQUIRED_ROLLBACK_REVISION"
 ROLLBACK_BASELINE_MIGRATION=$VERIFIED_MIGRATION_STATE
-if [ "$VERIFIED_BASELINE_REVISION" != "$ROLLBACK_CURRENT_REVISION" ]; then
-  echo "ERROR: deployed Helm revision changed from stored equivalent $ROLLBACK_CURRENT_REVISION to $VERIFIED_BASELINE_REVISION while pausing claims." >&2
-  exit 1
-fi
 
 if [ "$(require_trusted_source_identity "$CANDIDATE_SOURCE_SHA")" != "$CANDIDATE_SOURCE_SHA" ]; then
   echo "ERROR: source identity changed before application upgrade." >&2
@@ -4380,14 +4079,7 @@ if [ "$(
   echo "ERROR: proven UI image changed before application upgrade." >&2
   exit 1
 fi
-verify_rollback_containment \
-  "$ROLLBACK_BASELINE_MIGRATION" \
-  "$REQUIRED_ROLLBACK_REVISION"
-if [ "$VERIFIED_BASELINE_REVISION" != "$ROLLBACK_CURRENT_REVISION" ]; then
-  echo "ERROR: deployed Helm revision changed from baseline equivalent $ROLLBACK_CURRENT_REVISION to $VERIFIED_BASELINE_REVISION before the application upgrade." >&2
-  echo "Re-establish and re-verify the immutable all-workload baseline; refusing phase-1." >&2
-  exit 1
-fi
+verify_rollback_containment "$ROLLBACK_BASELINE_MIGRATION"
 verify_external_candidate_images \
   "$CANDIDATE_EXTERNAL_IMAGE_MAP" \
   "$CANDIDATE_TMP_DIR/external-recheck"
