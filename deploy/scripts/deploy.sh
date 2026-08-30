@@ -1473,6 +1473,29 @@ latest_cronjob_job() {
     | tail -n 1
 }
 
+cronjob_suspend_from_manifest() {
+  local manifest=$1
+  awk '
+    /^[^[:space:]]/ {
+      section = $0
+      sub(/:.*/, "", section)
+      next
+    }
+    section == "spec" && /^  suspend:[[:space:]]*/ {
+      matches++
+      value = $0
+      sub(/^  suspend:[[:space:]]*/, "", value)
+      gsub(/^["'"'"']|["'"'"']$/, "", value)
+    }
+    END {
+      if (matches != 1 || (value != "true" && value != "false")) {
+        exit 3
+      }
+      print value
+    }
+  ' "$manifest"
+}
+
 live_effective_image() {
   local kind=$1
   local name=$2
@@ -1480,15 +1503,48 @@ live_effective_image() {
   local container_name=$4
   local declared_image=$5
   local live_manifest=$6
-  local selector status_path image_ids image_id repository
+  local selector status_path image_ids image_id repository job_name suspended spec_image
 
   case "$kind" in
     CronJob)
-      local job_name
-      job_name="$(latest_cronjob_job "$name")"
-      if [ -z "$job_name" ]; then
-        echo "ERROR: missing image inventory: CronJob/$name has no retained Job to prove its effective image." >&2
+      if ! job_name="$(latest_cronjob_job "$name")"; then
+        echo "ERROR: failed to list retained Jobs for CronJob/$name while proving its effective image." >&2
         return 1
+      fi
+      if [ -z "$job_name" ]; then
+        if ! suspended="$(cronjob_suspend_from_manifest "$live_manifest")"; then
+          echo "ERROR: missing image inventory: CronJob/$name has no retained Job and its exact live spec.suspend value cannot be proven." >&2
+          return 1
+        fi
+        if [ "$suspended" != true ]; then
+          echo "ERROR: missing image inventory: runnable CronJob/$name has no retained Job to prove its effective image." >&2
+          return 1
+        fi
+        if ! spec_image="$(
+          manifest_workload_inventory "$live_manifest" \
+            | awk -F '\t' \
+                -v kind="$kind" \
+                -v name="$name" \
+                -v type="$container_type" \
+                -v container="$container_name" \
+                '$1 == kind && $2 == name && $3 == type && $4 == container {
+                   image = $5
+                   matches++
+                 }
+                 END {
+                   if (matches != 1) exit 3
+                   print image
+                 }'
+        )"; then
+          echo "ERROR: missing image inventory: suspended CronJob/$name does not contain exactly one live $container_type/$container_name tuple." >&2
+          return 1
+        fi
+        if ! is_digest_image "$spec_image"; then
+          echo "ERROR: suspended CronJob/$name $container_type/$container_name does not declare an immutable sha256 image: $spec_image" >&2
+          return 1
+        fi
+        printf '%s' "$spec_image"
+        return 0
       fi
       selector="job-name=$job_name"
       ;;
@@ -2585,7 +2641,7 @@ require_core_workloads() {
 
 workload_health() {
   local inventory=$1
-  local workloads kind name state succeeded failed active job_name
+  local workloads kind name state succeeded failed active job_name suspended
   workloads="$(cut -f1,2 "$inventory" | sort -u)"
   while IFS=$'\t' read -r kind name; do
     case "$kind" in
@@ -2596,9 +2652,19 @@ workload_health() {
         }
         ;;
       CronJob)
-        job_name="$(latest_cronjob_job "$name")"
+        if ! job_name="$(latest_cronjob_job "$name")"; then
+          echo "ERROR: failed to list retained Jobs for CronJob/$name during health verification." >&2
+          return 1
+        fi
         if [ -z "$job_name" ]; then
-          echo "ERROR: CronJob/$name has no retained Job health evidence." >&2
+          if ! suspended="$(kubectl get "CronJob/$name" -n "$NAMESPACE" -o jsonpath='{.spec.suspend}')"; then
+            echo "ERROR: failed to read CronJob/$name suspension state during health verification." >&2
+            return 1
+          fi
+          if [ "$suspended" = true ]; then
+            continue
+          fi
+          echo "ERROR: runnable CronJob/$name has no retained Job health evidence." >&2
           return 1
         fi
         state="$(kubectl get "job/$job_name" -n "$NAMESPACE" -o jsonpath='{.status.succeeded}{" "}{.status.failed}{" "}{.status.active}')"
