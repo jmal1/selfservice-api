@@ -39,7 +39,6 @@ spec:
     spec:
       backoffLimit: 0
       activeDeadlineSeconds: {{ required "synthetic.runner.activeDeadlineSeconds is required" .Values.synthetic.runner.activeDeadlineSeconds }}
-      ttlSecondsAfterFinished: 1800
       template:
         metadata:
           labels:

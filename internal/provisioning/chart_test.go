@@ -579,6 +579,50 @@ func TestSyntheticJanitorCronJobRetainsJobEvidence(t *testing.T) {
 	}
 }
 
+func TestSyntheticRunnerCronJobRetainsJobEvidence(t *testing.T) {
+	helmPath, err := exec.LookPath("helm")
+	if err != nil {
+		t.Skip("helm not available")
+	}
+	chartDir := filepath.Join("..", "..", "deploy", "helm", "selfservice")
+	if _, err := os.Stat(filepath.Join(chartDir, "charts")); err != nil {
+		t.Skip("chart dependencies not vendored; run `helm dependency build` in deploy/helm/selfservice first")
+	}
+
+	args := []string{"template", "selfservice", ".", "-f", "values.yaml", "-f", "values.prod.yaml", "--show-only", "templates/synthetic-runner-cronjob.yaml"}
+	cmd := exec.Command(helmPath, args...)
+	cmd.Dir = chartDir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("helm template failed: %v\n%s", err, out)
+	}
+
+	var rendered struct {
+		Spec struct {
+			SuccessfulJobsHistoryLimit int `yaml:"successfulJobsHistoryLimit"`
+			FailedJobsHistoryLimit     int `yaml:"failedJobsHistoryLimit"`
+			JobTemplate                struct {
+				Spec struct {
+					TTLSecondsAfterFinished *int `yaml:"ttlSecondsAfterFinished"`
+				} `yaml:"spec"`
+			} `yaml:"jobTemplate"`
+		} `yaml:"spec"`
+	}
+	if err := yaml.Unmarshal(out, &rendered); err != nil {
+		t.Fatalf("decode rendered runner cronjob: %v\n%s", err, out)
+	}
+
+	if rendered.Spec.SuccessfulJobsHistoryLimit != 3 {
+		t.Fatalf("runner successfulJobsHistoryLimit = %d, want 3", rendered.Spec.SuccessfulJobsHistoryLimit)
+	}
+	if rendered.Spec.FailedJobsHistoryLimit != 5 {
+		t.Fatalf("runner failedJobsHistoryLimit = %d, want 5", rendered.Spec.FailedJobsHistoryLimit)
+	}
+	if rendered.Spec.JobTemplate.Spec.TTLSecondsAfterFinished != nil {
+		t.Fatalf("runner cronjob rendered ttlSecondsAfterFinished=%d, want it omitted so job history is retained for image-evidence checks", *rendered.Spec.JobTemplate.Spec.TTLSecondsAfterFinished)
+	}
+}
+
 func TestSyntheticCronJobRunnerExpectedEnabledRendersAcrossOverlays(t *testing.T) {
 	helmPath, err := exec.LookPath("helm")
 	if err != nil {
