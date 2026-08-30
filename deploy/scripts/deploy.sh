@@ -3299,7 +3299,7 @@ verify_external_candidate_images() {
 }
 
 verify_deployed_candidate() {
-  local revision status tmp_dir manifest inventory deployed_canonical workload_health_status
+  local revision status tmp_dir manifest inventory expected_canonical deployed_canonical workload_health_status
   if ! read -r revision status <<< "$(latest_helm_revision_record)"; then
     echo "ERROR: could not determine the deployed candidate Helm revision." >&2
     return 1
@@ -3322,12 +3322,17 @@ verify_deployed_candidate() {
     echo "ERROR: deployed Helm manifest differs from the validated immutable candidate." >&2
     return 1
   fi
+  expected_canonical="$tmp_dir/expected.server.canonical"
+  if ! canonicalize_server_candidate "$CANDIDATE_MANIFEST" "$expected_canonical"; then
+    echo "ERROR: could not refresh the expected Helm object set against the post-upgrade cluster." >&2
+    return 1
+  fi
   deployed_canonical="$tmp_dir/server.canonical"
   if ! canonicalize_server_candidate "$manifest" "$deployed_canonical"; then
     echo "ERROR: could not canonicalize the deployed Helm object set." >&2
     return 1
   fi
-  if ! diff -u "$CANDIDATE_SERVER_CANONICAL" "$deployed_canonical"; then
+  if ! diff -u "$expected_canonical" "$deployed_canonical"; then
     echo "ERROR: deployed Helm object set differs from the exact validated candidate." >&2
     return 1
   fi

@@ -1099,6 +1099,42 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 	requirePOSIXShell(t)
 	live := baselineManifest(true, "", "false")
+	t.Run("successful upgrade accepts intended janitor TTL deletion", func(t *testing.T) {
+		candidate := rollbackManifestWithHistoricalSynthetics(true)
+		liveWithHistoricalSynthetics := baselineManifest(true, "", "false") +
+			historicalSyntheticCronJobs(true)
+		liveWithJanitorTTL := strings.Replace(
+			liveWithHistoricalSynthetics,
+			"  name: selfservice-synthetic-janitor\nspec:\n  suspend: true\n  jobTemplate:\n    spec:\n",
+			"  name: selfservice-synthetic-janitor\nspec:\n  suspend: true\n  jobTemplate:\n    spec:\n      ttlSecondsAfterFinished: 1800\n",
+			1,
+		)
+		if liveWithJanitorTTL == liveWithHistoricalSynthetics {
+			t.Fatal("janitor TTL fixture was not added to the live manifest")
+		}
+		env := newDeployScriptEnvironment(t, liveWithJanitorTTL, candidate)
+		env.retainLiveJanitorTTLBeforeUpgrade = true
+
+		output, err := env.run("--no-pull")
+		if err != nil {
+			t.Fatalf("intended janitor TTL deletion failed post-apply comparison: %v\n%s", err, output)
+		}
+		if _, statErr := os.Stat(env.upgradedMarker); statErr != nil {
+			t.Fatalf("TTL deletion regression did not reach Helm upgrade: %v\n%s", statErr, output)
+		}
+		if _, statErr := os.Stat(env.lockFile); !os.IsNotExist(statErr) {
+			t.Fatalf("successful TTL deletion left the release lock behind: %v\n%s", statErr, output)
+		}
+		ssaLog, readErr := os.ReadFile(env.janitorTTLSSALog)
+		if readErr != nil {
+			t.Fatalf("could not read janitor TTL SSA evidence: %v", readErr)
+		}
+		if !strings.Contains(string(ssaLog), "pre-upgrade-retained") ||
+			!strings.Contains(string(ssaLog), "post-upgrade-omitted") {
+			t.Fatalf("fake SSA did not model both sides of the production deletion race:\n%s", ssaLog)
+		}
+	})
+
 	for _, test := range []struct {
 		name                   string
 		configure              func(*deployScriptEnvironment)
@@ -3123,8 +3159,8 @@ func TestDeployScriptPostApplyHelmOwnershipHandling(t *testing.T) {
 				t.Fatalf("post-apply proof rejected %s for the wrong reason:\n%s", test.name, output)
 			}
 			if test.wantCanonicalFailure {
-				if !strings.Contains(string(output), "could not canonicalize the deployed Helm object set") {
-					t.Fatalf("malformed ownership did not fail canonicalization:\n%s", output)
+				if !strings.Contains(string(output), "could not refresh the expected Helm object set against the post-upgrade cluster") {
+					t.Fatalf("malformed live ownership did not fail the refreshed expected canonicalization:\n%s", output)
 				}
 			} else if !strings.Contains(string(output), "deployed Helm object set differs") {
 				t.Fatalf("metadata drift did not fail the deployed-candidate comparison:\n%s", output)
@@ -6271,6 +6307,7 @@ type deployScriptEnvironment struct {
 	lockDeleteRaceMark        string
 	serverDryRunLog           string
 	serverDryRunMark          string
+	janitorTTLSSALog          string
 	finalRollbackMark         string
 	liveVerificationMark      string
 	extraImageCount           string
@@ -6329,49 +6366,50 @@ type deployScriptEnvironment struct {
 	liveHelmRelease   string
 	liveHelmNamespace string
 
-	failFinalServerDryRun          bool
-	externalDriftAfterServerDryRun bool
-	mutateFinalServerObject        bool
-	warmerRolloutFailure           bool
-	warmerImageStaysEmpty          bool
-	finalWorkloadHealthRegression  bool
-	activeJobs                     int
-	activeKubernetesJobs           int
-	activeMutatingSyntheticJobs    int
-	completedMutatingSyntheticJob  bool
-	noRetainedJanitorJob           bool
-	noRetainedRunnerJob            bool
-	pendingSyntheticJobs           int
-	migrationState                 string
-	provisioningJobs               string
-	provisioningJobsAfterInitial   string
-	unknownProvisioningJobStatus   bool
-	syntheticQuotaState            string
-	syntheticUserID                string
-	syntheticOIDCSub               string
-	syntheticSecretValue           string
-	syntheticSecretExists          bool
-	syntheticSecretKeyPresent      bool
-	failSyntheticSecretRead        bool
-	syntheticUserKnown             bool
-	malformedJobsJSON              bool
-	preflightQueryFailure          string
-	failJobsList                   bool
-	failAtomicUpgrade              bool
-	atomicRollbackMismatch         string
-	postUpgradeMismatch            string
-	postUpgradeObjectMutation      bool
-	postApplyAnnotationsMode       string
-	failClaimsResume               bool
-	lockDeleteRaceMode             string
-	lockTTLSeconds                 string
-	signalAfterClaimsPause         string
-	signalDuringClaimsPause        string
-	failClaimsPauseBeforeMutation  bool
-	signalDuringHelm               string
-	signalDuringLockCreate         string
-	failLockCreateAfterMutation    bool
-	cronjobVerificationShape       string
+	failFinalServerDryRun             bool
+	externalDriftAfterServerDryRun    bool
+	mutateFinalServerObject           bool
+	warmerRolloutFailure              bool
+	warmerImageStaysEmpty             bool
+	finalWorkloadHealthRegression     bool
+	activeJobs                        int
+	activeKubernetesJobs              int
+	activeMutatingSyntheticJobs       int
+	completedMutatingSyntheticJob     bool
+	noRetainedJanitorJob              bool
+	noRetainedRunnerJob               bool
+	pendingSyntheticJobs              int
+	migrationState                    string
+	provisioningJobs                  string
+	provisioningJobsAfterInitial      string
+	unknownProvisioningJobStatus      bool
+	syntheticQuotaState               string
+	syntheticUserID                   string
+	syntheticOIDCSub                  string
+	syntheticSecretValue              string
+	syntheticSecretExists             bool
+	syntheticSecretKeyPresent         bool
+	failSyntheticSecretRead           bool
+	syntheticUserKnown                bool
+	malformedJobsJSON                 bool
+	preflightQueryFailure             string
+	failJobsList                      bool
+	failAtomicUpgrade                 bool
+	atomicRollbackMismatch            string
+	postUpgradeMismatch               string
+	postUpgradeObjectMutation         bool
+	retainLiveJanitorTTLBeforeUpgrade bool
+	postApplyAnnotationsMode          string
+	failClaimsResume                  bool
+	lockDeleteRaceMode                string
+	lockTTLSeconds                    string
+	signalAfterClaimsPause            string
+	signalDuringClaimsPause           string
+	failClaimsPauseBeforeMutation     bool
+	signalDuringHelm                  string
+	signalDuringLockCreate            string
+	failLockCreateAfterMutation       bool
+	cronjobVerificationShape          string
 
 	// simulateOwnershipConflict makes the fake kubectl reject any
 	// `--server-side --dry-run=server` apply that lacks `--force-conflicts`
@@ -6411,6 +6449,7 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 		lockDeleteRaceMark:        filepath.Join(root, "lock-delete-race.marker"),
 		serverDryRunLog:           filepath.Join(root, "server-dry-run.log"),
 		serverDryRunMark:          filepath.Join(root, "server-dry-run.marker"),
+		janitorTTLSSALog:          filepath.Join(root, "janitor-ttl-ssa.log"),
 		finalRollbackMark:         filepath.Join(root, "final-rollback.marker"),
 		liveVerificationMark:      filepath.Join(root, "live-verification.marker"),
 		extraImageCount:           filepath.Join(root, "extra-image-count"),
@@ -6769,6 +6808,16 @@ json_resource() {
   resource_file=$(mktemp)
   extract_resource "$manifest" "$resource" > "$resource_file"
   canonical=$(canonical_resource "$resource_file")
+  if [ "$FAKE_RETAIN_LIVE_JANITOR_TTL_BEFORE_UPGRADE" = true ] &&
+     [ "$resource" = "CronJob/selfservice-synthetic-janitor" ]; then
+    if [ "$source" = desired ]; then
+      canonical="$canonical
+      ttlSecondsAfterFinished: 1800"
+      echo pre-upgrade-retained >> "$FAKE_JANITOR_TTL_SSA_LOG"
+    elif [ "$source" = post-upgrade-expected ] || [ "$source" = post-apply ]; then
+      echo post-upgrade-omitted >> "$FAKE_JANITOR_TTL_SSA_LOG"
+    fi
+  fi
   kind=${resource%%/*}
   revision=$(awk '
     /^metadata:[[:space:]]*$/ { metadata = 1; next }
@@ -6835,7 +6884,10 @@ serverInjectedMutation: true"
                   {}
                 end
               )
-            elif $source == "post-apply" then
+            elif $source == "post-apply" or
+                 ($source == "post-upgrade-expected" and
+                  (($post_apply_mode | startswith("helm-wrong-")) or
+                   ($post_apply_mode | startswith("helm-nonstring-")))) then
               (
                 if ($post_apply_mode == "generated" or $post_apply_mode == "deployment-revision") and
                    $kind == "Deployment" then
@@ -6898,7 +6950,10 @@ serverInjectedMutation: true"
             end
           ),
           labels:(
-            if $source == "post-apply" and
+            if ($source == "post-apply" or
+                ($source == "post-upgrade-expected" and
+                 (($post_apply_mode | startswith("helm-wrong-")) or
+                  ($post_apply_mode | startswith("helm-nonstring-"))))) and
                ($post_apply_mode | startswith("helm-")) and
                ($resource == "CronJob/selfservice-synthetic-janitor" or
                 $resource == "CronJob/selfservice-synthetic-runner") then
@@ -6971,7 +7026,10 @@ serverInjectedMutation: true"
                   {}
                 end
               )
-            elif $source == "post-apply" then
+            elif $source == "post-apply" or
+                 ($source == "post-upgrade-expected" and
+                  (($post_apply_mode | startswith("helm-wrong-")) or
+                   ($post_apply_mode | startswith("helm-nonstring-")))) then
               (
                 if ($post_apply_mode == "generated" or $post_apply_mode == "deployment-revision") and
                    $kind == "Deployment" then
@@ -7034,7 +7092,10 @@ serverInjectedMutation: true"
             end
           ),
           labels:(
-            if $source == "post-apply" and
+            if ($source == "post-apply" or
+                ($source == "post-upgrade-expected" and
+                 (($post_apply_mode | startswith("helm-wrong-")) or
+                  ($post_apply_mode | startswith("helm-nonstring-"))))) and
                ($post_apply_mode | startswith("helm-")) and
                ($resource == "CronJob/selfservice-synthetic-janitor" or
                 $resource == "CronJob/selfservice-synthetic-runner") then
@@ -7679,7 +7740,10 @@ case "$1" in
       [ -n "$resource" ]
       source=desired
       if [ -f "$FAKE_UPGRADED_MARKER" ]; then
-        source=post-apply
+        case "$manifest" in
+          *expected.server.canonical.documents/*) source=post-upgrade-expected ;;
+          *) source=post-apply ;;
+        esac
       fi
       json_resource "$manifest" "$resource" "$source"
     else
@@ -8190,6 +8254,8 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_ATOMIC_ROLLBACK_MISMATCH="+e.atomicRollbackMismatch,
 		"FAKE_POST_UPGRADE_MISMATCH="+e.postUpgradeMismatch,
 		"FAKE_POST_UPGRADE_OBJECT_MUTATION="+strconv.FormatBool(e.postUpgradeObjectMutation),
+		"FAKE_RETAIN_LIVE_JANITOR_TTL_BEFORE_UPGRADE="+strconv.FormatBool(e.retainLiveJanitorTTLBeforeUpgrade),
+		"FAKE_JANITOR_TTL_SSA_LOG="+e.janitorTTLSSALog,
 		"FAKE_POST_APPLY_ANNOTATIONS_MODE="+e.postApplyAnnotationsMode,
 		"FAKE_GIT_BRANCH="+e.gitBranch,
 		"FAKE_GIT_REMOTE_SHA="+e.gitRemoteSHA,
@@ -8368,23 +8434,23 @@ spec:
 func rollbackManifestWithHistoricalSynthetics(contained bool) string {
 	manifest := baselineManifest(true, "", "false")
 	lifecycle := "true"
-	janitorSuspend := "false"
-	runnerSuspend := "false"
 	if contained {
 		lifecycle = "false"
-		janitorSuspend = "true"
-		runnerSuspend = "true"
 	}
 	if !contained {
 		manifest = replaceEnvValue(manifest, "SYNTHETIC_LIFECYCLE_ENABLED", "false", lifecycle)
 	}
-	return manifest + `---
+	return manifest + historicalSyntheticCronJobs(contained)
+}
+
+func historicalSyntheticCronJobs(suspend bool) string {
+	return `---
 apiVersion: batch/v1
 kind: CronJob
 metadata:
   name: selfservice-synthetic-janitor
 spec:
-  suspend: ` + janitorSuspend + `
+  suspend: ` + strconv.FormatBool(suspend) + `
   jobTemplate:
     spec:
       template:
@@ -8399,7 +8465,7 @@ kind: CronJob
 metadata:
   name: selfservice-synthetic-runner
 spec:
-  suspend: ` + runnerSuspend + `
+  suspend: ` + strconv.FormatBool(suspend) + `
   jobTemplate:
     spec:
       template:
