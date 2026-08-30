@@ -1099,6 +1099,40 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 	requirePOSIXShell(t)
 	live := baselineManifest(true, "", "false")
+	t.Run("successful upgrade accepts intended janitor TTL deletion", func(t *testing.T) {
+		candidate := rollbackManifestWithHistoricalSynthetics(false)
+		liveWithJanitorTTL := strings.Replace(
+			candidate,
+			"  name: selfservice-synthetic-janitor\nspec:\n  suspend: false\n  jobTemplate:\n    spec:\n",
+			"  name: selfservice-synthetic-janitor\nspec:\n  suspend: false\n  jobTemplate:\n    spec:\n      ttlSecondsAfterFinished: 1800\n",
+			1,
+		)
+		if liveWithJanitorTTL == candidate {
+			t.Fatal("janitor TTL fixture was not added to the live manifest")
+		}
+		env := newDeployScriptEnvironment(t, liveWithJanitorTTL, candidate)
+		env.retainLiveJanitorTTLBeforeUpgrade = true
+
+		output, err := env.run("--no-pull")
+		if err != nil {
+			t.Fatalf("intended janitor TTL deletion failed post-apply comparison: %v\n%s", err, output)
+		}
+		if _, statErr := os.Stat(env.upgradedMarker); statErr != nil {
+			t.Fatalf("TTL deletion regression did not reach Helm upgrade: %v\n%s", statErr, output)
+		}
+		if _, statErr := os.Stat(env.lockFile); !os.IsNotExist(statErr) {
+			t.Fatalf("successful TTL deletion left the release lock behind: %v\n%s", statErr, output)
+		}
+		ssaLog, readErr := os.ReadFile(env.janitorTTLSSALog)
+		if readErr != nil {
+			t.Fatalf("could not read janitor TTL SSA evidence: %v", readErr)
+		}
+		if !strings.Contains(string(ssaLog), "pre-upgrade-retained") ||
+			!strings.Contains(string(ssaLog), "post-upgrade-omitted") {
+			t.Fatalf("fake SSA did not model both sides of the production deletion race:\n%s", ssaLog)
+		}
+	})
+
 	for _, test := range []struct {
 		name                   string
 		configure              func(*deployScriptEnvironment)
@@ -6271,6 +6305,7 @@ type deployScriptEnvironment struct {
 	lockDeleteRaceMark        string
 	serverDryRunLog           string
 	serverDryRunMark          string
+	janitorTTLSSALog          string
 	finalRollbackMark         string
 	liveVerificationMark      string
 	extraImageCount           string
@@ -6329,49 +6364,50 @@ type deployScriptEnvironment struct {
 	liveHelmRelease   string
 	liveHelmNamespace string
 
-	failFinalServerDryRun          bool
-	externalDriftAfterServerDryRun bool
-	mutateFinalServerObject        bool
-	warmerRolloutFailure           bool
-	warmerImageStaysEmpty          bool
-	finalWorkloadHealthRegression  bool
-	activeJobs                     int
-	activeKubernetesJobs           int
-	activeMutatingSyntheticJobs    int
-	completedMutatingSyntheticJob  bool
-	noRetainedJanitorJob           bool
-	noRetainedRunnerJob            bool
-	pendingSyntheticJobs           int
-	migrationState                 string
-	provisioningJobs               string
-	provisioningJobsAfterInitial   string
-	unknownProvisioningJobStatus   bool
-	syntheticQuotaState            string
-	syntheticUserID                string
-	syntheticOIDCSub               string
-	syntheticSecretValue           string
-	syntheticSecretExists          bool
-	syntheticSecretKeyPresent      bool
-	failSyntheticSecretRead        bool
-	syntheticUserKnown             bool
-	malformedJobsJSON              bool
-	preflightQueryFailure          string
-	failJobsList                   bool
-	failAtomicUpgrade              bool
-	atomicRollbackMismatch         string
-	postUpgradeMismatch            string
-	postUpgradeObjectMutation      bool
-	postApplyAnnotationsMode       string
-	failClaimsResume               bool
-	lockDeleteRaceMode             string
-	lockTTLSeconds                 string
-	signalAfterClaimsPause         string
-	signalDuringClaimsPause        string
-	failClaimsPauseBeforeMutation  bool
-	signalDuringHelm               string
-	signalDuringLockCreate         string
-	failLockCreateAfterMutation    bool
-	cronjobVerificationShape       string
+	failFinalServerDryRun             bool
+	externalDriftAfterServerDryRun    bool
+	mutateFinalServerObject           bool
+	warmerRolloutFailure              bool
+	warmerImageStaysEmpty             bool
+	finalWorkloadHealthRegression     bool
+	activeJobs                        int
+	activeKubernetesJobs              int
+	activeMutatingSyntheticJobs       int
+	completedMutatingSyntheticJob     bool
+	noRetainedJanitorJob              bool
+	noRetainedRunnerJob               bool
+	pendingSyntheticJobs              int
+	migrationState                    string
+	provisioningJobs                  string
+	provisioningJobsAfterInitial      string
+	unknownProvisioningJobStatus      bool
+	syntheticQuotaState               string
+	syntheticUserID                   string
+	syntheticOIDCSub                  string
+	syntheticSecretValue              string
+	syntheticSecretExists             bool
+	syntheticSecretKeyPresent         bool
+	failSyntheticSecretRead           bool
+	syntheticUserKnown                bool
+	malformedJobsJSON                 bool
+	preflightQueryFailure             string
+	failJobsList                      bool
+	failAtomicUpgrade                 bool
+	atomicRollbackMismatch            string
+	postUpgradeMismatch               string
+	postUpgradeObjectMutation         bool
+	retainLiveJanitorTTLBeforeUpgrade bool
+	postApplyAnnotationsMode          string
+	failClaimsResume                  bool
+	lockDeleteRaceMode                string
+	lockTTLSeconds                    string
+	signalAfterClaimsPause            string
+	signalDuringClaimsPause           string
+	failClaimsPauseBeforeMutation     bool
+	signalDuringHelm                  string
+	signalDuringLockCreate            string
+	failLockCreateAfterMutation       bool
+	cronjobVerificationShape          string
 
 	// simulateOwnershipConflict makes the fake kubectl reject any
 	// `--server-side --dry-run=server` apply that lacks `--force-conflicts`
@@ -6411,6 +6447,7 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 		lockDeleteRaceMark:        filepath.Join(root, "lock-delete-race.marker"),
 		serverDryRunLog:           filepath.Join(root, "server-dry-run.log"),
 		serverDryRunMark:          filepath.Join(root, "server-dry-run.marker"),
+		janitorTTLSSALog:          filepath.Join(root, "janitor-ttl-ssa.log"),
 		finalRollbackMark:         filepath.Join(root, "final-rollback.marker"),
 		liveVerificationMark:      filepath.Join(root, "live-verification.marker"),
 		extraImageCount:           filepath.Join(root, "extra-image-count"),
@@ -6769,6 +6806,16 @@ json_resource() {
   resource_file=$(mktemp)
   extract_resource "$manifest" "$resource" > "$resource_file"
   canonical=$(canonical_resource "$resource_file")
+  if [ "$FAKE_RETAIN_LIVE_JANITOR_TTL_BEFORE_UPGRADE" = true ] &&
+     [ "$resource" = "CronJob/selfservice-synthetic-janitor" ]; then
+    if [ "$source" = desired ]; then
+      canonical="$canonical
+      ttlSecondsAfterFinished: 1800"
+      echo pre-upgrade-retained >> "$FAKE_JANITOR_TTL_SSA_LOG"
+    elif [ "$source" = post-apply ]; then
+      echo post-upgrade-omitted >> "$FAKE_JANITOR_TTL_SSA_LOG"
+    fi
+  fi
   kind=${resource%%/*}
   revision=$(awk '
     /^metadata:[[:space:]]*$/ { metadata = 1; next }
@@ -8190,6 +8237,8 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_ATOMIC_ROLLBACK_MISMATCH="+e.atomicRollbackMismatch,
 		"FAKE_POST_UPGRADE_MISMATCH="+e.postUpgradeMismatch,
 		"FAKE_POST_UPGRADE_OBJECT_MUTATION="+strconv.FormatBool(e.postUpgradeObjectMutation),
+		"FAKE_RETAIN_LIVE_JANITOR_TTL_BEFORE_UPGRADE="+strconv.FormatBool(e.retainLiveJanitorTTLBeforeUpgrade),
+		"FAKE_JANITOR_TTL_SSA_LOG="+e.janitorTTLSSALog,
 		"FAKE_POST_APPLY_ANNOTATIONS_MODE="+e.postApplyAnnotationsMode,
 		"FAKE_GIT_BRANCH="+e.gitBranch,
 		"FAKE_GIT_REMOTE_SHA="+e.gitRemoteSHA,
