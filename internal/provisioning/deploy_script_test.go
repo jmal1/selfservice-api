@@ -406,6 +406,7 @@ func runLiveEffectiveImageHarness(
 	declaredImage string,
 	expectedImage string,
 	retainedJob bool,
+	failJobLookup bool,
 	runtimeImageID string,
 ) ([]byte, error) {
 	t.Helper()
@@ -435,6 +436,10 @@ func runLiveEffectiveImageHarness(
 	writeExecutable(t, filepath.Join(binDir, "kubectl"), `#!/bin/bash
 set -euo pipefail
 if [ "$1 $2" = "get jobs" ]; then
+  if [ "$FAKE_FAIL_JOB_LOOKUP" = true ]; then
+    echo "sabotaged retained Job lookup failure" >&2
+    exit 97
+  fi
   if [ "$FAKE_RETAINED_JOB" = true ]; then
     printf 'selfservice-synthetic-runner-12345\n'
   fi
@@ -478,7 +483,58 @@ printf '%s' "$actual"
 		"DECLARED_IMAGE="+declaredImage,
 		"EXPECTED_IMAGE="+expectedImage,
 		"FAKE_RETAINED_JOB="+strconv.FormatBool(retainedJob),
+		"FAKE_FAIL_JOB_LOOKUP="+strconv.FormatBool(failJobLookup),
 		"FAKE_RUNTIME_IMAGE_ID="+runtimeImageID,
+	)
+	return cmd.CombinedOutput()
+}
+
+func runCronJobHealthLookupHarness(t *testing.T, deploySource string) ([]byte, error) {
+	t.Helper()
+	requirePOSIXShell(t)
+
+	var bodies strings.Builder
+	for _, name := range []string{"latest_cronjob_job", "workload_health"} {
+		body, _, _, err := extractFunctionBody(deploySource, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bodies.WriteString(body)
+	}
+
+	root := t.TempDir()
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, filepath.Join(binDir, "kubectl"), `#!/bin/bash
+set -euo pipefail
+if [ "$1 $2" = "get jobs" ]; then
+  echo "sabotaged retained Job lookup failure" >&2
+  exit 97
+fi
+if [ "$1 $2" = "get CronJob/selfservice-synthetic-runner" ]; then
+  printf 'true'
+  exit 0
+fi
+echo "unexpected kubectl invocation: $*" >&2
+exit 90
+`)
+	inventoryPath := filepath.Join(root, "inventory.tsv")
+	writeFile(t, inventoryPath, "CronJob\tselfservice-synthetic-runner\tcontainers\tsynthetic-runner\timage\n")
+	harnessPath := filepath.Join(root, "harness.sh")
+	writeExecutable(t, harnessPath, `#!/bin/bash
+set -euo pipefail
+NAMESPACE=selfservice
+`+bodies.String()+`
+workload_health "$INVENTORY"
+`)
+
+	cmd := exec.Command("bash", harnessPath)
+	cmd.Env = append(
+		os.Environ(),
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"INVENTORY="+inventoryPath,
 	)
 	return cmd.CombinedOutput()
 }
@@ -499,6 +555,7 @@ func TestDeployScriptSuspendedCronJobEffectiveImageProof(t *testing.T) {
 		declaredImage      string
 		expectedImage      string
 		retainedJob        bool
+		failJobLookup      bool
 		runtimeImageID     string
 		wantSuccess        bool
 		wantOutputContains string
@@ -510,6 +567,14 @@ func TestDeployScriptSuspendedCronJobEffectiveImageProof(t *testing.T) {
 			expectedImage:  imageA,
 			wantSuccess:    true,
 			runtimeImageID: runtimeImageB,
+		},
+		{
+			name:               "retained Job lookup failure cannot use suspended spec fallback",
+			manifest:           suspendedCronJobManifest(true, imageA, false),
+			declaredImage:      imageA,
+			expectedImage:      imageA,
+			failJobLookup:      true,
+			wantOutputContains: "failed to list retained Jobs for CronJob/selfservice-synthetic-runner",
 		},
 		{
 			name:               "runnable without retained Job fails closed",
@@ -557,6 +622,7 @@ func TestDeployScriptSuspendedCronJobEffectiveImageProof(t *testing.T) {
 				test.declaredImage,
 				test.expectedImage,
 				test.retainedJob,
+				test.failJobLookup,
 				test.runtimeImageID,
 			)
 			if test.wantSuccess && runErr != nil {
@@ -575,6 +641,32 @@ func TestDeployScriptSuspendedCronJobEffectiveImageProof(t *testing.T) {
 	}
 }
 
+func TestDeployScriptCronJobHealthJobLookupGuardIsLoadBearing(t *testing.T) {
+	deployBody, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(deployBody)
+
+	output, runErr := runCronJobHealthLookupHarness(t, source)
+	if runErr == nil || !strings.Contains(string(output), "failed to list retained Jobs for CronJob/selfservice-synthetic-runner during health verification") {
+		t.Fatalf("health lookup guard did not fail for the expected reason: err=%v\n%s", runErr, output)
+	}
+
+	guard := `if ! job_name="$(latest_cronjob_job "$name")"; then
+          echo "ERROR: failed to list retained Jobs for CronJob/$name during health verification." >&2
+          return 1
+        fi`
+	if strings.Count(source, guard) != 1 {
+		t.Fatalf("health lookup sabotage target count != 1")
+	}
+	sabotaged := strings.Replace(source, guard, `job_name="$(latest_cronjob_job "$name")" || true`, 1)
+	output, runErr = runCronJobHealthLookupHarness(t, sabotaged)
+	if runErr != nil {
+		t.Fatalf("removing the health lookup guard did not expose false acceptance: %v\n%s", runErr, output)
+	}
+}
+
 func TestDeployScriptSuspendedCronJobFallbackGuardsAreLoadBearing(t *testing.T) {
 	deployBody, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
 	if err != nil {
@@ -584,14 +676,28 @@ func TestDeployScriptSuspendedCronJobFallbackGuardsAreLoadBearing(t *testing.T) 
 	image := "ghcr.io/jmal1/selfservice-crucible-runner@sha256:" + testDigestA
 
 	for _, test := range []struct {
-		name         string
-		old          string
-		replacement  string
-		manifest     string
-		declared     string
-		expected     string
-		wantOriginal string
+		name          string
+		old           string
+		replacement   string
+		manifest      string
+		declared      string
+		expected      string
+		failJobLookup bool
+		wantOriginal  string
 	}{
+		{
+			name: "retained Job lookup status",
+			old: `if ! job_name="$(latest_cronjob_job "$name")"; then
+        echo "ERROR: failed to list retained Jobs for CronJob/$name while proving its effective image." >&2
+        return 1
+      fi`,
+			replacement:   `job_name="$(latest_cronjob_job "$name")" || true`,
+			manifest:      suspendedCronJobManifest(true, image, false),
+			declared:      image,
+			expected:      image,
+			failJobLookup: true,
+			wantOriginal:  "failed to list retained Jobs for CronJob/selfservice-synthetic-runner",
+		},
 		{
 			name:         "suspended-only predicate",
 			old:          `if [ "$suspended" != true ]; then`,
@@ -619,6 +725,7 @@ func TestDeployScriptSuspendedCronJobFallbackGuardsAreLoadBearing(t *testing.T) 
 				test.declared,
 				test.expected,
 				false,
+				test.failJobLookup,
 				"",
 			)
 			if originalErr == nil || !strings.Contains(string(originalOutput), test.wantOriginal) {
@@ -635,12 +742,13 @@ func TestDeployScriptSuspendedCronJobFallbackGuardsAreLoadBearing(t *testing.T) 
 				test.declared,
 				test.expected,
 				false,
+				test.failJobLookup,
 				"",
 			)
 			if sabotagedErr != nil {
 				t.Fatalf("removing the %s did not expose false acceptance: %v\n%s", test.name, sabotagedErr, sabotagedOutput)
 			}
-			if string(sabotagedOutput) != test.expected {
+			if !strings.HasSuffix(strings.TrimSpace(string(sabotagedOutput)), test.expected) {
 				t.Fatalf("sabotaged proof returned %q, want false acceptance of %q", sabotagedOutput, test.expected)
 			}
 		})

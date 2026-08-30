@@ -1507,7 +1507,10 @@ live_effective_image() {
 
   case "$kind" in
     CronJob)
-      job_name="$(latest_cronjob_job "$name")"
+      if ! job_name="$(latest_cronjob_job "$name")"; then
+        echo "ERROR: failed to list retained Jobs for CronJob/$name while proving its effective image." >&2
+        return 1
+      fi
       if [ -z "$job_name" ]; then
         if ! suspended="$(cronjob_suspend_from_manifest "$live_manifest")"; then
           echo "ERROR: missing image inventory: CronJob/$name has no retained Job and its exact live spec.suspend value cannot be proven." >&2
@@ -2649,9 +2652,15 @@ workload_health() {
         }
         ;;
       CronJob)
-        job_name="$(latest_cronjob_job "$name")"
+        if ! job_name="$(latest_cronjob_job "$name")"; then
+          echo "ERROR: failed to list retained Jobs for CronJob/$name during health verification." >&2
+          return 1
+        fi
         if [ -z "$job_name" ]; then
-          suspended="$(kubectl get "CronJob/$name" -n "$NAMESPACE" -o jsonpath='{.spec.suspend}')"
+          if ! suspended="$(kubectl get "CronJob/$name" -n "$NAMESPACE" -o jsonpath='{.spec.suspend}')"; then
+            echo "ERROR: failed to read CronJob/$name suspension state during health verification." >&2
+            return 1
+          fi
           if [ "$suspended" = true ]; then
             continue
           fi
