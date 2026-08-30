@@ -7,8 +7,6 @@ on:
       - '.github/workflows/helm-lint.yaml'
   push:
     branches: [main]
-    paths:
-      - 'deploy/helm/**'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
