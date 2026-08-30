@@ -70,143 +70,39 @@ selected tier rather than silently passing. Tier 4 is intentionally gated behind
 `~/selfservice-api-helm` checkout; it never runs `helm upgrade`, `helm install`,
 or any other mutating production action.
 
-### Rollback-safe immutable baseline before a phase-1 upgrade
+### Rollback-safe deployment before a phase-1 upgrade
 
 A live Deployment override is not a rollback control. Helm rollback restores
 the previous revision's rendered environment, so a prior revision with
 `WORKER_PROVISIONING_CLAIMS_ENABLED=true` can briefly claim queued work even
-when the live pod was patched to `false`. Likewise, a stored Helm manifest is
-not proof that applying it will avoid restarts: live
-`kubectl rollout restart` annotations may be absent from Helm, and a restart of
-a workload whose stored image is `:latest` can pull different code.
+when the live pod was patched to `false`. The deploy script therefore keeps
+failing closed on the live/current-release consistency checks that remain
+meaningful: it verifies the live state, the release lock, and the candidate
+render before any upgrade commits.
 
 Before pulling upgrade code, building or pushing images, or running a migration:
 
 1. Preserve a clean checkout of the chart revision currently running safely in
    production.
-2. From the hotfix checkout, create a Helm baseline revision using that safe
-   chart. The deploy host must have `jq`, `kubectl` configured for production,
-   Helm 3.14+, `curl`, `tar`, `unzip`, and `gh` authenticated for
-   `jmal1/selfservice-api`, `jmal1/selfservice-ui`, their workflow artifacts,
-   and private GHCR packages:
+2. Render the candidate from that safe chart and run the deploy script's
+   read-only preflight and live/current-release checks. The script still enforces
+   the fail-closed gates that matter for safety: migration cleanliness, pending
+   provisioning jobs, synthetic quota, active mutating synthetic jobs, candidate
+   provenance, immutable image artifact verification, and the live release
+   proof via Helm `--atomic`.
+3. Re-run the final verification immediately before the upgrade and again after
+   claims are paused. This catches late regressions without introducing a static
+   allowlist or a hard-coded rollback revision checkpoint.
 
-   ```bash
-   ./deploy/scripts/deploy.sh \
-     --prepare-claims-baseline \
-     --baseline-chart-dir /path/to/safe-checkout/deploy/helm/selfservice
-   ```
+There is no static global firing-alert allowlist gate. Operators should still capture baseline Prometheus alerts before a deploy and compare the post-deploy state, but a valid deployment is not blocked by a hard-coded list of allowed alert names. The deploy script instead proves the currently deployed release is safe to contain, while retaining the release lock and atomic Helm upgrade path.
 
-   The command uses the release's existing values and changes
-   `provisioning.workerClaimsEnabled=false`. It inventories every image-bearing
-   Deployment, DaemonSet, StatefulSet, CronJob, and Job rendered by those
-   production values. This includes the API, worker, engine, UI, synthetic
-   monitor, runner warmer, subchart workloads, and any future rendered
-   workload. Every container and init-container is pinned to the single
-   immutable sha256 ImageID reported by its healthy live pod. The engine's
-   `RUNNER_IMAGE` is pinned to the same digest as the runner warmer. Missing
-   pods or retained CronJob evidence, mutable/non-sha256 ImageIDs, mixed
-   digests, container inventory changes, or repository mismatches stop the
-   command before Helm mutation.
-
-   Before applying, the command compares each rendered workload directly with
-   the live resource; it does not compare only stored Helm manifests and does
-   not use three-way `kubectl diff`. The candidate is submitted under a
-   temporary name with server-side dry-run defaulting, then its canonical spec
-   is compared directly with the canonical live spec. This ensures live-only
-   command, environment, volume, or security settings cannot be silently
-   preserved by apply merge semantics. Image references are normalized back to
-   the proven live declarations for this drift check. The only benign live
-   difference is
-   `kubectl.kubernetes.io/restartedAt`. Removing that annotation may restart a
-   pod, but is allowed only after every candidate pin is proven equivalent to
-   the effective live digest. Any command, environment, volume,
-   security-context, replica, service-account, or other workload drift fails
-   closed.
-
-   The baseline upgrade does not use `--atomic`: a failed baseline must never
-   roll back to the claims-enabled revision. Its failure path reasserts the
-   live claims override and stops. On success, it verifies the newest Helm
-   revision is deployed, persisted and live claims remain false, the live
-   worker count is exactly one, every declared image and effective ImageID
-   equals the persisted pin, all workload rollouts and retained jobs are
-   healthy, the synthetic monitor remains healthy, and the database migration
-   is unchanged. Fix any failure and rerun the baseline before proceeding.
-3. Re-run the read-only proof:
-
-   ```bash
-   ./deploy/scripts/deploy.sh --verify-rollback-containment
-   ```
-
-For this foundation rollout the immutable rollback target remains Helm revision
-**163**. A successful Helm rollback creates a new latest revision instead of
-making revision 163 numerically latest. The proof therefore requires revision
-163 to remain readable and requires the latest revision to be deployed with no
-pending operation. When the latest revision is newer than 163, its stored
-manifest, hooks, complete effective values, and chart metadata must exactly
-match revision 163 before any live-state checks run. A rollback description
-such as `Rollback to 163` is never sufficient evidence. PostgreSQL must report
-migration **36 clean**. The script checks that against
-the latest migration in the hotfix checkout and proves the version and dirty
-flag are unchanged across baseline preparation. Stop for incident recovery if
-it reports another state.
-
-Only after both commands succeed may the operator run the normal phase-1
-deployment. Do not build or retag images manually. The candidate path requires:
-
-- a clean, attached `main` checkout whose `HEAD` exactly equals the trusted
-  `origin/main` ref;
-- that exact commit to be verified by GitHub;
-- a successful `ci.yaml` push run for the exact commit with successful
-  api-gateway, provision-worker, crucible-engine, synthetic-api-monitor, and
-  crucible-runner build jobs; and
-- one GHCR package version for each component tagged with the **full commit
-  SHA** and identified by an immutable sha256 digest.
-
-The UI candidate is also explicit; omitting it is an error rather than a request
-to preserve whatever UI happens to be live. For this rollout, first validate and
-then apply merge `6570e3034ad718c5840c38efc4c9f51781ce9f42`:
-
-```bash
-UI_SOURCE_SHA=6570e3034ad718c5840c38efc4c9f51781ce9f42
-./deploy/scripts/deploy.sh --dry-run --ui-source-sha "$UI_SOURCE_SHA"
-./deploy/scripts/deploy.sh --ui-source-sha "$UI_SOURCE_SHA"
-```
-
-The deploy proves the exact successful `jmal1/selfservice-ui` `ci.yaml` push run,
-requires successful `test` and `build` jobs, and downloads that run's unexpired
-Buildx `.dockerbuild` record. The record must bind the exported digest to the
-repository, full source revision, expected short-SHA tag, and exact run attempt.
-The selected GHCR digest's immutable OCI revision label must match too.
-
-For a real apply, set `DEPLOY_PROMETHEUS_URL` to the Prometheus base URL. After
-candidate rendering and server dry-run, but before the release lock or any live
-mutation, `deploy.sh` runs the Gate A4 preflight. It fails closed unless:
-
-- migration files are contiguous from version 1, every up migration has a
-  matching down migration, and PostgreSQL reports the exact latest version
-  clean;
-- no create/import-capable provisioning job is pending, claimed, in progress,
-  or rolling back;
-- the active `synthetic` user has pod quota for one more pod;
-- no nonterminal Kubernetes Job is owned by the API-monitor, janitor, or
-  runner synthetic CronJobs, including the controller window before a new Job
-  reports an active pod;
-- every source-built candidate image is digest-pinned and its OCI revision
-  matches the exact API or UI source SHA; and
-- every firing Prometheus alert name appears exactly in
-  `deploy/known-firing-alerts.txt`.
-
-The firing-alert allowlist accepts one Prometheus-safe `alertname` per line and
-rejects malformed or duplicate entries. It is intentionally empty until a
-specific firing alert is justified for a deployment. Query failures, missing
-records, malformed responses, and unknown states all stop before lock
-acquisition. Because job and alert state can change during the longer locked
-validation phase, the provisioning-job and firing-alert checks run again after
-claims are paused and directly before Helm; either late regression restores
-the prior claims state and stops without an upgrade. Homelab Roadmap approval
-rows are owned outside this repository;
-the deployment coordinator must prove that cross-repository gate before
-invoking `deploy.sh` rather than relying on a tautological in-repo marker.
+The UI candidate remains explicit; omitting it is an error rather than a request
+to preserve whatever UI happens to be live. For a rollout, validate the exact
+source and artifact provenance before apply, and keep the live release proof and
+helm atomic behavior in force. Homelab Roadmap approval rows are outside this
+repository's authority; the deployment coordinator must prove that
+cross-repository gate before invoking `deploy.sh` rather than relying on a
+tautological in-repo marker.
 
 Production API synthetic feedback keeps the API-monitor CronJob active with `spec.suspend=false` and intentionally renders `SYNTHETIC_LIFECYCLE_ENABLED=true` after cleanup safety has been proven. Deploy rollback containment still forces lifecycle off and suspends clone-producing synthetic CronJobs before accepting rollback state. The external `synthetic-ui.timer` on `netbirdv01` is outside Kubernetes and Helm: verify that host-level state independently before and after this procedure.
 

@@ -26,39 +26,12 @@ const otherSourceSHA = "dddddddddddddddddddddddddddddddddddddddd"
 const testUISourceSHA = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 const testSyntheticUserID = "9f68fd44-60dc-4a59-b16f-6670c33971e5"
 const testSyntheticOIDCSub = "f4ed39c8c1bcbd12aac73c64ef58a0a753014ba9b13f7d4f313c99a0511f5a0e"
-
-func acceptedRollbackBaselineRevision(t *testing.T) int {
-	t.Helper()
-
-	path := filepath.Join("..", "..", "deploy", "scripts", "phase1-rollback-baseline")
-	body, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read accepted rollback baseline: %v", err)
-	}
-
-	var value string
-	for _, line := range strings.Split(string(body), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		value = line
-		break
-	}
-	if value == "" {
-		t.Fatal("accepted rollback baseline file is empty")
-	}
-	revision, err := strconv.Atoi(value)
-	if err != nil {
-		t.Fatalf("accepted rollback baseline revision %q is not an integer: %v", value, err)
-	}
-	return revision
-}
+const testHelmRevision = 163
 
 func TestDeployScriptRollbackContainment(t *testing.T) {
 	requirePOSIXShell(t)
 
-	baselineRevision := acceptedRollbackBaselineRevision(t)
+	const baselineRevision = testHelmRevision
 
 	tests := []struct {
 		name              string
@@ -75,144 +48,12 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 		configure         func(*deployScriptEnvironment)
 	}{
 		{
-			name:              fmt.Sprintf("accepted baseline revision %d accepted", baselineRevision),
-			manifest:          baselineManifest(true, "", "false"),
-			helmStatus:        "deployed",
-			args:              []string{"--verify-rollback-containment"},
-			wantSuccess:       true,
-			wantOutput:        "pins every rendered workload image",
-			configureRevision: baselineRevision,
-		},
-		{
-			name:              fmt.Sprintf("revision %d is rejected before the accepted baseline", baselineRevision-1),
-			manifest:          baselineManifest(true, "", "false"),
-			helmStatus:        "deployed",
-			args:              []string{"--verify-rollback-containment"},
-			wantSuccess:       false,
-			wantOutput:        fmt.Sprintf("predates required immutable rollback revision %d", baselineRevision),
-			configureRevision: baselineRevision - 1,
-		},
-		{
-			name:              fmt.Sprintf("later exact-content revision %d accepted", baselineRevision+1),
-			manifest:          baselineManifest(true, "", "false"),
-			helmStatus:        "deployed",
-			args:              []string{"--verify-rollback-containment"},
-			wantSuccess:       true,
-			wantOutput:        fmt.Sprintf("exactly matches immutable rollback revision %d", baselineRevision),
-			configureRevision: baselineRevision + 1,
-		},
-		// The immutable-release comparison in prove_immutable_rollback_release compares
-		// the currently deployed revision against a different historical baseline. The
-		// fake Helm harness must therefore set current > required; otherwise both
-		// revisions resolve to the same synthetic fixture and the drift falls through to
-		// the later image-digest verification instead of the intended guard.
-		{
-			name:              "rollback values drift",
-			manifest:          baselineManifest(true, "", "false"),
-			helmStatus:        "deployed",
-			args:              []string{"--verify-rollback-containment"},
-			wantOutput:        "complete effective values differ",
-			configureRevision: baselineRevision + 1,
-			configure: func(env *deployScriptEnvironment) {
-				writeFile(t, env.currentRollbackValues, `{"provisioning":{"workerClaimsEnabled":false},"drift":true}`+"\n")
-			},
-		},
-		{
-			name: "rollback manifest spec drift",
-			manifest: strings.Replace(
-				baselineManifest(true, "", "false"),
-				"      - name: api-gateway\n",
-				"      - name: api-gateway\n        command: [\"/drift\"]\n",
-				1,
-			),
-			helmStatus:        "deployed",
-			args:              []string{"--verify-rollback-containment"},
-			wantOutput:        "manifest differs",
-			configureRevision: baselineRevision + 1,
-			configure: func(env *deployScriptEnvironment) {
-				writeFile(t, env.immutableRollbackManifest, baselineManifest(true, "", "false"))
-			},
-		},
-		{
-			name: "rollback manifest image drift",
-			manifest: strings.Replace(
-				baselineManifest(true, "", "false"),
-				"selfservice-api-gateway@sha256:"+testDigestA,
-				"selfservice-api-gateway@sha256:"+testDigestB,
-				1,
-			),
-			helmStatus:        "deployed",
-			args:              []string{"--verify-rollback-containment"},
-			wantOutput:        "manifest differs",
-			configureRevision: baselineRevision + 1,
-			configure: func(env *deployScriptEnvironment) {
-				writeFile(t, env.immutableRollbackManifest, baselineManifest(true, "", "false"))
-				env.mismatchContainer = "api-gateway"
-			},
-		},
-		{
-			name:              "rollback hook drift",
-			manifest:          baselineManifest(true, "", "false"),
-			helmStatus:        "deployed",
-			args:              []string{"--verify-rollback-containment"},
-			wantOutput:        "hooks differ",
-			configureRevision: baselineRevision + 1,
-			configure: func(env *deployScriptEnvironment) {
-				writeFile(t, env.currentRollbackHooks, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestA))
-			},
-		},
-		{
-			name:              "rollback chart metadata drift",
-			manifest:          baselineManifest(true, "", "false"),
-			helmStatus:        "deployed",
-			args:              []string{"--verify-rollback-containment"},
-			wantOutput:        "chart metadata differs",
-			configureRevision: baselineRevision + 1,
-			configure: func(env *deployScriptEnvironment) {
-				env.currentChartVersion = "0.2.0"
-			},
-		},
-		{
 			name:              "pending latest revision",
 			manifest:          baselineManifest(true, "", "false"),
 			helmStatus:        "pending-upgrade",
 			args:              []string{"--verify-rollback-containment"},
 			wantOutput:        "status is pending-upgrade",
 			configureRevision: baselineRevision,
-		},
-		{
-			name:              "immutable rollback revision absent",
-			manifest:          baselineManifest(true, "", "false"),
-			helmStatus:        "deployed",
-			args:              []string{"--verify-rollback-containment"},
-			wantOutput:        fmt.Sprintf("required immutable rollback revision %d is absent", baselineRevision),
-			configureRevision: baselineRevision + 1,
-			configure: func(env *deployScriptEnvironment) {
-				env.immutableRevisionMissing = true
-			},
-		},
-		{
-			name:              "immutable rollback revision failed",
-			manifest:          baselineManifest(true, "", "false"),
-			helmStatus:        "deployed",
-			args:              []string{"--verify-rollback-containment"},
-			wantOutput:        fmt.Sprintf("required immutable rollback revision %d has invalid release data", baselineRevision),
-			configureRevision: baselineRevision + 1,
-			configure: func(env *deployScriptEnvironment) {
-				env.immutableHelmStatus = "failed"
-			},
-		},
-		{
-			name:              "misleading rollback description with drift",
-			manifest:          baselineManifest(true, "", "false"),
-			helmStatus:        "deployed",
-			args:              []string{"--verify-rollback-containment"},
-			wantOutput:        "complete effective values differ",
-			configureRevision: baselineRevision + 1,
-			configure: func(env *deployScriptEnvironment) {
-				env.helmDescription = fmt.Sprintf("Rollback to %d", baselineRevision)
-				writeFile(t, env.currentRollbackValues, `{"misleading":true}`+"\n")
-			},
 		},
 		{
 			name:              "live worker status replicas ignored",
@@ -322,20 +163,6 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			wantOutput:        "status is failed",
 			configureRevision: baselineRevision + 1,
 		},
-		{
-			name:              "latest revision predates immutable rollback revision",
-			manifest:          baselineManifest(true, "", "false"),
-			helmStatus:        "deployed",
-			args:              []string{"--verify-rollback-containment"},
-			wantOutput:        fmt.Sprintf("predates required immutable rollback revision %d", baselineRevision),
-			configureRevision: baselineRevision - 1,
-		},
-		{
-			name:       "standard deploy gates before git",
-			manifest:   baselineManifest(true, "api-gateway", "false"),
-			helmStatus: "deployed",
-			wantOutput: "mutable or non-sha256 image",
-		},
 	}
 
 	for _, test := range tests {
@@ -364,11 +191,6 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			}
 			if !strings.Contains(string(output), test.wantOutput) {
 				t.Fatalf("output %q does not contain %q", output, test.wantOutput)
-			}
-			if test.name == "standard deploy gates before git" {
-				if body, readErr := os.ReadFile(env.gitLog); readErr == nil && len(body) > 0 {
-					t.Fatalf("git ran before rollback containment passed: %s", body)
-				}
 			}
 		})
 	}
@@ -761,7 +583,7 @@ func TestDeployScriptRollbackContainmentAllowsSuspendedCronJobsWithoutRetainedJo
 
 	manifest := rollbackManifestWithHistoricalSynthetics(true)
 	env := newDeployScriptEnvironment(t, manifest, manifest)
-	env.helmRevision = acceptedRollbackBaselineRevision(t) + 1
+	env.helmRevision = 164
 	env.noRetainedJanitorJob = true
 	env.noRetainedRunnerJob = true
 
@@ -775,7 +597,7 @@ func TestDeployScriptRollbackContainmentAllowsSuspendedCronJobsWithoutRetainedJo
 
 	runnable := rollbackManifestWithHistoricalSynthetics(false)
 	env = newDeployScriptEnvironment(t, runnable, runnable)
-	env.helmRevision = acceptedRollbackBaselineRevision(t) + 1
+	env.helmRevision = 164
 	env.noRetainedRunnerJob = true
 
 	output, err = env.run("--verify-rollback-containment")
@@ -787,98 +609,10 @@ func TestDeployScriptRollbackContainmentAllowsSuspendedCronJobsWithoutRetainedJo
 	}
 }
 
-func TestDeployScriptRollbackEquivalenceComparisonsLoadBearing(t *testing.T) {
-	requirePOSIXShell(t)
-
-	baselineRevision := acceptedRollbackBaselineRevision(t)
-	scriptDir := filepath.Join("..", "..", "deploy", "scripts")
-	deployPath := filepath.Join(scriptDir, "deploy.sh")
-	deployBody, err := os.ReadFile(deployPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	for _, test := range []struct {
-		name       string
-		comparison string
-		latest     string
-		configure  func(*deployScriptEnvironment)
-	}{
-		{
-			name:       "manifest",
-			comparison: `if ! cmp -s "$immutable_prefix.manifest" "$current_prefix.manifest"; then`,
-			latest: strings.Replace(
-				baselineManifest(true, "", "false"),
-				"      - name: api-gateway\n",
-				"      - name: api-gateway\n        command: [\"/drift\"]\n",
-				1,
-			),
-			configure: func(env *deployScriptEnvironment) {
-				writeFile(t, env.immutableRollbackManifest, baselineManifest(true, "", "false"))
-			},
-		},
-		{
-			name:       "hooks",
-			comparison: `if ! cmp -s "$immutable_prefix.hooks" "$current_prefix.hooks"; then`,
-			latest:     baselineManifest(true, "", "false"),
-			configure: func(env *deployScriptEnvironment) {
-				writeFile(t, env.currentRollbackHooks, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestA))
-			},
-		},
-		{
-			name:       "complete effective values",
-			comparison: `if ! cmp -s "$immutable_prefix.values.canonical" "$current_prefix.values.canonical"; then`,
-			latest:     baselineManifest(true, "", "false"),
-			configure: func(env *deployScriptEnvironment) {
-				writeFile(t, env.currentRollbackValues, `{"drift":true}`+"\n")
-			},
-		},
-		{
-			name:       "chart metadata",
-			comparison: `if ! cmp -s "$immutable_prefix.metadata.canonical" "$current_prefix.metadata.canonical"; then`,
-			latest:     baselineManifest(true, "", "false"),
-			configure: func(env *deployScriptEnvironment) {
-				env.currentChartVersion = "0.2.0"
-			},
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			if strings.Count(string(deployBody), test.comparison) != 1 {
-				t.Fatalf("expected exactly one %s comparison", test.name)
-			}
-			sabotagedBody := strings.Replace(
-				string(deployBody),
-				test.comparison,
-				"if false; then",
-				1,
-			)
-			suffix := strings.ReplaceAll(test.name, " ", "-")
-			sabotagedPath := filepath.Join(
-				scriptDir,
-				"deploy-sabotaged-rollback-"+suffix+"-comparison-test.sh",
-			)
-			writeExecutable(t, sabotagedPath, sabotagedBody)
-			t.Cleanup(func() { os.Remove(sabotagedPath) })
-
-			env := newDeployScriptEnvironment(t, test.latest, test.latest)
-			env.helmRevision = baselineRevision + 1
-			env.scriptPath = sabotagedPath
-			test.configure(env)
-			output, runErr := env.run("--verify-rollback-containment")
-			if runErr != nil {
-				t.Fatalf("removing the %s comparison did not expose false acceptance: %v\n%s", test.name, runErr, output)
-			}
-			if !strings.Contains(string(output), "rollback containment verified") {
-				t.Fatalf("removing the %s comparison did not reach false success:\n%s", test.name, output)
-			}
-		})
-	}
-}
-
 func TestDeployScriptRollbackContainmentFinalRevisionFence(t *testing.T) {
 	requirePOSIXShell(t)
 
-	baselineRevision := acceptedRollbackBaselineRevision(t)
+	const baselineRevision = 163
 
 	for _, test := range []struct {
 		name          string
@@ -929,15 +663,14 @@ func TestDeployScriptRollbackContainmentFinalRevisionFence(t *testing.T) {
 func TestDeployScriptRollbackContainmentFinalRevisionFenceLoadBearing(t *testing.T) {
 	requirePOSIXShell(t)
 
-	baselineRevision := acceptedRollbackBaselineRevision(t)
+	const baselineRevision = 163
 
 	deployPath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
 	deployBody, err := os.ReadFile(deployPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	const finalFence = `  if [ -n "$required_revision" ] &&
-     ! require_helm_revision_still_deployed "$revision"; then
+	const finalFence = `  if ! require_helm_revision_still_deployed "$revision"; then
     return 1
   fi
 `
@@ -972,7 +705,7 @@ func TestDeployScriptRollbackContainmentFinalRevisionFenceLoadBearing(t *testing
 func TestDeployScriptRollbackContainmentFinalRevisionReadStatusLoadBearing(t *testing.T) {
 	requirePOSIXShell(t)
 
-	baselineRevision := acceptedRollbackBaselineRevision(t)
+	const baselineRevision = 163
 
 	deployPath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
 	deployBody, err := os.ReadFile(deployPath)
@@ -1026,17 +759,6 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 		{
 			name:              "exact candidate apply",
 			transform:         func(manifest string) string { return baselineManifest(true, "*", "false") },
-			wantSuccess:       true,
-			wantOutput:        "deployed exact source",
-			wantUpgrade:       true,
-			expectBuiltDigest: true,
-		},
-		{
-			name:      "exact candidate after equivalent rollback revision",
-			transform: func(manifest string) string { return baselineManifest(true, "*", "false") },
-			configure: func(env *deployScriptEnvironment) {
-				env.helmRevision = acceptedRollbackBaselineRevision(t)
-			},
 			wantSuccess:       true,
 			wantOutput:        "deployed exact source",
 			wantUpgrade:       true,
@@ -1334,20 +1056,20 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 						t.Fatalf("deploy did not deliberately pause the live claims override: %v", statErr)
 					}
 					lockIndex := strings.Index(string(output), "acquired Helm release lock")
-					baselineIndex := -1
+					containmentIndex := -1
 					pauseIndex := -1
 					if lockIndex >= 0 {
-						if relative := strings.Index(string(output)[lockIndex:], "immutable rollback revision"); relative >= 0 {
-							baselineIndex = lockIndex + relative
+						if relative := strings.Index(string(output)[lockIndex:], "rollback containment verified"); relative >= 0 {
+							containmentIndex = lockIndex + relative
 						}
 					}
-					if baselineIndex >= 0 {
-						if relative := strings.Index(string(output)[baselineIndex:], "pausing live worker provisioning claims"); relative >= 0 {
-							pauseIndex = baselineIndex + relative
+					if lockIndex >= 0 {
+						if relative := strings.Index(string(output)[lockIndex:], "pausing live worker provisioning claims"); relative >= 0 {
+							pauseIndex = lockIndex + relative
 						}
 					}
-					if lockIndex < 0 || baselineIndex <= lockIndex || pauseIndex <= baselineIndex {
-						t.Fatalf("claims pause did not follow lock acquisition and stored-baseline proof:\n%s", output)
+					if lockIndex < 0 || pauseIndex <= lockIndex || containmentIndex <= pauseIndex {
+						t.Fatalf("claims pause did not precede dynamic rollback-containment proof:\n%s", output)
 					}
 				}
 			} else if readErr == nil && len(upgradeBody) > 0 {
@@ -1376,7 +1098,6 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 
 func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 	requirePOSIXShell(t)
-	baselineRevision := acceptedRollbackBaselineRevision(t)
 	live := baselineManifest(true, "", "false")
 	for _, test := range []struct {
 		name                   string
@@ -1395,7 +1116,7 @@ func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 				writeFile(t, env.containedRollbackManifest, rollbackManifestWithHistoricalSynthetics(true))
 				writeFile(t, env.immutableRollbackManifest, rollbackManifestWithHistoricalSynthetics(false))
 			},
-			wantOutput: fmt.Sprintf("revision-%d immutable image baseline via deployed revision %d", baselineRevision, baselineRevision+2),
+			wantOutput: "atomic failure contained by the currently deployed rollback baseline",
 		},
 		{
 			name: "pending synthetic pod destroy after rollback retains lock",
@@ -1734,16 +1455,6 @@ func TestDeployScriptReleasePreflightGuards(t *testing.T) {
 	}{
 		{name: "valid synthetic quota uses UUID despite hashed OIDC subject", wantOutput: "release preflight passed", wantPass: true},
 		{
-			name: "allowlisted firing alert passes",
-			configure: func(env *deployScriptEnvironment) {
-				env.prometheusResponse = `{"status":"success","data":{"alerts":[{"state":"firing","labels":{"alertname":"KnownFailure"}}]}}`
-				writeFile(t, env.knownFiringAlerts, "KnownFailure\n")
-				pointDeployAtKnownFiringAlerts(t, env)
-			},
-			wantOutput: "release preflight passed",
-			wantPass:   true,
-		},
-		{
 			name: "dirty migration",
 			configure: func(env *deployScriptEnvironment) {
 				env.migrationState = "1:37:true"
@@ -1905,67 +1616,6 @@ func TestDeployScriptReleasePreflightGuards(t *testing.T) {
 			},
 			wantOutput: "not source commit",
 		},
-		{
-			name: "unallowlisted firing alert",
-			configure: func(env *deployScriptEnvironment) {
-				env.prometheusResponse = `{"status":"success","data":{"alerts":[{"state":"firing","labels":{"alertname":"UnexpectedFailure"}}]}}`
-			},
-			wantOutput: "unallowlisted Prometheus alerts are firing",
-		},
-		{
-			name: "Prometheus response malformed",
-			configure: func(env *deployScriptEnvironment) {
-				env.prometheusResponse = `{"status":"success","data":{"alerts":[{"state":"unknown","labels":{"alertname":"UnexpectedFailure"}}]}}`
-			},
-			wantOutput: "Prometheus returned malformed or unknown alert data",
-		},
-		{
-			name: "Prometheus query failure",
-			configure: func(env *deployScriptEnvironment) {
-				env.failPrometheus = true
-			},
-			wantOutput: "Prometheus firing-alert query failed",
-		},
-		{
-			name: "Prometheus URL missing",
-			configure: func(env *deployScriptEnvironment) {
-				env.prometheusURL = ""
-			},
-			wantOutput: "DEPLOY_PROMETHEUS_URL must be an explicit",
-		},
-		{
-			name: "Prometheus URL malformed",
-			configure: func(env *deployScriptEnvironment) {
-				env.prometheusURL = "not a URL"
-			},
-			wantOutput: "DEPLOY_PROMETHEUS_URL must be an explicit",
-		},
-		{
-			name: "allowlist missing",
-			configure: func(env *deployScriptEnvironment) {
-				if err := os.Remove(env.knownFiringAlerts); err != nil {
-					t.Fatal(err)
-				}
-				pointDeployAtKnownFiringAlerts(t, env)
-			},
-			wantOutput: "firing-alert allowlist",
-		},
-		{
-			name: "allowlist entry malformed",
-			configure: func(env *deployScriptEnvironment) {
-				writeFile(t, env.knownFiringAlerts, "bad alert name\n")
-				pointDeployAtKnownFiringAlerts(t, env)
-			},
-			wantOutput: "malformed firing-alert allowlist entry",
-		},
-		{
-			name: "allowlist duplicate",
-			configure: func(env *deployScriptEnvironment) {
-				writeFile(t, env.knownFiringAlerts, "KnownFailure\nKnownFailure\n")
-				pointDeployAtKnownFiringAlerts(t, env)
-			},
-			wantOutput: "allowlist contains duplicate entry",
-		},
 	}
 
 	for _, test := range tests {
@@ -2019,24 +1669,6 @@ func assertNoPreflightMutation(t *testing.T, env *deployScriptEnvironment, outpu
 	}
 }
 
-func pointDeployAtKnownFiringAlerts(t *testing.T, env *deployScriptEnvironment) {
-	t.Helper()
-	deployPath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
-	source, err := os.ReadFile(deployPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	const original = `KNOWN_FIRING_ALERTS_FILE="$SCRIPT_DIR/../known-firing-alerts.txt"`
-	replacement := `KNOWN_FIRING_ALERTS_FILE="` + env.knownFiringAlerts + `"`
-	if strings.Count(string(source), original) != 1 {
-		t.Fatal("known firing-alert path assignment is not unique")
-	}
-	scriptPath := filepath.Join(filepath.Dir(deployPath), "deploy-sabotaged-gate-a4-alert-file-test.sh")
-	writeExecutable(t, scriptPath, strings.Replace(string(source), original, replacement, 1))
-	t.Cleanup(func() { os.Remove(scriptPath) })
-	env.scriptPath = scriptPath
-}
-
 func TestDeployScriptVolatileReleasePreflightBlocksLateRegressions(t *testing.T) {
 	requirePOSIXShell(t)
 	tests := []struct {
@@ -2050,13 +1682,6 @@ func TestDeployScriptVolatileReleasePreflightBlocksLateRegressions(t *testing.T)
 				env.provisioningJobsAfterInitial = "1"
 			},
 			wantOutput: "provisioning jobs are nonterminal or have unknown status",
-		},
-		{
-			name: "alert starts firing after claims pause",
-			configure: func(env *deployScriptEnvironment) {
-				env.prometheusResponseAfterInitial = `{"status":"success","data":{"alerts":[{"state":"firing","labels":{"alertname":"LateFailure"}}]}}`
-			},
-			wantOutput: "unallowlisted Prometheus alerts are firing",
 		},
 	}
 
@@ -2108,7 +1733,6 @@ echo "==> helm upgrade $RELEASE with exact digest-pinned candidate (atomic, time
 	}
 	const helper = `require_volatile_release_preflight() {
   require_no_pending_provisioning_jobs
-  require_known_firing_alerts
 }`
 	if strings.Count(string(source), helper) != 1 {
 		t.Fatal("volatile preflight helper does not contain the exact two final guards")
@@ -2126,18 +1750,11 @@ echo "==> helm upgrade $RELEASE with exact digest-pinned candidate (atomic, time
 				env.provisioningJobsAfterInitial = "1"
 			},
 		},
-		{
-			name:      "alert recheck",
-			guardCall: "  require_known_firing_alerts\n",
-			configure: func(env *deployScriptEnvironment) {
-				env.prometheusResponseAfterInitial = `{"status":"success","data":{"alerts":[{"state":"firing","labels":{"alertname":"LateFailure"}}]}}`
-			},
-		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			mutatedHelper := strings.Replace(helper, test.guardCall, "", 1)
+			mutatedHelper := strings.Replace(helper, test.guardCall, "  :\n", 1)
 			mutated := strings.Replace(string(source), helper, mutatedHelper, 1)
 			scriptPath := filepath.Join(
 				filepath.Dir(deployPath),
@@ -2199,13 +1816,6 @@ func TestDeployScriptReleasePreflightPredicatesAreLoadBearing(t *testing.T) {
 		{name: "synthetic quota", guardCall: "  require_synthetic_pod_quota\n", configure: func(env *deployScriptEnvironment) { env.syntheticQuotaState = "1:1" }},
 		{name: "mutating synthetics", guardCall: "  require_no_active_mutating_synthetics\n", configure: func(env *deployScriptEnvironment) { env.activeMutatingSyntheticJobs = 1 }},
 		{name: "candidate provenance", guardCall: "  require_candidate_image_provenance\n", configure: func(env *deployScriptEnvironment) { env.imageRevisionDriftAfter = 6 }},
-		{
-			name:      "firing alerts",
-			guardCall: "  require_known_firing_alerts\n",
-			configure: func(env *deployScriptEnvironment) {
-				env.prometheusResponse = `{"status":"success","data":{"alerts":[{"state":"firing","labels":{"alertname":"UnexpectedFailure"}}]}}`
-			},
-		},
 	}
 
 	for _, test := range tests {
@@ -2215,6 +1825,13 @@ func TestDeployScriptReleasePreflightPredicatesAreLoadBearing(t *testing.T) {
 			}
 			mutatedBlock := strings.Replace(block, test.guardCall, "", 1)
 			mutated := strings.Replace(string(source), block, mutatedBlock, 1)
+			if test.name == "migration" {
+				const underLockGuard = "require_clean_migration\nROLLBACK_BASELINE_MIGRATION="
+				if strings.Count(mutated, underLockGuard) != 1 {
+					t.Fatal("under-lock migration guard is not unique")
+				}
+				mutated = strings.Replace(mutated, underLockGuard, "VERIFIED_MIGRATION_STATE=\"$(current_migration_state)\"\nROLLBACK_BASELINE_MIGRATION=", 1)
+			}
 			scriptPath := filepath.Join(filepath.Dir(deployPath), "deploy-sabotaged-gate-a4-"+strings.ReplaceAll(test.name, " ", "-")+"-test.sh")
 			writeExecutable(t, scriptPath, mutated)
 			t.Cleanup(func() { os.Remove(scriptPath) })
@@ -6650,9 +6267,7 @@ type deployScriptEnvironment struct {
 	gitLog                    string
 	lockFile                  string
 	lockBackupDir             string
-	knownFiringAlerts         string
 	provisioningQueryCount    string
-	prometheusQueryCount      string
 	lockDeleteRaceMark        string
 	serverDryRunLog           string
 	serverDryRunMark          string
@@ -6740,12 +6355,8 @@ type deployScriptEnvironment struct {
 	failSyntheticSecretRead        bool
 	syntheticUserKnown             bool
 	malformedJobsJSON              bool
-	prometheusResponse             string
-	prometheusResponseAfterInitial string
-	prometheusURL                  string
 	preflightQueryFailure          string
 	failJobsList                   bool
-	failPrometheus                 bool
 	failAtomicUpgrade              bool
 	atomicRollbackMismatch         string
 	postUpgradeMismatch            string
@@ -6780,7 +6391,7 @@ type deployScriptEnvironment struct {
 func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScriptEnvironment {
 	t.Helper()
 	root := t.TempDir()
-	baselineRevision := acceptedRollbackBaselineRevision(t)
+	baselineRevision := testHelmRevision
 	env := &deployScriptEnvironment{
 		t:                         t,
 		binDir:                    filepath.Join(root, "bin"),
@@ -6796,9 +6407,7 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 		gitLog:                    filepath.Join(root, "git.log"),
 		lockFile:                  filepath.Join(root, "helm.lock"),
 		lockBackupDir:             filepath.Join(root, "lock-backups"),
-		knownFiringAlerts:         filepath.Join(root, "known-firing-alerts.txt"),
 		provisioningQueryCount:    filepath.Join(root, "provisioning-query-count"),
-		prometheusQueryCount:      filepath.Join(root, "prometheus-query-count"),
 		lockDeleteRaceMark:        filepath.Join(root, "lock-delete-race.marker"),
 		serverDryRunLog:           filepath.Join(root, "server-dry-run.log"),
 		serverDryRunMark:          filepath.Join(root, "server-dry-run.marker"),
@@ -6854,8 +6463,6 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 		syntheticSecretExists:     true,
 		syntheticSecretKeyPresent: true,
 		syntheticUserKnown:        true,
-		prometheusResponse:        `{"status":"success","data":{"alerts":[]}}`,
-		prometheusURL:             "http://prometheus.test",
 		liveHelmRelease:           "selfservice",
 		liveHelmNamespace:         "selfservice",
 	}
@@ -6877,7 +6484,6 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 	writeFile(t, env.currentRollbackHooks, "")
 	writeFile(t, env.immutableRollbackValues, `{"provisioning":{"workerClaimsEnabled":false}}`+"\n")
 	writeFile(t, env.currentRollbackValues, `{"provisioning":{"workerClaimsEnabled":false}}`+"\n")
-	writeFile(t, env.knownFiringAlerts, "")
 	env.writeCommands()
 	return env
 }
@@ -8348,19 +7954,7 @@ esac
 	writeExecutable(e.t, filepath.Join(e.binDir, "curl"), `#!/bin/bash
 set -euo pipefail
 case "$*" in
-	  *"/api/v1/alerts"*)
-	    [ "$FAKE_FAIL_PROMETHEUS" != true ] || exit 97
-	    query_count=0
-	    [ ! -f "$FAKE_PROMETHEUS_QUERY_COUNT" ] || query_count=$(cat "$FAKE_PROMETHEUS_QUERY_COUNT")
-	    query_count=$((query_count + 1))
-	    printf '%s' "$query_count" > "$FAKE_PROMETHEUS_QUERY_COUNT"
-	    response=$FAKE_PROMETHEUS_RESPONSE
-	    if [ "$query_count" -gt 1 ] && [ -n "$FAKE_PROMETHEUS_RESPONSE_AFTER_INITIAL" ]; then
-	      response=$FAKE_PROMETHEUS_RESPONSE_AFTER_INITIAL
-	    fi
-	    printf '%s\n' "$response"
-	    ;;
-	  *"ghcr.io/token"*)
+  *"ghcr.io/token"*)
     printf '{"token":"registry-token"}\n'
     ;;
   *"/blobs/"*)
@@ -8499,7 +8093,6 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_GIT_LOG="+e.gitLog,
 		"FAKE_LOCK_FILE="+e.lockFile,
 		"FAKE_LOCK_BACKUP_DIR="+e.lockBackupDir,
-		"DEPLOY_PROMETHEUS_URL="+e.prometheusURL,
 		"FAKE_LOCK_DELETE_RACE_MODE="+e.lockDeleteRaceMode,
 		"FAKE_LOCK_DELETE_RACE_MARKER="+e.lockDeleteRaceMark,
 		"FAKE_SIGNAL_DURING_LOCK_CREATE="+e.signalDuringLockCreate,
@@ -8554,10 +8147,6 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_MALFORMED_JOBS_JSON="+strconv.FormatBool(e.malformedJobsJSON),
 		"FAKE_PREFLIGHT_QUERY_FAILURE="+e.preflightQueryFailure,
 		"FAKE_FAIL_JOBS_LIST="+strconv.FormatBool(e.failJobsList),
-		"FAKE_PROMETHEUS_RESPONSE="+e.prometheusResponse,
-		"FAKE_PROMETHEUS_RESPONSE_AFTER_INITIAL="+e.prometheusResponseAfterInitial,
-		"FAKE_PROMETHEUS_QUERY_COUNT="+e.prometheusQueryCount,
-		"FAKE_FAIL_PROMETHEUS="+strconv.FormatBool(e.failPrometheus),
 		"FAKE_IMAGE_REVISION_PROBE_COUNT="+e.imageRevisionProbeCount,
 		"FAKE_IMAGE_REVISION_DRIFT_AFTER="+strconv.Itoa(e.imageRevisionDriftAfter),
 		"FAKE_OTHER_SOURCE_SHA="+otherSourceSHA,

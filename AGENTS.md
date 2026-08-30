@@ -897,35 +897,19 @@ repository, source revision, expected short-SHA tag, and builder run attempt
 must agree, and the selected GHCR digest must carry the same immutable OCI
 revision label. Exactly the UI container is replaced with that proven digest.
 
-A real apply also requires `DEPLOY_PROMETHEUS_URL`. After immutable candidate
-rendering and server validation, but before the release lock, claims pause, or
-any live mutation, the Gate A4 preflight requires contiguous paired migrations
-with PostgreSQL at the exact clean head; zero pending, claimed, in-progress, or
-rollback create/import-capable provisioning jobs; one free pod slot for the
-active primary synthetic user; no nonterminal Job owned by the API-monitor,
-janitor, or runner synthetic CronJobs (including the pre-pod controller
-window); digest-pinned candidate images whose OCI revision matches the exact
-API/UI source SHA; and firing Prometheus alert names that are a subset of
-`deploy/known-firing-alerts.txt`. The allowlist is one exact
-Prometheus-safe alert name per line, rejects duplicates, and remains empty
-unless a current firing alert is explicitly justified. Every query, read,
-parse, malformed, missing, or unknown result fails before lock acquisition.
-After claims are paused and all longer locked validation completes, the
-provisioning-job and firing-alert guards run again directly adjacent to Helm.
-A late pending job or newly firing unallowlisted alert restores prior claims
-state and exits without invoking the upgrade.
+After immutable candidate rendering and server validation, but before the release lock, claims pause, or any live mutation, the preflight requires contiguous paired migrations with PostgreSQL at the exact clean head; zero pending, claimed, in-progress, or rollback create/import-capable provisioning jobs; one free pod slot for the active primary synthetic user; no nonterminal Job owned by the API-monitor, janitor, or runner synthetic CronJobs (including the pre-pod controller window); and digest-pinned candidate images whose OCI revision matches the exact API/UI source SHA. Operators capture baseline alerts before deployment and compare the post-deploy state, but a valid deploy is not blocked by a hard-coded allowlist. Every required query, read, parse, malformed, missing, or unknown result fails before lock acquisition. After claims are paused and all longer locked validation completes, the provisioning-job and live-state checks run again directly adjacent to Helm. A late pending job restores prior claims state and exits without invoking the upgrade.
 Homelab Roadmap rows are outside this repository's authority, so the deployment
 coordinator must prove that cross-repository gate before invoking `deploy.sh`;
 there is no in-repo checkbox that pretends to prove it.
 
-If the stored rollback revision renders claims disabled but the live worker has
-a temporary claims-enabled override, candidate provenance, rendering, and its
+If the live worker has a temporary claims-enabled override while the candidate
+render remains claims-disabled, candidate provenance, rendering, and the
 first server dry-run still happen without mutation. A real apply then acquires
-the release lock, proves immutable revision 163 remains present and the latest
-deployed revision is content-identical and claims-disabled,
-deliberately sets the live worker back to claims disabled, waits for that
-rollout and durable job drain, and only then runs the complete stored/live
-rollback proof. The override does not make the rollback baseline claims-enabled.
+the release lock, verifies the currently deployed live release remains
+content-identical and claims-disabled, deliberately sets the live worker back
+to claims disabled, waits for that rollout and durable job drain, and then
+runs the live/current-release rollback proof. The override does not create a
+replacement checkpoint or dynamic rollback baseline.
 
 Every other rendered image is copied from the exact live ImageID, including
 PostgreSQL, NATS, NATS box/reloader, and future unrelated external chart
