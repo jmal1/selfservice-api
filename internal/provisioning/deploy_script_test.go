@@ -373,6 +373,311 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 	}
 }
 
+func suspendedCronJobManifest(suspend bool, image string, duplicateContainer bool) string {
+	duplicate := ""
+	if duplicateContainer {
+		duplicate = `
+          - name: synthetic-runner
+            image: ` + image
+	}
+	return `apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: selfservice-synthetic-runner
+spec:
+  schedule: "17 * * * *"
+  suspend: ` + strconv.FormatBool(suspend) + `
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 1800
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: synthetic-runner
+            image: ` + image + duplicate + `
+`
+}
+
+func runLiveEffectiveImageHarness(
+	t *testing.T,
+	deploySource string,
+	manifest string,
+	declaredImage string,
+	expectedImage string,
+	retainedJob bool,
+	runtimeImageID string,
+) ([]byte, error) {
+	t.Helper()
+	requirePOSIXShell(t)
+
+	functions := []string{
+		"is_digest_image",
+		"manifest_workload_inventory",
+		"latest_cronjob_job",
+		"cronjob_suspend_from_manifest",
+		"live_effective_image",
+	}
+	var bodies strings.Builder
+	for _, name := range functions {
+		body, _, _, err := extractFunctionBody(deploySource, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bodies.WriteString(body)
+	}
+
+	root := t.TempDir()
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, filepath.Join(binDir, "kubectl"), `#!/bin/bash
+set -euo pipefail
+if [ "$1 $2" = "get jobs" ]; then
+  if [ "$FAKE_RETAINED_JOB" = true ]; then
+    printf 'selfservice-synthetic-runner-12345\n'
+  fi
+  exit 0
+fi
+if [ "$1 $2" = "get pods" ]; then
+  printf '%s\n' "$FAKE_RUNTIME_IMAGE_ID"
+  exit 0
+fi
+echo "unexpected kubectl invocation: $*" >&2
+exit 90
+`)
+	manifestPath := filepath.Join(root, "cronjob.yaml")
+	writeFile(t, manifestPath, manifest)
+	harnessPath := filepath.Join(root, "harness.sh")
+	writeExecutable(t, harnessPath, `#!/bin/bash
+set -euo pipefail
+NAMESPACE=selfservice
+`+bodies.String()+`
+actual="$(
+  live_effective_image \
+    CronJob \
+    selfservice-synthetic-runner \
+    containers \
+    synthetic-runner \
+    "$DECLARED_IMAGE" \
+    "$CRONJOB_MANIFEST"
+)"
+if [ "$actual" != "$EXPECTED_IMAGE" ]; then
+  echo "ERROR: digest mismatch for CronJob/selfservice-synthetic-runner containers/synthetic-runner: effective image $actual, pinned baseline $EXPECTED_IMAGE." >&2
+  exit 1
+fi
+printf '%s' "$actual"
+`)
+
+	cmd := exec.Command("bash", harnessPath)
+	cmd.Env = append(
+		os.Environ(),
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"CRONJOB_MANIFEST="+manifestPath,
+		"DECLARED_IMAGE="+declaredImage,
+		"EXPECTED_IMAGE="+expectedImage,
+		"FAKE_RETAINED_JOB="+strconv.FormatBool(retainedJob),
+		"FAKE_RUNTIME_IMAGE_ID="+runtimeImageID,
+	)
+	return cmd.CombinedOutput()
+}
+
+func TestDeployScriptSuspendedCronJobEffectiveImageProof(t *testing.T) {
+	deployBody, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(deployBody)
+	imageA := "ghcr.io/jmal1/selfservice-crucible-runner@sha256:" + testDigestA
+	imageB := "ghcr.io/jmal1/selfservice-crucible-runner@sha256:" + testDigestB
+	runtimeImageB := "docker-pullable://" + imageB
+
+	for _, test := range []struct {
+		name               string
+		manifest           string
+		declaredImage      string
+		expectedImage      string
+		retainedJob        bool
+		runtimeImageID     string
+		wantSuccess        bool
+		wantOutputContains string
+	}{
+		{
+			name:           "suspended without retained Job uses matching digest-pinned live spec",
+			manifest:       suspendedCronJobManifest(true, imageA, false),
+			declaredImage:  imageA,
+			expectedImage:  imageA,
+			wantSuccess:    true,
+			runtimeImageID: runtimeImageB,
+		},
+		{
+			name:               "runnable without retained Job fails closed",
+			manifest:           suspendedCronJobManifest(false, imageA, false),
+			declaredImage:      imageA,
+			expectedImage:      imageA,
+			wantOutputContains: "runnable CronJob/selfservice-synthetic-runner has no retained Job",
+		},
+		{
+			name:               "suspended floating spec image fails closed",
+			manifest:           suspendedCronJobManifest(true, "ghcr.io/jmal1/selfservice-crucible-runner:latest", false),
+			declaredImage:      "ghcr.io/jmal1/selfservice-crucible-runner:latest",
+			expectedImage:      "ghcr.io/jmal1/selfservice-crucible-runner:latest",
+			wantOutputContains: "does not declare an immutable sha256 image",
+		},
+		{
+			name:               "suspended spec digest mismatch is rejected by desired-live comparison",
+			manifest:           suspendedCronJobManifest(true, imageB, false),
+			declaredImage:      imageB,
+			expectedImage:      imageA,
+			wantOutputContains: "digest mismatch for CronJob/selfservice-synthetic-runner",
+		},
+		{
+			name:           "retained runnable Job still proves the observed runtime ImageID",
+			manifest:       suspendedCronJobManifest(false, imageA, false),
+			declaredImage:  imageA,
+			expectedImage:  imageB,
+			retainedJob:    true,
+			runtimeImageID: runtimeImageB,
+			wantSuccess:    true,
+		},
+		{
+			name:               "suspended spec requires exactly one matching container tuple",
+			manifest:           suspendedCronJobManifest(true, imageA, true),
+			declaredImage:      imageA,
+			expectedImage:      imageA,
+			wantOutputContains: "does not contain exactly one live containers/synthetic-runner tuple",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			output, runErr := runLiveEffectiveImageHarness(
+				t,
+				source,
+				test.manifest,
+				test.declaredImage,
+				test.expectedImage,
+				test.retainedJob,
+				test.runtimeImageID,
+			)
+			if test.wantSuccess && runErr != nil {
+				t.Fatalf("effective image proof failed: %v\n%s", runErr, output)
+			}
+			if !test.wantSuccess && runErr == nil {
+				t.Fatalf("effective image proof unexpectedly succeeded:\n%s", output)
+			}
+			if test.wantSuccess && string(output) != test.expectedImage {
+				t.Fatalf("effective image = %q, want %q", output, test.expectedImage)
+			}
+			if test.wantOutputContains != "" && !strings.Contains(string(output), test.wantOutputContains) {
+				t.Fatalf("output %q does not contain %q", output, test.wantOutputContains)
+			}
+		})
+	}
+}
+
+func TestDeployScriptSuspendedCronJobFallbackGuardsAreLoadBearing(t *testing.T) {
+	deployBody, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(deployBody)
+	image := "ghcr.io/jmal1/selfservice-crucible-runner@sha256:" + testDigestA
+
+	for _, test := range []struct {
+		name         string
+		old          string
+		replacement  string
+		manifest     string
+		declared     string
+		expected     string
+		wantOriginal string
+	}{
+		{
+			name:         "suspended-only predicate",
+			old:          `if [ "$suspended" != true ]; then`,
+			replacement:  `if false; then`,
+			manifest:     suspendedCronJobManifest(false, image, false),
+			declared:     image,
+			expected:     image,
+			wantOriginal: "runnable CronJob/selfservice-synthetic-runner has no retained Job",
+		},
+		{
+			name:         "immutable digest check",
+			old:          `if ! is_digest_image "$spec_image"; then`,
+			replacement:  `if false; then`,
+			manifest:     suspendedCronJobManifest(true, "ghcr.io/jmal1/selfservice-crucible-runner:latest", false),
+			declared:     "ghcr.io/jmal1/selfservice-crucible-runner:latest",
+			expected:     "ghcr.io/jmal1/selfservice-crucible-runner:latest",
+			wantOriginal: "does not declare an immutable sha256 image",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			originalOutput, originalErr := runLiveEffectiveImageHarness(
+				t,
+				source,
+				test.manifest,
+				test.declared,
+				test.expected,
+				false,
+				"",
+			)
+			if originalErr == nil || !strings.Contains(string(originalOutput), test.wantOriginal) {
+				t.Fatalf("original guard did not fail for the expected reason: err=%v\n%s", originalErr, originalOutput)
+			}
+			if strings.Count(source, test.old) != 1 {
+				t.Fatalf("sabotage target %q count != 1", test.old)
+			}
+			sabotaged := strings.Replace(source, test.old, test.replacement, 1)
+			sabotagedOutput, sabotagedErr := runLiveEffectiveImageHarness(
+				t,
+				sabotaged,
+				test.manifest,
+				test.declared,
+				test.expected,
+				false,
+				"",
+			)
+			if sabotagedErr != nil {
+				t.Fatalf("removing the %s did not expose false acceptance: %v\n%s", test.name, sabotagedErr, sabotagedOutput)
+			}
+			if string(sabotagedOutput) != test.expected {
+				t.Fatalf("sabotaged proof returned %q, want false acceptance of %q", sabotagedOutput, test.expected)
+			}
+		})
+	}
+}
+
+func TestDeployScriptRollbackContainmentAllowsSuspendedCronJobsWithoutRetainedJobs(t *testing.T) {
+	requirePOSIXShell(t)
+
+	manifest := rollbackManifestWithHistoricalSynthetics(true)
+	env := newDeployScriptEnvironment(t, manifest, manifest)
+	env.helmRevision = acceptedRollbackBaselineRevision(t) + 1
+	env.noRetainedJanitorJob = true
+	env.noRetainedRunnerJob = true
+
+	output, err := env.run("--verify-rollback-containment")
+	if err != nil {
+		t.Fatalf("rollback containment rejected suspended CronJobs without retained Jobs: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "rollback containment verified") {
+		t.Fatalf("rollback containment did not reach success:\n%s", output)
+	}
+
+	runnable := rollbackManifestWithHistoricalSynthetics(false)
+	env = newDeployScriptEnvironment(t, runnable, runnable)
+	env.helmRevision = acceptedRollbackBaselineRevision(t) + 1
+	env.noRetainedRunnerJob = true
+
+	output, err = env.run("--verify-rollback-containment")
+	if err == nil {
+		t.Fatalf("rollback containment accepted runnable CronJob without retained Job:\n%s", output)
+	}
+	if !strings.Contains(string(output), "runnable CronJob/selfservice-synthetic-runner has no retained Job") {
+		t.Fatalf("failure did not preserve runnable CronJob evidence requirement:\n%s", output)
+	}
+}
+
 func TestDeployScriptRollbackEquivalenceComparisonsLoadBearing(t *testing.T) {
 	requirePOSIXShell(t)
 
@@ -6149,6 +6454,8 @@ type deployScriptEnvironment struct {
 	activeKubernetesJobs           int
 	activeMutatingSyntheticJobs    int
 	completedMutatingSyntheticJob  bool
+	noRetainedJanitorJob           bool
+	noRetainedRunnerJob            bool
 	pendingSyntheticJobs           int
 	migrationState                 string
 	provisioningJobs               string
@@ -7031,7 +7338,15 @@ case "$1" in
             }'
         fi
       else
+        if [[ "$*" == *'eq .name "selfservice-synthetic-janitor"'* ]] &&
+         [ "$FAKE_NO_RETAINED_JANITOR_JOB" = true ]; then
+        :
+        elif [[ "$*" == *'eq .name "selfservice-synthetic-runner"'* ]] &&
+           [ "$FAKE_NO_RETAINED_RUNNER_JOB" = true ]; then
+        :
+        else
         printf 'selfservice-synthetic-api-monitor-1\n'
+        fi
       fi
     elif [[ "$2" == job/* ]]; then
       printf '1 0 0'
@@ -7842,6 +8157,8 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_SYNTHETIC_USER_KNOWN="+strconv.FormatBool(e.syntheticUserKnown),
 		"FAKE_ACTIVE_MUTATING_SYNTHETIC_JOBS="+strconv.Itoa(e.activeMutatingSyntheticJobs),
 		"FAKE_COMPLETED_MUTATING_SYNTHETIC_JOB="+strconv.FormatBool(e.completedMutatingSyntheticJob),
+		"FAKE_NO_RETAINED_JANITOR_JOB="+strconv.FormatBool(e.noRetainedJanitorJob),
+		"FAKE_NO_RETAINED_RUNNER_JOB="+strconv.FormatBool(e.noRetainedRunnerJob),
 		"FAKE_MALFORMED_JOBS_JSON="+strconv.FormatBool(e.malformedJobsJSON),
 		"FAKE_PREFLIGHT_QUERY_FAILURE="+e.preflightQueryFailure,
 		"FAKE_FAIL_JOBS_LIST="+strconv.FormatBool(e.failJobsList),
