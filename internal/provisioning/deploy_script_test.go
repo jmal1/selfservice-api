@@ -1101,13 +1101,15 @@ func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 	live := baselineManifest(true, "", "false")
 	t.Run("successful upgrade accepts intended janitor TTL deletion", func(t *testing.T) {
 		candidate := rollbackManifestWithHistoricalSynthetics(false)
+		liveWithHistoricalSynthetics := baselineManifest(true, "", "false") +
+			historicalSyntheticCronJobs(false)
 		liveWithJanitorTTL := strings.Replace(
-			candidate,
+			liveWithHistoricalSynthetics,
 			"  name: selfservice-synthetic-janitor\nspec:\n  suspend: false\n  jobTemplate:\n    spec:\n",
 			"  name: selfservice-synthetic-janitor\nspec:\n  suspend: false\n  jobTemplate:\n    spec:\n      ttlSecondsAfterFinished: 1800\n",
 			1,
 		)
-		if liveWithJanitorTTL == candidate {
+		if liveWithJanitorTTL == liveWithHistoricalSynthetics {
 			t.Fatal("janitor TTL fixture was not added to the live manifest")
 		}
 		env := newDeployScriptEnvironment(t, liveWithJanitorTTL, candidate)
@@ -3157,8 +3159,8 @@ func TestDeployScriptPostApplyHelmOwnershipHandling(t *testing.T) {
 				t.Fatalf("post-apply proof rejected %s for the wrong reason:\n%s", test.name, output)
 			}
 			if test.wantCanonicalFailure {
-				if !strings.Contains(string(output), "could not canonicalize the deployed Helm object set") {
-					t.Fatalf("malformed ownership did not fail canonicalization:\n%s", output)
+				if !strings.Contains(string(output), "could not refresh the expected Helm object set against the post-upgrade cluster") {
+					t.Fatalf("malformed live ownership did not fail the refreshed expected canonicalization:\n%s", output)
 				}
 			} else if !strings.Contains(string(output), "deployed Helm object set differs") {
 				t.Fatalf("metadata drift did not fail the deployed-candidate comparison:\n%s", output)
@@ -6812,7 +6814,7 @@ json_resource() {
       canonical="$canonical
       ttlSecondsAfterFinished: 1800"
       echo pre-upgrade-retained >> "$FAKE_JANITOR_TTL_SSA_LOG"
-    elif [ "$source" = post-apply ]; then
+    elif [ "$source" = post-upgrade-expected ] || [ "$source" = post-apply ]; then
       echo post-upgrade-omitted >> "$FAKE_JANITOR_TTL_SSA_LOG"
     fi
   fi
@@ -6882,7 +6884,10 @@ serverInjectedMutation: true"
                   {}
                 end
               )
-            elif $source == "post-apply" then
+            elif $source == "post-apply" or
+                 ($source == "post-upgrade-expected" and
+                  (($post_apply_mode | startswith("helm-wrong-")) or
+                   ($post_apply_mode | startswith("helm-nonstring-")))) then
               (
                 if ($post_apply_mode == "generated" or $post_apply_mode == "deployment-revision") and
                    $kind == "Deployment" then
@@ -6945,7 +6950,10 @@ serverInjectedMutation: true"
             end
           ),
           labels:(
-            if $source == "post-apply" and
+            if ($source == "post-apply" or
+                ($source == "post-upgrade-expected" and
+                 (($post_apply_mode | startswith("helm-wrong-")) or
+                  ($post_apply_mode | startswith("helm-nonstring-"))))) and
                ($post_apply_mode | startswith("helm-")) and
                ($resource == "CronJob/selfservice-synthetic-janitor" or
                 $resource == "CronJob/selfservice-synthetic-runner") then
@@ -7018,7 +7026,10 @@ serverInjectedMutation: true"
                   {}
                 end
               )
-            elif $source == "post-apply" then
+            elif $source == "post-apply" or
+                 ($source == "post-upgrade-expected" and
+                  (($post_apply_mode | startswith("helm-wrong-")) or
+                   ($post_apply_mode | startswith("helm-nonstring-")))) then
               (
                 if ($post_apply_mode == "generated" or $post_apply_mode == "deployment-revision") and
                    $kind == "Deployment" then
@@ -7081,7 +7092,10 @@ serverInjectedMutation: true"
             end
           ),
           labels:(
-            if $source == "post-apply" and
+            if ($source == "post-apply" or
+                ($source == "post-upgrade-expected" and
+                 (($post_apply_mode | startswith("helm-wrong-")) or
+                  ($post_apply_mode | startswith("helm-nonstring-"))))) and
                ($post_apply_mode | startswith("helm-")) and
                ($resource == "CronJob/selfservice-synthetic-janitor" or
                 $resource == "CronJob/selfservice-synthetic-runner") then
@@ -7726,7 +7740,10 @@ case "$1" in
       [ -n "$resource" ]
       source=desired
       if [ -f "$FAKE_UPGRADED_MARKER" ]; then
-        source=post-apply
+        case "$manifest" in
+          *expected.server.canonical.documents/*) source=post-upgrade-expected ;;
+          *) source=post-apply ;;
+        esac
       fi
       json_resource "$manifest" "$resource" "$source"
     else
@@ -8417,23 +8434,23 @@ spec:
 func rollbackManifestWithHistoricalSynthetics(contained bool) string {
 	manifest := baselineManifest(true, "", "false")
 	lifecycle := "true"
-	janitorSuspend := "false"
-	runnerSuspend := "false"
 	if contained {
 		lifecycle = "false"
-		janitorSuspend = "true"
-		runnerSuspend = "true"
 	}
 	if !contained {
 		manifest = replaceEnvValue(manifest, "SYNTHETIC_LIFECYCLE_ENABLED", "false", lifecycle)
 	}
-	return manifest + `---
+	return manifest + historicalSyntheticCronJobs(contained)
+}
+
+func historicalSyntheticCronJobs(suspend bool) string {
+	return `---
 apiVersion: batch/v1
 kind: CronJob
 metadata:
   name: selfservice-synthetic-janitor
 spec:
-  suspend: ` + janitorSuspend + `
+  suspend: ` + strconv.FormatBool(suspend) + `
   jobTemplate:
     spec:
       template:
@@ -8448,7 +8465,7 @@ kind: CronJob
 metadata:
   name: selfservice-synthetic-runner
 spec:
-  suspend: ` + runnerSuspend + `
+  suspend: ` + strconv.FormatBool(suspend) + `
   jobTemplate:
     spec:
       template:
