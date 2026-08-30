@@ -30,7 +30,6 @@ spec:
     spec:
       backoffLimit: 0
       activeDeadlineSeconds: {{ .Values.synthetic.janitor.activeDeadlineSeconds | default 600 }}
-      ttlSecondsAfterFinished: 1800
       template:
         metadata:
           labels:
