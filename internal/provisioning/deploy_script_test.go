@@ -1100,13 +1100,13 @@ func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 	requirePOSIXShell(t)
 	live := baselineManifest(true, "", "false")
 	t.Run("successful upgrade accepts intended janitor TTL deletion", func(t *testing.T) {
-		candidate := rollbackManifestWithHistoricalSynthetics(false)
+		candidate := rollbackManifestWithHistoricalSynthetics(true)
 		liveWithHistoricalSynthetics := baselineManifest(true, "", "false") +
-			historicalSyntheticCronJobs(false)
+			historicalSyntheticCronJobs(true)
 		liveWithJanitorTTL := strings.Replace(
 			liveWithHistoricalSynthetics,
-			"  name: selfservice-synthetic-janitor\nspec:\n  suspend: false\n  jobTemplate:\n    spec:\n",
-			"  name: selfservice-synthetic-janitor\nspec:\n  suspend: false\n  jobTemplate:\n    spec:\n      ttlSecondsAfterFinished: 1800\n",
+			"  name: selfservice-synthetic-janitor\nspec:\n  suspend: true\n  jobTemplate:\n    spec:\n",
+			"  name: selfservice-synthetic-janitor\nspec:\n  suspend: true\n  jobTemplate:\n    spec:\n      ttlSecondsAfterFinished: 1800\n",
 			1,
 		)
 		if liveWithJanitorTTL == liveWithHistoricalSynthetics {
