@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"testing"
@@ -21,6 +22,20 @@ type orphanDestroyRecoveryFixture struct {
 	vlanTag int
 	subnet  string
 	jobID   uuid.UUID
+}
+
+func insertOrphanDestroyJob(t *testing.T, pool *pgxpool.Pool, jobID, podID uuid.UUID, createdAt time.Time, result map[string]any) {
+	t.Helper()
+	resultJSON, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO jobs (id, type, payload, status, result, created_at, completed_at)
+		VALUES ($1, 'pod_destroy', jsonb_build_object('pod_id', $2::text), 'failed', $3::jsonb, $4, $4)
+	`, jobID, podID, string(resultJSON), createdAt); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func newOrphanDestroyRecoveryFixture(t *testing.T) *orphanDestroyRecoveryFixture {
@@ -65,7 +80,7 @@ func newOrphanDestroyRecoveryFixture(t *testing.T) *orphanDestroyRecoveryFixture
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO pods (id, owner_id, name, status, vlan_id, subnet, error_message)
 		VALUES ($1, $2, 'student test', 'destroy_failed', $3, $4, $5)
-	`, fixture.podID, fixture.ownerID, fixture.vlanTag, fixture.subnet, models.PodErrorManualCleanupRequiredPrefix); err != nil {
+	`, fixture.podID, fixture.ownerID, fixture.vlanTag, fixture.subnet, models.PodErrorManualCleanupRequiredPrefix+"operator confirmed zero residue"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `
@@ -73,12 +88,17 @@ func newOrphanDestroyRecoveryFixture(t *testing.T) *orphanDestroyRecoveryFixture
 	`, fixture.podID, fixture.vlanTag); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO jobs (id, type, payload, status, result)
-		VALUES ($1, 'pod_destroy', jsonb_build_object('pod_id', $2::text), 'failed', jsonb_build_object('status', 'manual_cleanup_required'))
-	`, fixture.jobID, fixture.podID); err != nil {
-		t.Fatal(err)
-	}
+	t.Cleanup(func() {
+		cleanupCtx := context.Background()
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM jobs WHERE payload->>'pod_id' = $1::text`, fixture.podID)
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM pods WHERE id = $1`, fixture.podID)
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM users WHERE id = $1`, fixture.ownerID)
+	})
+	insertOrphanDestroyJob(t, pool, fixture.jobID, fixture.podID, time.Now().Add(-2*time.Minute), map[string]any{
+		"error":                   "manual cleanup required after orphaned destroy left no live residue",
+		"attempts":                2,
+		"manual_cleanup_required": true,
+	})
 	return fixture
 }
 
@@ -100,6 +120,23 @@ func assertOrphanRecoveryState(t *testing.T, pool *pgxpool.Pool, podID uuid.UUID
 	}
 }
 
+func assertOrphanRecoveryAuditJobID(t *testing.T, pool *pgxpool.Pool, podID, wantJobID uuid.UUID) {
+	t.Helper()
+	var jobID uuid.UUID
+	if err := pool.QueryRow(context.Background(), `
+		SELECT job_id
+		FROM pod_destroy_recovery_audit
+		WHERE pod_id = $1
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, podID).Scan(&jobID); err != nil {
+		t.Fatal(err)
+	}
+	if jobID != wantJobID {
+		t.Fatalf("audit job_id = %s, want %s", jobID, wantJobID)
+	}
+}
+
 func TestFinalizeOrphanedPodDestroyPostgresFinalizesAndAudits(t *testing.T) {
 	fixture := newOrphanDestroyRecoveryFixture(t)
 	ctx := context.Background()
@@ -115,6 +152,113 @@ func TestFinalizeOrphanedPodDestroyPostgresFinalizesAndAudits(t *testing.T) {
 		t.Fatalf("snapshot mismatch: %+v", snap)
 	}
 	assertOrphanRecoveryState(t, fixture.pool, fixture.podID, models.PodStatusDestroyed, false, 1)
+	assertOrphanRecoveryAuditJobID(t, fixture.pool, fixture.podID, fixture.jobID)
+}
+
+func TestFinalizeOrphanedPodDestroyPostgresUsesFirstDestroyJobAcrossAttempts(t *testing.T) {
+	fixture := newOrphanDestroyRecoveryFixture(t)
+	ctx := context.Background()
+	laterJobID := uuid.New()
+	insertOrphanDestroyJob(t, fixture.pool, laterJobID, fixture.podID, time.Now().Add(-time.Minute), map[string]any{
+		"error":    "transient cleanup retry failed after the authoritative job was already recorded",
+		"attempts": 3,
+	})
+
+	snap, err := fixture.queries.FinalizeOrphanedPodDestroy(ctx, fixture.ownerID, fixture.podID, PodDestroyRecoveryAttestation{
+		VLANID:            fixture.vlanTag,
+		Subnet:            fixture.subnet,
+		ConfirmationToken: "orphan-456",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.DestroyJobID != fixture.jobID {
+		t.Fatalf("authoritative destroy job = %s, want %s", snap.DestroyJobID, fixture.jobID)
+	}
+	if snap.DestroyJobReason != "manual cleanup required after orphaned destroy left no live residue" {
+		t.Fatalf("destroy job reason = %q, want production-style error field", snap.DestroyJobReason)
+	}
+	assertOrphanRecoveryAuditJobID(t, fixture.pool, fixture.podID, fixture.jobID)
+}
+
+func TestFinalizeOrphanedPodDestroyPostgresRejectsUnsupportedManualCleanupResults(t *testing.T) {
+	cases := []struct {
+		name   string
+		result map[string]any
+	}{
+		{
+			name: "false-flag",
+			result: map[string]any{
+				"error":                   "manual cleanup required after orphaned destroy left no live residue",
+				"attempts":                2,
+				"manual_cleanup_required": false,
+			},
+		},
+		{
+			name: "string-flag",
+			result: map[string]any{
+				"error":                   "manual cleanup required after orphaned destroy left no live residue",
+				"attempts":                2,
+				"manual_cleanup_required": "true",
+			},
+		},
+		{
+			name: "missing-flag",
+			result: map[string]any{
+				"error":    "manual cleanup required after orphaned destroy left no live residue",
+				"attempts": 2,
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newOrphanDestroyRecoveryFixture(t)
+			resultJSON, err := json.Marshal(tc.result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fixture.pool.Exec(context.Background(), `
+				UPDATE jobs
+				SET result = $1::jsonb
+				WHERE id = $2
+			`, string(resultJSON), fixture.jobID); err != nil {
+				t.Fatal(err)
+			}
+			insertOrphanDestroyJob(t, fixture.pool, uuid.New(), fixture.podID, time.Now().Add(-time.Minute), map[string]any{
+				"error":                   "manual cleanup required after the authoritative row was already rejected",
+				"attempts":                3,
+				"manual_cleanup_required": true,
+			})
+			if _, err := fixture.queries.FinalizeOrphanedPodDestroy(context.Background(), fixture.ownerID, fixture.podID, PodDestroyRecoveryAttestation{
+				VLANID:            fixture.vlanTag,
+				Subnet:            fixture.subnet,
+				ConfirmationToken: "orphan-invalid",
+			}); !errors.Is(err, ErrPodDestroyRecoveryPrecondition) {
+				t.Fatalf("unsupported result error = %v, want %v", err, ErrPodDestroyRecoveryPrecondition)
+			}
+		})
+	}
+}
+
+func TestFinalizeOrphanedPodDestroyPostgresRejectsLaterDestroyCompetingWork(t *testing.T) {
+	fixture := newOrphanDestroyRecoveryFixture(t)
+	ctx := context.Background()
+	laterJobID := uuid.New()
+	if _, err := fixture.pool.Exec(ctx, `
+		INSERT INTO jobs (id, type, payload, status)
+		VALUES ($1, 'pod_destroy', jsonb_build_object('pod_id', $2::text), 'claimed')
+	`, laterJobID, fixture.podID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.queries.FinalizeOrphanedPodDestroy(ctx, fixture.ownerID, fixture.podID, PodDestroyRecoveryAttestation{
+		VLANID:            fixture.vlanTag,
+		Subnet:            fixture.subnet,
+		ConfirmationToken: "orphan-later-destroy",
+	}); !errors.Is(err, ErrPodDestroyRecoveryPrecondition) {
+		t.Fatalf("later destroy job error = %v, want %v", err, ErrPodDestroyRecoveryPrecondition)
+	}
+	assertOrphanRecoveryState(t, fixture.pool, fixture.podID, models.PodStatusDestroyFailed, true, 0)
 }
 
 func TestFinalizeOrphanedPodDestroyPostgresRejectsBadAttestation(t *testing.T) {

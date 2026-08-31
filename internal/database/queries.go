@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -745,6 +746,25 @@ type PodDestroyRecoveryAttestation struct {
 	ConfirmationToken string `json:"confirmation_token"`
 }
 
+func parseManualCleanupDestroyJobResult(result []byte) (string, bool) {
+	var payload map[string]any
+	if err := json.Unmarshal(result, &payload); err != nil {
+		return "", false
+	}
+	reason, ok := payload["error"].(string)
+	if !ok || reason == "" {
+		return "", false
+	}
+	if _, ok := payload["attempts"].(float64); !ok {
+		return "", false
+	}
+	manualCleanupRequired, ok := payload["manual_cleanup_required"].(bool)
+	if !ok || !manualCleanupRequired {
+		return "", false
+	}
+	return reason, true
+}
+
 func (q *Queries) FinalizeOrphanedPodDestroy(ctx context.Context, actorUserID, podID uuid.UUID, attestation PodDestroyRecoveryAttestation) (*PodDestroyRecoverySnapshot, error) {
 	tx, err := q.pool.Begin(ctx)
 	if err != nil {
@@ -769,7 +789,7 @@ func (q *Queries) FinalizeOrphanedPodDestroy(ctx context.Context, actorUserID, p
 		}
 		return nil, fmt.Errorf("lock pod for orphaned destroy recovery: %w", err)
 	}
-	if podStatus != models.PodStatusDestroyFailed || podError != models.PodErrorManualCleanupRequiredPrefix {
+	if podStatus != models.PodStatusDestroyFailed || !strings.HasPrefix(podError, models.PodErrorManualCleanupRequiredPrefix) {
 		return nil, fmt.Errorf("%w: pod %s status=%s", ErrPodDestroyRecoveryPrecondition, podID, podStatus)
 	}
 	if attestation.VLANID != vlanID || attestation.Subnet != subnet {
@@ -777,25 +797,26 @@ func (q *Queries) FinalizeOrphanedPodDestroy(ctx context.Context, actorUserID, p
 	}
 
 	var jobID uuid.UUID
-	var jobStatus, jobReason string
+	var jobStatus string
+	var jobResult []byte
 	if err := tx.QueryRow(ctx, `
-		SELECT id, status, COALESCE(result->>'status', '')
+		SELECT id, status, COALESCE(result, '{}'::jsonb)
 		FROM jobs
 		WHERE type = 'pod_destroy'
 		  AND payload->>'pod_id' = $1::text
 		ORDER BY created_at ASC, id ASC
 		FOR UPDATE
 		LIMIT 1
-	`, podID).Scan(&jobID, &jobStatus, &jobReason); err != nil {
+	`, podID).Scan(&jobID, &jobStatus, &jobResult); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, fmt.Errorf("%w: missing pod_destroy job for pod %s", ErrPodDestroyRecoveryPrecondition, podID)
 		}
 		return nil, fmt.Errorf("lock pod destroy job for orphaned recovery: %w", err)
 	}
-	if jobStatus != models.JobStatusFailed || jobReason != "manual_cleanup_required" {
-		return nil, fmt.Errorf("%w: pod destroy job %s status=%s", ErrPodDestroyRecoveryPrecondition, jobID, jobStatus)
+	jobReason, ok := parseManualCleanupDestroyJobResult(jobResult)
+	if !ok || jobStatus != models.JobStatusFailed {
+		return nil, fmt.Errorf("%w: pod destroy job %s invalid", ErrPodDestroyRecoveryPrecondition, jobID)
 	}
-
 	var placements int
 	if err := tx.QueryRow(ctx, `
 		SELECT count(*)
@@ -827,9 +848,9 @@ func (q *Queries) FinalizeOrphanedPodDestroy(ctx context.Context, actorUserID, p
 		SELECT count(*)
 		FROM jobs
 		WHERE payload->>'pod_id' = $1::text
-		  AND type <> 'pod_destroy'
+		  AND id <> $2
 		  AND status NOT IN ('completed', 'failed')
-	`, podID).Scan(&activeJobs); err != nil {
+	`, podID, jobID).Scan(&activeJobs); err != nil {
 		return nil, fmt.Errorf("count competing jobs for orphaned recovery: %w", err)
 	}
 	if activeJobs != 0 {
