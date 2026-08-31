@@ -1971,7 +1971,7 @@ current_migration_state() {
 }
 
 require_no_active_jobs() {
-  local postgres_pod active_jobs active_kubernetes_jobs
+  local postgres_pod active_jobs jobs_json active_kubernetes_jobs
   postgres_pod="$(
     kubectl get pods -n "$NAMESPACE" \
       -l "app.kubernetes.io/name=postgresql,app.kubernetes.io/instance=$RELEASE" \
@@ -2002,22 +2002,85 @@ require_no_active_jobs() {
     echo "ERROR: $active_jobs durable jobs remain claimed, in_progress, or rollback after claims pause." >&2
     return 1
   fi
-  active_kubernetes_jobs="$(
-    kubectl get jobs -n "$NAMESPACE" -o json \
-      | jq -er '[.items[] | select((.status.active // 0) > 0)] | length'
-  )"
-  if [[ ! "$active_kubernetes_jobs" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: invalid active Kubernetes Job count: $active_kubernetes_jobs" >&2
+  if ! jobs_json="$(kubectl get jobs -n "$NAMESPACE" -o json)"; then
+    echo "ERROR: failed to list Kubernetes Jobs while verifying job drain." >&2
     return 1
   fi
-  if [ "$active_kubernetes_jobs" != "0" ]; then
-    echo "ERROR: $active_kubernetes_jobs Kubernetes Jobs remain active in namespace $NAMESPACE." >&2
+  if ! active_kubernetes_jobs="$(
+    jq -er --arg release "$RELEASE" '
+      def is_contained_api_monitor:
+        (.metadata.name | startswith($release + "-synthetic-api-monitor-")) and
+        (
+          [
+            (.metadata.ownerReferences // [])[]
+            | select(
+                .kind == "CronJob" and
+                .name == ($release + "-synthetic-api-monitor") and
+                .controller == true
+              )
+          ] | length
+        ) == 1 and
+        ((.spec.template.spec.containers // null) | type) == "array" and
+        ((.spec.template.spec.containers | length) == 1) and
+        (.spec.template.spec.containers[0].name == "synthetic-api-monitor") and
+        ((.spec.template.spec.containers[0].env // null) | type) == "array" and
+        (
+          [
+            .spec.template.spec.containers[0].env[]
+            | select(.name == "SYNTHETIC_LIFECYCLE_ENABLED")
+          ] | length
+        ) == 1 and
+        (
+          [
+            .spec.template.spec.containers[0].env[]
+            | select(
+                .name == "SYNTHETIC_LIFECYCLE_ENABLED" and
+                .value == "false"
+              )
+          ] | length
+        ) == 1 and
+        ((.spec.template.spec.initContainers // []) | type) == "array" and
+        (((.spec.template.spec.initContainers // []) | length) == 0);
+
+      if (.items | type) != "array" then
+        error("items must be an array")
+      else
+        [
+          .items[]
+          | if (.metadata.name | type) != "string" or
+               ((.metadata.ownerReferences // []) | type) != "array" or
+               ((.metadata.ownerReferences // []) | all(
+                 type == "object" and
+                 (.kind | type) == "string" and
+                 (.name | type) == "string" and
+                 ((.controller // false) | type) == "boolean"
+               ) | not) or
+               ((.status.active // 0) | type) != "number" or
+               ((.status.active // 0) < 0) or
+               ((.status.active // 0) != ((.status.active // 0) | floor)) then
+              error("malformed Job record")
+            else .
+            end
+          | select((.status.active // 0) > 0)
+          | select(is_contained_api_monitor | not)
+          | .metadata.name
+        ]
+        | unique
+        | join(",")
+      end
+    ' <<< "$jobs_json"
+  )"; then
+    echo "ERROR: Kubernetes Job data is malformed while verifying job drain." >&2
+    return 1
+  fi
+  if [ -n "$active_kubernetes_jobs" ]; then
+    echo "ERROR: Kubernetes Jobs remain active in namespace $NAMESPACE: $active_kubernetes_jobs." >&2
     return 1
   fi
   if ! require_no_nonterminal_synthetic_pod_jobs "$postgres_pod"; then
     return 1
   fi
-  echo "==> job drain verified: no durable claimed/in_progress/rollback work and no active Kubernetes Jobs"
+  echo "==> job drain verified: no durable claimed/in_progress/rollback work and no active storage/lifecycle-mutating Kubernetes Jobs"
 }
 
 require_no_nonterminal_synthetic_pod_jobs() {
