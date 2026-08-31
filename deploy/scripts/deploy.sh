@@ -2971,13 +2971,20 @@ validate_foundation_intent() {
   local manifest=$1
   local validate_replicas=${2:-true}
   local validate_synthetic_lifecycle=${3:-true}
-  local claims content_enabled content_feed synthetic_expected synthetic_feed synthetic_lifecycle worker_replicas
+  local provisioning_enabled claims content_enabled content_feed synthetic_expected synthetic_feed synthetic_lifecycle worker_replicas
+  local synthetic_provisioning_expected
+  provisioning_enabled="$(env_from_manifest PROVISIONING_ENABLED < "$manifest")"
   claims="$(claims_from_manifest < "$manifest")"
   content_enabled="$(env_from_manifest WORKER_CONTENT_FILTER_ENABLED < "$manifest")"
   content_feed="$(env_from_manifest WORKER_CONTENT_FILTER_CATEGORY_FEED_BASE_URL < "$manifest")"
   synthetic_expected="$(env_from_manifest SYNTHETIC_CONTENT_FILTER_EXPECTED < "$manifest")"
+  synthetic_provisioning_expected="$(env_from_manifest SYNTHETIC_PROVISIONING_EXPECTED_ENABLED < "$manifest")"
   synthetic_feed="$(env_from_manifest SYNTHETIC_CONTENT_FILTER_CATEGORY_FEED_BASE_URL < "$manifest")"
   synthetic_lifecycle="$(env_from_manifest SYNTHETIC_LIFECYCLE_ENABLED < "$manifest")"
+  if [ "$provisioning_enabled" != "false" ]; then
+    echo "ERROR: candidate renders PROVISIONING_ENABLED=$provisioning_enabled, not false." >&2
+    return 1
+  fi
   if [ "$claims" != "false" ]; then
     echo "ERROR: candidate renders worker provisioning claims as $claims, not false." >&2
     return 1
@@ -2988,6 +2995,10 @@ validate_foundation_intent() {
   fi
   if [ "$synthetic_expected" != "false" ] || [ -n "$synthetic_feed" ]; then
     echo "ERROR: candidate synthetic content-filter intent must remain false with an empty category feed." >&2
+    return 1
+  fi
+  if [ "$synthetic_provisioning_expected" != "false" ]; then
+    echo "ERROR: candidate must keep SYNTHETIC_PROVISIONING_EXPECTED_ENABLED=false." >&2
     return 1
   fi
   if [ "$validate_synthetic_lifecycle" = true ] && [ "$synthetic_lifecycle" != "false" ]; then
@@ -3346,6 +3357,31 @@ verify_external_candidate_images() {
         return 1
       fi
       if [ "$kind" = CronJob ]; then
+        local suspended
+        if ! suspended="$(cronjob_suspend_from_manifest "$live_manifest")"; then
+          echo "ERROR: candidate CronJob/$name suspension state could not be proven before verification." >&2
+          return 1
+        fi
+        if [ "$suspended" = true ]; then
+          if [ "$declared" != "$expected" ]; then
+            echo "ERROR: suspended candidate declared image drifted for CronJob/$name: expected $expected, found $declared." >&2
+            return 1
+          fi
+          actual="$(
+            live_effective_image \
+              "$kind" \
+              "$name" \
+              "$container_type" \
+              "$container_name" \
+              "$declared" \
+              "$live_manifest"
+          )"
+          if [ "$actual" != "$expected" ]; then
+            echo "ERROR: suspended candidate live image drifted for CronJob/$name $container_type/$container_name: expected $expected, found $actual." >&2
+            return 1
+          fi
+          continue
+        fi
         if ! verify_candidate_cronjob_image \
             "$name" \
             "$container_type" \

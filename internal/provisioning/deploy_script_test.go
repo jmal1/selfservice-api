@@ -346,7 +346,7 @@ printf '%s' "$actual"
 	return cmd.CombinedOutput()
 }
 
-func runCronJobHealthLookupHarness(t *testing.T, deploySource string) ([]byte, error) {
+func runCronJobHealthLookupHarness(t *testing.T, deploySource string, suspended bool, retainedJob bool, failJobLookup bool) ([]byte, error) {
 	t.Helper()
 	requirePOSIXShell(t)
 
@@ -367,11 +367,17 @@ func runCronJobHealthLookupHarness(t *testing.T, deploySource string) ([]byte, e
 	writeExecutable(t, filepath.Join(binDir, "kubectl"), `#!/bin/bash
 set -euo pipefail
 if [ "$1 $2" = "get jobs" ]; then
-  echo "sabotaged retained Job lookup failure" >&2
-  exit 97
+  if [ "$FAKE_FAIL_JOB_LOOKUP" = true ]; then
+    echo "sabotaged retained Job lookup failure" >&2
+    exit 97
+  fi
+  if [ "$FAKE_RETAINED_JOB" = true ]; then
+    printf 'selfservice-synthetic-runner-12345\n'
+  fi
+  exit 0
 fi
 if [ "$1 $2" = "get CronJob/selfservice-synthetic-runner" ]; then
-  printf 'true'
+  printf '%s' "$FAKE_CRONJOB_SUSPENDED"
   exit 0
 fi
 echo "unexpected kubectl invocation: $*" >&2
@@ -392,6 +398,9 @@ workload_health "$INVENTORY"
 		os.Environ(),
 		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"INVENTORY="+inventoryPath,
+		"FAKE_CRONJOB_SUSPENDED="+strconv.FormatBool(suspended),
+		"FAKE_RETAINED_JOB="+strconv.FormatBool(retainedJob),
+		"FAKE_FAIL_JOB_LOOKUP="+strconv.FormatBool(failJobLookup),
 	)
 	return cmd.CombinedOutput()
 }
@@ -505,22 +514,17 @@ func TestDeployScriptCronJobHealthJobLookupGuardIsLoadBearing(t *testing.T) {
 	}
 	source := string(deployBody)
 
-	output, runErr := runCronJobHealthLookupHarness(t, source)
-	if runErr == nil || !strings.Contains(string(output), "failed to list retained Jobs for CronJob/selfservice-synthetic-runner during health verification") {
-		t.Fatalf("health lookup guard did not fail for the expected reason: err=%v\n%s", runErr, output)
-	}
-
-	guard := `if ! job_name="$(latest_cronjob_job "$name")"; then
-          echo "ERROR: failed to list retained Jobs for CronJob/$name during health verification." >&2
-          return 1
-        fi`
-	if strings.Count(source, guard) != 1 {
-		t.Fatalf("health lookup sabotage target count != 1")
-	}
-	sabotaged := strings.Replace(source, guard, `job_name="$(latest_cronjob_job "$name")" || true`, 1)
-	output, runErr = runCronJobHealthLookupHarness(t, sabotaged)
+	output, runErr := runCronJobHealthLookupHarness(t, source, true, false, false)
 	if runErr != nil {
-		t.Fatalf("removing the health lookup guard did not expose false acceptance: %v\n%s", runErr, output)
+		t.Fatalf("suspended CronJob health short-circuit failed: %v\n%s", runErr, output)
+	}
+	sabotaged := strings.Replace(source, `  if [ "$suspended" = true ]; then`, `  if false; then`, 1)
+	if sabotaged == source {
+		t.Fatal("health lookup sabotage mutation had no effect")
+	}
+	output, runErr = runCronJobHealthLookupHarness(t, sabotaged, true, false, false)
+	if runErr == nil || !strings.Contains(string(output), "runnable CronJob/selfservice-synthetic-runner has no retained Job health evidence") {
+		t.Fatalf("health lookup guard did not fail for the suspended short-circuit reason: err=%v\n%s", runErr, output)
 	}
 }
 
@@ -1385,114 +1389,83 @@ func TestDeployScriptPostUpgradeActiveJobGuardIsLoadBearing(t *testing.T) {
 	}
 }
 
-func TestDeployScriptCandidateCronJobVerificationIsContained(t *testing.T) {
+func TestDeployScriptCandidateCronJobsHonorSuspensionBeforeJobCreation(t *testing.T) {
 	requirePOSIXShell(t)
-	live := baselineManifest(true, "", "false")
-	candidate := replaceEnvValue(
-		baselineManifest(true, "*", "false"),
-		"SYNTHETIC_LIFECYCLE_ENABLED",
-		"false",
-		"true",
-	)
+	live := rollbackManifestWithHistoricalSynthetics(true)
+	env := newDeployScriptEnvironment(t, live, live)
+	writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
+	env.noRetainedJanitorJob = true
+	env.noRetainedRunnerJob = true
 
-	for _, test := range []struct {
-		name  string
-		shape string
-	}{
-		{name: "overrides enabled lifecycle while candidate CronJob stays enabled"},
-		{name: "adds missing lifecycle while candidate CronJob stays enabled", shape: "missing-lifecycle"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			env := newDeployScriptEnvironment(t, live, candidate)
-			writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
-			env.cronjobVerificationShape = test.shape
-			output, err := env.run("--no-pull")
-			if err != nil {
-				t.Fatalf("contained candidate verification failed: %v\n%s", err, output)
-			}
-			if _, statErr := os.Stat(env.claimsPausedMark); statErr != nil {
-				t.Fatalf("verification did not run while worker claims were paused: %v", statErr)
-			}
-			jobBody, readErr := os.ReadFile(env.cronjobVerifyManifest)
-			if readErr != nil {
-				t.Fatalf("read created verification Job: %v", readErr)
-			}
-			var job struct {
-				Spec struct {
-					Template struct {
-						Spec struct {
-							Containers []struct {
-								Name string `json:"name"`
-								Env  []struct {
-									Name  string `json:"name"`
-									Value string `json:"value"`
-								} `json:"env"`
-							} `json:"containers"`
-						} `json:"spec"`
-					} `json:"template"`
-				} `json:"spec"`
-			}
-			if err := json.Unmarshal(jobBody, &job); err != nil {
-				t.Fatalf("decode created verification Job: %v", err)
-			}
-			var lifecycleValues []string
-			for _, container := range job.Spec.Template.Spec.Containers {
-				if container.Name != "synthetic-api-monitor" {
-					continue
-				}
-				for _, envVar := range container.Env {
-					if envVar.Name == "SYNTHETIC_LIFECYCLE_ENABLED" {
-						lifecycleValues = append(lifecycleValues, envVar.Value)
-					}
-				}
-			}
-			if len(lifecycleValues) != 1 || lifecycleValues[0] != "false" {
-				t.Fatalf("verification Job lifecycle values = %v, want exactly [false]", lifecycleValues)
-			}
-			applied, readErr := os.ReadFile(env.appliedManifest)
-			if readErr != nil {
-				t.Fatalf("read applied candidate manifest: %v", readErr)
-			}
-			if got := manifestEnvValue(t, string(applied), "SYNTHETIC_LIFECYCLE_ENABLED"); got != "true" {
-				t.Fatalf("candidate CronJob lifecycle = %q, want true", got)
-			}
-		})
+	output, err := env.run("--no-pull")
+	if err != nil {
+		t.Fatalf("contained candidate verification failed: %v\n%s", err, output)
 	}
-
-	for _, test := range []struct {
-		name       string
-		shape      string
-		wantOutput string
-	}{
-		{
-			name:       "missing target container fails closed",
-			shape:      "missing-target",
-			wantOutput: "could not contain image-verification Job for CronJob/selfservice-synthetic-api-monitor containers/synthetic-api-monitor",
-		},
-		{
-			name:       "malformed target container list fails closed",
-			shape:      "malformed-containers",
-			wantOutput: "could not contain image-verification Job for CronJob/selfservice-synthetic-api-monitor containers/synthetic-api-monitor",
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			env := newDeployScriptEnvironment(t, live, candidate)
-			writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
-			env.cronjobVerificationShape = test.shape
-			output, err := env.run("--no-pull")
-			if err == nil {
-				t.Fatalf("malformed verification Job unexpectedly passed:\n%s", output)
+	if _, statErr := os.Stat(env.claimsPausedMark); statErr != nil {
+		t.Fatalf("verification did not run while worker claims were paused: %v", statErr)
+	}
+	logBody, readErr := os.ReadFile(env.cronjobCreateLog)
+	if readErr != nil {
+		t.Fatalf("read CronJob create log: %v", readErr)
+	}
+	lines := strings.Split(strings.TrimSpace(string(logBody)), "\n")
+	if len(lines) != 1 || lines[0] == "" {
+		t.Fatalf("CronJob create log = %q, want exactly one verification Job creation", logBody)
+	}
+	if !strings.HasPrefix(lines[0], "selfservice-synthetic-api-monitor-deploy-verify-") {
+		t.Fatalf("CronJob create log %q did not record only the API monitor verification Job", logBody)
+	}
+	jobBody, readErr := os.ReadFile(env.cronjobVerifyManifest)
+	if readErr != nil {
+		t.Fatalf("read created verification Job: %v", readErr)
+	}
+	var job struct {
+		Spec struct {
+			Template struct {
+				Spec struct {
+					Containers []struct {
+						Name string `json:"name"`
+						Env  []struct {
+							Name  string `json:"name"`
+							Value string `json:"value"`
+						} `json:"env"`
+					} `json:"containers"`
+				} `json:"spec"`
+			} `json:"template"`
+		} `json:"spec"`
+	}
+	if err := json.Unmarshal(jobBody, &job); err != nil {
+		t.Fatalf("decode created verification Job: %v", err)
+	}
+	var lifecycleValues []string
+	for _, container := range job.Spec.Template.Spec.Containers {
+		if container.Name != "synthetic-api-monitor" {
+			continue
+		}
+		for _, envVar := range container.Env {
+			if envVar.Name == "SYNTHETIC_LIFECYCLE_ENABLED" {
+				lifecycleValues = append(lifecycleValues, envVar.Value)
 			}
-			if !strings.Contains(string(output), test.wantOutput) {
-				t.Fatalf("output %q does not contain %q", output, test.wantOutput)
-			}
-			if _, statErr := os.Stat(env.cronjobVerifyManifest); !os.IsNotExist(statErr) {
-				t.Fatalf("malformed verification Job was created: %v", statErr)
-			}
-			if _, statErr := os.Stat(env.lockFile); statErr != nil {
-				t.Fatalf("verification failure did not retain the release lock: %v", statErr)
-			}
-		})
+		}
+	}
+	if len(lifecycleValues) != 1 || lifecycleValues[0] != "false" {
+		t.Fatalf("verification Job lifecycle values = %v, want exactly [false]", lifecycleValues)
+	}
+	if strings.Contains(string(logBody), "selfservice-synthetic-runner") || strings.Contains(string(logBody), "selfservice-synthetic-janitor") {
+		t.Fatalf("suspended runner/janitor must not create verification Jobs: %q", logBody)
+	}
+	applied, readErr := os.ReadFile(env.appliedManifest)
+	if readErr != nil {
+		t.Fatalf("read applied candidate manifest: %v", readErr)
+	}
+	if got := manifestEnvValue(t, string(applied), "SYNTHETIC_LIFECYCLE_ENABLED"); got != "false" {
+		t.Fatalf("candidate CronJob lifecycle = %q, want false", got)
+	}
+	if got := manifestEnvValue(t, string(applied), "PROVISIONING_ENABLED"); got != "false" {
+		t.Fatalf("candidate API provisioning enabled = %q, want false", got)
+	}
+	if got := manifestEnvValue(t, string(applied), "SYNTHETIC_PROVISIONING_EXPECTED_ENABLED"); got != "false" {
+		t.Fatalf("candidate CronJob provisioning expectation = %q, want false", got)
 	}
 }
 
@@ -6466,6 +6439,7 @@ type deployScriptEnvironment struct {
 	currentRollbackValues     string
 	cronjobVerifyMark         string
 	cronjobVerifyManifest     string
+	cronjobCreateLog          string
 	claimsPausedMark          string
 	claimsResumedMark         string
 	warmerRolloutMark         string
@@ -6609,6 +6583,7 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 		currentRollbackValues:     filepath.Join(root, "current-rollback-values.json"),
 		cronjobVerifyMark:         filepath.Join(root, "cronjob-verified"),
 		cronjobVerifyManifest:     filepath.Join(root, "cronjob-verification-job.json"),
+		cronjobCreateLog:          filepath.Join(root, "cronjob-create.log"),
 		claimsPausedMark:          filepath.Join(root, "claims-paused.marker"),
 		claimsResumedMark:         filepath.Join(root, "claims-resumed.marker"),
 		warmerRolloutMark:         filepath.Join(root, "warmer-rollout.marker"),
@@ -7777,6 +7752,9 @@ case "$1" in
           exit 98
         fi
       fi
+      if [ -n "$FAKE_CRONJOB_CREATE_LOG" ]; then
+        printf '%s\n' "$(jq -r '.metadata.name' "$manifest")" >> "$FAKE_CRONJOB_CREATE_LOG"
+      fi
       cp "$manifest" "$FAKE_CRONJOB_VERIFY_MANIFEST"
       : > "$FAKE_CRONJOB_VERIFY_MARKER"
       printf 'job.batch/%s created\n' "$(jq -r '.metadata.name' "$manifest")"
@@ -8414,6 +8392,7 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_CURRENT_ROLLBACK_VALUES="+e.currentRollbackValues,
 		"FAKE_CRONJOB_VERIFY_MARKER="+e.cronjobVerifyMark,
 		"FAKE_CRONJOB_VERIFY_MANIFEST="+e.cronjobVerifyManifest,
+		"FAKE_CRONJOB_CREATE_LOG="+e.cronjobCreateLog,
 		"FAKE_CRONJOB_VERIFICATION_SHAPE="+e.cronjobVerificationShape,
 		"FAKE_CLAIMS_PAUSED_MARKER="+e.claimsPausedMark,
 		"FAKE_CLAIMS_RESUMED_MARKER="+e.claimsResumedMark,
@@ -8537,6 +8516,9 @@ spec:
       containers:
       - name: api-gateway
         image: ` + image("api-gateway", "ghcr.io/jmal1/selfservice-api-gateway") + `
+        env:
+        - name: PROVISIONING_ENABLED
+          value: "false"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -8626,6 +8608,8 @@ spec:
               value: "false"
             - name: SYNTHETIC_CONTENT_FILTER_CATEGORY_FEED_BASE_URL
               value: ""
+            - name: SYNTHETIC_PROVISIONING_EXPECTED_ENABLED
+              value: "false"
             - name: SYNTHETIC_RUNNER_EXPECTED_ENABLED
               value: "false"
             - name: SYNTHETIC_LIFECYCLE_ENABLED

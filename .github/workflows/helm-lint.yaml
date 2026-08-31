@@ -50,24 +50,32 @@ jobs:
         run: helm template selfservice . -f values.yaml -f values.prod.yaml > rendered-prod.yaml
 
       # Guards the 2026-08-25 dry-run failure: deploy.sh's
-      # validate_foundation_intent requires SYNTHETIC_LIFECYCLE_ENABLED to
-      # render EXACTLY ONCE with an explicit boolean. Wrapping it in the
-      # synthetic.lifecycle.enabled conditional makes it disappear entirely,
-      # which `helm template ... > /dev/null` alone does not catch.
-      - name: assert SYNTHETIC_LIFECYCLE_ENABLED=true in prod render
+      # validate_foundation_intent requires the rendered foundation facts to
+      # stay explicit booleans rather than drifting behind defaults or omitted
+      # envs. `helm template ... > /dev/null` alone does not catch that.
+      - name: assert SYNTHETIC_LIFECYCLE_ENABLED=false in prod render
         working-directory: deploy/helm/selfservice
         run: |
           set -euo pipefail
-          count=$(grep -c '^\s*- name: SYNTHETIC_LIFECYCLE_ENABLED$' rendered-prod.yaml)
-          if [ "$count" -ne 1 ]; then
-            echo "ERROR: prod render has SYNTHETIC_LIFECYCLE_ENABLED $count times, want exactly 1" >&2
-            exit 1
-          fi
-          value=$(grep -A1 '^\s*- name: SYNTHETIC_LIFECYCLE_ENABLED$' rendered-prod.yaml | tail -1)
-          if ! echo "$value" | grep -qx '\s*value: "true"'; then
-            echo "ERROR: prod render's SYNTHETIC_LIFECYCLE_ENABLED is not explicit true: $value" >&2
-            exit 1
-          fi
+          assert_env() {
+            local name=$1
+            local want=$2
+            local count value
+            count=$(grep -c "^[[:space:]]*- name: ${name}$" rendered-prod.yaml)
+            if [ "$count" -ne 1 ]; then
+              echo "ERROR: prod render has $name $count times, want exactly 1" >&2
+              exit 1
+            fi
+            value=$(grep -A1 "^[[:space:]]*- name: ${name}$" rendered-prod.yaml | tail -1)
+            if ! echo "$value" | grep -Eq "^[[:space:]]*value: \"${want}\"$"; then
+              echo "ERROR: prod render's $name is not explicit ${want}: $value" >&2
+              exit 1
+            fi
+          }
+          assert_env PROVISIONING_ENABLED false
+          assert_env SYNTHETIC_PROVISIONING_EXPECTED_ENABLED false
+          assert_env SYNTHETIC_RUNNER_EXPECTED_ENABLED false
+          assert_env SYNTHETIC_LIFECYCLE_ENABLED false
 
       - name: helm lint and template (approved full-fleet overlay)
         working-directory: deploy/helm/selfservice
@@ -79,13 +87,22 @@ jobs:
         working-directory: deploy/helm/selfservice
         run: |
           set -euo pipefail
-          count=$(grep -c '^\s*- name: SYNTHETIC_LIFECYCLE_ENABLED$' rendered-full-fleet.yaml)
-          if [ "$count" -ne 1 ]; then
-            echo "ERROR: full-fleet render has SYNTHETIC_LIFECYCLE_ENABLED $count times, want exactly 1" >&2
-            exit 1
-          fi
-          value=$(grep -A1 '^\s*- name: SYNTHETIC_LIFECYCLE_ENABLED$' rendered-full-fleet.yaml | tail -1)
-          if ! echo "$value" | grep -qx '\s*value: "true"'; then
-            echo "ERROR: full-fleet render's SYNTHETIC_LIFECYCLE_ENABLED is not explicit true: $value" >&2
-            exit 1
-          fi
+          assert_env() {
+            local name=$1
+            local want=$2
+            local count value
+            count=$(grep -c "^[[:space:]]*- name: ${name}$" rendered-full-fleet.yaml)
+            if [ "$count" -ne 1 ]; then
+              echo "ERROR: full-fleet render has $name $count times, want exactly 1" >&2
+              exit 1
+            fi
+            value=$(grep -A1 "^[[:space:]]*- name: ${name}$" rendered-full-fleet.yaml | tail -1)
+            if ! echo "$value" | grep -Eq "^[[:space:]]*value: \"${want}\"$"; then
+              echo "ERROR: full-fleet render's $name is not explicit ${want}: $value" >&2
+              exit 1
+            fi
+          }
+          assert_env PROVISIONING_ENABLED true
+          assert_env SYNTHETIC_PROVISIONING_EXPECTED_ENABLED true
+          assert_env SYNTHETIC_RUNNER_EXPECTED_ENABLED true
+          assert_env SYNTHETIC_LIFECYCLE_ENABLED true
