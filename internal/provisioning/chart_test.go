@@ -64,9 +64,11 @@ type chartValues struct {
 		} `yaml:"lifecycle"`
 		Janitor struct {
 			Enabled bool `yaml:"enabled"`
+			Suspend bool `yaml:"suspend"`
 		} `yaml:"janitor"`
 		Runner struct {
 			Enabled bool `yaml:"enabled"`
+			Suspend bool `yaml:"suspend"`
 		} `yaml:"runner"`
 	} `yaml:"synthetic"`
 }
@@ -123,6 +125,12 @@ func TestChartProvisioningDefaultsRemainCompatible(t *testing.T) {
 	if !values.Synthetic.ProvisioningExpectedEnabled {
 		t.Fatal("default synthetic must expect provisioning enabled")
 	}
+	if values.Synthetic.Suspend {
+		t.Fatal("default synthetic API monitor CronJob must remain unsuspended")
+	}
+	if values.Synthetic.Runner.Suspend || values.Synthetic.Janitor.Suspend {
+		t.Fatalf("default synthetic CronJobs must remain unsuspended: %+v", values.Synthetic)
+	}
 	if values.Worker.ShutdownGracePeriodSeconds < 120 {
 		t.Fatalf(
 			"worker shutdown grace = %d seconds, want at least the two-minute durable handoff window",
@@ -133,6 +141,9 @@ func TestChartProvisioningDefaultsRemainCompatible(t *testing.T) {
 		"provisioning.enabled":                  "true",
 		"provisioning.workerClaimsEnabled":      "true",
 		"synthetic.provisioningExpectedEnabled": "true",
+		"synthetic.suspend":                     "false",
+		"synthetic.runner.suspend":              "false",
+		"synthetic.janitor.suspend":             "false",
 	} {
 		parts := strings.Split(path, ".")
 		if got := chartScalar(t, "values.yaml", parts...); got != want {
@@ -211,17 +222,18 @@ func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T
 	if values.ReplicaCount.Worker != 1 {
 		t.Errorf("production worker replicas = %d, want exactly 1 while ESXi2 remains quarantined", values.ReplicaCount.Worker)
 	}
-	if !values.Provisioning.Enabled || values.Provisioning.WorkerClaimsEnabled {
-		t.Fatalf("production provisioning controls = %+v, want admission on and chart-rendered worker claims gated", values.Provisioning)
+	if values.Provisioning.Enabled || values.Provisioning.WorkerClaimsEnabled {
+		t.Fatalf("production provisioning controls = %+v, want admission off and chart-rendered worker claims gated", values.Provisioning)
 	}
-	if !values.Synthetic.ProvisioningExpectedEnabled {
-		t.Fatal("production synthetic must expect provisioning enabled")
+	if values.Synthetic.ProvisioningExpectedEnabled {
+		t.Fatal("production synthetic must expect provisioning disabled")
 	}
 	if values.Synthetic.Suspend {
 		t.Fatal("production non-mutating API monitor CronJob must remain active")
 	}
-	if !values.Synthetic.Lifecycle.Enabled || !values.Synthetic.Runner.Enabled || !values.Synthetic.Janitor.Enabled {
-		t.Fatalf("production mutating synthetics must remain enabled after the live provisioning proof: %+v", values.Synthetic)
+	if values.Synthetic.Lifecycle.Enabled || !values.Synthetic.Runner.Enabled || !values.Synthetic.Janitor.Enabled ||
+		!values.Synthetic.Runner.Suspend || !values.Synthetic.Janitor.Suspend {
+		t.Fatalf("production mutating synthetics must stay enabled but suspended after the live provisioning proof: %+v", values.Synthetic)
 	}
 	if values.VCenter.Hosts != "esxi1.lab.jmal.io" {
 		t.Fatalf("production VCENTER_HOSTS = %q, want ESXi1 only", values.VCenter.Hosts)
@@ -246,12 +258,15 @@ func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T
 	}
 	for path, want := range map[string]string{
 		"replicaCount.worker":                   "1",
-		"provisioning.enabled":                  "true",
+		"provisioning.enabled":                  "false",
 		"provisioning.workerClaimsEnabled":      "false",
-		"synthetic.provisioningExpectedEnabled": "true",
-		"synthetic.lifecycle.enabled":           "true",
+		"synthetic.provisioningExpectedEnabled": "false",
+		"synthetic.suspend":                     "false",
+		"synthetic.lifecycle.enabled":           "false",
 		"synthetic.janitor.enabled":             "true",
 		"synthetic.runner.enabled":              "true",
+		"synthetic.janitor.suspend":             "true",
+		"synthetic.runner.suspend":              "true",
 		"vcenter.hosts":                         "esxi1.lab.jmal.io",
 		"vcenter.resourcePools":                 "/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs",
 		"vcenter.insecure":                      "false",
@@ -279,10 +294,13 @@ func TestFullFleetOverlayRendersApprovedFinalState(t *testing.T) {
 	if !values.Provisioning.Enabled || !values.Provisioning.WorkerClaimsEnabled {
 		t.Fatalf("full-fleet provisioning controls = %+v, want enabled", values.Provisioning)
 	}
-	if !values.Synthetic.ProvisioningExpectedEnabled ||
+	if values.Synthetic.Suspend ||
+		!values.Synthetic.ProvisioningExpectedEnabled ||
 		!values.Synthetic.Lifecycle.Enabled ||
 		!values.Synthetic.Janitor.Enabled ||
-		!values.Synthetic.Runner.Enabled {
+		!values.Synthetic.Runner.Enabled ||
+		values.Synthetic.Janitor.Suspend ||
+		values.Synthetic.Runner.Suspend {
 		t.Fatalf("full-fleet synthetics are not fully enabled: %+v", values.Synthetic)
 	}
 	if !values.Worker.L1Validation.Enabled ||
@@ -369,6 +387,14 @@ func TestChartWiresEveryProvisioningControl(t *testing.T) {
 			".Values.synthetic.provisioningExpectedEnabled",
 			"SYNTHETIC_RUNNER_EXPECTED_ENABLED",
 			".Values.synthetic.runner.enabled",
+			".Values.synthetic.runner.suspend",
+			"and .Values.synthetic.runner.enabled (not .Values.synthetic.runner.suspend)",
+		},
+		"synthetic-runner-cronjob.yaml": {
+			"suspend: {{ .Values.synthetic.runner.suspend }}",
+		},
+		"synthetic-janitor-cronjob.yaml": {
+			"suspend: {{ .Values.synthetic.janitor.suspend }}",
 		},
 	}
 	for name, fragments := range files {
@@ -518,11 +544,11 @@ func TestSyntheticCronJobLifecycleEnabledRendersAcrossOverlays(t *testing.T) {
 		}
 	}
 
-	assertExactlyOne(t, render("values.prod.yaml"), "values.prod.yaml", "true")
+	assertExactlyOne(t, render("values.prod.yaml"), "values.prod.yaml", "false")
 	assertExactlyOne(t, render("values.full-fleet.yaml"), "values.full-fleet.yaml", "true")
 }
 
-func TestCloneSyntheticCronJobsRenderExplicitUnsuspendedState(t *testing.T) {
+func TestCloneSyntheticCronJobsRenderSuspensionAcrossOverlays(t *testing.T) {
 	helmPath, err := exec.LookPath("helm")
 	if err != nil {
 		t.Skip("helm not available")
@@ -532,7 +558,7 @@ func TestCloneSyntheticCronJobsRenderExplicitUnsuspendedState(t *testing.T) {
 		t.Skip("chart dependencies not vendored; run `helm dependency build` in deploy/helm/selfservice first")
 	}
 
-	assertUnsuspended := func(rendered, wantName string) error {
+	assertSuspension := func(rendered, wantName string, wantSuspended bool) error {
 		var document struct {
 			Kind     string `yaml:"kind"`
 			Metadata struct {
@@ -565,31 +591,38 @@ func TestCloneSyntheticCronJobsRenderExplicitUnsuspendedState(t *testing.T) {
 			if document.Spec.Suspend == nil {
 				return fmt.Errorf("%s omits spec.suspend", wantName)
 			}
-			if *document.Spec.Suspend {
-				return fmt.Errorf("%s renders spec.suspend=true", wantName)
+			if *document.Spec.Suspend != wantSuspended {
+				return fmt.Errorf("%s renders spec.suspend=%t, want %t", wantName, *document.Spec.Suspend, wantSuspended)
 			}
 			return nil
 		}
 		return fmt.Errorf("did not render CronJob/%s", wantName)
 	}
 
-	t.Run("sabotage predicate rejects omitted or true suspension", func(t *testing.T) {
+	t.Run("sabotage predicate rejects omitted or wrong suspension", func(t *testing.T) {
 		for _, test := range []struct {
-			name     string
-			manifest string
+			name          string
+			manifest      string
+			wantSuspended bool
 		}{
-			{name: "selfservice-synthetic-janitor", manifest: "kind: CronJob\nmetadata:\n  name: selfservice-synthetic-janitor\nspec: {}\n"},
-			{name: "selfservice-synthetic-runner", manifest: "kind: CronJob\nmetadata:\n  name: selfservice-synthetic-runner\nspec:\n  suspend: true\n"},
+			{name: "selfservice-synthetic-janitor", manifest: "kind: CronJob\nmetadata:\n  name: selfservice-synthetic-janitor\nspec: {}\n", wantSuspended: false},
+			{name: "selfservice-synthetic-runner", manifest: "kind: CronJob\nmetadata:\n  name: selfservice-synthetic-runner\nspec:\n  suspend: true\n", wantSuspended: false},
 		} {
-			if err := assertUnsuspended(test.manifest, test.name); err == nil {
+			if err := assertSuspension(test.manifest, test.name, test.wantSuspended); err == nil {
 				t.Fatalf("sabotaged CronJob manifest unexpectedly passed: %s", test.manifest)
 			}
 		}
 	})
 
-	for _, overlay := range []string{"values.prod.yaml", "values.full-fleet.yaml"} {
-		t.Run(overlay, func(t *testing.T) {
-			args := []string{"template", "selfservice", ".", "-f", "values.yaml", "-f", overlay}
+	for _, test := range []struct {
+		overlay       string
+		wantSuspended bool
+	}{
+		{overlay: "values.prod.yaml", wantSuspended: true},
+		{overlay: "values.full-fleet.yaml", wantSuspended: false},
+	} {
+		t.Run(test.overlay, func(t *testing.T) {
+			args := []string{"template", "selfservice", ".", "-f", "values.yaml", "-f", test.overlay}
 			cmd := exec.Command(helmPath, args...)
 			cmd.Dir = chartDir
 			rendered, err := cmd.CombinedOutput()
@@ -597,7 +630,7 @@ func TestCloneSyntheticCronJobsRenderExplicitUnsuspendedState(t *testing.T) {
 				t.Fatalf("helm template: %v\n%s", err, rendered)
 			}
 			for _, name := range []string{"selfservice-synthetic-janitor", "selfservice-synthetic-runner"} {
-				if err := assertUnsuspended(string(rendered), name); err != nil {
+				if err := assertSuspension(string(rendered), name, test.wantSuspended); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -741,6 +774,6 @@ func TestSyntheticCronJobRunnerExpectedEnabledRendersAcrossOverlays(t *testing.T
 		}
 	}
 
-	assertExactlyOne(t, render("values.prod.yaml"), "values.prod.yaml", "true")
+	assertExactlyOne(t, render("values.prod.yaml"), "values.prod.yaml", "false")
 	assertExactlyOne(t, render("values.full-fleet.yaml"), "values.full-fleet.yaml", "true")
 }

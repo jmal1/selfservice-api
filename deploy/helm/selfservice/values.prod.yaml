@@ -11,14 +11,14 @@
 #   - Vault path: secret/selfservice/<secret-name>
 
 replicaCount:
-  # Reopen provisioning with one worker after the ESXi1 canary validated
-  # host-pinned placement, durable receipts, and exact-MoRef cleanup.
+  # Keep one worker online for cleanup/orphan recovery while production stays
+  # admission-contained.
   worker: 1
 
 provisioning:
-  # Keep API admission visible but gate new provisioning claims for the first
-  # hotfix rollout. Enable claims only after migration and residue checks.
-  enabled: true
+  # Production stays in admission-contained mode until the rollout is
+  # deliberately reopened.
+  enabled: false
   workerClaimsEnabled: false
 
 vcenter:
@@ -34,18 +34,19 @@ vcenter:
   # chain. Keep hostname verification enabled in every production process.
   insecure: "false"
 
-# Synthetic monitoring includes the non-mutating API monitor plus the
-# clone-producing lifecycle, janitor, and runner checks. deploy.sh still
-# contains rollback safety by forcing clone-producing CronJobs off before a
-# guarded apply and after a failed atomic rollback.
+# Synthetic monitoring keeps the non-mutating API monitor active while the
+# lifecycle check stays disabled and the runner/janitor CronJobs stay
+# rendered but suspended. deploy.sh still contains rollback safety by
+# forcing clone-producing CronJobs off before a guarded apply and after a
+# failed atomic rollback.
 synthetic:
-  # Keep the non-mutating API monitor active. Destructive lifecycle coverage
-  # remains independently gated below.
+  # Keep the non-mutating API monitor active while the cluster remains
+  # admission-contained.
   suspend: false
   schedule: "*/12 * * * *"
-  provisioningExpectedEnabled: true
+  provisioningExpectedEnabled: false
   lifecycle:
-    enabled: true
+    enabled: false
     template: synthetic-noop
     # Pinned to the production-calibrated value. Must agree with
     # values.yaml and DefaultPodLifecycleConfig in lifecycle.go.
@@ -57,12 +58,14 @@ synthetic:
     retryBackoff: 30s
   janitor:
     enabled: true
+    suspend: true
   # Hourly end-to-end proof of the Kali runner path (Multus NAD, CNI dhcp lease,
   # pod-VLAN L3 reachability, nmap). Chart defaults already match prod: it clones
   # the synthetic-noop template and runs the version-controlled playlist seeded by
   # deploy/sql/synthetic-runner-smoke-playlist.sql.
   runner:
     enabled: true
+    suspend: true
     schedule: "37 * * * *"
     # Explicitly pin the deadline. The Runner-authorized retry cycle is
     # 2490s = 41m30s and its bounded session JWT TTL is 46m;

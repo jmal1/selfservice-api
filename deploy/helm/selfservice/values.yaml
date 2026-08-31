@@ -399,6 +399,7 @@ synthetic:
   # `synthetic_janitor`; severity is warning. See checks/janitor.go.
   janitor:
     enabled: false
+    suspend: false
     # Daily at 04:17 UTC — offset to avoid colliding with backup or monitor cron.
     schedule: "17 4 * * *"
     # Orphan-age cutoff. Pods named synthetic-noop-* and older than this are
@@ -429,6 +430,7 @@ synthetic:
   # collision; this key exists to make the intent visible, not to enable it.
   runner:
     enabled: false
+    suspend: false
     # Hourly at :37 -- offset from the */12 monitor and the 04:17 janitor so
     # three synthetic pods never contend for the same vCenter clone slot.
     schedule: "37 * * * *"
