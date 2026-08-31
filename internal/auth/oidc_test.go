@@ -1,8 +1,21 @@
 package auth
 
 import (
+	"context"
+	"encoding/json"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/oauth2"
+
+	"github.com/jmal1/selfservice-api/internal/database"
 )
 
 func TestBuildEndSessionURL(t *testing.T) {
@@ -63,5 +76,133 @@ func TestBuildEndSessionURL(t *testing.T) {
 				t.Errorf("post_logout_redirect_uri = %q, want %q", q.Get("post_logout_redirect_uri"), tt.wantPostLogin)
 			}
 		})
+	}
+}
+
+func TestLoginHandlerRedirectsWithCSRFStateCookie(t *testing.T) {
+	provider := &Provider{
+		oauth2Config: oauth2.Config{
+			ClientID:    "selfservice-client",
+			RedirectURL: "https://app.example.test/auth/callback",
+			Endpoint: oauth2.Endpoint{
+				AuthURL:  "https://idp.example.test/application/o/authorize/",
+				TokenURL: "https://idp.example.test/application/o/token/",
+			},
+			Scopes: []string{"openid", "profile", "email"},
+		},
+		logger: slog.Default(),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/auth/login", nil)
+	rec := httptest.NewRecorder()
+	provider.LoginHandler(rec, req)
+
+	if rec.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusTemporaryRedirect)
+	}
+	loc, err := url.Parse(rec.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("Location is not a valid URL: %v", err)
+	}
+	if got := loc.Query().Get("client_id"); got != "selfservice-client" {
+		t.Fatalf("state flow client_id = %q, want %q", got, "selfservice-client")
+	}
+	if loc.Query().Get("redirect_uri") != "https://app.example.test/auth/callback" {
+		t.Fatalf("redirect_uri = %q, want %q", loc.Query().Get("redirect_uri"), "https://app.example.test/auth/callback")
+	}
+	if loc.Query().Get("state") == "" {
+		t.Fatal("state missing from redirect URL")
+	}
+
+	cookies := rec.Result().Cookies()
+	var stateCookie *http.Cookie
+	for i := range cookies {
+		if cookies[i].Name == "oauth_state" {
+			stateCookie = cookies[i]
+			break
+		}
+	}
+	if stateCookie == nil {
+		t.Fatal("oauth_state cookie was not set")
+	}
+	if !stateCookie.HttpOnly || !stateCookie.Secure || stateCookie.Path != "/" || stateCookie.MaxAge != 300 {
+		t.Fatalf("oauth_state cookie has unexpected security attributes: %#v", stateCookie)
+	}
+	if stateCookie.Value != loc.Query().Get("state") {
+		t.Fatalf("oauth_state cookie value %q does not match redirect state %q", stateCookie.Value, loc.Query().Get("state"))
+	}
+}
+
+func TestCallbackHandlerRejectsStateMismatch(t *testing.T) {
+	provider := &Provider{logger: slog.Default()}
+
+	req := httptest.NewRequest(http.MethodGet, "/auth/callback?state=wrong-state", nil)
+	req.AddCookie(&http.Cookie{Name: "oauth_state", Value: "expected-state"})
+	rec := httptest.NewRecorder()
+	provider.CallbackHandler(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+	if !strings.Contains(rec.Body.String(), "invalid state") {
+		t.Fatalf("body = %q, want invalid state error", rec.Body.String())
+	}
+}
+
+func TestLogoutHandlerClearsSessionCookieAndReturnsJSON(t *testing.T) {
+	secret := []byte("logout-secret")
+	pool, err := pgxpool.New(context.Background(), "postgres://postgres:postgres@127.0.0.1:1/selfservice")
+	if err != nil {
+		t.Fatalf("create pgx pool: %v", err)
+	}
+	defer pool.Close()
+	provider := &Provider{jwtSecret: secret, logger: slog.Default(), queries: database.NewQueries(pool)}
+
+	claims := SessionClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   "550e8400-e29b-41d4-a716-446655440000",
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+			Issuer:    "selfservice-api",
+		},
+		UserID:    "550e8400-e29b-41d4-a716-446655440000",
+		Username:  "demo-user",
+		Role:      "student",
+		SessionID: "",
+	}
+	jwtToken, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(secret)
+	if err != nil {
+		t.Fatalf("sign JWT: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	req.AddCookie(&http.Cookie{Name: "session", Value: jwtToken})
+	rec := httptest.NewRecorder()
+	provider.LogoutHandler(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var resp map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode JSON logout response: %v", err)
+	}
+	if resp["status"] != "logged_out" {
+		t.Fatalf("status field = %q, want %q", resp["status"], "logged_out")
+	}
+
+	var sessionCookie *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == "session" {
+			sessionCookie = c
+			break
+		}
+	}
+	if sessionCookie == nil {
+		t.Fatal("session cookie was not cleared")
+	}
+	if sessionCookie.Value != "" || sessionCookie.MaxAge != -1 || !sessionCookie.HttpOnly || !sessionCookie.Secure {
+		t.Fatalf("session cookie not cleared as expected: %#v", sessionCookie)
 	}
 }

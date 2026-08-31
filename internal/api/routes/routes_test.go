@@ -207,6 +207,90 @@ func TestStudentGuideRoutesAreRegistered(t *testing.T) {
 	}
 }
 
+func TestReadinessAndConsoleRoutes(t *testing.T) {
+	provider := auth.NewTestProvider([]byte(testJWTSecret))
+	h := handlers.NewHandler(nil, nil, nil, slog.Default(), []string{"https://example.test"})
+	router := Setup(h, provider, nil, []string{"https://example.test"})
+
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		cookie     *http.Cookie
+		wantStatus int
+		wantBody   string
+	}{
+		{
+			name:       "readyz is live",
+			method:     http.MethodGet,
+			path:       "/readyz",
+			wantStatus: http.StatusOK,
+			wantBody:   "\"status\":\"ok\"",
+		},
+		{
+			name:       "pod vm console requires auth",
+			method:     http.MethodGet,
+			path:       "/api/v1/pods/not-a-uuid/vms/not-a-uuid/console/ws",
+			wantStatus: http.StatusUnauthorized,
+			wantBody:   "unauthorized",
+		},
+		{
+			name:       "pod vm console validates ids after auth",
+			method:     http.MethodGet,
+			path:       "/api/v1/pods/not-a-uuid/vms/not-a-uuid/console/ws",
+			cookie:     makeSessionCookie(t, models.RoleStudent),
+			wantStatus: http.StatusBadRequest,
+			wantBody:   "invalid pod id",
+		},
+		{
+			name:       "template console forbids student users",
+			method:     http.MethodGet,
+			path:       "/api/v1/admin/templates/00000000-0000-0000-0000-000000000001/console/ws",
+			cookie:     makeSessionCookie(t, models.RoleStudent),
+			wantStatus: http.StatusForbidden,
+			wantBody:   "forbidden",
+		},
+		{
+			name:       "template console validates template id after auth",
+			method:     http.MethodGet,
+			path:       "/api/v1/admin/templates/not-a-uuid/console/ws",
+			cookie:     makeSessionCookie(t, models.RoleInstructor),
+			wantStatus: http.StatusBadRequest,
+			wantBody:   "invalid template id",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(tt.method, tt.path, nil)
+			if tt.cookie != nil {
+				req.AddCookie(tt.cookie)
+			}
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d (body=%s)", rec.Code, tt.wantStatus, rec.Body.String())
+			}
+			if tt.wantBody != "" && !strings.Contains(rec.Body.String(), tt.wantBody) {
+				t.Fatalf("body = %q, want substring %q", rec.Body.String(), tt.wantBody)
+			}
+		})
+	}
+}
+
+func TestAuthRoutesAreRegistered(t *testing.T) {
+	found := walkRoutes(t)
+	for _, want := range []string{
+		"GET /auth/login",
+		"GET /auth/callback",
+		"POST /auth/logout",
+	} {
+		if !found[want] {
+			t.Errorf("auth route not registered: %s", want)
+		}
+	}
+}
+
 func TestProvisioningStatusRouteIsAuthenticated(t *testing.T) {
 	found := walkRoutes(t)
 	if !found["GET /api/v1/provisioning/status"] {
