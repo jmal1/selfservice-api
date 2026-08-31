@@ -221,6 +221,15 @@ func validateTestingRunAccess(podOwnerID, userID uuid.UUID, role string) int {
 	return http.StatusForbidden
 }
 
+// validateTestingRunPodMatch returns 0 when the run belongs to the pod in the
+// route, otherwise NotFound to avoid leaking another pod's run metadata.
+func validateTestingRunPodMatch(runPodID, podID uuid.UUID) int {
+	if runPodID == podID {
+		return 0
+	}
+	return http.StatusNotFound
+}
+
 // GetTestingRun returns a single run with results (owner/instructor/admin view).
 func (h *Handler) GetTestingRun(w http.ResponseWriter, r *http.Request) {
 	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
@@ -257,8 +266,8 @@ func (h *Handler) GetTestingRun(w http.ResponseWriter, r *http.Request) {
 		respondError(w, r, http.StatusNotFound, "run not found")
 		return
 	}
-	if run.PodID != podID {
-		respondError(w, r, http.StatusNotFound, "run not found")
+	if status := validateTestingRunPodMatch(run.PodID, podID); status != 0 {
+		respondError(w, r, status, "run not found")
 		return
 	}
 
@@ -307,6 +316,10 @@ func (h *Handler) CancelTestingRun(w http.ResponseWriter, r *http.Request) {
 	run, err := h.db.GetRun(r.Context(), runID)
 	if err != nil {
 		respondError(w, r, http.StatusNotFound, "run not found")
+		return
+	}
+	if status := validateTestingRunPodMatch(run.PodID, podID); status != 0 {
+		respondError(w, r, status, "run not found")
 		return
 	}
 

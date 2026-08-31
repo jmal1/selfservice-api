@@ -21,6 +21,54 @@ func requestWithRouteParams(t *testing.T, url string, params map[string]string) 
 	return httptest.NewRequest(http.MethodGet, url, nil).WithContext(context.WithValue(context.Background(), chi.RouteCtxKey, ctx))
 }
 
+func TestValidateTestingRunPodMatch(t *testing.T) {
+	podID := uuid.New()
+	otherID := uuid.New()
+
+	tests := []struct {
+		name   string
+		runPod uuid.UUID
+		podID  uuid.UUID
+		want   int
+	}{
+		{name: "same pod", runPod: podID, podID: podID, want: 0},
+		{name: "different pod", runPod: podID, podID: otherID, want: http.StatusNotFound},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := validateTestingRunPodMatch(tc.runPod, tc.podID); got != tc.want {
+				t.Fatalf("validateTestingRunPodMatch() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidatePodOwnerAccess(t *testing.T) {
+	ownerID := uuid.New()
+	otherID := uuid.New()
+
+	tests := []struct {
+		name       string
+		podOwnerID uuid.UUID
+		userID     uuid.UUID
+		role       string
+		want       int
+	}{
+		{name: "owner student allowed", podOwnerID: ownerID, userID: ownerID, role: models.RoleStudent, want: 0},
+		{name: "other student denied", podOwnerID: ownerID, userID: otherID, role: models.RoleStudent, want: http.StatusForbidden},
+		{name: "admin override allowed", podOwnerID: ownerID, userID: otherID, role: models.RoleAdmin, want: 0},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := validatePodOwnerAccess(tc.podOwnerID, tc.userID, tc.role); got != tc.want {
+				t.Fatalf("validatePodOwnerAccess() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestValidateTestingRunAccess(t *testing.T) {
 	ownerID := uuid.New()
 	otherID := uuid.New()

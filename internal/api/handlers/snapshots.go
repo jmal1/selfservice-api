@@ -34,8 +34,8 @@ func (h *Handler) ListVMSnapshots(w http.ResponseWriter, r *http.Request) {
 	}
 	userID := middleware.UserIDFromContext(r.Context())
 	role := middleware.RoleFromContext(r.Context())
-	if pod.OwnerID != userID && role != models.RoleAdmin {
-		http.Error(w, "forbidden", http.StatusForbidden)
+	if status := validatePodOwnerAccess(pod.OwnerID, userID, role); status != 0 {
+		http.Error(w, "forbidden", status)
 		return
 	}
 	vm, err := h.db.GetPodVM(r.Context(), vmID)
@@ -76,8 +76,8 @@ func (h *Handler) CreateVMSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 	userID := middleware.UserIDFromContext(r.Context())
 	role := middleware.RoleFromContext(r.Context())
-	if pod.OwnerID != userID && role != models.RoleAdmin {
-		http.Error(w, "forbidden", http.StatusForbidden)
+	if status := validatePodOwnerAccess(pod.OwnerID, userID, role); status != 0 {
+		http.Error(w, "forbidden", status)
 		return
 	}
 	vm, err := h.db.GetPodVM(r.Context(), vmID)
@@ -166,8 +166,8 @@ func (h *Handler) RevertToInitial(w http.ResponseWriter, r *http.Request) {
 	}
 	userID := middleware.UserIDFromContext(r.Context())
 	role := middleware.RoleFromContext(r.Context())
-	if pod.OwnerID != userID && role != models.RoleAdmin {
-		http.Error(w, "forbidden", http.StatusForbidden)
+	if status := validatePodOwnerAccess(pod.OwnerID, userID, role); status != 0 {
+		http.Error(w, "forbidden", status)
 		return
 	}
 	vm, err := h.db.GetPodVM(r.Context(), vmID)
@@ -261,8 +261,8 @@ func (h *Handler) RevertToSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 	userID := middleware.UserIDFromContext(r.Context())
 	role := middleware.RoleFromContext(r.Context())
-	if pod.OwnerID != userID && role != models.RoleAdmin {
-		http.Error(w, "forbidden", http.StatusForbidden)
+	if status := validatePodOwnerAccess(pod.OwnerID, userID, role); status != 0 {
+		http.Error(w, "forbidden", status)
 		return
 	}
 	vm, err := h.db.GetPodVM(r.Context(), vmID)
@@ -347,8 +347,8 @@ func (h *Handler) DeleteVMSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 	userID := middleware.UserIDFromContext(r.Context())
 	role := middleware.RoleFromContext(r.Context())
-	if pod.OwnerID != userID && role != models.RoleAdmin {
-		http.Error(w, "forbidden", http.StatusForbidden)
+	if status := validatePodOwnerAccess(pod.OwnerID, userID, role); status != 0 {
+		http.Error(w, "forbidden", status)
 		return
 	}
 	vm, err := h.db.GetPodVM(r.Context(), vmID)
