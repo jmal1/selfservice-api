@@ -3231,10 +3231,35 @@ verify_candidate_cronjob_image() {
   local container_type=$2
   local container_name=$3
   local expected=$4
-  local verification_job source_manifest verification_manifest contain_lifecycle actual
+  local verification_job source_manifest verification_manifest contain_lifecycle actual live_manifest_path suspended
   if [ "$container_type" != containers ]; then
     echo "ERROR: candidate CronJob/$name uses unsupported $container_type/$container_name for verification." >&2
     return 1
+  fi
+  live_manifest_path="$CANDIDATE_TMP_DIR/${name}-live.yaml"
+  if ! kubectl get "cronjob/$name" -n "$NAMESPACE" -o yaml > "$live_manifest_path"; then
+    echo "ERROR: could not read CronJob/$name before verifying its candidate image." >&2
+    return 1
+  fi
+  if ! suspended="$(cronjob_suspend_from_manifest "$live_manifest_path")"; then
+    echo "ERROR: could not read CronJob/$name suspension state before verifying its candidate image." >&2
+    return 1
+  fi
+  if [ "$suspended" = true ]; then
+    actual="$(
+      live_effective_image \
+        CronJob \
+        "$name" \
+        "$container_type" \
+        "$container_name" \
+        "$expected" \
+        "$live_manifest_path"
+    )"
+    if [ "$actual" != "$expected" ]; then
+      echo "ERROR: candidate live image drifted for CronJob/$name $container_type/$container_name: expected $expected, found $actual." >&2
+      return 1
+    fi
+    return 0
   fi
   verification_job="${name}-deploy-verify-$(date -u +%s)-$$"
   verification_job="${verification_job:0:63}"

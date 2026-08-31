@@ -346,6 +346,77 @@ printf '%s' "$actual"
 	return cmd.CombinedOutput()
 }
 
+func runSuspendedCandidateCronJobVerificationHarness(
+	t *testing.T,
+	deploySource string,
+	manifest string,
+	candidateName string,
+	containerName string,
+	expected string,
+) ([]byte, error) {
+	t.Helper()
+	requirePOSIXShell(t)
+
+	functions := []string{
+		"is_digest_image",
+		"manifest_workload_inventory",
+		"latest_cronjob_job",
+		"cronjob_suspend_from_manifest",
+		"live_effective_image",
+		"verify_candidate_cronjob_image",
+	}
+	var bodies strings.Builder
+	for _, name := range functions {
+		body, _, _, err := extractFunctionBody(deploySource, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bodies.WriteString(body)
+	}
+
+	root := t.TempDir()
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	functionsPath := filepath.Join(root, "functions.sh")
+	manifestPath := filepath.Join(root, "cronjob.yaml")
+	writeFile(t, functionsPath, bodies.String())
+	writeFile(t, manifestPath, manifest)
+	writeExecutable(t, filepath.Join(binDir, "kubectl"), `#!/bin/bash
+set -euo pipefail
+if [ "$1" = "get" ] && [[ "$2" == cronjob/* ]]; then
+  cat "$FAKE_MANIFEST"
+  exit 0
+fi
+if [ "$1" = "get" ] && [ "$2" = "jobs" ]; then
+  exit 0
+fi
+echo "unexpected kubectl invocation: $*" >&2
+exit 98
+`)
+
+	harnessPath := filepath.Join(root, "harness.sh")
+	writeExecutable(t, harnessPath, `#!/bin/bash
+set -euo pipefail
+NAMESPACE=selfservice
+CANDIDATE_TMP_DIR="$TMPDIR"
+source "$FUNCTIONS_FILE"
+verify_candidate_cronjob_image "$1" containers "$2" "$3"
+printf 'VERIFY_OK\n'
+	`)
+
+	cmd := exec.Command("bash", harnessPath, candidateName, containerName, expected)
+	cmd.Env = append(
+		os.Environ(),
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"FAKE_MANIFEST="+manifestPath,
+		"FUNCTIONS_FILE="+functionsPath,
+		"TMPDIR="+root,
+	)
+	return cmd.CombinedOutput()
+}
+
 func runCronJobHealthLookupHarness(t *testing.T, deploySource string) ([]byte, error) {
 	t.Helper()
 	requirePOSIXShell(t)
@@ -607,6 +678,100 @@ func TestDeployScriptSuspendedCronJobFallbackGuardsAreLoadBearing(t *testing.T) 
 			}
 			if !strings.HasSuffix(strings.TrimSpace(string(sabotagedOutput)), test.expected) {
 				t.Fatalf("sabotaged proof returned %q, want false acceptance of %q", sabotagedOutput, test.expected)
+			}
+		})
+	}
+}
+
+func TestDeployScriptSuspendedCandidateCronJobVerificationSkipsJobCreation(t *testing.T) {
+	requirePOSIXShell(t)
+
+	deployBody, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(deployBody)
+	suspendedGuard := `  if [ "$suspended" = true ]; then
+    actual="$(
+      live_effective_image \
+        CronJob \
+        "$name" \
+        "$container_type" \
+        "$container_name" \
+        "$expected" \
+        "$live_manifest_path"
+    )"
+    if [ "$actual" != "$expected" ]; then
+      echo "ERROR: candidate live image drifted for CronJob/$name $container_type/$container_name: expected $expected, found $actual." >&2
+      return 1
+    fi
+    return 0
+  fi`
+	if !strings.Contains(source, suspendedGuard) {
+		t.Fatal("suspended CronJob verification guard is missing")
+	}
+
+	tests := []struct {
+		name          string
+		candidateName string
+		containerName string
+		manifest      string
+		expected      string
+	}{
+		{
+			name:          "runner",
+			candidateName: "selfservice-synthetic-runner",
+			containerName: "synthetic-runner",
+			manifest:      suspendedCronJobManifest(true, "ghcr.io/jmal1/selfservice-crucible-runner@sha256:"+testDigestA, false),
+			expected:      "ghcr.io/jmal1/selfservice-crucible-runner@sha256:" + testDigestA,
+		},
+		{
+			name:          "janitor",
+			candidateName: "selfservice-synthetic-janitor",
+			containerName: "synthetic-janitor",
+			manifest: strings.ReplaceAll(
+				strings.ReplaceAll(
+					suspendedCronJobManifest(true, "ghcr.io/jmal1/selfservice-synthetic-api-monitor@sha256:"+testDigestA, false),
+					"selfservice-synthetic-runner",
+					"selfservice-synthetic-janitor",
+				),
+				"synthetic-runner",
+				"synthetic-janitor",
+			),
+			expected: "ghcr.io/jmal1/selfservice-synthetic-api-monitor@sha256:" + testDigestA,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			originalOutput, originalErr := runSuspendedCandidateCronJobVerificationHarness(
+				t,
+				source,
+				test.manifest,
+				test.candidateName,
+				test.containerName,
+				test.expected,
+			)
+			if originalErr != nil || !strings.Contains(string(originalOutput), "VERIFY_OK") {
+				t.Fatalf("suspended candidate verification should succeed without creating a Job: %v\n%s", originalErr, originalOutput)
+			}
+
+			sabotagedGuard := strings.Replace(suspendedGuard, `if [ "$suspended" = true ]; then`, `if false; then`, 1)
+			sabotagedSource := strings.Replace(source, suspendedGuard, sabotagedGuard, 1)
+			sabotagedOutput, sabotagedErr := runSuspendedCandidateCronJobVerificationHarness(
+				t,
+				sabotagedSource,
+				test.manifest,
+				test.candidateName,
+				test.containerName,
+				test.expected,
+			)
+			if sabotagedErr == nil {
+				t.Fatalf("restoring Job creation for suspended %s unexpectedly passed:\n%s", test.name, sabotagedOutput)
+			}
+			if !strings.Contains(string(sabotagedOutput), "could not render contained image-verification Job from CronJob/"+test.candidateName) &&
+				!strings.Contains(string(sabotagedOutput), "unexpected kubectl invocation: create job") {
+				t.Fatalf("sabotaged suspended %s verification failed for the wrong reason:\n%s", test.name, sabotagedOutput)
 			}
 		})
 	}

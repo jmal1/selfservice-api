@@ -27,7 +27,7 @@ metadata:
     app.kubernetes.io/component: synthetic-monitor
 spec:
   schedule: {{ required "synthetic.runner.schedule is required" .Values.synthetic.runner.schedule | quote }}
-  suspend: false
+  suspend: {{ .Values.synthetic.runner.suspend | default false }}
   # Forbid, not Replace: a run in flight owns a real pod and a runner Job.
   # Killing it mid-flight would orphan both, and the replacement would then
   # trip the synthetic user's pod quota with a 409.

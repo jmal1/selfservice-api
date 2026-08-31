@@ -691,21 +691,45 @@ if ($selectedTiers -contains 4) {
                 $remoteTarget = $resolvedRemote.Target
                 $remoteScript = @"
 set -euo pipefail
-trap 'rm -f /tmp/rendered-selfservice-prod.yaml' EXIT
+trap 'rm -f /tmp/rendered-api.yaml /tmp/rendered-worker.yaml /tmp/rendered-synthetic.yaml /tmp/rendered-janitor.yaml /tmp/rendered-runner.yaml' EXIT
 cd "$HOME/selfservice-api-helm"
+assert_env_value() {
+  local file=$1 key=$2 want=$3 count value
+  count=$(grep -c "^[[:space:]]*- name: ${key}$" "$file")
+  if [ "$count" -ne 1 ]; then
+    echo "ERROR: $file has $key $count times, want exactly 1" >&2
+    exit 1
+  fi
+  value=$(grep -A1 "^[[:space:]]*- name: ${key}$" "$file" | tail -1)
+  if ! printf '%s\n' "$value" | grep -Eq "^[[:space:]]*value: \"${want}\"$"; then
+    echo "ERROR: $file's $key is not explicit ${want}: $value" >&2
+    exit 1
+  fi
+}
+assert_suspended() {
+  local file=$1 name=$2
+  if ! grep -Eq "^[[:space:]]*suspend: true$" "$file"; then
+    echo "ERROR: $name is not explicitly suspended in $file" >&2
+    exit 1
+  fi
+}
 helm lint deploy/helm/selfservice -f deploy/helm/selfservice/values.yaml
 helm lint deploy/helm/selfservice -f deploy/helm/selfservice/values.yaml -f deploy/helm/selfservice/values.prod.yaml
-helm template selfservice deploy/helm/selfservice -f deploy/helm/selfservice/values.yaml -f deploy/helm/selfservice/values.prod.yaml > /tmp/rendered-selfservice-prod.yaml
-count=$(grep -c '^[[:space:]]*- name: SYNTHETIC_LIFECYCLE_ENABLED$' /tmp/rendered-selfservice-prod.yaml)
-if [ "$count" -ne 1 ]; then
-  echo "ERROR: prod render has SYNTHETIC_LIFECYCLE_ENABLED $count times, want exactly 1" >&2
-  exit 1
-fi
-value=$(grep -A1 '^[[:space:]]*- name: SYNTHETIC_LIFECYCLE_ENABLED$' /tmp/rendered-selfservice-prod.yaml | tail -1)
-if ! printf '%s\n' "$value" | grep -Eq '^[[:space:]]*value: "true"$'; then
-  echo "ERROR: prod render's SYNTHETIC_LIFECYCLE_ENABLED is not explicit true: $value" >&2
-  exit 1
-fi
+helm template selfservice deploy/helm/selfservice -f deploy/helm/selfservice/values.yaml -f deploy/helm/selfservice/values.prod.yaml --show-only templates/api-deployment.yaml > /tmp/rendered-api.yaml
+helm template selfservice deploy/helm/selfservice -f deploy/helm/selfservice/values.yaml -f deploy/helm/selfservice/values.prod.yaml --show-only templates/worker-deployment.yaml > /tmp/rendered-worker.yaml
+helm template selfservice deploy/helm/selfservice -f deploy/helm/selfservice/values.yaml -f deploy/helm/selfservice/values.prod.yaml --show-only templates/synthetic-cronjob.yaml > /tmp/rendered-synthetic.yaml
+helm template selfservice deploy/helm/selfservice -f deploy/helm/selfservice/values.yaml -f deploy/helm/selfservice/values.prod.yaml --show-only templates/synthetic-janitor-cronjob.yaml > /tmp/rendered-janitor.yaml
+helm template selfservice deploy/helm/selfservice -f deploy/helm/selfservice/values.yaml -f deploy/helm/selfservice/values.prod.yaml --show-only templates/synthetic-runner-cronjob.yaml > /tmp/rendered-runner.yaml
+assert_env_value /tmp/rendered-api.yaml PROVISIONING_ENABLED false
+assert_env_value /tmp/rendered-worker.yaml WORKER_PROVISIONING_CLAIMS_ENABLED false
+assert_env_value /tmp/rendered-worker.yaml VCENTER_HOSTS nuc2.lab.jmal.io,nuc3.lab.jmal.io
+assert_env_value /tmp/rendered-worker.yaml VCENTER_RESOURCE_POOLS /JMAL-Datacenter/host/Intel-Cluster/Resources/Student-VMs
+assert_env_value /tmp/rendered-worker.yaml VCENTER_PLACEMENT_RESERVED_MEMORY_MB nuc2.lab.jmal.io=2048,nuc3.lab.jmal.io=2048
+assert_env_value /tmp/rendered-synthetic.yaml SYNTHETIC_PROVISIONING_EXPECTED_ENABLED false
+assert_env_value /tmp/rendered-synthetic.yaml SYNTHETIC_LIFECYCLE_ENABLED false
+assert_env_value /tmp/rendered-synthetic.yaml SYNTHETIC_RUNNER_EXPECTED_ENABLED true
+assert_suspended /tmp/rendered-janitor.yaml selfservice-synthetic-janitor
+assert_suspended /tmp/rendered-runner.yaml selfservice-synthetic-runner
 "@
                 $remoteOutput = & ssh $remoteTarget $remoteScript 2>&1
                 if ($LASTEXITCODE -ne 0) {
