@@ -120,19 +120,24 @@ func TestProvisioningAdmissionPrecedesDatabaseTouchingAudit(t *testing.T) {
 	}
 }
 
-func loadCIWorkflow(t *testing.T) map[string]any {
+func loadWorkflow(t *testing.T, name string) map[string]any {
 	t.Helper()
 	root := findRepoRoot(t)
-	body, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "ci.yaml"))
+	body, err := os.ReadFile(filepath.Join(root, ".github", "workflows", name))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	var workflow map[string]any
 	if err := yaml.Unmarshal(body, &workflow); err != nil {
-		t.Fatalf("parse ci.yaml: %v", err)
+		t.Fatalf("parse %s: %v", name, err)
 	}
 	return workflow
+}
+
+func loadCIWorkflow(t *testing.T) map[string]any {
+	t.Helper()
+	return loadWorkflow(t, "ci.yaml")
 }
 
 func mustMap(t *testing.T, v any, context string) map[string]any {
@@ -244,6 +249,29 @@ func TestCIWorkflowTriggersDependentPRsButPublishesOnlyFromMain(t *testing.T) {
 	branches := mustSlice(t, push["branches"], "on.push.branches")
 	if len(branches) != 1 || mustString(t, branches[0], "on.push.branches[0]") != "main" {
 		t.Fatalf("on.push.branches = %v, want exactly [main] so feature branches cannot publish images", branches)
+	}
+}
+
+func TestHelmLintWorkflowRunsOnEveryMainPushAndFiltersPRs(t *testing.T) {
+	workflow := loadWorkflow(t, "helm-lint.yaml")
+	triggers := mustMap(t, workflow["on"], "on")
+
+	push := mustMap(t, triggers["push"], "on.push")
+	branches := mustSlice(t, push["branches"], "on.push.branches")
+	if len(branches) != 1 || mustString(t, branches[0], "on.push.branches[0]") != "main" {
+		t.Fatalf("on.push.branches = %v, want exactly [main]", branches)
+	}
+	if paths, restricted := push["paths"]; restricted {
+		t.Fatalf("on.push.paths = %v, want every main push to produce Helm Lint evidence", paths)
+	}
+	if pathsIgnore, restricted := push["paths-ignore"]; restricted {
+		t.Fatalf("on.push.paths-ignore = %v, want every main push to produce Helm Lint evidence", pathsIgnore)
+	}
+
+	pullRequest := mustMap(t, triggers["pull_request"], "on.pull_request")
+	wantPRPaths := []any{"deploy/helm/**", ".github/workflows/helm-lint.yaml"}
+	if got := mustSlice(t, pullRequest["paths"], "on.pull_request.paths"); !reflect.DeepEqual(got, wantPRPaths) {
+		t.Fatalf("on.pull_request.paths = %v, want %v", got, wantPRPaths)
 	}
 }
 
