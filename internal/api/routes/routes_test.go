@@ -90,6 +90,7 @@ func TestTemplateAdministrationRoutesAreRegistered(t *testing.T) {
 		"POST /api/v1/admin/templates/{templateID}/power",
 		"GET /api/v1/admin/templates/{templateID}/resolved-credentials",
 		"GET /api/v1/admin/templates/{templateID}/console/ticket",
+		"GET /api/v1/admin/templates/{templateID}/console/ws",
 		"PATCH /api/v1/admin/templates/{templateID}",
 		"DELETE /api/v1/admin/templates/{templateID}",
 		"POST /api/v1/admin/templates/{templateID}/access",
