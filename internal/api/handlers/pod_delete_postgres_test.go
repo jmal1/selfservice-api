@@ -308,6 +308,10 @@ func (p *podDeleteRecordingJobCreatedPublisher) PublishJobCreated(jobID uuid.UUI
 }
 
 func (p *recordingJobStatusPublisher) PublishRaw(subject string, evt events.Event) error {
+	p.mu.Lock()
+	p.calls = append(p.calls, recordedJobStatusEvent{subject: subject, evt: evt})
+	p.mu.Unlock()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	tx, err := p.pool.Begin(ctx)
@@ -349,7 +353,6 @@ func (p *recordingJobStatusPublisher) PublishRaw(subject string, evt events.Even
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.calls = append(p.calls, recordedJobStatusEvent{subject: subject, evt: evt})
 	p.observedPodStatus = podStatus
 	p.observedPodError = podError
 	p.observedJobStatus = jobStatus
