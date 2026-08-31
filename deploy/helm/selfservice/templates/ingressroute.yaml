@@ -53,46 +53,6 @@ spec:
                 name: {{ .Release.Name }}-ui
                 port:
                   number: 8080
-    {{- if and .Values.ingress.internalHostname (ne .Values.ingress.internalHostname .Values.ingress.hostname) }}
-    - host: {{ .Values.ingress.internalHostname }}
-      http:
-        paths:
-          - path: /healthz
-            pathType: Exact
-            backend:
-              service:
-                name: {{ .Release.Name }}-api
-                port:
-                  number: {{ .Values.api.port }}
-          - path: /api
-            pathType: Prefix
-            backend:
-              service:
-                name: {{ .Release.Name }}-api
-                port:
-                  number: {{ .Values.api.port }}
-          - path: /auth
-            pathType: Prefix
-            backend:
-              service:
-                name: {{ .Release.Name }}-api
-                port:
-                  number: {{ .Values.api.port }}
-          - path: /ws
-            pathType: Prefix
-            backend:
-              service:
-                name: {{ .Release.Name }}-api
-                port:
-                  number: {{ .Values.api.port }}
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: {{ .Release.Name }}-ui
-                port:
-                  number: 8080
-    {{- end }}
   tls:
     - hosts:
         - {{ .Values.ingress.hostname }}
