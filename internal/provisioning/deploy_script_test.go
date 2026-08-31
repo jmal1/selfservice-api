@@ -648,6 +648,73 @@ func TestDeployScriptRollbackContainmentAllowsSuspendedCronJobsWithoutRetainedJo
 	}
 }
 
+func TestDeployScriptCandidateCronJobsHonorSuspensionBeforeJobCreation(t *testing.T) {
+	requirePOSIXShell(t)
+
+	originalBytes, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(originalBytes)
+
+	live := baselineManifest(true, "", "false")
+	candidate := baselineManifest(true, "*", "false")
+
+	t.Run("suspended cronjobs skip verification jobs", func(t *testing.T) {
+		env := newDeployScriptEnvironment(t, live, candidate)
+
+		output, runErr := env.run("--no-pull")
+		if runErr != nil {
+			t.Fatalf("deploy unexpectedly failed while suspended CronJobs should have skipped verification jobs:\n%s", output)
+		}
+
+		createdJobs := strings.Count(string(output), "job.batch/")
+		if createdJobs != 1 {
+			t.Fatalf("suspended runner/janitor unexpectedly created %d verification Jobs:\n%s", createdJobs, output)
+		}
+		if !strings.Contains(string(output), "job.batch/selfservice-synthetic-api-monitor-deploy-verify-") {
+			t.Fatalf("unsuspended API monitor did not create a verification Job:\n%s", output)
+		}
+		if _, statErr := os.Stat(env.cronjobVerifyMark); statErr != nil {
+			t.Fatalf("suspended CronJob deployment never reached candidate verification: %v", statErr)
+		}
+	})
+
+	t.Run("ignoring suspension reintroduces job creation", func(t *testing.T) {
+		const suspendedGuard = `      if [ "$kind" = CronJob ]; then
+        suspended="$(cronjob_suspend_from_manifest "$live_manifest")" || return 1
+      fi`
+		if strings.Count(source, suspendedGuard) != 1 {
+			t.Fatalf("sabotage target count != 1")
+		}
+		sabotaged := strings.Replace(source, suspendedGuard, `      if [ "$kind" = CronJob ]; then
+        suspended=false
+      fi`, 1)
+		scriptPath := filepath.Join("..", "..", "deploy", "scripts", "deploy-sabotaged-cronjob-suspension-test.sh")
+		writeExecutable(t, scriptPath, sabotaged)
+		t.Cleanup(func() { os.Remove(scriptPath) })
+
+		env := newDeployScriptEnvironment(t, live, candidate)
+		env.scriptPath = scriptPath
+
+		output, runErr := env.run("--no-pull")
+		if runErr != nil {
+			t.Fatalf("sabotaged suspension-first candidate verification unexpectedly failed:\n%s", output)
+		}
+
+		createdJobs := strings.Count(string(output), "job.batch/")
+		if createdJobs != 3 {
+			t.Fatalf("ignoring suspension created %d verification Jobs, want 3:\n%s", createdJobs, output)
+		}
+		if !strings.Contains(string(output), "job.batch/selfservice-synthetic-runner-deploy-verify-") {
+			t.Fatalf("sabotaged suspension-first candidate verification did not create the runner Job:\n%s", output)
+		}
+		if !strings.Contains(string(output), "job.batch/selfservice-synthetic-janitor-deploy-verify-") {
+			t.Fatalf("sabotaged suspension-first candidate verification did not create the janitor Job:\n%s", output)
+		}
+	})
+}
+
 func TestDeployScriptRollbackContainmentFinalRevisionFence(t *testing.T) {
 	requirePOSIXShell(t)
 

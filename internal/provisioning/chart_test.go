@@ -528,7 +528,7 @@ func TestSyntheticCronJobLifecycleEnabledRendersAcrossOverlays(t *testing.T) {
 		}
 	}
 
-	assertExactlyOne(t, render("values.prod.yaml"), "values.prod.yaml", "true")
+	assertExactlyOne(t, render("values.prod.yaml"), "values.prod.yaml", "false")
 	assertExactlyOne(t, render("values.full-fleet.yaml"), "values.full-fleet.yaml", "true")
 }
 
@@ -758,6 +758,6 @@ func TestSyntheticCronJobRunnerExpectedEnabledRendersAcrossOverlays(t *testing.T
 		}
 	}
 
-	assertExactlyOne(t, render("values.prod.yaml"), "values.prod.yaml", "true")
+	assertExactlyOne(t, render("values.prod.yaml"), "values.prod.yaml", "false")
 	assertExactlyOne(t, render("values.full-fleet.yaml"), "values.full-fleet.yaml", "true")
 }

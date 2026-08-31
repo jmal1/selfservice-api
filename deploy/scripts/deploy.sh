@@ -3320,7 +3320,7 @@ verify_external_candidate_images() {
   local external_map=$1
   local tmp_dir=$2
   local image_class=${3:-external}
-  local kind name container_type container_name expected live_manifest live_inventory live_row declared actual
+  local kind name container_type container_name expected live_manifest live_inventory live_row declared actual suspended
   mkdir -p "$tmp_dir"
   while IFS=$'\t' read -r kind name container_type container_name expected; do
     live_manifest="$tmp_dir/${kind}-${name}.yaml"
@@ -3341,11 +3341,17 @@ verify_external_candidate_images() {
     )"
     declared="$(printf '%s\n' "$live_row" | cut -f5)"
     if [ "$image_class" = candidate ]; then
+      if [ "$kind" = CronJob ]; then
+        suspended="$(cronjob_suspend_from_manifest "$live_manifest")" || return 1
+      fi
       if [ "$declared" != "$expected" ]; then
         echo "ERROR: candidate declared image drifted for $kind/$name $container_type/$container_name: expected $expected, found $declared." >&2
         return 1
       fi
       if [ "$kind" = CronJob ]; then
+        if [ "$suspended" = true ]; then
+          continue
+        fi
         if ! verify_candidate_cronjob_image \
             "$name" \
             "$container_type" \
