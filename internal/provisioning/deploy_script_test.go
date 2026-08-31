@@ -1181,7 +1181,12 @@ func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 			configure: func(env *deployScriptEnvironment) {
 				env.failAtomicUpgrade = true
 				writeFile(t, env.liveManifest, rollbackManifestWithHistoricalSynthetics(false))
-				writeFile(t, env.liveResource, rollbackManifestWithHistoricalSynthetics(true))
+				writeFile(t, env.liveResource, replaceEnvValue(
+					rollbackManifestWithHistoricalSynthetics(true),
+					"SYNTHETIC_LIFECYCLE_ENABLED",
+					"false",
+					"true",
+				))
 				writeFile(t, env.atomicRollbackManifest, rollbackManifestWithHistoricalSynthetics(false))
 				writeFile(t, env.containedRollbackManifest, rollbackManifestWithHistoricalSynthetics(true))
 				writeFile(t, env.immutableRollbackManifest, rollbackManifestWithHistoricalSynthetics(false))
@@ -1194,7 +1199,12 @@ func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 				env.failAtomicUpgrade = true
 				env.pendingSyntheticJobs = 1
 				writeFile(t, env.liveManifest, rollbackManifestWithHistoricalSynthetics(false))
-				writeFile(t, env.liveResource, rollbackManifestWithHistoricalSynthetics(true))
+				writeFile(t, env.liveResource, replaceEnvValue(
+					rollbackManifestWithHistoricalSynthetics(true),
+					"SYNTHETIC_LIFECYCLE_ENABLED",
+					"false",
+					"true",
+				))
 				writeFile(t, env.atomicRollbackManifest, rollbackManifestWithHistoricalSynthetics(false))
 				writeFile(t, env.containedRollbackManifest, rollbackManifestWithHistoricalSynthetics(true))
 				writeFile(t, env.immutableRollbackManifest, rollbackManifestWithHistoricalSynthetics(false))
@@ -7871,6 +7881,13 @@ case "$1" in
     ;;
   patch)
     : > "$FAKE_SYNTHETIC_CONTAINED_MARKER"
+    if [ "$2" = "cronjob/selfservice-synthetic-api-monitor" ] &&
+       [[ "$*" == *"SYNTHETIC_LIFECYCLE_ENABLED"* ]]; then
+      manifest=$(current_manifest)
+      sed '/- name: SYNTHETIC_LIFECYCLE_ENABLED/{n;s/value: "true"/value: "false"/;}' \
+        "$manifest" > "$manifest.patched"
+      mv "$manifest.patched" "$manifest"
+    fi
     ;;
   set)
     [ -f "$FAKE_LOCK_FILE" ] || {
