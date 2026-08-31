@@ -57,7 +57,21 @@ func (h *Handler) GetBlueprint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respondJSON(w, http.StatusOK, bp)
+	userID := middleware.UserIDFromContext(r.Context())
+	role := middleware.RoleFromContext(r.Context())
+	accessible, err := h.db.ListBlueprintsForUser(r.Context(), userID, role)
+	if err != nil {
+		h.logger.Error("list blueprints failed", "error", err)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
+		return
+	}
+	for _, candidate := range accessible {
+		if candidate.ID == bpID {
+			respondJSON(w, http.StatusOK, bp)
+			return
+		}
+	}
+	respondError(w, r, http.StatusForbidden, "blueprint not accessible")
 }
 
 // DeployBlueprint creates a new pod from a blueprint definition.
