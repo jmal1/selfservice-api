@@ -1393,7 +1393,12 @@ func TestDeployScriptCandidateCronJobsHonorSuspensionBeforeJobCreation(t *testin
 	requirePOSIXShell(t)
 	live := rollbackManifestWithHistoricalSynthetics(true)
 	env := newDeployScriptEnvironment(t, live, live)
-	writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
+	writeFile(t, env.liveResource, replaceEnvValue(
+		live,
+		"WORKER_PROVISIONING_CLAIMS_ENABLED",
+		"false",
+		"true",
+	))
 	env.noRetainedJanitorJob = true
 	env.noRetainedRunnerJob = true
 
