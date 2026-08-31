@@ -44,6 +44,31 @@ func TestValidateTestingRunPodMatch(t *testing.T) {
 	}
 }
 
+func TestValidatePodOwnerAccess(t *testing.T) {
+	ownerID := uuid.New()
+	otherID := uuid.New()
+
+	tests := []struct {
+		name       string
+		podOwnerID uuid.UUID
+		userID     uuid.UUID
+		role       string
+		want       int
+	}{
+		{name: "owner student allowed", podOwnerID: ownerID, userID: ownerID, role: models.RoleStudent, want: 0},
+		{name: "other student denied", podOwnerID: ownerID, userID: otherID, role: models.RoleStudent, want: http.StatusForbidden},
+		{name: "admin override allowed", podOwnerID: ownerID, userID: otherID, role: models.RoleAdmin, want: 0},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := validatePodOwnerAccess(tc.podOwnerID, tc.userID, tc.role); got != tc.want {
+				t.Fatalf("validatePodOwnerAccess() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestValidateTestingRunAccess(t *testing.T) {
 	ownerID := uuid.New()
 	otherID := uuid.New()

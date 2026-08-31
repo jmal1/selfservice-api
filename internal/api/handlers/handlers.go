@@ -438,6 +438,14 @@ func hideUnreadyPodCredentialsFromList(pods []models.Pod) {
 	}
 }
 
+// validatePodOwnerAccess returns 0 when the caller owns the pod or is an admin.
+func validatePodOwnerAccess(podOwnerID, userID uuid.UUID, role string) int {
+	if podOwnerID == userID || role == models.RoleAdmin {
+		return 0
+	}
+	return http.StatusForbidden
+}
+
 // CreatePod creates the pod + VMs in the DB, then queues a provisioning job.
 func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 	if h.rejectProvisioning(w, r, provisioningRoutePodCreate) {
@@ -1282,8 +1290,8 @@ func (h *Handler) VMPowerAction(w http.ResponseWriter, r *http.Request) {
 
 	userID := middleware.UserIDFromContext(r.Context())
 	role := middleware.RoleFromContext(r.Context())
-	if pod.OwnerID != userID && role != models.RoleAdmin {
-		respondError(w, r, http.StatusForbidden, "forbidden")
+	if status := validatePodOwnerAccess(pod.OwnerID, userID, role); status != 0 {
+		respondError(w, r, status, "forbidden")
 		return
 	}
 
