@@ -848,9 +848,9 @@ func (q *Queries) FinalizeOrphanedPodDestroy(ctx context.Context, actorUserID, p
 		SELECT count(*)
 		FROM jobs
 		WHERE payload->>'pod_id' = $1::text
-		  AND type <> 'pod_destroy'
+		  AND id <> $2
 		  AND status NOT IN ('completed', 'failed')
-	`, podID).Scan(&activeJobs); err != nil {
+	`, podID, jobID).Scan(&activeJobs); err != nil {
 		return nil, fmt.Errorf("count competing jobs for orphaned recovery: %w", err)
 	}
 	if activeJobs != 0 {

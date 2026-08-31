@@ -241,6 +241,26 @@ func TestFinalizeOrphanedPodDestroyPostgresRejectsUnsupportedManualCleanupResult
 	}
 }
 
+func TestFinalizeOrphanedPodDestroyPostgresRejectsLaterDestroyCompetingWork(t *testing.T) {
+	fixture := newOrphanDestroyRecoveryFixture(t)
+	ctx := context.Background()
+	laterJobID := uuid.New()
+	if _, err := fixture.pool.Exec(ctx, `
+		INSERT INTO jobs (id, type, payload, status)
+		VALUES ($1, 'pod_destroy', jsonb_build_object('pod_id', $2::text), 'claimed')
+	`, laterJobID, fixture.podID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.queries.FinalizeOrphanedPodDestroy(ctx, fixture.ownerID, fixture.podID, PodDestroyRecoveryAttestation{
+		VLANID:            fixture.vlanTag,
+		Subnet:            fixture.subnet,
+		ConfirmationToken: "orphan-later-destroy",
+	}); !errors.Is(err, ErrPodDestroyRecoveryPrecondition) {
+		t.Fatalf("later destroy job error = %v, want %v", err, ErrPodDestroyRecoveryPrecondition)
+	}
+	assertOrphanRecoveryState(t, fixture.pool, fixture.podID, models.PodStatusDestroyFailed, true, 0)
+}
+
 func TestFinalizeOrphanedPodDestroyPostgresRejectsBadAttestation(t *testing.T) {
 	fixture := newOrphanDestroyRecoveryFixture(t)
 	ctx := context.Background()
