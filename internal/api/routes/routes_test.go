@@ -1,9 +1,14 @@
 package routes
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -11,9 +16,12 @@ import (
 	"github.com/go-chi/chi/v5"
 	jwtlib "github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/jmal1/selfservice-api/internal/api/handlers"
 	"github.com/jmal1/selfservice-api/internal/auth"
+	"github.com/jmal1/selfservice-api/internal/config"
+	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/models"
 )
 
@@ -138,6 +146,41 @@ func TestAdminRunsRouteRegistered(t *testing.T) {
 // method is invoked for the student case; for the instructor case the nil
 // handler panics, chi's Recoverer returns 500, which is still != 403.
 const testJWTSecret = "admin-runs-rbac-test-secret-do-not-use-in-prod"
+
+func newTestAuthProvider(t *testing.T, queries *database.Queries) *auth.Provider {
+	t.Helper()
+
+	var issuerURL string
+	issuer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/.well-known/openid-configuration" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"issuer":%q,"authorization_endpoint":%q,"token_endpoint":%q,"jwks_uri":%q,"end_session_endpoint":%q}`,
+			issuerURL,
+			issuerURL+"/application/o/authorize/",
+			issuerURL+"/application/o/token/",
+			issuerURL+"/keys",
+			issuerURL+"/application/o/selfservice/end-session/",
+		)
+	}))
+	issuerURL = issuer.URL
+	t.Cleanup(issuer.Close)
+
+	provider, err := auth.NewProvider(context.Background(), config.OIDCConfig{
+		IssuerURL:             issuer.URL,
+		ClientID:              "selfservice-client",
+		ClientSecret:          "client-secret",
+		RedirectURL:           "https://app.example.test/auth/callback",
+		Scopes:                []string{"openid", "profile", "email"},
+		PostLogoutRedirectURI: "https://app.example.test/login",
+	}, queries, []byte(testJWTSecret), slog.Default())
+	if err != nil {
+		t.Fatalf("build auth provider: %v", err)
+	}
+	return provider
+}
 
 func makeSessionCookie(t *testing.T, role string) *http.Cookie {
 	t.Helper()
@@ -278,16 +321,225 @@ func TestReadinessAndConsoleRoutes(t *testing.T) {
 	}
 }
 
-func TestAuthRoutesAreRegistered(t *testing.T) {
-	found := walkRoutes(t)
-	for _, want := range []string{
-		"GET /auth/login",
-		"GET /auth/callback",
-		"POST /auth/logout",
-	} {
-		if !found[want] {
-			t.Errorf("auth route not registered: %s", want)
+func TestAuthRoutesThroughSetup(t *testing.T) {
+	provider := newTestAuthProvider(t, nil)
+	router := Setup(nil, provider, nil, []string{"https://example.test"})
+
+	t.Run("login redirect includes Authentik state and cookie", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/auth/login", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusTemporaryRedirect {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusTemporaryRedirect)
 		}
+		loc, err := url.Parse(rec.Header().Get("Location"))
+		if err != nil {
+			t.Fatalf("Location is not a valid URL: %v", err)
+		}
+		if got := loc.Query().Get("client_id"); got != "selfservice-client" {
+			t.Fatalf("client_id = %q, want %q", got, "selfservice-client")
+		}
+		if got := loc.Query().Get("redirect_uri"); got != "https://app.example.test/auth/callback" {
+			t.Fatalf("redirect_uri = %q, want %q", got, "https://app.example.test/auth/callback")
+		}
+		state := loc.Query().Get("state")
+		if state == "" {
+			t.Fatal("state missing from Authentik redirect URL")
+		}
+		cookies := rec.Result().Cookies()
+		var stateCookie *http.Cookie
+		for i := range cookies {
+			if cookies[i].Name == "oauth_state" {
+				stateCookie = cookies[i]
+				break
+			}
+		}
+		if stateCookie == nil {
+			t.Fatal("oauth_state cookie was not set")
+		}
+		if stateCookie.Value != state {
+			t.Fatalf("oauth_state cookie value %q does not match redirect state %q", stateCookie.Value, state)
+		}
+	})
+
+	t.Run("callback rejects mismatched state", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/auth/callback?state=wrong-state", nil)
+		req.AddCookie(&http.Cookie{Name: "oauth_state", Value: "expected-state"})
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+		}
+		if !strings.Contains(rec.Body.String(), "invalid state") {
+			t.Fatalf("body = %q, want invalid state", rec.Body.String())
+		}
+	})
+
+	t.Run("logout clears the session cookie and returns JSON", func(t *testing.T) {
+		claims := auth.SessionClaims{
+			RegisteredClaims: jwtlib.RegisteredClaims{
+				Subject:   uuid.NewString(),
+				IssuedAt:  jwtlib.NewNumericDate(time.Now()),
+				ExpiresAt: jwtlib.NewNumericDate(time.Now().Add(8 * time.Hour)),
+				Issuer:    "selfservice-api",
+			},
+			UserID:   "not-a-uuid",
+			Username: "logout-user",
+			Role:     models.RoleStudent,
+		}
+		token, err := jwtlib.NewWithClaims(jwtlib.SigningMethodHS256, claims).SignedString([]byte(testJWTSecret))
+		if err != nil {
+			t.Fatalf("sign JWT: %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+		req.AddCookie(&http.Cookie{Name: "session", Value: token})
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+		var resp map[string]string
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode logout JSON: %v", err)
+		}
+		if resp["status"] != "logged_out" {
+			t.Fatalf("status = %q, want %q", resp["status"], "logged_out")
+		}
+		logoutURL := resp["logout_url"]
+		if logoutURL == "" {
+			t.Fatal("logout_url missing from JSON response")
+		}
+		u, err := url.Parse(logoutURL)
+		if err != nil {
+			t.Fatalf("logout_url is not a valid URL: %v", err)
+		}
+		if got := u.Query().Get("post_logout_redirect_uri"); got != "https://app.example.test/login" {
+			t.Fatalf("post_logout_redirect_uri = %q, want %q", got, "https://app.example.test/login")
+		}
+		if got := u.Query().Get("id_token_hint"); got != "" {
+			t.Fatalf("id_token_hint = %q, want empty when no persisted session token exists", got)
+		}
+		var sessionCookie *http.Cookie
+		for _, c := range rec.Result().Cookies() {
+			if c.Name == "session" {
+				sessionCookie = c
+				break
+			}
+		}
+		if sessionCookie == nil {
+			t.Fatal("session cookie was not cleared")
+		}
+		if sessionCookie.Value != "" || sessionCookie.MaxAge != -1 || !sessionCookie.HttpOnly || !sessionCookie.Secure {
+			t.Fatalf("session cookie not cleared as expected: %#v", sessionCookie)
+		}
+	})
+}
+
+func TestLogoutRouteDeactivatesSessionAndIncludesIdTokenHint(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set TEST_DATABASE_URL to an isolated PostgreSQL database to run logout persistence tests")
+	}
+	if err := database.RunMigrations(dsn); err != nil {
+		t.Fatalf("run migrations: %v", err)
+	}
+
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect database: %v", err)
+	}
+	defer pool.Close()
+	queries := database.NewQueries(pool)
+
+	userID := uuid.New()
+	user := &models.User{
+		ID:          userID,
+		OIDCSub:     "logout-route-" + uuid.NewString(),
+		Username:    "logout.route.user",
+		Email:       "logout-route@example.test",
+		DisplayName: "Logout Route User",
+		Role:        models.RoleStudent,
+	}
+	if err := queries.UpsertUser(ctx, user); err != nil {
+		t.Fatalf("upsert user: %v", err)
+	}
+	stored, err := queries.GetUserBySub(ctx, user.OIDCSub)
+	if err != nil {
+		t.Fatalf("get user by sub: %v", err)
+	}
+	if stored == nil {
+		t.Fatal("stored user not found")
+	}
+
+	sessionID := uuid.New()
+	idToken := "logout-id-token-" + uuid.NewString()
+	if err := queries.CreateSession(ctx, sessionID, stored.ID, "127.0.0.1", "test-agent", idToken); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	jwtToken, err := jwtlib.NewWithClaims(jwtlib.SigningMethodHS256, auth.SessionClaims{
+		RegisteredClaims: jwtlib.RegisteredClaims{
+			Subject:   stored.ID.String(),
+			IssuedAt:  jwtlib.NewNumericDate(time.Now()),
+			ExpiresAt: jwtlib.NewNumericDate(time.Now().Add(8 * time.Hour)),
+			Issuer:    "selfservice-api",
+		},
+		UserID:    stored.ID.String(),
+		Username:  stored.Username,
+		Role:      stored.Role,
+		SessionID: sessionID.String(),
+	}).SignedString([]byte(testJWTSecret))
+	if err != nil {
+		t.Fatalf("sign JWT: %v", err)
+	}
+
+	provider := newTestAuthProvider(t, queries)
+	router := Setup(nil, provider, queries, []string{"https://app.example.test"})
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	req.AddCookie(&http.Cookie{Name: "session", Value: jwtToken})
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (body=%s)", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var resp map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode logout JSON: %v", err)
+	}
+	if _, hasRawIDToken := resp["id_token"]; hasRawIDToken {
+		t.Fatalf("logout response exposed raw id_token: %#v", resp)
+	}
+	if _, hasRawHint := resp["id_token_hint"]; hasRawHint {
+		t.Fatalf("logout response exposed id_token_hint as a JSON field: %#v", resp)
+	}
+	logoutURL := resp["logout_url"]
+	if logoutURL == "" {
+		t.Fatal("logout_url missing from JSON response")
+	}
+	u, err := url.Parse(logoutURL)
+	if err != nil {
+		t.Fatalf("logout_url is not a valid URL: %v", err)
+	}
+	if got := u.Query().Get("id_token_hint"); got != idToken {
+		t.Fatalf("id_token_hint = %q, want %q", got, idToken)
+	}
+	if got := u.Query().Get("post_logout_redirect_uri"); got != "https://app.example.test/login" {
+		t.Fatalf("post_logout_redirect_uri = %q, want %q", got, "https://app.example.test/login")
+	}
+
+	active, err := queries.IsSessionActive(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("check session active: %v", err)
+	}
+	if active {
+		t.Fatal("session remains active after logout")
 	}
 }
 

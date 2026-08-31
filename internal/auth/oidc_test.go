@@ -1,21 +1,14 @@
 package auth
 
 import (
-	"context"
-	"encoding/json"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/golang-jwt/jwt/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/oauth2"
-
-	"github.com/jmal1/selfservice-api/internal/database"
 )
 
 func TestBuildEndSessionURL(t *testing.T) {
@@ -146,63 +139,5 @@ func TestCallbackHandlerRejectsStateMismatch(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "invalid state") {
 		t.Fatalf("body = %q, want invalid state error", rec.Body.String())
-	}
-}
-
-func TestLogoutHandlerClearsSessionCookieAndReturnsJSON(t *testing.T) {
-	secret := []byte("logout-secret")
-	pool, err := pgxpool.New(context.Background(), "postgres://postgres:postgres@127.0.0.1:1/selfservice")
-	if err != nil {
-		t.Fatalf("create pgx pool: %v", err)
-	}
-	defer pool.Close()
-	provider := &Provider{jwtSecret: secret, logger: slog.Default(), queries: database.NewQueries(pool)}
-
-	claims := SessionClaims{
-		RegisteredClaims: jwt.RegisteredClaims{
-			Subject:   "550e8400-e29b-41d4-a716-446655440000",
-			IssuedAt:  jwt.NewNumericDate(time.Now()),
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
-			Issuer:    "selfservice-api",
-		},
-		UserID:    "550e8400-e29b-41d4-a716-446655440000",
-		Username:  "demo-user",
-		Role:      "student",
-		SessionID: "",
-	}
-	jwtToken, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(secret)
-	if err != nil {
-		t.Fatalf("sign JWT: %v", err)
-	}
-
-	req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
-	req.AddCookie(&http.Cookie{Name: "session", Value: jwtToken})
-	rec := httptest.NewRecorder()
-	provider.LogoutHandler(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
-	}
-
-	var resp map[string]string
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("decode JSON logout response: %v", err)
-	}
-	if resp["status"] != "logged_out" {
-		t.Fatalf("status field = %q, want %q", resp["status"], "logged_out")
-	}
-
-	var sessionCookie *http.Cookie
-	for _, c := range rec.Result().Cookies() {
-		if c.Name == "session" {
-			sessionCookie = c
-			break
-		}
-	}
-	if sessionCookie == nil {
-		t.Fatal("session cookie was not cleared")
-	}
-	if sessionCookie.Value != "" || sessionCookie.MaxAge != -1 || !sessionCookie.HttpOnly || !sessionCookie.Secure {
-		t.Fatalf("session cookie not cleared as expected: %#v", sessionCookie)
 	}
 }
