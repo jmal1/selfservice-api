@@ -72,6 +72,73 @@ func TestAdminImageRoutesAreRegistered(t *testing.T) {
 	}
 }
 
+func TestTemplateAdministrationRoutesAreRegistered(t *testing.T) {
+	found := walkRoutes(t)
+	want := []string{
+		"GET /api/v1/admin/templates/",
+		"POST /api/v1/admin/templates/",
+		"POST /api/v1/admin/templates/draft",
+		"GET /api/v1/admin/templates/guest-os-catalog",
+		"GET /api/v1/admin/templates/{templateID}/wizard-state",
+		"POST /api/v1/admin/templates/{templateID}/provision",
+		"POST /api/v1/admin/templates/{templateID}/preflight",
+		"POST /api/v1/admin/templates/{templateID}/generalize",
+		"POST /api/v1/admin/templates/{templateID}/publish",
+		"POST /api/v1/admin/templates/{templateID}/unpublish",
+		"POST /api/v1/admin/templates/{templateID}/cancel",
+		"POST /api/v1/admin/templates/{templateID}/retry",
+		"POST /api/v1/admin/templates/{templateID}/power",
+		"GET /api/v1/admin/templates/{templateID}/resolved-credentials",
+		"GET /api/v1/admin/templates/{templateID}/console/ticket",
+		"PATCH /api/v1/admin/templates/{templateID}",
+		"DELETE /api/v1/admin/templates/{templateID}",
+		"POST /api/v1/admin/templates/{templateID}/access",
+		"GET /api/v1/admin/templates/{templateID}/dependents",
+		"GET /api/v1/admin/templates/{templateID}/playlists",
+		"POST /api/v1/admin/templates/{templateID}/playlists",
+		"GET /api/v1/admin/templates/{templateID}/source-replicas",
+		"POST /api/v1/admin/templates/{templateID}/source-replicas",
+		"DELETE /api/v1/admin/templates/{templateID}/source-replicas/{replicaID}",
+		"POST /api/v1/admin/templates/{templateID}/source-replica-builds",
+		"GET /api/v1/admin/templates/{templateID}/source-replica-builds/{buildID}",
+		"POST /api/v1/admin/templates/{templateID}/source-replica-builds/{buildID}/retry",
+		"POST /api/v1/admin/templates/{templateID}/source-replica-builds/{buildID}/cleanup",
+		"POST /api/v1/admin/templates/{id}/pin",
+		"DELETE /api/v1/admin/templates/{id}/pin",
+		"POST /api/v1/admin/templates/reorder",
+	}
+	for _, route := range want {
+		if !found[route] {
+			t.Errorf("template administration route not registered: %s", route)
+		}
+	}
+}
+
+func TestTemplateAdministrationRoutesRequireInstructorRole(t *testing.T) {
+	provider := auth.NewTestProvider([]byte(testJWTSecret))
+	router := Setup(nil, provider, nil, []string{"*"})
+
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{method: http.MethodGet, path: "/api/v1/admin/templates/"},
+		{method: http.MethodPost, path: "/api/v1/admin/templates/"},
+		{method: http.MethodPatch, path: "/api/v1/admin/templates/" + uuid.NewString()},
+		{method: http.MethodDelete, path: "/api/v1/admin/templates/" + uuid.NewString()},
+	} {
+		t.Run(tc.method, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			req.AddCookie(makeSessionCookie(t, models.RoleStudent))
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("student role: status = %d, want 403", rec.Code)
+			}
+		})
+	}
+}
+
 // The pre-existing admin routes must survive the addition — this is the
 // specific failure mode of getting the nesting wrong.
 func TestExistingAdminRoutesStillRegistered(t *testing.T) {
