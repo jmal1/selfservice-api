@@ -23,7 +23,7 @@ var expectedSerializedPodJobProducerInventory = map[string][]string{
 		"internal/provisioner/destroy.go:RequeueFailedPodDestroyJob",
 		"internal/provisioner/vm_ops.go:CreateEmptyPodDestroyJob",
 	},
-	"vm_add":             {"internal/api/handlers/handlers.go:CreateVMAddJob"},
+	"vm_add":             {"internal/api/handlers/handlers.go:CreateVMAddJobTx"},
 	"vm_destroy":         {"internal/api/handlers/handlers.go:CreateVMJob"},
 	"vm_start":           {"internal/api/handlers/handlers.go:CreateVMJob"},
 	"vm_stop":            {"internal/api/handlers/handlers.go:CreateVMJob"},
@@ -39,7 +39,7 @@ var expectedSerializedBoundaryCalls = map[string]map[string]int{
 	"internal/api/handlers/handlers.go": {
 		"CreatePodCreateJobTx": 1,
 		"CreatePodDestroyJob":  1,
-		"CreateVMAddJob":       1,
+		"CreateVMAddJobTx":     1,
 		"CreateVMJob":          2,
 		"ExtendPod":            2,
 	},
@@ -104,6 +104,7 @@ func TestSerializedPodJobProducerInventoryUsesOnlySharedBoundary(t *testing.T) {
 			"RequeueFailedPodDestroyJob",
 			"PreparePodDestroy",
 			"CreateVMAddJob",
+			"CreateVMAddJobTx",
 			"CreateVMJob",
 			"ExtendPod",
 		} {

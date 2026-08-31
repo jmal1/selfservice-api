@@ -571,6 +571,17 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(ctx)
 
+	if err := h.validateQuotaTx(ctx, tx, userID, 1, totalVCPUs, totalRAM); err != nil {
+		var qe *QuotaError
+		if errors.As(err, &qe) {
+			respondError(w, r, http.StatusConflict, qe.Error())
+		} else {
+			h.logger.Error("transactional quota validation failed", "error", err)
+			respondError(w, r, http.StatusInternalServerError, "internal error")
+		}
+		return
+	}
+
 	podID := uuid.New()
 
 	// Insert pod record first (FK target for vlan_pool.pod_id)
@@ -1181,7 +1192,26 @@ func (h *Handler) AddVM(w http.ResponseWriter, r *http.Request) {
 		"display_name":  req.DisplayName,
 		"user_id":       userID.String(),
 	})
-	job, err := h.db.CreateVMAddJob(r.Context(), vm, payload)
+	tx, err := h.db.Pool().Begin(r.Context())
+	if err != nil {
+		h.logger.Error("begin vm add tx failed", "error", err)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
+		return
+	}
+	defer tx.Rollback(r.Context())
+
+	if err := h.validateQuotaTx(r.Context(), tx, userID, 0, vcpus, ram); err != nil {
+		var qe *QuotaError
+		if errors.As(err, &qe) {
+			respondError(w, r, http.StatusConflict, qe.Error())
+		} else {
+			h.logger.Error("transactional quota validation failed", "error", err)
+			respondError(w, r, http.StatusInternalServerError, "internal error")
+		}
+		return
+	}
+
+	job, err := h.db.CreateVMAddJobTx(r.Context(), tx, vm, payload)
 	if err != nil {
 		if errors.Is(err, database.ErrPodJobRejected) {
 			respondError(w, r, http.StatusConflict, "pod must be active to add VMs")
@@ -1191,8 +1221,13 @@ func (h *Handler) AddVM(w http.ResponseWriter, r *http.Request) {
 		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
+	if err := tx.Commit(r.Context()); err != nil {
+		h.logger.Error("commit vm add tx failed", "error", err)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
+		return
+	}
 
-	if err := h.events.PublishJobCreated(job.ID, job.Type); err != nil {
+	if err := h.jobEvents.PublishJobCreated(job.ID, job.Type); err != nil {
 		h.logger.Warn("failed to publish job created event", "error", err)
 	}
 

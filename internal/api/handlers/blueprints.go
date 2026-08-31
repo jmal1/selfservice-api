@@ -232,6 +232,17 @@ func (h *Handler) DeployBlueprint(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(r.Context())
 
+	if err := h.validateQuotaTx(r.Context(), tx, userID, 1, totalVCPUs, totalRAM); err != nil {
+		var qe *QuotaError
+		if errors.As(err, &qe) {
+			respondError(w, r, http.StatusConflict, qe.Error())
+		} else {
+			h.logger.Error("transactional quota validation failed", "error", err)
+			respondError(w, r, http.StatusInternalServerError, "internal error")
+		}
+		return
+	}
+
 	// Insert pod with blueprint reference
 	_, err = tx.Exec(r.Context(), `
 		INSERT INTO pods (id, owner_id, name, salt, vlan_id, subnet, status, expires_at, blueprint_id, allow_vm_additions)

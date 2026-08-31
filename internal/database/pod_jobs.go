@@ -286,18 +286,46 @@ func (q *Queries) CreateVMAddJob(
 	vm *models.PodVM,
 	payload []byte,
 ) (*models.Job, error) {
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin vm_add enqueue: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	job, err := q.createVMAddJobTx(ctx, tx, vm, payload)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit vm_add job for VM %s in pod %s: %w", vm.ID, vm.PodID, err)
+	}
+	return job, nil
+}
+
+// CreateVMAddJobTx creates the pending VM and job under the caller's
+// transaction. Callers that enforce owner quotas lock the user row first, then
+// this helper locks the pod so all provisioning uses user -> pod lock order.
+func (q *Queries) CreateVMAddJobTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	vm *models.PodVM,
+	payload []byte,
+) (*models.Job, error) {
+	return q.createVMAddJobTx(ctx, tx, vm, payload)
+}
+
+func (q *Queries) createVMAddJobTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	vm *models.PodVM,
+	payload []byte,
+) (*models.Job, error) {
 	if vm.ID == uuid.Nil {
 		return nil, errors.New("vm_add requires a preallocated pod VM id")
 	}
 	if err := validatePodJobPayload(payload, vm.PodID, &vm.ID); err != nil {
 		return nil, err
 	}
-
-	tx, err := q.pool.Begin(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("begin vm_add enqueue: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
 
 	var status string
 	if err := tx.QueryRow(ctx, `
@@ -337,9 +365,6 @@ func (q *Queries) CreateVMAddJob(
 	job, err := createJob(ctx, tx, models.JobTypeVMAdd, payload)
 	if err != nil {
 		return nil, fmt.Errorf("insert vm_add job for VM %s in pod %s: %w", vm.ID, vm.PodID, err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("commit vm_add job for VM %s in pod %s: %w", vm.ID, vm.PodID, err)
 	}
 	return job, nil
 }

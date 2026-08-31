@@ -287,3 +287,71 @@ func TestDeployBlueprintCommitsResourcesAndInitialJobTogether(t *testing.T) {
 		t.Fatalf("blueprint.deploy audit rows = %d, want 1", auditCount)
 	}
 }
+
+func TestPodCreateProducersShareConcurrentQuotaBoundary(t *testing.T) {
+	fixture := newBlueprintDeployPostgresFixture(t)
+	if _, err := fixture.pool.Exec(context.Background(), `
+		UPDATE users SET max_pods = 1 WHERE id = $1
+	`, fixture.userID); err != nil {
+		t.Fatal(err)
+	}
+	delayPodCreateJobInsert(t, fixture.pool, fixture.userID)
+
+	type result struct {
+		rec       *httptest.ResponseRecorder
+		publisher *recordingJobCreatedPublisher
+	}
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	go func() {
+		<-start
+		publisher := &recordingJobCreatedPublisher{}
+		results <- result{
+			rec:       fixture.podCreatePostgresFixture.request(t, publisher),
+			publisher: publisher,
+		}
+	}()
+	go func() {
+		<-start
+		publisher := &recordingJobCreatedPublisher{}
+		results <- result{
+			rec:       fixture.request(t, publisher),
+			publisher: publisher,
+		}
+	}()
+	close(start)
+
+	statuses := map[int]int{}
+	published := 0
+	for i := 0; i < 2; i++ {
+		got := <-results
+		statuses[got.rec.Code]++
+		published += got.publisher.calls
+	}
+	if statuses[http.StatusAccepted] != 1 || statuses[http.StatusConflict] != 1 {
+		t.Fatalf("cross-producer statuses = %v, want one 202 and one quota 409", statuses)
+	}
+	if published != 1 {
+		t.Fatalf("cross-producer job-created publishes = %d, want 1", published)
+	}
+
+	var pods, vms, jobs, allocatedVLANs int
+	if err := fixture.pool.QueryRow(context.Background(), `
+		SELECT
+			(SELECT COUNT(*) FROM pods WHERE owner_id = $1),
+			(SELECT COUNT(*) FROM pod_vms pv JOIN pods p ON p.id = pv.pod_id WHERE p.owner_id = $1),
+			(SELECT COUNT(*) FROM jobs WHERE type = 'pod_create' AND payload->>'user_id' = $1::text),
+			(SELECT COUNT(*) FROM vlan_pool vp JOIN pods p ON p.id = vp.pod_id WHERE p.owner_id = $1)
+	`, fixture.userID).Scan(&pods, &vms, &jobs, &allocatedVLANs); err != nil {
+		t.Fatal(err)
+	}
+	if pods != 1 || vms != 1 || jobs != 1 || allocatedVLANs != 1 {
+		t.Fatalf(
+			"cross-producer aggregate: pods=%d vms=%d jobs=%d allocated_vlans=%d, want 1 each",
+			pods,
+			vms,
+			jobs,
+			allocatedVLANs,
+		)
+	}
+}
