@@ -475,10 +475,13 @@ vault:
     database: "selfservice/data/db"
     jwt: "selfservice/data/jwt"
 
-# Traefik IngressRoute
+# Traefik IngressRoute. The internal lab hostname must share the same cert and
+# route set as the public hostname so K3s split-DNS resolves cleanly to the same
+# TLS endpoint without changing the public route or bypassing Authentik.
 ingress:
   enabled: true
   hostname: crucible.jmal.io
+  internalHostname: crucible.lab.jmal.io
 
 # PostgreSQL subchart values
 postgresql:

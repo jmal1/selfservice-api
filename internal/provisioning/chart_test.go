@@ -45,6 +45,11 @@ type chartValues struct {
 			Enabled bool `yaml:"enabled"`
 		} `yaml:"contentFilter"`
 	} `yaml:"worker"`
+	Ingress struct {
+		Enabled          bool   `yaml:"enabled"`
+		Hostname         string `yaml:"hostname"`
+		InternalHostname string `yaml:"internalHostname"`
+	} `yaml:"ingress"`
 	VCenter struct {
 		Hosts                     string `yaml:"hosts"`
 		ResourcePools             string `yaml:"resourcePools"`
@@ -133,6 +138,71 @@ func TestChartProvisioningDefaultsRemainCompatible(t *testing.T) {
 		if got := chartScalar(t, "values.yaml", parts...); got != want {
 			t.Errorf("%s = %q, want explicit %q", path, got, want)
 		}
+	}
+}
+
+func TestInternalIngressCanonicalizesToPublicHost(t *testing.T) {
+	helmPath, err := exec.LookPath("helm")
+	if err != nil {
+		t.Skip("helm not available")
+	}
+	chartDir := filepath.Join("..", "..", "deploy", "helm", "selfservice")
+	if _, err := os.Stat(filepath.Join(chartDir, "charts")); err != nil {
+		t.Skip("chart dependencies not vendored; run `helm dependency build` in deploy/helm/selfservice first")
+	}
+
+	values := loadChartValues(t, "values.yaml")
+	if values.Ingress.Hostname != "crucible.jmal.io" {
+		t.Fatalf("public ingress hostname = %q, want %q to preserve the public route", values.Ingress.Hostname, "crucible.jmal.io")
+	}
+	if values.Ingress.InternalHostname != "crucible.lab.jmal.io" {
+		t.Fatalf("internal ingress hostname = %q, want %q", values.Ingress.InternalHostname, "crucible.lab.jmal.io")
+	}
+	if !values.Provisioning.Enabled || !values.Provisioning.WorkerClaimsEnabled {
+		t.Fatalf("ingress tests require default provisioning controls to remain enabled: %+v", values.Provisioning)
+	}
+
+	publicCmd := exec.Command(helmPath, "template", "selfservice", ".", "-f", "values.yaml", "--show-only", "templates/ingressroute.yaml")
+	publicCmd.Dir = chartDir
+	publicOut, err := publicCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("helm template public ingress failed: %v\n%s", err, publicOut)
+	}
+	publicManifest := string(publicOut)
+	if strings.Contains(publicManifest, "host: crucible.lab.jmal.io") {
+		t.Fatalf("public ingress must keep the public host as the primary route; internal browser traffic must be redirected:\n%s", publicManifest)
+	}
+	if !strings.Contains(publicManifest, "host: crucible.jmal.io") {
+		t.Fatalf("public ingress missing the public host:\n%s", publicManifest)
+	}
+	if !strings.Contains(publicManifest, "- crucible.lab.jmal.io") {
+		t.Fatalf("public TLS secret must cover the internal hostname for certificate validity:\n%s", publicManifest)
+	}
+	if !strings.Contains(publicManifest, "cert-manager.io/cluster-issuer: letsencrypt-prod") {
+		t.Fatalf("public ingress must own the shared cert-manager certificate:\n%s", publicManifest)
+	}
+
+	internalCmd := exec.Command(helmPath, "template", "selfservice", ".", "-f", "values.yaml", "--show-only", "templates/ingressroute-internal.yaml")
+	internalCmd.Dir = chartDir
+	internalOut, err := internalCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("helm template internal ingress failed: %v\n%s", err, internalOut)
+	}
+	internalManifest := string(internalOut)
+	if strings.Contains(internalManifest, "cert-manager.io/cluster-issuer") {
+		t.Fatalf("internal redirect ingress must not own cert-manager and must only consume the shared TLS secret:\n%s", internalManifest)
+	}
+	if !strings.Contains(internalManifest, "host: crucible.lab.jmal.io") {
+		t.Fatalf("internal ingress missing the internal host:\n%s", internalManifest)
+	}
+	if !strings.Contains(internalManifest, "redirectRegex") || !strings.Contains(internalManifest, "https://crucible.jmal.io${1}") {
+		t.Fatalf("internal ingress must redirect requests to the public host while preserving path/query:\n%s", internalManifest)
+	}
+	if strings.Contains(internalManifest, "path: /healthz") {
+		t.Fatalf("internal redirect ingress must not claim a direct /healthz route; browser auth must canonicalize back to the public host:\n%s", internalManifest)
+	}
+	if !strings.Contains(internalManifest, "secretName: selfservice-tls") {
+		t.Fatalf("internal ingress missing the shared TLS secret:\n%s", internalManifest)
 	}
 }
 

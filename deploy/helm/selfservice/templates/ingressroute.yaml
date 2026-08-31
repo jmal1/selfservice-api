@@ -56,5 +56,8 @@ spec:
   tls:
     - hosts:
         - {{ .Values.ingress.hostname }}
+        {{- if and .Values.ingress.internalHostname (ne .Values.ingress.internalHostname .Values.ingress.hostname) }}
+        - {{ .Values.ingress.internalHostname }}
+        {{- end }}
       secretName: selfservice-tls
 {{- end }}
