@@ -45,6 +45,10 @@ type chartValues struct {
 			Enabled bool `yaml:"enabled"`
 		} `yaml:"contentFilter"`
 	} `yaml:"worker"`
+	Ingress struct {
+		Enabled  bool   `yaml:"enabled"`
+		Hostname string `yaml:"hostname"`
+	} `yaml:"ingress"`
 	VCenter struct {
 		Hosts                     string `yaml:"hosts"`
 		ResourcePools             string `yaml:"resourcePools"`
@@ -133,6 +137,47 @@ func TestChartProvisioningDefaultsRemainCompatible(t *testing.T) {
 		if got := chartScalar(t, "values.yaml", parts...); got != want {
 			t.Errorf("%s = %q, want explicit %q", path, got, want)
 		}
+	}
+}
+
+func TestIngressIncludesInternalHostnameAndTLS(t *testing.T) {
+	helmPath, err := exec.LookPath("helm")
+	if err != nil {
+		t.Skip("helm not available")
+	}
+	chartDir := filepath.Join("..", "..", "deploy", "helm", "selfservice")
+	if _, err := os.Stat(filepath.Join(chartDir, "charts")); err != nil {
+		t.Skip("chart dependencies not vendored; run `helm dependency build` in deploy/helm/selfservice first")
+	}
+
+	values := loadChartValues(t, "values.yaml")
+	if values.Ingress.Hostname != "crucible.jmal.io" {
+		t.Fatalf("public ingress hostname = %q, want %q to preserve existing public route", values.Ingress.Hostname, "crucible.jmal.io")
+	}
+	if !values.Provisioning.Enabled || !values.Provisioning.WorkerClaimsEnabled {
+		t.Fatalf("ingress tests require default provisioning controls to remain enabled: %+v", values.Provisioning)
+	}
+
+	cmd := exec.Command(helmPath, "template", "selfservice", ".", "-f", "values.yaml", "--show-only", "templates/ingressroute.yaml")
+	cmd.Dir = chartDir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("helm template ingress failed: %v\n%s", err, out)
+	}
+	manifest := string(out)
+	for _, host := range []string{"crucible.jmal.io", "crucible.lab.jmal.io"} {
+		if !strings.Contains(manifest, "host: "+host) {
+			t.Fatalf("ingress manifest missing host %q:\n%s", host, manifest)
+		}
+	}
+	if strings.Count(manifest, "name: selfservice-ui") < 2 {
+		t.Fatalf("both hosts must route to the UI service; rendered manifest:\n%s", manifest)
+	}
+	if !strings.Contains(manifest, "secretName: selfservice-tls") {
+		t.Fatalf("ingress manifest missing the shared TLS secret:\n%s", manifest)
+	}
+	if !strings.Contains(manifest, "- crucible.jmal.io") || !strings.Contains(manifest, "- crucible.lab.jmal.io") {
+		t.Fatalf("tls hosts do not cover both public and internal names:\n%s", manifest)
 	}
 }
 
