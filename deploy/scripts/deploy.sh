@@ -3246,15 +3246,28 @@ verify_candidate_cronjob_image() {
     return 1
   fi
   if [ "$suspended" = true ]; then
-    actual="$(
-      live_effective_image \
-        CronJob \
-        "$name" \
-        "$container_type" \
-        "$container_name" \
-        "$expected" \
-        "$live_manifest_path"
-    )"
+    if ! actual="$(
+      manifest_workload_inventory "$live_manifest_path" \
+        | awk -F '\t' \
+            -v name="$name" \
+            -v type="$container_type" \
+            -v container="$container_name" \
+            '$1 == "CronJob" && $2 == name && $3 == type && $4 == container {
+               image = $5
+               matches++
+             }
+             END {
+               if (matches != 1) exit 3
+               print image
+             }'
+    )"; then
+      echo "ERROR: suspended candidate CronJob/$name does not contain exactly one live $container_type/$container_name tuple." >&2
+      return 1
+    fi
+    if ! is_digest_image "$actual"; then
+      echo "ERROR: suspended candidate CronJob/$name $container_type/$container_name does not declare an immutable sha256 image: $actual" >&2
+      return 1
+    fi
     if [ "$actual" != "$expected" ]; then
       echo "ERROR: candidate live image drifted for CronJob/$name $container_type/$container_name: expected $expected, found $actual." >&2
       return 1

@@ -146,6 +146,21 @@ func TestLocalVerificationCoverageMatchesRequiredCI(t *testing.T) {
 	}
 }
 
+func TestLocalVerifyRemoteHelmScriptIsLiteral(t *testing.T) {
+	root := findRepoRoot(t)
+	data, err := os.ReadFile(filepath.Join(root, "scripts", "local-verify.ps1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := strings.ReplaceAll(string(data), "\r\n", "\n")
+	if strings.Contains(source, `$remoteScript = @"`) {
+		t.Fatal("remote Helm Bash must not use an interpolating PowerShell here-string")
+	}
+	if !strings.Contains(source, "$remoteScript = @'\nset -euo pipefail") {
+		t.Fatal("remote Helm Bash is not assigned with a literal PowerShell here-string")
+	}
+}
+
 func TestLocalVerificationCoverageRejectsSabotage(t *testing.T) {
 	actual := localCoverageFromWorkflows(t)
 	sabotaged := make(map[string]int, len(actual))

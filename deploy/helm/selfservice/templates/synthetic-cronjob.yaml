@@ -52,7 +52,7 @@ spec:
                 - name: SYNTHETIC_PROVISIONING_EXPECTED_ENABLED
                   value: {{ .Values.synthetic.provisioningExpectedEnabled | quote }}
                 - name: SYNTHETIC_RUNNER_EXPECTED_ENABLED
-                  value: {{ .Values.synthetic.runner.enabled | quote }}
+                  value: {{ (and .Values.synthetic.runner.enabled (not .Values.synthetic.runner.suspend)) | quote }}
                 - name: SYNTHETIC_USER_ID
                   valueFrom:
                     secretKeyRef:

@@ -360,9 +360,7 @@ func runSuspendedCandidateCronJobVerificationHarness(
 	functions := []string{
 		"is_digest_image",
 		"manifest_workload_inventory",
-		"latest_cronjob_job",
 		"cronjob_suspend_from_manifest",
-		"live_effective_image",
 		"verify_candidate_cronjob_image",
 	}
 	var bodies strings.Builder
@@ -390,7 +388,8 @@ if [ "$1" = "get" ] && [[ "$2" == cronjob/* ]]; then
   exit 0
 fi
 if [ "$1" = "get" ] && [ "$2" = "jobs" ]; then
-  exit 0
+  echo "suspended verification must not inspect retained Jobs" >&2
+  exit 97
 fi
 echo "unexpected kubectl invocation: $*" >&2
 exit 98
@@ -691,23 +690,12 @@ func TestDeployScriptSuspendedCandidateCronJobVerificationSkipsJobCreation(t *te
 		t.Fatal(err)
 	}
 	source := string(deployBody)
-	suspendedGuard := `  if [ "$suspended" = true ]; then
-    actual="$(
-      live_effective_image \
-        CronJob \
-        "$name" \
-        "$container_type" \
-        "$container_name" \
-        "$expected" \
-        "$live_manifest_path"
-    )"
-    if [ "$actual" != "$expected" ]; then
-      echo "ERROR: candidate live image drifted for CronJob/$name $container_type/$container_name: expected $expected, found $actual." >&2
-      return 1
-    fi
-    return 0
-  fi`
-	if !strings.Contains(source, suspendedGuard) {
+	verifyBody, verifyStart, verifyEnd, err := extractFunctionBody(source, "verify_candidate_cronjob_image")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const suspendedPredicate = `if [ "$suspended" = true ]; then`
+	if strings.Count(verifyBody, suspendedPredicate) != 1 {
 		t.Fatal("suspended CronJob verification guard is missing")
 	}
 
@@ -756,8 +744,8 @@ func TestDeployScriptSuspendedCandidateCronJobVerificationSkipsJobCreation(t *te
 				t.Fatalf("suspended candidate verification should succeed without creating a Job: %v\n%s", originalErr, originalOutput)
 			}
 
-			sabotagedGuard := strings.Replace(suspendedGuard, `if [ "$suspended" = true ]; then`, `if false; then`, 1)
-			sabotagedSource := strings.Replace(source, suspendedGuard, sabotagedGuard, 1)
+			sabotagedBody := strings.Replace(verifyBody, suspendedPredicate, `if false; then`, 1)
+			sabotagedSource := source[:verifyStart] + sabotagedBody + source[verifyEnd:]
 			sabotagedOutput, sabotagedErr := runSuspendedCandidateCronJobVerificationHarness(
 				t,
 				sabotagedSource,

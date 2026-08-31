@@ -306,6 +306,7 @@ func TestChartWiresEveryProvisioningControl(t *testing.T) {
 			".Values.synthetic.provisioningExpectedEnabled",
 			"SYNTHETIC_RUNNER_EXPECTED_ENABLED",
 			".Values.synthetic.runner.enabled",
+			".Values.synthetic.runner.suspend",
 		},
 		"synthetic-runner-cronjob.yaml": {
 			"suspend: {{ .Values.synthetic.runner.suspend | default false }}",
@@ -690,6 +691,6 @@ func TestSyntheticCronJobRunnerExpectedEnabledRendersAcrossOverlays(t *testing.T
 		}
 	}
 
-	assertExactlyOne(t, render("values.prod.yaml"), "values.prod.yaml", "true")
+	assertExactlyOne(t, render("values.prod.yaml"), "values.prod.yaml", "false")
 	assertExactlyOne(t, render("values.full-fleet.yaml"), "values.full-fleet.yaml", "true")
 }

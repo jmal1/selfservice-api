@@ -689,7 +689,7 @@ if ($selectedTiers -contains 4) {
             }
             else {
                 $remoteTarget = $resolvedRemote.Target
-                $remoteScript = @"
+                $remoteScript = @'
 set -euo pipefail
 trap 'rm -f /tmp/rendered-api.yaml /tmp/rendered-worker.yaml /tmp/rendered-synthetic.yaml /tmp/rendered-janitor.yaml /tmp/rendered-runner.yaml' EXIT
 cd "$HOME/selfservice-api-helm"
@@ -727,10 +727,10 @@ assert_env_value /tmp/rendered-worker.yaml VCENTER_RESOURCE_POOLS /JMAL-Datacent
 assert_env_value /tmp/rendered-worker.yaml VCENTER_PLACEMENT_RESERVED_MEMORY_MB nuc2.lab.jmal.io=2048,nuc3.lab.jmal.io=2048
 assert_env_value /tmp/rendered-synthetic.yaml SYNTHETIC_PROVISIONING_EXPECTED_ENABLED false
 assert_env_value /tmp/rendered-synthetic.yaml SYNTHETIC_LIFECYCLE_ENABLED false
-assert_env_value /tmp/rendered-synthetic.yaml SYNTHETIC_RUNNER_EXPECTED_ENABLED true
+assert_env_value /tmp/rendered-synthetic.yaml SYNTHETIC_RUNNER_EXPECTED_ENABLED false
 assert_suspended /tmp/rendered-janitor.yaml selfservice-synthetic-janitor
 assert_suspended /tmp/rendered-runner.yaml selfservice-synthetic-runner
-"@
+'@
                 $remoteOutput = & ssh $remoteTarget $remoteScript 2>&1
                 if ($LASTEXITCODE -ne 0) {
                     Write-TierResult -Index 4 -Name "production Helm render + lint via Vault SSH" -State "FAIL" -Details (Format-TrimmedOutput ($remoteOutput | Out-String))
