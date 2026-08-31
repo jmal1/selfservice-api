@@ -120,6 +120,23 @@ func assertOrphanRecoveryState(t *testing.T, pool *pgxpool.Pool, podID uuid.UUID
 	}
 }
 
+func assertOrphanRecoveryAuditJobID(t *testing.T, pool *pgxpool.Pool, podID, wantJobID uuid.UUID) {
+	t.Helper()
+	var jobID uuid.UUID
+	if err := pool.QueryRow(context.Background(), `
+		SELECT job_id
+		FROM pod_destroy_recovery_audit
+		WHERE pod_id = $1
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, podID).Scan(&jobID); err != nil {
+		t.Fatal(err)
+	}
+	if jobID != wantJobID {
+		t.Fatalf("audit job_id = %s, want %s", jobID, wantJobID)
+	}
+}
+
 func TestFinalizeOrphanedPodDestroyPostgresFinalizesAndAudits(t *testing.T) {
 	fixture := newOrphanDestroyRecoveryFixture(t)
 	ctx := context.Background()
@@ -135,6 +152,7 @@ func TestFinalizeOrphanedPodDestroyPostgresFinalizesAndAudits(t *testing.T) {
 		t.Fatalf("snapshot mismatch: %+v", snap)
 	}
 	assertOrphanRecoveryState(t, fixture.pool, fixture.podID, models.PodStatusDestroyed, false, 1)
+	assertOrphanRecoveryAuditJobID(t, fixture.pool, fixture.podID, fixture.jobID)
 }
 
 func TestFinalizeOrphanedPodDestroyPostgresUsesFirstDestroyJobAcrossAttempts(t *testing.T) {
@@ -160,6 +178,7 @@ func TestFinalizeOrphanedPodDestroyPostgresUsesFirstDestroyJobAcrossAttempts(t *
 	if snap.DestroyJobReason != "manual cleanup required after orphaned destroy left no live residue" {
 		t.Fatalf("destroy job reason = %q, want production-style error field", snap.DestroyJobReason)
 	}
+	assertOrphanRecoveryAuditJobID(t, fixture.pool, fixture.podID, fixture.jobID)
 }
 
 func TestFinalizeOrphanedPodDestroyPostgresRejectsUnsupportedManualCleanupResults(t *testing.T) {
@@ -206,6 +225,11 @@ func TestFinalizeOrphanedPodDestroyPostgresRejectsUnsupportedManualCleanupResult
 			`, string(resultJSON), fixture.jobID); err != nil {
 				t.Fatal(err)
 			}
+			insertOrphanDestroyJob(t, fixture.pool, uuid.New(), fixture.podID, time.Now().Add(-time.Minute), map[string]any{
+				"error":                   "manual cleanup required after the authoritative row was already rejected",
+				"attempts":                3,
+				"manual_cleanup_required": true,
+			})
 			if _, err := fixture.queries.FinalizeOrphanedPodDestroy(context.Background(), fixture.ownerID, fixture.podID, PodDestroyRecoveryAttestation{
 				VLANID:            fixture.vlanTag,
 				Subnet:            fixture.subnet,

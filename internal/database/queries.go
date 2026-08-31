@@ -746,6 +746,25 @@ type PodDestroyRecoveryAttestation struct {
 	ConfirmationToken string `json:"confirmation_token"`
 }
 
+func parseManualCleanupDestroyJobResult(result []byte) (string, bool) {
+	var payload map[string]any
+	if err := json.Unmarshal(result, &payload); err != nil {
+		return "", false
+	}
+	reason, ok := payload["error"].(string)
+	if !ok || reason == "" {
+		return "", false
+	}
+	if _, ok := payload["attempts"].(float64); !ok {
+		return "", false
+	}
+	manualCleanupRequired, ok := payload["manual_cleanup_required"].(bool)
+	if !ok || !manualCleanupRequired {
+		return "", false
+	}
+	return reason, true
+}
+
 func (q *Queries) FinalizeOrphanedPodDestroy(ctx context.Context, actorUserID, podID uuid.UUID, attestation PodDestroyRecoveryAttestation) (*PodDestroyRecoverySnapshot, error) {
 	tx, err := q.pool.Begin(ctx)
 	if err != nil {
@@ -778,25 +797,25 @@ func (q *Queries) FinalizeOrphanedPodDestroy(ctx context.Context, actorUserID, p
 	}
 
 	var jobID uuid.UUID
-	var jobStatus, jobReason string
+	var jobStatus string
+	var jobResult []byte
 	if err := tx.QueryRow(ctx, `
-		SELECT id, status, COALESCE(result->>'error', '')
+		SELECT id, status, COALESCE(result, '{}'::jsonb)
 		FROM jobs
 		WHERE type = 'pod_destroy'
 		  AND payload->>'pod_id' = $1::text
-		  AND status = 'failed'
-		  AND jsonb_typeof(result->'error') = 'string'
-		  AND jsonb_typeof(result->'attempts') = 'number'
-		  AND jsonb_typeof(result->'manual_cleanup_required') = 'boolean'
-		  AND result->'manual_cleanup_required' = 'true'::jsonb
 		ORDER BY created_at ASC, id ASC
 		FOR UPDATE
 		LIMIT 1
-	`, podID).Scan(&jobID, &jobStatus, &jobReason); err != nil {
+	`, podID).Scan(&jobID, &jobStatus, &jobResult); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, fmt.Errorf("%w: missing pod_destroy job for pod %s", ErrPodDestroyRecoveryPrecondition, podID)
 		}
 		return nil, fmt.Errorf("lock pod destroy job for orphaned recovery: %w", err)
+	}
+	jobReason, ok := parseManualCleanupDestroyJobResult(jobResult)
+	if !ok || jobStatus != models.JobStatusFailed {
+		return nil, fmt.Errorf("%w: pod destroy job %s invalid", ErrPodDestroyRecoveryPrecondition, jobID)
 	}
 	var placements int
 	if err := tx.QueryRow(ctx, `
