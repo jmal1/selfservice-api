@@ -1,8 +1,12 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"fmt"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/jmal1/selfservice-api/internal/models"
 )
@@ -45,11 +49,9 @@ func IsQuotaError(err error) bool {
 // most user-facing limit first (a pod-count breach is easier to reason
 // about than a vCPU breach hidden behind a pod-count breach).
 //
-// The function is pure: no I/O, no goroutines. Make sure usage and user
-// are loaded from the same transaction or close enough in time that the
-// snapshot is meaningful — concurrent pod creates can still race past
-// this check (we accept that; the alternative is a row-level lock on
-// every user record).
+// The function is pure: no I/O, no goroutines. Provisioning callers must use
+// validateQuotaTx before inserting durable state so their quota decision is
+// serialized with concurrent provisioning for the same owner.
 func ValidateQuotas(usage *models.ResourceUsage, user *models.User, requestedPods, requestedVCPUs, requestedRAMMB int) error {
 	if user == nil {
 		// Defensive: callers should never pass nil. Returning an error
@@ -85,4 +87,24 @@ func ValidateQuotas(usage *models.ResourceUsage, user *models.User, requestedPod
 		}
 	}
 	return nil
+}
+
+func (h *Handler) validateQuotaTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	userID uuid.UUID,
+	requestedPods, requestedVCPUs, requestedRAMMB int,
+) error {
+	user, err := h.db.GetUserByIDForUpdate(ctx, tx, userID)
+	if err != nil {
+		return fmt.Errorf("lock user for provisioning quota: %w", err)
+	}
+	if user == nil {
+		return errors.New("lock user for provisioning quota: user not found")
+	}
+	usage, err := h.db.GetResourceUsageTx(ctx, tx, userID)
+	if err != nil {
+		return fmt.Errorf("read provisioning quota usage: %w", err)
+	}
+	return ValidateQuotas(usage, user, requestedPods, requestedVCPUs, requestedRAMMB)
 }

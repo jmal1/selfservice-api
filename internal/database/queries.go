@@ -152,6 +152,25 @@ func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (*models.User, 
 	return &u, err
 }
 
+// GetUserByIDForUpdate loads and locks a user so concurrent provisioning
+// transactions for the same owner serialize their quota decisions.
+func (q *Queries) GetUserByIDForUpdate(ctx context.Context, tx pgx.Tx, id uuid.UUID) (*models.User, error) {
+	var u models.User
+	err := tx.QueryRow(ctx, `
+		SELECT id, oidc_sub, username, email, COALESCE(display_name, ''), role,
+		       max_vcpus, max_ram_mb, max_pods, is_active, created_at, updated_at
+		FROM users WHERE id = $1
+		FOR UPDATE
+	`, id).Scan(
+		&u.ID, &u.OIDCSub, &u.Username, &u.Email, &u.DisplayName, &u.Role,
+		&u.MaxVCPUs, &u.MaxRAMMB, &u.MaxPods, &u.IsActive, &u.CreatedAt, &u.UpdatedAt,
+	)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	return &u, err
+}
+
 // ListUsers returns all users (admin).
 func (q *Queries) ListUsers(ctx context.Context) ([]models.User, error) {
 	rows, err := q.pool.Query(ctx, `
@@ -627,9 +646,18 @@ func (q *Queries) ListAuditLog(ctx context.Context) ([]models.AuditLog, error) {
 
 // GetResourceUsage returns a user's current resource consumption.
 func (q *Queries) GetResourceUsage(ctx context.Context, userID uuid.UUID) (*models.ResourceUsage, error) {
+	return getResourceUsage(ctx, q.pool, userID)
+}
+
+// GetResourceUsageTx returns usage visible to the caller's transaction.
+func (q *Queries) GetResourceUsageTx(ctx context.Context, tx pgx.Tx, userID uuid.UUID) (*models.ResourceUsage, error) {
+	return getResourceUsage(ctx, tx, userID)
+}
+
+func getResourceUsage(ctx context.Context, querier jobRowQuerier, userID uuid.UUID) (*models.ResourceUsage, error) {
 	var usage models.ResourceUsage
 
-	err := q.pool.QueryRow(ctx, `
+	err := querier.QueryRow(ctx, `
 		SELECT
 			COALESCE(SUM(pv.vcpus), 0),
 			COALESCE(SUM(pv.ram_mb), 0),
