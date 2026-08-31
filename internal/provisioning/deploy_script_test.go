@@ -836,7 +836,7 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 			name:      "pauses temporary live claims override",
 			transform: func(manifest string) string { return baselineManifest(true, "*", "false") },
 			configure: func(env *deployScriptEnvironment) {
-				writeFile(t, env.liveResource, rollbackManifestWithHistoricalSynthetics(true))
+				writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
 			},
 			wantSuccess:       true,
 			wantOutput:        "pausing live worker provisioning claims",
