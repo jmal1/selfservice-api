@@ -21,7 +21,7 @@ metadata:
     app.kubernetes.io/component: synthetic-monitor
 spec:
   schedule: {{ .Values.synthetic.janitor.schedule | quote }}
-  suspend: false
+  suspend: {{ .Values.synthetic.janitor.suspend | default false }}
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 5

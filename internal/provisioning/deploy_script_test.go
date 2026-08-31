@@ -426,12 +426,22 @@ func TestDeployScriptSuspendedCronJobEffectiveImageProof(t *testing.T) {
 			runtimeImageID: runtimeImageB,
 		},
 		{
-			name:               "retained Job lookup failure cannot use suspended spec fallback",
-			manifest:           suspendedCronJobManifest(true, imageA, false),
-			declaredImage:      imageA,
-			expectedImage:      imageA,
-			failJobLookup:      true,
-			wantOutputContains: "failed to list retained Jobs for CronJob/selfservice-synthetic-runner",
+			name:           "suspended retained Job cannot override declared image",
+			manifest:       suspendedCronJobManifest(true, imageA, false),
+			declaredImage:  imageA,
+			expectedImage:  imageA,
+			retainedJob:    true,
+			wantSuccess:    true,
+			runtimeImageID: runtimeImageB,
+		},
+		{
+			name:           "suspended Job lookup failure still uses the declared image",
+			manifest:       suspendedCronJobManifest(true, imageA, false),
+			declaredImage:  imageA,
+			expectedImage:  imageA,
+			failJobLookup:  true,
+			wantSuccess:    true,
+			runtimeImageID: runtimeImageB,
 		},
 		{
 			name:               "runnable without retained Job fails closed",
@@ -506,21 +516,22 @@ func TestDeployScriptCronJobHealthJobLookupGuardIsLoadBearing(t *testing.T) {
 	source := string(deployBody)
 
 	output, runErr := runCronJobHealthLookupHarness(t, source)
-	if runErr == nil || !strings.Contains(string(output), "failed to list retained Jobs for CronJob/selfservice-synthetic-runner during health verification") {
-		t.Fatalf("health lookup guard did not fail for the expected reason: err=%v\n%s", runErr, output)
+	if runErr != nil {
+		t.Fatalf("suspended CronJob health verification should skip retained Job lookup: %v\n%s", runErr, output)
 	}
 
-	guard := `if ! job_name="$(latest_cronjob_job "$name")"; then
-          echo "ERROR: failed to list retained Jobs for CronJob/$name during health verification." >&2
-          return 1
+	guard := `        if [ "$suspended" = true ]; then
+          continue
         fi`
 	if strings.Count(source, guard) != 1 {
-		t.Fatalf("health lookup sabotage target count != 1")
+		t.Fatalf("health suspension guard sabotage target count != 1")
 	}
-	sabotaged := strings.Replace(source, guard, `job_name="$(latest_cronjob_job "$name")" || true`, 1)
+	sabotaged := strings.Replace(source, guard, `        if false; then
+          continue
+        fi`, 1)
 	output, runErr = runCronJobHealthLookupHarness(t, sabotaged)
-	if runErr != nil {
-		t.Fatalf("removing the health lookup guard did not expose false acceptance: %v\n%s", runErr, output)
+	if runErr == nil || !strings.Contains(string(output), "failed to list retained Jobs for CronJob/selfservice-synthetic-runner during health verification") {
+		t.Fatalf("health suspension guard sabotage did not restore the retained-Job failure: err=%v\n%s", runErr, output)
 	}
 }
 
@@ -531,6 +542,7 @@ func TestDeployScriptSuspendedCronJobFallbackGuardsAreLoadBearing(t *testing.T) 
 	}
 	source := string(deployBody)
 	image := "ghcr.io/jmal1/selfservice-crucible-runner@sha256:" + testDigestA
+	runtimeImage := "docker-pullable://ghcr.io/jmal1/selfservice-crucible-runner@sha256:" + testDigestB
 
 	for _, test := range []struct {
 		name          string
@@ -540,38 +552,34 @@ func TestDeployScriptSuspendedCronJobFallbackGuardsAreLoadBearing(t *testing.T) 
 		declared      string
 		expected      string
 		failJobLookup bool
-		wantOriginal  string
+		retainedJob   bool
+		runtimeImage  string
+		wantOutput    string
 	}{
 		{
-			name: "retained Job lookup status",
-			old: `if ! job_name="$(latest_cronjob_job "$name")"; then
-        echo "ERROR: failed to list retained Jobs for CronJob/$name while proving its effective image." >&2
-        return 1
-      fi`,
-			replacement:   `job_name="$(latest_cronjob_job "$name")" || true`,
+			name: "suspended lookup failure still accepts declared image",
+			old: `      if [ "$suspended" = true ]; then
+        if ! spec_image="$(`,
+			replacement: `      if false; then
+        if ! spec_image="$(`,
 			manifest:      suspendedCronJobManifest(true, image, false),
 			declared:      image,
 			expected:      image,
 			failJobLookup: true,
-			wantOriginal:  "failed to list retained Jobs for CronJob/selfservice-synthetic-runner",
+			wantOutput:    "failed to list retained Jobs for CronJob/selfservice-synthetic-runner while proving its effective image",
 		},
 		{
-			name:         "suspended-only predicate",
-			old:          `if [ "$suspended" != true ]; then`,
-			replacement:  `if false; then`,
-			manifest:     suspendedCronJobManifest(false, image, false),
+			name: "stale retained Job cannot override suspended image",
+			old: `      if [ "$suspended" = true ]; then
+        if ! spec_image="$(`,
+			replacement: `      if false; then
+        if ! spec_image="$(`,
+			manifest:     suspendedCronJobManifest(true, image, false),
 			declared:     image,
 			expected:     image,
-			wantOriginal: "runnable CronJob/selfservice-synthetic-runner has no retained Job",
-		},
-		{
-			name:         "immutable digest check",
-			old:          `if ! is_digest_image "$spec_image"; then`,
-			replacement:  `if false; then`,
-			manifest:     suspendedCronJobManifest(true, "ghcr.io/jmal1/selfservice-crucible-runner:latest", false),
-			declared:     "ghcr.io/jmal1/selfservice-crucible-runner:latest",
-			expected:     "ghcr.io/jmal1/selfservice-crucible-runner:latest",
-			wantOriginal: "does not declare an immutable sha256 image",
+			retainedJob:  true,
+			runtimeImage: runtimeImage,
+			wantOutput:   "digest mismatch for CronJob/selfservice-synthetic-runner containers/synthetic-runner: effective image",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -581,12 +589,12 @@ func TestDeployScriptSuspendedCronJobFallbackGuardsAreLoadBearing(t *testing.T) 
 				test.manifest,
 				test.declared,
 				test.expected,
-				false,
+				test.retainedJob,
 				test.failJobLookup,
-				"",
+				test.runtimeImage,
 			)
-			if originalErr == nil || !strings.Contains(string(originalOutput), test.wantOriginal) {
-				t.Fatalf("original guard did not fail for the expected reason: err=%v\n%s", originalErr, originalOutput)
+			if originalErr != nil {
+				t.Fatalf("fixed suspended CronJob ordering failed unexpectedly: %v\n%s", originalErr, originalOutput)
 			}
 			if strings.Count(source, test.old) != 1 {
 				t.Fatalf("sabotage target %q count != 1", test.old)
@@ -598,15 +606,12 @@ func TestDeployScriptSuspendedCronJobFallbackGuardsAreLoadBearing(t *testing.T) 
 				test.manifest,
 				test.declared,
 				test.expected,
-				false,
+				test.retainedJob,
 				test.failJobLookup,
-				"",
+				test.runtimeImage,
 			)
-			if sabotagedErr != nil {
-				t.Fatalf("removing the %s did not expose false acceptance: %v\n%s", test.name, sabotagedErr, sabotagedOutput)
-			}
-			if !strings.HasSuffix(strings.TrimSpace(string(sabotagedOutput)), test.expected) {
-				t.Fatalf("sabotaged proof returned %q, want false acceptance of %q", sabotagedOutput, test.expected)
+			if sabotagedErr == nil || !strings.Contains(string(sabotagedOutput), test.wantOutput) {
+				t.Fatalf("sabotaged suspended CronJob ordering did not fail for the expected reason: err=%v\n%s", sabotagedErr, sabotagedOutput)
 			}
 		})
 	}
