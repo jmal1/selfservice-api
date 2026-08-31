@@ -139,6 +139,103 @@ func TestTemplateAdministrationRoutesRequireInstructorRole(t *testing.T) {
 	}
 }
 
+func TestAdministrativeResourceRoutesAreRegistered(t *testing.T) {
+	found := walkRoutes(t)
+	want := []string{
+		"GET /api/v1/admin/audit",
+		"GET /api/v1/admin/audit/search",
+		"GET /api/v1/admin/sessions",
+		"PATCH /api/v1/admin/users/{userID}/quotas",
+		"GET /api/v1/admin/jobs",
+		"GET /api/v1/admin/vlans",
+		"POST /api/v1/admin/vlans",
+		"PATCH /api/v1/admin/vlans/{vlanID}",
+		"DELETE /api/v1/admin/vlans/{vlanID}",
+		"GET /api/v1/admin/blueprints",
+		"POST /api/v1/admin/blueprints",
+		"PUT /api/v1/admin/blueprints/{blueprintID}",
+		"DELETE /api/v1/admin/blueprints/{blueprintID}",
+		"POST /api/v1/admin/blueprints/{blueprintID}/access",
+		"POST /api/v1/admin/blueprints/{id}/pin",
+		"DELETE /api/v1/admin/blueprints/{id}/pin",
+		"POST /api/v1/admin/blueprints/reorder",
+		"POST /api/v1/admin/blueprints/{blueprintID}/vm-playlists",
+		"GET /api/v1/admin/blueprints/{blueprintID}/vm-playlists",
+		"DELETE /api/v1/admin/blueprints/{blueprintID}/vm-playlists/{vmSlot}",
+		"POST /api/v1/admin/pods/{podID}/extend",
+		"POST /api/v1/admin/pods/{podID}/finalize-orphaned-destroy",
+		"GET /api/v1/admin/workflows/",
+		"POST /api/v1/admin/workflows/",
+		"POST /api/v1/admin/workflows/import",
+		"GET /api/v1/admin/workflows/export",
+		"GET /api/v1/admin/workflows/{workflowID}",
+		"PUT /api/v1/admin/workflows/{workflowID}",
+		"DELETE /api/v1/admin/workflows/{workflowID}",
+		"POST /api/v1/admin/workflows/{workflowID}/submit",
+		"POST /api/v1/admin/workflows/{workflowID}/approve",
+		"POST /api/v1/admin/workflows/{workflowID}/activate",
+		"GET /api/v1/admin/actions/",
+		"POST /api/v1/admin/actions/",
+		"GET /api/v1/admin/actions/{actionID}",
+		"PUT /api/v1/admin/actions/{actionID}",
+		"DELETE /api/v1/admin/actions/{actionID}",
+		"POST /api/v1/admin/scripts/validate",
+		"GET /api/v1/admin/playlists/",
+		"POST /api/v1/admin/playlists/",
+		"GET /api/v1/admin/playlists/{playlistID}",
+		"PUT /api/v1/admin/playlists/{playlistID}",
+		"DELETE /api/v1/admin/playlists/{playlistID}",
+	}
+	for _, route := range want {
+		if !found[route] {
+			t.Errorf("administrative resource route not registered: %s", route)
+		}
+	}
+}
+
+func TestAdministrativeResourceRoutesRequireInstructorRole(t *testing.T) {
+	provider := auth.NewTestProvider([]byte(testJWTSecret))
+	router := Setup(nil, provider, nil, []string{"*"})
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{method: http.MethodGet, path: "/api/v1/admin/jobs"},
+		{method: http.MethodPatch, path: "/api/v1/admin/users/" + uuid.NewString() + "/quotas"},
+		{method: http.MethodPost, path: "/api/v1/admin/blueprints/reorder"},
+		{method: http.MethodPost, path: "/api/v1/admin/pods/" + uuid.NewString() + "/extend"},
+		{method: http.MethodPost, path: "/api/v1/admin/workflows/import"},
+		{method: http.MethodDelete, path: "/api/v1/admin/actions/" + uuid.NewString()},
+		{method: http.MethodPut, path: "/api/v1/admin/playlists/" + uuid.NewString()},
+	} {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			req.AddCookie(makeSessionCookie(t, models.RoleStudent))
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("student role: status = %d, want 403", rec.Code)
+			}
+		})
+	}
+}
+
+func TestAuditAndSessionRoutesRequireAdminRole(t *testing.T) {
+	provider := auth.NewTestProvider([]byte(testJWTSecret))
+	router := Setup(nil, provider, nil, []string{"*"})
+	for _, path := range []string{"/api/v1/admin/audit", "/api/v1/admin/audit/search", "/api/v1/admin/sessions"} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			req.AddCookie(makeSessionCookie(t, models.RoleInstructor))
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("instructor role: status = %d, want 403", rec.Code)
+			}
+		})
+	}
+}
+
 // The pre-existing admin routes must survive the addition — this is the
 // specific failure mode of getting the nesting wrong.
 func TestExistingAdminRoutesStillRegistered(t *testing.T) {
