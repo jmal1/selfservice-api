@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -769,7 +770,7 @@ func (q *Queries) FinalizeOrphanedPodDestroy(ctx context.Context, actorUserID, p
 		}
 		return nil, fmt.Errorf("lock pod for orphaned destroy recovery: %w", err)
 	}
-	if podStatus != models.PodStatusDestroyFailed || podError != models.PodErrorManualCleanupRequiredPrefix {
+	if podStatus != models.PodStatusDestroyFailed || !strings.HasPrefix(podError, models.PodErrorManualCleanupRequiredPrefix) {
 		return nil, fmt.Errorf("%w: pod %s status=%s", ErrPodDestroyRecoveryPrecondition, podID, podStatus)
 	}
 	if attestation.VLANID != vlanID || attestation.Subnet != subnet {
@@ -779,10 +780,15 @@ func (q *Queries) FinalizeOrphanedPodDestroy(ctx context.Context, actorUserID, p
 	var jobID uuid.UUID
 	var jobStatus, jobReason string
 	if err := tx.QueryRow(ctx, `
-		SELECT id, status, COALESCE(result->>'status', '')
+		SELECT id, status, COALESCE(result->>'error', '')
 		FROM jobs
 		WHERE type = 'pod_destroy'
 		  AND payload->>'pod_id' = $1::text
+		  AND status = 'failed'
+		  AND jsonb_typeof(result->'error') = 'string'
+		  AND jsonb_typeof(result->'attempts') = 'number'
+		  AND jsonb_typeof(result->'manual_cleanup_required') = 'boolean'
+		  AND result->'manual_cleanup_required' = 'true'::jsonb
 		ORDER BY created_at ASC, id ASC
 		FOR UPDATE
 		LIMIT 1
@@ -792,10 +798,6 @@ func (q *Queries) FinalizeOrphanedPodDestroy(ctx context.Context, actorUserID, p
 		}
 		return nil, fmt.Errorf("lock pod destroy job for orphaned recovery: %w", err)
 	}
-	if jobStatus != models.JobStatusFailed || jobReason != "manual_cleanup_required" {
-		return nil, fmt.Errorf("%w: pod destroy job %s status=%s", ErrPodDestroyRecoveryPrecondition, jobID, jobStatus)
-	}
-
 	var placements int
 	if err := tx.QueryRow(ctx, `
 		SELECT count(*)

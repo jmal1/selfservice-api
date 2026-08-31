@@ -14,6 +14,6 @@ Body:
 }
 ```
 
-The endpoint is admin-only, fail-closed, and does not call external infrastructure. It requires the pod to still be `destroy_failed`, the authoritative destroy job to remain in `manual_cleanup_required`, and the attestation to match the pod’s recorded VLAN and subnet exactly.
+The endpoint is admin-only, fail-closed, and does not call external infrastructure. It requires the pod to still be `destroy_failed`, the authoritative destroy job to be a failed `pod_destroy` record whose JSON result includes `"manual_cleanup_required": true`, and the attestation to match the pod’s recorded VLAN and subnet exactly.
 
 Use this only after out-of-band inspection has already proven the pod is a pure orphaned database record. It is not a general destroy-failure bypass.
