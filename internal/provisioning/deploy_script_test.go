@@ -1286,6 +1286,105 @@ func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 	}
 }
 
+func TestDeployScriptPostUpgradeActiveJobContainment(t *testing.T) {
+	requirePOSIXShell(t)
+	live := baselineManifest(true, "", "false")
+	candidate := baselineManifest(true, "*", "false")
+
+	t.Run("contained API monitor is permitted", func(t *testing.T) {
+		env := newDeployScriptEnvironment(t, live, candidate)
+		env.postUpgradeActiveKubernetesJob = "api-monitor-contained"
+
+		output, err := env.run("--no-pull")
+		if err != nil {
+			t.Fatalf("contained API monitor caused false post-upgrade failure: %v\n%s", err, output)
+		}
+		if !strings.Contains(string(output), "deployed exact source") {
+			t.Fatalf("contained API monitor did not reach successful deployment:\n%s", output)
+		}
+		if _, statErr := os.Stat(env.candidateAppliedMark); statErr != nil {
+			t.Fatalf("contained API monitor fixture did not reach post-upgrade containment: %v", statErr)
+		}
+		if _, statErr := os.Stat(env.lockFile); !os.IsNotExist(statErr) {
+			t.Fatalf("successful contained API monitor deployment retained the release lock: %v", statErr)
+		}
+	})
+
+	for _, test := range []struct {
+		name string
+		job  string
+	}{
+		{name: "runner remains blocking", job: "runner"},
+		{name: "janitor remains blocking", job: "janitor"},
+		{name: "provisioning remains blocking", job: "provisioning"},
+		{name: "unknown name remains blocking", job: "unknown"},
+		{name: "spoofed API monitor remains blocking", job: "api-monitor-wrong-owner"},
+		{name: "lifecycle-enabled API monitor remains blocking", job: "api-monitor-lifecycle"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			env := newDeployScriptEnvironment(t, live, candidate)
+			env.postUpgradeActiveKubernetesJob = test.job
+
+			output, err := env.run("--no-pull")
+			if err == nil {
+				t.Fatalf("active %s Job unexpectedly passed post-upgrade containment:\n%s", test.job, output)
+			}
+			if !strings.Contains(string(output), "Kubernetes Jobs remain active") {
+				t.Fatalf("active %s Job failure did not identify the job drain:\n%s", test.job, output)
+			}
+			if _, statErr := os.Stat(env.candidateAppliedMark); statErr != nil {
+				t.Fatalf("active %s Job fixture did not reach post-upgrade containment: %v", test.job, statErr)
+			}
+			if _, statErr := os.Stat(env.lockFile); statErr != nil {
+				t.Fatalf("active %s Job failure did not retain the release lock: %v", test.job, statErr)
+			}
+		})
+	}
+}
+
+func TestDeployScriptPostUpgradeActiveJobGuardIsLoadBearing(t *testing.T) {
+	requirePOSIXShell(t)
+	deployPath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
+	deployBody, err := os.ReadFile(deployPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const guard = `  if [ -n "$active_kubernetes_jobs" ]; then
+    echo "ERROR: Kubernetes Jobs remain active in namespace $NAMESPACE: $active_kubernetes_jobs." >&2
+    return 1
+  fi
+`
+	if strings.Count(string(deployBody), guard) != 1 {
+		t.Fatal("post-upgrade active Kubernetes Job guard is not unique")
+	}
+	sabotagedBody := strings.Replace(string(deployBody), guard, "", 1)
+	sabotagedPath := filepath.Join(
+		filepath.Dir(deployPath),
+		"deploy-sabotaged-active-job-guard-test.sh",
+	)
+	writeExecutable(t, sabotagedPath, sabotagedBody)
+	t.Cleanup(func() { os.Remove(sabotagedPath) })
+
+	live := baselineManifest(true, "", "false")
+	env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "false"))
+	env.postUpgradeActiveKubernetesJob = "provisioning"
+	env.scriptPath = sabotagedPath
+
+	output, runErr := env.run("--no-pull")
+	if runErr != nil {
+		t.Fatalf("removing the active Job guard did not expose false acceptance: %v\n%s", runErr, output)
+	}
+	if !strings.Contains(string(output), "deployed exact source") {
+		t.Fatalf("removing the active Job guard did not reach false success:\n%s", output)
+	}
+	if _, statErr := os.Stat(env.candidateAppliedMark); statErr != nil {
+		t.Fatalf("active Job sabotage did not reach post-upgrade containment: %v", statErr)
+	}
+	if _, statErr := os.Stat(env.lockFile); !os.IsNotExist(statErr) {
+		t.Fatalf("sabotaged active Job guard did not falsely release the lock: %v", statErr)
+	}
+}
+
 func TestDeployScriptCandidateCronJobVerificationIsContained(t *testing.T) {
 	requirePOSIXShell(t)
 	live := baselineManifest(true, "", "false")
@@ -6418,6 +6517,7 @@ type deployScriptEnvironment struct {
 	finalWorkloadHealthRegression     bool
 	activeJobs                        int
 	activeKubernetesJobs              int
+	postUpgradeActiveKubernetesJob    string
 	activeMutatingSyntheticJobs       int
 	completedMutatingSyntheticJob     bool
 	noRetainedJanitorJob              bool
@@ -7290,15 +7390,100 @@ case "$1" in
         if [ "$FAKE_MALFORMED_JOBS_JSON" = true ]; then
           printf '{"items":"not-an-array"}\n'
         else
+          post_upgrade=
+          if [ -f "$FAKE_CANDIDATE_APPLIED_MARKER" ]; then
+            post_upgrade=$FAKE_POST_UPGRADE_ACTIVE_KUBERNETES_JOB
+          fi
           jq -cn \
             --argjson active "$FAKE_ACTIVE_KUBERNETES_JOBS" \
             --argjson synthetic "$FAKE_ACTIVE_MUTATING_SYNTHETIC_JOBS" \
             --argjson completed "$FAKE_COMPLETED_MUTATING_SYNTHETIC_JOB" \
+            --arg post_upgrade "$post_upgrade" \
             '{
               items: (
                 (if $active > 0 then
                    [{metadata:{name:"active-fixture"},status:{active:$active}}]
                  else [] end) +
+                (if $post_upgrade == "api-monitor-contained" or
+                    $post_upgrade == "api-monitor-lifecycle" then
+                   [{
+                     metadata:{
+                       name:"selfservice-synthetic-api-monitor-29802528",
+                       ownerReferences:[{
+                         apiVersion:"batch/v1",
+                         kind:"CronJob",
+                         name:"selfservice-synthetic-api-monitor",
+                         controller:true
+                       }]
+                     },
+                     spec:{template:{spec:{containers:[{
+                       name:"synthetic-api-monitor",
+                       env:[{
+                         name:"SYNTHETIC_LIFECYCLE_ENABLED",
+                         value:(if $post_upgrade == "api-monitor-contained" then "false" else "true" end)
+                       }]
+                     }]}}},
+                     status:{active:1}
+                   }]
+                 elif $post_upgrade == "api-monitor-wrong-owner" then
+                   [{
+                     metadata:{
+                       name:"selfservice-synthetic-api-monitor-29802528",
+                       ownerReferences:[{
+                         apiVersion:"apps/v1",
+                         kind:"Deployment",
+                         name:"selfservice-worker",
+                         controller:true
+                       }]
+                     },
+                     spec:{template:{spec:{containers:[{
+                       name:"synthetic-api-monitor",
+                       env:[{name:"SYNTHETIC_LIFECYCLE_ENABLED",value:"false"}]
+                     }]}}},
+                     status:{active:1}
+                   }]
+                 elif $post_upgrade == "runner" or $post_upgrade == "janitor" then
+                   [{
+                     metadata:{
+                       name:("selfservice-synthetic-" + $post_upgrade + "-active"),
+                       ownerReferences:[{
+                         apiVersion:"batch/v1",
+                         kind:"CronJob",
+                         name:("selfservice-synthetic-" + $post_upgrade),
+                         controller:true
+                       }]
+                     },
+                     spec:{template:{spec:{containers:[{name:("synthetic-" + $post_upgrade)}]}}},
+                     status:{active:1}
+                   }]
+                 elif $post_upgrade == "provisioning" then
+                   [{
+                     metadata:{name:"selfservice-image-import-active"},
+                     spec:{template:{spec:{containers:[{name:"provision-worker"}]}}},
+                     status:{active:1}
+                   }]
+                 elif $post_upgrade == "unknown" then
+                   [{
+                     metadata:{
+                       name:"unexpected-active",
+                       ownerReferences:[{
+                         apiVersion:"batch/v1",
+                         kind:"CronJob",
+                         name:"selfservice-synthetic-api-monitor",
+                         controller:true
+                       }]
+                     },
+                     spec:{template:{spec:{containers:[{
+                       name:"synthetic-api-monitor",
+                       env:[{name:"SYNTHETIC_LIFECYCLE_ENABLED",value:"false"}]
+                     }]}}},
+                     status:{active:1}
+                   }]
+                 elif $post_upgrade == "" then
+                   []
+                 else
+                   error("unknown post-upgrade active Job fixture")
+                 end) +
                 (if $synthetic > 0 then
                    [{
                      metadata:{
@@ -8300,6 +8485,7 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_EXTRA_REPOSITORY="+e.extraRepository,
 		"FAKE_ACTIVE_JOBS="+strconv.Itoa(e.activeJobs),
 		"FAKE_ACTIVE_KUBERNETES_JOBS="+strconv.Itoa(e.activeKubernetesJobs),
+		"FAKE_POST_UPGRADE_ACTIVE_KUBERNETES_JOB="+e.postUpgradeActiveKubernetesJob,
 		"FAKE_PENDING_SYNTHETIC_JOBS="+strconv.Itoa(e.pendingSyntheticJobs),
 		"FAKE_FAIL_ATOMIC_UPGRADE="+strconv.FormatBool(e.failAtomicUpgrade),
 		"FAKE_ATOMIC_ROLLBACK_MISMATCH="+e.atomicRollbackMismatch,
