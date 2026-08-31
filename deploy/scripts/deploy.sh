@@ -1813,7 +1813,15 @@ resume_live_provisioning_claims() {
 
 verify_rollback_containment() {
   local expected_migration=${1:-}
+  local synthetic_lifecycle_contained=${2:-false}
   local revision status inventory tmp_dir
+  case "$synthetic_lifecycle_contained" in
+    true|false) ;;
+    *)
+      echo "ERROR: rollback containment lifecycle mode must be true or false." >&2
+      return 1
+      ;;
+  esac
   tmp_dir="$(mktemp -d)"
   if ! read -r revision status <<< "$(latest_helm_revision_record)"; then
     echo "ERROR: could not determine the latest Helm revision and status." >&2
@@ -1831,7 +1839,10 @@ verify_rollback_containment() {
     rm -rf "$tmp_dir"
     return 1
   fi
-  if ! verify_manifest_and_live "$tmp_dir/manifest.yaml" "$expected_migration"; then
+  if ! verify_manifest_and_live \
+      "$tmp_dir/manifest.yaml" \
+      "$expected_migration" \
+      "$synthetic_lifecycle_contained"; then
     rm -rf "$tmp_dir"
     return 1
   fi
@@ -3436,7 +3447,7 @@ contain_failed_atomic_upgrade() {
   fi
   expected_inventory=$VERIFIED_BASELINE_IMAGE_INVENTORY_SHA256
   expected_runner=$VERIFIED_BASELINE_RUNNER_IMAGE
-  if ! verify_rollback_containment "$ROLLBACK_BASELINE_MIGRATION"; then
+  if ! verify_rollback_containment "$ROLLBACK_BASELINE_MIGRATION" true; then
     echo "ERROR: atomic rollback did not restore the currently deployed baseline with claims disabled and healthy workloads." >&2
     return 1
   fi
@@ -3642,7 +3653,8 @@ canonical_desired_workload_spec() {
 verify_manifest_and_live() {
   local manifest=$1
   local expected_migration=${2:-}
-  local tmp_dir inventory rendered_claims rendered_runner rendered_worker_replicas
+  local synthetic_lifecycle_contained=${3:-false}
+  local tmp_dir inventory rendered_claims rendered_runner rendered_worker_replicas rendered_synthetic_lifecycle
   local workloads kind name live_manifest live_inventory rendered_rows
   local container_type container_name rendered_image live_row live_image effective_image
   tmp_dir="$(mktemp -d)"
@@ -3683,6 +3695,21 @@ verify_manifest_and_live() {
     rm -rf "$tmp_dir"
     return 1
   fi
+  if ! rendered_synthetic_lifecycle="$(
+    env_from_manifest SYNTHETIC_LIFECYCLE_ENABLED < "$manifest"
+  )"; then
+    echo "ERROR: current Helm rollback target must define exactly one literal SYNTHETIC_LIFECYCLE_ENABLED value." >&2
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  case "$rendered_synthetic_lifecycle" in
+    true|false) ;;
+    *)
+      echo "ERROR: current Helm rollback target renders invalid SYNTHETIC_LIFECYCLE_ENABLED=$rendered_synthetic_lifecycle." >&2
+      rm -rf "$tmp_dir"
+      return 1
+      ;;
+  esac
 
   workloads="$(cut -f1,2 "$inventory" | sort -u)"
   : > "$tmp_dir/live-foundation.yaml"
@@ -3735,7 +3762,7 @@ verify_manifest_and_live() {
     done < "$rendered_rows"
   done <<< "$workloads"
 
-  local live_worker live_claims live_replicas live_runner
+  local live_worker live_claims live_replicas live_runner live_synthetic_lifecycle
   live_worker="$tmp_dir/Deployment-${RELEASE}-worker.yaml"
   live_claims="$(claims_from_manifest < "$live_worker")"
   if ! live_replicas="$(live_worker_replicas)"; then
@@ -3756,8 +3783,35 @@ verify_manifest_and_live() {
     rm -rf "$tmp_dir"
     return 1
   fi
-  if ! validate_foundation_intent "$tmp_dir/live-foundation.yaml" false true; then
+  if ! validate_foundation_intent "$tmp_dir/live-foundation.yaml" false false; then
     echo "ERROR: live rollback workloads change the claims/content-filter foundation intent." >&2
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  if ! live_synthetic_lifecycle="$(
+    env_from_manifest SYNTHETIC_LIFECYCLE_ENABLED < "$tmp_dir/live-foundation.yaml"
+  )"; then
+    echo "ERROR: live rollback state must define exactly one literal SYNTHETIC_LIFECYCLE_ENABLED value." >&2
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  case "$live_synthetic_lifecycle" in
+    true|false) ;;
+    *)
+      echo "ERROR: live rollback state has invalid SYNTHETIC_LIFECYCLE_ENABLED=$live_synthetic_lifecycle." >&2
+      rm -rf "$tmp_dir"
+      return 1
+      ;;
+  esac
+  if [ "$synthetic_lifecycle_contained" = true ] &&
+     [ "$live_synthetic_lifecycle" != "false" ]; then
+    echo "ERROR: live SYNTHETIC_LIFECYCLE_ENABLED=$live_synthetic_lifecycle while rollback lifecycle containment requires false." >&2
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  if [ "$synthetic_lifecycle_contained" != true ] &&
+     [ "$live_synthetic_lifecycle" != "$rendered_synthetic_lifecycle" ]; then
+    echo "ERROR: live SYNTHETIC_LIFECYCLE_ENABLED=$live_synthetic_lifecycle differs from the Helm rollback target value $rendered_synthetic_lifecycle." >&2
     rm -rf "$tmp_dir"
     return 1
   fi
@@ -4084,7 +4138,7 @@ if [ "$(
   echo "ERROR: proven UI image changed before application upgrade." >&2
   exit 1
 fi
-verify_rollback_containment "$ROLLBACK_BASELINE_MIGRATION"
+verify_rollback_containment "$ROLLBACK_BASELINE_MIGRATION" true
 verify_external_candidate_images \
   "$CANDIDATE_EXTERNAL_IMAGE_MAP" \
   "$CANDIDATE_TMP_DIR/external-recheck"

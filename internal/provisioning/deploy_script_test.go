@@ -66,9 +66,14 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			configureRevision: baselineRevision + 1,
 		},
 		{
-			name:              "historical synthetic values use contained live state",
-			manifest:          rollbackManifestWithHistoricalSynthetics(false),
-			liveResource:      rollbackManifestWithHistoricalSynthetics(true),
+			name:     "historical synthetic values use contained live state",
+			manifest: rollbackManifestWithHistoricalSynthetics(false),
+			liveResource: replaceEnvValue(
+				rollbackManifestWithHistoricalSynthetics(true),
+				"SYNTHETIC_LIFECYCLE_ENABLED",
+				"false",
+				"true",
+			),
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
 			wantSuccess:       true,
@@ -143,7 +148,7 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			configureRevision: baselineRevision + 1,
 		},
 		{
-			name: "live API monitor lifecycle enabled",
+			name: "matching enabled API monitor lifecycle",
 			manifest: replaceEnvValue(
 				baselineManifest(true, "", "false"),
 				"SYNTHETIC_LIFECYCLE_ENABLED",
@@ -152,7 +157,36 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			),
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
-			wantOutput:        "SYNTHETIC_LIFECYCLE_ENABLED=false",
+			wantSuccess:       true,
+			wantOutput:        "rollback containment verified",
+			configureRevision: baselineRevision + 1,
+		},
+		{
+			name: "live API monitor lifecycle differs from rollback target",
+			manifest: replaceEnvValue(
+				baselineManifest(true, "", "false"),
+				"SYNTHETIC_LIFECYCLE_ENABLED",
+				"false",
+				"true",
+			),
+			liveResource:      baselineManifest(true, "", "false"),
+			helmStatus:        "deployed",
+			args:              []string{"--verify-rollback-containment"},
+			wantOutput:        "live SYNTHETIC_LIFECYCLE_ENABLED=false differs from the Helm rollback target value true",
+			configureRevision: baselineRevision + 1,
+		},
+		{
+			name:     "live API monitor lifecycle enabled outside rollback target",
+			manifest: baselineManifest(true, "", "false"),
+			liveResource: replaceEnvValue(
+				baselineManifest(true, "", "false"),
+				"SYNTHETIC_LIFECYCLE_ENABLED",
+				"false",
+				"true",
+			),
+			helmStatus:        "deployed",
+			args:              []string{"--verify-rollback-containment"},
+			wantOutput:        "live SYNTHETIC_LIFECYCLE_ENABLED=true differs from the Helm rollback target value false",
 			configureRevision: baselineRevision + 1,
 		},
 		{
@@ -1147,7 +1181,12 @@ func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 			configure: func(env *deployScriptEnvironment) {
 				env.failAtomicUpgrade = true
 				writeFile(t, env.liveManifest, rollbackManifestWithHistoricalSynthetics(false))
-				writeFile(t, env.liveResource, rollbackManifestWithHistoricalSynthetics(true))
+				writeFile(t, env.liveResource, replaceEnvValue(
+					rollbackManifestWithHistoricalSynthetics(true),
+					"SYNTHETIC_LIFECYCLE_ENABLED",
+					"false",
+					"true",
+				))
 				writeFile(t, env.atomicRollbackManifest, rollbackManifestWithHistoricalSynthetics(false))
 				writeFile(t, env.containedRollbackManifest, rollbackManifestWithHistoricalSynthetics(true))
 				writeFile(t, env.immutableRollbackManifest, rollbackManifestWithHistoricalSynthetics(false))
@@ -1160,7 +1199,12 @@ func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 				env.failAtomicUpgrade = true
 				env.pendingSyntheticJobs = 1
 				writeFile(t, env.liveManifest, rollbackManifestWithHistoricalSynthetics(false))
-				writeFile(t, env.liveResource, rollbackManifestWithHistoricalSynthetics(true))
+				writeFile(t, env.liveResource, replaceEnvValue(
+					rollbackManifestWithHistoricalSynthetics(true),
+					"SYNTHETIC_LIFECYCLE_ENABLED",
+					"false",
+					"true",
+				))
 				writeFile(t, env.atomicRollbackManifest, rollbackManifestWithHistoricalSynthetics(false))
 				writeFile(t, env.containedRollbackManifest, rollbackManifestWithHistoricalSynthetics(true))
 				writeFile(t, env.immutableRollbackManifest, rollbackManifestWithHistoricalSynthetics(false))
@@ -7837,6 +7881,13 @@ case "$1" in
     ;;
   patch)
     : > "$FAKE_SYNTHETIC_CONTAINED_MARKER"
+    if [ "$2" = "cronjob/selfservice-synthetic-api-monitor" ] &&
+       [[ "$*" == *"SYNTHETIC_LIFECYCLE_ENABLED"* ]]; then
+      manifest=$(current_manifest)
+      sed '/- name: SYNTHETIC_LIFECYCLE_ENABLED/{n;s/value: "true"/value: "false"/;}' \
+        "$manifest" > "$manifest.patched"
+      mv "$manifest.patched" "$manifest"
+    fi
     ;;
   set)
     [ -f "$FAKE_LOCK_FILE" ] || {
