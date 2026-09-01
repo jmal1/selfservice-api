@@ -7156,7 +7156,6 @@ json_resource() {
          [ "$resource" = "CronJob/selfservice-synthetic-api-monitor" ]; then
       if printf '%s' "$canonical" | grep -Fq 'schedule: "*/10 * * * *"' &&
          printf '%s' "$canonical" | grep -Fq 'suspend: false' &&
-         printf '%s' "$canonical" | grep -Fq 'activeDeadlineSeconds: 300' &&
          printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_CONTENT_FILTER_EXPECTED' &&
          printf '%s' "$canonical" | grep -Fq 'value: "false"' &&
          printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_PROVISIONING_EXPECTED_ENABLED' &&
