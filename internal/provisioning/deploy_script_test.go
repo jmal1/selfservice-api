@@ -7117,8 +7117,8 @@ json_resource() {
   extract_resource "$manifest" "$resource" > "$resource_file"
   canonical=$(canonical_resource "$resource_file")
   is_synthetic_api_monitor=false
-  case "$resource" in
-    *selfservice-synthetic-api-monitor*)
+  case "$canonical" in
+    *"name: synthetic-api-monitor"*)
       is_synthetic_api_monitor=true
       ;;
   esac
