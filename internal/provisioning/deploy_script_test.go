@@ -1254,7 +1254,7 @@ func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "false"))
+			env := newDeployScriptEnvironment(t, live, baselineApiMonitorManifest())
 			test.configure(env)
 			output, err := env.run("--no-pull")
 			if err == nil {
@@ -1370,7 +1370,7 @@ func TestDeployScriptPostUpgradeActiveJobGuardIsLoadBearing(t *testing.T) {
 	t.Cleanup(func() { os.Remove(sabotagedPath) })
 
 	live := baselineManifest(true, "", "false")
-	env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "false"))
+	env := newDeployScriptEnvironment(t, live, baselineApiMonitorManifest())
 	env.postUpgradeActiveKubernetesJob = "provisioning"
 	env.scriptPath = sabotagedPath
 
@@ -2749,7 +2749,7 @@ func TestDeployScriptRejectsUntrustedSource(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "false"))
+			env := newDeployScriptEnvironment(t, live, baselineApiMonitorManifest())
 			test.configure(env)
 			output, err := env.run("--no-pull")
 			if err == nil {
@@ -8967,6 +8967,15 @@ func historicalApiMonitorFixture(manifest string, lifecycleEnabled bool) string 
 		return strings.Join(lines, "\n")
 	}
 	panic("historical API monitor lifecycle fixture did not match the expected env block")
+}
+
+func baselineApiMonitorManifest() string {
+	return strings.Replace(
+		baselineManifest(true, "*", "false"),
+		"  jobTemplate:\n    spec:\n      template:\n",
+		"  jobTemplate:\n    spec:\n      activeDeadlineSeconds: 300\n      template:\n",
+		1,
+	)
 }
 
 func manifestEnvValue(t *testing.T, manifest, name string) string {
