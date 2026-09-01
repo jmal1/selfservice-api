@@ -7118,7 +7118,7 @@ json_resource() {
   canonical=$(canonical_resource "$resource_file")
   is_synthetic_api_monitor=false
   case "$canonical" in
-    *"name: synthetic-api-monitor"*)
+    *SYNTHETIC_CONTENT_FILTER_EXPECTED*|*SYNTHETIC_LIFECYCLE_ENABLED*)
       is_synthetic_api_monitor=true
       ;;
   esac
