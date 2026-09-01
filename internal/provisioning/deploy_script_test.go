@@ -8052,6 +8052,8 @@ case "$1" in
           exit
         }
       ' "$manifest")
+      resource=${resource//$'\r'/}
+      resource=${resource%"${resource##*[![:space:]]}"}
       [ -n "$resource" ]
       json_resource "$manifest" "$resource"
     else
@@ -8215,6 +8217,8 @@ case "$1" in
           exit
         }
       ' "$manifest")
+      resource=${resource//$'\r'/}
+      resource=${resource%"${resource##*[![:space:]]}"}
       [ -n "$resource" ]
       source=desired
       if [ -f "$FAKE_UPGRADED_MARKER" ]; then
