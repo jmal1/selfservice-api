@@ -198,6 +198,9 @@ jobs:
       - name: Verify wiki bundle
         run: make verify-wiki
 
+      - name: "Fast fail: short Go suite"
+        run: go test ./... -short -count=1
+
       - name: Test
         run: go test ./... -v -race
 
