@@ -20,6 +20,7 @@ var requiredLocalVerificationTiers = map[string]int{
 	"ci.yaml|test|Build":                                                               0,
 	"ci.yaml|test|Vet":                                                                 0,
 	"ci.yaml|test|Verify wiki bundle":                                                  2,
+	"ci.yaml|test|Fast fail: short Go suite":                                           0,
 	"ci.yaml|test|Test":                                                                0,
 	"helm-lint.yaml|lint|Install helm":                                                 4,
 	"helm-lint.yaml|lint|Add chart repos":                                              4,
