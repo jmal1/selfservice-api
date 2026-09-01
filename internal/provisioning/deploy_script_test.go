@@ -7224,7 +7224,7 @@ serverInjectedMutation: true"
       --arg source "$source" \
       --arg post_apply_mode "$FAKE_POST_APPLY_ANNOTATIONS_MODE" \
       --arg resource "$resource" \
-      --argjson synthetic_api_monitor "$is_synthetic_api_monitor" \
+      --argjson omit_fixture_canonical "$omit_fixture_canonical" \
       --arg release "$FAKE_LIVE_HELM_RELEASE" \
       --arg namespace "$FAKE_LIVE_HELM_NAMESPACE" \
       --argjson replicas "$replicas" \
@@ -7374,7 +7374,7 @@ serverInjectedMutation: true"
       --arg source "$source" \
       --arg post_apply_mode "$FAKE_POST_APPLY_ANNOTATIONS_MODE" \
       --arg resource "$resource" \
-      --argjson synthetic_api_monitor "$is_synthetic_api_monitor" \
+      --argjson omit_fixture_canonical "$omit_fixture_canonical" \
       --arg release "$FAKE_LIVE_HELM_RELEASE" \
       --arg namespace "$FAKE_LIVE_HELM_NAMESPACE" \
       '{
