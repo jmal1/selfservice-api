@@ -7113,6 +7113,8 @@ json_resource() {
   local resource=$2
   local source=${3:-desired}
   local resource_file canonical kind replicas revision daemonset_generation
+  resource=${resource//$'\r'/}
+  resource=${resource%"${resource##*[![:space:]]}"}
   resource_file=$(mktemp)
   extract_resource "$manifest" "$resource" > "$resource_file"
   canonical=$(canonical_resource "$resource_file")
@@ -8052,8 +8054,6 @@ case "$1" in
           exit
         }
       ' "$manifest")
-      resource=${resource//$'\r'/}
-      resource=${resource%"${resource##*[![:space:]]}"}
       [ -n "$resource" ]
       json_resource "$manifest" "$resource"
     else
@@ -8217,8 +8217,6 @@ case "$1" in
           exit
         }
       ' "$manifest")
-      resource=${resource//$'\r'/}
-      resource=${resource%"${resource##*[![:space:]]}"}
       [ -n "$resource" ]
       source=desired
       if [ -f "$FAKE_UPGRADED_MARKER" ]; then
