@@ -202,7 +202,6 @@ jobs:
         run: go test ./... -v -race
 
   ci-required:
-    name: PR CI gate
     if: always() && github.event_name == 'pull_request'
     needs: [changes, build-pr, test]
     runs-on: ubuntu-latest
