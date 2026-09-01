@@ -7153,7 +7153,8 @@ json_resource() {
          ! printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_RETRY_BACKOFF'; then
       omit_fixture_canonical=true
     elif [ "$source" = desired ] &&
-         printf '%s' "$canonical" | grep -Fq 'schedule: "*/10 * * * *"' &&
+         [ "$resource" = "CronJob/selfservice-synthetic-api-monitor" ]; then
+      if printf '%s' "$canonical" | grep -Fq 'schedule: "*/10 * * * *"' &&
          printf '%s' "$canonical" | grep -Fq 'suspend: false' &&
          printf '%s' "$canonical" | grep -Fq 'activeDeadlineSeconds: 300' &&
          printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_CONTENT_FILTER_EXPECTED' &&
@@ -7166,7 +7167,11 @@ json_resource() {
          ! printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_DESTROY_TIMEOUT' &&
          ! printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_MAX_ATTEMPTS' &&
          ! printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_RETRY_BACKOFF'; then
-      omit_fixture_canonical=true
+        omit_fixture_canonical=true
+      else
+        echo "desired API monitor fixture did not match the expected contained baseline" >&2
+        exit 1
+      fi
     fi
   fi
   if [ "$FAKE_RETAIN_LIVE_JANITOR_TTL_BEFORE_UPGRADE" = true ] &&
