@@ -2974,51 +2974,65 @@ synthetic:
 func TestDeployScriptPreparesClaimsBaselineAllowsHistoricalApiMonitorFixture(t *testing.T) {
 	requirePOSIXShell(t)
 
-	historicalApiMonitor := func(manifest string) string {
-		manifest = replaceSyntheticSuspend(manifest, true)
-		manifest = strings.Replace(manifest, "activeDeadlineSeconds: 300", "activeDeadlineSeconds: 900", 1)
-		manifest = replaceEnvValue(manifest, "SYNTHETIC_PROVISIONING_EXPECTED_ENABLED", "false", "true")
-		manifest = replaceEnvValue(manifest, "SYNTHETIC_RUNNER_EXPECTED_ENABLED", "false", "true")
-		manifest = replaceEnvValue(manifest, "SYNTHETIC_LIFECYCLE_ENABLED", "false", "true")
-		return manifest
-	}
+	for _, test := range []struct {
+		name                string
+		lifecycleEnabled    bool
+		wantLifecycleExtras bool
+	}{
+		{
+			name:                "historical lifecycle enabled",
+			lifecycleEnabled:    true,
+			wantLifecycleExtras: true,
+		},
+		{
+			name:                "historical lifecycle disabled",
+			lifecycleEnabled:    false,
+			wantLifecycleExtras: false,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			live := historicalApiMonitorFixture(baselineManifest(true, "", "false"), test.lifecycleEnabled)
+			if !strings.Contains(live, "activeDeadlineSeconds: 900") ||
+				!strings.Contains(live, "SYNTHETIC_PROVISIONING_EXPECTED_ENABLED") ||
+				!strings.Contains(live, "SYNTHETIC_RUNNER_EXPECTED_ENABLED") ||
+				!strings.Contains(live, "SYNTHETIC_LIFECYCLE_ENABLED") {
+				t.Fatal("historical API monitor fixture did not pick up the intended baseline override drift")
+			}
+			extras := []string{
+				"SYNTHETIC_LIFECYCLE_TEMPLATE",
+				"SYNTHETIC_LIFECYCLE_READY_TIMEOUT",
+				"SYNTHETIC_LIFECYCLE_DESTROY_TIMEOUT",
+				"SYNTHETIC_LIFECYCLE_MAX_ATTEMPTS",
+				"SYNTHETIC_LIFECYCLE_RETRY_BACKOFF",
+			}
+			for _, extra := range extras {
+				contains := strings.Contains(live, extra)
+				if contains != test.wantLifecycleExtras {
+					t.Fatalf("historical API monitor fixture lifecycle coverage mismatch for %s: got contains=%v want %v", extra, contains, test.wantLifecycleExtras)
+				}
+			}
 
-	live := historicalApiMonitor(baselineManifest(true, "", "false"))
-	if !strings.Contains(live, "activeDeadlineSeconds: 900") ||
-		!strings.Contains(live, "SYNTHETIC_PROVISIONING_EXPECTED_ENABLED") ||
-		!strings.Contains(live, "SYNTHETIC_RUNNER_EXPECTED_ENABLED") ||
-		!strings.Contains(live, "SYNTHETIC_LIFECYCLE_ENABLED") {
-		t.Fatal("historical API monitor fixture did not pick up the intended baseline override drift")
-	}
-
-	env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "false"))
-	output, err := env.run(
-		"--prepare-claims-baseline",
-		"--baseline-chart-dir",
-		env.chartDir,
-	)
-	if err != nil {
-		t.Fatalf("baseline preparation failed: %v\n%s", err, output)
-	}
-	if !strings.Contains(string(output), "immutable all-workload baseline complete") {
-		t.Fatalf("baseline run did not complete cleanly:\n%s", output)
+			env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "false"))
+			output, err := env.run(
+				"--prepare-claims-baseline",
+				"--baseline-chart-dir",
+				env.chartDir,
+			)
+			if err != nil {
+				t.Fatalf("baseline preparation failed: %v\n%s", err, output)
+			}
+			if !strings.Contains(string(output), "immutable all-workload baseline complete") {
+				t.Fatalf("baseline run did not complete cleanly:\n%s", output)
+			}
+		})
 	}
 }
 
 func TestDeployScriptPreparesClaimsBaselineRejectsUnrelatedApiMonitorDrift(t *testing.T) {
 	requirePOSIXShell(t)
 
-	historicalApiMonitor := func(manifest string) string {
-		manifest = replaceSyntheticSuspend(manifest, true)
-		manifest = strings.Replace(manifest, "activeDeadlineSeconds: 300", "activeDeadlineSeconds: 900", 1)
-		manifest = replaceEnvValue(manifest, "SYNTHETIC_PROVISIONING_EXPECTED_ENABLED", "false", "true")
-		manifest = replaceEnvValue(manifest, "SYNTHETIC_RUNNER_EXPECTED_ENABLED", "false", "true")
-		manifest = replaceEnvValue(manifest, "SYNTHETIC_LIFECYCLE_ENABLED", "false", "true")
-		return manifest
-	}
-
 	live := strings.Replace(
-		historicalApiMonitor(baselineManifest(true, "", "false")),
+		historicalApiMonitorFixture(baselineManifest(true, "", "false"), true),
 		"successfulJobsHistoryLimit: 3",
 		"successfulJobsHistoryLimit: 4",
 		1,
@@ -3037,6 +3051,37 @@ func TestDeployScriptPreparesClaimsBaselineRejectsUnrelatedApiMonitorDrift(t *te
 		t.Fatalf("baseline preparation unexpectedly passed unrelated API monitor drift:\n%s", output)
 	}
 	if !strings.Contains(string(output), "spec drifts from the server-defaulted safe chart") {
+		t.Fatalf("baseline failed for the wrong reason:\n%s", output)
+	}
+	if upgradeBody, readErr := os.ReadFile(env.upgradeLog); readErr == nil && len(upgradeBody) > 0 {
+		t.Fatalf("baseline drift reached Helm upgrade despite failing the live-spec comparison: %s", upgradeBody)
+	}
+}
+
+func TestDeployScriptPreparesClaimsBaselineRejectsInvalidHistoricalApiMonitorValue(t *testing.T) {
+	requirePOSIXShell(t)
+
+	live := replaceEnvValue(
+		historicalApiMonitorFixture(baselineManifest(true, "", "false"), true),
+		"SYNTHETIC_LIFECYCLE_TEMPLATE",
+		"synthetic-noop",
+		"synthetic-bad",
+	)
+	if !strings.Contains(live, `SYNTHETIC_LIFECYCLE_TEMPLATE`) ||
+		!strings.Contains(live, `value: "synthetic-bad"`) {
+		t.Fatal("invalid historical API monitor fixture did not sabotage the targeted value")
+	}
+
+	env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "false"))
+	output, err := env.run(
+		"--prepare-claims-baseline",
+		"--baseline-chart-dir",
+		env.chartDir,
+	)
+	if err == nil {
+		t.Fatalf("baseline preparation unexpectedly passed an invalid targeted API monitor value:\n%s", output)
+	}
+	if !strings.Contains(string(output), "SYNTHETIC_LIFECYCLE_TEMPLATE=synthetic-noop") {
 		t.Fatalf("baseline failed for the wrong reason:\n%s", output)
 	}
 	if upgradeBody, readErr := os.ReadFile(env.upgradeLog); readErr == nil && len(upgradeBody) > 0 {
@@ -8873,6 +8918,55 @@ func replaceEnvValue(manifest, name, oldValue, newValue string) string {
 	}
 	valueIndex := nameIndex + len(nameMarker) + valueOffset
 	return manifest[:valueIndex] + `value: "` + newValue + `"` + manifest[valueIndex+len(valueMarker):]
+}
+
+func historicalApiMonitorFixture(manifest string, lifecycleEnabled bool) string {
+	manifest = replaceSyntheticSuspend(manifest, true)
+	manifest = strings.Replace(manifest, "activeDeadlineSeconds: 300", "activeDeadlineSeconds: 900", 1)
+	manifest = replaceEnvValue(manifest, "SYNTHETIC_PROVISIONING_EXPECTED_ENABLED", "false", "true")
+	manifest = replaceEnvValue(manifest, "SYNTHETIC_RUNNER_EXPECTED_ENABLED", "false", "true")
+	if lifecycleEnabled {
+		manifest = replaceEnvValue(manifest, "SYNTHETIC_LIFECYCLE_ENABLED", "false", "true")
+	} else {
+		manifest = replaceEnvValue(manifest, "SYNTHETIC_LIFECYCLE_ENABLED", "false", "false")
+	}
+
+	lines := strings.Split(manifest, "\n")
+	for i := 0; i < len(lines)-1; i++ {
+		if strings.TrimSpace(lines[i]) != "- name: SYNTHETIC_LIFECYCLE_ENABLED" {
+			continue
+		}
+		if lifecycleEnabled {
+			if strings.TrimSpace(lines[i+1]) != `value: "true"` {
+				panic("historical API monitor lifecycle fixture did not match the expected enabled value")
+			}
+			separator := i + 2
+			if separator >= len(lines) || strings.TrimSpace(lines[separator]) != "---" {
+				panic("historical API monitor lifecycle fixture did not match the expected workload separator")
+			}
+			nameIndent := lines[i][:len(lines[i])-len(strings.TrimLeft(lines[i], " "))]
+			valueIndent := lines[i+1][:len(lines[i+1])-len(strings.TrimLeft(lines[i+1], " "))]
+			extra := []string{
+				nameIndent + "- name: SYNTHETIC_LIFECYCLE_TEMPLATE",
+				valueIndent + `value: "synthetic-noop"`,
+				nameIndent + "- name: SYNTHETIC_LIFECYCLE_READY_TIMEOUT",
+				valueIndent + `value: "150s"`,
+				nameIndent + "- name: SYNTHETIC_LIFECYCLE_DESTROY_TIMEOUT",
+				valueIndent + `value: "90s"`,
+				nameIndent + "- name: SYNTHETIC_LIFECYCLE_MAX_ATTEMPTS",
+				valueIndent + `value: "2"`,
+				nameIndent + "- name: SYNTHETIC_LIFECYCLE_RETRY_BACKOFF",
+				valueIndent + `value: "30s"`,
+			}
+			lines = append(lines[:separator], append(extra, lines[separator:]...)...)
+			return strings.Join(lines, "\n")
+		}
+		if strings.TrimSpace(lines[i+1]) != `value: "false"` {
+			panic("historical API monitor lifecycle fixture did not match the expected disabled value")
+		}
+		return strings.Join(lines, "\n")
+	}
+	panic("historical API monitor lifecycle fixture did not match the expected env block")
 }
 
 func manifestEnvValue(t *testing.T, manifest, name string) string {

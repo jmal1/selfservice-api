@@ -3942,11 +3942,31 @@ normalize_prepared_api_monitor_spec() {
       def api_monitor_envs($name):
         [api_monitor_containers[] | .env[]? | select(.name == $name)];
 
+      def api_monitor_env_value($name):
+        api_monitor_envs($name)[0].value;
+
       def require_exact_env($name; $expected; $path):
         if (api_monitor_envs($name) | length) != 1 then
           error($path + " must render exactly one " + $name + " env")
-        elif (api_monitor_envs($name)[0].value | tostring) != $expected then
+        elif (api_monitor_env_value($name) | tostring) != $expected then
           error($path + " must render " + $name + "=" + $expected)
+        else
+          .
+        end;
+
+      def require_true_false_env($name; $path):
+        if (api_monitor_envs($name) | length) != 1 then
+          error($path + " must render exactly one " + $name + " env")
+        elif (api_monitor_env_value($name) | tostring) != "true" and
+             (api_monitor_env_value($name) | tostring) != "false" then
+          error($path + " must render " + $name + " as a literal true/false string")
+        else
+          .
+        end;
+
+      def require_absent_env($name; $path):
+        if (api_monitor_envs($name) | length) != 0 then
+          error($path + " must not render " + $name)
         else
           .
         end;
@@ -3961,15 +3981,45 @@ normalize_prepared_api_monitor_spec() {
             error(".spec.jobTemplate.spec.activeDeadlineSeconds must be a number")
           elif (api_monitor_envs("SYNTHETIC_PROVISIONING_EXPECTED_ENABLED") | length) != 1 then
             error(".spec.jobTemplate.spec.template.spec.containers[0].env must render exactly one SYNTHETIC_PROVISIONING_EXPECTED_ENABLED env")
+          elif (api_monitor_env_value("SYNTHETIC_PROVISIONING_EXPECTED_ENABLED") | tostring) != "true" and
+               (api_monitor_env_value("SYNTHETIC_PROVISIONING_EXPECTED_ENABLED") | tostring) != "false" then
+            error(".spec.jobTemplate.spec.template.spec.containers[0].env must render SYNTHETIC_PROVISIONING_EXPECTED_ENABLED as a literal true/false string")
           elif (api_monitor_envs("SYNTHETIC_RUNNER_EXPECTED_ENABLED") | length) != 1 then
             error(".spec.jobTemplate.spec.template.spec.containers[0].env must render exactly one SYNTHETIC_RUNNER_EXPECTED_ENABLED env")
+          elif (api_monitor_env_value("SYNTHETIC_RUNNER_EXPECTED_ENABLED") | tostring) != "true" and
+               (api_monitor_env_value("SYNTHETIC_RUNNER_EXPECTED_ENABLED") | tostring) != "false" then
+            error(".spec.jobTemplate.spec.template.spec.containers[0].env must render SYNTHETIC_RUNNER_EXPECTED_ENABLED as a literal true/false string")
           elif (api_monitor_envs("SYNTHETIC_LIFECYCLE_ENABLED") | length) != 1 then
             error(".spec.jobTemplate.spec.template.spec.containers[0].env must render exactly one SYNTHETIC_LIFECYCLE_ENABLED env")
-          else
-            .spec.suspend = false
-            | .spec.jobTemplate.spec.activeDeadlineSeconds = 300
-            | .spec.jobTemplate.spec.template.spec.containers |= map(
-                if .name == "synthetic-api-monitor" then
+          elif (api_monitor_env_value("SYNTHETIC_LIFECYCLE_ENABLED") | tostring) != "true" and
+               (api_monitor_env_value("SYNTHETIC_LIFECYCLE_ENABLED") | tostring) != "false" then
+            error(".spec.jobTemplate.spec.template.spec.containers[0].env must render SYNTHETIC_LIFECYCLE_ENABLED as a literal true/false string")
+          elif (api_monitor_env_value("SYNTHETIC_LIFECYCLE_ENABLED") | tostring) == "true" then
+            if (api_monitor_envs("SYNTHETIC_LIFECYCLE_TEMPLATE") | length) != 1 then
+              error(".spec.jobTemplate.spec.template.spec.containers[0].env must render exactly one SYNTHETIC_LIFECYCLE_TEMPLATE env")
+            elif (api_monitor_env_value("SYNTHETIC_LIFECYCLE_TEMPLATE") | tostring) != "synthetic-noop" then
+              error(".spec.jobTemplate.spec.template.spec.containers[0].env must render SYNTHETIC_LIFECYCLE_TEMPLATE=synthetic-noop")
+            elif (api_monitor_envs("SYNTHETIC_LIFECYCLE_READY_TIMEOUT") | length) != 1 then
+              error(".spec.jobTemplate.spec.template.spec.containers[0].env must render exactly one SYNTHETIC_LIFECYCLE_READY_TIMEOUT env")
+            elif (api_monitor_env_value("SYNTHETIC_LIFECYCLE_READY_TIMEOUT") | tostring) != "150s" then
+              error(".spec.jobTemplate.spec.template.spec.containers[0].env must render SYNTHETIC_LIFECYCLE_READY_TIMEOUT=150s")
+            elif (api_monitor_envs("SYNTHETIC_LIFECYCLE_DESTROY_TIMEOUT") | length) != 1 then
+              error(".spec.jobTemplate.spec.template.spec.containers[0].env must render exactly one SYNTHETIC_LIFECYCLE_DESTROY_TIMEOUT env")
+            elif (api_monitor_env_value("SYNTHETIC_LIFECYCLE_DESTROY_TIMEOUT") | tostring) != "90s" then
+              error(".spec.jobTemplate.spec.template.spec.containers[0].env must render SYNTHETIC_LIFECYCLE_DESTROY_TIMEOUT=90s")
+            elif (api_monitor_envs("SYNTHETIC_LIFECYCLE_MAX_ATTEMPTS") | length) != 1 then
+              error(".spec.jobTemplate.spec.template.spec.containers[0].env must render exactly one SYNTHETIC_LIFECYCLE_MAX_ATTEMPTS env")
+            elif (api_monitor_env_value("SYNTHETIC_LIFECYCLE_MAX_ATTEMPTS") | tostring) != "2" then
+              error(".spec.jobTemplate.spec.template.spec.containers[0].env must render SYNTHETIC_LIFECYCLE_MAX_ATTEMPTS=2")
+            elif (api_monitor_envs("SYNTHETIC_LIFECYCLE_RETRY_BACKOFF") | length) != 1 then
+              error(".spec.jobTemplate.spec.template.spec.containers[0].env must render exactly one SYNTHETIC_LIFECYCLE_RETRY_BACKOFF env")
+            elif (api_monitor_env_value("SYNTHETIC_LIFECYCLE_RETRY_BACKOFF") | tostring) != "30s" then
+              error(".spec.jobTemplate.spec.template.spec.containers[0].env must render SYNTHETIC_LIFECYCLE_RETRY_BACKOFF=30s")
+            else
+              .spec.suspend = false
+              | .spec.jobTemplate.spec.activeDeadlineSeconds = 300
+              | .spec.jobTemplate.spec.template.spec.containers |= map(
+                  if .name == "synthetic-api-monitor" then
                   .env |= map(
                     if .name == "SYNTHETIC_PROVISIONING_EXPECTED_ENABLED" or
                        .name == "SYNTHETIC_RUNNER_EXPECTED_ENABLED" or
@@ -3979,10 +4029,52 @@ normalize_prepared_api_monitor_spec() {
                       .
                     end
                   )
-                else
+                  | .env |= map(
+                      select(
+                        .name != "SYNTHETIC_LIFECYCLE_TEMPLATE" and
+                        .name != "SYNTHETIC_LIFECYCLE_READY_TIMEOUT" and
+                        .name != "SYNTHETIC_LIFECYCLE_DESTROY_TIMEOUT" and
+                        .name != "SYNTHETIC_LIFECYCLE_MAX_ATTEMPTS" and
+                        .name != "SYNTHETIC_LIFECYCLE_RETRY_BACKOFF"
+                      )
+                    )
+                  else
                   .
-                end
-              )
+                  end
+                )
+            end
+          elif (api_monitor_env_value("SYNTHETIC_LIFECYCLE_ENABLED") | tostring) == "false" then
+            if (api_monitor_envs("SYNTHETIC_LIFECYCLE_TEMPLATE") | length) != 0 then
+              error(".spec.jobTemplate.spec.template.spec.containers[0].env must not render SYNTHETIC_LIFECYCLE_TEMPLATE when SYNTHETIC_LIFECYCLE_ENABLED=false")
+            elif (api_monitor_envs("SYNTHETIC_LIFECYCLE_READY_TIMEOUT") | length) != 0 then
+              error(".spec.jobTemplate.spec.template.spec.containers[0].env must not render SYNTHETIC_LIFECYCLE_READY_TIMEOUT when SYNTHETIC_LIFECYCLE_ENABLED=false")
+            elif (api_monitor_envs("SYNTHETIC_LIFECYCLE_DESTROY_TIMEOUT") | length) != 0 then
+              error(".spec.jobTemplate.spec.template.spec.containers[0].env must not render SYNTHETIC_LIFECYCLE_DESTROY_TIMEOUT when SYNTHETIC_LIFECYCLE_ENABLED=false")
+            elif (api_monitor_envs("SYNTHETIC_LIFECYCLE_MAX_ATTEMPTS") | length) != 0 then
+              error(".spec.jobTemplate.spec.template.spec.containers[0].env must not render SYNTHETIC_LIFECYCLE_MAX_ATTEMPTS when SYNTHETIC_LIFECYCLE_ENABLED=false")
+            elif (api_monitor_envs("SYNTHETIC_LIFECYCLE_RETRY_BACKOFF") | length) != 0 then
+              error(".spec.jobTemplate.spec.template.spec.containers[0].env must not render SYNTHETIC_LIFECYCLE_RETRY_BACKOFF when SYNTHETIC_LIFECYCLE_ENABLED=false")
+            else
+              .spec.suspend = false
+              | .spec.jobTemplate.spec.activeDeadlineSeconds = 300
+              | .spec.jobTemplate.spec.template.spec.containers |= map(
+                  if .name == "synthetic-api-monitor" then
+                  .env |= map(
+                    if .name == "SYNTHETIC_PROVISIONING_EXPECTED_ENABLED" or
+                       .name == "SYNTHETIC_RUNNER_EXPECTED_ENABLED" or
+                       .name == "SYNTHETIC_LIFECYCLE_ENABLED" then
+                      .value = "false"
+                    else
+                      .
+                    end
+                  )
+                  else
+                  .
+                  end
+                )
+            end
+          else
+            error(".spec.jobTemplate.spec.template.spec.containers[0].env must render SYNTHETIC_LIFECYCLE_ENABLED as a literal true/false string")
           end
         else
           if .spec.suspend != false then
@@ -3993,6 +4085,11 @@ normalize_prepared_api_monitor_spec() {
             require_exact_env("SYNTHETIC_PROVISIONING_EXPECTED_ENABLED"; "false"; "prepared baseline")
             | require_exact_env("SYNTHETIC_RUNNER_EXPECTED_ENABLED"; "false"; "prepared baseline")
             | require_exact_env("SYNTHETIC_LIFECYCLE_ENABLED"; "false"; "prepared baseline")
+            | require_absent_env("SYNTHETIC_LIFECYCLE_TEMPLATE"; "prepared baseline")
+            | require_absent_env("SYNTHETIC_LIFECYCLE_READY_TIMEOUT"; "prepared baseline")
+            | require_absent_env("SYNTHETIC_LIFECYCLE_DESTROY_TIMEOUT"; "prepared baseline")
+            | require_absent_env("SYNTHETIC_LIFECYCLE_MAX_ATTEMPTS"; "prepared baseline")
+            | require_absent_env("SYNTHETIC_LIFECYCLE_RETRY_BACKOFF"; "prepared baseline")
           end
         end
       else
