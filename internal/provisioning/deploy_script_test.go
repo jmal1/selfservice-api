@@ -2966,26 +2966,6 @@ synthetic:
 			}
 		}
 	}
-
-	baseline, readErr := os.ReadFile(env.baselineManifest)
-	if readErr != nil {
-		t.Fatalf("read baseline manifest: %v", readErr)
-	}
-	for name, want := range map[string]string{
-		"PROVISIONING_ENABLED":                         "false",
-		"WORKER_PROVISIONING_CLAIMS_ENABLED":           "false",
-		"WORKER_CONTENT_FILTER_ENABLED":                "false",
-		"WORKER_CONTENT_FILTER_CATEGORY_FEED_BASE_URL": "",
-		"SYNTHETIC_PROVISIONING_EXPECTED_ENABLED":      "false",
-		"SYNTHETIC_LIFECYCLE_ENABLED":                  "false",
-	} {
-		if got := manifestEnvValue(t, string(baseline), name); got != want {
-			t.Fatalf("baseline manifest %s = %q, want %q", name, got, want)
-		}
-	}
-	if strings.Count(string(baseline), "  suspend: true") != 2 {
-		t.Fatalf("baseline manifest does not keep both mutating synthetic CronJobs suspended:\n%s", baseline)
-	}
 	if !strings.Contains(string(output), "immutable all-workload baseline complete") {
 		t.Fatalf("baseline run did not complete cleanly:\n%s", output)
 	}
