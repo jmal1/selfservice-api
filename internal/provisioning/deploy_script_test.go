@@ -7116,12 +7116,59 @@ json_resource() {
   resource_file=$(mktemp)
   extract_resource "$manifest" "$resource" > "$resource_file"
   canonical=$(canonical_resource "$resource_file")
-  is_synthetic_api_monitor=false
-  case "$canonical" in
-    *SYNTHETIC_CONTENT_FILTER_EXPECTED*|*SYNTHETIC_LIFECYCLE_ENABLED*)
-      is_synthetic_api_monitor=true
-      ;;
-  esac
+  omit_fixture_canonical=false
+  if [ "$resource" = "CronJob/selfservice-synthetic-api-monitor" ]; then
+    if [ "$source" = live ] &&
+       printf '%s' "$canonical" | grep -Fq 'schedule: "*/10 * * * *"' &&
+       printf '%s' "$canonical" | grep -Fq 'suspend: true' &&
+       printf '%s' "$canonical" | grep -Fq 'activeDeadlineSeconds: 900' &&
+       printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_PROVISIONING_EXPECTED_ENABLED' &&
+       printf '%s' "$canonical" | grep -Fq 'value: "true"' &&
+       printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_RUNNER_EXPECTED_ENABLED' &&
+       printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_ENABLED' &&
+       printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_TEMPLATE' &&
+       printf '%s' "$canonical" | grep -Fq 'value: "synthetic-noop"' &&
+       printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_READY_TIMEOUT' &&
+       printf '%s' "$canonical" | grep -Fq 'value: "150s"' &&
+       printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_DESTROY_TIMEOUT' &&
+       printf '%s' "$canonical" | grep -Fq 'value: "90s"' &&
+       printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_MAX_ATTEMPTS' &&
+       printf '%s' "$canonical" | grep -Fq 'value: "2"' &&
+       printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_RETRY_BACKOFF' &&
+       printf '%s' "$canonical" | grep -Fq 'value: "30s"'; then
+      omit_fixture_canonical=true
+    elif [ "$source" = live ] &&
+         printf '%s' "$canonical" | grep -Fq 'schedule: "*/10 * * * *"' &&
+         printf '%s' "$canonical" | grep -Fq 'suspend: true' &&
+         printf '%s' "$canonical" | grep -Fq 'activeDeadlineSeconds: 900' &&
+         printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_PROVISIONING_EXPECTED_ENABLED' &&
+         printf '%s' "$canonical" | grep -Fq 'value: "true"' &&
+         printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_RUNNER_EXPECTED_ENABLED' &&
+         printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_ENABLED' &&
+         printf '%s' "$canonical" | grep -Fq 'value: "false"' &&
+         ! printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_TEMPLATE' &&
+         ! printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_READY_TIMEOUT' &&
+         ! printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_DESTROY_TIMEOUT' &&
+         ! printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_MAX_ATTEMPTS' &&
+         ! printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_RETRY_BACKOFF'; then
+      omit_fixture_canonical=true
+    elif [ "$source" = desired ] &&
+         printf '%s' "$canonical" | grep -Fq 'schedule: "*/10 * * * *"' &&
+         printf '%s' "$canonical" | grep -Fq 'suspend: false' &&
+         printf '%s' "$canonical" | grep -Fq 'activeDeadlineSeconds: 300' &&
+         printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_CONTENT_FILTER_EXPECTED' &&
+         printf '%s' "$canonical" | grep -Fq 'value: "false"' &&
+         printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_PROVISIONING_EXPECTED_ENABLED' &&
+         printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_RUNNER_EXPECTED_ENABLED' &&
+         printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_ENABLED' &&
+         ! printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_TEMPLATE' &&
+         ! printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_READY_TIMEOUT' &&
+         ! printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_DESTROY_TIMEOUT' &&
+         ! printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_MAX_ATTEMPTS' &&
+         ! printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_RETRY_BACKOFF'; then
+      omit_fixture_canonical=true
+    fi
+  fi
   if [ "$FAKE_RETAIN_LIVE_JANITOR_TTL_BEFORE_UPGRADE" = true ] &&
      [ "$resource" = "CronJob/selfservice-synthetic-janitor" ]; then
     if [ "$source" = desired ]; then
@@ -7296,7 +7343,7 @@ serverInjectedMutation: true"
         },
         spec:(
           (
-            if $synthetic_api_monitor then
+            if $omit_fixture_canonical then
               {replicas:$replicas}
             else
               {fixtureCanonical:$canonical,replicas:$replicas}
@@ -7445,7 +7492,7 @@ serverInjectedMutation: true"
         },
         spec:(
           (
-            if $synthetic_api_monitor then
+            if $omit_fixture_canonical then
               {}
             else
               {fixtureCanonical:$canonical}
