@@ -7116,6 +7116,12 @@ json_resource() {
   resource_file=$(mktemp)
   extract_resource "$manifest" "$resource" > "$resource_file"
   canonical=$(canonical_resource "$resource_file")
+  is_synthetic_api_monitor=false
+  case "$resource" in
+    *selfservice-synthetic-api-monitor*)
+      is_synthetic_api_monitor=true
+      ;;
+  esac
   if [ "$FAKE_RETAIN_LIVE_JANITOR_TTL_BEFORE_UPGRADE" = true ] &&
      [ "$resource" = "CronJob/selfservice-synthetic-janitor" ]; then
     if [ "$source" = desired ]; then
@@ -7171,6 +7177,7 @@ serverInjectedMutation: true"
       --arg source "$source" \
       --arg post_apply_mode "$FAKE_POST_APPLY_ANNOTATIONS_MODE" \
       --arg resource "$resource" \
+      --argjson synthetic_api_monitor "$is_synthetic_api_monitor" \
       --arg release "$FAKE_LIVE_HELM_RELEASE" \
       --arg namespace "$FAKE_LIVE_HELM_NAMESPACE" \
       --argjson replicas "$replicas" \
@@ -7289,7 +7296,7 @@ serverInjectedMutation: true"
         },
         spec:(
           (
-            if $resource == "CronJob/selfservice-synthetic-api-monitor" then
+            if $synthetic_api_monitor then
               {replicas:$replicas}
             else
               {fixtureCanonical:$canonical,replicas:$replicas}
@@ -7320,6 +7327,7 @@ serverInjectedMutation: true"
       --arg source "$source" \
       --arg post_apply_mode "$FAKE_POST_APPLY_ANNOTATIONS_MODE" \
       --arg resource "$resource" \
+      --argjson synthetic_api_monitor "$is_synthetic_api_monitor" \
       --arg release "$FAKE_LIVE_HELM_RELEASE" \
       --arg namespace "$FAKE_LIVE_HELM_NAMESPACE" \
       '{
@@ -7437,7 +7445,7 @@ serverInjectedMutation: true"
         },
         spec:(
           (
-            if $resource == "CronJob/selfservice-synthetic-api-monitor" then
+            if $synthetic_api_monitor then
               {}
             else
               {fixtureCanonical:$canonical}
