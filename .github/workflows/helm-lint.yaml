@@ -49,11 +49,9 @@ jobs:
         working-directory: deploy/helm/selfservice
         run: helm template selfservice . -f values.yaml -f values.prod.yaml > rendered-prod.yaml
 
-      # Guards the 2026-08-25 dry-run failure: deploy.sh's
-      # validate_foundation_intent requires the rendered foundation facts to
-      # stay explicit booleans rather than drifting behind defaults or omitted
-      # envs. `helm template ... > /dev/null` alone does not catch that.
-      - name: assert SYNTHETIC_LIFECYCLE_ENABLED=false in prod render
+      # Guards explicit boolean foundation facts in the production overlay
+      # (Helm 176 live contract). Mutating synthetics stay false until canaries pass.
+      - name: assert production overlay foundation env
         working-directory: deploy/helm/selfservice
         run: |
           set -euo pipefail
@@ -72,8 +70,8 @@ jobs:
               exit 1
             fi
           }
-          assert_env PROVISIONING_ENABLED false
-          assert_env SYNTHETIC_PROVISIONING_EXPECTED_ENABLED false
+          assert_env PROVISIONING_ENABLED true
+          assert_env SYNTHETIC_PROVISIONING_EXPECTED_ENABLED true
           assert_env SYNTHETIC_RUNNER_EXPECTED_ENABLED false
           assert_env SYNTHETIC_LIFECYCLE_ENABLED false
 

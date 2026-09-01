@@ -1,6 +1,16 @@
 # Production overrides for selfservice helm chart.
 # Apply with: helm upgrade selfservice . -n selfservice -f values.yaml -f values.prod.yaml
 #
+# This file is the production source of truth. It must match the live Helm
+# intent (admission, claims, hosts, synthetic suspend). Do not leave a newer
+# contract only on the cluster or in /tmp overlays.
+#
+# Note: deploy.sh validate_foundation_intent still requires a contained
+# candidate (PROVISIONING_ENABLED=false). A guarded deploy.sh apply of this
+# overlay will fail until that gate is retargeted. Until then, production
+# applies of this file use helm with the digest post-renderer from git, not
+# host-local script copies.
+#
 # Anything NOT listed here uses defaults from values.yaml. Keep this file as
 # small as possible — only true production overrides belong here.
 #
@@ -11,22 +21,20 @@
 #   - Vault path: secret/selfservice/<secret-name>
 
 replicaCount:
-  # Keep one worker online for cleanup/orphan recovery while production stays
-  # admission-contained.
+  # One worker is enough while AMD canaries stay serial (one host in VCENTER_HOSTS).
   worker: 1
 
 provisioning:
-  # Production stays in admission-contained mode until the rollout is
-  # deliberately reopened.
-  enabled: false
-  workerClaimsEnabled: false
+  # Live Helm 176 (2026-09-01): API admission and worker claims are open.
+  # Mutating synthetics stay off until each AMD host has a zero-residue noop canary.
+  enabled: true
+  workerClaimsEnabled: true
 
 vcenter:
-  # Production placement and standard-vSwitch mutation remain restricted to ESXi1.
-  # The AMD pool is the resource-pool compatibility constraint for ESXi1, not
-  # a substitute for the host allowlist. Explicit host pinning controls initial
-  # placement. While ESXi2 is quarantined, do not accept DRS recommendations or
-  # manually move provisioning or source VMs to it.
+  # Exact-host canary pin: ESXi1 only. ESXi2 is no longer "indefinite quarantine"
+  # (2026-09-01 forensics: VMwareCertified if_re 1.101.01, NetPort 708 is not
+  # Crucible-specific). Do not add esxi2.lab.jmal.io until one attended
+  # synthetic-noop on ESXi2 returns zero residue. Intel NUCs are overflow.
   hosts: "esxi1.lab.jmal.io"
   resourcePools: "/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs"
   placementReservedMemoryMB: "esxi1.lab.jmal.io=8192"
@@ -40,11 +48,11 @@ vcenter:
 # forcing clone-producing CronJobs off before a guarded apply and after a
 # failed atomic rollback.
 synthetic:
-  # Keep the non-mutating API monitor active while the cluster remains
-  # admission-contained.
+  # Non-mutating API monitor is scheduled. Lifecycle/runner/janitor stay
+  # rendered but suspended until AMD canaries pass.
   suspend: false
   schedule: "*/12 * * * *"
-  provisioningExpectedEnabled: false
+  provisioningExpectedEnabled: true
   lifecycle:
     enabled: false
     template: synthetic-noop

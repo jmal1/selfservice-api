@@ -409,6 +409,9 @@ func TestCIWorkflowBuildJobMatchesDeployProof(t *testing.T) {
 	if !strings.Contains(string(body), `--arg job "build ($component)"`) {
 		t.Fatal(`deploy.sh no longer proves successful image builds with job names "build ($component)"`)
 	}
+	if !strings.Contains(string(body), `--arg release "Build release images ($component)"`) {
+		t.Fatal(`deploy.sh no longer accepts CI matrix job names "Build release images ($component)"`)
+	}
 }
 
 func TestCIWorkflowTestJobStillRunsFullCoverage(t *testing.T) {

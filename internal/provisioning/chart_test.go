@@ -220,23 +220,23 @@ func TestInternalIngressCanonicalizesToPublicHost(t *testing.T) {
 func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T) {
 	values := loadChartValues(t, "values.prod.yaml")
 	if values.ReplicaCount.Worker != 1 {
-		t.Errorf("production worker replicas = %d, want exactly 1 while ESXi2 remains quarantined", values.ReplicaCount.Worker)
+		t.Errorf("production worker replicas = %d, want exactly 1 while AMD canaries stay serial", values.ReplicaCount.Worker)
 	}
-	if values.Provisioning.Enabled || values.Provisioning.WorkerClaimsEnabled {
-		t.Fatalf("production provisioning controls = %+v, want admission off and chart-rendered worker claims gated", values.Provisioning)
+	if !values.Provisioning.Enabled || !values.Provisioning.WorkerClaimsEnabled {
+		t.Fatalf("production provisioning controls = %+v, want admission and worker claims open (Helm 176 live contract)", values.Provisioning)
 	}
-	if values.Synthetic.ProvisioningExpectedEnabled {
-		t.Fatal("production synthetic must expect provisioning disabled")
+	if !values.Synthetic.ProvisioningExpectedEnabled {
+		t.Fatal("production synthetic must expect provisioning enabled while admission is open")
 	}
 	if values.Synthetic.Suspend {
 		t.Fatal("production non-mutating API monitor CronJob must remain active")
 	}
 	if values.Synthetic.Lifecycle.Enabled || !values.Synthetic.Runner.Enabled || !values.Synthetic.Janitor.Enabled ||
 		!values.Synthetic.Runner.Suspend || !values.Synthetic.Janitor.Suspend {
-		t.Fatalf("production mutating synthetics must stay enabled but suspended after the live provisioning proof: %+v", values.Synthetic)
+		t.Fatalf("production mutating synthetics must stay enabled but suspended until AMD canaries pass: %+v", values.Synthetic)
 	}
 	if values.VCenter.Hosts != "esxi1.lab.jmal.io" {
-		t.Fatalf("production VCENTER_HOSTS = %q, want ESXi1 only", values.VCenter.Hosts)
+		t.Fatalf("production VCENTER_HOSTS = %q, want ESXi1 only until the ESXi2 canary", values.VCenter.Hosts)
 	}
 	if values.VCenter.ResourcePools != "/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs" {
 		t.Fatalf("production resource pools = %q, want ESXi1-compatible AMD pool only", values.VCenter.ResourcePools)
@@ -258,9 +258,9 @@ func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T
 	}
 	for path, want := range map[string]string{
 		"replicaCount.worker":                   "1",
-		"provisioning.enabled":                  "false",
-		"provisioning.workerClaimsEnabled":      "false",
-		"synthetic.provisioningExpectedEnabled": "false",
+		"provisioning.enabled":                  "true",
+		"provisioning.workerClaimsEnabled":      "true",
+		"synthetic.provisioningExpectedEnabled": "true",
 		"synthetic.suspend":                     "false",
 		"synthetic.lifecycle.enabled":           "false",
 		"synthetic.janitor.enabled":             "true",
