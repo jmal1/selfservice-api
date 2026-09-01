@@ -3966,6 +3966,18 @@ prepare_claims_baseline() {
 
   local tmp_dir live_values candidate_unpinned candidate_manifest candidate_inventory
   local desired_map declared_map live_dir comparison_manifest
+  local -a baseline_overrides=(
+    --set provisioning.enabled=false
+    --set provisioning.workerClaimsEnabled=false
+    --set worker.contentFilter.enabled=false
+    --set-string worker.contentFilter.categoryFeedBaseURL=
+    --set synthetic.provisioningExpectedEnabled=false
+    --set synthetic.suspend=false
+    --set synthetic.janitor.suspend=true
+    --set synthetic.runner.suspend=true
+    --set synthetic.lifecycle.enabled=false
+    --set replicaCount.worker=1
+  )
   tmp_dir="$(mktemp -d)"
   BASELINE_TMP_DIR=$tmp_dir
   live_values="$tmp_dir/live-values.yaml"
@@ -3982,7 +3994,7 @@ prepare_claims_baseline() {
   helm template "$RELEASE" "$BASELINE_CHART_DIR" \
     -n "$NAMESPACE" \
     -f "$live_values" \
-    --set provisioning.workerClaimsEnabled=false \
+    "${baseline_overrides[@]}" \
     --skip-tests > "$candidate_unpinned"
   manifest_workload_inventory "$candidate_unpinned" > "$candidate_inventory"
   require_core_workloads "$candidate_inventory"
@@ -4050,7 +4062,7 @@ prepare_claims_baseline() {
       helm upgrade "$RELEASE" "$BASELINE_CHART_DIR" \
       --namespace "$NAMESPACE" \
       --reuse-values \
-      --set provisioning.workerClaimsEnabled=false \
+      "${baseline_overrides[@]}" \
       --post-renderer "$PIN_BASELINE_SCRIPT" \
       --wait \
       --timeout "$TIMEOUT"; then
