@@ -7430,7 +7430,13 @@ serverInjectedMutation: true"
           )
         },
         spec:(
-          {fixtureCanonical:$canonical} +
+          (
+            if $resource == "CronJob/selfservice-synthetic-api-monitor" then
+              {}
+            else
+              {fixtureCanonical:$canonical}
+            end
+          ) +
           if $source == "post-apply" and $post_apply_mode == "template-level" and
              $kind == "Deployment" then
             {template:{metadata:{annotations:{"deployment.kubernetes.io/revision":"164"}}}}
