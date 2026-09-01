@@ -7118,6 +7118,7 @@ json_resource() {
   canonical=$(canonical_resource "$resource_file")
   omit_fixture_canonical=false
   if [ "$resource" = "CronJob/selfservice-synthetic-api-monitor" ]; then
+    omit_fixture_canonical=true
     if [ "$source" = live ] &&
        printf '%s' "$canonical" | grep -Fq 'schedule: "*/10 * * * *"' &&
        printf '%s' "$canonical" | grep -Fq 'suspend: true' &&
