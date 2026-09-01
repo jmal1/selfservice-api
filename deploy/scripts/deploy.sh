@@ -1066,8 +1066,8 @@ prove_successful_source_build() {
     crucible-engine \
     synthetic-api-monitor \
     crucible-runner; do
-    if ! jq -e --arg job "build ($component)" \
-        '.jobs | any(.name == $job and .status == "completed" and .conclusion == "success")' \
+    if ! jq -e --arg job "build ($component)" --arg release "Build release images ($component)" \
+        '.jobs | any((.name == $job or .name == $release) and .status == "completed" and .conclusion == "success")' \
         >/dev/null <<< "$jobs_json"; then
       echo "ERROR: successful workflow run $run_id does not contain a successful image build for $component." >&2
       return 1

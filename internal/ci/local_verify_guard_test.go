@@ -28,7 +28,7 @@ var requiredLocalVerificationTiers = map[string]int{
 	"helm-lint.yaml|lint|helm lint (defaults)":                                         4,
 	"helm-lint.yaml|lint|helm lint (defaults + prod overrides)":                        4,
 	"helm-lint.yaml|lint|helm template (defaults + prod overrides)":                    4,
-	"helm-lint.yaml|lint|assert SYNTHETIC_LIFECYCLE_ENABLED=false in prod render":      4,
+	"helm-lint.yaml|lint|assert production overlay foundation env":                     4,
 	"helm-lint.yaml|lint|helm lint and template (approved full-fleet overlay)":         4,
 	"helm-lint.yaml|lint|assert SYNTHETIC_LIFECYCLE_ENABLED=true in full-fleet render": 4,
 }
