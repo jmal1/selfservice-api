@@ -7289,7 +7289,7 @@ serverInjectedMutation: true"
         },
         spec:(
           (
-            if ($resource | contains("selfservice-synthetic-api-monitor")) then
+            if ($canonical | contains("name: synthetic-api-monitor")) then
               {replicas:$replicas}
             else
               {fixtureCanonical:$canonical,replicas:$replicas}
@@ -7437,7 +7437,7 @@ serverInjectedMutation: true"
         },
         spec:(
           (
-            if ($resource | contains("selfservice-synthetic-api-monitor")) then
+            if ($canonical | contains("name: synthetic-api-monitor")) then
               {}
             else
               {fixtureCanonical:$canonical}
