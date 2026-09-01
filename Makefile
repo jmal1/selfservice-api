@@ -1,4 +1,4 @@
-.PHONY: build test test-race lint fmt vet tidy clean dev-up dev-down dev-logs help wiki-bundle verify-wiki
+.PHONY: build test test-race lint fmt vet tidy clean dev-up dev-down dev-logs help wiki-bundle verify-wiki verify-fast verify-local ci-fast ci-local
 
 GO            ?= go
 GOFLAGS       ?=
@@ -31,11 +31,28 @@ build: ## Build all command binaries into ./bin
 		$(GO) build $(BUILD_FLAGS) -o $(BIN_DIR)/$$cmd ./cmd/$$cmd || exit 1; \
 	done
 
-test: ## Run unit tests with the race detector (matches CI)
+test: ## Run the full local CI-equivalent race suite (matches GitHub Actions)
 	$(GO) test ./... -race -count=1
 
 test-short: ## Run tests excluding -tags=integration
 	$(GO) test ./... -short -race -count=1
+
+ci-fast: ## Fast local gate: build + vet + wiki + short Go tests without the full race suite
+	@echo "==> Phase 1/4: build"
+	@$(GO) build ./...
+	@echo "==> Phase 2/4: vet"
+	@$(GO) vet ./...
+	@echo "==> Phase 3/4: wiki bundle"
+	@$(MAKE) verify-wiki
+	@echo "==> Phase 4/4: short tests"
+	@$(GO) test ./... -short -count=1
+
+verify-fast: ci-fast
+
+verify-local: ## Run the Windows-first local CI mirror before opening a PR
+	@pwsh ./scripts/local-verify.ps1
+
+ci-local: verify-local
 
 vet: ## Run go vet
 	$(GO) vet ./...

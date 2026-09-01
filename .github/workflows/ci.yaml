@@ -59,6 +59,7 @@ jobs:
           echo "run_tests=$GO_TESTS" >> "$GITHUB_OUTPUT"
 
   build-pr:
+    name: Build PR images
     needs: changes
     if: |
       github.event_name == 'pull_request' &&
@@ -142,6 +143,7 @@ jobs:
           retention-days: 90
 
   build:
+    name: Build release images
     needs: [changes, test]
     if: |
       always() &&
@@ -153,6 +155,7 @@ jobs:
     steps: *build_steps
 
   test:
+    name: Go build + vet + wiki + race tests
     needs: changes
     if: needs.changes.outputs.run_tests == 'true'
     runs-on: ubuntu-latest
@@ -199,6 +202,7 @@ jobs:
         run: go test ./... -v -race
 
   ci-required:
+    name: PR CI gate
     if: always() && github.event_name == 'pull_request'
     needs: [changes, build-pr, test]
     runs-on: ubuntu-latest

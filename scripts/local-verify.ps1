@@ -722,8 +722,14 @@ fi
 
 if ($script:AnyFail) {
     Write-Host "OVERALL: FAIL - at least one runnable tier failed."
+    Write-Host "Fast rerun for the local Go gate: pwsh ./scripts/local-verify.ps1 -Tier 0"
+    Write-Host "Full local mirror before PRs: pwsh ./scripts/local-verify.ps1"
+    Write-Host "Shortcut from Make: make ci-fast or make verify-local"
     exit 1
 }
 
 Write-Host "OVERALL: PASS - all selected tiers succeeded or were intentionally skipped."
+Write-Host "Fast rerun for the local Go gate: pwsh ./scripts/local-verify.ps1 -Tier 0"
+Write-Host "Full local mirror before PRs: pwsh ./scripts/local-verify.ps1"
+Write-Host "Shortcut from Make: make ci-fast or make verify-local"
 exit 0
