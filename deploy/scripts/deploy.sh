@@ -3930,6 +3930,77 @@ verify_manifest_and_live() {
   rm -rf "$tmp_dir"
 }
 
+normalize_prepared_api_monitor_spec() {
+  local mode=$1
+  local manifest=$2
+  jq -ceS \
+    --arg mode "$mode" \
+    '
+      def api_monitor_containers:
+        [.spec.jobTemplate.spec.template.spec.containers[] | select(.name == "synthetic-api-monitor")];
+
+      def api_monitor_envs($name):
+        [api_monitor_containers[] | .env[]? | select(.name == $name)];
+
+      def require_exact_env($name; $expected; $path):
+        if (api_monitor_envs($name) | length) != 1 then
+          error($path + " must render exactly one " + $name + " env")
+        elif (api_monitor_envs($name)[0].value | tostring) != $expected then
+          error($path + " must render " + $name + "=" + $expected)
+        else
+          .
+        end;
+
+      if .kind == "CronJob" and .metadata.name == "selfservice-synthetic-api-monitor" then
+        if (api_monitor_containers | length) != 1 then
+          error(".spec.jobTemplate.spec.template.spec.containers must contain exactly one synthetic-api-monitor container")
+        elif $mode == "live" then
+          if (.spec.suspend | type) != "boolean" then
+            error(".spec.suspend must be a boolean")
+          elif (.spec.jobTemplate.spec.activeDeadlineSeconds | type) != "number" then
+            error(".spec.jobTemplate.spec.activeDeadlineSeconds must be a number")
+          elif (api_monitor_envs("SYNTHETIC_PROVISIONING_EXPECTED_ENABLED") | length) != 1 then
+            error(".spec.jobTemplate.spec.template.spec.containers[0].env must render exactly one SYNTHETIC_PROVISIONING_EXPECTED_ENABLED env")
+          elif (api_monitor_envs("SYNTHETIC_RUNNER_EXPECTED_ENABLED") | length) != 1 then
+            error(".spec.jobTemplate.spec.template.spec.containers[0].env must render exactly one SYNTHETIC_RUNNER_EXPECTED_ENABLED env")
+          elif (api_monitor_envs("SYNTHETIC_LIFECYCLE_ENABLED") | length) != 1 then
+            error(".spec.jobTemplate.spec.template.spec.containers[0].env must render exactly one SYNTHETIC_LIFECYCLE_ENABLED env")
+          else
+            .spec.suspend = false
+            | .spec.jobTemplate.spec.activeDeadlineSeconds = 300
+            | .spec.jobTemplate.spec.template.spec.containers |= map(
+                if .name == "synthetic-api-monitor" then
+                  .env |= map(
+                    if .name == "SYNTHETIC_PROVISIONING_EXPECTED_ENABLED" or
+                       .name == "SYNTHETIC_RUNNER_EXPECTED_ENABLED" or
+                       .name == "SYNTHETIC_LIFECYCLE_ENABLED" then
+                      .value = "false"
+                    else
+                      .
+                    end
+                  )
+                else
+                  .
+                end
+              )
+          end
+        else
+          if .spec.suspend != false then
+            error("prepared baseline must render CronJob/selfservice-synthetic-api-monitor with suspend=false")
+          elif .spec.jobTemplate.spec.activeDeadlineSeconds != 300 then
+            error("prepared baseline must render CronJob/selfservice-synthetic-api-monitor with activeDeadlineSeconds=300")
+          else
+            require_exact_env("SYNTHETIC_PROVISIONING_EXPECTED_ENABLED"; "false"; "prepared baseline")
+            | require_exact_env("SYNTHETIC_RUNNER_EXPECTED_ENABLED"; "false"; "prepared baseline")
+            | require_exact_env("SYNTHETIC_LIFECYCLE_ENABLED"; "false"; "prepared baseline")
+          end
+        end
+      else
+        .
+      end
+    ' <<< "$manifest"
+}
+
 prepare_claims_baseline() {
   if [ -z "$BASELINE_CHART_DIR" ]; then
     echo "ERROR: --prepare-claims-baseline requires --baseline-chart-dir pointing at the currently deployed safe chart checkout." >&2
@@ -4042,6 +4113,14 @@ prepare_claims_baseline() {
     fi
     if ! desired_spec="$(canonical_desired_workload_spec "$kind" "$named_manifest")"; then
       echo "ERROR: server dry-run could not canonicalize rendered $kind/$name for direct drift comparison." >&2
+      return 1
+    fi
+    if ! live_spec="$(normalize_prepared_api_monitor_spec live "$live_spec")"; then
+      echo "ERROR: could not normalize the live $kind/$name spec for direct drift comparison." >&2
+      return 1
+    fi
+    if ! desired_spec="$(normalize_prepared_api_monitor_spec desired "$desired_spec")"; then
+      echo "ERROR: could not validate the prepared $kind/$name spec for direct drift comparison." >&2
       return 1
     fi
     if [ "$live_spec" != "$desired_spec" ]; then

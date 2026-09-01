@@ -2971,6 +2971,79 @@ synthetic:
 	}
 }
 
+func TestDeployScriptPreparesClaimsBaselineAllowsHistoricalApiMonitorFixture(t *testing.T) {
+	requirePOSIXShell(t)
+
+	historicalApiMonitor := func(manifest string) string {
+		manifest = replaceSyntheticSuspend(manifest, true)
+		manifest = strings.Replace(manifest, "activeDeadlineSeconds: 300", "activeDeadlineSeconds: 900", 1)
+		manifest = replaceEnvValue(manifest, "SYNTHETIC_PROVISIONING_EXPECTED_ENABLED", "false", "true")
+		manifest = replaceEnvValue(manifest, "SYNTHETIC_RUNNER_EXPECTED_ENABLED", "false", "true")
+		manifest = replaceEnvValue(manifest, "SYNTHETIC_LIFECYCLE_ENABLED", "false", "true")
+		return manifest
+	}
+
+	live := historicalApiMonitor(baselineManifest(true, "", "false"))
+	if !strings.Contains(live, "activeDeadlineSeconds: 900") ||
+		!strings.Contains(live, "SYNTHETIC_PROVISIONING_EXPECTED_ENABLED") ||
+		!strings.Contains(live, "SYNTHETIC_RUNNER_EXPECTED_ENABLED") ||
+		!strings.Contains(live, "SYNTHETIC_LIFECYCLE_ENABLED") {
+		t.Fatal("historical API monitor fixture did not pick up the intended baseline override drift")
+	}
+
+	env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "false"))
+	output, err := env.run(
+		"--prepare-claims-baseline",
+		"--baseline-chart-dir",
+		env.chartDir,
+	)
+	if err != nil {
+		t.Fatalf("baseline preparation failed: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "immutable all-workload baseline complete") {
+		t.Fatalf("baseline run did not complete cleanly:\n%s", output)
+	}
+}
+
+func TestDeployScriptPreparesClaimsBaselineRejectsUnrelatedApiMonitorDrift(t *testing.T) {
+	requirePOSIXShell(t)
+
+	historicalApiMonitor := func(manifest string) string {
+		manifest = replaceSyntheticSuspend(manifest, true)
+		manifest = strings.Replace(manifest, "activeDeadlineSeconds: 300", "activeDeadlineSeconds: 900", 1)
+		manifest = replaceEnvValue(manifest, "SYNTHETIC_PROVISIONING_EXPECTED_ENABLED", "false", "true")
+		manifest = replaceEnvValue(manifest, "SYNTHETIC_RUNNER_EXPECTED_ENABLED", "false", "true")
+		manifest = replaceEnvValue(manifest, "SYNTHETIC_LIFECYCLE_ENABLED", "false", "true")
+		return manifest
+	}
+
+	live := strings.Replace(
+		historicalApiMonitor(baselineManifest(true, "", "false")),
+		"successfulJobsHistoryLimit: 3",
+		"successfulJobsHistoryLimit: 4",
+		1,
+	)
+	if !strings.Contains(live, "successfulJobsHistoryLimit: 4") {
+		t.Fatal("unrelated API monitor fixture drift did not change the schedule-adjacent field")
+	}
+
+	env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "false"))
+	output, err := env.run(
+		"--prepare-claims-baseline",
+		"--baseline-chart-dir",
+		env.chartDir,
+	)
+	if err == nil {
+		t.Fatalf("baseline preparation unexpectedly passed unrelated API monitor drift:\n%s", output)
+	}
+	if !strings.Contains(string(output), "spec drifts from the server-defaulted safe chart") {
+		t.Fatalf("baseline failed for the wrong reason:\n%s", output)
+	}
+	if upgradeBody, readErr := os.ReadFile(env.upgradeLog); readErr == nil && len(upgradeBody) > 0 {
+		t.Fatalf("baseline drift reached Helm upgrade despite failing the live-spec comparison: %s", upgradeBody)
+	}
+}
+
 func TestDeployScriptHelmOwnershipNormalizationLoadBearing(t *testing.T) {
 	requirePOSIXShell(t)
 
