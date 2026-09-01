@@ -7154,23 +7154,33 @@ json_resource() {
       omit_fixture_canonical=true
     elif [ "$source" = desired ] &&
          [ "$resource" = "CronJob/selfservice-synthetic-api-monitor" ]; then
-      if printf '%s' "$canonical" | grep -Fq 'schedule: "*/10 * * * *"' &&
-         printf '%s' "$canonical" | grep -Fq 'suspend: false' &&
-         printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_CONTENT_FILTER_EXPECTED' &&
-         printf '%s' "$canonical" | grep -Fq 'value: "false"' &&
-         printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_PROVISIONING_EXPECTED_ENABLED' &&
-         printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_RUNNER_EXPECTED_ENABLED' &&
-         printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_ENABLED' &&
-         ! printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_TEMPLATE' &&
-         ! printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_READY_TIMEOUT' &&
-         ! printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_DESTROY_TIMEOUT' &&
-         ! printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_MAX_ATTEMPTS' &&
-         ! printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_RETRY_BACKOFF'; then
-        omit_fixture_canonical=true
-      else
-        echo "desired API monitor fixture did not match the expected contained baseline" >&2
-        exit 1
-      fi
+      for desired_token in \
+        'schedule: "*/10 * * * *"' \
+        'suspend: false' \
+        'SYNTHETIC_CONTENT_FILTER_EXPECTED' \
+        'value: "false"' \
+        'SYNTHETIC_PROVISIONING_EXPECTED_ENABLED' \
+        'SYNTHETIC_RUNNER_EXPECTED_ENABLED' \
+        'SYNTHETIC_LIFECYCLE_ENABLED'
+      do
+        if ! printf '%s' "$canonical" | grep -Fq "$desired_token"; then
+          echo "desired API monitor fixture did not match the expected contained baseline" >&2
+          exit 1
+        fi
+      done
+      for forbidden_token in \
+        'SYNTHETIC_LIFECYCLE_TEMPLATE' \
+        'SYNTHETIC_LIFECYCLE_READY_TIMEOUT' \
+        'SYNTHETIC_LIFECYCLE_DESTROY_TIMEOUT' \
+        'SYNTHETIC_LIFECYCLE_MAX_ATTEMPTS' \
+        'SYNTHETIC_LIFECYCLE_RETRY_BACKOFF'
+      do
+        if printf '%s' "$canonical" | grep -Fq "$forbidden_token"; then
+          echo "desired API monitor fixture must not render $forbidden_token" >&2
+          exit 1
+        fi
+      done
+      omit_fixture_canonical=true
     fi
   fi
   if [ "$FAKE_RETAIN_LIVE_JANITOR_TTL_BEFORE_UPGRADE" = true ] &&
