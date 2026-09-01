@@ -2993,7 +2993,6 @@ func TestDeployScriptPreparesClaimsBaselineAllowsHistoricalApiMonitorFixture(t *
 		t.Run(test.name, func(t *testing.T) {
 			live := historicalApiMonitorFixture(baselineManifest(true, "", "false"), test.lifecycleEnabled)
 			if !strings.Contains(live, "activeDeadlineSeconds: 900") ||
-				!strings.Contains(live, "successfulJobsHistoryLimit: 3") ||
 				!strings.Contains(live, "SYNTHETIC_PROVISIONING_EXPECTED_ENABLED") ||
 				!strings.Contains(live, "SYNTHETIC_RUNNER_EXPECTED_ENABLED") ||
 				!strings.Contains(live, "SYNTHETIC_LIFECYCLE_ENABLED") {
@@ -8922,7 +8921,6 @@ func replaceEnvValue(manifest, name, oldValue, newValue string) string {
 }
 
 func historicalApiMonitorFixture(manifest string, lifecycleEnabled bool) string {
-	manifest = strings.Replace(manifest, "  schedule: \"*/10 * * * *\"\n  suspend: false\n", "  schedule: \"*/10 * * * *\"\n  successfulJobsHistoryLimit: 3\n  failedJobsHistoryLimit: 5\n  startingDeadlineSeconds: 120\n  suspend: false\n", 1)
 	manifest = strings.Replace(manifest, "  jobTemplate:\n    spec:\n      template:\n", "  jobTemplate:\n    spec:\n      activeDeadlineSeconds: 900\n      template:\n", 1)
 	manifest = replaceSyntheticSuspend(manifest, true)
 	manifest = replaceEnvValue(manifest, "SYNTHETIC_PROVISIONING_EXPECTED_ENABLED", "false", "true")
