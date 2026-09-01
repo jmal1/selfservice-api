@@ -7152,8 +7152,8 @@ json_resource() {
          ! printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_MAX_ATTEMPTS' &&
          ! printf '%s' "$canonical" | grep -Fq 'SYNTHETIC_LIFECYCLE_RETRY_BACKOFF'; then
       omit_fixture_canonical=true
-    elif [ "$source" = desired ] &&
-         [ "$resource" = "CronJob/selfservice-synthetic-api-monitor" ]; then
+    elif [ "$resource" = "CronJob/selfservice-synthetic-api-monitor" ] &&
+         [ "$source" != live ]; then
       for desired_token in \
         'schedule: "*/10 * * * *"' \
         'suspend: false' \
