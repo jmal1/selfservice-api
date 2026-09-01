@@ -7290,7 +7290,7 @@ serverInjectedMutation: true"
         spec:(
           (
             if ($resource | contains("selfservice-synthetic-api-monitor")) then
-              {}
+              {replicas:$replicas}
             else
               {fixtureCanonical:$canonical,replicas:$replicas}
             end
