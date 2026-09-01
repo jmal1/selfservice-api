@@ -2909,6 +2909,88 @@ func TestDeployScriptPreparesAllWorkloadBaseline(t *testing.T) {
 	}
 }
 
+func TestDeployScriptPreparesClaimsBaselineOverridesContainedFoundation(t *testing.T) {
+	requirePOSIXShell(t)
+
+	live := baselineManifest(true, "", "false")
+	env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "false"))
+	writeFile(t, env.currentRollbackValues, `replicaCount:
+  worker: 4
+provisioning:
+  enabled: true
+  workerClaimsEnabled: true
+worker:
+  contentFilter:
+    enabled: true
+    categoryFeedBaseURL: https://student-filter-feed.lab.jmal.io
+synthetic:
+  provisioningExpectedEnabled: true
+  suspend: true
+  janitor:
+    suspend: false
+  runner:
+    suspend: false
+  lifecycle:
+    enabled: true
+`)
+
+	output, err := env.run(
+		"--prepare-claims-baseline",
+		"--baseline-chart-dir",
+		env.chartDir,
+	)
+	if err != nil {
+		t.Fatalf("baseline preparation failed: %v\n%s", err, output)
+	}
+
+	requiredArgs := []string{
+		"--set provisioning.enabled=false",
+		"--set provisioning.workerClaimsEnabled=false",
+		"--set worker.contentFilter.enabled=false",
+		"--set-string worker.contentFilter.categoryFeedBaseURL=",
+		"--set synthetic.provisioningExpectedEnabled=false",
+		"--set synthetic.suspend=false",
+		"--set synthetic.janitor.suspend=true",
+		"--set synthetic.runner.suspend=true",
+		"--set synthetic.lifecycle.enabled=false",
+		"--set replicaCount.worker=1",
+	}
+	for _, logPath := range []string{env.templateLog, env.upgradeLog} {
+		body, readErr := os.ReadFile(logPath)
+		if readErr != nil {
+			t.Fatalf("read %s: %v", logPath, readErr)
+		}
+		for _, want := range requiredArgs {
+			if !strings.Contains(string(body), want) {
+				t.Fatalf("%s does not contain %q:\n%s", logPath, want, body)
+			}
+		}
+	}
+
+	baseline, readErr := os.ReadFile(env.baselineManifest)
+	if readErr != nil {
+		t.Fatalf("read baseline manifest: %v", readErr)
+	}
+	for name, want := range map[string]string{
+		"PROVISIONING_ENABLED":                         "false",
+		"WORKER_PROVISIONING_CLAIMS_ENABLED":           "false",
+		"WORKER_CONTENT_FILTER_ENABLED":                "false",
+		"WORKER_CONTENT_FILTER_CATEGORY_FEED_BASE_URL": "",
+		"SYNTHETIC_PROVISIONING_EXPECTED_ENABLED":      "false",
+		"SYNTHETIC_LIFECYCLE_ENABLED":                  "false",
+	} {
+		if got := manifestEnvValue(t, string(baseline), name); got != want {
+			t.Fatalf("baseline manifest %s = %q, want %q", name, got, want)
+		}
+	}
+	if strings.Count(string(baseline), "  suspend: true") != 2 {
+		t.Fatalf("baseline manifest does not keep both mutating synthetic CronJobs suspended:\n%s", baseline)
+	}
+	if !strings.Contains(string(output), "immutable all-workload baseline complete") {
+		t.Fatalf("baseline run did not complete cleanly:\n%s", output)
+	}
+}
+
 func TestDeployScriptHelmOwnershipNormalizationLoadBearing(t *testing.T) {
 	requirePOSIXShell(t)
 
@@ -6421,6 +6503,7 @@ type deployScriptEnvironment struct {
 	appliedManifest           string
 	upgradedMarker            string
 	upgradeLog                string
+	templateLog               string
 	gitLog                    string
 	lockFile                  string
 	lockBackupDir             string
@@ -6565,6 +6648,7 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 		appliedManifest:           filepath.Join(root, "applied.yaml"),
 		upgradedMarker:            filepath.Join(root, "upgraded"),
 		upgradeLog:                filepath.Join(root, "upgrade.log"),
+		templateLog:               filepath.Join(root, "template.log"),
 		gitLog:                    filepath.Join(root, "git.log"),
 		lockFile:                  filepath.Join(root, "helm.lock"),
 		lockBackupDir:             filepath.Join(root, "lock-backups"),
@@ -6759,6 +6843,8 @@ case "$1 $2" in
   "dependency build"|"dep build")
     ;;
   "template selfservice")
+    original_args="$*"
+    printf '%s\n' "$original_args" >> "$FAKE_TEMPLATE_LOG"
     cat "$FAKE_CANDIDATE_MANIFEST"
     if [[ "$*" == *"--is-upgrade"* ]] && [ -s "$FAKE_UPGRADE_HOOK_MANIFEST" ]; then
       printf '%s\n' '---'
@@ -8373,6 +8459,7 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_APPLIED_MANIFEST="+e.appliedManifest,
 		"FAKE_UPGRADED_MARKER="+e.upgradedMarker,
 		"FAKE_UPGRADE_LOG="+e.upgradeLog,
+		"FAKE_TEMPLATE_LOG="+e.templateLog,
 		"FAKE_GIT_LOG="+e.gitLog,
 		"FAKE_LOCK_FILE="+e.lockFile,
 		"FAKE_LOCK_BACKUP_DIR="+e.lockBackupDir,
