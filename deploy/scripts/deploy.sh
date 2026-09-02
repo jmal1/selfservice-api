@@ -1729,12 +1729,12 @@ pause_live_provisioning_claims() {
 # (2026-08-25 -> 2026-08-28) while every workload reported healthy, because a
 # worker that claims nothing is indistinguishable from an idle one.
 #
-# The restored value is the observed PRE-DEPLOY LIVE state, deliberately not the
-# rendered chart value: validate_foundation_intent, verify_rollback_containment,
-# and the baseline check all REQUIRE the rendered candidate to be claims=false
-# so every rollback target is uniformly claims-disabled. Claims are therefore
-# enabled operationally on the live Deployment, never through the chart, and
-# reading intent from the manifest would resume nothing at all.
+# The restored value is the observed PRE-DEPLOY LIVE state, not a hard-coded
+# true. validate_foundation_intent now requires the rendered reopened contract
+# (claims=true in values.prod.yaml), but the live Deployment is still paused to
+# false for the guarded apply window. Resume must therefore restore whatever
+# claims state was live before the pause — typically true after a reopened
+# deploy, or false when the operator had already quiesced claims.
 #
 # EXIT cleanup owns the resume after any successful live pause mutation. This
 # covers normal success, set -e failures, contained Helm failures, comparator
@@ -1860,7 +1860,7 @@ verify_rollback_containment() {
     return 1
   fi
   VERIFIED_BASELINE_REVISION=$revision
-  echo "==> rollback containment verified: deployed revision $revision pins every rendered workload image, keeps claims false with one worker, and matches healthy live workloads"
+  echo "==> rollback containment verified: deployed revision $revision pins every rendered workload image, keeps reopened foundation claims with one worker, and matches healthy live workloads"
 }
 
 required_migration_version() {
@@ -2967,10 +2967,18 @@ validate_upgrade_hooks() {
   fi
 }
 
+# validate_foundation_intent asserts the reopened production contract from
+# values.prod.yaml: admission and worker claims on, synthetic provisioning
+# expected on, content-filter still off, and exactly one worker. Lifecycle is
+# optional at call sites that already compare it separately (candidate apply
+# skips it; prepare-claims-baseline still requires the explicit true).
+# expected_claims defaults to true for rendered chart/candidate manifests.
+# Pass false when checking the live pause window during rollback containment.
 validate_foundation_intent() {
   local manifest=$1
   local validate_replicas=${2:-true}
   local validate_synthetic_lifecycle=${3:-true}
+  local expected_claims=${4:-true}
   local provisioning_enabled claims content_enabled content_feed synthetic_expected synthetic_feed synthetic_lifecycle worker_replicas
   local synthetic_provisioning_expected
   provisioning_enabled="$(env_from_manifest PROVISIONING_ENABLED < "$manifest")"
@@ -2981,12 +2989,12 @@ validate_foundation_intent() {
   synthetic_provisioning_expected="$(env_from_manifest SYNTHETIC_PROVISIONING_EXPECTED_ENABLED < "$manifest")"
   synthetic_feed="$(env_from_manifest SYNTHETIC_CONTENT_FILTER_CATEGORY_FEED_BASE_URL < "$manifest")"
   synthetic_lifecycle="$(env_from_manifest SYNTHETIC_LIFECYCLE_ENABLED < "$manifest")"
-  if [ "$provisioning_enabled" != "false" ]; then
-    echo "ERROR: candidate renders PROVISIONING_ENABLED=$provisioning_enabled, not false." >&2
+  if [ "$provisioning_enabled" != "true" ]; then
+    echo "ERROR: candidate renders PROVISIONING_ENABLED=$provisioning_enabled, not true." >&2
     return 1
   fi
-  if [ "$claims" != "false" ]; then
-    echo "ERROR: candidate renders worker provisioning claims as $claims, not false." >&2
+  if [ "$claims" != "$expected_claims" ]; then
+    echo "ERROR: candidate renders worker provisioning claims as $claims, not $expected_claims." >&2
     return 1
   fi
   if [ "$content_enabled" != "false" ] || [ -n "$content_feed" ]; then
@@ -2997,12 +3005,12 @@ validate_foundation_intent() {
     echo "ERROR: candidate synthetic content-filter intent must remain false with an empty category feed." >&2
     return 1
   fi
-  if [ "$synthetic_provisioning_expected" != "false" ]; then
-    echo "ERROR: candidate must keep SYNTHETIC_PROVISIONING_EXPECTED_ENABLED=false." >&2
+  if [ "$synthetic_provisioning_expected" != "true" ]; then
+    echo "ERROR: candidate must keep SYNTHETIC_PROVISIONING_EXPECTED_ENABLED=true." >&2
     return 1
   fi
-  if [ "$validate_synthetic_lifecycle" = true ] && [ "$synthetic_lifecycle" != "false" ]; then
-    echo "ERROR: candidate must keep SYNTHETIC_LIFECYCLE_ENABLED=false." >&2
+  if [ "$validate_synthetic_lifecycle" = true ] && [ "$synthetic_lifecycle" != "true" ]; then
+    echo "ERROR: candidate must keep SYNTHETIC_LIFECYCLE_ENABLED=true." >&2
     return 1
   fi
   if [ "$validate_replicas" = true ]; then
@@ -3584,12 +3592,12 @@ validate_pinned_manifest() {
     return 1
   fi
   claims="$(claims_from_manifest < "$manifest")"
-  if [ "$claims" != "false" ]; then
-    echo "ERROR: baseline renders worker provisioning claims as $claims, not false." >&2
+  if [ "$claims" != "true" ]; then
+    echo "ERROR: baseline renders worker provisioning claims as $claims, not true." >&2
     return 1
   fi
   if ! validate_foundation_intent "$manifest"; then
-    echo "ERROR: prepared baseline changes the claims/content-filter foundation intent." >&2
+    echo "ERROR: prepared baseline changes the reopened production foundation intent." >&2
     return 1
   fi
   if ! validate_synthetic_monitor_active "$manifest"; then
@@ -3772,8 +3780,8 @@ verify_manifest_and_live() {
   done < "$inventory"
 
   rendered_claims="$(claims_from_manifest < "$manifest")"
-  if [ "$rendered_claims" != "false" ]; then
-    echo "ERROR: current Helm revision (the rollback target) renders worker provisioning claims as $rendered_claims, not false." >&2
+  if [ "$rendered_claims" != "true" ]; then
+    echo "ERROR: current Helm revision (the rollback target) renders worker provisioning claims as $rendered_claims, not true." >&2
     rm -rf "$tmp_dir"
     return 1
   fi
@@ -3790,7 +3798,7 @@ verify_manifest_and_live() {
     return 1
   fi
   if ! validate_foundation_intent "$manifest" true false; then
-    echo "ERROR: current Helm rollback target changes the claims/content-filter foundation intent." >&2
+    echo "ERROR: current Helm rollback target changes the reopened production foundation intent." >&2
     rm -rf "$tmp_dir"
     return 1
   fi
@@ -3869,8 +3877,15 @@ verify_manifest_and_live() {
     rm -rf "$tmp_dir"
     return 1
   fi
-  if [ "$live_claims" != "false" ] || [ "$live_replicas" != "1" ]; then
-    echo "ERROR: live worker must have claims=false and replicas=1; got claims=$live_claims replicas=$live_replicas." >&2
+  if [ "$live_replicas" != "1" ]; then
+    echo "ERROR: live worker must have replicas=1; got claims=$live_claims replicas=$live_replicas." >&2
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  # Allow paused claims=false during a guarded apply, or steady-state claims that
+  # already match the reopened rendered chart (claims=true).
+  if [ "$live_claims" != "false" ] && [ "$live_claims" != "$rendered_claims" ]; then
+    echo "ERROR: live worker claims=$live_claims; want false (paused) or matching rendered $rendered_claims." >&2
     rm -rf "$tmp_dir"
     return 1
   fi
@@ -3882,8 +3897,9 @@ verify_manifest_and_live() {
     rm -rf "$tmp_dir"
     return 1
   fi
-  if ! validate_foundation_intent "$tmp_dir/live-foundation.yaml" false false; then
-    echo "ERROR: live rollback workloads change the claims/content-filter foundation intent." >&2
+  # Live may be paused (claims=false) or already match the reopened chart.
+  if ! validate_foundation_intent "$tmp_dir/live-foundation.yaml" false false "$live_claims"; then
+    echo "ERROR: live rollback workloads change the reopened production foundation intent." >&2
     rm -rf "$tmp_dir"
     return 1
   fi
@@ -3966,16 +3982,18 @@ prepare_claims_baseline() {
 
   local tmp_dir live_values candidate_unpinned candidate_manifest candidate_inventory
   local desired_map declared_map live_dir comparison_manifest
+  # Pin the reopened production foundation while still forcing clone-producing
+  # CronJobs off for the baseline comparison. Content-filter stays disabled.
   local -a baseline_overrides=(
-    --set provisioning.enabled=false
-    --set provisioning.workerClaimsEnabled=false
+    --set provisioning.enabled=true
+    --set provisioning.workerClaimsEnabled=true
     --set worker.contentFilter.enabled=false
     --set-string worker.contentFilter.categoryFeedBaseURL=
-    --set synthetic.provisioningExpectedEnabled=false
+    --set synthetic.provisioningExpectedEnabled=true
     --set synthetic.suspend=false
     --set synthetic.janitor.suspend=true
     --set synthetic.runner.suspend=true
-    --set synthetic.lifecycle.enabled=false
+    --set synthetic.lifecycle.enabled=true
     --set replicaCount.worker=1
   )
   tmp_dir="$(mktemp -d)"
@@ -4047,7 +4065,7 @@ prepare_claims_baseline() {
     if [ "$live_spec" != "$desired_spec" ]; then
       printf '%s\n' "$live_spec" > "$tmp_dir/${kind}-${name}.live-spec"
       printf '%s\n' "$desired_spec" > "$tmp_dir/${kind}-${name}.desired-spec"
-      echo "ERROR: live $kind/$name spec drifts from the server-defaulted safe chart beyond image pinning, claims=false, and its proven rollout annotation." >&2
+      echo "ERROR: live $kind/$name spec drifts from the server-defaulted safe chart beyond image pinning, reopened foundation claims, and its proven rollout annotation." >&2
       diff -u "$tmp_dir/${kind}-${name}.live-spec" "$tmp_dir/${kind}-${name}.desired-spec" | head -300 >&2 || true
       return 1
     fi
@@ -4056,7 +4074,7 @@ prepare_claims_baseline() {
   workload_health "$candidate_inventory"
   require_clean_migration "$migration_before"
 
-  echo "==> creating claims-disabled Helm baseline with every rendered workload and RUNNER_IMAGE pinned to live effective digests"
+  echo "==> creating reopened-foundation Helm baseline with every rendered workload and RUNNER_IMAGE pinned to live effective digests"
   HELM_RELEASE_LOCK_PRESERVE=true
   if ! BASELINE_IMAGE_MAP="$desired_map" BASELINE_RUNNER_IMAGE="$BASELINE_RUNNER_IMAGE" \
       helm upgrade "$RELEASE" "$BASELINE_CHART_DIR" \

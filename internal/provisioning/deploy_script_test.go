@@ -49,7 +49,7 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 	}{
 		{
 			name:              "pending latest revision",
-			manifest:          baselineManifest(true, "", "false"),
+			manifest:          baselineManifest(true, "", "true"),
 			helmStatus:        "pending-upgrade",
 			args:              []string{"--verify-rollback-containment"},
 			wantOutput:        "status is pending-upgrade",
@@ -57,7 +57,7 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 		},
 		{
 			name:              "live worker status replicas ignored",
-			manifest:          baselineManifest(true, "", "false"),
+			manifest:          baselineManifest(true, "", "true"),
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
 			wantSuccess:       true,
@@ -82,7 +82,7 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 		},
 		{
 			name:              "non-worker floating image",
-			manifest:          baselineManifest(true, "api-gateway", "false"),
+			manifest:          baselineManifest(true, "api-gateway", "true"),
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
 			wantOutput:        "mutable or non-sha256 image",
@@ -90,7 +90,7 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 		},
 		{
 			name:              "missing image inventory",
-			manifest:          baselineManifest(false, "", "false"),
+			manifest:          baselineManifest(false, "", "true"),
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
 			wantOutput:        "missing image inventory",
@@ -98,7 +98,7 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 		},
 		{
 			name:              "effective digest mismatch",
-			manifest:          baselineManifest(true, "", "false"),
+			manifest:          baselineManifest(true, "", "true"),
 			helmStatus:        "deployed",
 			mismatchContainer: "api-gateway",
 			args:              []string{"--verify-rollback-containment"},
@@ -106,17 +106,17 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			configureRevision: baselineRevision + 1,
 		},
 		{
-			name:              "claims enabled rollback target",
-			manifest:          baselineManifest(true, "", "true"),
+			name:              "claims disabled rollback target",
+			manifest:          baselineManifest(true, "", "false"),
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
-			wantOutput:        "renders worker provisioning claims",
+			wantOutput:        "not true",
 			configureRevision: baselineRevision + 1,
 		},
 		{
 			name: "content filter enabled rollback target",
 			manifest: replaceEnvValue(
-				baselineManifest(true, "", "false"),
+				baselineManifest(true, "", "true"),
 				"WORKER_CONTENT_FILTER_ENABLED",
 				"false",
 				"true",
@@ -129,7 +129,7 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 		{
 			name: "content filter feed in rollback target",
 			manifest: replaceEnvValue(
-				baselineManifest(true, "", "false"),
+				baselineManifest(true, "", "true"),
 				"WORKER_CONTENT_FILTER_CATEGORY_FEED_BASE_URL",
 				"",
 				"https://student-filter-feed.lab.jmal.io",
@@ -141,7 +141,7 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 		},
 		{
 			name:              "live API monitor suspended",
-			manifest:          replaceSyntheticSuspend(baselineManifest(true, "", "false"), true),
+			manifest:          replaceSyntheticSuspend(baselineManifest(true, "", "true"), true),
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
 			wantOutput:        "API monitor",
@@ -149,12 +149,7 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 		},
 		{
 			name: "matching enabled API monitor lifecycle",
-			manifest: replaceEnvValue(
-				baselineManifest(true, "", "false"),
-				"SYNTHETIC_LIFECYCLE_ENABLED",
-				"false",
-				"true",
-			),
+			manifest:          baselineManifest(true, "", "true"),
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
 			wantSuccess:       true,
@@ -163,27 +158,27 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 		},
 		{
 			name: "live API monitor lifecycle differs from rollback target",
-			manifest: replaceEnvValue(
-				baselineManifest(true, "", "false"),
+			manifest: baselineManifest(true, "", "true"),
+			liveResource: replaceEnvValue(
+				baselineManifest(true, "", "true"),
 				"SYNTHETIC_LIFECYCLE_ENABLED",
-				"false",
 				"true",
+				"false",
 			),
-			liveResource:      baselineManifest(true, "", "false"),
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
 			wantOutput:        "live SYNTHETIC_LIFECYCLE_ENABLED=false differs from the Helm rollback target value true",
 			configureRevision: baselineRevision + 1,
 		},
 		{
-			name:     "live API monitor lifecycle enabled outside rollback target",
-			manifest: baselineManifest(true, "", "false"),
-			liveResource: replaceEnvValue(
-				baselineManifest(true, "", "false"),
+			name: "live API monitor lifecycle enabled outside rollback target",
+			manifest: replaceEnvValue(
+				baselineManifest(true, "", "true"),
 				"SYNTHETIC_LIFECYCLE_ENABLED",
-				"false",
 				"true",
+				"false",
 			),
+			liveResource:      baselineManifest(true, "", "true"),
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
 			wantOutput:        "live SYNTHETIC_LIFECYCLE_ENABLED=true differs from the Helm rollback target value false",
@@ -191,7 +186,7 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 		},
 		{
 			name:              "failed latest revision",
-			manifest:          baselineManifest(true, "", "false"),
+			manifest:          baselineManifest(true, "", "true"),
 			helmStatus:        "failed",
 			args:              []string{"--verify-rollback-containment"},
 			wantOutput:        "status is failed",
@@ -677,7 +672,7 @@ func TestDeployScriptRollbackContainmentFinalRevisionFence(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			manifest := baselineManifest(true, "", "false")
+			manifest := baselineManifest(true, "", "true")
 			env := newDeployScriptEnvironment(t, manifest, manifest)
 			env.helmRevision = baselineRevision
 			env.postLiveHelmRevision = test.finalRevision
@@ -721,7 +716,7 @@ func TestDeployScriptRollbackContainmentFinalRevisionFenceLoadBearing(t *testing
 	writeExecutable(t, sabotagedPath, sabotagedBody)
 	t.Cleanup(func() { os.Remove(sabotagedPath) })
 
-	manifest := baselineManifest(true, "", "false")
+	manifest := baselineManifest(true, "", "true")
 	env := newDeployScriptEnvironment(t, manifest, manifest)
 	env.helmRevision = baselineRevision
 	env.postLiveHelmRevision = baselineRevision + 1
@@ -766,7 +761,7 @@ func TestDeployScriptRollbackContainmentFinalRevisionReadStatusLoadBearing(t *te
 	writeExecutable(t, sabotagedPath, sabotagedBody)
 	t.Cleanup(func() { os.Remove(sabotagedPath) })
 
-	manifest := baselineManifest(true, "", "false")
+	manifest := baselineManifest(true, "", "true")
 	env := newDeployScriptEnvironment(t, manifest, manifest)
 	env.helmRevision = baselineRevision
 	env.postLiveHelmHistoryExit = 7
@@ -784,7 +779,7 @@ func TestDeployScriptRollbackContainmentFinalRevisionReadStatusLoadBearing(t *te
 func TestDeployScriptImmutableCandidate(t *testing.T) {
 	requirePOSIXShell(t)
 
-	live := baselineManifest(true, "", "false")
+	live := baselineManifest(true, "", "true")
 	for _, test := range []struct {
 		name              string
 		transform         func(string) string
@@ -796,7 +791,7 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 	}{
 		{
 			name:              "exact candidate apply",
-			transform:         func(manifest string) string { return baselineManifest(true, "*", "false") },
+			transform:         func(manifest string) string { return baselineManifest(true, "*", "true") },
 			wantSuccess:       true,
 			wantOutput:        "deployed exact source",
 			wantUpgrade:       true,
@@ -804,7 +799,7 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 		},
 		{
 			name:      "raw Buildx record artifact",
-			transform: func(manifest string) string { return baselineManifest(true, "*", "false") },
+			transform: func(manifest string) string { return baselineManifest(true, "*", "true") },
 			configure: func(env *deployScriptEnvironment) {
 				env.uiBuildRecordRaw = true
 			},
@@ -816,11 +811,11 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 		{
 			name: "canonicalizes Docker Hub aliases",
 			transform: func(manifest string) string {
-				return replaceExtraRepository(baselineManifest(true, "*", "false"), "busybox")
+				return replaceExtraRepository(baselineManifest(true, "*", "true"), "busybox")
 			},
 			configure: func(env *deployScriptEnvironment) {
 				qualified := replaceExtraRepository(
-					baselineManifest(true, "", "false"),
+					baselineManifest(true, "", "true"),
 					"docker.io/library/busybox",
 				)
 				writeFile(t, env.liveManifest, qualified)
@@ -834,7 +829,7 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 		},
 		{
 			name:      "pauses temporary live claims override",
-			transform: func(manifest string) string { return baselineManifest(true, "*", "false") },
+			transform: func(manifest string) string { return baselineManifest(true, "*", "true") },
 			configure: func(env *deployScriptEnvironment) {
 				writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
 			},
@@ -845,7 +840,7 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 		},
 		{
 			name:      "active durable job blocks upgrade",
-			transform: func(manifest string) string { return baselineManifest(true, "*", "false") },
+			transform: func(manifest string) string { return baselineManifest(true, "*", "true") },
 			configure: func(env *deployScriptEnvironment) {
 				env.activeJobs = 1
 			},
@@ -854,7 +849,7 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 		},
 		{
 			name:      "active Kubernetes job blocks upgrade",
-			transform: func(manifest string) string { return baselineManifest(true, "*", "false") },
+			transform: func(manifest string) string { return baselineManifest(true, "*", "true") },
 			configure: func(env *deployScriptEnvironment) {
 				env.activeKubernetesJobs = 1
 			},
@@ -863,21 +858,21 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 		},
 		{
 			name:        "floating package tag",
-			transform:   func(manifest string) string { return baselineManifest(true, "*", "false") },
+			transform:   func(manifest string) string { return baselineManifest(true, "*", "true") },
 			configure:   func(env *deployScriptEnvironment) { env.packageTag = "latest" },
 			wantOutput:  "full source commit",
 			wantUpgrade: false,
 		},
 		{
 			name:        "digest belongs to another commit",
-			transform:   func(manifest string) string { return baselineManifest(true, "*", "false") },
+			transform:   func(manifest string) string { return baselineManifest(true, "*", "true") },
 			configure:   func(env *deployScriptEnvironment) { env.packageTag = otherSourceSHA },
 			wantOutput:  "full source commit",
 			wantUpgrade: false,
 		},
 		{
 			name:      "digest revision belongs to another commit",
-			transform: func(manifest string) string { return baselineManifest(true, "*", "false") },
+			transform: func(manifest string) string { return baselineManifest(true, "*", "true") },
 			configure: func(env *deployScriptEnvironment) {
 				env.imageRevision = otherSourceSHA
 			},
@@ -886,7 +881,7 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 		},
 		{
 			name:      "digest differs from workflow artifact",
-			transform: func(manifest string) string { return baselineManifest(true, "*", "false") },
+			transform: func(manifest string) string { return baselineManifest(true, "*", "true") },
 			configure: func(env *deployScriptEnvironment) {
 				env.runArtifactDigest = testDigestA
 			},
@@ -895,7 +890,7 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 		},
 		{
 			name:      "digest has conflicting commit tag",
-			transform: func(manifest string) string { return baselineManifest(true, "*", "false") },
+			transform: func(manifest string) string { return baselineManifest(true, "*", "true") },
 			configure: func(env *deployScriptEnvironment) {
 				env.packageAdditionalTag = otherSourceSHA
 			},
@@ -904,7 +899,7 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 		},
 		{
 			name:      "unverified UI commit",
-			transform: func(manifest string) string { return baselineManifest(true, "*", "false") },
+			transform: func(manifest string) string { return baselineManifest(true, "*", "true") },
 			configure: func(env *deployScriptEnvironment) {
 				env.uiCommitVerified = false
 			},
@@ -913,7 +908,7 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 		},
 		{
 			name:      "missing UI run artifact",
-			transform: func(manifest string) string { return baselineManifest(true, "*", "false") },
+			transform: func(manifest string) string { return baselineManifest(true, "*", "true") },
 			configure: func(env *deployScriptEnvironment) {
 				env.uiBuildRecordMissing = true
 			},
@@ -922,7 +917,7 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 		},
 		{
 			name:      "UI artifact belongs to another commit",
-			transform: func(manifest string) string { return baselineManifest(true, "*", "false") },
+			transform: func(manifest string) string { return baselineManifest(true, "*", "true") },
 			configure: func(env *deployScriptEnvironment) {
 				env.uiArtifactSHA = otherSourceSHA
 			},
@@ -931,7 +926,7 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 		},
 		{
 			name:      "UI OCI revision belongs to another commit",
-			transform: func(manifest string) string { return baselineManifest(true, "*", "false") },
+			transform: func(manifest string) string { return baselineManifest(true, "*", "true") },
 			configure: func(env *deployScriptEnvironment) {
 				env.uiImageRevision = otherSourceSHA
 			},
@@ -940,7 +935,7 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 		},
 		{
 			name:      "external live image drifts",
-			transform: func(manifest string) string { return baselineManifest(true, "*", "false") },
+			transform: func(manifest string) string { return baselineManifest(true, "*", "true") },
 			configure: func(env *deployScriptEnvironment) {
 				env.externalDriftAfterServerDryRun = true
 			},
@@ -949,7 +944,7 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 		},
 		{
 			name:      "final server dry run fails",
-			transform: func(manifest string) string { return baselineManifest(true, "*", "false") },
+			transform: func(manifest string) string { return baselineManifest(true, "*", "true") },
 			configure: func(env *deployScriptEnvironment) {
 				env.failFinalServerDryRun = true
 			},
@@ -958,7 +953,7 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 		},
 		{
 			name:      "final server object mutation",
-			transform: func(manifest string) string { return baselineManifest(true, "*", "false") },
+			transform: func(manifest string) string { return baselineManifest(true, "*", "true") },
 			configure: func(env *deployScriptEnvironment) {
 				env.mutateFinalServerObject = true
 			},
@@ -967,7 +962,7 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 		},
 		{
 			name:      "floating upgrade-only hook",
-			transform: func(manifest string) string { return baselineManifest(true, "*", "false") },
+			transform: func(manifest string) string { return baselineManifest(true, "*", "true") },
 			configure: func(env *deployScriptEnvironment) {
 				writeFile(t, env.upgradeHookManifest, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway:latest"))
 			},
@@ -978,20 +973,20 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 			name: "claims intent changed",
 			transform: func(manifest string) string {
 				return replaceEnvValue(
-					baselineManifest(true, "*", "false"),
+					baselineManifest(true, "*", "true"),
 					"WORKER_PROVISIONING_CLAIMS_ENABLED",
-					"false",
 					"true",
+					"false",
 				)
 			},
-			wantOutput:  "provisioning claims",
+			wantOutput:  "not true",
 			wantUpgrade: false,
 		},
 		{
 			name: "content filter intent changed",
 			transform: func(manifest string) string {
 				return replaceEnvValue(
-					baselineManifest(true, "*", "false"),
+					baselineManifest(true, "*", "true"),
 					"WORKER_CONTENT_FILTER_ENABLED",
 					"false",
 					"true",
@@ -1004,7 +999,7 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 			name: "content filter feed changed",
 			transform: func(manifest string) string {
 				return replaceEnvValue(
-					baselineManifest(true, "*", "false"),
+					baselineManifest(true, "*", "true"),
 					"WORKER_CONTENT_FILTER_CATEGORY_FEED_BASE_URL",
 					"",
 					"https://student-filter-feed.lab.jmal.io",
@@ -1027,7 +1022,7 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 				return replaceEnvValue(
 					manifest,
 					"SYNTHETIC_LIFECYCLE_ENABLED",
-					"false",
+					"true",
 					"true",
 				)
 			},
@@ -1136,10 +1131,10 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 
 func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 	requirePOSIXShell(t)
-	live := baselineManifest(true, "", "false")
+	live := baselineManifest(true, "", "true")
 	t.Run("successful upgrade accepts intended janitor TTL deletion", func(t *testing.T) {
 		candidate := rollbackManifestWithHistoricalSynthetics(true)
-		liveWithHistoricalSynthetics := baselineManifest(true, "", "false") +
+		liveWithHistoricalSynthetics := baselineManifest(true, "", "true") +
 			historicalSyntheticCronJobs(true)
 		liveWithJanitorTTL := strings.Replace(
 			liveWithHistoricalSynthetics,
@@ -1254,7 +1249,7 @@ func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "false"))
+			env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "true"))
 			test.configure(env)
 			output, err := env.run("--no-pull")
 			if err == nil {
@@ -1292,8 +1287,8 @@ func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 
 func TestDeployScriptPostUpgradeActiveJobContainment(t *testing.T) {
 	requirePOSIXShell(t)
-	live := baselineManifest(true, "", "false")
-	candidate := baselineManifest(true, "*", "false")
+	live := baselineManifest(true, "", "true")
+	candidate := baselineManifest(true, "*", "true")
 
 	t.Run("contained API monitor is permitted", func(t *testing.T) {
 		env := newDeployScriptEnvironment(t, live, candidate)
@@ -1369,8 +1364,8 @@ func TestDeployScriptPostUpgradeActiveJobGuardIsLoadBearing(t *testing.T) {
 	writeExecutable(t, sabotagedPath, sabotagedBody)
 	t.Cleanup(func() { os.Remove(sabotagedPath) })
 
-	live := baselineManifest(true, "", "false")
-	env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "false"))
+	live := baselineManifest(true, "", "true")
+	env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "true"))
 	env.postUpgradeActiveKubernetesJob = "provisioning"
 	env.scriptPath = sabotagedPath
 
@@ -1396,7 +1391,7 @@ func TestDeployScriptCandidateCronJobsHonorSuspensionBeforeJobCreation(t *testin
 	writeFile(t, env.liveResource, replaceEnvValue(
 		live,
 		"WORKER_PROVISIONING_CLAIMS_ENABLED",
-		"false",
+		"true",
 		"true",
 	))
 	env.noRetainedJanitorJob = true
@@ -1466,11 +1461,11 @@ func TestDeployScriptCandidateCronJobsHonorSuspensionBeforeJobCreation(t *testin
 	if got := manifestEnvValue(t, string(applied), "SYNTHETIC_LIFECYCLE_ENABLED"); got != "false" {
 		t.Fatalf("candidate CronJob lifecycle = %q, want false", got)
 	}
-	if got := manifestEnvValue(t, string(applied), "PROVISIONING_ENABLED"); got != "false" {
-		t.Fatalf("candidate API provisioning enabled = %q, want false", got)
+	if got := manifestEnvValue(t, string(applied), "PROVISIONING_ENABLED"); got != "true" {
+		t.Fatalf("candidate API provisioning enabled = %q, want true", got)
 	}
-	if got := manifestEnvValue(t, string(applied), "SYNTHETIC_PROVISIONING_EXPECTED_ENABLED"); got != "false" {
-		t.Fatalf("candidate CronJob provisioning expectation = %q, want false", got)
+	if got := manifestEnvValue(t, string(applied), "SYNTHETIC_PROVISIONING_EXPECTED_ENABLED"); got != "true" {
+		t.Fatalf("candidate CronJob provisioning expectation = %q, want true", got)
 	}
 }
 
@@ -1501,13 +1496,8 @@ func TestDeployScriptCandidateCronJobLifecycleOverrideIsLoadBearing(t *testing.T
 		t.Fatal(err)
 	}
 
-	live := baselineManifest(true, "", "false")
-	candidate := replaceEnvValue(
-		baselineManifest(true, "*", "false"),
-		"SYNTHETIC_LIFECYCLE_ENABLED",
-		"false",
-		"true",
-	)
+	live := baselineManifest(true, "", "true")
+	candidate := baselineManifest(true, "*", "true")
 	env := newDeployScriptEnvironment(t, live, candidate)
 	writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
 	env.scriptPath = scriptPath
@@ -1538,22 +1528,21 @@ func TestDeployScriptCandidateCronJobLifecycleOverrideIsLoadBearing(t *testing.T
 // every workload reported healthy, which is exactly why a green deploy is not
 // sufficient evidence on its own.
 //
-// The restored value must come from the observed pre-deploy LIVE state, not the
-// rendered chart: validate_foundation_intent and the rollback-containment gates
-// all require the candidate to render claims=false, so claims are only ever
-// enabled operationally on the live Deployment.
+// The restored value must come from the observed pre-deploy LIVE state. The
+// rendered reopened chart also has claims=true, but resume still keys off the
+// pre-pause live value so a deliberately quiesced cluster stays paused.
 //
 // The assertion is behavioral, not textual: it runs the real deploy.sh against
 // the fake kubectl and inspects the resulting live claims state.
 func TestDeployScriptResumesProvisioningClaimsAfterSuccessfulDeploy(t *testing.T) {
 	requirePOSIXShell(t)
-	candidate := baselineManifest(true, "*", "false")
+	candidate := baselineManifest(true, "*", "true")
 
 	t.Run("restores claims that were live before the deploy", func(t *testing.T) {
-		env := newDeployScriptEnvironment(t, baselineManifest(true, "", "false"), candidate)
-		// Claims are enabled operationally on the live Deployment only; the
-		// rendered/rollback manifests must stay claims=false, which is exactly
-		// why the resume cannot read its intent from the chart.
+		env := newDeployScriptEnvironment(t, baselineManifest(true, "", "true"), candidate)
+		// Claims are enabled on the live Deployment before the deploy; pause
+		// forces false for the guarded window. A reopened chart may restore
+		// claims via helm, making EXIT resume a no-op already-match path.
 		writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
 
 		output, err := env.run("--no-pull")
@@ -1561,17 +1550,22 @@ func TestDeployScriptResumesProvisioningClaimsAfterSuccessfulDeploy(t *testing.T
 			t.Fatalf("successful deploy failed: %v\n%s", err, output)
 		}
 		if _, statErr := os.Stat(env.claimsResumedMark); statErr != nil {
-			t.Fatalf("successful deploy never restored provisioning claims; the worker would claim no jobs: %v\n%s", statErr, output)
+			if !strings.Contains(string(output), "already match the pre-deploy state; no restore mutation needed") {
+				t.Fatalf("successful deploy never restored provisioning claims; the worker would claim no jobs: %v\n%s", statErr, output)
+			}
 		}
-		if !strings.Contains(string(output), "restoring live worker provisioning claims") {
+		if !strings.Contains(string(output), "restoring live worker provisioning claims") &&
+			!strings.Contains(string(output), "already match the pre-deploy state; no restore mutation needed") {
 			t.Fatalf("output %q does not report the claims restore", output)
 		}
 	})
 
 	t.Run("leaves claims paused when they were already paused", func(t *testing.T) {
 		// A deploy must not turn provisioning on for a cluster that was
-		// deliberately quiesced before the deploy started.
-		env := newDeployScriptEnvironment(t, baselineManifest(true, "", "false"), candidate)
+		// deliberately quiesced before the deploy started. Rendered chart
+		// claims stay true; only the live Deployment starts paused.
+		env := newDeployScriptEnvironment(t, baselineManifest(true, "", "true"), candidate)
+		writeFile(t, env.liveResource, baselineManifest(true, "", "false"))
 
 		output, err := env.run("--no-pull")
 		if err != nil {
@@ -1587,8 +1581,8 @@ func TestDeployScriptPreflightFailureCannotMutate(t *testing.T) {
 	requirePOSIXShell(t)
 	env := newDeployScriptEnvironment(
 		t,
-		baselineManifest(true, "", "false"),
-		baselineManifest(true, "*", "false"),
+		baselineManifest(true, "", "true"),
+		baselineManifest(true, "*", "true"),
 	)
 	env.migrationState = "1:37:true"
 
@@ -1779,8 +1773,8 @@ func TestDeployScriptReleasePreflightGuards(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			env := newDeployScriptEnvironment(
 				t,
-				baselineManifest(true, "", "false"),
-				baselineManifest(true, "*", "false"),
+				baselineManifest(true, "", "true"),
+				baselineManifest(true, "*", "true"),
 			)
 			if test.configure != nil {
 				test.configure(env)
@@ -1846,8 +1840,8 @@ func TestDeployScriptVolatileReleasePreflightBlocksLateRegressions(t *testing.T)
 		t.Run(test.name, func(t *testing.T) {
 			env := newDeployScriptEnvironment(
 				t,
-				baselineManifest(true, "", "false"),
-				baselineManifest(true, "*", "false"),
+				baselineManifest(true, "", "true"),
+				baselineManifest(true, "*", "true"),
 			)
 			writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
 			test.configure(env)
@@ -1922,8 +1916,8 @@ echo "==> helm upgrade $RELEASE with exact digest-pinned candidate (atomic, time
 
 			env := newDeployScriptEnvironment(
 				t,
-				baselineManifest(true, "", "false"),
-				baselineManifest(true, "*", "false"),
+				baselineManifest(true, "", "true"),
+				baselineManifest(true, "*", "true"),
 			)
 			writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
 			env.scriptPath = scriptPath
@@ -1937,7 +1931,9 @@ echo "==> helm upgrade $RELEASE with exact digest-pinned candidate (atomic, time
 				t.Fatalf("removing final %s did not reach Helm mutation: %v\n%s", test.name, statErr, output)
 			}
 			if _, statErr := os.Stat(env.claimsResumedMark); statErr != nil {
-				t.Fatalf("sabotaged successful deploy did not restore claims: %v\n%s", statErr, output)
+				if !strings.Contains(string(output), "already match the pre-deploy state; no restore mutation needed") {
+					t.Fatalf("sabotaged successful deploy did not restore claims: %v\n%s", statErr, output)
+				}
 			}
 		})
 	}
@@ -1993,7 +1989,7 @@ func TestDeployScriptReleasePreflightPredicatesAreLoadBearing(t *testing.T) {
 			writeExecutable(t, scriptPath, mutated)
 			t.Cleanup(func() { os.Remove(scriptPath) })
 
-			env := newDeployScriptEnvironment(t, baselineManifest(true, "", "false"), baselineManifest(true, "*", "false"))
+			env := newDeployScriptEnvironment(t, baselineManifest(true, "", "true"), baselineManifest(true, "*", "true"))
 			writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
 			env.scriptPath = scriptPath
 			test.configure(env)
@@ -2056,7 +2052,7 @@ func TestDeployScriptSyntheticQuotaIdentityIsLoadBearing(t *testing.T) {
 			writeExecutable(t, scriptPath, mutated)
 			t.Cleanup(func() { os.Remove(scriptPath) })
 
-			env := newDeployScriptEnvironment(t, baselineManifest(true, "", "false"), baselineManifest(true, "*", "false"))
+			env := newDeployScriptEnvironment(t, baselineManifest(true, "", "true"), baselineManifest(true, "*", "true"))
 			env.scriptPath = scriptPath
 			output, runErr := env.run("--no-pull")
 			if runErr == nil || !strings.Contains(string(output), test.wantOutput) {
@@ -2084,7 +2080,7 @@ func TestDeployScriptMigrationContiguityIsLoadBearing(t *testing.T) {
 	writeExecutable(t, scriptPath, mutated)
 	t.Cleanup(func() { os.Remove(scriptPath) })
 
-	env := newDeployScriptEnvironment(t, baselineManifest(true, "", "false"), baselineManifest(true, "*", "false"))
+	env := newDeployScriptEnvironment(t, baselineManifest(true, "", "true"), baselineManifest(true, "*", "true"))
 	env.scriptPath = scriptPath
 	output, err := env.run("--no-pull")
 	if err == nil || !strings.Contains(string(output), "migrations are not contiguous") {
@@ -2110,7 +2106,7 @@ func TestDeployScriptMigrationPairingIsLoadBearing(t *testing.T) {
 	writeExecutable(t, scriptPath, mutated)
 	t.Cleanup(func() { os.Remove(scriptPath) })
 
-	env := newDeployScriptEnvironment(t, baselineManifest(true, "", "false"), baselineManifest(true, "*", "false"))
+	env := newDeployScriptEnvironment(t, baselineManifest(true, "", "true"), baselineManifest(true, "*", "true"))
 	env.scriptPath = scriptPath
 	output, err := env.run("--no-pull")
 	if err == nil || !strings.Contains(string(output), "must have exactly one up and one down file") {
@@ -2121,11 +2117,11 @@ func TestDeployScriptMigrationPairingIsLoadBearing(t *testing.T) {
 
 func TestDeployScriptRestoresProvisioningClaimsOnEveryPostPauseExit(t *testing.T) {
 	requirePOSIXShell(t)
-	candidate := baselineManifest(true, "*", "false")
+	candidate := baselineManifest(true, "*", "true")
 
 	newLiveClaimsEnvironment := func(t *testing.T) *deployScriptEnvironment {
 		t.Helper()
-		env := newDeployScriptEnvironment(t, baselineManifest(true, "", "false"), candidate)
+		env := newDeployScriptEnvironment(t, baselineManifest(true, "", "true"), candidate)
 		writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
 		return env
 	}
@@ -2145,8 +2141,13 @@ func TestDeployScriptRestoresProvisioningClaimsOnEveryPostPauseExit(t *testing.T
 		if _, err := os.Stat(env.claimsPausedMark); err != nil {
 			t.Fatalf("test never reached the real claims pause: %v\n%s", err, output)
 		}
+		// Reopened charts render claims=true, so helm upgrade often restores
+		// claims before EXIT resume runs. Accept either an explicit resume
+		// mutation or the no-op already-match path.
 		if _, err := os.Stat(env.claimsResumedMark); err != nil {
-			t.Fatalf("EXIT cleanup did not restore claims: %v\n%s", err, output)
+			if !strings.Contains(string(output), "already match the pre-deploy state; no restore mutation needed") {
+				t.Fatalf("EXIT cleanup did not restore claims: %v\n%s", err, output)
+			}
 		}
 	}
 
@@ -2199,20 +2200,21 @@ func TestDeployScriptRestoresProvisioningClaimsOnEveryPostPauseExit(t *testing.T
 	})
 
 	t.Run("resume failure after otherwise successful deploy", func(t *testing.T) {
+		// With the reopened chart rendering claims=true, helm upgrade restores
+		// claims before EXIT resume runs, so failClaimsResume cannot fire on the
+		// success path. Cover resume-mutation failure via the paused-still path
+		// below; here prove the already-match no-op still releases the lock.
 		env := newLiveClaimsEnvironment(t)
 		env.failClaimsResume = true
 		output, err := env.run("--no-pull")
-		if got := exitCode(t, err); got != 86 {
-			t.Fatalf("resume failure exit code = %d, want 86\n%s", got, output)
+		if err != nil {
+			t.Fatalf("successful deploy with chart-restored claims failed: %v\n%s", err, output)
 		}
-		if _, err := os.Stat(env.claimsResumedMark); !os.IsNotExist(err) {
-			t.Fatalf("failed resume wrote a success marker: %v\n%s", err, output)
+		if !strings.Contains(string(output), "already match the pre-deploy state; no restore mutation needed") {
+			t.Fatalf("expected chart-restored claims already-match path:\n%s", output)
 		}
-		if _, err := os.Stat(env.lockFile); err != nil {
-			t.Fatalf("resume failure did not preserve the lock: %v\n%s", err, output)
-		}
-		if !strings.Contains(string(output), "original exit code: 0, resume exit code: 86") {
-			t.Fatalf("resume failure did not log both statuses:\n%s", output)
+		if _, err := os.Stat(env.lockFile); !os.IsNotExist(err) {
+			t.Fatalf("chart-restored claims path did not release the lock: %v\n%s", err, output)
 		}
 	})
 
@@ -2341,8 +2343,8 @@ func TestDeployScriptClaimsExitRestorationIsLoadBearing(t *testing.T) {
 
 	env := newDeployScriptEnvironment(
 		t,
-		baselineManifest(true, "", "false"),
-		baselineManifest(true, "*", "false"),
+		baselineManifest(true, "", "true"),
+		baselineManifest(true, "*", "true"),
 	)
 	writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
 	env.activeJobs = 1
@@ -2361,8 +2363,8 @@ func TestDeployScriptClaimsExitRestorationIsLoadBearing(t *testing.T) {
 
 func TestDeployScriptDeployedCandidateWaitsForWarmerRolloutBeforeImageVerification(t *testing.T) {
 	requirePOSIXShell(t)
-	live := baselineManifest(true, "", "false")
-	candidate := baselineManifest(true, "*", "false")
+	live := baselineManifest(true, "", "true")
+	candidate := baselineManifest(true, "*", "true")
 
 	t.Run("succeeds after warmer rollout", func(t *testing.T) {
 		env := newDeployScriptEnvironment(t, live, candidate)
@@ -2495,8 +2497,8 @@ func TestDeployScriptDeployedCandidateOrderingIsLoadBearing(t *testing.T) {
 	}
 	t.Cleanup(func() { os.Remove(scriptPath) })
 
-	live := baselineManifest(true, "", "false")
-	candidate := baselineManifest(true, "*", "false")
+	live := baselineManifest(true, "", "true")
+	candidate := baselineManifest(true, "*", "true")
 	env := newDeployScriptEnvironment(t, live, candidate)
 	env.scriptPath = scriptPath
 	writeFile(t, env.upgradeHookManifest, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestB))
@@ -2580,8 +2582,8 @@ func TestDeployScriptWorkloadHealthRolloutFailureIsLoadBearing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	live := baselineManifest(true, "", "false")
-	candidate := baselineManifest(true, "*", "false")
+	live := baselineManifest(true, "", "true")
+	candidate := baselineManifest(true, "*", "true")
 
 	t.Run("rollout failure retains lock", func(t *testing.T) {
 		env := newDeployScriptEnvironment(t, live, candidate)
@@ -2648,8 +2650,8 @@ func TestDeployScriptFinalWorkloadHealthFenceIsLoadBearing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	live := baselineManifest(true, "", "false")
-	candidate := baselineManifest(true, "*", "false")
+	live := baselineManifest(true, "", "true")
+	candidate := baselineManifest(true, "*", "true")
 
 	t.Run("final health regression retains lock", func(t *testing.T) {
 		env := newDeployScriptEnvironment(t, live, candidate)
@@ -2706,7 +2708,7 @@ func TestDeployScriptFinalWorkloadHealthFenceIsLoadBearing(t *testing.T) {
 func TestDeployScriptRejectsUntrustedSource(t *testing.T) {
 	requirePOSIXShell(t)
 
-	live := baselineManifest(true, "", "false")
+	live := baselineManifest(true, "", "true")
 	for _, test := range []struct {
 		name       string
 		configure  func(*deployScriptEnvironment)
@@ -2749,7 +2751,7 @@ func TestDeployScriptRejectsUntrustedSource(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "false"))
+			env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "true"))
 			test.configure(env)
 			output, err := env.run("--no-pull")
 			if err == nil {
@@ -2767,7 +2769,7 @@ func TestDeployScriptRejectsUntrustedSource(t *testing.T) {
 
 func TestDeployScriptRequiresExplicitProvenUICandidate(t *testing.T) {
 	requirePOSIXShell(t)
-	live := baselineManifest(true, "", "false")
+	live := baselineManifest(true, "", "true")
 
 	for _, test := range []struct {
 		name       string
@@ -2786,7 +2788,7 @@ func TestDeployScriptRequiresExplicitProvenUICandidate(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "false"))
+			env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "true"))
 			output, err := env.runWithUI(false, test.args...)
 			if err == nil {
 				t.Fatalf("unproven UI candidate unexpectedly deployed:\n%s", output)
@@ -2803,8 +2805,8 @@ func TestDeployScriptRequiresExplicitProvenUICandidate(t *testing.T) {
 
 func TestDeployScriptDryRunPrintsFinalCandidate(t *testing.T) {
 	requirePOSIXShell(t)
-	live := baselineManifest(true, "", "false")
-	env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "false"))
+	live := baselineManifest(true, "", "true")
+	env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "true"))
 	writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
 	output, err := env.run("--no-pull", "--dry-run")
 	if err != nil {
@@ -2842,36 +2844,36 @@ func TestDeployScriptPreparesAllWorkloadBaseline(t *testing.T) {
 	}{
 		{
 			name:        "expected Helm ownership and deployment revision annotations ignored",
-			live:        withAPITopLevelRevisionAnnotation(baselineManifest(true, "*", "false")),
+			live:        withAPITopLevelRevisionAnnotation(baselineManifest(true, "*", "true")),
 			wantSuccess: true,
 			wantOutput:  "immutable all-workload baseline complete",
 		},
 		{
 			name:        "rollout annotation drift with digest equivalence",
-			live:        withAPIRolloutAnnotation(baselineManifest(true, "*", "false")),
+			live:        withAPIRolloutAnnotation(baselineManifest(true, "*", "true")),
 			wantSuccess: true,
 			wantOutput:  "immutable all-workload baseline complete",
 		},
 		{
 			name:       "substantive pod template drift",
-			live:       withAPISubstantiveDrift(baselineManifest(true, "*", "false")),
+			live:       withAPISubstantiveDrift(baselineManifest(true, "*", "true")),
 			wantOutput: "spec drifts from the server-defaulted safe chart",
 		},
 		{
 			name:            "wrong Helm release name",
-			live:            baselineManifest(true, "*", "false"),
+			live:            baselineManifest(true, "*", "true"),
 			liveHelmRelease: "other-release",
 			wantOutput:      `.metadata.annotations["meta.helm.sh/release-name"] must equal "selfservice"`,
 		},
 		{
 			name:              "wrong Helm release namespace",
-			live:              baselineManifest(true, "*", "false"),
+			live:              baselineManifest(true, "*", "true"),
 			liveHelmNamespace: "other-namespace",
 			wantOutput:        `.metadata.annotations["meta.helm.sh/release-namespace"] must equal "selfservice"`,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			candidate := baselineManifest(true, "*", "false")
+			candidate := baselineManifest(true, "*", "true")
 			env := newDeployScriptEnvironment(t, test.live, candidate)
 			if test.liveHelmRelease != "" {
 				env.liveHelmRelease = test.liveHelmRelease
@@ -2909,29 +2911,29 @@ func TestDeployScriptPreparesAllWorkloadBaseline(t *testing.T) {
 	}
 }
 
-func TestDeployScriptPreparesClaimsBaselineOverridesContainedFoundation(t *testing.T) {
+func TestDeployScriptPreparesClaimsBaselineOverridesReopenedFoundation(t *testing.T) {
 	requirePOSIXShell(t)
 
-	live := baselineManifest(true, "", "false")
-	env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "false"))
+	live := baselineManifest(true, "", "true")
+	env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "true"))
 	writeFile(t, env.currentRollbackValues, `replicaCount:
   worker: 4
 provisioning:
-  enabled: true
-  workerClaimsEnabled: true
+  enabled: false
+  workerClaimsEnabled: false
 worker:
   contentFilter:
     enabled: true
     categoryFeedBaseURL: https://student-filter-feed.lab.jmal.io
 synthetic:
-  provisioningExpectedEnabled: true
+  provisioningExpectedEnabled: false
   suspend: true
   janitor:
     suspend: false
   runner:
     suspend: false
   lifecycle:
-    enabled: true
+    enabled: false
 `)
 
 	output, err := env.run(
@@ -2944,15 +2946,15 @@ synthetic:
 	}
 
 	requiredArgs := []string{
-		"--set provisioning.enabled=false",
-		"--set provisioning.workerClaimsEnabled=false",
+		"--set provisioning.enabled=true",
+		"--set provisioning.workerClaimsEnabled=true",
 		"--set worker.contentFilter.enabled=false",
 		"--set-string worker.contentFilter.categoryFeedBaseURL=",
-		"--set synthetic.provisioningExpectedEnabled=false",
+		"--set synthetic.provisioningExpectedEnabled=true",
 		"--set synthetic.suspend=false",
 		"--set synthetic.janitor.suspend=true",
 		"--set synthetic.runner.suspend=true",
-		"--set synthetic.lifecycle.enabled=false",
+		"--set synthetic.lifecycle.enabled=true",
 		"--set replicaCount.worker=1",
 	}
 	for _, logPath := range []string{env.templateLog, env.upgradeLog} {
@@ -3029,8 +3031,8 @@ func TestDeployScriptHelmOwnershipNormalizationLoadBearing(t *testing.T) {
 			writeExecutable(t, sabotagedDeployPath, sabotagedDeployBody)
 			t.Cleanup(func() { os.Remove(sabotagedDeployPath) })
 
-			live := withAPITopLevelRevisionAnnotation(baselineManifest(true, "*", "false"))
-			env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "false"))
+			live := withAPITopLevelRevisionAnnotation(baselineManifest(true, "*", "true"))
+			env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "true"))
 			env.scriptPath = sabotagedDeployPath
 			output, runErr := env.run(
 				"--prepare-claims-baseline",
@@ -3111,7 +3113,7 @@ func TestDeployScriptGeneratedAnnotationNormalizationLoadBearing(t *testing.T) {
 			writeExecutable(t, sabotagedDeployPath, sabotagedDeployBody)
 			t.Cleanup(func() { os.Remove(sabotagedDeployPath) })
 
-			manifest := baselineManifest(true, "*", "false")
+			manifest := baselineManifest(true, "*", "true")
 			env := newDeployScriptEnvironment(t, manifest, manifest)
 			env.scriptPath = sabotagedDeployPath
 			output, runErr := env.run(
@@ -3140,8 +3142,8 @@ func TestDeployScriptGeneratedAnnotationNormalizationLoadBearing(t *testing.T) {
 			writeExecutable(t, sabotagedDeployPath, sabotagedDeployBody)
 			t.Cleanup(func() { os.Remove(sabotagedDeployPath) })
 
-			live := baselineManifest(true, "", "false")
-			env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "false"))
+			live := baselineManifest(true, "", "true")
+			env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "true"))
 			env.postApplyAnnotationsMode = test.mode
 			env.scriptPath = sabotagedDeployPath
 			output, runErr := env.run("--no-pull")
@@ -3161,9 +3163,9 @@ func TestDeployScriptGeneratedAnnotationNormalizationLoadBearing(t *testing.T) {
 func TestDeployScriptPostApplyGeneratedAnnotationHandling(t *testing.T) {
 	requirePOSIXShell(t)
 
-	live := baselineManifest(true, "", "false")
+	live := baselineManifest(true, "", "true")
 	t.Run("ignores realistic generated annotations", func(t *testing.T) {
-		env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "false"))
+		env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "true"))
 		env.postApplyAnnotationsMode = "generated"
 		output, err := env.run("--no-pull")
 		if err != nil {
@@ -3195,7 +3197,7 @@ func TestDeployScriptPostApplyGeneratedAnnotationHandling(t *testing.T) {
 		},
 	} {
 		t.Run("preserves "+test.name, func(t *testing.T) {
-			env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "false"))
+			env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "true"))
 			env.postApplyAnnotationsMode = test.mode
 			if test.configure != nil {
 				test.configure(env)
@@ -3242,7 +3244,7 @@ func TestDeployScriptPostApplyGeneratedAnnotationHandling(t *testing.T) {
 		writeExecutable(t, sabotagedPath, sabotagedBody)
 		t.Cleanup(func() { os.Remove(sabotagedPath) })
 
-		env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "false"))
+		env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "true"))
 		env.postApplyAnnotationsMode = "unrelated"
 		env.scriptPath = sabotagedPath
 		output, runErr := env.run("--no-pull")
@@ -3258,7 +3260,7 @@ func TestDeployScriptPostApplyGeneratedAnnotationHandling(t *testing.T) {
 func TestDeployScriptPostApplyHelmOwnershipHandling(t *testing.T) {
 	requirePOSIXShell(t)
 
-	live := baselineManifest(true, "", "false")
+	live := baselineManifest(true, "", "true")
 	candidate := rollbackManifestWithHistoricalSynthetics(false)
 
 	t.Run("expected top-level ownership on newly created CronJobs compares equal", func(t *testing.T) {
@@ -3397,7 +3399,7 @@ func TestDeployScriptPostApplyHelmOwnershipNormalizationLoadBearing(t *testing.T
 			writeExecutable(t, sabotagedPath, sabotagedBody)
 			t.Cleanup(func() { os.Remove(sabotagedPath) })
 
-			live := baselineManifest(true, "", "false")
+			live := baselineManifest(true, "", "true")
 			candidate := rollbackManifestWithHistoricalSynthetics(false)
 			env := newDeployScriptEnvironment(t, live, candidate)
 			env.postApplyAnnotationsMode = "helm-ownership"
@@ -4127,8 +4129,8 @@ func TestDeployScriptDryRunDowngradeWithDecoyFailsAtRuntime(t *testing.T) {
 	}
 	t.Cleanup(func() { os.Remove(scriptPath) })
 
-	live := baselineManifest(true, "", "false")
-	candidate := baselineManifest(true, "*", "false")
+	live := baselineManifest(true, "", "true")
+	candidate := baselineManifest(true, "*", "true")
 	env := newDeployScriptEnvironment(t, live, candidate)
 	env.scriptPath = scriptPath
 	// Deliberately do NOT write env.upgradeHookManifest: validate_upgrade_hooks
@@ -4269,8 +4271,8 @@ func TestDeployScriptConflictingDryRunAppendFailsAtRuntime(t *testing.T) {
 	}
 	t.Cleanup(func() { os.Remove(scriptPath) })
 
-	live := baselineManifest(true, "", "false")
-	candidate := baselineManifest(true, "*", "false")
+	live := baselineManifest(true, "", "true")
+	candidate := baselineManifest(true, "*", "true")
 	env := newDeployScriptEnvironment(t, live, candidate)
 	env.scriptPath = scriptPath
 	// Deliberately do NOT write env.upgradeHookManifest: validate_upgrade_hooks
@@ -4737,8 +4739,8 @@ func TestKubectlShadowFunctionHarnessInterceptsBareKubectlCalls(t *testing.T) {
 // fix addresses.
 func TestDeployScriptServerValidationSucceedsUnderRealisticOwnershipConflicts(t *testing.T) {
 	requirePOSIXShell(t)
-	live := baselineManifest(true, "", "false")
-	candidate := baselineManifest(true, "*", "false")
+	live := baselineManifest(true, "", "true")
+	candidate := baselineManifest(true, "*", "true")
 	env := newDeployScriptEnvironment(t, live, candidate)
 	env.simulateOwnershipConflict = true
 	writeFile(t, env.upgradeHookManifest, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestB))
@@ -4788,8 +4790,8 @@ func TestDeployScriptServerValidationSucceedsUnderRealisticOwnershipConflicts(t 
 // every required workload present in the resulting inventory.
 func TestDeployScriptServerValidateCandidateHandlesListWrappedMultiDocumentOutput(t *testing.T) {
 	requirePOSIXShell(t)
-	live := baselineManifest(true, "", "false")
-	candidate := baselineManifest(true, "*", "false")
+	live := baselineManifest(true, "", "true")
+	candidate := baselineManifest(true, "*", "true")
 	env := newDeployScriptEnvironment(t, live, candidate)
 	writeFile(t, env.upgradeHookManifest, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestB))
 
@@ -4914,8 +4916,8 @@ func TestDeployScriptServerValidateCandidateMultiDocumentSplitIsLoadBearing(t *t
 	}
 	t.Cleanup(func() { os.Remove(scriptPath) })
 
-	live := baselineManifest(true, "", "false")
-	candidate := baselineManifest(true, "*", "false")
+	live := baselineManifest(true, "", "true")
+	candidate := baselineManifest(true, "*", "true")
 	env := newDeployScriptEnvironment(t, live, candidate)
 	env.scriptPath = scriptPath
 	writeFile(t, env.upgradeHookManifest, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestB))
@@ -4941,8 +4943,8 @@ func TestDeployScriptServerValidateCandidateMultiDocumentSplitIsLoadBearing(t *t
 // the source text.
 func TestDeployScriptServerValidateCandidateAbortsOnPerDocumentDryRunFailure(t *testing.T) {
 	requirePOSIXShell(t)
-	live := baselineManifest(true, "", "false")
-	candidate := baselineManifest(true, "*", "false")
+	live := baselineManifest(true, "", "true")
+	candidate := baselineManifest(true, "*", "true")
 	env := newDeployScriptEnvironment(t, live, candidate)
 	env.failServerValidateDocument = "selfservice-worker"
 	writeFile(t, env.upgradeHookManifest, upgradeHookManifest("ghcr.io/jmal1/selfservice-api-gateway@sha256:"+testDigestB))
@@ -4987,8 +4989,8 @@ func TestDeployScriptForceConflictsIsLoadBearing(t *testing.T) {
 	}
 	t.Cleanup(func() { os.Remove(scriptPath) })
 
-	live := baselineManifest(true, "", "false")
-	candidate := baselineManifest(true, "*", "false")
+	live := baselineManifest(true, "", "true")
+	candidate := baselineManifest(true, "*", "true")
 	env := newDeployScriptEnvironment(t, live, candidate)
 	env.scriptPath = scriptPath
 	env.simulateOwnershipConflict = true
@@ -5927,7 +5929,7 @@ status:
 
 func TestDeployScriptRejectsConcurrentReleaseMutation(t *testing.T) {
 	requirePOSIXShell(t)
-	manifest := baselineManifest(true, "*", "false")
+	manifest := baselineManifest(true, "*", "true")
 	env := newDeployScriptEnvironment(t, manifest, manifest)
 	writeFile(t, env.lockFile, "another-operator")
 
@@ -6003,7 +6005,7 @@ func writeDeployLockFixtureWithHolder(
 
 func TestDeployScriptStaleReleaseLockRecovery(t *testing.T) {
 	requirePOSIXShell(t)
-	manifest := baselineManifest(true, "*", "false")
+	manifest := baselineManifest(true, "*", "true")
 	localHostname, err := os.Hostname()
 	if err != nil {
 		t.Fatal(err)
@@ -6329,7 +6331,7 @@ func TestDeployScriptStaleLockGuardsAreLoadBearing(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := string(sourceBytes)
-	manifest := baselineManifest(true, "*", "false")
+	manifest := baselineManifest(true, "*", "true")
 	localHostname, err := os.Hostname()
 	if err != nil {
 		t.Fatal(err)
@@ -6433,7 +6435,7 @@ func TestDeployScriptStaleLockGuardsAreLoadBearing(t *testing.T) {
 
 func TestDeployScriptInterruptedLockCreationIsReconciled(t *testing.T) {
 	requirePOSIXShell(t)
-	manifest := baselineManifest(true, "*", "false")
+	manifest := baselineManifest(true, "*", "true")
 	env := newDeployScriptEnvironment(t, manifest, manifest)
 	env.signalDuringLockCreate = "HUP"
 	output, err := env.run(
@@ -6452,7 +6454,7 @@ func TestDeployScriptInterruptedLockCreationIsReconciled(t *testing.T) {
 
 func TestDeployScriptAmbiguousLockCreationIsReconciled(t *testing.T) {
 	requirePOSIXShell(t)
-	manifest := baselineManifest(true, "*", "false")
+	manifest := baselineManifest(true, "*", "true")
 	env := newDeployScriptEnvironment(t, manifest, manifest)
 	env.failLockCreateAfterMutation = true
 	output, err := env.run(
@@ -6709,8 +6711,8 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 	writeFile(t, env.immutableRollbackManifest, live)
 	writeFile(t, env.immutableRollbackHooks, "")
 	writeFile(t, env.currentRollbackHooks, "")
-	writeFile(t, env.immutableRollbackValues, `{"provisioning":{"workerClaimsEnabled":false}}`+"\n")
-	writeFile(t, env.currentRollbackValues, `{"provisioning":{"workerClaimsEnabled":false}}`+"\n")
+	writeFile(t, env.immutableRollbackValues, `{"provisioning":{"workerClaimsEnabled":true}}`+"\n")
+	writeFile(t, env.currentRollbackValues, `{"provisioning":{"workerClaimsEnabled":true}}`+"\n")
 	env.writeCommands()
 	return env
 }
@@ -8590,7 +8592,7 @@ spec:
         image: ` + image("api-gateway", "ghcr.io/jmal1/selfservice-api-gateway") + `
         env:
         - name: PROVISIONING_ENABLED
-          value: "false"
+          value: "true"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -8681,11 +8683,11 @@ spec:
             - name: SYNTHETIC_CONTENT_FILTER_CATEGORY_FEED_BASE_URL
               value: ""
             - name: SYNTHETIC_PROVISIONING_EXPECTED_ENABLED
-              value: "false"
+              value: "true"
             - name: SYNTHETIC_RUNNER_EXPECTED_ENABLED
               value: "false"
             - name: SYNTHETIC_LIFECYCLE_ENABLED
-              value: "false"
+              value: "true"
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -8725,13 +8727,9 @@ spec:
 }
 
 func rollbackManifestWithHistoricalSynthetics(contained bool) string {
-	manifest := baselineManifest(true, "", "false")
-	lifecycle := "true"
+	manifest := baselineManifest(true, "", "true")
 	if contained {
-		lifecycle = "false"
-	}
-	if !contained {
-		manifest = replaceEnvValue(manifest, "SYNTHETIC_LIFECYCLE_ENABLED", "false", lifecycle)
+		manifest = replaceEnvValue(manifest, "SYNTHETIC_LIFECYCLE_ENABLED", "true", "false")
 	}
 	return manifest + historicalSyntheticCronJobs(contained)
 }
