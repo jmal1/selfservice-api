@@ -67,7 +67,7 @@ synthetic:
     retryBackoff: 30s
   janitor:
     enabled: true
-    suspend: true
+    suspend: false
   # Hourly end-to-end proof of the Kali runner path (Multus NAD, CNI dhcp lease,
   # pod-VLAN L3 reachability, nmap). Chart defaults already match prod: it clones
   # the synthetic-noop template and runs the version-controlled playlist seeded by
