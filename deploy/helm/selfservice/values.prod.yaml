@@ -21,7 +21,7 @@
 #   - Vault path: secret/selfservice/<secret-name>
 
 replicaCount:
-  # One worker is enough while AMD canaries stay serial (one host in VCENTER_HOSTS).
+  # One worker while mutating synthetics stay off. Host count is not a reason to scale workers.
   worker: 1
 
 provisioning:
@@ -31,13 +31,15 @@ provisioning:
   workerClaimsEnabled: true
 
 vcenter:
-  # Exact-host pin: ESXi1 only. Helm 178 ESXi2-only canary failed at placement
-  # planning because synthetic-noop (vm-8002) lives on host-1002/ESXi1, which
-  # must be in the allowlist to clone. No guest VM was created. Do not pin
-  # ESXi2-only until templates are on that host or both hosts are allowlisted.
-  hosts: "esxi1.lab.jmal.io"
+  # AMD cluster only: templates on ESXi1 can clone onto ESXi2 without a second
+  # copy. Placement requires the source host in VCENTER_HOSTS, then any
+  # allowlisted host in the same cluster with the datastore mounted.
+  # Do not duplicate every template into every pool. A replica is needed only
+  # when a catalog item must run on a different compute resource (Intel).
+  # nuc1/nuc2/nuc3 stay out until a later overlay; mutating synthetics stay off.
+  hosts: "esxi1.lab.jmal.io,esxi2.lab.jmal.io"
   resourcePools: "/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs"
-  placementReservedMemoryMB: "esxi1.lab.jmal.io=8192"
+  placementReservedMemoryMB: "esxi1.lab.jmal.io=8192,esxi2.lab.jmal.io=8192"
   # k3sv01 validates the vCenter 8.0.3 certificate through the system trust
   # chain. Keep hostname verification enabled in every production process.
   insecure: "false"
