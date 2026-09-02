@@ -232,8 +232,8 @@ func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T
 		t.Fatal("production non-mutating API monitor CronJob must remain active")
 	}
 	if !values.Synthetic.Lifecycle.Enabled || !values.Synthetic.Runner.Enabled || !values.Synthetic.Janitor.Enabled ||
-		values.Synthetic.Runner.Suspend || !values.Synthetic.Janitor.Suspend {
-		t.Fatalf("production scheduled lifecycle and runner must be enabled with janitor still suspended: %+v", values.Synthetic)
+		values.Synthetic.Runner.Suspend || values.Synthetic.Janitor.Suspend {
+		t.Fatalf("production lifecycle, runner, and janitor must all be enabled and unsuspended: %+v", values.Synthetic)
 	}
 	if values.VCenter.Hosts != "esxi1.lab.jmal.io,esxi2.lab.jmal.io,nuc1.lab.jmal.io,nuc2.lab.jmal.io,nuc3.lab.jmal.io" {
 		t.Fatalf("production VCENTER_HOSTS = %q, want AMD ESXi1+ESXi2 plus nuc1/nuc2/nuc3 after Vault-gated canary", values.VCenter.Hosts)
@@ -265,7 +265,7 @@ func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T
 		"synthetic.lifecycle.enabled":           "true",
 		"synthetic.janitor.enabled":             "true",
 		"synthetic.runner.enabled":              "true",
-		"synthetic.janitor.suspend":             "true",
+		"synthetic.janitor.suspend":             "false",
 		"synthetic.runner.suspend":              "false",
 		"vcenter.hosts":                         "esxi1.lab.jmal.io,esxi2.lab.jmal.io,nuc1.lab.jmal.io,nuc2.lab.jmal.io,nuc3.lab.jmal.io",
 		"vcenter.resourcePools":                 "/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs,/JMAL-Datacenter/host/Intel-Cluster/Resources/Student-VMs",
