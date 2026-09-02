@@ -112,7 +112,7 @@ worker:
   networkReconciler:
     enabled: true
   idleEvaluator:
-    enabled: false
+    enabled: true
     dryRun: true
   pipelineReconciler:
     enabled: true

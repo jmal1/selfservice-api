@@ -251,7 +251,7 @@ func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T
 		!values.Worker.NetworkReconciler.Enabled ||
 		!values.Worker.L1Validation.Enabled ||
 		!values.Worker.TemplateHealth.Enabled ||
-		values.Worker.IdleEvaluator.Enabled ||
+		!values.Worker.IdleEvaluator.Enabled ||
 		!values.Worker.PipelineReconciler.Enabled ||
 		!values.Worker.IdleEvaluator.DryRun {
 		t.Fatalf("production worker background controls are not in the expected guarded-feedback state: %+v", values.Worker)
@@ -275,7 +275,7 @@ func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T
 		"worker.networkReconciler.enabled":      "true",
 		"worker.l1Validation.enabled":           "true",
 		"worker.templateHealth.enabled":         "true",
-		"worker.idleEvaluator.enabled":          "false",
+		"worker.idleEvaluator.enabled":          "true",
 		"worker.idleEvaluator.dryRun":           "true",
 		"worker.pipelineReconciler.enabled":     "true",
 	} {
