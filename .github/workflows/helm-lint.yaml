@@ -73,7 +73,7 @@ jobs:
           assert_env PROVISIONING_ENABLED true
           assert_env SYNTHETIC_PROVISIONING_EXPECTED_ENABLED true
           assert_env SYNTHETIC_RUNNER_EXPECTED_ENABLED false
-          assert_env SYNTHETIC_LIFECYCLE_ENABLED false
+          assert_env SYNTHETIC_LIFECYCLE_ENABLED true
 
       - name: helm lint and template (approved full-fleet overlay)
         working-directory: deploy/helm/selfservice

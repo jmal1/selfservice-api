@@ -44,19 +44,18 @@ vcenter:
   # chain. Keep hostname verification enabled in every production process.
   insecure: "false"
 
-# Synthetic monitoring keeps the non-mutating API monitor active while the
-# lifecycle check stays disabled and the runner/janitor CronJobs stay
-# rendered but suspended. deploy.sh still contains rollback safety by
+# Synthetic monitoring keeps the API monitor active with scheduled pod_lifecycle
+# after Intel canaries. Runner/janitor CronJobs stay rendered but suspended. deploy.sh still contains rollback safety by
 # forcing clone-producing CronJobs off before a guarded apply and after a
 # failed atomic rollback.
 synthetic:
-  # Non-mutating API monitor is scheduled. Lifecycle/runner/janitor stay
-  # rendered but suspended until AMD canaries pass.
+  # API monitor scheduled every 12 minutes with lifecycle enabled after Intel
+  # canaries. Runner/janitor stay rendered but suspended until Phase 4.
   suspend: false
   schedule: "*/12 * * * *"
   provisioningExpectedEnabled: true
   lifecycle:
-    enabled: false
+    enabled: true
     template: synthetic-noop
     # Pinned to the production-calibrated value. Must agree with
     # values.yaml and DefaultPodLifecycleConfig in lifecycle.go.
