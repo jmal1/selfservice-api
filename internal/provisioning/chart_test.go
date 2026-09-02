@@ -253,7 +253,7 @@ func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T
 		!values.Worker.TemplateHealth.Enabled ||
 		!values.Worker.IdleEvaluator.Enabled ||
 		!values.Worker.PipelineReconciler.Enabled ||
-		!values.Worker.IdleEvaluator.DryRun {
+		values.Worker.IdleEvaluator.DryRun {
 		t.Fatalf("production worker background controls are not in the expected guarded-feedback state: %+v", values.Worker)
 	}
 	for path, want := range map[string]string{
@@ -276,7 +276,7 @@ func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T
 		"worker.l1Validation.enabled":           "true",
 		"worker.templateHealth.enabled":         "true",
 		"worker.idleEvaluator.enabled":          "true",
-		"worker.idleEvaluator.dryRun":           "true",
+		"worker.idleEvaluator.dryRun":           "false",
 		"worker.pipelineReconciler.enabled":     "true",
 	} {
 		parts := strings.Split(path, ".")
