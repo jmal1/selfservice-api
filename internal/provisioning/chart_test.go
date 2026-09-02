@@ -235,8 +235,8 @@ func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T
 		!values.Synthetic.Runner.Suspend || !values.Synthetic.Janitor.Suspend {
 		t.Fatalf("production mutating synthetics must stay enabled but suspended until AMD canaries pass: %+v", values.Synthetic)
 	}
-	if values.VCenter.Hosts != "esxi1.lab.jmal.io,esxi2.lab.jmal.io,nuc2.lab.jmal.io,nuc3.lab.jmal.io" {
-		t.Fatalf("production VCENTER_HOSTS = %q, want AMD ESXi1+ESXi2 plus nuc2/nuc3 without nuc1 until Vault-gated canary", values.VCenter.Hosts)
+	if values.VCenter.Hosts != "esxi1.lab.jmal.io,esxi2.lab.jmal.io,nuc1.lab.jmal.io,nuc2.lab.jmal.io,nuc3.lab.jmal.io" {
+		t.Fatalf("production VCENTER_HOSTS = %q, want AMD ESXi1+ESXi2 plus nuc1/nuc2/nuc3 after Vault-gated canary", values.VCenter.Hosts)
 	}
 	if values.VCenter.ResourcePools != "/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs,/JMAL-Datacenter/host/Intel-Cluster/Resources/Student-VMs" {
 		t.Fatalf("production resource pools = %q, want AMD plus Intel Student-VMs pools", values.VCenter.ResourcePools)
@@ -244,8 +244,8 @@ func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T
 	if values.VCenter.Insecure != "false" {
 		t.Fatalf("production vCenter insecure = %q, want strict TLS", values.VCenter.Insecure)
 	}
-	if values.VCenter.PlacementReservedMemoryMB != "esxi1.lab.jmal.io=8192,esxi2.lab.jmal.io=8192,nuc2.lab.jmal.io=2048,nuc3.lab.jmal.io=2048" {
-		t.Fatalf("production placement reserve = %q, want ESXi1/ESXi2 8 GiB plus nuc2/nuc3 2 GiB", values.VCenter.PlacementReservedMemoryMB)
+	if values.VCenter.PlacementReservedMemoryMB != "esxi1.lab.jmal.io=8192,esxi2.lab.jmal.io=8192,nuc1.lab.jmal.io=4096,nuc2.lab.jmal.io=2048,nuc3.lab.jmal.io=2048" {
+		t.Fatalf("production placement reserve = %q, want ESXi1/ESXi2 8 GiB plus nuc1 4 GiB and nuc2/nuc3 2 GiB", values.VCenter.PlacementReservedMemoryMB)
 	}
 	if values.Worker.OrphanReconciler.Enabled ||
 		values.Worker.NetworkReconciler.Enabled ||
@@ -267,10 +267,10 @@ func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T
 		"synthetic.runner.enabled":              "true",
 		"synthetic.janitor.suspend":             "true",
 		"synthetic.runner.suspend":              "true",
-		"vcenter.hosts":                         "esxi1.lab.jmal.io,esxi2.lab.jmal.io,nuc2.lab.jmal.io,nuc3.lab.jmal.io",
+		"vcenter.hosts":                         "esxi1.lab.jmal.io,esxi2.lab.jmal.io,nuc1.lab.jmal.io,nuc2.lab.jmal.io,nuc3.lab.jmal.io",
 		"vcenter.resourcePools":                 "/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs,/JMAL-Datacenter/host/Intel-Cluster/Resources/Student-VMs",
 		"vcenter.insecure":                      "false",
-		"vcenter.placementReservedMemoryMB":     "esxi1.lab.jmal.io=8192,esxi2.lab.jmal.io=8192,nuc2.lab.jmal.io=2048,nuc3.lab.jmal.io=2048",
+		"vcenter.placementReservedMemoryMB":     "esxi1.lab.jmal.io=8192,esxi2.lab.jmal.io=8192,nuc1.lab.jmal.io=4096,nuc2.lab.jmal.io=2048,nuc3.lab.jmal.io=2048",
 		"worker.orphanReconciler.enabled":       "false",
 		"worker.networkReconciler.enabled":      "false",
 		"worker.l1Validation.enabled":           "true",
