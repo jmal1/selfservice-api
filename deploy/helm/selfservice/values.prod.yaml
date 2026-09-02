@@ -113,7 +113,7 @@ worker:
     enabled: true
   idleEvaluator:
     enabled: true
-    dryRun: true
+    dryRun: false
   pipelineReconciler:
     enabled: true
 
