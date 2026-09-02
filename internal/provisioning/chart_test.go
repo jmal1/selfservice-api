@@ -247,7 +247,7 @@ func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T
 	if values.VCenter.PlacementReservedMemoryMB != "esxi1.lab.jmal.io=8192,esxi2.lab.jmal.io=8192,nuc1.lab.jmal.io=4096,nuc2.lab.jmal.io=2048,nuc3.lab.jmal.io=2048" {
 		t.Fatalf("production placement reserve = %q, want ESXi1/ESXi2 8 GiB plus nuc1 4 GiB and nuc2/nuc3 2 GiB", values.VCenter.PlacementReservedMemoryMB)
 	}
-	if values.Worker.OrphanReconciler.Enabled ||
+	if !values.Worker.OrphanReconciler.Enabled ||
 		!values.Worker.NetworkReconciler.Enabled ||
 		!values.Worker.L1Validation.Enabled ||
 		!values.Worker.TemplateHealth.Enabled ||
@@ -271,7 +271,7 @@ func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T
 		"vcenter.resourcePools":                 "/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs,/JMAL-Datacenter/host/Intel-Cluster/Resources/Student-VMs",
 		"vcenter.insecure":                      "false",
 		"vcenter.placementReservedMemoryMB":     "esxi1.lab.jmal.io=8192,esxi2.lab.jmal.io=8192,nuc1.lab.jmal.io=4096,nuc2.lab.jmal.io=2048,nuc3.lab.jmal.io=2048",
-		"worker.orphanReconciler.enabled":       "false",
+		"worker.orphanReconciler.enabled":       "true",
 		"worker.networkReconciler.enabled":      "true",
 		"worker.l1Validation.enabled":           "true",
 		"worker.templateHealth.enabled":         "true",

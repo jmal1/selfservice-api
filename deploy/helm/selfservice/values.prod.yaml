@@ -108,7 +108,7 @@ worker:
     confirmationBackoff: "5m"
     confirmationReconcileInterval: "1m"
   orphanReconciler:
-    enabled: false
+    enabled: true
   networkReconciler:
     enabled: true
   idleEvaluator:
