@@ -102,7 +102,7 @@ worker:
     validationInterval: "168h"
     schedulerInterval: "5m"
   templateHealth:
-    enabled: false
+    enabled: true
     interval: "12h"
     deepTimeout: "10m"
     confirmationBackoff: "5m"

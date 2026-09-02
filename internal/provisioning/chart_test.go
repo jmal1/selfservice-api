@@ -250,7 +250,7 @@ func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T
 	if values.Worker.OrphanReconciler.Enabled ||
 		values.Worker.NetworkReconciler.Enabled ||
 		!values.Worker.L1Validation.Enabled ||
-		values.Worker.TemplateHealth.Enabled ||
+		!values.Worker.TemplateHealth.Enabled ||
 		values.Worker.IdleEvaluator.Enabled ||
 		values.Worker.PipelineReconciler.Enabled ||
 		!values.Worker.IdleEvaluator.DryRun {
@@ -274,7 +274,7 @@ func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T
 		"worker.orphanReconciler.enabled":       "false",
 		"worker.networkReconciler.enabled":      "false",
 		"worker.l1Validation.enabled":           "true",
-		"worker.templateHealth.enabled":         "false",
+		"worker.templateHealth.enabled":         "true",
 		"worker.idleEvaluator.enabled":          "false",
 		"worker.idleEvaluator.dryRun":           "true",
 		"worker.pipelineReconciler.enabled":     "false",
