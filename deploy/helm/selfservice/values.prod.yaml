@@ -31,11 +31,13 @@ provisioning:
   workerClaimsEnabled: true
 
 vcenter:
-  # Exact-host canary pin: ESXi2 only, after ESXi1 synthetic-noop 97d7c4dc
-  # created/destroyed on host-1002 with zero extra residue (2026-09-02).
-  hosts: "esxi2.lab.jmal.io"
+  # Exact-host pin: ESXi1 only. Helm 178 ESXi2-only canary failed at placement
+  # planning because synthetic-noop (vm-8002) lives on host-1002/ESXi1, which
+  # must be in the allowlist to clone. No guest VM was created. Do not pin
+  # ESXi2-only until templates are on that host or both hosts are allowlisted.
+  hosts: "esxi1.lab.jmal.io"
   resourcePools: "/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs"
-  placementReservedMemoryMB: "esxi2.lab.jmal.io=8192"
+  placementReservedMemoryMB: "esxi1.lab.jmal.io=8192"
   # k3sv01 validates the vCenter 8.0.3 certificate through the system trust
   # chain. Keep hostname verification enabled in every production process.
   insecure: "false"
