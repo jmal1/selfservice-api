@@ -115,7 +115,7 @@ worker:
     enabled: false
     dryRun: true
   pipelineReconciler:
-    enabled: false
+    enabled: true
 
 # Bitnami postgresql subchart image overrides.
 # We pin tag explicitly to avoid surprise major upgrades on chart upgrade.

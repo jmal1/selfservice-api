@@ -252,7 +252,7 @@ func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T
 		!values.Worker.L1Validation.Enabled ||
 		!values.Worker.TemplateHealth.Enabled ||
 		values.Worker.IdleEvaluator.Enabled ||
-		values.Worker.PipelineReconciler.Enabled ||
+		!values.Worker.PipelineReconciler.Enabled ||
 		!values.Worker.IdleEvaluator.DryRun {
 		t.Fatalf("production worker background controls are not in the expected guarded-feedback state: %+v", values.Worker)
 	}
@@ -277,7 +277,7 @@ func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T
 		"worker.templateHealth.enabled":         "true",
 		"worker.idleEvaluator.enabled":          "false",
 		"worker.idleEvaluator.dryRun":           "true",
-		"worker.pipelineReconciler.enabled":     "false",
+		"worker.pipelineReconciler.enabled":     "true",
 	} {
 		parts := strings.Split(path, ".")
 		if got := chartScalar(t, "values.prod.yaml", parts...); got != want {
