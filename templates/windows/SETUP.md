@@ -18,11 +18,15 @@ The platform uses a 3-level template hierarchy:
 | **L3 — Student pod VM** | Crucible provisioner | Linked clone off L2's `base-image` snapshot, per-pod password injected via guestinfo + cloudbase-init. |
 
 > [!important] Stop and read this if you've used the OLD scripts
-> The old `build-student-windows-*.ps1` PowerCLI scripts in `future/scripts/`
-> are a single-level flow that built a vCenter "template" (Template=true)
+> The old `build-student-windows-*.ps1` PowerCLI scripts in Homelab vault
+> `future/scripts/` (including `build-student-windows-server-*.ps1`) are a
+> single-level flow that built a vCenter "template" (Template=true)
 > directly. That flow is **deprecated** for the wizard-driven hierarchy
 > above. Do NOT mark the L1 VM as a template — leave it as a regular VM
-> so the wizard can full-clone it.
+> so the wizard can full-clone it. Server L1 runbooks live beside this
+> file: gold [SERVER-2022-SETUP.md](SERVER-2022-SETUP.md) (July 2026),
+> [SERVER-2019-SETUP.md](SERVER-2019-SETUP.md). Server 2025 is blocked
+> (Homelab vault **[[Roadmap]]**).
 
 ## Prerequisites
 

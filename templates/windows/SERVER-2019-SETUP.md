@@ -1,86 +1,96 @@
-# Windows Server 2022 Base Template Setup Guide
+# Windows Server 2019 Base Template Setup Guide
 
-> **Gold L1 (July 2026).** This is the blessed Windows Server image for
-> Crucible. Server 2019 is a documented delta
-> ([SERVER-2019-SETUP.md](SERVER-2019-SETUP.md)). Server 2025 is **BLOCKED**
-> (Microsoft `explorer.exe` `0xc0000409` / Cloudbase password — Homelab vault
-> **[[Roadmap]]** known issue); do not rebuild 2025 as a gate.
-
-This guide documents how to build the **L1 base Windows Server 2022 template**
+This guide documents how to build the **L1 base Windows Server 2019 template**
 that the Crucible self-service portal's template wizard then provisions FROM.
-The output is a single, blessed `student-windows-server-2022` VM in the
+The output is a single, blessed `student-windows-server-2019` VM in the
 Templates folder, sysprepped with our `windows-unattend.xml` + cloudbase-init
 combo, ready for instructors to clone via the wizard.
 
-It follows the **exact same L1/L2/L3 conventions** as the Windows 11 guide
-([SETUP.md](SETUP.md)), so the identical wizard/provisioner code drives L2
-(monthly/quarterly course templates) and L3 (student pods). Server 2019
-reuses this flow with the deltas in SERVER-2019-SETUP.md. The older
-[SERVER-2025-SETUP.md](SERVER-2025-SETUP.md) runbook is retained for
-history only.
+It follows the **exact same L1/L2/L3 conventions** as the gold Windows Server
+2022 guide ([SERVER-2022-SETUP.md](SERVER-2022-SETUP.md), July 2026) and the
+Windows 11 guide ([SETUP.md](SETUP.md)), so the identical wizard/provisioner
+code drives L2 (monthly/quarterly course templates) and L3 (student pods).
+**Read SERVER-2022-SETUP.md first** — this doc is a delta and only calls out
+where Server 2019 differs from that gold 2022 flow.
 
-## Template hierarchy (same as Windows 11)
+> [!important] Do NOT use the deprecated vault PowerCLI scripts
+> Homelab vault `future/scripts/build-student-windows-server-*.ps1` is a
+> single-level flow that marked a vCenter Template=true VM. That path is
+> **deprecated**. Follow this runbook + `templates/windows/` +
+> `docs/instructor/os-recipes.md`. Do not invent a new credential protocol:
+> the student local account is **`Student`**, and per-clone passwords come
+> from existing `clone_with_customize` + Cloudbase-Init (`VMwareGuestInfoService`)
+> exactly as 2022.
+
+> [!warning] Server 2025 is BLOCKED — do not rebuild it as a gate
+> Microsoft `explorer.exe` `0xc0000409` on first clone boot after sysprep,
+> plus a Cloudbase-Init password failure on that SKU. Tracked as a known
+> issue on the Homelab vault **[[Roadmap]]**. Server 2022 (July 2026) is gold.
+> This 2019 L1 is the additional Server SKU this wave ships.
+
+## Template hierarchy (same as Windows 11 / Server 2022 gold)
 
 | Level | Built by | Purpose |
 |-------|----------|---------|
-| **L1 — Base** | This guide (mostly automated via answer ISO + `govc`) | Vanilla WS2022 + VMware Tools + fully patched + cloudbase-init + unattend.xml, sysprepped. The "blessed" image. |
+| **L1 — Base** | This guide (mostly automated via answer ISO + `govc`) | Vanilla WS2019 + VMware Tools + fully patched + cloudbase-init + unattend.xml, sysprepped. The "blessed" image. |
 | **L2 — Course template** | Crucible wizard (instructor self-service) | Full-clones L1, instructor customizes, wizard re-sysprep + snapshots as `base-image`. |
 | **L3 — Student pod VM** | Crucible provisioner | Linked clone off L2's `base-image` snapshot, per-pod password injected via guestinfo + cloudbase-init. |
 
 > [!important] Do NOT mark the L1 VM as a template and do NOT snapshot it
-> Same rule as Windows 11 — the wizard full-clones the L1 *VM*
+> Same rule as Windows 11 / Server 2022 — the wizard full-clones the L1 *VM*
 > and creates the `base-image` snapshot itself during the L2 generalize step.
 
-## What is different from Server 2025 (historical summary)
+## What is different from Server 2022 gold (summary)
 
-Server 2025 is **BLOCKED** (Homelab vault **[[Roadmap]]**). This table is
-kept so a rebuild of *this* gold 2022 image still uses the right hardware.
-
-| Topic | Server 2025 | Server 2022 |
-|-------|-------------|-------------|
-| Edition | Datacenter (Desktop Experience) | **Standard (Desktop Experience)** |
-| WIM `/IMAGE/NAME` | `Windows Server 2025 SERVERDATACENTER` | **`Windows Server 2022 SERVERSTANDARD`** (verify on media) |
-| Disk controller | pvscsi | **LSI Logic SAS** (see gotcha below) |
-| ComputerName (build) | `WIN-WS2025-L1` | `WIN-WS2022-L1` |
-| Everything else | — | **Identical** (answer ISO, govc-headless prep, cloudbase-init, SkipRearm, sysprep flow) |
+| Topic | Server 2022 (gold, July 2026) | Server 2019 |
+|-------|------------------------------|-------------|
+| Edition | Standard (Desktop Experience) | **Standard (Desktop Experience)** — same |
+| WIM `/IMAGE/NAME` | `Windows Server 2022 SERVERSTANDARD` | **`Windows Server 2019 SERVERSTANDARD`** (verify on media; not `…CORE`) |
+| Disk controller | LSI Logic SAS | **LSI Logic SAS** (same — see gotcha) |
+| guestId | `windows2019srvNext_64Guest` | **`windows2019srv_64Guest`** (no `Next`) |
+| ComputerName (build) | `WIN-WS2022-L1` | `WIN-WS2019-L1` |
+| Install ISO | `WindowsServer2022.iso` | **`WindowsServer2019.iso`** (place on NAS first) |
+| Answer ISO / XML | `ws2022-autounattend.iso` / `autounattend-server2022.xml` | **`ws2019-autounattend.iso` / `autounattend-server2019.xml` |
+| pvscsi folder (if you ever inject) | Tools `pvscsi\Win10\amd64` | Tools **`pvscsi\Win8\amd64`** |
+| Everything else | — | **Identical** (answer ISO → WU as SYSTEM task → Cloudbase-Init `username=Student` → shared `windows-unattend.xml` → `SkipRearm=1` → `sysprep /generalize /oobe /shutdown` → register L1 for `clone_with_customize`) |
 
 > [!danger] Disk controller: use **LSI Logic SAS**, not pvscsi
-> The Server 2025 build used pvscsi because WS2025's WinPE ships the VMware
-> pvscsi driver in-box, so Setup could see the boot disk. **WS2022's installer
-> WinPE does NOT reliably include it** — a pvscsi boot disk is invisible to
-> Setup, and the unattended install fails at the disk-selection/partition step
-> ("we couldn't find any drives"). This is documented in the Homelab vault
-> `archive/VM-Templates.md` §11. Put the L1 disk on **`VirtualLsiLogicSAS`**;
-> it is in-box in every Windows Server WinPE and needs no F6 driver. (Perf
-> difference vs pvscsi is negligible for student pods. If you insist on pvscsi
-> parity with 2025, you must inject `pvscsi.inf` into the answer ISO's WinPE
-> via `<PnpCustomizationsWinPE><DriverPaths>` — not covered here.)
+> Same as 2022. WS2019's installer WinPE does **not** reliably include the
+> VMware pvscsi driver — a pvscsi boot disk is invisible to Setup ("we
+> couldn't find any drives"). Put the L1 disk on **`VirtualLsiLogicSAS`**.
+> If you insist on pvscsi, inject `pvscsi.inf` from Tools
+> `…\pvscsi\Win8\amd64` (not Win10) via
+> `<PnpCustomizationsWinPE><DriverPaths>` — not covered here.
 
 ## Prerequisites
 
 - The two ISOs on `[NAS-BackupsAndISOS]`:
-  - `ISOs/Windows/WindowsServer2022.iso` (Standard, Desktop Experience, Eval)
-  - `ISOs/Windows/ws2022-autounattend.iso` — the **answer ISO** built from
-    `templates/windows/autounattend-server2022.xml` (see "Building the answer
-    ISO" below). Ideally also bundles VMware Tools `setup64.exe` under
-    `\vmtools\` so Tools installs unattended.
+  - `ISOs/Windows/WindowsServer2019.iso` (Standard, Desktop Experience, Eval).
+    **Not yet in this lab's ISO library** — a human must download Evaluation
+    Center / VLSC media and place it at that path with that filename before
+    this L1 can be built.
+  - `ISOs/Windows/ws2019-autounattend.iso` — the **answer ISO** built from
+    `templates/windows/autounattend-server2019.xml` (see "Building the answer
+    ISO" below). Ideally also bundles VMware Tools `setup64.exe` / `setup.exe`
+    under `\vmtools\` so Tools installs unattended.
 - `govc` access to vCenter from `k3sv01` (Vault-signed SSH cert; secret keys
   `vcenter-url` / `vcenter-user` / `vcenter-password`).
 - This repo (for `internal/provisioner/assets/windows-unattend.xml` — the
-  version-neutral sysprep answer file, identical to the W11/2025 flow).
+  version-neutral sysprep answer file, identical to the W11/2022 flow).
 
 > [!important] VERIFY the WIM edition name before building
 > The answer file selects the edition by `/IMAGE/NAME`. Confirm the exact name
 > the media uses for **Standard Desktop Experience** before you build the ISO:
-> mount `WindowsServer2022.iso` and run
+> mount `WindowsServer2019.iso` and run
 > `dism /Get-WimInfo /WimFile:<drive>\sources\install.wim`. Standard Desktop
-> Experience is typically index 2, name `Windows Server 2022 SERVERSTANDARD`.
+> Experience is typically index 2, name `Windows Server 2019 SERVERSTANDARD`.
 > If the media labels it differently, update the `<Value>` in
-> `autounattend-server2022.xml` and rebuild the answer ISO. Also confirm the
+> `autounattend-server2019.xml` and rebuild the answer ISO. Also confirm the
 > media is **Evaluation** (drives the `SkipRearm` step) — GA/volume media with
-> a key needs the ProductKey / `SkipRearm` handling adjusted.
+> a key needs the ProductKey / `SkipRearm` handling adjusted. Do **not** pick
+> `SERVERSTANDARDCORE`.
 
-> [!danger] Vault SSH cert = 2h TTL and long WS2022 builds outrun it
+> [!danger] Vault SSH cert = 2h TTL and long WS2019 builds outrun it
 > Windows Update alone can exceed 2h. Re-sign with
 > `.\future\scripts\vault-ssh.ps1 --sign-only` from the Homelab repo root
 > whenever SSH silently hangs. k3sv01 `/tmp` may be cleared between signings —
@@ -88,12 +98,12 @@ kept so a rebuild of *this* gold 2022 image still uses the right hardware.
 
 ## VM hardware (replicate exactly)
 
-- Firmware **EFI**, guestId `windows2019srvNext_64Guest`
+- Firmware **EFI**, guestId **`windows2019srv_64Guest`**
 - 4 vCPU / 8192 MB RAM
 - 60 GB disk on **LSI Logic SAS** (`VirtualLsiLogicSAS`) controller, datastore
-  `[iSCSI-vmstore]` *(controller differs from the 2025 guide — see gotcha above)*
+  `[iSCSI-vmstore]`
 - **vmxnet3** NIC on `PG-VM-Lab` (VLAN 30 — has DHCP + NAT egress)
-- CD1 = `WindowsServer2022.iso`, CD2 = `ws2022-autounattend.iso`, both
+- CD1 = `WindowsServer2019.iso`, CD2 = `ws2019-autounattend.iso`, both
   **start-connected** (the vCenter svc account cannot toggle CD connect state
   at runtime, but start-connected CDs attach on power-on)
 - **No vTPM** (intentional — avoids auto-BitLocker on the server SKU)
@@ -105,18 +115,19 @@ kept so a rebuild of *this* gold 2022 image still uses the right hardware.
 Unlike Windows 11, there is **no manual OOBE**. With both CDs start-connected
 and a blank/wiped disk, EFI boots the install ISO directly (no "press any key"
 prompt appears when the disk has no bootable OS) and
-`autounattend-server2022.xml` drives the entire install:
+`autounattend-server2019.xml` drives the entire install:
 
 - wipes disk 0, UEFI/GPT layout, installs **Standard (Desktop Experience)**
 - enables built-in Administrator with throwaway password `BuildAdmin123!`
 - skips OOBE, auto-logons once as Administrator and runs the FirstLogonCommands:
   1. sets Administrator **password-never-expires** (build safety — see gotcha)
-  2. silently installs **VMware Tools** from `setup64.exe` if present on a CD
+  2. silently installs **VMware Tools** from `setup64.exe` / `setup.exe` if
+     present on a CD
 
 Power on and wait ~10-15 min. Confirm the guest reaches the Administrator
 desktop and got an IP on VLAN 30.
 
-> [!warning] Account-lockout gotcha (this bit us — caused a blank password)
+> [!warning] Account-lockout gotcha (this bit us on 2022 — caused a blank password)
 > Do NOT hammer `govc guest.run` auth during reboots. Windows locks the
 > account after ~10 failed attempts in ~10 min, and a mid-build password
 > policy once *blanked* the Administrator password entirely. During any
@@ -133,7 +144,8 @@ FirstLogonCommand installed Tools, skip this step. Otherwise:
 
 1. vCenter → right-click VM → **Guest OS → Install VMware Tools** (mounts the
    tools ISO)
-2. In the guest console, run `setup64.exe` from the CD (Typical), reboot
+2. In the guest console, run `setup64.exe` (or `setup.exe` on newer Tools
+   media) from the CD (Typical), reboot
 3. Verify in vCenter Summary: "VMware Tools: Running" + guest IP shown
 
 Then confirm from k3sv01: `govc vm.info vm-XXXX` shows an IP and Tools running.
@@ -154,10 +166,8 @@ net accounts /maxpwage:unlimited
 
 ## Step 4: Windows Update (native WUA COM as a SYSTEM task)
 
-> [!danger] Do NOT use PSWindowsUpdate, and do NOT run WUA in the govc session
-> `PSWindowsUpdate` hangs forever bootstrapping NuGet/PSGallery on an offline-ish
-> box. The WUA COM API also hangs if run directly inside the non-interactive
-> Tools session. **Run it as a SYSTEM scheduled task** and poll a status file.
+Identical to Server 2022 gold. Do **not** use PSWindowsUpdate, and do **not**
+run WUA in the govc session.
 
 Worker script (`wu-worker.ps1`) — uses `Microsoft.Update.Session`, loops
 search → download → install, writes `PASS_DONE`/`REBOOT_REQUIRED` to
@@ -195,23 +205,22 @@ with nothing new.
 
 > [!note] The perpetually re-offered Defender platform update
 > WUA will keep re-offering the Defender platform update every pass. It is
-> harmless and its servicing churn was the leading suspect for the earlier
-> sysprep 1018. **Leave it uninstalled** — do not loop forever chasing it.
+> harmless. **Leave it uninstalled** — do not loop forever chasing it.
 > If an online scan wedges `wuauserv` (~20 min hang), clear it with
 > `govc vm.power -reset` and continue.
 
 ## Step 5: BitLocker — verify N/A
 
-Server 2022 without a vTPM does not auto-encrypt. A stock **SERVERSTANDARD
-(Desktop Experience)** eval install does **not** include the BitLocker
-optional feature, so `Get-BitLockerVolume` is *not present* (the cmdlet errors
-with "not recognized") and `manage-bde -status C:` reports no BitLocker — both
-are the expected clean state (verified on the first build). Confirm with:
+Server 2019 without a vTPM does not auto-encrypt. A stock **SERVERSTANDARD
+(Desktop Experience)** eval install typically does **not** include the
+BitLocker optional feature, so `Get-BitLockerVolume` may be *not present*
+and `manage-bde -status C:` reports no BitLocker — both are the expected
+clean state (same as 2022 gold). Confirm with:
 `manage-bde -status C:` → no conversion/protection lines.
 If (unexpectedly) encrypted, `manage-bde -off C:` and wait, exactly as W11
 [SETUP.md](SETUP.md) Step 5 — an encrypted base image bricks every clone.
 
-## Step 6: Install & configure cloudbase-init (identical to Windows 11)
+## Step 6: Install & configure cloudbase-init (identical to Windows 11 / 2022)
 
 1. `Invoke-WebRequest https://www.cloudbase.it/downloads/CloudbaseInitSetup_Stable_x64.msi -OutFile C:\cbinit.msi` (or bundle it if offline)
 2. `msiexec /i C:\cbinit.msi /qn` — **do not** run sysprep/shutdown from the MSI
@@ -221,16 +230,19 @@ If (unexpectedly) encrypted, `manage-bde -off C:` and wait, exactly as W11
    `SetHostNamePlugin` + `LocalScriptsPlugin`).
 4. Copy `internal/provisioner/assets/windows-unattend.xml` from this repo to
    `C:\Windows\Panther\unattend.xml` (the version-neutral sysprep answer file —
-   **do not modify it**; it is shared with the Windows 11 / 2025 flow).
+   **do not modify it**; it is shared with the Windows 11 / 2022 flow).
 5. Disable the service so clones re-enable it on first boot:
    `Set-Service cloudbase-init -StartupType Disabled`
 
+This is the existing `clone_with_customize` / Cloudbase-Init contract. Do not
+add a new password protocol.
+
 ## Step 7: SkipRearm (Evaluation media, REQUIRED)
 
-Server 2022 Eval media is **180-day, rearmable**. `sysprep /generalize`
+Server 2019 Eval media is **180-day, rearmable**. `sysprep /generalize`
 consumes a rearm, and the eval SKU has a limited rearm count — without this,
 monthly/quarterly L2 re-syspreps would eventually exhaust rearms and break the
-pipeline. Set:
+pipeline. Set (same as 2022 gold):
 
 ```powershell
 Set-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SoftwareProtectionPlatform' -Name SkipRearm -Value 1 -Type DWord
@@ -243,10 +255,9 @@ harmless but unnecessary.)
 ## Step 8: Final cleanup + component-store finalize (avoids sysprep 1018)
 
 > [!danger] This is the key mitigation for sysprep error **1018**
-> (`ERROR_KEY_DELETED` / 0x800703fa). A cumulative update can leave a CBS
-> registry key marked-for-deletion; `StartComponentCleanup` finalizes pending
-> component operations and clears it. A rebuild that skipped this failed
-> sysprep 1018 repeatedly; the rebuild that ran it succeeded first try.
+> (`ERROR_KEY_DELETED` / 0x800703fa). Same as 2022 gold. A cumulative update
+> can leave a CBS registry key marked-for-deletion; `StartComponentCleanup`
+> finalizes pending component operations and clears it.
 
 ```powershell
 # 1. finalize the component store (can take 5-15 min)
@@ -308,14 +319,16 @@ state. If it does not power off, read
    device disconnected (empty ATAPI). No manual UI step needed.
 2. Register via the Crucible portal **Admin → Templates → New Template** (or an
    equivalent DB insert — `AdminCreateTemplate` is a plain insert + folder-cache
-   invalidation, no side effects). **This gold 2022 row is the registration
-   to mirror** — `source_type = manual` with the **VM name** in
-   `vcenter_template`, NOT `clone_vcenter` + moref:
-   - **Name:** `Windows Server 2022`
+   invalidation, no side effects). **Mirror the live gold `Windows Server 2022`
+   row** — that template uses `source_type = manual` with the **VM name** in
+   `vcenter_template` (the L1 is a vCenter clone source for
+   `clone_with_customize`; do **not** invent a moref-only `clone_vcenter`
+   registration unless you are matching a different live row on purpose):
+   - **Name:** `Windows Server 2019`
    - **OS type:** `windows`
    - **kind:** `clone_with_customize`
    - **Source type:** `manual`
-   - **vcenter_template:** `student-windows-server-2022` (the VM *name*; the
+   - **vcenter_template:** `student-windows-server-2019` (the VM *name*; the
      wizard/provisioner resolves the source VM by name for manual templates)
    - **vcenter_vm_id / source_ref:** empty
    - **Defaults:** 4 vCPU / 4096 MB / 60 GB, `Student` / `Changeme123!`,
@@ -323,12 +336,16 @@ state. If it does not power off, read
      `template_state=active`, `is_internal=false`
 3. If you inserted directly, `kubectl -n selfservice rollout restart
    deployment/selfservice-api` to refresh the templates folder cache. Do **not**
-   mark the VM as a vSphere template or snapshot it (the wizard snapshots at L2).
+   mark the VM as a vSphere template or snapshot it (the wizard snapshots
+   `base-image` at L2).
+
+Per-clone student passwords stay on the existing `clone_with_customize` +
+Cloudbase-Init path. No new credential protocol.
 
 ## Step 11: Smoke-test one L2 wizard run
 
 Run the wizard end-to-end against a throwaway course to confirm the shared
-pipeline works for WS2022 (verifies `SkipRearm` lets re-sysprep succeed):
+pipeline works for WS2019 (verifies `SkipRearm` lets re-sysprep succeed):
 
 1. Template detail → **Run Wizard** → Step 1 provision → `tpl-xxx` appears
 2. Step 2 configure: WebMKS console, log in as `Student` / `Changeme123!`
@@ -340,19 +357,14 @@ pipeline works for WS2022 (verifies `SkipRearm` lets re-sysprep succeed):
 ## Step 12: Backups + docs
 
 > [!note] L1 gold-image templates are **excluded** from ghettoVCB by convention
-> The ghettoVCB list on `esxi1` holds only service VMs (DNSv01, authv01,
-> mgmtv01, netbirdv01, k3sv01, stagingv01). The existing Windows template
-> gold images (`student-windows-server-2025`, `student-windows-11`) are **not**
-> backed up — they are fully reproducible from this runbook + the answer ISO,
-> and Crucible snapshots handle L2. Mirror that: do **not** add
-> `student-windows-server-2022` to ghettoVCB. (If you decide gold images *should*
-> be backed up, add it to both hosts' lists and update
-> `current/00-Infrastructure-Overview.md` + `archive/VM-Backup-Strategy.md`.)
+> Same as `student-windows-server-2022` / `student-windows-11`: do **not** add
+> `student-windows-server-2019` to ghettoVCB. The image is reproducible from
+> this runbook + the answer ISO, and Crucible snapshots handle L2.
 
 ## Monthly / quarterly L2 rebuild (the whole point)
 
 Instructors build their sysprepped course images entirely through the **wizard**
-against the published `student-windows-server-2022` template — no manual steps.
+against the published `student-windows-server-2019` template — no manual steps.
 Because `SkipRearm=1` is baked into L1 and inherited by every full-clone, each
 L2 generalize does **not** consume an eval rearm, so monthly/quarterly rebuilds
 run indefinitely. To refresh L1 itself with new patches, re-run **Step 4**
@@ -362,15 +374,16 @@ freshly rebuilt box; never sysprep an L1 that has already been generalized.
 ## Troubleshooting
 
 - **Setup "we couldn't find any drives" / no install target:** the boot disk is
-  on pvscsi and WS2022 WinPE lacks the driver — rebuild the VM with an
-  **LSI Logic SAS** controller (see the disk-controller gotcha).
+  on pvscsi and WS2019 WinPE lacks the driver — rebuild the VM with an
+  **LSI Logic SAS** controller (see the disk-controller gotcha). If injecting
+  pvscsi instead, use Tools `pvscsi\Win8\amd64`, not Win10.
 - **Sysprep 1018 (`ERROR_KEY_DELETED`):** Step 8 `StartComponentCleanup` +
   reboot was skipped, or a pending update left a marked-for-deletion CBS key.
   Rebuild from the answer ISO and run Step 8 before sysprep.
 - **Sysprep "machine is in an invalid state" (0x1f):** a prior generalize
   partially ran. The box is unrecoverable for sysprep — rebuild.
 - **Install stops on the edition picker:** the `/IMAGE/NAME` in
-  `autounattend-server2022.xml` doesn't match the media — verify with
+  `autounattend-server2019.xml` doesn't match the media — verify with
   `dism /Get-WimInfo` and correct it, then rebuild the answer ISO.
 - **govc `File /bin/bash was not found`:** VMware Tools is not running (Step 2)
   or the guest is mid-reboot.
@@ -378,7 +391,8 @@ freshly rebuilt box; never sysprep an L1 that has already been generalized.
 - **Account locked / password blank mid-build:** you hammered guest auth during
   a reboot — poll `vm.info` toolsRunningStatus instead (Step 1 gotcha).
 - **cloudbase-init / OOBE-on-clones / RDP / per-clone password:** identical to
-  Windows 11 — see [SETUP.md](SETUP.md) Troubleshooting.
+  Windows 11 / Server 2022 gold — see [SETUP.md](SETUP.md) Troubleshooting and
+  [SERVER-2022-SETUP.md](SERVER-2022-SETUP.md).
 - **`template_verify` fails "Student never switched to its generated password …
   cloudbase-init likely isn't running" (Server SKUs):** Windows **Server**
   silently SKIPS the unattend `FirstLogonCommands` when `SkipMachineOOBE`/
@@ -388,28 +402,55 @@ freshly rebuilt box; never sysprep an L1 that has already been generalized.
   in the **`specialize` pass** (`RunSynchronousCommand` →
   `sc config cloudbase-init start= delayed-auto`), which runs on all SKUs. If
   you see this, make sure the provision-worker is running an image built after
-  that fix.
+  that fix. This is **not** the Server 2025 Cloudbase password known issue
+  (Homelab vault **[[Roadmap]]**); do not "fix" 2019 by rebuilding 2025.
 
 ## Building the answer ISO
 
-`ws2022-autounattend.iso` must contain `autounattend.xml` (a copy of
-`templates/windows/autounattend-server2022.xml`) at the ISO root. Optionally
-bundle VMware Tools `setup64.exe` under `\vmtools\` so Step 1's FirstLogonCommand
-installs Tools with no internet. Build it with any ISO tool, e.g. on Linux:
+`ws2019-autounattend.iso` must contain `autounattend.xml` (a copy of
+`templates/windows/autounattend-server2019.xml`) at the ISO root. Optionally
+bundle VMware Tools `setup64.exe` (or `setup.exe`) under `\vmtools\` so Step 1's
+FirstLogonCommand installs Tools with no internet. Build it with any ISO tool,
+e.g. on Linux:
 
 ```bash
 mkdir -p iso/vmtools
-cp autounattend-server2022.xml iso/autounattend.xml
+cp autounattend-server2019.xml iso/autounattend.xml
 # optional: cp /path/to/VMware-tools/setup64.exe iso/vmtools/
-genisoimage -o ws2022-autounattend.iso -J -r -V AUTOUNATTEND iso/
+genisoimage -o ws2019-autounattend.iso -J -r -V AUTOUNATTEND iso/
 ```
 
 Or on Windows with the Windows ADK's `oscdimg`:
 
 ```cmd
-copy autounattend-server2022.xml iso\autounattend.xml
-oscdimg -j1 -o -m -lAUTOUNATTEND iso ws2022-autounattend.iso
+copy autounattend-server2019.xml iso\autounattend.xml
+oscdimg -j1 -o -m -lAUTOUNATTEND iso ws2019-autounattend.iso
 ```
 
-Upload it to `[NAS-BackupsAndISOS] ISOs/Windows/ws2022-autounattend.iso`
-(e.g. `govc datastore.upload -ds=NAS-BackupsAndISOS ws2022-autounattend.iso ISOs/Windows/ws2022-autounattend.iso`).
+Upload it to `[NAS-BackupsAndISOS] ISOs/Windows/ws2019-autounattend.iso`
+(e.g. `govc datastore.upload -ds=NAS-BackupsAndISOS ws2019-autounattend.iso ISOs/Windows/ws2019-autounattend.iso`).
+
+## Human lab checklist (ISO + L1)
+
+A human on lab does this after merging this docs PR. This repo does **not**
+claim the L1 was built or runtime-verified.
+
+1. Place **`WindowsServer2019.iso`** at
+   `[NAS-BackupsAndISOS] ISOs/Windows/WindowsServer2019.iso`
+   (Microsoft Evaluation Center / VLSC; Standard Desktop Experience Eval).
+2. Build and upload **`ws2019-autounattend.iso`** as above.
+3. Create the VM with the hardware in "VM hardware", attach both CDs
+   start-connected, power on.
+4. Wait for unattended Setup + Tools (Steps 1–2).
+5. Harden Administrator → Windows Update as SYSTEM task until `PASS_DONE`
+   (Steps 3–4).
+6. Verify BitLocker N/A (Step 5).
+7. Install Cloudbase-Init, write conf (`username=Student`), copy shared
+   `windows-unattend.xml`, disable the service (Step 6).
+8. `SkipRearm=1` (Step 7).
+9. `DISM /StartComponentCleanup`, reboot, settle, clean `C:\` (Step 8).
+10. `sysprep /generalize /oobe /shutdown` once via the SYSTEM task (Step 9).
+    Leave powered off — do not snapshot L1.
+11. Eject CDs. Register `student-windows-server-2019` as
+    `clone_with_customize` / `source_type=manual` (Step 10).
+12. Smoke-test one L2 wizard run until `base-image` exists (Step 11).

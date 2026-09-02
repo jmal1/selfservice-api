@@ -1,5 +1,15 @@
 # Windows Server 2025 Base Template Setup Guide
 
+> [!danger] BLOCKED — do not rebuild Server 2025 as a gate
+> This SKU is **not** a supported Crucible L1. First clone boot after
+> `sysprep /generalize` hits Microsoft `explorer.exe` `0xc0000409`, and
+> Cloudbase-Init fails to apply the per-clone password. Tracked as a known
+> issue on the Homelab vault **[[Roadmap]]** (do not invent a vault URL).
+> **Gold** is Windows Server 2022 (July 2026) —
+> [SERVER-2022-SETUP.md](SERVER-2022-SETUP.md). Additional Server SKU this
+> wave: [SERVER-2019-SETUP.md](SERVER-2019-SETUP.md). Keep this file for
+> historical hardware/answer-ISO notes only.
+
 This guide documents how to build the **L1 base Windows Server 2025 template**
 that the Crucible self-service portal's template wizard then provisions FROM.
 The output is a single, blessed `student-windows-server-2025` VM in the

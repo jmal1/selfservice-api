@@ -60,12 +60,14 @@ field in the wizard):
 | **Clone an existing vCenter VM** | Build from an imported OVA or a VM an admin points you at | No — no OS install needed |
 | **ISO install** | Install an OS from scratch off an installer disc | **Yes — this whole page** |
 
-The ten OSes below are the ones the ISO-install path is known to handle. The
-**install mode** and **Guest OS ID** columns are the values Crucible's installer
-automation actually supports today — they come straight from the platform's
-install-mode list (`manual`, `cloudinit_cidata`, `debian_preseed`,
-`windows_autounattend`). Anything not on this page hasn't been given a tested
-recipe yet; pick the closest match and expect to do more by hand.
+The OSes below are the ones the ISO-install path is known to handle, plus the
+Windows Server **L1 gold** clone path for 2019/2022. The **install mode** and
+**Guest OS ID** columns are the values Crucible's installer automation actually
+supports today — they come straight from the platform's install-mode list
+(`manual`, `cloudinit_cidata`, `debian_preseed`, `windows_autounattend`).
+**Windows Server 2025 is BLOCKED** (recipe 10) — do not use it as a build gate.
+Anything else not on this page hasn't been given a tested recipe yet; pick the
+closest match and expect to do more by hand.
 
 **What is live in your lab** is separate from what can be built. To see the
 templates students can deploy, go to **Admin → Templates** and look for ones in
@@ -334,12 +336,34 @@ Choose this if you don't need unique passwords and want the simplest path.
 
 ## Windows recipes
 
-All Windows recipes use `Install mode = windows_autounattend`. Crucible writes
-an `autounattend.xml` seed disc that installs Windows unattended, creates the
-`Student` account with a **sysprep-safe encoded password**, and installs
-**cloudbase-init** so each student clone gets its own random password. Generalize
-runs **sysprep /generalize** automatically. Give Windows more disk and RAM than
-Linux.
+All Windows recipes use `Install mode = windows_autounattend` **when you install
+from ISO**. Crucible writes an `autounattend.xml` seed disc that installs
+Windows unattended, creates the `Student` account with a **sysprep-safe encoded
+password**, and installs **cloudbase-init** so each student clone gets its own
+random password. Generalize runs **sysprep /generalize** automatically. Give
+Windows more disk and RAM than Linux.
+
+> [!important]
+> **Windows Server SKU status (Wave A).**
+>
+> - **Server 2022 is gold (July 2026).** Prefer cloning the published L1
+>   `student-windows-server-2022` (`clone_with_customize`, local account
+>   `Student`, existing Cloudbase-Init guestinfo password). Operator L1 runbook:
+>   `templates/windows/SERVER-2022-SETUP.md`.
+> - **Server 2019 is the additional Server SKU this wave.** Same L1 pipeline as
+>   2022 (answer ISO → WU → Cloudbase-Init → `sysprep /generalize /oobe /shutdown`
+>   → wizard `base-image` at L2). Operator L1 runbook:
+>   `templates/windows/SERVER-2019-SETUP.md`. A human still has to place
+>   `WindowsServer2019.iso` and build that L1 on lab.
+> - **Server 2025 is BLOCKED.** Microsoft `explorer.exe` crash `0xc0000409` on
+>   first clone boot after sysprep, plus a Cloudbase-Init password failure.
+>   Tracked as a known issue on the Homelab vault **[[Roadmap]]** (do not invent
+>   a vault URL). Do **not** rebuild 2025 as a gate. Use 2022 (gold) or 2019.
+>
+> Do **not** use the deprecated Homelab vault
+> `future/scripts/build-student-windows-server-*.ps1` scripts. Follow
+> `templates/windows/` + this page. No new credential protocol — per-clone
+> passwords stay on existing `clone_with_customize` / Cloudbase-Init.
 
 **The per-clone password just works — do not set it by hand.** The answer file
 stores the build password in Windows' encoded form
@@ -387,14 +411,20 @@ needs the supported workaround in recipe 6.
 
 <a id="fully-patch-before-sysprep"></a>
 > [!warning]
-> **Windows 11 24H2 and Server 2025 (build 26100): fully patch BEFORE you
-> Generalize.** Un-patched build-26100 images hit a Microsoft shell bug where
+> **Windows 11 24H2 (build 26100): fully patch BEFORE you Generalize.**
+> Un-patched build-26100 images hit a Microsoft shell bug where
 > `explorer.exe` crashes with `0xc0000409` on the **first clone boot after
 > sysprep /generalize**, leaving a gray screen. This is a Microsoft bug, **not** a
 > Crucible defect. Fix: in the Build Console, install the **November 2024 (or
 > later) cumulative update** so the image is build **≥ 26100.2314**, *then*
 > Generalize. Win11 23H2 (build 22631) is unaffected. (Confirm the exact KB on
 > the Windows Update history page for your build.)
+>
+> **Windows Server 2025 is BLOCKED for the same Microsoft `0xc0000409` explorer
+> crash plus a Cloudbase-Init password failure.** Do not treat "patch then
+> generalize" as a Server 2025 gate, and do not rebuild 2025 to unblock a
+> course. Tracked on the Homelab vault **[[Roadmap]]**. Use Server 2022 (gold,
+> July 2026) or Server 2019 instead — see [recipe 10](#10-windows-server-2025).
 
 ### 5. Windows 10 Pro
 
@@ -610,11 +640,52 @@ template reaches `active`. See the shared
 
 ### 8. Windows Server 2019
 
+**Preferred: clone the L1 gold VM** after an admin builds it. That L1 matches
+the Server 2022 (July 2026) pipeline: answer ISO → Windows Update →
+Cloudbase-Init (`username=Student`) → `sysprep /generalize /oobe /shutdown` →
+leave powered off (no L1 snapshot) → register for `clone_with_customize` →
+the wizard takes `base-image` at L2. Operator runbook (plain path, not a wiki
+page): `templates/windows/SERVER-2019-SETUP.md`. Do **not** use deprecated
+vault `future/scripts/build-student-windows-server-*.ps1`.
+
+Until that L1 exists on lab, a human must place **`WindowsServer2019.iso`** at
+`[NAS-BackupsAndISOS] ISOs/Windows/WindowsServer2019.iso` (see *Missing ISOs*).
+
+#### L1 deltas vs Server 2022 gold
+
+| Topic | Server 2022 (gold) | Server 2019 |
+|-------|--------------------|-------------|
+| guestId | `windows2019srvNext_64Guest` | **`windows2019srv_64Guest`** (no `Next`) |
+| Install ISO | `WindowsServer2022.iso` (already on NAS) | **`WindowsServer2019.iso`** (place first) |
+| Answer ISO / XML | `ws2022-autounattend.iso` / `autounattend-server2022.xml` | **`ws2019-autounattend.iso` / `autounattend-server2019.xml`** |
+| WIM `/IMAGE/NAME` | `Windows Server 2022 SERVERSTANDARD` | **`Windows Server 2019 SERVERSTANDARD`** (not `…CORE`) |
+| Disk controller | LSI Logic SAS | **LSI Logic SAS** (same — WS2019 WinPE has no reliable in-box pvscsi) |
+| ComputerName (build) | `WIN-WS2022-L1` | `WIN-WS2019-L1` |
+| pvscsi inject folder | Tools `pvscsi\Win10\amd64` | Tools **`pvscsi\Win8\amd64`** |
+| Local account / passwords | `Student` + existing `clone_with_customize` / Cloudbase-Init | **Identical** |
+| Sysprep | `/generalize /oobe /shutdown` once | **Identical** |
+
+#### After L1 is published — clone it (instructors)
+
+| Wizard field | Value |
+|--------------|-------|
+| **OS family** | `Windows` |
+| **Source type** | **Clone an existing Crucible template** (or **Clone an existing vCenter VM** if the L1 is not yet a Crucible row) |
+| **Source** | `Windows Server 2019` / vCenter VM `student-windows-server-2019` |
+| **Unattended → Username** | `Student` |
+| **Unattended → Password** | `Changeme123!` (bootstrap only — clones get a random password) |
+| **Generalize method** | sysprep /generalize (automatic — creates `base-image`) |
+
+kind is `clone_with_customize`. Per-clone passwords stay on Cloudbase-Init
+guestinfo — no new credential protocol.
+
+#### From-scratch ISO install (only if L1 is not published)
+
 | Wizard field | Value |
 |--------------|-------|
 | **OS family** | `Windows` |
 | **Source type** | `ISO install` |
-| **ISO** | Pick the Windows Server 2019 x64 ISO (e.g. `WinServer2019_x64.iso`). **Not yet in this lab's ISO library — ask an admin to upload it first** (see *Missing ISOs* at the bottom). |
+| **ISO** | Pick `WindowsServer2019.iso` after an admin uploads it (see *Missing ISOs*). |
 | **Install mode** | `windows_autounattend` |
 | **Guest OS ID** | `windows2019srv_64Guest` |
 | **vCPUs** | `2` |
@@ -628,7 +699,8 @@ template reaches `active`. See the shared
 
 **Steps** — identical to Windows 10: Provision → (optional) configure →
 Generalize → Publish. Setup sees the disk automatically — Server shells build on
-LSI SAS (Gap B, Option 2, #122), so no Load-driver step is needed.
+LSI SAS (Gap B, Option 2, #122), so no Load-driver step is needed. If you ever
+inject pvscsi by hand, use Tools `pvscsi\Win8\amd64`.
 
 **You're done when…** the template reaches `active` and a test deploy logs in as
 `Student` with the per-pod password. See the shared
@@ -638,12 +710,18 @@ LSI SAS (Gap B, Option 2, #122), so no Load-driver step is needed.
 
 ### 9. Windows Server 2022
 
+**Gold L1 (July 2026).** Prefer cloning the published
+`student-windows-server-2022` template (`clone_with_customize`, local account
+`Student`). Operator L1 runbook: `templates/windows/SERVER-2022-SETUP.md`.
+ISO-install from `WindowsServer2022.iso` remains available if you need a
+from-scratch rebuild.
+
 | Wizard field | Value |
 |--------------|-------|
 | **OS family** | `Windows` |
-| **Source type** | `ISO install` |
-| **ISO** | Pick the Windows Server 2022 x64 ISO — in this lab it is `WindowsServer2022.iso` |
-| **Install mode** | `windows_autounattend` |
+| **Source type** | **Clone an existing Crucible template** (preferred) or `ISO install` |
+| **ISO** | Only for from-scratch: `WindowsServer2022.iso` |
+| **Install mode** | `windows_autounattend` (ISO path only) |
 | **Guest OS ID** | `windows2019srvNext_64Guest` ⚠️ ("2019**Next**" = Server 2022, **not** 2019) |
 | **vCPUs** | `2` |
 | **RAM (MB)** | `4096` |
@@ -654,9 +732,9 @@ LSI SAS (Gap B, Option 2, #122), so no Load-driver step is needed.
 | **Unattended → Password** | `Changeme123!` |
 | **Generalize method** | sysprep /generalize (automatic) |
 
-**Steps** — identical to Windows 10: Provision → (optional) configure →
-Generalize → Publish. Setup sees the disk automatically — Server shells build on
-LSI SAS (Gap B, Option 2, #122), so no Load-driver step is needed.
+**Steps** — clone the gold L1 (or ISO-install like Windows 10): Provision →
+(optional) configure → Generalize → Publish. Server shells build on LSI SAS
+(Gap B, Option 2, #122), so no Load-driver step is needed.
 
 **You're done when…** the template reaches `active` and a test deploy logs in as
 `Student` with the per-pod password. See the shared
@@ -664,49 +742,28 @@ LSI SAS (Gap B, Option 2, #122), so no Load-driver step is needed.
 
 ---
 
+<a id="10-windows-server-2025"></a>
 ### 10. Windows Server 2025
 
-| Wizard field | Value |
-|--------------|-------|
-| **OS family** | `Windows` |
-| **Source type** | `ISO install` |
-| **ISO** | Pick the Windows Server 2025 x64 ISO — in this lab it is `WindowsServer2025.iso` |
-| **Install mode** | `windows_autounattend` |
-| **Guest OS ID** | `windows2022srvNext_64Guest` ⚠️ ("2022**Next**" = Server 2025, **not** 2022) |
-| **vCPUs** | `2` |
-| **RAM (MB)** | `4096` |
-| **Disk (GB)** | `70` (60–80 is fine) |
-| **Firmware / vTPM** | EFI (default). No vTPM required. |
-| **Unattended → Hostname** | `ws2025-lab` (or blank) |
-| **Unattended → Username** | `Student` |
-| **Unattended → Password** | `Changeme123!` |
-| **Generalize method** | sysprep /generalize (automatic) |
+> [!danger]
+> **BLOCKED — do not build or rebuild Server 2025 as a gate.**
+>
+> First clone boot after `sysprep /generalize` hits Microsoft `explorer.exe`
+> `0xc0000409` (gray desktop), and Cloudbase-Init fails to apply the per-clone
+> password. This is tracked as a known issue on the Homelab vault
+> **[[Roadmap]]** (do not invent a vault URL). Patching cumulative updates is
+> **not** an accepted unblock for this SKU in Crucible.
+>
+> Use **Server 2022 (gold, July 2026)** or **Server 2019** instead.
 
-**Gotchas**
+Historical guest-OS ID only (so nobody "corrects" the enum table above):
+`windows2022srvNext_64Guest` ("2022**Next**" = Server 2025). The ISO
+`WindowsServer2025.iso` may still appear in the picker; **do not** start a
+new template from it. Operator notes retained for history only:
+`templates/windows/SERVER-2025-SETUP.md`.
 
-- **Fully patch before you Generalize.** Server 2025 is build **26100** and hits
-  the same first-clone gray-screen bug as Windows 11 24H2. Install the Nov 2024+
-  cumulative update (build ≥ 26100.2314) in the console **before** Generalize —
-  see [fully patch before sysprep](#fully-patch-before-sysprep).
-- **BitLocker cmdlets are missing by default.** Crucible's generalize step tries
-  to auto-decrypt any BitLocker volume, but Server 2025 doesn't ship
-  `manage-bde` / the BitLocker PowerShell module out of the box, so that step
-  simply **no-ops** — which is fine for a lab image that never enabled
-  BitLocker. Don't be alarmed if the generalize log mentions skipping it.
-- **Large cumulative updates can fail over COM.** If a big cumulative update
-  errors out when scripted, drive it from **Settings → Windows Update** (or
-  `UsoClient StartInstall`) rather than a scripted COM call, which can fail on
-  WS2025.
-- Storage: no action needed — Server shells build on LSI SAS automatically
-  (Gap B, Option 2, #122), so Setup sees the disk without a Load-driver step.
-- **Guest OS ID fallback:** if your ESXi 8.0 build's dropdown doesn't offer
-  `windows2022srvNext_64Guest` yet, fall back to `windows2019srvNext_64Guest`
-  (Server 2022's ID) — the install still works; only optimization hints differ.
-
-**You're done when…** the template reaches `active`; a test clone boots to a
-desktop (no gray screen) and the generalize log skipping BitLocker is expected,
-not an error. See the shared
-[health-check checklist](#health-check-checklist-every-recipe).
+**You're done when…** you did **not** publish a Server 2025 template. Pick
+recipe 8 or 9.
 
 ---
 
@@ -763,16 +820,21 @@ Three recipes above point here because their installer ISO is **not yet in this
 lab's ISO library**, so the wizard's **ISO source** dropdown won't list them until
 an admin uploads them to the `NAS-BackupsAndISOS` datastore (`ISOs/…`):
 
-| OS | Recipe | Get the ISO from |
-|----|--------|------------------|
-| Debian 12 / 13 | Recipe 3 (Debian) | debian.org → the amd64 netinst/DVD image |
-| Windows Server 2016 | Server recipes | Microsoft Evaluation Center / VLSC |
-| Windows Server 2019 | Server recipes | Microsoft Evaluation Center / VLSC |
+| OS | Recipe | Filename to place | Get the ISO from |
+|----|--------|-------------------|------------------|
+| Debian 12 / 13 | Recipe 3 (Debian) | as published on debian.org | debian.org → the amd64 netinst/DVD image |
+| Windows Server 2016 | Server recipes | e.g. `WinServer2016_x64.iso` | Microsoft Evaluation Center / VLSC |
+| Windows Server 2019 | Recipe 8 + L1 runbook | **`WindowsServer2019.iso`** at `ISOs/Windows/WindowsServer2019.iso` | Microsoft Evaluation Center / VLSC (Standard Desktop Experience Eval) |
+
+The Server 2019 L1 also needs the answer ISO `ws2019-autounattend.iso` built
+from `templates/windows/autounattend-server2019.xml` — see
+`templates/windows/SERVER-2019-SETUP.md`.
 
 Everything else in this guide (Ubuntu Server/Desktop 24.04.3, Linux Mint 22.3,
-Windows 10, Windows 11 25H2, Windows Server 2022, Windows Server 2025) **is
-already uploaded** and will appear in the picker with the exact filename shown in
-each recipe's **ISO** row.
+Windows 10, Windows 11 25H2, Windows Server 2022) **is already uploaded** and
+will appear in the picker with the exact filename shown in each recipe's **ISO**
+row. `WindowsServer2025.iso` may also be on the datastore; that SKU is
+[blocked](#10-windows-server-2025) — do not start a new template from it.
 
 ---
 

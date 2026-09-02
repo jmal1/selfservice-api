@@ -1,0 +1,268 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Install-time answer file for the Windows Server 2019 L1 base template.
+
+  This is DIFFERENT from internal/provisioner/assets/windows-unattend.xml:
+    * THIS file (autounattend.xml) automates the *OS install* of the L1 VM
+      only. It is burned onto a small "answer ISO" mounted as a 2nd CD next
+      to WindowsServer2019.iso, and Windows Setup reads it automatically from
+      the ISO root during the windowsPE pass. It never travels to L2/L3.
+    * windows-unattend.xml is the *sysprep* answer file that the Crucible
+      wizard writes to C:\Windows\Panther\unattend.xml on every L2 generalize
+      run; it creates the per-clone Student account. See templates/windows/
+      SERVER-2019-SETUP.md, SERVER-2022-SETUP.md (gold), and SETUP.md.
+
+  End state produced by this file:
+    * Windows Server 2019 Standard (Desktop Experience) installed on a clean
+      UEFI/GPT 60 GB disk (Evaluation media — 180 day, rearmable).
+    * Built-in Administrator enabled with a throwaway build password.
+    * OOBE fully skipped; auto-logon once as Administrator to (a) set the
+      built-in Administrator to never expire and (b) silently install VMware
+      Tools from setup64.exe / setup.exe on the bundled answer/tools ISO (no
+      internet). If Tools is not bundled, install it via vSphere per
+      SERVER-2019-SETUP.md.
+    * RDP enabled (NLA off) + firewall opened, purely for build-phase access.
+
+  After the install completes and VMware Tools is running, the remaining L1
+  prep (Windows Update, cloudbase-init, unattend placement, sysprep) is driven
+  via `govc guest.run` per SERVER-2019-SETUP.md. That runbook is a delta of
+  the gold Server 2022 (July 2026) flow in SERVER-2022-SETUP.md.
+
+  Image name comes from the WIM inside WindowsServer2019.iso:
+    Index 2 = "Windows Server 2019 SERVERSTANDARD"
+             (Display: "Windows Server 2019 Standard Evaluation (Desktop Experience)")
+    VERIFY on the actual media before building — some ISOs order/label the WIM
+    differently. Run `dism /Get-WimInfo /WimFile:<mount>\sources\install.wim`
+    and set /IMAGE/NAME below to the exact "Name" of the Standard Desktop
+    Experience image (see SERVER-2019-SETUP.md "Prerequisites"). Do not pick
+    SERVERSTANDARDCORE.
+-->
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+
+  <!-- ============ windowsPE: locale, disk layout, image selection ============ -->
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64"
+      publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+      xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <SetupUILanguage>
+        <UILanguage>en-US</UILanguage>
+      </SetupUILanguage>
+      <InputLocale>en-US</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UserLocale>en-US</UserLocale>
+    </component>
+
+    <component name="Microsoft-Windows-Setup" processorArchitecture="amd64"
+      publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+      xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+
+      <!-- Wipe disk 0 and lay down a standard UEFI/GPT layout:
+           EFI system (260MB) + MSR (128MB) + Windows (rest).
+           NOTE: the L1 VM's disk is on an LSI Logic SAS controller (NOT
+           pvscsi) so WinPE sees it in-box with no F6 driver — see
+           SERVER-2019-SETUP.md "VM hardware". Same controller as the gold
+           Server 2022 L1; WS2019 WinPE also lacks a reliable in-box pvscsi. -->
+      <DiskConfiguration>
+        <Disk wcm:action="add">
+          <DiskID>0</DiskID>
+          <WillWipeDisk>true</WillWipeDisk>
+          <CreatePartitions>
+            <CreatePartition wcm:action="add">
+              <Order>1</Order>
+              <Type>EFI</Type>
+              <Size>260</Size>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>2</Order>
+              <Type>MSR</Type>
+              <Size>128</Size>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>3</Order>
+              <Type>Primary</Type>
+              <Extend>true</Extend>
+            </CreatePartition>
+          </CreatePartitions>
+          <ModifyPartitions>
+            <ModifyPartition wcm:action="add">
+              <Order>1</Order>
+              <PartitionID>1</PartitionID>
+              <Format>FAT32</Format>
+              <Label>System</Label>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>2</Order>
+              <PartitionID>2</PartitionID>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>3</Order>
+              <PartitionID>3</PartitionID>
+              <Format>NTFS</Format>
+              <Label>Windows</Label>
+              <Letter>C</Letter>
+            </ModifyPartition>
+          </ModifyPartitions>
+        </Disk>
+      </DiskConfiguration>
+
+      <ImageInstall>
+        <OSImage>
+          <!-- Select the Standard (Desktop Experience) edition by WIM name so
+               Setup never shows the "which edition" picker. VERIFY the exact
+               name against the media (see header comment). -->
+          <InstallFrom>
+            <MetaData wcm:action="add">
+              <Key>/IMAGE/NAME</Key>
+              <Value>Windows Server 2019 SERVERSTANDARD</Value>
+            </MetaData>
+          </InstallFrom>
+          <InstallTo>
+            <DiskID>0</DiskID>
+            <PartitionID>3</PartitionID>
+          </InstallTo>
+        </OSImage>
+      </ImageInstall>
+
+      <UserData>
+        <AcceptEula>true</AcceptEula>
+        <FullName>Crucible Lab</FullName>
+        <Organization>Crucible</Organization>
+        <!-- Evaluation media has no product key. An empty ProductKey with
+             WillShowUI=Never suppresses the product-key page. -->
+        <ProductKey>
+          <WillShowUI>Never</WillShowUI>
+        </ProductKey>
+      </UserData>
+    </component>
+  </settings>
+
+  <!-- ============ specialize: hostname, timezone, RDP (build-phase only) ============ -->
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64"
+      publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+      xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <ComputerName>WIN-WS2019-L1</ComputerName>
+      <TimeZone>Eastern Standard Time</TimeZone>
+      <RegisteredOrganization>Crucible</RegisteredOrganization>
+      <RegisteredOwner>Crucible Lab</RegisteredOwner>
+    </component>
+
+    <!-- Enable RDP -->
+    <component name="Microsoft-Windows-TerminalServices-LocalSessionManager" processorArchitecture="amd64"
+      publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+      xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <fDenyTSConnections>false</fDenyTSConnections>
+    </component>
+
+    <!-- Open the Remote Desktop firewall group -->
+    <component name="Networking-MPSSVC-Svc" processorArchitecture="amd64"
+      publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+      xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <FirewallGroups>
+        <FirewallGroup wcm:action="add" wcm:keyValue="RemoteDesktop">
+          <Active>true</Active>
+          <Group>Remote Desktop</Group>
+          <Profile>all</Profile>
+        </FirewallGroup>
+      </FirewallGroups>
+    </component>
+
+    <!-- Disable NLA so build-phase RDP works before creds are finalized -->
+    <component name="Microsoft-Windows-TerminalServices-RDP-WinStationExtensions" processorArchitecture="amd64"
+      publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+      xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <UserAuthentication>0</UserAuthentication>
+    </component>
+  </settings>
+
+  <!-- ============ oobeSystem: skip OOBE, set admin pw, install VMware Tools ============ -->
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64"
+      publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+      xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideLocalAccountScreen>true</HideLocalAccountScreen>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <ProtectYourPC>3</ProtectYourPC>
+        <SkipMachineOOBE>true</SkipMachineOOBE>
+        <SkipUserOOBE>true</SkipUserOOBE>
+      </OOBE>
+
+      <!-- Set the built-in Administrator password (throwaway build password;
+           disabled again before sysprep per SERVER-2019-SETUP.md). -->
+      <UserAccounts>
+        <AdministratorPassword>
+          <Value>BuildAdmin123!</Value>
+          <PlainText>true</PlainText>
+        </AdministratorPassword>
+      </UserAccounts>
+
+      <!-- One auto-logon as Administrator to run the VMware Tools install. -->
+      <AutoLogon>
+        <Enabled>true</Enabled>
+        <Username>Administrator</Username>
+        <Password>
+          <Value>BuildAdmin123!</Value>
+          <PlainText>true</PlainText>
+        </Password>
+        <LogonCount>1</LogonCount>
+      </AutoLogon>
+
+      <FirstLogonCommands>
+        <!-- Harden the throwaway build Administrator so an inactivity/maxpwage
+             policy can never blank the password mid-build (this bit us once:
+             govc guest auth started failing after the password silently
+             expired). The final hardening also runs in SERVER-2019-SETUP.md
+             via govc, but doing it here protects the whole build window. -->
+        <SynchronousCommand wcm:order="1">
+          <CommandLine>powershell -NoProfile -ExecutionPolicy Bypass -Command "Set-LocalUser -Name Administrator -PasswordNeverExpires $true; net accounts /maxpwage:unlimited"</CommandLine>
+          <Description>Administrator password never expires (build safety)</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+        <!-- Install VMware Tools with NO internet from the bundled answer ISO.
+             Scan drive letters D..L. The bundled Tools tree lives under
+             \vmtools\ and its installer is setup.exe (modern Tools 12.x/13.x
+             dropped the separate setup64.exe); older media used setup64.exe.
+             Check \vmtools\setup64.exe, then \vmtools\setup.exe, then a bare
+             \setup64.exe at a CD root. Deliberately do NOT match a bare
+             \setup.exe at a root — that is the Windows install ISO's own
+             Setup.exe and would relaunch Windows Setup. Silent syntax is
+             `/S /v"/qn REBOOT=ReallySuppress"` (no space between /v and the
+             quote). If none is found, install Tools via vSphere per
+             SERVER-2019-SETUP.md step 2; the govc-driven prep cannot start
+             until Tools is running.
+
+             This is a PowerShell -EncodedCommand (base64, UTF-16LE) rather than
+             an inline `cmd /c "..."` for-loop: the cmd form's nested
+             `/v"/qn ..."` double quotes prematurely close the outer `cmd /c "..."`
+             quote and silently break the loop, so Tools never installed (this
+             bit the first WS2022 build — Tools had to be installed manually).
+             The encoded form has zero quoting to mangle. Decoded script:
+               foreach($d in 68..76){$L=[char]$d;foreach($p in
+                 'vmtools\setup64.exe','vmtools\setup.exe','setup64.exe'){
+                 $f="${L}:\$p";if(Test-Path $f){Start-Process -FilePath $f
+                 -ArgumentList '/S /v"/qn REBOOT=ReallySuppress"' -Wait;exit}}} -->
+        <SynchronousCommand wcm:order="2">
+          <CommandLine>powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand ZgBvAHIAZQBhAGMAaAAoACQAZAAgAGkAbgAgADYAOAAuAC4ANwA2ACkAewAkAEwAPQBbAGMAaABhAHIAXQAkAGQAOwBmAG8AcgBlAGEAYwBoACgAJABwACAAaQBuACAAJwB2AG0AdABvAG8AbABzAFwAcwBlAHQAdQBwADYANAAuAGUAeABlACcALAAnAHYAbQB0AG8AbwBsAHMAXABzAGUAdAB1AHAALgBlAHgAZQAnACwAJwBzAGUAdAB1AHAANgA0AC4AZQB4AGUAJwApAHsAJABmAD0AIgAkAHsATAB9ADoAXAAkAHAAIgA7AGkAZgAoAFQAZQBzAHQALQBQAGEAdABoACAAJABmACkAewBTAHQAYQByAHQALQBQAHIAbwBjAGUAcwBzACAALQBGAGkAbABlAFAAYQB0AGgAIAAkAGYAIAAtAEEAcgBnAHUAbQBlAG4AdABMAGkAcwB0ACAAJwAvAFMAIAAvAHYAIgAvAHEAbgAgAFIARQBCAE8ATwBUAD0AUgBlAGEAbABsAHkAUwB1AHAAcAByAGUAcwBzACIAJwAgAC0AVwBhAGkAdAA7AGUAeABpAHQAfQB9AH0A</CommandLine>
+          <Description>Install VMware Tools silently from answer/tools ISO</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+      </FirstLogonCommands>
+    </component>
+
+    <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64"
+      publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+      xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <InputLocale>en-US</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UserLocale>en-US</UserLocale>
+    </component>
+  </settings>
+
+</unattend>
