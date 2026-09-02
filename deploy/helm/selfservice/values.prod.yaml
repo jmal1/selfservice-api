@@ -31,13 +31,11 @@ provisioning:
   workerClaimsEnabled: true
 
 vcenter:
-  # Exact-host canary pin: ESXi1 only. ESXi2 is no longer "indefinite quarantine"
-  # (2026-09-01 forensics: VMwareCertified if_re 1.101.01, NetPort 708 is not
-  # Crucible-specific). Do not add esxi2.lab.jmal.io until one attended
-  # synthetic-noop on ESXi2 returns zero residue. Intel NUCs are overflow.
-  hosts: "esxi1.lab.jmal.io"
+  # Exact-host canary pin: ESXi2 only, after ESXi1 synthetic-noop 97d7c4dc
+  # created/destroyed on host-1002 with zero extra residue (2026-09-02).
+  hosts: "esxi2.lab.jmal.io"
   resourcePools: "/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs"
-  placementReservedMemoryMB: "esxi1.lab.jmal.io=8192"
+  placementReservedMemoryMB: "esxi2.lab.jmal.io=8192"
   # k3sv01 validates the vCenter 8.0.3 certificate through the system trust
   # chain. Keep hostname verification enabled in every production process.
   insecure: "false"

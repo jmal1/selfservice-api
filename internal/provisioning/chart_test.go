@@ -235,8 +235,8 @@ func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T
 		!values.Synthetic.Runner.Suspend || !values.Synthetic.Janitor.Suspend {
 		t.Fatalf("production mutating synthetics must stay enabled but suspended until AMD canaries pass: %+v", values.Synthetic)
 	}
-	if values.VCenter.Hosts != "esxi1.lab.jmal.io" {
-		t.Fatalf("production VCENTER_HOSTS = %q, want ESXi1 only until the ESXi2 canary", values.VCenter.Hosts)
+	if values.VCenter.Hosts != "esxi2.lab.jmal.io" {
+		t.Fatalf("production VCENTER_HOSTS = %q, want ESXi2 only for the attended canary", values.VCenter.Hosts)
 	}
 	if values.VCenter.ResourcePools != "/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs" {
 		t.Fatalf("production resource pools = %q, want ESXi1-compatible AMD pool only", values.VCenter.ResourcePools)
@@ -244,8 +244,8 @@ func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T
 	if values.VCenter.Insecure != "false" {
 		t.Fatalf("production vCenter insecure = %q, want strict TLS", values.VCenter.Insecure)
 	}
-	if values.VCenter.PlacementReservedMemoryMB != "esxi1.lab.jmal.io=8192" {
-		t.Fatalf("production placement reserve = %q, want ESXi1 8 GiB", values.VCenter.PlacementReservedMemoryMB)
+	if values.VCenter.PlacementReservedMemoryMB != "esxi2.lab.jmal.io=8192" {
+		t.Fatalf("production placement reserve = %q, want ESXi2 8 GiB", values.VCenter.PlacementReservedMemoryMB)
 	}
 	if values.Worker.OrphanReconciler.Enabled ||
 		values.Worker.NetworkReconciler.Enabled ||
@@ -267,10 +267,10 @@ func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T
 		"synthetic.runner.enabled":              "true",
 		"synthetic.janitor.suspend":             "true",
 		"synthetic.runner.suspend":              "true",
-		"vcenter.hosts":                         "esxi1.lab.jmal.io",
+		"vcenter.hosts":                         "esxi2.lab.jmal.io",
 		"vcenter.resourcePools":                 "/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs",
 		"vcenter.insecure":                      "false",
-		"vcenter.placementReservedMemoryMB":     "esxi1.lab.jmal.io=8192",
+		"vcenter.placementReservedMemoryMB":     "esxi2.lab.jmal.io=8192",
 		"worker.orphanReconciler.enabled":       "false",
 		"worker.networkReconciler.enabled":      "false",
 		"worker.l1Validation.enabled":           "true",
