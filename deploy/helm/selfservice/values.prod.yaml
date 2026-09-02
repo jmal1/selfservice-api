@@ -5,11 +5,9 @@
 # intent (admission, claims, hosts, synthetic suspend). Do not leave a newer
 # contract only on the cluster or in /tmp overlays.
 #
-# Note: deploy.sh validate_foundation_intent still requires a contained
-# candidate (PROVISIONING_ENABLED=false). A guarded deploy.sh apply of this
-# overlay will fail until that gate is retargeted. Until then, production
-# applies of this file use helm with the digest post-renderer from git, not
-# host-local script copies.
+# deploy.sh validate_foundation_intent matches this reopened contract:
+# PROVISIONING_ENABLED=true, worker claims=true, synthetic provisioning
+# expected=true, lifecycle=true, content-filter still false, worker replicas=1.
 #
 # Anything NOT listed here uses defaults from values.yaml. Keep this file as
 # small as possible — only true production overrides belong here.
