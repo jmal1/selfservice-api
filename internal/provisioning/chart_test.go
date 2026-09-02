@@ -248,7 +248,7 @@ func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T
 		t.Fatalf("production placement reserve = %q, want ESXi1/ESXi2 8 GiB plus nuc1 4 GiB and nuc2/nuc3 2 GiB", values.VCenter.PlacementReservedMemoryMB)
 	}
 	if values.Worker.OrphanReconciler.Enabled ||
-		values.Worker.NetworkReconciler.Enabled ||
+		!values.Worker.NetworkReconciler.Enabled ||
 		!values.Worker.L1Validation.Enabled ||
 		!values.Worker.TemplateHealth.Enabled ||
 		values.Worker.IdleEvaluator.Enabled ||
@@ -272,7 +272,7 @@ func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T
 		"vcenter.insecure":                      "false",
 		"vcenter.placementReservedMemoryMB":     "esxi1.lab.jmal.io=8192,esxi2.lab.jmal.io=8192,nuc1.lab.jmal.io=4096,nuc2.lab.jmal.io=2048,nuc3.lab.jmal.io=2048",
 		"worker.orphanReconciler.enabled":       "false",
-		"worker.networkReconciler.enabled":      "false",
+		"worker.networkReconciler.enabled":      "true",
 		"worker.l1Validation.enabled":           "true",
 		"worker.templateHealth.enabled":         "true",
 		"worker.idleEvaluator.enabled":          "false",

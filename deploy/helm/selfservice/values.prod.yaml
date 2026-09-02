@@ -110,7 +110,7 @@ worker:
   orphanReconciler:
     enabled: false
   networkReconciler:
-    enabled: false
+    enabled: true
   idleEvaluator:
     enabled: false
     dryRun: true
