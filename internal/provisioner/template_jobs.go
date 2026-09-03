@@ -33,6 +33,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/vmware/govmomi/vim25/mo"
 
 	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/models"
@@ -66,7 +67,8 @@ const windowsUnattendGuestPath = `C:\Windows\Panther\unattend.xml`
 //
 // SourceType is one of models.TemplateSource* constants. SourceRef's
 // meaning depends on SourceType:
-//   - clone_template / clone_vcenter: vCenter VM moref of the source
+//   - clone_template / clone_vcenter / ovf: vCenter VM moref of the source
+//     (ovf source_ref is already a moref of an imported OVA)
 //   - iso: "[datastore] path/to/installer.iso" — the installer media a
 //     freshly-created blank VM boots from. See provisionTemplateFromISO.
 //
@@ -174,8 +176,9 @@ func (p *Provisioner) ProvisionTemplate(ctx context.Context, job *models.Job) er
 			func(step, message string) { p.publishProgress(job.ID, step, message) }, payload)
 	}
 
-	// clone_template / clone_vcenter: resolve the source to a live vCenter
-	// moref via the SAME helper preflight uses, so the two can never diverge.
+	// clone_template / clone_vcenter / ovf: resolve the source to a live
+	// vCenter moref via the SAME helper preflight uses, so the two can never
+	// diverge.
 	//
 	// source_ref semantics depend on source_type. clone_vcenter's source_ref
 	// is already a moref; clone_template's is a *Crucible templates.id UUID*
@@ -668,13 +671,6 @@ func (p *Provisioner) GeneralizeTemplate(ctx context.Context, job *models.Job) e
 	if payload.VMMoref == "" {
 		return fmt.Errorf("vm_moref is required")
 	}
-	if payload.GuestUsername == "" || payload.GuestPassword == "" {
-		return fmt.Errorf("guest_username and guest_password are required")
-	}
-	osType := strings.ToLower(payload.OSType)
-	if osType != "linux" && osType != "windows" {
-		return fmt.Errorf("os_type must be 'linux' or 'windows', got %q", payload.OSType)
-	}
 	snapshotName := payload.SnapshotName
 	if snapshotName == "" {
 		snapshotName = "base-image"
@@ -691,6 +687,21 @@ func (p *Provisioner) GeneralizeTemplate(ctx context.Context, job *models.Job) e
 		return fmt.Errorf("template %s is in state %q, expected %q",
 			payload.TemplateID, tmpl.TemplateState, models.TemplateStateGeneralizing)
 	}
+
+	skipGuestOps, planErr := planGeneralize(tmpl, &payload)
+	if planErr != nil {
+		return planErr
+	}
+	if skipGuestOps {
+		if err := skipGeneralizeAndFinalize(ctx, p.vc, p.db, p.pipeline,
+			func(step, message string) { p.publishProgress(job.ID, step, message) },
+			&payload, snapshotName); err != nil {
+			return p.markTemplateError(ctx, payload.TemplateID, err)
+		}
+		return nil
+	}
+
+	osType := strings.ToLower(payload.OSType)
 
 	// Step 0 (recovery / idempotency): if the VM is already powered off when
 	// this job starts, a *previous* generalize run's sysprep almost certainly
@@ -923,27 +934,131 @@ func powerOffTimeout(osType string) time.Duration {
 	return 10 * time.Minute
 }
 
+// planGeneralize decides whether template_generalize skips GuestOps.
+// skip_generalize=true never requires guest credentials. The normal path
+// still requires username+password and a linux/windows os_type.
+func planGeneralize(tmpl *models.Template, payload *TemplateGeneralizePayload) (skipGuestOps bool, err error) {
+	if tmpl != nil && tmpl.SkipGeneralize {
+		return true, nil
+	}
+	if payload.GuestUsername == "" || payload.GuestPassword == "" {
+		return false, fmt.Errorf("guest_username and guest_password are required")
+	}
+	osType := strings.ToLower(payload.OSType)
+	if osType != "linux" && osType != "windows" {
+		return false, fmt.Errorf("os_type must be 'linux' or 'windows', got %q", payload.OSType)
+	}
+	return false, nil
+}
+
+// skipGeneralizeVCenter is the vCenter subset the skip_generalize short-circuit
+// needs. *vcenter.Client satisfies it; tests inject a fake so GuestOps methods
+// are not even on the type — calling them is a compile error in those tests.
+type skipGeneralizeVCenter interface {
+	GetVM(ctx context.Context, moref string) (*mo.VirtualMachine, error)
+	PowerOffVM(ctx context.Context, moref string) error
+	CreateVMSnapshot(ctx context.Context, moref, name, description string) (string, error)
+}
+
+// skipGeneralizeDB is the database subset the skip_generalize short-circuit needs.
+type skipGeneralizeDB interface {
+	UpdateTemplateLifecycleState(ctx context.Context, id uuid.UUID, from, to string) error
+}
+
+var (
+	_ skipGeneralizeVCenter = (*vcenter.Client)(nil)
+	_ skipGeneralizeDB      = (*database.Queries)(nil)
+)
+
+// skipGeneralizeAndFinalize implements skip_generalize=true: power the staging
+// VM off if needed, then take the base-image snapshot and advance to ready.
+// It never calls GuestOps. Credentials are not required.
+func skipGeneralizeAndFinalize(
+	ctx context.Context,
+	vc skipGeneralizeVCenter,
+	db skipGeneralizeDB,
+	metrics pipelineMetricsSink,
+	progress func(step, message string),
+	payload *TemplateGeneralizePayload,
+	snapshotName string,
+) error {
+	props, err := vc.GetVM(ctx, payload.VMMoref)
+	if err != nil {
+		return fmt.Errorf("read VM state: %w", err)
+	}
+	if props.Runtime.PowerState != "poweredOff" {
+		if progress != nil {
+			progress("power_off", "Powering off VM (skip_generalize)")
+		}
+		if offErr := vc.PowerOffVM(ctx, payload.VMMoref); offErr != nil && !isAlreadyPoweredOffErr(offErr) {
+			return fmt.Errorf("power off: %w", offErr)
+		}
+	}
+	if err := snapshotAndMarkReady(ctx, vc, db, metrics, progress, payload, snapshotName); err != nil {
+		return err
+	}
+	payload.GuestUsername = "[redacted]"
+	payload.GuestPassword = "[redacted]"
+	return nil
+}
+
+func isAlreadyPoweredOffErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "invalidpowerstate") ||
+		strings.Contains(msg, "powered off")
+}
+
+// snapshotAndMarkReady snapshots the powered-off VM as the base image and
+// advances generalizing → ready. Shared by skip_generalize and the normal
+// finalize path.
+func snapshotAndMarkReady(
+	ctx context.Context,
+	vc skipGeneralizeVCenter,
+	db skipGeneralizeDB,
+	metrics pipelineMetricsSink,
+	progress func(step, message string),
+	payload *TemplateGeneralizePayload,
+	snapshotName string,
+) error {
+	if progress != nil {
+		progress("create_snapshot", fmt.Sprintf("Snapshotting as %q", snapshotName))
+	}
+	if _, err := vc.CreateVMSnapshot(ctx, payload.VMMoref, snapshotName,
+		"Created by Crucible template wizard on "+time.Now().UTC().Format(time.RFC3339)); err != nil {
+		return fmt.Errorf("snapshot: %w", err)
+	}
+	if progress != nil {
+		progress("update_state", "Marking template as ready")
+	}
+	if err := templates.CanTransition(models.TemplateStateGeneralizing, models.TemplateStateReady); err != nil {
+		return fmt.Errorf("advance to ready: %w", err)
+	}
+	if err := db.UpdateTemplateLifecycleState(ctx, payload.TemplateID, models.TemplateStateGeneralizing, models.TemplateStateReady); err != nil {
+		return fmt.Errorf("advance to ready: %w", err)
+	}
+	if metrics != nil {
+		metrics.RecordTemplateTransition(models.TemplateStateGeneralizing, models.TemplateStateReady)
+	}
+	return nil
+}
+
 // finalizeGeneralizedTemplate runs the terminal steps shared by the normal
 // generalize path and the Step 0 "VM already powered off" recovery path:
 // snapshot the powered-off VM as the base image, advance the template to
 // 'ready', and scrub credentials from the in-process payload struct so the
 // worker's success result doesn't echo them.
 func (p *Provisioner) finalizeGeneralizedTemplate(ctx context.Context, job *models.Job, payload *TemplateGeneralizePayload, snapshotName string) error {
-	// Step 4: snapshot
-	p.publishProgress(job.ID, "create_snapshot", fmt.Sprintf("Snapshotting as %q", snapshotName))
-	if _, err := p.vc.CreateVMSnapshot(ctx, payload.VMMoref, snapshotName,
-		"Created by Crucible template wizard on "+time.Now().UTC().Format(time.RFC3339)); err != nil {
-		return p.markTemplateError(ctx, payload.TemplateID, fmt.Errorf("snapshot: %w", err))
+	if err := snapshotAndMarkReady(ctx, p.vc, p.db, p.pipeline,
+		func(step, message string) { p.publishProgress(job.ID, step, message) },
+		payload, snapshotName); err != nil {
+		return p.markTemplateError(ctx, payload.TemplateID, err)
 	}
 
-	// Step 5: advance to 'ready'
-	p.publishProgress(job.ID, "update_state", "Marking template as ready")
-	if err := p.transitionTemplate(ctx, payload.TemplateID, models.TemplateStateGeneralizing, models.TemplateStateReady); err != nil {
-		return p.markTemplateError(ctx, payload.TemplateID, fmt.Errorf("advance to ready: %w", err))
-	}
-
-	// Step 6: scrub credentials in this in-process payload struct so
-	// when the worker writes the success result, the creds aren't echoed.
+	// Scrub credentials in this in-process payload struct so when the
+	// worker writes the success result, the creds aren't echoed.
 	// (The DB payload column still has them; documented above.)
 	payload.GuestUsername = "[redacted]"
 	payload.GuestPassword = "[redacted]"

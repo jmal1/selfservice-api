@@ -73,6 +73,7 @@ func TestTemplateSourceConstantsAreStable(t *testing.T) {
 		{TemplateSourceCloneTemplate, "clone_template"},
 		{TemplateSourceCloneVCenter, "clone_vcenter"},
 		{TemplateSourceISO, "iso"},
+		{TemplateSourceOVF, "ovf"},
 	}
 	for _, c := range cases {
 		if c.got != c.want {
@@ -92,6 +93,7 @@ func TestTemplateJSONWireShapeIncludesLifecycleFields(t *testing.T) {
 		SourceType:     TemplateSourceCloneTemplate,
 		SourceRef:      "00000000-0000-0000-0000-000000000001",
 		StagingNetwork: "LabVMs-VLAN30",
+		SkipGeneralize: true,
 	}
 	b, err := json.Marshal(tmpl)
 	if err != nil {
@@ -104,6 +106,7 @@ func TestTemplateJSONWireShapeIncludesLifecycleFields(t *testing.T) {
 		`"source_type":"clone_template"`,
 		`"source_ref":"00000000-0000-0000-0000-000000000001"`,
 		`"staging_network":"LabVMs-VLAN30"`,
+		`"skip_generalize":true`,
 	} {
 		if !contains(got, want) {
 			t.Errorf("template JSON missing %s in: %s", want, got)
@@ -122,4 +125,42 @@ func contains(haystack, needle string) bool {
 		}
 	}
 	return false
+}
+
+func TestValidateSkipGeneralize(t *testing.T) {
+	if err := ValidateSkipGeneralize(TemplateSourceISO, true); err == nil {
+		t.Fatal("skip_generalize=true on iso must be rejected")
+	}
+	if err := ValidateSkipGeneralize(TemplateSourceCloneTemplate, true); err == nil {
+		t.Fatal("skip_generalize=true on clone_template must be rejected")
+	}
+	if err := ValidateSkipGeneralize(TemplateSourceManual, true); err == nil {
+		t.Fatal("skip_generalize=true on manual must be rejected")
+	}
+	if err := ValidateSkipGeneralize(TemplateSourceOVF, true); err != nil {
+		t.Fatalf("skip_generalize=true on ovf should be allowed: %v", err)
+	}
+	if err := ValidateSkipGeneralize(TemplateSourceCloneVCenter, true); err != nil {
+		t.Fatalf("skip_generalize=true on clone_vcenter should be allowed: %v", err)
+	}
+	if err := ValidateSkipGeneralize(TemplateSourceISO, false); err != nil {
+		t.Fatalf("skip_generalize=false is always allowed: %v", err)
+	}
+}
+
+func TestValidWizardSourceType(t *testing.T) {
+	want := map[string]bool{
+		TemplateSourceCloneTemplate: true,
+		TemplateSourceCloneVCenter:  true,
+		TemplateSourceISO:           true,
+		TemplateSourceOVF:           true,
+		TemplateSourceManual:        false,
+		"bogus":                     false,
+		"":                          false,
+	}
+	for s, ok := range want {
+		if got := ValidWizardSourceType(s); got != ok {
+			t.Errorf("ValidWizardSourceType(%q) = %v; want %v", s, got, ok)
+		}
+	}
 }

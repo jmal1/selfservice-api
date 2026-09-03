@@ -13,8 +13,8 @@
     {
       "path": "AGENTS.md",
       "title": "AGENTS.md — Crucible AI Authoring Reference",
-      "size": 83759,
-      "sha256": "c5ef8d0d2dde52a5f9847a91d0365bc64f12e456e5c03203e7bc2af81cb81f8b",
+      "size": 83961,
+      "sha256": "8f1c0883598be4ee4709f61476b2ab5f3b726ae070ecc64bfffb77ffa790af92",
       "is_markdown": true,
       "links_out": [
         "deploy/runner/actions.sh",
@@ -55,8 +55,8 @@
     {
       "path": "docs/ai-prompts/create-a-template.md",
       "title": "Prompt: \"Help me create a Crucible template\"",
-      "size": 7137,
-      "sha256": "98bd58aa6b2058d85a3a5d0b915dd7f5c4c9048e96ca1dcd2a596870c6fa5d2e",
+      "size": 7290,
+      "sha256": "c0bd2cfeaa0e83e32cbaea5f99a263c5cc48620d43f268285278b318696433df",
       "is_markdown": true,
       "from_seed": true
     },
@@ -103,12 +103,13 @@
     {
       "path": "docs/instructor/os-recipes.md",
       "title": "Per-OS Template Build Recipes",
-      "size": 41935,
-      "sha256": "d3219f98c18e0a00216177cded671ef9955336cffd72907336c85577954fbc74",
+      "size": 42095,
+      "sha256": "5f43c1b927395364d9668c9afc2946a62b33af386f7ca53d119c49c2ce04fbc6",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/glossary.md",
         "docs/instructor/overview.md",
+        "docs/instructor/templates.md",
         "docs/instructor/templates.md",
         "docs/instructor/templates.md",
         "docs/instructor/templates.md",
@@ -184,8 +185,8 @@
     {
       "path": "docs/instructor/templates.md",
       "title": "Building a Template",
-      "size": 63153,
-      "sha256": "7562152412e12af2490ec24306eeecf4f0ffc3b46af749f0362a7520df23a7e7",
+      "size": 64189,
+      "sha256": "848563e95f9722653491bf6d045ea88d976ef84ba39fb92a3eddf4add89aa87c",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/glossary.md",
@@ -386,5 +387,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 423752
+  "total_bytes": 425303
 }

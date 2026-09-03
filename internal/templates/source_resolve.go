@@ -41,6 +41,8 @@ type VMNameResolver interface {
 // live vCenter VM moref, applying the rules the worker and preflight must share:
 //
 //   - clone_vcenter: sourceRef IS the moref; returned unchanged.
+//   - ovf: sourceRef IS the moref of an already-imported OVA; returned
+//     unchanged (same contract as clone_vcenter).
 //   - clone_template: sourceRef is a Crucible templates.id UUID. The source
 //     template row is loaded and resolved to a moref via its vcenter_vm_id
 //     (preferred — set by wizard-published templates) or, failing that, its
@@ -61,7 +63,7 @@ func ResolveCloneSourceMoref(
 	case models.TemplateSourceISO:
 		return "", nil
 
-	case models.TemplateSourceCloneVCenter:
+	case models.TemplateSourceCloneVCenter, models.TemplateSourceOVF:
 		if sourceRef == "" {
 			return "", fmt.Errorf("source_ref is required for source_type=%s", sourceType)
 		}
@@ -105,6 +107,6 @@ func ResolveCloneSourceMoref(
 		}
 
 	default:
-		return "", fmt.Errorf("unknown source_type %q (must be one of clone_template, clone_vcenter, iso)", sourceType)
+		return "", fmt.Errorf("unknown source_type %q (must be one of clone_template, clone_vcenter, iso, ovf)", sourceType)
 	}
 }

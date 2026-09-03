@@ -9,8 +9,9 @@ package provisioner
 //   - ISO -> streamed onto the ISO datastore under ISOs/<file>, so the
 //            template wizard / pod builder can mount it as install media.
 //   - OVA -> imported via OVF into the Templates inventory folder, producing
-//            a VM that is already selectable through the clone_vcenter source
-//            type (no new template source type is needed).
+//            a VM whose moref is stored on the image row. The wizard authors
+//            a template with source_type=ovf and that moref as source_ref
+//            (clone_vcenter remains valid for the same moref).
 //
 // Design mirrors the reconciler handlers in this package (reconcile.go,
 // ip_reconcile.go): a thin (p *Provisioner) wrapper delegates to a pure,

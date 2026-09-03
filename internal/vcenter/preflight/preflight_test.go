@@ -14,6 +14,7 @@ package preflight_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -562,6 +563,18 @@ func TestPF07_SkippedForISO(t *testing.T) {
 	pf07 := findResult(t, r, "PF-07")
 	if !pf07.OK {
 		t.Fatal("PF-07 should be skipped (OK=true) for ISO sources")
+	}
+}
+
+// ovf is a clone-from-imported-OVA source: PF-07 (tools present) applies,
+// the same as clone_vcenter.
+func TestPF07_AppliesToOVF(t *testing.T) {
+	f := newFake()
+	p := preflight.Params{SourceMoref: "vm-1", SourceType: models.TemplateSourceOVF}
+	r := preflight.RunAll(context.Background(), f, p)
+	pf07 := findResult(t, r, "PF-07")
+	if strings.Contains(pf07.Detail, "skipped") {
+		t.Fatalf("PF-07 must apply to ovf (clone-like); got Detail=%q", pf07.Detail)
 	}
 }
 

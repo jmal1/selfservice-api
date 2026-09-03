@@ -34,17 +34,23 @@ import (
 // ---------------------------------------------------------------------------
 
 type fakeProvDB struct {
-	// GetTemplateByID returns tmpl on the first call, then provisioning on subsequent calls.
-	tmpl      *models.Template
-	getCalls  int
+	// GetTemplateByID returns tmpl on the first call, then afterUpdateState
+	// (default: provisioning) on subsequent calls.
+	tmpl            *models.Template
+	getCalls        int
+	afterUpdateState string
 
 	// UpdateTemplateLifecycleState records whether it was called.
 	updateCalled bool
+	updateFrom   string
+	updateTo     string
 	updateErr    error
 
 	// CreateJob records whether it was called.
-	createJobCalls int
-	createJobErr   error
+	createJobCalls   int
+	createJobType    string
+	createJobPayload []byte
+	createJobErr     error
 }
 
 func (f *fakeProvDB) GetTemplateByID(_ context.Context, _ uuid.UUID) (*models.Template, error) {
@@ -59,23 +65,30 @@ func (f *fakeProvDB) GetTemplateByID(_ context.Context, _ uuid.UUID) (*models.Te
 		return f.tmpl, nil
 	}
 	copy := *f.tmpl
-	copy.TemplateState = models.TemplateStateProvisioning
+	if f.afterUpdateState != "" {
+		copy.TemplateState = f.afterUpdateState
+	} else {
+		copy.TemplateState = models.TemplateStateProvisioning
+	}
 	return &copy, nil
 }
 
-func (f *fakeProvDB) UpdateTemplateLifecycleState(_ context.Context, _ uuid.UUID, _, _ string) error {
+func (f *fakeProvDB) UpdateTemplateLifecycleState(_ context.Context, _ uuid.UUID, from, to string) error {
 	f.updateCalled = true
+	f.updateFrom, f.updateTo = from, to
 	return f.updateErr
 }
 
-func (f *fakeProvDB) CreateJob(_ context.Context, _ string, _ []byte) (*models.Job, error) {
+func (f *fakeProvDB) CreateJob(_ context.Context, jobType string, payload []byte) (*models.Job, error) {
 	f.createJobCalls++
+	f.createJobType = jobType
+	f.createJobPayload = payload
 	if f.createJobErr != nil {
 		return nil, f.createJobErr
 	}
 	return &models.Job{
 		ID:        uuid.New(),
-		Type:      models.JobTypeTemplateProvision,
+		Type:      jobType,
 		Status:    "pending",
 		CreatedAt: time.Now(),
 	}, nil

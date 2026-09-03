@@ -154,6 +154,17 @@ type PreflightVCenter interface {
 	) ([]string, error)
 }
 
+// isCloneSourceType reports whether sourceType clones an existing VM
+// (clone_template, clone_vcenter, ovf). ISO installs create a blank VM.
+func isCloneSourceType(sourceType string) bool {
+	switch sourceType {
+	case models.TemplateSourceCloneTemplate, models.TemplateSourceCloneVCenter, models.TemplateSourceOVF:
+		return true
+	default:
+		return false
+	}
+}
+
 // RunAll executes all 11 preflight checks and returns their results in
 // canonical order (PF-01 … PF-11). Checks that do not apply to the given
 // source type are skipped and returned as OK=true with an explanatory Detail.
@@ -162,8 +173,7 @@ type PreflightVCenter interface {
 // returned as a failing Result with a descriptive Detail, not a panic or an
 // omission — partial vCenter outages should not silently suppress all results.
 func RunAll(ctx context.Context, vc PreflightVCenter, p Params) []Result {
-	isClone := p.SourceType == models.TemplateSourceCloneTemplate ||
-		p.SourceType == models.TemplateSourceCloneVCenter
+	isClone := isCloneSourceType(p.SourceType)
 	isISO := p.SourceType == models.TemplateSourceISO
 
 	results := make([]Result, 0, 11)

@@ -42,7 +42,8 @@ modes, or defaults.** If it isn't in that guide, it doesn't exist.
 Key facts from that guide you may rely on:
 
 - **Source type** is one of: *Clone an existing Crucible template* (easiest),
-  *Clone an existing vCenter VM*, or *ISO install* (install an OS from scratch).
+  *Clone an existing vCenter VM*, *OVF / imported OVA* (`source_ref` = imported
+  VM moref), or *ISO install* (install an OS from scratch).
 - **ISO install → Install mode** is one of:
   - `manual` — the student drives the installer in the browser console.
   - `cloudinit_cidata` — hands-off **Ubuntu Server**.
@@ -63,6 +64,7 @@ Key facts from that guide you may rely on:
 | Student wants… | Source type | ISO mode | Username | Password |
 |----------------|-------------|----------|----------|----------|
 | A copy of a template that already works | Clone an existing Crucible template | — | blank | blank |
+| An already-imported OVA | OVF / imported OVA (`source_ref` = moref) | — | blank | blank |
 | Ubuntu Server from scratch | ISO install | `cloudinit_cidata` | `student` | `Changeme123!` |
 | Kali / Debian from scratch | ISO install | `debian_preseed` | `student` | `Changeme123!` |
 | Windows from scratch | ISO install | `windows_autounattend` | `Student` | `Changeme123!` |

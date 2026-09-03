@@ -824,6 +824,7 @@ func TestCloneTemplateDraftGuardOnlyAppliesToCloneTemplate(t *testing.T) {
 	}{
 		{models.TemplateSourceISO, "[NAS] ISOs/kali.iso"},
 		{models.TemplateSourceCloneVCenter, "vm-1234"},
+		{models.TemplateSourceOVF, "vm-123"},
 	} {
 		t.Run(tc.sourceType, func(t *testing.T) {
 			h := &Handler{logger: noopLogger(t)} // nil DB
@@ -1067,5 +1068,92 @@ func TestAdminListGuestOSCatalog(t *testing.T) {
 	}
 	if !sawUbuntu {
 		t.Error("catalog response missing ubuntu64Guest")
+	}
+}
+
+// TestAdminCreateTemplateDraft_RejectsSkipGeneralizeOnISO is the load-bearing
+// guard for the unsafe combo. Mutation tested: removing the
+// ValidateSkipGeneralize call lets this request fall through to auth (401)
+// instead of 400 naming skip_generalize + iso.
+func TestAdminCreateTemplateDraft_RejectsSkipGeneralizeOnISO(t *testing.T) {
+	rec := postDraft(t, CreateTemplateDraftRequest{
+		Name:           "Fresh ISO",
+		OSType:         models.OSTypeLinux,
+		SourceType:     models.TemplateSourceISO,
+		SourceRef:      "[NAS] ISOs/ubuntu.iso",
+		GuestID:        "ubuntu64Guest",
+		SkipGeneralize: true,
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d; want 400 (skip_generalize on iso is unsafe)", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "skip_generalize") {
+		t.Errorf("body = %q; want it to name skip_generalize", body)
+	}
+	if !strings.Contains(body, "iso") {
+		t.Errorf("body = %q; want it to name source_type=iso", body)
+	}
+}
+
+func TestAdminCreateTemplateDraft_RejectsSkipGeneralizeOnCloneTemplate(t *testing.T) {
+	rec := postDraft(t, CreateTemplateDraftRequest{
+		Name:           "Copy",
+		OSType:         models.OSTypeLinux,
+		SourceType:     models.TemplateSourceCloneTemplate,
+		SourceRef:      uuid.NewString(),
+		DefaultUsername: "student",
+		SkipGeneralize: true,
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d; want 400", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "skip_generalize") {
+		t.Errorf("body = %q; want skip_generalize", rec.Body.String())
+	}
+}
+
+func TestAdminCreateTemplateDraft_AcceptsOVF(t *testing.T) {
+	rec := postDraft(t, CreateTemplateDraftRequest{
+		Name:       "Imported OVA",
+		OSType:     models.OSTypeLinux,
+		SourceType: models.TemplateSourceOVF,
+		SourceRef:  "vm-123",
+	})
+	// Nil handler has no auth context; ovf must pass source-type validation
+	// and reach the auth required 401 (not 400 "unknown source_type").
+	if rec.Code == http.StatusBadRequest {
+		t.Fatalf("ovf was rejected as invalid source_type: %s", rec.Body.String())
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d; want 401 after ovf validation (no auth on Handler{})", rec.Code)
+	}
+}
+
+func TestAdminCreateTemplateDraft_AllowsSkipGeneralizeOnOVF(t *testing.T) {
+	rec := postDraft(t, CreateTemplateDraftRequest{
+		Name:           "Imported OVA",
+		OSType:         models.OSTypeLinux,
+		SourceType:     models.TemplateSourceOVF,
+		SourceRef:      "vm-123",
+		SkipGeneralize: true,
+	})
+	if rec.Code == http.StatusBadRequest && strings.Contains(rec.Body.String(), "skip_generalize") {
+		t.Fatalf("skip_generalize on ovf was rejected: %s", rec.Body.String())
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d; want 401 after accepting ovf+skip_generalize", rec.Code)
+	}
+}
+
+func TestAdminCreateTemplateDraft_RejectsUnknownSourceType(t *testing.T) {
+	rec := postDraft(t, CreateTemplateDraftRequest{
+		Name:       "X",
+		OSType:     models.OSTypeLinux,
+		SourceType: "manual",
+		SourceRef:  "vm-1",
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d; want 400 for source_type=manual on the wizard", rec.Code)
 	}
 }
