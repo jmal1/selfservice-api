@@ -64,6 +64,23 @@ func TestResolveCloneSourceMoref_CloneVCenter_EmptyRef(t *testing.T) {
 	}
 }
 
+func TestResolveCloneSourceMoref_OVF_Passthrough(t *testing.T) {
+	moref, err := ResolveCloneSourceMoref(context.Background(), nil, nil, models.TemplateSourceOVF, "vm-123")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if moref != "vm-123" {
+		t.Fatalf("ovf moref = %q; want vm-123", moref)
+	}
+}
+
+func TestResolveCloneSourceMoref_OVF_EmptyRef(t *testing.T) {
+	_, err := ResolveCloneSourceMoref(context.Background(), nil, nil, models.TemplateSourceOVF, "")
+	if err == nil {
+		t.Fatal("expected error for empty ovf source_ref")
+	}
+}
+
 // The core bug: clone_template's source_ref is a Crucible templates.id UUID,
 // not a moref. It must be resolved via the source template row's vcenter_vm_id.
 func TestResolveCloneSourceMoref_CloneTemplate_ViaVMID(t *testing.T) {

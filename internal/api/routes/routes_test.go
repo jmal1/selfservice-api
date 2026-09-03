@@ -125,8 +125,11 @@ func TestTemplateAdministrationRoutesRequireInstructorRole(t *testing.T) {
 	}{
 		{method: http.MethodGet, path: "/api/v1/admin/templates/"},
 		{method: http.MethodPost, path: "/api/v1/admin/templates/"},
+		{method: http.MethodPost, path: "/api/v1/admin/templates/draft"},
 		{method: http.MethodPatch, path: "/api/v1/admin/templates/" + uuid.NewString()},
 		{method: http.MethodDelete, path: "/api/v1/admin/templates/" + uuid.NewString()},
+		{method: http.MethodPost, path: "/api/v1/admin/images/"},
+		{method: http.MethodPost, path: "/api/v1/admin/images/" + uuid.NewString() + "/import"},
 	} {
 		t.Run(tc.method, func(t *testing.T) {
 			req := httptest.NewRequest(tc.method, tc.path, nil)
@@ -137,6 +140,27 @@ func TestTemplateAdministrationRoutesRequireInstructorRole(t *testing.T) {
 				t.Fatalf("student role: status = %d, want 403", rec.Code)
 			}
 		})
+	}
+}
+
+// TestStudentCannotHitAdminDraftOrImport is the RBAC guard for the ovf
+// authoring surface: students must not reach wizard draft or image import.
+func TestStudentCannotHitAdminDraftOrImport(t *testing.T) {
+	provider := auth.NewTestProvider([]byte(testJWTSecret))
+	router := Setup(nil, provider, nil, []string{"*"})
+
+	for _, path := range []string{
+		"/api/v1/admin/templates/draft",
+		"/api/v1/admin/images/",
+		"/api/v1/admin/images/" + uuid.NewString() + "/import",
+	} {
+		req := httptest.NewRequest(http.MethodPost, path, nil)
+		req.AddCookie(makeSessionCookie(t, models.RoleStudent))
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("%s: student status = %d, want 403", path, rec.Code)
+		}
 	}
 }
 

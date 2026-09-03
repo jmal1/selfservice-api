@@ -57,7 +57,8 @@ field in the wizard):
 | Source type | When you'd use it | Covered on this page? |
 |-------------|-------------------|-----------------------|
 | **Clone an existing Crucible template** | Fastest, safest — start from a template that already works | No — see [templates.md](templates.md); no OS install needed |
-| **Clone an existing vCenter VM** | Build from an imported OVA or a VM an admin points you at | No — no OS install needed |
+| **Clone an existing vCenter VM** | Build from a VM an admin points you at | No — no OS install needed |
+| **OVF / imported OVA** | Build from an OVA already imported via **Admin → Images** (`source_ref` = VM moref) | No — no OS install needed; see [templates.md](templates.md) |
 | **ISO install** | Install an OS from scratch off an installer disc | **Yes — this whole page** |
 
 The OSes below are the ones the ISO-install path is known to handle, plus the

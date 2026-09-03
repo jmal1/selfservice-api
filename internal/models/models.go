@@ -2,6 +2,7 @@ package models
 
 import (
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -63,6 +64,11 @@ type Template struct {
 	SourceType     string     `json:"source_type" db:"source_type"`
 	SourceRef      string     `json:"source_ref" db:"source_ref"`
 	StagingNetwork string     `json:"staging_network" db:"staging_network"`
+	// SkipGeneralize, when true, tells template_generalize to power the
+	// staging VM off and take the base-image snapshot without running
+	// GuestOps generalize scripts. Publish is unchanged: ready → verifying
+	// → active. Migration 000039. Default false.
+	SkipGeneralize bool `json:"skip_generalize" db:"skip_generalize"`
 	// UnattendMode drives ISO-install automation (migration 000023). Only
 	// meaningful when SourceType == TemplateSourceISO. See the
 	// models.UnattendMode* constants and internal/unattend.
@@ -188,7 +194,8 @@ const (
 )
 
 // Template source type constants — keep in sync with the CHECK constraint
-// in migration 000018_template_lifecycle.up.sql.
+// in migration 000018_template_lifecycle.up.sql as extended by 000039
+// (adds 'ovf').
 const (
 	// TemplateSourceManual is the legacy path: the VM was created in
 	// vCenter directly (or by another tool) and an admin filled in the
@@ -208,7 +215,43 @@ const (
 	// TemplateSourceISO mounts an ISO and starts a clean install.
 	// source_ref holds the ISO's datastore path.
 	TemplateSourceISO = "iso"
+
+	// TemplateSourceOVF clones an already-imported OVA. source_ref is the
+	// vCenter VM moref of that imported VM (same shape as clone_vcenter).
+	// Instructors import the OVA via Images / ImportOVA first.
+	TemplateSourceOVF = "ovf"
 )
+
+// ValidWizardSourceType reports whether s is a source_type the template
+// wizard draft endpoint accepts.
+func ValidWizardSourceType(s string) bool {
+	switch s {
+	case TemplateSourceCloneTemplate, TemplateSourceCloneVCenter, TemplateSourceISO, TemplateSourceOVF:
+		return true
+	default:
+		return false
+	}
+}
+
+// ValidateSkipGeneralize rejects skip_generalize=true on source types where
+// skipping GuestOps generalize would publish a never-generalized fresh
+// install or a uniquely-customized clone. ovf and clone_vcenter are the
+// already-prepared VM sources where the instructor may opt in.
+func ValidateSkipGeneralize(sourceType string, skip bool) error {
+	if !skip {
+		return nil
+	}
+	switch sourceType {
+	case TemplateSourceOVF, TemplateSourceCloneVCenter:
+		return nil
+	case TemplateSourceISO:
+		return fmt.Errorf("skip_generalize is not allowed for source_type=iso: a fresh ISO install must run GuestOps generalize")
+	case TemplateSourceCloneTemplate:
+		return fmt.Errorf("skip_generalize is not allowed for source_type=clone_template: a customized clone must be re-generalized before publish")
+	default:
+		return fmt.Errorf("skip_generalize is not allowed for source_type=%s", sourceType)
+	}
+}
 
 // CanonicalStagingNetwork is the ONLY network a template build VM is ever
 // attached to. It is the isolated VLAN 30 staging port group (present on
@@ -307,9 +350,9 @@ const (
 	ImageKindISO = "iso"
 
 	// ImageKindOVA is a packaged virtual appliance imported via OVF. The
-	// resulting VM lands in the Templates folder and is therefore already
-	// selectable through the existing clone_vcenter source type — OVA needs
-	// no new template source type.
+	// resulting VM lands in the Templates folder. The wizard then authors
+	// a template with source_type=ovf and source_ref=<imported VM moref>
+	// (clone_vcenter remains valid for the same moref).
 	ImageKindOVA = "ova"
 )
 

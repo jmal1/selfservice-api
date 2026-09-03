@@ -70,7 +70,7 @@ const BlueprintPinOrderClause = `ORDER BY b.pinned DESC, ` +
 // source_type, source_ref, staging_network. Migration 000019 added
 // is_internal. Migration 000029 added visibility. Migration 000030 added
 // pinning support (pinned, pin_order, pinned_at, pinned_by). Migration 000036
-// added guest_credentials_verified_at.
+// added guest_credentials_verified_at. Migration 000039 added skip_generalize.
 const templateSelectCols = `id, name, vcenter_template, os_type, default_vcpus, default_ram_mb,
 		default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''),
 		default_username, default_password, kind, assign_ip, is_active,
@@ -80,7 +80,8 @@ const templateSelectCols = `id, name, vcenter_template, os_type, default_vcpus, 
 		created_at, updated_at,
 		trust_tier, last_validated_at, last_validation_result,
 		pinned, pin_order, pinned_at, pinned_by,
-		guest_credentials_verified_at`
+		guest_credentials_verified_at,
+		skip_generalize`
 
 // scanTemplate populates t from a row whose columns are in templateSelectCols
 // order. Centralizes the column ordering so adding a column in the future
@@ -97,6 +98,7 @@ func scanTemplate(row pgx.Row, t *models.Template) error {
 		&t.TrustTier, &t.LastValidatedAt, &t.LastValidationResult,
 		&t.Pinned, &t.PinOrder, &t.PinnedAt, &t.PinnedBy,
 		&t.GuestCredentialsVerifiedAt,
+		&t.SkipGeneralize,
 	)
 }
 

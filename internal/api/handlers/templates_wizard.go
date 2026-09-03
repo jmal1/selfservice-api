@@ -40,7 +40,8 @@ import (
 // Source identifies what we're cloning from:
 //   - source_type=clone_template, source_ref=<template UUID>
 //   - source_type=clone_vcenter, source_ref=<vCenter VM moref>
-//   - source_type=iso, source_ref=<datastore path> (Phase 2 stub)
+//   - source_type=ovf, source_ref=<vCenter VM moref of an already-imported OVA>
+//   - source_type=iso, source_ref=<datastore path>
 //
 // The staging network is NOT part of this payload: every build VM is forced
 // onto models.CanonicalStagingNetwork server-side as a non-negotiable network
@@ -56,6 +57,10 @@ type CreateTemplateDraftRequest struct {
 
 	SourceType string `json:"source_type"`
 	SourceRef  string `json:"source_ref"`
+	// SkipGeneralize, when true, tells template_generalize to snapshot
+	// without GuestOps generalize scripts. Rejected for unsafe source
+	// types (iso, clone_template). JSON/DB name is skip_generalize.
+	SkipGeneralize bool `json:"skip_generalize"`
 
 	VCPUs  int `json:"vcpus,omitempty"`
 	RAMMB  int `json:"ram_mb,omitempty"`
@@ -104,6 +109,7 @@ type WizardStateResponse struct {
 	VCenterVMID       string    `json:"vcenter_vm_id,omitempty"`
 	SourceType        string    `json:"source_type,omitempty"`
 	SourceRef         string    `json:"source_ref,omitempty"`
+	SkipGeneralize    bool      `json:"skip_generalize"`
 	StagingNetwork    string    `json:"staging_network,omitempty"`
 	LastJobType       string    `json:"last_job_type,omitempty"`
 	LastJobStatus     string    `json:"last_job_status,omitempty"`
@@ -159,14 +165,15 @@ func (h *Handler) AdminCreateTemplateDraft(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if req.SourceType == "" {
-		http.Error(w, "source_type is required (clone_template, clone_vcenter, or iso)", http.StatusBadRequest)
+		http.Error(w, "source_type is required (clone_template, clone_vcenter, iso, or ovf)", http.StatusBadRequest)
 		return
 	}
-	switch req.SourceType {
-	case models.TemplateSourceCloneTemplate, models.TemplateSourceCloneVCenter, models.TemplateSourceISO:
-		// ok
-	default:
-		http.Error(w, "source_type must be clone_template, clone_vcenter, or iso", http.StatusBadRequest)
+	if !models.ValidWizardSourceType(req.SourceType) {
+		http.Error(w, "source_type must be clone_template, clone_vcenter, iso, or ovf", http.StatusBadRequest)
+		return
+	}
+	if err := models.ValidateSkipGeneralize(req.SourceType, req.SkipGeneralize); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if req.SourceRef == "" {
@@ -308,10 +315,11 @@ func (h *Handler) AdminCreateTemplateDraft(w http.ResponseWriter, r *http.Reques
 		    is_active = false,
 		    guest_id = $7,
 		    unattend_mode = $8,
-		    unattend_config = $9
+		    unattend_config = $9,
+		    skip_generalize = $10
 		WHERE id = $1
 	`, tmpl.ID, models.TemplateStateDraft, req.SourceType, req.SourceRef, stagingNetwork, userID,
-		req.GuestID, unattendMode, unattendConfig); err != nil {
+		req.GuestID, unattendMode, unattendConfig, req.SkipGeneralize); err != nil {
 		h.logger.Error("set draft state failed", "error", err, "template_id", tmpl.ID)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -396,7 +404,7 @@ func (h *Handler) AdminGeneralizeTemplate(w http.ResponseWriter, r *http.Request
 	}
 
 	guestUser, guestPass, _ := resolveGuestCredentials(tmpl, req.GuestUsername, req.GuestPassword)
-	if guestUser == "" || guestPass == "" {
+	if !tmpl.SkipGeneralize && (guestUser == "" || guestPass == "") {
 		http.Error(w,
 			"guest_username and guest_password are required (provide in body or set default_username/default_password on the template)",
 			http.StatusBadRequest)
@@ -988,6 +996,7 @@ func (h *Handler) wizardState(ctx stdcontext.Context, tmpl *models.Template) Wiz
 		VCenterVMID:       tmpl.VCenterVMID,
 		SourceType:        tmpl.SourceType,
 		SourceRef:         tmpl.SourceRef,
+		SkipGeneralize:    tmpl.SkipGeneralize,
 		StagingNetwork:    tmpl.StagingNetwork,
 		// Build-VM access (Phase H): plumb the template's OS/kind/defaults
 		// always. The wizard UI only renders the access panel during

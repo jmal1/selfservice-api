@@ -688,7 +688,7 @@ The template creation wizard's "ISO install" step calls `GET /api/v1/admin/vcent
 
 ### 15.4 OVA behaviour
 
-OVAs are imported into vCenter's Templates folder as a VM (moref stored in `vcenter_vm_id`). They are **not** mounted as CD-ROM media and **never appear** in the ISO picker. To use an OVA-sourced VM as a template source, use the `clone_vcenter` template source type.
+OVAs are imported into vCenter's Templates folder as a VM (moref stored in `vcenter_vm_id`). They are **not** mounted as CD-ROM media and **never appear** in the ISO picker. To use an OVA-sourced VM as a template source, create a wizard draft with `source_type=ovf` and `source_ref` set to that imported VM moref (same `vm-123` shape as `clone_vcenter`). `skip_generalize=true` skips GuestOps generalize scripts and still requires `ready` → `verifying` → `active`.
 
 ### 15.5 Error retry
 
