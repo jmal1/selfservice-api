@@ -108,7 +108,7 @@ func (q *Queries) ListOwnedTemplateFolderMorefs(ctx context.Context) (map[string
 
 	buildRows, err := q.pool.Query(ctx, `
 		SELECT destination_vm_moref, canary_vm_moref
-		FROM template_replica_builds
+		FROM template_source_replica_builds
 		WHERE (
 			(destination_vm_moref <> '' AND residue_cleaned_at IS NULL)
 			OR (canary_vm_moref <> '' AND cleanup_completed_at IS NULL)
