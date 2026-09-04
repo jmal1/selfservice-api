@@ -638,17 +638,18 @@ func (h *Handler) AdminRetryTemplate(w http.ResponseWriter, r *http.Request) {
 }
 
 // AdminCancelTemplate (POST /admin/templates/:id/cancel) — early-cancel
-// from configuring or ready back to draft. Future enhancement: enqueue a
-// cleanup job that destroys the staging VM; for now we just flip the
-// state and surface a warning in the response that the VM is still in
-// vCenter.
+// from configuring or ready back to draft. Destroys the staging VM first
+// (when present), then clears vcenter_vm_id, then transitions to draft —
+// same destroy-before-forget ordering as AdminDeleteTemplate so a failed
+// vCenter call keeps the moref for retry instead of orphaning inventory.
 func (h *Handler) AdminCancelTemplate(w http.ResponseWriter, r *http.Request) {
 	templateID, err := uuid.Parse(chi.URLParam(r, "templateID"))
 	if err != nil {
 		http.Error(w, "invalid template id", http.StatusBadRequest)
 		return
 	}
-	tmpl, err := h.db.GetTemplateByID(r.Context(), templateID)
+	pdb := h.provisionStore()
+	tmpl, err := pdb.GetTemplateByID(r.Context(), templateID)
 	if err != nil || tmpl == nil {
 		http.Error(w, "template not found", http.StatusNotFound)
 		return
@@ -664,24 +665,62 @@ func (h *Handler) AdminCancelTemplate(w http.ResponseWriter, r *http.Request) {
 		h.writeStateConflict(w, tmpl, err.Error())
 		return
 	}
-	if err := h.db.UpdateTemplateLifecycleState(r.Context(), tmpl.ID, from, models.TemplateStateDraft); err != nil {
+
+	destroyedMoref := ""
+	if tmpl.VCenterVMID != "" {
+		if h.vc == nil {
+			// Production always wires vc; this branch protects test/dev
+			// configs from silently orphaning VMs. Transition still proceeds
+			// so the wizard is usable; the template orphan reconciler cleans
+			// draft leftovers after the inactivity window.
+			h.logger.Warn("template cancel: vCenter client not configured, leaving VM in place",
+				"template_id", tmpl.ID, "moref", tmpl.VCenterVMID)
+		} else {
+			if err := h.vc.DestroyVM(r.Context(), tmpl.VCenterVMID); err != nil {
+				h.logger.Error("template cancel: destroy staging VM failed",
+					"template_id", tmpl.ID, "moref", tmpl.VCenterVMID, "error", err)
+				if h.db != nil {
+					audit.Log(r.Context(), h.db, "template.cancel_failed",
+						audit.Resource("template", tmpl.ID),
+						audit.IP(r.RemoteAddr),
+						audit.Detail("from_state", from),
+						audit.Detail("moref", tmpl.VCenterVMID),
+						audit.Detail("error", err.Error()),
+					)
+				}
+				http.Error(w, "failed to destroy staging VM in vCenter: "+err.Error(), http.StatusBadGateway)
+				return
+			}
+			destroyedMoref = tmpl.VCenterVMID
+			if err := pdb.SetTemplateVCenterVM(r.Context(), tmpl.ID, ""); err != nil {
+				h.logger.Error("template cancel: clear vcenter_vm_id failed after destroy",
+					"template_id", tmpl.ID, "moref", destroyedMoref, "error", err)
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			}
+		}
+	}
+
+	if err := pdb.UpdateTemplateLifecycleState(r.Context(), tmpl.ID, from, models.TemplateStateDraft); err != nil {
 		h.handleLifecycleUpdateErr(w, tmpl, err)
 		return
 	}
-	audit.Log(r.Context(), h.db, "template.cancel",
-		audit.Resource("template", tmpl.ID),
-		audit.IP(r.RemoteAddr),
-		audit.Detail("from_state", from),
-	)
+	if h.db != nil {
+		audit.Log(r.Context(), h.db, "template.cancel",
+			audit.Resource("template", tmpl.ID),
+			audit.IP(r.RemoteAddr),
+			audit.Detail("from_state", from),
+			audit.Detail("destroyed_moref", destroyedMoref),
+		)
+	}
 
-	fresh, _ := h.db.GetTemplateByID(r.Context(), tmpl.ID)
+	fresh, _ := pdb.GetTemplateByID(r.Context(), tmpl.ID)
 	resp := h.wizardState(r.Context(), fresh)
-	resp.VCenterVMID = tmpl.VCenterVMID // surface so UI can prompt for manual cleanup if non-empty
-	respondJSON(w, http.StatusOK, map[string]any{
-		"state": resp,
-		"warning": ifNonEmpty(tmpl.VCenterVMID,
-			"staging VM "+tmpl.VCenterVMID+" still exists in vCenter; delete manually if not needed"),
-	})
+	out := map[string]any{"state": resp}
+	if destroyedMoref == "" && tmpl.VCenterVMID != "" {
+		out["warning"] = "staging VM " + tmpl.VCenterVMID + " still exists in vCenter; delete manually if not needed"
+	}
+	respondJSON(w, http.StatusOK, out)
 }
 
 // AdminGetWizardState (GET /admin/templates/:id/wizard-state) — UI uses

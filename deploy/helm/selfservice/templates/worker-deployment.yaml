@@ -148,6 +148,18 @@ spec:
               value: {{ .Values.worker.orphanReconciler.interval | default "1h" | quote }}
             - name: WORKER_ORPHAN_RECONCILER_MIN_AGE
               value: {{ .Values.worker.orphanReconciler.minAge | default "1h" | quote }}
+            # Templates-folder orphan reconciler: stale error/draft wizard VMs
+            # and unmatched disposable inventory leftovers.
+            - name: WORKER_TEMPLATE_ORPHAN_RECONCILER_ENABLED
+              value: {{ .Values.worker.templateOrphanReconciler.enabled | default false | quote }}
+            - name: WORKER_TEMPLATE_ORPHAN_RECONCILER_FOLDER
+              value: {{ .Values.worker.templateOrphanReconciler.folder | default "" | quote }}
+            - name: WORKER_TEMPLATE_ORPHAN_RECONCILER_INTERVAL
+              value: {{ .Values.worker.templateOrphanReconciler.interval | default "1h" | quote }}
+            - name: WORKER_TEMPLATE_ORPHAN_RECONCILER_INACTIVE_AGE
+              value: {{ .Values.worker.templateOrphanReconciler.inactiveAge | default "24h" | quote }}
+            - name: WORKER_TEMPLATE_ORPHAN_RECONCILER_MIN_AGE
+              value: {{ .Values.worker.templateOrphanReconciler.minAge | default "1h" | quote }}
             # OPNsense network reconciler: heals missing VLAN/interface/Kea
             # bindings for active pods and releases stale vlan_pool
             # allocations for terminal pods.

@@ -33,6 +33,8 @@ worker:
     enabled: true
   orphanReconciler:
     enabled: true
+  templateOrphanReconciler:
+    enabled: true
   networkReconciler:
     enabled: true
   idleEvaluator:

@@ -331,6 +331,78 @@ func main() {
 		)
 	}
 
+	// Optional: Templates-folder orphan reconciler. Destroys leftover wizard
+	// staging VMs for error/draft rows idle longer than inactiveAge, and
+	// unmatched disposable inventory names with no DB owner.
+	// Disabled by default. Set WORKER_TEMPLATE_ORPHAN_RECONCILER_ENABLED=true.
+	templateOrphanEnabled := strings.EqualFold(os.Getenv("WORKER_TEMPLATE_ORPHAN_RECONCILER_ENABLED"), "true")
+	templateOrphanInterval := time.Hour
+	if v := os.Getenv("WORKER_TEMPLATE_ORPHAN_RECONCILER_INTERVAL"); v != "" {
+		if parsed, err := time.ParseDuration(v); err == nil && parsed > 0 {
+			templateOrphanInterval = parsed
+		} else {
+			logger.Warn("invalid WORKER_TEMPLATE_ORPHAN_RECONCILER_INTERVAL; using default 1h", "value", v, "error", err)
+		}
+	}
+	templateOrphanFolder := os.Getenv("WORKER_TEMPLATE_ORPHAN_RECONCILER_FOLDER")
+	if templateOrphanFolder == "" {
+		templateOrphanFolder = cfg.VCenter.TemplatesFolder
+	}
+	templateOrphanInactiveAge := provisioner.DefaultTemplateOrphanInactiveAge
+	if v := os.Getenv("WORKER_TEMPLATE_ORPHAN_RECONCILER_INACTIVE_AGE"); v != "" {
+		if parsed, err := time.ParseDuration(v); err == nil && parsed > 0 {
+			templateOrphanInactiveAge = parsed
+		}
+	}
+	templateOrphanMinAge := time.Hour
+	if v := os.Getenv("WORKER_TEMPLATE_ORPHAN_RECONCILER_MIN_AGE"); v != "" {
+		if parsed, err := time.ParseDuration(v); err == nil && parsed > 0 {
+			templateOrphanMinAge = parsed
+		}
+	}
+	var templateOrphanPusher *provisioner.TemplateOrphanCountPusher
+	if pgURL := os.Getenv("WORKER_PUSHGATEWAY_URL"); pgURL != "" {
+		job := os.Getenv("WORKER_PUSHGATEWAY_JOB")
+		if job == "" {
+			job = "crucible_provision_worker"
+		}
+		templateOrphanPusher = &provisioner.TemplateOrphanCountPusher{
+			BaseURL:        pgURL,
+			Job:            job,
+			GroupingLabels: map[string]string{"layer": "api"},
+		}
+	}
+	templateOrphanCfg := provisioner.TemplateOrphanReconcilerConfig{
+		Folder:      templateOrphanFolder,
+		InactiveAge: templateOrphanInactiveAge,
+		MinAge:      templateOrphanMinAge,
+		Pusher:      templateOrphanPusher,
+	}
+	var templateOrphanScheduler *provisioner.OrphanReconcilerScheduler
+	if templateOrphanEnabled {
+		templateOrphanScheduler = provisioner.NewOrphanReconcilerScheduler(
+			func() provisioner.OrphanLeadershipState {
+				state := elec.CurrentLeadership()
+				return provisioner.OrphanLeadershipState{
+					IsLeader:   state.IsLeader,
+					Generation: state.Generation,
+					Context:    state.Context,
+				}
+			},
+			func(runCtx context.Context) (provisioner.ReconcileCounts, error) {
+				counts, err := prov.ReconcileTemplateOrphans(runCtx, templateOrphanCfg)
+				return provisioner.ReconcileCounts{
+					InventoryVMs:    counts.InventoryVMs,
+					Unknown:         counts.UnknownDryRun,
+					SkippedRecent:   counts.SkippedRecent,
+					Destroyed:       counts.Destroyed,
+					DestroyFailures: counts.DestroyFailures,
+				}, err
+			},
+			logger,
+		)
+	}
+
 	// Pod-VM DHCP IP reconciler. Keeps pod_vms.ip_address in sync with the
 	// live guest address for running, IP-assigned VMs — catching both a
 	// missed capture at provisioning (slow Windows OOBE) and later DHCP lease
@@ -629,6 +701,20 @@ func main() {
 		orphanScheduler.Start(ctx)
 	}
 
+	// Templates-folder orphan reconciler ticker (opt-in; nil-safe).
+	var templateOrphanTickerC <-chan time.Time
+	if templateOrphanEnabled {
+		t := time.NewTicker(templateOrphanInterval)
+		defer t.Stop()
+		templateOrphanTickerC = t.C
+		logger.Info("template orphan reconciler enabled",
+			"folder", templateOrphanCfg.Folder,
+			"interval", templateOrphanInterval,
+			"inactive_age", templateOrphanInactiveAge,
+			"min_age", templateOrphanMinAge)
+		templateOrphanScheduler.Start(ctx)
+	}
+
 	// Pod-VM IP reconciler ticker (enabled by default; nil-safe).
 	var ipReconcilerTickerC <-chan time.Time
 	if ipReconcilerEnabled {
@@ -773,6 +859,8 @@ func main() {
 				}
 			case <-orphanTickerC:
 				orphanScheduler.Tick(ctx)
+			case <-templateOrphanTickerC:
+				templateOrphanScheduler.Tick(ctx)
 			case <-ipReconcilerTickerC:
 				if !elec.IsLeader() {
 					continue
@@ -849,6 +937,9 @@ func main() {
 				}
 				if orphanScheduler != nil {
 					orphanScheduler.LeadershipChanged(ctx)
+				}
+				if templateOrphanScheduler != nil {
+					templateOrphanScheduler.LeadershipChanged(ctx)
 				}
 				if !isLeader {
 					continue
@@ -949,6 +1040,9 @@ func main() {
 	if orphanScheduler != nil {
 		orphanScheduler.Stop()
 	}
+	if templateOrphanScheduler != nil {
+		templateOrphanScheduler.Stop()
+	}
 	if !jobRuns.StopAndWait(time.Until(shutdownDeadline)) {
 		logger.Error("worker shutdown deadline reached; durable job recovery will resume unfinished work")
 	}
@@ -959,6 +1053,10 @@ func main() {
 	if orphanScheduler != nil &&
 		!orphanScheduler.WaitTimeout(time.Until(shutdownDeadline)) {
 		logger.Error("worker shutdown deadline reached while waiting for orphan reconciliation")
+	}
+	if templateOrphanScheduler != nil &&
+		!templateOrphanScheduler.WaitTimeout(time.Until(shutdownDeadline)) {
+		logger.Error("worker shutdown deadline reached while waiting for template orphan reconciliation")
 	}
 	if !closeBeforeDeadline(pool, time.Until(shutdownDeadline)) {
 		logger.Error("worker shutdown deadline reached while closing database pool")

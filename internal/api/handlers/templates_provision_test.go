@@ -94,6 +94,13 @@ func (f *fakeProvDB) CreateJob(_ context.Context, jobType string, payload []byte
 	}, nil
 }
 
+
+func (f *fakeProvDB) SetTemplateVCenterVM(_ context.Context, _ uuid.UUID, vcenterVMID string) error {
+	if f.tmpl != nil {
+		f.tmpl.VCenterVMID = vcenterVMID
+	}
+	return nil
+}
 // ---------------------------------------------------------------------------
 // healthyStubVC — a PreflightVCenter whose every check passes
 // ---------------------------------------------------------------------------

@@ -261,6 +261,10 @@ type provisionDB interface {
 	GetTemplateByID(ctx context.Context, id uuid.UUID) (*models.Template, error)
 	UpdateTemplateLifecycleState(ctx context.Context, id uuid.UUID, from, to string) error
 	CreateJob(ctx context.Context, jobType string, payload []byte) (*models.Job, error)
+	// SetTemplateVCenterVM clears or records the staging VM moref. Cancel uses
+	// it with an empty string after DestroyVM so draft rows do not keep a stale
+	// pointer at a destroyed inventory object.
+	SetTemplateVCenterVM(ctx context.Context, id uuid.UUID, vcenterVMID string) error
 }
 
 // provisionStore returns the provisionDB in use. h.provDB is non-nil only in
