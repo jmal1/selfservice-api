@@ -84,6 +84,18 @@ worker:
     folder: ""
     interval: "1h"
     minAge: "1h"
+  # Templates-folder orphan reconciler. Destroys leftover wizard staging VMs
+  # for error/draft rows idle longer than inactiveAge, and unmatched disposable
+  # inventory names (tpl-*, crucible-healthcheck-*, smoke-*) with no DB owner.
+  # Never touches owned published/active templates or non-prefixed names.
+  # Disabled by default; prod/full-fleet enable it.
+  templateOrphanReconciler:
+    enabled: false
+    # Empty falls back to vcenter.templatesFolder.
+    folder: ""
+    interval: "1h"
+    inactiveAge: "24h"
+    minAge: "1h"
   # OPNsense + vlan_pool network reconciler. Converges VLAN/interface/DHCP
   # state for non-terminal pods and releases vlan_pool allocations for
   # terminal pods.

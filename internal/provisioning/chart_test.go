@@ -25,6 +25,9 @@ type chartValues struct {
 		OrphanReconciler           struct {
 			Enabled bool `yaml:"enabled"`
 		} `yaml:"orphanReconciler"`
+		TemplateOrphanReconciler struct {
+			Enabled bool `yaml:"enabled"`
+		} `yaml:"templateOrphanReconciler"`
 		NetworkReconciler struct {
 			Enabled bool `yaml:"enabled"`
 		} `yaml:"networkReconciler"`
@@ -248,6 +251,7 @@ func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T
 		t.Fatalf("production placement reserve = %q, want ESXi1/ESXi2 8 GiB plus nuc1 4 GiB and nuc2/nuc3 2 GiB", values.VCenter.PlacementReservedMemoryMB)
 	}
 	if !values.Worker.OrphanReconciler.Enabled ||
+		!values.Worker.TemplateOrphanReconciler.Enabled ||
 		!values.Worker.NetworkReconciler.Enabled ||
 		!values.Worker.L1Validation.Enabled ||
 		!values.Worker.TemplateHealth.Enabled ||
@@ -257,27 +261,28 @@ func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T
 		t.Fatalf("production worker background controls are not in the expected guarded-feedback state: %+v", values.Worker)
 	}
 	for path, want := range map[string]string{
-		"replicaCount.worker":                   "1",
-		"provisioning.enabled":                  "true",
-		"provisioning.workerClaimsEnabled":      "true",
-		"synthetic.provisioningExpectedEnabled": "true",
-		"synthetic.suspend":                     "false",
-		"synthetic.lifecycle.enabled":           "true",
-		"synthetic.janitor.enabled":             "true",
-		"synthetic.runner.enabled":              "true",
-		"synthetic.janitor.suspend":             "false",
-		"synthetic.runner.suspend":              "false",
-		"vcenter.hosts":                         "esxi1.lab.jmal.io,esxi2.lab.jmal.io,nuc1.lab.jmal.io,nuc2.lab.jmal.io,nuc3.lab.jmal.io",
-		"vcenter.resourcePools":                 "/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs,/JMAL-Datacenter/host/Intel-Cluster/Resources/Student-VMs",
-		"vcenter.insecure":                      "false",
-		"vcenter.placementReservedMemoryMB":     "esxi1.lab.jmal.io=8192,esxi2.lab.jmal.io=8192,nuc1.lab.jmal.io=4096,nuc2.lab.jmal.io=2048,nuc3.lab.jmal.io=2048",
-		"worker.orphanReconciler.enabled":       "true",
-		"worker.networkReconciler.enabled":      "true",
-		"worker.l1Validation.enabled":           "true",
-		"worker.templateHealth.enabled":         "true",
-		"worker.idleEvaluator.enabled":          "true",
-		"worker.idleEvaluator.dryRun":           "false",
-		"worker.pipelineReconciler.enabled":     "true",
+		"replicaCount.worker":                     "1",
+		"provisioning.enabled":                    "true",
+		"provisioning.workerClaimsEnabled":        "true",
+		"synthetic.provisioningExpectedEnabled":   "true",
+		"synthetic.suspend":                       "false",
+		"synthetic.lifecycle.enabled":             "true",
+		"synthetic.janitor.enabled":               "true",
+		"synthetic.runner.enabled":                "true",
+		"synthetic.janitor.suspend":               "false",
+		"synthetic.runner.suspend":                "false",
+		"vcenter.hosts":                           "esxi1.lab.jmal.io,esxi2.lab.jmal.io,nuc1.lab.jmal.io,nuc2.lab.jmal.io,nuc3.lab.jmal.io",
+		"vcenter.resourcePools":                   "/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs,/JMAL-Datacenter/host/Intel-Cluster/Resources/Student-VMs",
+		"vcenter.insecure":                        "false",
+		"vcenter.placementReservedMemoryMB":       "esxi1.lab.jmal.io=8192,esxi2.lab.jmal.io=8192,nuc1.lab.jmal.io=4096,nuc2.lab.jmal.io=2048,nuc3.lab.jmal.io=2048",
+		"worker.orphanReconciler.enabled":         "true",
+		"worker.templateOrphanReconciler.enabled": "true",
+		"worker.networkReconciler.enabled":        "true",
+		"worker.l1Validation.enabled":             "true",
+		"worker.templateHealth.enabled":           "true",
+		"worker.idleEvaluator.enabled":            "true",
+		"worker.idleEvaluator.dryRun":             "false",
+		"worker.pipelineReconciler.enabled":       "true",
 	} {
 		parts := strings.Split(path, ".")
 		if got := chartScalar(t, "values.prod.yaml", parts...); got != want {
@@ -306,6 +311,7 @@ func TestFullFleetOverlayRendersApprovedFinalState(t *testing.T) {
 	if !values.Worker.L1Validation.Enabled ||
 		!values.Worker.TemplateHealth.Enabled ||
 		!values.Worker.OrphanReconciler.Enabled ||
+		!values.Worker.TemplateOrphanReconciler.Enabled ||
 		!values.Worker.NetworkReconciler.Enabled ||
 		!values.Worker.IdleEvaluator.Enabled ||
 		values.Worker.IdleEvaluator.DryRun ||
@@ -314,24 +320,25 @@ func TestFullFleetOverlayRendersApprovedFinalState(t *testing.T) {
 		t.Fatalf("full-fleet producer controls are not approved: %+v", values.Worker)
 	}
 	for path, want := range map[string]string{
-		"replicaCount.worker":               "4",
-		"provisioning.enabled":              "true",
-		"provisioning.workerClaimsEnabled":  "true",
-		"vcenter.insecure":                  "false",
-		"vcenter.hosts":                     "esxi1.lab.jmal.io,esxi2.lab.jmal.io,nuc1.lab.jmal.io,nuc2.lab.jmal.io,nuc3.lab.jmal.io",
-		"vcenter.resourcePools":             "/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs,/JMAL-Datacenter/host/Intel-Cluster/Resources/Student-VMs",
-		"vcenter.placementReservedMemoryMB": "esxi1.lab.jmal.io=8192,esxi2.lab.jmal.io=8192,nuc1.lab.jmal.io=4096,nuc2.lab.jmal.io=2048,nuc3.lab.jmal.io=2048",
-		"synthetic.lifecycle.enabled":       "true",
-		"synthetic.janitor.enabled":         "true",
-		"synthetic.runner.enabled":          "true",
-		"worker.l1Validation.enabled":       "true",
-		"worker.templateHealth.enabled":     "true",
-		"worker.orphanReconciler.enabled":   "true",
-		"worker.networkReconciler.enabled":  "true",
-		"worker.idleEvaluator.enabled":      "true",
-		"worker.idleEvaluator.dryRun":       "false",
-		"worker.pipelineReconciler.enabled": "true",
-		"worker.contentFilter.enabled":      "false",
+		"replicaCount.worker":                     "4",
+		"provisioning.enabled":                    "true",
+		"provisioning.workerClaimsEnabled":        "true",
+		"vcenter.insecure":                        "false",
+		"vcenter.hosts":                           "esxi1.lab.jmal.io,esxi2.lab.jmal.io,nuc1.lab.jmal.io,nuc2.lab.jmal.io,nuc3.lab.jmal.io",
+		"vcenter.resourcePools":                   "/JMAL-Datacenter/host/AMD-Cluster/Resources/Student-VMs,/JMAL-Datacenter/host/Intel-Cluster/Resources/Student-VMs",
+		"vcenter.placementReservedMemoryMB":       "esxi1.lab.jmal.io=8192,esxi2.lab.jmal.io=8192,nuc1.lab.jmal.io=4096,nuc2.lab.jmal.io=2048,nuc3.lab.jmal.io=2048",
+		"synthetic.lifecycle.enabled":             "true",
+		"synthetic.janitor.enabled":               "true",
+		"synthetic.runner.enabled":                "true",
+		"worker.l1Validation.enabled":             "true",
+		"worker.templateHealth.enabled":           "true",
+		"worker.orphanReconciler.enabled":         "true",
+		"worker.templateOrphanReconciler.enabled": "true",
+		"worker.networkReconciler.enabled":        "true",
+		"worker.idleEvaluator.enabled":            "true",
+		"worker.idleEvaluator.dryRun":             "false",
+		"worker.pipelineReconciler.enabled":       "true",
+		"worker.contentFilter.enabled":            "false",
 	} {
 		parts := strings.Split(path, ".")
 		if got := chartScalar(t, "values.full-fleet.yaml", parts...); got != want {

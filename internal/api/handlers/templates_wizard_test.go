@@ -190,10 +190,11 @@ func TestWizardStateHappy(t *testing.T) {
 // tests can assert wizardState() didn't query vCenter outside the
 // build-time states (cost: a wasted SOAP round-trip per poll otherwise).
 type fakeVC struct {
-	info     *vcenter.GuestInfo
-	err      error
-	powerErr error
-	gotCalls []string
+	info       *vcenter.GuestInfo
+	err        error
+	powerErr   error
+	destroyErr error
+	gotCalls   []string
 }
 
 func (f *fakeVC) AcquireWebMKSTicket(_ context.Context, moref string) (*vcenter.WebMKSTicket, error) {
@@ -208,7 +209,7 @@ func (f *fakeVC) GetGuestInfo(_ context.Context, moref string) (*vcenter.GuestIn
 
 func (f *fakeVC) DestroyVM(_ context.Context, moref string) error {
 	f.gotCalls = append(f.gotCalls, "destroy:"+moref)
-	return nil
+	return f.destroyErr
 }
 
 func (f *fakeVC) PowerOnVM(_ context.Context, moref string) error {

@@ -60,6 +60,7 @@ var requiredWiring = map[string][]struct {
 		{"ReconcileTemplateHealthIfDue", "the 12h ticker is created at process start and reset by every restart; this service deploys several times a day, so WITHOUT the leader-acquisition catch-up the ticker never fires and the feature above is dead on arrival. Note the plain ReconcileTemplateHealth row does not cover this -- it is a substring of this symbol, so it stays green even if the catch-up is deleted"},
 		{"ReplaceTemplateHealthSnapshot", "without the leader-acquisition replacement, Pushgateway retains deleted templates and obsolete raw check_type series from the previous worker process whenever the due-check skips a fresh vCenter cycle"},
 		{"ReconcileTemplateReplicaBuildMetrics", "without it retained replica build phase and stuck-operation gauges are never refreshed"},
+		{"ReconcileTemplateOrphans", "without it stale error/draft wizard staging VMs and deleted-template leftovers in the Templates folder are never destroyed; crucible_template_orphans_* metrics never push"},
 	},
 	"cmd/crucible-runner/main.go": {
 		{"MaterializeActionLibrary", "without it the engine-generated action library is never written to disk, so every library action (http_get, port_open, ssh_exec, …) fails with exit 127 — the original defect, in which workflows appeared to run, the Job exited 0, and no action could possibly pass"},
@@ -438,11 +439,11 @@ func TestCIWorkflowTestJobStillRunsFullCoverage(t *testing.T) {
 	}
 
 	expectRuns := map[string]string{
-		"Build":                    "go build ./...",
-		"Vet":                      "go vet ./...",
-		"Verify wiki bundle":       "make verify-wiki",
+		"Build":                     "go build ./...",
+		"Vet":                       "go vet ./...",
+		"Verify wiki bundle":        "make verify-wiki",
 		"Fast fail: short Go suite": "go test ./... -short -count=1",
-		"Test":                     "go test ./... -v -race",
+		"Test":                      "go test ./... -v -race",
 	}
 	for _, raw := range steps {
 		step := mustMap(t, raw, "jobs.test.steps")

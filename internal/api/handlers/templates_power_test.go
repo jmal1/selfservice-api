@@ -46,6 +46,13 @@ func (f *fakePowerDB) CreateJob(_ context.Context, _ string, _ []byte) (*models.
 	return &models.Job{ID: uuid.New()}, nil
 }
 
+func (f *fakePowerDB) SetTemplateVCenterVM(_ context.Context, _ uuid.UUID, vcenterVMID string) error {
+	if f.tmpl != nil {
+		f.tmpl.VCenterVMID = vcenterVMID
+	}
+	return nil
+}
+
 // powerTemplate builds a ready-state template with a staging VM moref. `ready`
 // is deliberately not a build state, so wizardState() won't issue a GetGuestInfo
 // call and pollute the fakeVC call log we assert on.

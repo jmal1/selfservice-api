@@ -107,6 +107,8 @@ worker:
     confirmationReconcileInterval: "1m"
   orphanReconciler:
     enabled: true
+  templateOrphanReconciler:
+    enabled: true
   networkReconciler:
     enabled: true
   idleEvaluator:
