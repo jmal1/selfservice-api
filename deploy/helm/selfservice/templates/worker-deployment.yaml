@@ -277,13 +277,11 @@ spec:
             {{- toYaml .Values.worker.resources | nindent 12 }}
       affinity:
         podAntiAffinity:
-          # Preferred (not required): spread worker replicas across nodes for
-          # resilience without making pods unschedulable on small clusters.
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                labelSelector:
-                  matchLabels:
-                    app.kubernetes.io/name: selfservice-api
-                    app.kubernetes.io/component: provision-worker
-                topologyKey: kubernetes.io/hostname
+          # Required: Wave D keeps two workers on distinct nodes. Soft
+          # preference previously allowed both replicas on one host.
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: selfservice-api
+                  app.kubernetes.io/component: provision-worker
+              topologyKey: kubernetes.io/hostname

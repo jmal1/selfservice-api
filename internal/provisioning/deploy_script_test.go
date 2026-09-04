@@ -2955,7 +2955,7 @@ synthetic:
 		"--set synthetic.janitor.suspend=true",
 		"--set synthetic.runner.suspend=true",
 		"--set synthetic.lifecycle.enabled=true",
-		"--set replicaCount.worker=1",
+		"--set replicaCount.worker=2",
 	}
 	for _, logPath := range []string{env.templateLog, env.upgradeLog} {
 		body, readErr := os.ReadFile(logPath)

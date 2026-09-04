@@ -7,7 +7,9 @@
 #
 # deploy.sh validate_foundation_intent matches this reopened contract:
 # PROVISIONING_ENABLED=true, worker claims=true, synthetic provisioning
-# expected=true, lifecycle=true, content-filter still false, worker replicas=1.
+# expected=true, lifecycle=true, content-filter still false, worker replicas=2.
+# DB pool at 2 workers: api(20) + engine(20) + 2×(dbMaxConns 5 + leader 1) = 52 / 100.
+# Worker pods use required hostname anti-affinity so the two replicas never share a node.
 #
 # Anything NOT listed here uses defaults from values.yaml. Keep this file as
 # small as possible — only true production overrides belong here.
@@ -19,8 +21,8 @@
 #   - Vault path: secret/selfservice/<secret-name>
 
 replicaCount:
-  # One worker while mutating synthetics stay off. Host count is not a reason to scale workers.
-  worker: 1
+  # Two workers with leader election + required hostname anti-affinity (Wave D).
+  worker: 2
 
 provisioning:
   # Live Helm 176 (2026-09-01): API admission and worker claims are open.

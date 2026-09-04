@@ -222,8 +222,8 @@ func TestInternalIngressCanonicalizesToPublicHost(t *testing.T) {
 
 func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T) {
 	values := loadChartValues(t, "values.prod.yaml")
-	if values.ReplicaCount.Worker != 1 {
-		t.Errorf("production worker replicas = %d, want exactly 1 while mutating synthetics stay off", values.ReplicaCount.Worker)
+	if values.ReplicaCount.Worker != 2 {
+		t.Errorf("production worker replicas = %d, want exactly 2 (Wave D, required hostname anti-affinity)", values.ReplicaCount.Worker)
 	}
 	if !values.Provisioning.Enabled || !values.Provisioning.WorkerClaimsEnabled {
 		t.Fatalf("production provisioning controls = %+v, want admission and worker claims open (Helm 176 live contract)", values.Provisioning)
@@ -261,7 +261,7 @@ func TestProductionProvisioningKeepsClaimsGuardedAndFeedbackEnabled(t *testing.T
 		t.Fatalf("production worker background controls are not in the expected guarded-feedback state: %+v", values.Worker)
 	}
 	for path, want := range map[string]string{
-		"replicaCount.worker":                     "1",
+		"replicaCount.worker":                     "2",
 		"provisioning.enabled":                    "true",
 		"provisioning.workerClaimsEnabled":        "true",
 		"synthetic.provisioningExpectedEnabled":   "true",
