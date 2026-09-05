@@ -8,6 +8,14 @@ metadata:
     app.kubernetes.io/component: provision-worker
 spec:
   replicas: {{ .Values.replicaCount.worker }}
+  # Hard hostname anti-affinity + only two untainted nodes (k3sv03 is
+  # NoSchedule/runner) means a surge pod has nowhere to land. Replace
+  # in place: PDB keeps minAvailable = replicas-1 during the gap.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: selfservice-api
