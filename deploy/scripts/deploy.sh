@@ -2969,11 +2969,12 @@ validate_upgrade_hooks() {
 
 # validate_foundation_intent asserts the reopened production contract from
 # values.prod.yaml: admission and worker claims on, synthetic provisioning
-# expected on, content-filter still off, and exactly one worker. Lifecycle is
-# optional at call sites that already compare it separately (candidate apply
-# skips it; prepare-claims-baseline still requires the explicit true).
-# expected_claims defaults to true for rendered chart/candidate manifests.
-# Pass false when checking the live pause window during rollback containment.
+# expected on, content-filter still off, and exactly two workers (Wave D).
+# Lifecycle is optional at call sites that already compare it separately
+# (candidate apply skips it; prepare-claims-baseline still requires the
+# explicit true). expected_claims defaults to true for rendered
+# chart/candidate manifests. Pass false when checking the live pause window
+# during rollback containment.
 validate_foundation_intent() {
   local manifest=$1
   local validate_replicas=${2:-true}
@@ -3015,8 +3016,8 @@ validate_foundation_intent() {
   fi
   if [ "$validate_replicas" = true ]; then
     worker_replicas="$(rendered_worker_replicas_from_manifest "$manifest")"
-    if [ "$worker_replicas" != "1" ]; then
-      echo "ERROR: candidate renders $worker_replicas workers, not exactly 1." >&2
+    if [ "$worker_replicas" != "2" ]; then
+      echo "ERROR: candidate renders $worker_replicas workers, not exactly 2." >&2
       return 1
     fi
   fi
@@ -3786,8 +3787,8 @@ verify_manifest_and_live() {
     return 1
   fi
   rendered_worker_replicas="$(rendered_worker_replicas_from_manifest "$manifest")"
-  if [ "$rendered_worker_replicas" != "1" ]; then
-    echo "ERROR: current Helm rollback target renders $rendered_worker_replicas workers, not exactly 1." >&2
+  if [ "$rendered_worker_replicas" != "2" ]; then
+    echo "ERROR: current Helm rollback target renders $rendered_worker_replicas workers, not exactly 2." >&2
     rm -rf "$tmp_dir"
     return 1
   fi
@@ -3873,12 +3874,12 @@ verify_manifest_and_live() {
   live_worker="$tmp_dir/Deployment-${RELEASE}-worker.yaml"
   live_claims="$(claims_from_manifest < "$live_worker")"
   if ! live_replicas="$(live_worker_replicas)"; then
-    echo "ERROR: could not read an integer replica count of exactly 1 from the live worker Deployment." >&2
+    echo "ERROR: could not read an integer replica count of exactly 2 from the live worker Deployment." >&2
     rm -rf "$tmp_dir"
     return 1
   fi
-  if [ "$live_replicas" != "1" ]; then
-    echo "ERROR: live worker must have replicas=1; got claims=$live_claims replicas=$live_replicas." >&2
+  if [ "$live_replicas" != "2" ]; then
+    echo "ERROR: live worker must have replicas=2; got claims=$live_claims replicas=$live_replicas." >&2
     rm -rf "$tmp_dir"
     return 1
   fi
@@ -3994,7 +3995,7 @@ prepare_claims_baseline() {
     --set synthetic.janitor.suspend=true
     --set synthetic.runner.suspend=true
     --set synthetic.lifecycle.enabled=true
-    --set replicaCount.worker=1
+    --set replicaCount.worker=2
   )
   tmp_dir="$(mktemp -d)"
   BASELINE_TMP_DIR=$tmp_dir

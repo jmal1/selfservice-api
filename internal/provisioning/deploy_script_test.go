@@ -2955,7 +2955,7 @@ synthetic:
 		"--set synthetic.janitor.suspend=true",
 		"--set synthetic.runner.suspend=true",
 		"--set synthetic.lifecycle.enabled=true",
-		"--set replicaCount.worker=1",
+		"--set replicaCount.worker=2",
 	}
 	for _, logPath := range []string{env.templateLog, env.upgradeLog} {
 		body, readErr := os.ReadFile(logPath)
@@ -5671,7 +5671,7 @@ kind: Deployment
 metadata:
   name: worker-replica-fixture
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: worker-replica-fixture
@@ -5707,12 +5707,12 @@ spec:
 		transform   string
 		wantSuccess bool
 	}{
-		{name: "integer one", transform: ".", wantSuccess: true},
+		{name: "integer two", transform: ".", wantSuccess: true},
 		{name: "missing", transform: "del(.spec.replicas)"},
 		{name: "null", transform: ".spec.replicas = null"},
-		{name: "string", transform: `.spec.replicas = "1"`},
+		{name: "string", transform: `.spec.replicas = "2"`},
 		{name: "zero", transform: ".spec.replicas = 0"},
-		{name: "two", transform: ".spec.replicas = 2"},
+		{name: "one", transform: ".spec.replicas = 1"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -5728,10 +5728,10 @@ spec:
 			output, filterErr := command.CombinedOutput()
 			if test.wantSuccess {
 				if filterErr != nil {
-					t.Fatalf("replicas=1 was rejected: %v\n%s", filterErr, output)
+					t.Fatalf("replicas=2 was rejected: %v\n%s", filterErr, output)
 				}
-				if strings.TrimSpace(string(output)) != "1" {
-					t.Fatalf("replicas=1 produced %q, not 1", output)
+				if strings.TrimSpace(string(output)) != "2" {
+					t.Fatalf("replicas=2 produced %q, not 2", output)
 				}
 			} else if filterErr == nil {
 				t.Fatalf("sabotaged replica count unexpectedly passed: %s", output)
@@ -8599,7 +8599,7 @@ kind: Deployment
 metadata:
   name: selfservice-worker
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: worker

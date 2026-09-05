@@ -6,8 +6,8 @@ elif (.spec.replicas | type) != "number" then
   error("worker Deployment .spec.replicas must be a number")
 elif (.spec.replicas | floor) != .spec.replicas then
   error("worker Deployment .spec.replicas must be an integer")
-elif .spec.replicas != 1 then
-  error("worker Deployment .spec.replicas must equal 1")
+elif .spec.replicas != 2 then
+  error("worker Deployment .spec.replicas must equal 2")
 else
   .spec.replicas
 end
