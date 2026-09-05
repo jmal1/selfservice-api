@@ -5706,13 +5706,15 @@ spec:
 		name        string
 		transform   string
 		wantSuccess bool
+		wantValue   string
 	}{
-		{name: "integer two", transform: ".", wantSuccess: true},
+		{name: "integer two", transform: ".", wantSuccess: true, wantValue: "2"},
+		{name: "integer one", transform: ".spec.replicas = 1", wantSuccess: true, wantValue: "1"},
 		{name: "missing", transform: "del(.spec.replicas)"},
 		{name: "null", transform: ".spec.replicas = null"},
 		{name: "string", transform: `.spec.replicas = "2"`},
 		{name: "zero", transform: ".spec.replicas = 0"},
-		{name: "one", transform: ".spec.replicas = 1"},
+		{name: "three", transform: ".spec.replicas = 3"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -5728,10 +5730,10 @@ spec:
 			output, filterErr := command.CombinedOutput()
 			if test.wantSuccess {
 				if filterErr != nil {
-					t.Fatalf("replicas=2 was rejected: %v\n%s", filterErr, output)
+					t.Fatalf("replicas=%s was rejected: %v\n%s", test.wantValue, filterErr, output)
 				}
-				if strings.TrimSpace(string(output)) != "2" {
-					t.Fatalf("replicas=2 produced %q, not 2", output)
+				if strings.TrimSpace(string(output)) != test.wantValue {
+					t.Fatalf("replicas=%s produced %q, not %s", test.wantValue, output, test.wantValue)
 				}
 			} else if filterErr == nil {
 				t.Fatalf("sabotaged replica count unexpectedly passed: %s", output)

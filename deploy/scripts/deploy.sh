@@ -3787,18 +3787,25 @@ verify_manifest_and_live() {
     return 1
   fi
   rendered_worker_replicas="$(rendered_worker_replicas_from_manifest "$manifest")"
-  if [ "$rendered_worker_replicas" != "2" ]; then
-    echo "ERROR: current Helm rollback target renders $rendered_worker_replicas workers, not exactly 2." >&2
-    rm -rf "$tmp_dir"
-    return 1
-  fi
+  # Wave D scale-up: the live rollback target may still be the pre-scale
+  # single-worker revision while the candidate renders 2. Accept either so
+  # the first 1→2 apply is not deadlocked; reject any other count.
+  case "$rendered_worker_replicas" in
+    1|2) ;;
+    *)
+      echo "ERROR: current Helm rollback target renders $rendered_worker_replicas workers, want 1 (pre-Wave-D) or 2." >&2
+      rm -rf "$tmp_dir"
+      return 1
+      ;;
+  esac
   rendered_runner="$(runner_image_from_manifest < "$manifest")"
   if ! is_digest_image "$rendered_runner"; then
     echo "ERROR: current Helm rollback target leaves RUNNER_IMAGE mutable: $rendered_runner" >&2
     rm -rf "$tmp_dir"
     return 1
   fi
-  if ! validate_foundation_intent "$manifest" true false; then
+  # Skip replica equality here: candidate validation still requires exactly 2.
+  if ! validate_foundation_intent "$manifest" false false; then
     echo "ERROR: current Helm rollback target changes the reopened production foundation intent." >&2
     rm -rf "$tmp_dir"
     return 1
@@ -3874,15 +3881,26 @@ verify_manifest_and_live() {
   live_worker="$tmp_dir/Deployment-${RELEASE}-worker.yaml"
   live_claims="$(claims_from_manifest < "$live_worker")"
   if ! live_replicas="$(live_worker_replicas)"; then
-    echo "ERROR: could not read an integer replica count of exactly 2 from the live worker Deployment." >&2
+    echo "ERROR: could not read an integer replica count of 1 or 2 from the live worker Deployment." >&2
     rm -rf "$tmp_dir"
     return 1
   fi
-  if [ "$live_replicas" != "2" ]; then
-    echo "ERROR: live worker must have replicas=2; got claims=$live_claims replicas=$live_replicas." >&2
+  # Live must match the rollback target. During Wave D scale-up both are 1;
+  # after the first successful apply both are 2. The jq gate still requires
+  # exactly 2 once live has been scaled, so accept the transition pair here.
+  if [ "$live_replicas" != "$rendered_worker_replicas" ]; then
+    echo "ERROR: live worker replicas=$live_replicas must match rollback target replicas=$rendered_worker_replicas (claims=$live_claims)." >&2
     rm -rf "$tmp_dir"
     return 1
   fi
+  case "$live_replicas" in
+    1|2) ;;
+    *)
+      echo "ERROR: live worker replicas=$live_replicas is outside the Wave D transition window (want 1 or 2)." >&2
+      rm -rf "$tmp_dir"
+      return 1
+      ;;
+  esac
   # Allow paused claims=false during a guarded apply, or steady-state claims that
   # already match the reopened rendered chart (claims=true).
   if [ "$live_claims" != "false" ] && [ "$live_claims" != "$rendered_claims" ]; then
