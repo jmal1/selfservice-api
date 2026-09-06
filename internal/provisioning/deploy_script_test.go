@@ -2071,7 +2071,7 @@ func TestDeployScriptMigrationContiguityIsLoadBearing(t *testing.T) {
 		t.Fatal(err)
 	}
 	const correct = "local inventory base raw name direction version expected max_version=0"
-	const sabotaged = "local inventory base raw name direction version expected max_version=40"
+	const sabotaged = "local inventory base raw name direction version expected max_version=41"
 	if strings.Count(string(source), correct) != 1 {
 		t.Fatal("migration contiguity sequence initializer is not unique")
 	}
