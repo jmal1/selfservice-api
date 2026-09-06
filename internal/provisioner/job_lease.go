@@ -12,10 +12,13 @@ import (
 )
 
 const (
-	JobLeaseDuration          = 15 * time.Minute
-	JobLeaseHeartbeatInterval = 30 * time.Second
-	JobLeaseRecoveryInterval  = time.Minute
-	jobLeaseWriteTimeout      = 10 * time.Second
+	// JobLeaseDuration is the liveness window while heartbeats succeed — not a
+	// maximum job runtime. Clone/API work may run far longer if renewals keep
+	// claimed_at fresh. Sized at ~6 missed 15s intervals for DNS/PG blips.
+	JobLeaseDuration          = 90 * time.Second
+	JobLeaseHeartbeatInterval = 15 * time.Second
+	JobLeaseRecoveryInterval  = 15 * time.Second
+	jobLeaseWriteTimeout      = 5 * time.Second
 )
 
 var errJobLeaseFinished = errors.New("job execution finished")

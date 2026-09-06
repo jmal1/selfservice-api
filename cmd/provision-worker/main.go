@@ -2,24 +2,26 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jmal1/selfservice-api/internal/config"
 	"github.com/jmal1/selfservice-api/internal/database"
-	"github.com/jmal1/selfservice-api/internal/leader"
 	events "github.com/jmal1/selfservice-api/internal/nats"
 	"github.com/jmal1/selfservice-api/internal/objectstore"
 	"github.com/jmal1/selfservice-api/internal/opnsense"
 	"github.com/jmal1/selfservice-api/internal/provisioner"
 	"github.com/jmal1/selfservice-api/internal/vcenter"
+	"github.com/jmal1/selfservice-api/internal/worklease"
 )
 
 func main() {
@@ -43,25 +45,13 @@ func main() {
 	}
 	queries := database.NewQueries(pool)
 
-	// Leader election: gate all periodic reconcilers behind a session-scoped
-	// Postgres advisory lock so exactly one replica runs them at a time.
-	// The job-claim loop (processJobs) is intentionally NOT gated — all replicas
-	// must claim jobs via SELECT ... FOR UPDATE SKIP LOCKED.
-	//
-	// Set WORKER_LEADER_ELECTION_ENABLED=false to disable (single-replica mode).
-	leaderElectionEnabled := true
-	if v := os.Getenv("WORKER_LEADER_ELECTION_ENABLED"); v != "" {
-		leaderElectionEnabled = strings.EqualFold(v, "true")
-	}
-	leaderRetry := envDuration(logger, "WORKER_LEADER_RETRY_INTERVAL", 5*time.Second)
-
-	elec := leader.NewPostgresElector(cfg.Database.DSN(), leader.WorkerLockKey, leaderRetry, logger)
-	if !leaderElectionEnabled {
-		// When disabled, behave as a permanent leader (single-replica operation).
-		logger.Warn("leader election disabled; this replica will run all reconcilers unconditionally")
-		elec = leader.NewAlwaysLeader(logger)
-	}
-	go elec.Run(ctx)
+	// Work leases (Postgres row claim + heartbeat) gate exclusive reconcilers.
+	// There is no process-wide leader: each named reconciler is claimed independently.
+	// Job claiming remains multi-worker via FOR UPDATE SKIP LOCKED + job leases.
+	leaseStore := queries
+	workerHost, _ := os.Hostname()
+	workerID := workerHost + "-" + uuid.NewString()
+	logger.Info("work-lease coordination enabled", "worker_id", workerID)
 
 	// Connect to NATS
 	natsClient, err := events.NewClient(cfg.NATS, logger)
@@ -139,24 +129,6 @@ func main() {
 		prov.EnablePipelineMetrics(pipeline)
 		logger.Info("pipeline metrics enabled", "url", pgURL, "job", job)
 		go pipeline.RunPusher(ctx, 30*time.Second, logger)
-	}
-
-	// Leader metrics: push crucible_worker_is_leader and
-	// crucible_worker_leader_transitions_total to Pushgateway, labelled by pod.
-	// This feeds the CrucibleWorkerNoLeader alert (sum != 1 for 15m).
-	if pgURL := os.Getenv("WORKER_PUSHGATEWAY_URL"); pgURL != "" {
-		workerJob := os.Getenv("WORKER_PUSHGATEWAY_JOB")
-		if workerJob == "" {
-			workerJob = "crucible_provision_worker"
-		}
-		podName, _ := os.Hostname()
-		leaderPusher := &leader.Pusher{
-			BaseURL: pgURL,
-			Job:     workerJob,
-			Pod:     podName,
-		}
-		go leaderPusher.RunPusher(ctx, elec, 30*time.Second)
-		logger.Info("leader metrics pusher enabled", "pod", podName, "url", pgURL)
 	}
 
 	// Optional: enable destroy_failed Pushgateway metric. When the
@@ -316,16 +288,12 @@ func main() {
 	var orphanScheduler *provisioner.OrphanReconcilerScheduler
 	if orphanEnabled {
 		orphanScheduler = provisioner.NewOrphanReconcilerScheduler(
-			func() provisioner.OrphanLeadershipState {
-				state := elec.CurrentLeadership()
-				return provisioner.OrphanLeadershipState{
-					IsLeader:   state.IsLeader,
-					Generation: state.Generation,
-					Context:    state.Context,
-				}
-			},
+			alwaysWorkLeaseLeadership(ctx),
 			func(runCtx context.Context) (provisioner.ReconcileCounts, error) {
-				return prov.ReconcileVCenterOrphans(runCtx, orphanCfg)
+				return runOrphanLeased(runCtx, leaseStore, worklease.VCenterOrphan, workerID, logger,
+					func(leaseCtx context.Context) (provisioner.ReconcileCounts, error) {
+						return prov.ReconcileVCenterOrphans(leaseCtx, orphanCfg)
+					})
 			},
 			logger,
 		)
@@ -381,23 +349,19 @@ func main() {
 	var templateOrphanScheduler *provisioner.OrphanReconcilerScheduler
 	if templateOrphanEnabled {
 		templateOrphanScheduler = provisioner.NewOrphanReconcilerScheduler(
-			func() provisioner.OrphanLeadershipState {
-				state := elec.CurrentLeadership()
-				return provisioner.OrphanLeadershipState{
-					IsLeader:   state.IsLeader,
-					Generation: state.Generation,
-					Context:    state.Context,
-				}
-			},
+			alwaysWorkLeaseLeadership(ctx),
 			func(runCtx context.Context) (provisioner.ReconcileCounts, error) {
-				counts, err := prov.ReconcileTemplateOrphans(runCtx, templateOrphanCfg)
-				return provisioner.ReconcileCounts{
-					InventoryVMs:    counts.InventoryVMs,
-					Unknown:         counts.UnknownDryRun,
-					SkippedRecent:   counts.SkippedRecent,
-					Destroyed:       counts.Destroyed,
-					DestroyFailures: counts.DestroyFailures,
-				}, err
+				return runOrphanLeased(runCtx, leaseStore, worklease.TemplateOrphan, workerID, logger,
+					func(leaseCtx context.Context) (provisioner.ReconcileCounts, error) {
+						counts, err := prov.ReconcileTemplateOrphans(leaseCtx, templateOrphanCfg)
+						return provisioner.ReconcileCounts{
+							InventoryVMs:    counts.InventoryVMs,
+							Unknown:         counts.UnknownDryRun,
+							SkippedRecent:   counts.SkippedRecent,
+							Destroyed:       counts.Destroyed,
+							DestroyFailures: counts.DestroyFailures,
+						}, err
+					})
 			},
 			logger,
 		)
@@ -571,7 +535,6 @@ func main() {
 	l1ValidationSchedulerInterval := envDuration(logger, "WORKER_L1_VALIDATION_SCHEDULER_INTERVAL", 5*time.Minute)
 	l1ValidationCfg := provisioner.L1TrustValidationReconcilerConfig{
 		Interval: l1ValidationInterval,
-		IsLeader: elec.IsLeader,
 	}
 	var l1ValidationSchedulerMetrics *provisioner.L1ValidationSchedulerMetrics
 	if pgURL := os.Getenv("WORKER_PUSHGATEWAY_URL"); pgURL != "" {
@@ -585,15 +548,22 @@ func main() {
 	var l1ValidationScheduler *provisioner.L1TrustValidationScheduler
 	if l1ValidationEnabled {
 		reconcile := func(runCtx context.Context) (provisioner.L1TrustValidationCounts, error) {
-			return prov.ReconcileL1TrustValidation(runCtx, l1ValidationCfg)
+			var counts provisioner.L1TrustValidationCounts
+			err := worklease.RunExclusive(runCtx, leaseStore, worklease.L1Validation, workerID, logger,
+				func(leaseCtx context.Context, _ *worklease.Lease) error {
+					cfg := l1ValidationCfg
+					cfg.IsLeader = func() bool { return leaseCtx.Err() == nil }
+					var e error
+					counts, e = prov.ReconcileL1TrustValidation(leaseCtx, cfg)
+					return e
+				})
+			if errors.Is(err, worklease.ErrNotClaimed) {
+				return counts, nil
+			}
+			return counts, err
 		}
-		if l1ValidationSchedulerMetrics == nil {
-			l1ValidationScheduler = provisioner.NewL1TrustValidationScheduler(
-				elec.IsLeader, reconcile, nil, logger)
-		} else {
-			l1ValidationScheduler = provisioner.NewL1TrustValidationScheduler(
-				elec.IsLeader, reconcile, l1ValidationSchedulerMetrics, logger)
-		}
+		l1ValidationScheduler = provisioner.NewL1TrustValidationScheduler(
+			func() bool { return true }, reconcile, l1ValidationSchedulerMetrics, logger)
 	}
 
 	// Template health reconciler. Checks every student-visible template
@@ -639,13 +609,6 @@ func main() {
 	}
 	prov.ConfigureTemplateHealth(healthReconcilerCfg)
 
-	// Worker ID for job claiming
-	workerHost, err := os.Hostname()
-	if err != nil {
-		workerHost = "worker-unknown"
-	}
-	workerID := workerHost + "-" + uuid.NewString()
-
 	logger.Info("starting provision worker",
 		"worker_id", workerID,
 		"vcenter", cfg.VCenter.URL,
@@ -661,8 +624,11 @@ func main() {
 		logger.Info("recovered stale jobs", "count", recovered)
 	}
 
-	// Retry any pods stuck in destroy_failed from previous runs
-	prov.RetryFailedDestroys(ctx)
+	// Retry any pods stuck in destroy_failed from previous runs (work-lease gated).
+	runLeased(ctx, leaseStore, worklease.RetryFailedDestroys, workerID, logger, func(leaseCtx context.Context) error {
+		prov.RetryFailedDestroys(leaseCtx)
+		return nil
+	})
 
 	jobRuns := &jobRunner{}
 
@@ -731,9 +697,7 @@ func main() {
 		defer t.Stop()
 		networkReconcilerTickerC = t.C
 		logger.Info("opnsense network reconciler enabled", "interval", networkReconcilerInterval)
-		// Initial run: handled via elec.Changes() in the main select loop below
-		// so the first pass fires as soon as leadership is elected, not speculatively
-		// before the lock is acquired.
+		// Initial run is attempted via startupCatchup below (work-lease gated).
 	}
 
 	// Idle VM suspend evaluator ticker (disabled by default via dry-run; nil-safe).
@@ -746,13 +710,11 @@ func main() {
 			"interval", idleEvalInterval,
 			"dry_run", dryRunResult.DryRun)
 		if idleEvalPusher != nil {
-			// Leader-gate the push: only the replica that runs the evaluator
-			// (and thus advances the last-run timestamp) may write the shared
-			// Pushgateway grouping key. See RunSuspendMetricsPusher for why a
-			// non-leader push pins crucible_idle_evaluator_last_run_timestamp
-			// to a stale start-time seed and makes CrucibleIdleEvaluatorStale
-			// fire forever.
-			go idleEvalPusher.RunSuspendMetricsPusher(ctx, 30*time.Second, elec.IsLeader, logger)
+			// Only the suspend_metrics lease holder may push shared Pushgateway
+			// gauges (avoids stale last-run seeds from non-owners).
+			var holdSuspend atomic.Bool
+			go holdWorkLease(ctx, leaseStore, worklease.SuspendMetrics, workerID, logger, &holdSuspend)
+			go idleEvalPusher.RunSuspendMetricsPusher(ctx, 30*time.Second, holdSuspend.Load, logger)
 		}
 	}
 
@@ -771,20 +733,17 @@ func main() {
 		l1ValidationScheduler.Start(ctx)
 	}
 
-	// Expiration cron ticker: gated by leader election (integrated into the main
-	// select loop below). ExpireStale is called immediately on leadership
-	// acquisition via elec.Changes(), then on each 5-minute tick.
+	// Expiration cron ticker: work-lease gated in the select loop.
 	expirationCronTicker := time.NewTicker(5 * time.Minute)
 	defer expirationCronTicker.Stop()
 
-	// Stuck-upload reconciler ticker: gated by leader election (integrated into
-	// the main select loop below). Only active when an object store is configured.
+	// Stuck-upload reconciler ticker: work-lease gated.
 	var stuckUploadTickerC <-chan time.Time
 	if cfg.ObjectStore.Endpoint != "" {
 		t := time.NewTicker(stuckUploadInterval)
 		defer t.Stop()
 		stuckUploadTickerC = t.C
-		logger.Info("stuck-upload reconciler enabled (leader-gated)",
+		logger.Info("stuck-upload reconciler enabled (work-lease gated)",
 			"interval", stuckUploadInterval, "stale_threshold", stuckUploadStaleThreshold)
 	}
 	// Template health reconciler ticker (opt-in; nil-safe).
@@ -836,195 +795,78 @@ func main() {
 					})
 				}
 
-			// ── Periodic reconcilers: ALL gated by leader election ─────────────
-			// When not leader the tick fires but the body is a cheap no-op.
-			// This keeps the ticker alive so the leader can take over without
-			// needing a restart.
+			// ── Periodic reconcilers: each named work-lease (DB claim+heartbeat) ──
 			case <-retryTicker.C:
-				if !elec.IsLeader() {
-					continue
-				}
-				prov.RetryFailedDestroys(ctx)
+				runLeased(ctx, leaseStore, worklease.RetryFailedDestroys, workerID, logger, func(leaseCtx context.Context) error {
+					prov.RetryFailedDestroys(leaseCtx)
+					return nil
+				})
 			case <-expirationCronTicker.C:
-				if !elec.IsLeader() {
-					continue
-				}
-				prov.ExpireStale(ctx)
+				runLeased(ctx, leaseStore, worklease.ExpireStale, workerID, logger, func(leaseCtx context.Context) error {
+					prov.ExpireStale(leaseCtx)
+					return nil
+				})
 			case <-stuckUploadTickerC:
-				if !elec.IsLeader() {
-					continue
-				}
-				if _, err := prov.ReconcileStuckImageUploads(ctx, stuckUploadStaleThreshold); err != nil {
-					logger.Error("stuck-upload reconcile failed", "error", err)
-				}
+				runLeased(ctx, leaseStore, worklease.StuckUploads, workerID, logger, func(leaseCtx context.Context) error {
+					_, err := prov.ReconcileStuckImageUploads(leaseCtx, stuckUploadStaleThreshold)
+					return err
+				})
 			case <-orphanTickerC:
 				orphanScheduler.Tick(ctx)
 			case <-templateOrphanTickerC:
 				templateOrphanScheduler.Tick(ctx)
 			case <-ipReconcilerTickerC:
-				if !elec.IsLeader() {
-					continue
-				}
-				if _, err := prov.ReconcilePodVMIPs(ctx, ipReconcilerCfg); err != nil {
-					logger.Error("pod-vm ip reconcile failed", "error", err)
-				}
+				runLeased(ctx, leaseStore, worklease.PodVMIP, workerID, logger, func(leaseCtx context.Context) error {
+					_, err := prov.ReconcilePodVMIPs(leaseCtx, ipReconcilerCfg)
+					return err
+				})
 			case <-networkReconcilerTickerC:
-				if !elec.IsLeader() {
-					continue
-				}
-				if _, err := prov.ReconcileNetwork(ctx, networkReconcilerCfg); err != nil {
-					logger.Error("network reconcile failed", "error", err)
-				}
+				runLeased(ctx, leaseStore, worklease.NetworkReconcile, workerID, logger, func(leaseCtx context.Context) error {
+					_, err := prov.ReconcileNetwork(leaseCtx, networkReconcilerCfg)
+					return err
+				})
 			case <-idleEvalTickerC:
-				if !elec.IsLeader() {
-					continue
-				}
-				if _, err := prov.EvaluateIdleVMs(ctx, idleEvalCfg); err != nil {
-					logger.Error("idle vm evaluation failed", "error", err)
-				}
+				runLeased(ctx, leaseStore, worklease.IdleEval, workerID, logger, func(leaseCtx context.Context) error {
+					_, err := prov.EvaluateIdleVMs(leaseCtx, idleEvalCfg)
+					return err
+				})
 			case <-templateReconcilerTickerC:
-				if !elec.IsLeader() {
-					continue
-				}
-				if _, err := prov.ReconcileTemplateMetrics(ctx, provisioner.TemplateReconcilerConfig{
-					Interval:       templateReconcilerInterval,
-					StaleThreshold: templateReconcilerStaleThreshold,
-				}); err != nil {
-					logger.Error("template reconcile failed", "error", err)
-				}
-				if err := prov.ReconcileTemplateReplicaBuildMetrics(
-					ctx,
-					templateReconcilerStaleThreshold,
-				); err != nil {
-					logger.Error("template replica build reconcile failed", "error", err)
-				}
+				runLeased(ctx, leaseStore, worklease.TemplateMetrics, workerID, logger, func(leaseCtx context.Context) error {
+					if _, err := prov.ReconcileTemplateMetrics(leaseCtx, provisioner.TemplateReconcilerConfig{
+						Interval:       templateReconcilerInterval,
+						StaleThreshold: templateReconcilerStaleThreshold,
+					}); err != nil {
+						return err
+					}
+					return prov.ReconcileTemplateReplicaBuildMetrics(leaseCtx, templateReconcilerStaleThreshold)
+				})
 			case <-retryPendingTickerC:
-				if !elec.IsLeader() {
-					continue
-				}
-				if err := prov.ReconcileRetryPending(ctx); err != nil {
-					logger.Error("retry-pending reconcile failed", "error", err)
-				}
+				runLeased(ctx, leaseStore, worklease.RetryPending, workerID, logger, func(leaseCtx context.Context) error {
+					return prov.ReconcileRetryPending(leaseCtx)
+				})
 			case <-l1ValidationTickerC:
 				l1ValidationScheduler.Tick(ctx)
 
 			case <-healthReconcilerTickerC:
-				if !elec.IsLeader() {
-					continue
-				}
-				if _, err := prov.ReconcileTemplateHealth(ctx, healthReconcilerCfg); err != nil {
-					logger.Error("template health reconcile failed", "error", err)
-				}
+				runLeased(ctx, leaseStore, worklease.TemplateHealth, workerID, logger, func(leaseCtx context.Context) error {
+					_, err := prov.ReconcileTemplateHealth(leaseCtx, healthReconcilerCfg)
+					return err
+				})
 			case <-healthConfirmationTickerC:
-				if !elec.IsLeader() {
-					continue
-				}
-				if _, err := prov.ReconcileTemplateHealthConfirmations(ctx, healthReconcilerCfg); err != nil {
-					logger.Error("template health confirmation schedule reconcile failed", "error", err)
-				}
-
-			// ── Leadership change notification ────────────────────────────────
-			// elec.Changes() fires true when this replica acquires the lock
-			// (startup or failover) and false when it loses it. On acquisition
-			// we run immediate passes for any reconcilers that need prompt
-			// startup behaviour — equivalent to the old "initial run" goroutines
-			// but racefree because leadership is confirmed before we reach here.
-			// The channel is buffered (size 1), so the event is safe even if the
-			// select loop is busy; it will be delivered on the next iteration.
-			case isLeader := <-elec.Changes():
-				if l1ValidationScheduler != nil {
-					l1ValidationScheduler.LeadershipChanged(ctx, isLeader)
-				}
-				if orphanScheduler != nil {
-					orphanScheduler.LeadershipChanged(ctx)
-				}
-				if templateOrphanScheduler != nil {
-					templateOrphanScheduler.LeadershipChanged(ctx)
-				}
-				if !isLeader {
-					continue
-				}
-				// Immediately expire any stale pods now that we are leader.
-				// This is fast (DB-only) so we run it inline.
-				prov.ExpireStale(ctx)
-				// Network reconcile touches the OPNsense API — run in a goroutine
-				// so it cannot stall the select loop on a slow firewall response.
-				if networkReconcilerEnabled {
-					go func() {
-						if _, err := prov.ReconcileNetwork(ctx, networkReconcilerCfg); err != nil {
-							logger.Error("network reconcile on leader acquisition failed", "error", err)
-						}
-					}()
-				}
-				// Health-check clones from a crashed previous leader are swept
-				// here rather than at startup so exactly one replica does it.
-				// The catch-up cycle runs after the sweep, in the same
-				// goroutine, so it can never race the sweep into deleting its
-				// own in-flight clone.
-				if healthReconcilerEnabled {
-					go func() {
-						orphanMinAge := time.Duration(healthReconcilerCfg.MaxRetries+1) * healthReconcilerCfg.DeepCheckTimeout
-						if orphanMinAge < time.Hour {
-							orphanMinAge = time.Hour
-						}
-						if _, err := vcClient.SweepHealthCheckOrphans(
-							ctx,
-							cfg.VCenter.TemplatesFolder,
-							time.Now().Add(-orphanMinAge),
-						); err != nil {
-							logger.Warn("health-check orphan sweep failed", "error", err)
-						}
-						// Replace any series retained from the previous worker
-						// before IfDue can skip a fresh vCenter cycle.
-						if err := prov.ReplaceTemplateHealthSnapshot(ctx, healthReconcilerCfg); err != nil {
-							logger.Error("template health startup snapshot replacement failed", "error", err)
-						}
-						if _, err := prov.ReconcileTemplateHealthConfirmations(ctx, healthReconcilerCfg); err != nil {
-							logger.Error("template health confirmation schedule repair on leader acquisition failed", "error", err)
-						}
-						// The 12h ticker is created at process start and reset
-						// by every restart. This service deploys several times
-						// a day, so without a catch-up pass the reconciler
-						// would never actually fire. IfDue consults persisted
-						// state, so frequent deploys do not each trigger a
-						// vCenter clone.
-						counts, ran, err := prov.ReconcileTemplateHealthIfDue(ctx, healthReconcilerCfg)
-						if err != nil {
-							logger.Error("template health catch-up on leader acquisition failed", "error", err)
-							return
-						}
-						if ran {
-							logger.Info("template health catch-up cycle complete",
-								"templates", counts.Templates,
-								"healthy", counts.Healthy,
-								"unhealthy", counts.Unhealthy,
-								"deep_checked", counts.DeepChecked)
-						} else {
-							logger.Info("template health catch-up skipped; a cycle ran within the interval",
-								"interval", healthReconcilerCfg.Interval)
-						}
-					}()
-				}
-				// Idle-VM evaluator: run one pass immediately on leadership
-				// acquisition. The 15m ticker is created at process start and is
-				// not reset by failover, so a newly-elected leader would wait up
-				// to a full interval before its first pass. During that window it
-				// keeps pushing its stale process-start seed for
-				// crucible_idle_evaluator_last_run_timestamp, which can trip
-				// CrucibleIdleEvaluatorStale on a mid-life failover. Running a
-				// pass now refreshes the heartbeat immediately. Goroutine because
-				// it touches vCenter and must not stall the select loop.
-				if idleEvalEnabled {
-					go func() {
-						if _, err := prov.EvaluateIdleVMs(ctx, idleEvalCfg); err != nil {
-							logger.Error("idle vm evaluation on leader acquisition failed", "error", err)
-						}
-					}()
-				}
-
+				runLeased(ctx, leaseStore, worklease.TemplateHealthConfirm, workerID, logger, func(leaseCtx context.Context) error {
+					_, err := prov.ReconcileTemplateHealthConfirmations(leaseCtx, healthReconcilerCfg)
+					return err
+				})
 			}
 		}
 	}()
+
+	// Startup catch-up: claim each lease once so deploy/reboot does not wait a
+	// full ticker interval. Losers of the claim no-op.
+	go startupWorkLeaseCatchup(ctx, leaseStore, workerID, logger, prov, vcClient, cfg,
+		networkReconcilerEnabled, networkReconcilerCfg,
+		healthReconcilerEnabled, healthReconcilerCfg,
+		idleEvalEnabled, idleEvalCfg)
 
 	// Wait for shutdown signal
 	sigCh := make(chan os.Signal, 1)
@@ -1184,3 +1026,144 @@ func splitNonEmpty(value string) []string {
 	}
 	return out
 }
+
+func alwaysWorkLeaseLeadership(ctx context.Context) func() provisioner.OrphanLeadershipState {
+	return func() provisioner.OrphanLeadershipState {
+		return provisioner.OrphanLeadershipState{
+			IsLeader:   true,
+			Generation: 1,
+			Context:    ctx,
+		}
+	}
+}
+
+func runOrphanLeased(
+	ctx context.Context,
+	store worklease.Store,
+	name, workerID string,
+	logger *slog.Logger,
+	fn func(context.Context) (provisioner.ReconcileCounts, error),
+) (provisioner.ReconcileCounts, error) {
+	var counts provisioner.ReconcileCounts
+	err := worklease.RunExclusive(ctx, store, name, workerID, logger,
+		func(leaseCtx context.Context, _ *worklease.Lease) error {
+			var e error
+			counts, e = fn(leaseCtx)
+			return e
+		})
+	if errors.Is(err, worklease.ErrNotClaimed) {
+		return counts, nil
+	}
+	return counts, err
+}
+
+func runLeased(
+	ctx context.Context,
+	store worklease.Store,
+	name, workerID string,
+	logger *slog.Logger,
+	fn func(context.Context) error,
+) {
+	if err := worklease.TryRun(ctx, store, name, workerID, logger, func(leaseCtx context.Context, _ *worklease.Lease) error {
+		return fn(leaseCtx)
+	}); err != nil {
+		logger.Error("leased reconciler failed", "name", name, "error", err)
+	}
+}
+
+func holdWorkLease(
+	ctx context.Context,
+	store worklease.Store,
+	name, workerID string,
+	logger *slog.Logger,
+	held *atomic.Bool,
+) {
+	for ctx.Err() == nil {
+		err := worklease.RunExclusive(ctx, store, name, workerID, logger,
+			func(leaseCtx context.Context, _ *worklease.Lease) error {
+				held.Store(true)
+				defer held.Store(false)
+				<-leaseCtx.Done()
+				return nil
+			})
+		if errors.Is(err, worklease.ErrNotClaimed) {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Second):
+			}
+			continue
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+func startupWorkLeaseCatchup(
+	ctx context.Context,
+	store worklease.Store,
+	workerID string,
+	logger *slog.Logger,
+	prov *provisioner.Provisioner,
+	vcClient *vcenter.Client,
+	cfg *config.Config,
+	networkEnabled bool,
+	networkCfg provisioner.NetworkReconcilerConfig,
+	healthEnabled bool,
+	healthCfg provisioner.TemplateHealthReconcilerConfig,
+	idleEnabled bool,
+	idleCfg provisioner.IdleEvaluatorConfig,
+) {
+	runLeased(ctx, store, worklease.ExpireStale, workerID, logger, func(leaseCtx context.Context) error {
+		prov.ExpireStale(leaseCtx)
+		return nil
+	})
+	if networkEnabled {
+		runLeased(ctx, store, worklease.NetworkReconcile, workerID, logger, func(leaseCtx context.Context) error {
+			_, err := prov.ReconcileNetwork(leaseCtx, networkCfg)
+			return err
+		})
+	}
+	if idleEnabled {
+		runLeased(ctx, store, worklease.IdleEval, workerID, logger, func(leaseCtx context.Context) error {
+			_, err := prov.EvaluateIdleVMs(leaseCtx, idleCfg)
+			return err
+		})
+	}
+	if healthEnabled {
+		runLeased(ctx, store, worklease.TemplateHealth, workerID, logger, func(leaseCtx context.Context) error {
+			orphanMinAge := time.Duration(healthCfg.MaxRetries+1) * healthCfg.DeepCheckTimeout
+			if orphanMinAge < time.Hour {
+				orphanMinAge = time.Hour
+			}
+			if _, err := vcClient.SweepHealthCheckOrphans(
+				leaseCtx,
+				cfg.VCenter.TemplatesFolder,
+				time.Now().Add(-orphanMinAge),
+			); err != nil {
+				logger.Warn("health-check orphan sweep failed", "error", err)
+			}
+			if err := prov.ReplaceTemplateHealthSnapshot(leaseCtx, healthCfg); err != nil {
+				return err
+			}
+			if _, err := prov.ReconcileTemplateHealthConfirmations(leaseCtx, healthCfg); err != nil {
+				return err
+			}
+			counts, ran, err := prov.ReconcileTemplateHealthIfDue(leaseCtx, healthCfg)
+			if err != nil {
+				return err
+			}
+			if ran {
+				logger.Info("template health catch-up cycle complete",
+					"templates", counts.Templates,
+					"healthy", counts.Healthy,
+					"unhealthy", counts.Unhealthy,
+					"deep_checked", counts.DeepChecked)
+			}
+			return nil
+		})
+	}
+}
+

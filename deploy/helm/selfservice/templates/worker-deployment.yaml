@@ -266,19 +266,10 @@ spec:
                   name: {{ .Values.secrets.objectstore }}
                   key: secret-key
             {{- end }}
-            # Leader election: gate periodic reconcilers to the elected replica.
-            # Disabled (false) reverts to single-replica behaviour where every
-            # replica runs reconcilers — only safe when replicaCount.worker is 1.
-            - name: WORKER_LEADER_ELECTION_ENABLED
-              value: {{ .Values.worker.leaderElection.enabled | default true | quote }}
-            - name: WORKER_LEADER_RETRY_INTERVAL
-              value: {{ .Values.worker.leaderElection.retryInterval | default "5s" | quote }}
-            # Pool cap for the worker's pgxpool. The worker is nearly single-
-            # threaded (sequential job claims + one reconciler at a time), so
-            # it needs far fewer connections than the default 20. Each replica
-            # also holds 1 dedicated leader-election connection outside the pool,
-            # so the per-replica ceiling is dbMaxConns + 1.
-            # Platform budget: api(20) + engine(20) + 4 × workers(5+1) = 64 / 100.
+            # Pool cap for the worker's pgxpool. The worker claims jobs and
+            # holds short-lived work-lease connections from the pool (no
+            # dedicated advisory-lock session). Platform budget: api(20) +
+            # engine(20) + 4 × workers(5) = 60 / 100.
             - name: DB_MAX_CONNS
               value: {{ .Values.worker.dbMaxConns | default 5 | quote }}
           resources:
