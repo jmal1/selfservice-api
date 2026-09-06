@@ -75,6 +75,15 @@ func loginWithCertificate(ctx context.Context, u *url.URL, cert tls.Certificate,
 		return nil, fmt.Errorf("sts Issue: %w", err)
 	}
 
+	// LoginByToken requires the SOAPAction version from
+	// /sdk/vimServiceVersions.xml. govmomi defaults to vim25.Version (9.1.0.0),
+	// which VCSA 8 rejects with VersionMismatchFaultCode. Same guard as govc.
+	if vc.Version == vim25.Version {
+		if err := vc.UseServiceVersion(); err != nil {
+			return nil, fmt.Errorf("vim25 UseServiceVersion: %w", err)
+		}
+	}
+
 	header := soap.Header{Security: signer}
 	if err := session.NewManager(vc).LoginByToken(vc.WithHeader(ctx, header)); err != nil {
 		return nil, fmt.Errorf("LoginByToken: %w", err)
