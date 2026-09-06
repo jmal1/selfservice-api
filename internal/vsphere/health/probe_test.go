@@ -20,8 +20,7 @@ func TestNew_validatesRequired(t *testing.T) {
 		want string
 	}{
 		{"missing url", Config{User: "u", Password: "p"}, "VCenterURL"},
-		{"missing user", Config{VCenterURL: "https://v/sdk", Password: "p"}, "User"},
-		{"missing password", Config{VCenterURL: "https://v/sdk", User: "u"}, "Password"},
+		{"missing auth", Config{VCenterURL: "https://v/sdk"}, "User+Password"},
 		{"timeout too small", Config{VCenterURL: "https://v/sdk", User: "u", Password: "p", ProbeTimeout: 500 * time.Millisecond}, "ProbeTimeout"},
 	}
 	for _, tc := range cases {

@@ -83,6 +83,19 @@ spec:
                     secretKeyRef:
                       name: {{ .Values.secrets.jwt }}
                       key: jwt-secret
+                      optional: true
+                - name: JWT_PRIVATE_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.secrets.jwt }}
+                      key: jwt-private-key
+                      optional: true
+                - name: JWT_PUBLIC_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.secrets.jwt }}
+                      key: jwt-public-key
+                      optional: true
                 - name: SYNTHETIC_RUNNER_MODE
                   value: "true"
                 - name: SYNTHETIC_RUNNER_TEMPLATE

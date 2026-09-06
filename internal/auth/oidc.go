@@ -49,14 +49,17 @@ type Provider struct {
 	oauth2Config          oauth2.Config
 	verifier              *oidc.IDTokenVerifier
 	queries               *database.Queries
-	jwtSecret             []byte
+	sessionSigner         SessionSigner
 	logger                *slog.Logger
 	endSessionEndpoint    string
 	postLogoutRedirectURI string
 }
 
 // NewProvider creates a new OIDC authentication provider.
-func NewProvider(ctx context.Context, cfg config.OIDCConfig, queries *database.Queries, jwtSecret []byte, logger *slog.Logger) (*Provider, error) {
+func NewProvider(ctx context.Context, cfg config.OIDCConfig, queries *database.Queries, signer SessionSigner, logger *slog.Logger) (*Provider, error) {
+	if signer == nil {
+		return nil, fmt.Errorf("session signer is required")
+	}
 	provider, err := oidc.NewProvider(ctx, cfg.IssuerURL)
 	if err != nil {
 		return nil, fmt.Errorf("create OIDC provider: %w", err)
@@ -91,7 +94,7 @@ func NewProvider(ctx context.Context, cfg config.OIDCConfig, queries *database.Q
 		oauth2Config:          oauth2Cfg,
 		verifier:              verifier,
 		queries:               queries,
-		jwtSecret:             jwtSecret,
+		sessionSigner:         signer,
 		logger:                logger,
 		endSessionEndpoint:    discovery.EndSessionEndpoint,
 		postLogoutRedirectURI: cfg.PostLogoutRedirectURI,
@@ -328,12 +331,7 @@ func (p *Provider) ValidateSession(r *http.Request) (*SessionClaims, error) {
 		return nil, fmt.Errorf("no session cookie")
 	}
 
-	token, err := jwt.ParseWithClaims(cookie.Value, &SessionClaims{}, func(token *jwt.Token) (any, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-		}
-		return p.jwtSecret, nil
-	})
+	token, err := jwt.ParseWithClaims(cookie.Value, &SessionClaims{}, p.sessionSigner.Keyfunc)
 	if err != nil {
 		return nil, fmt.Errorf("invalid session token: %w", err)
 	}
@@ -346,11 +344,15 @@ func (p *Provider) ValidateSession(r *http.Request) (*SessionClaims, error) {
 	return claims, nil
 }
 
-// NewTestProvider returns a *Provider whose only configured field is jwtSecret.
+// NewTestProvider returns a *Provider whose only configured field is the session signer.
 // Use in unit tests that need to sign or verify session JWTs without a live
 // OIDC endpoint or database. Do not call from production code.
 func NewTestProvider(jwtSecret []byte) *Provider {
-	return &Provider{jwtSecret: jwtSecret}
+	s, err := NewHMACSessionSigner(jwtSecret)
+	if err != nil {
+		panic(err)
+	}
+	return &Provider{sessionSigner: s}
 }
 
 // RefreshSessionCookie re-issues the session JWT if it's past the halfway point of its TTL.
@@ -369,8 +371,7 @@ func (p *Provider) RefreshSessionCookie(w http.ResponseWriter, claims *SessionCl
 	now := time.Now()
 	claims.IssuedAt = jwt.NewNumericDate(now)
 	claims.ExpiresAt = jwt.NewNumericDate(now.Add(sessionTTL))
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	signed, err := token.SignedString(p.jwtSecret)
+	signed, err := p.sessionSigner.Sign(claims)
 	if err != nil {
 		return
 	}
@@ -400,8 +401,7 @@ func (p *Provider) issueSessionToken(user *models.User, sessionID string) (strin
 		SessionID: sessionID,
 	}
 
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString(p.jwtSecret)
+	return p.sessionSigner.Sign(claims)
 }
 
 // mapGroupsToRole maps Authentik group names to portal roles.

@@ -61,15 +61,15 @@ func main() {
 	}
 	defer natsClient.Close()
 
-	// Initialize OIDC auth provider
-	// JWT secret: in production, fetch from Vault. For now, use env var.
-	jwtSecret := []byte(os.Getenv("JWT_SECRET"))
-	if len(jwtSecret) == 0 {
-		logger.Error("JWT_SECRET environment variable is required")
+	// Session JWT signer: prefer JWT_PRIVATE_KEY+JWT_PUBLIC_KEY (RS256);
+	// fall back to JWT_SECRET (HS256) until Vault cutover.
+	sessionSigner, err := auth.NewSessionSignerFromEnv()
+	if err != nil {
+		logger.Error("session JWT signer init failed", "error", err)
 		os.Exit(1)
 	}
 
-	authProvider, err := auth.NewProvider(ctx, cfg.OIDC, queries, jwtSecret, logger)
+	authProvider, err := auth.NewProvider(ctx, cfg.OIDC, queries, sessionSigner, logger)
 	if err != nil {
 		logger.Error("OIDC provider init failed", "error", err)
 		os.Exit(1)
@@ -77,11 +77,13 @@ func main() {
 
 	// Initialize vCenter client for console access (optional — console won't work without it)
 	var vcClient handlers.VCenterConsole
-	if cfg.VCenter.URL != "" && cfg.VCenter.User != "" {
+	if cfg.VCenter.URL != "" && (len(cfg.VCenter.ClientCertPEM) > 0 && len(cfg.VCenter.ClientKeyPEM) > 0 || cfg.VCenter.User != "") {
 		vc := vcenter.New(vcenter.Config{
 			URL:                  cfg.VCenter.URL,
 			User:                 cfg.VCenter.User,
 			Password:             cfg.VCenter.Password,
+			ClientCertPEM:        cfg.VCenter.ClientCertPEM,
+			ClientKeyPEM:         cfg.VCenter.ClientKeyPEM,
 			Datacenter:           cfg.VCenter.Datacenter,
 			Datastore:            cfg.VCenter.Datastore,
 			VMFolder:             cfg.VCenter.VMFolder,
@@ -191,11 +193,13 @@ func main() {
 	// it shares the api-gateway pod lifecycle. The probe creates a fresh
 	// govmomi client every cycle so cached sessions cannot mask a rotated
 	// SSO password — the exact failure mode we hit on 2026-06-07.
-	if cfg.VCenter.URL != "" && cfg.VCenter.User != "" && cfg.VCenter.Password != "" {
+	if cfg.VCenter.URL != "" && ((len(cfg.VCenter.ClientCertPEM) > 0 && len(cfg.VCenter.ClientKeyPEM) > 0) || (cfg.VCenter.User != "" && cfg.VCenter.Password != "")) {
 		probe, err := vsphereHealth.New(vsphereHealth.Config{
 			VCenterURL:     cfg.VCenter.URL,
 			User:           cfg.VCenter.User,
 			Password:       cfg.VCenter.Password,
+			ClientCertPEM:  cfg.VCenter.ClientCertPEM,
+			ClientKeyPEM:   cfg.VCenter.ClientKeyPEM,
 			Insecure:       cfg.VCenter.Insecure,
 			PushgatewayURL: cfg.VCenter.HealthPushgatewayURL,
 			Job:            "crucible_vsphere_health",

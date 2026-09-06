@@ -29,6 +29,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jmal1/selfservice-api/internal/auth"
 	"github.com/jmal1/selfservice-api/internal/opnsense"
 	"github.com/jmal1/selfservice-api/internal/provisioner"
 	"github.com/jmal1/selfservice-api/internal/synthetic"
@@ -179,12 +180,16 @@ func main() {
 
 func run(logger *slog.Logger) error {
 	baseURL := mustEnv(envBaseURL)
-	jwtSecret := mustEnv(envJWTSecret)
 	userID := mustEnv(envUserID)
 	username := envOr(envUsername, "synthetic")
 	role := envOr(envRole, "student")
 	pushgatewayURL := mustEnv(envPushgatewayURL)
 	job := envOr(envJob, "crucible_synthetic_api")
+
+	sessionSigner, err := resolveSessionSigner()
+	if err != nil {
+		return err
+	}
 
 	// Resolve the mode ONCE, up front, and derive everything from it. The push
 	// grouping and the registered check set must never be able to disagree
@@ -427,13 +432,13 @@ func run(logger *slog.Logger) error {
 		sessionTTL = runnerSessionTTL
 	}
 	mintSessions := func() error {
-		c, err := synthetic.MintSessionToken([]byte(jwtSecret), userID, username, role, sessionTTL)
+		c, err := synthetic.MintSessionTokenWithSigner(sessionSigner, userID, username, role, sessionTTL)
 		if err != nil {
 			return fmt.Errorf("mint session token: %w", err)
 		}
 		client.SessionCookie = c
 		if instructorClient != nil {
-			ic, err := synthetic.MintSessionToken([]byte(jwtSecret), instructorID, instructorName,
+			ic, err := synthetic.MintSessionTokenWithSigner(sessionSigner, instructorID, instructorName,
 				"instructor", sessionTTL)
 			if err != nil {
 				return fmt.Errorf("mint instructor session token: %w", err)
@@ -544,6 +549,19 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// resolveSessionSigner prefers RS256 (JWT_PRIVATE_KEY+JWT_PUBLIC_KEY, same as
+// api-gateway) and falls back to SYNTHETIC_JWT_SECRET HMAC.
+func resolveSessionSigner() (auth.SessionSigner, error) {
+	if os.Getenv("JWT_PRIVATE_KEY") != "" || os.Getenv("JWT_PUBLIC_KEY") != "" {
+		return auth.NewSessionSignerFromEnv()
+	}
+	secret := os.Getenv(envJWTSecret)
+	if secret == "" {
+		return nil, fmt.Errorf("%s or JWT_PRIVATE_KEY+JWT_PUBLIC_KEY is required", envJWTSecret)
+	}
+	return auth.NewHMACSessionSigner([]byte(secret))
 }
 
 // envBool returns true for "1", "true", "yes" (case-insensitive).

@@ -109,6 +109,8 @@ func main() {
 			URL:                  cfg.VCenter.URL,
 			User:                 cfg.VCenter.User,
 			Password:             cfg.VCenter.Password,
+			ClientCertPEM:        cfg.VCenter.ClientCertPEM,
+			ClientKeyPEM:         cfg.VCenter.ClientKeyPEM,
 			Datacenter:           cfg.VCenter.Datacenter,
 			Datastore:            cfg.VCenter.Datastore,
 			VMFolder:             cfg.VCenter.VMFolder,

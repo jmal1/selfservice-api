@@ -56,6 +56,11 @@ type DatabaseConfig struct {
 	Password string
 	DBName   string
 	SSLMode  string
+	// CredentialsFile, when set, is a path refreshed by Vault Agent (or similar)
+	// containing username on line 1 and password on line 2. Each new pool
+	// connection re-reads the file so dynamic DB leases rotate without a
+	// process restart. Empty disables the reload path (static env credentials).
+	CredentialsFile string
 	// MaxConns caps the pgxpool connection pool for this process.
 	// 0 means "use the database package default (20)". Tune this per
 	// deployment: the platform-wide ceiling against max_connections = 100 is
@@ -96,8 +101,12 @@ type VCenterConfig struct {
 	URL        string
 	User       string
 	Password   string
-	Datacenter string
-	Datastore  string
+	// ClientCertPEM / ClientKeyPEM enable STS cert login (solution user).
+	// When both are non-empty they take precedence over User/Password.
+	ClientCertPEM []byte
+	ClientKeyPEM  []byte
+	Datacenter    string
+	Datastore     string
 	// ISODatastore holds installer media (ISOs) and is deliberately separate
 	// from Datastore, which holds VM disks. Conflating them uploads multi-GB
 	// installer images onto the VM datastore. Note the trailing capital "S" in
@@ -135,7 +144,10 @@ type OPNsenseConfig struct {
 	SSHHost     string
 	SSHUser     string
 	SSHPassword string
-	SSHHostKey  string
+	// SSHPrivateKeyPEM is the OpenSSH/PEM private key for destroy-path SSH.
+	// Preferred over SSHPassword when set (opnsense.Config.SSHKey).
+	SSHPrivateKeyPEM string
+	SSHHostKey       string
 }
 
 // Load reads configuration from environment variables.
@@ -171,13 +183,14 @@ func Load() (*Config, error) {
 			AllowedOrigins: splitEnv("ALLOWED_ORIGINS", "https://crucible.jmal.io"),
 		},
 		Database: DatabaseConfig{
-			Host:     getEnv("DB_HOST", "localhost"),
-			Port:     getEnvInt("DB_PORT", 5432),
-			User:     getEnv("DB_USER", "selfservice"),
-			Password: getEnv("DB_PASSWORD", ""),
-			DBName:   getEnv("DB_NAME", "selfservice"),
-			SSLMode:  getEnv("DB_SSLMODE", "disable"),
-			MaxConns: getEnvInt("DB_MAX_CONNS", 0), // 0 → database package default (20)
+			Host:            getEnv("DB_HOST", "localhost"),
+			Port:            getEnvInt("DB_PORT", 5432),
+			User:            getEnv("DB_USER", "selfservice"),
+			Password:        getEnv("DB_PASSWORD", ""),
+			DBName:          getEnv("DB_NAME", "selfservice"),
+			SSLMode:         getEnv("DB_SSLMODE", "disable"),
+			CredentialsFile: getEnv("DB_CREDENTIALS_FILE", ""),
+			MaxConns:        getEnvInt("DB_MAX_CONNS", 0), // 0 → database package default (20)
 		},
 		OIDC: OIDCConfig{
 			IssuerURL:             getEnv("OIDC_ISSUER_URL", ""),
@@ -199,6 +212,8 @@ func Load() (*Config, error) {
 			URL:                  getEnv("VCENTER_URL", "https://vcenter.lab.jmal.io/sdk"),
 			User:                 getEnv("VCENTER_USER", ""),
 			Password:             getEnv("VCENTER_PASSWORD", ""),
+			ClientCertPEM:        []byte(getEnv("VCENTER_CLIENT_CERT", "")),
+			ClientKeyPEM:         []byte(getEnv("VCENTER_CLIENT_KEY", "")),
 			Datacenter:           getEnv("VCENTER_DATACENTER", "JMAL-Datacenter"),
 			Datastore:            getEnv("VCENTER_DATASTORE", "NAS-vmstore"),
 			ISODatastore:         getEnv("VCENTER_ISO_DATASTORE", "NAS-BackupsAndISOS"),
@@ -213,13 +228,14 @@ func Load() (*Config, error) {
 			HealthCheckInterval:  getEnvDuration("VCENTER_HEALTH_INTERVAL", 5*time.Minute),
 		},
 		OPNsense: OPNsenseConfig{
-			BaseURL:     getEnv("OPNSENSE_URL", "https://10.10.10.60/api"),
-			APIKey:      getEnv("OPNSENSE_API_KEY", ""),
-			APISecret:   getEnv("OPNSENSE_API_SECRET", ""),
-			SSHHost:     getEnv("OPNSENSE_SSH_HOST", "10.10.10.60:22"),
-			SSHUser:     getEnv("OPNSENSE_SSH_USER", "root"),
-			SSHPassword: getEnv("OPNSENSE_SSH_PASSWORD", ""),
-			SSHHostKey:  getEnv("OPNSENSE_SSH_HOST_KEY", ""),
+			BaseURL:          getEnv("OPNSENSE_URL", "https://10.10.10.60/api"),
+			APIKey:           getEnv("OPNSENSE_API_KEY", ""),
+			APISecret:        getEnv("OPNSENSE_API_SECRET", ""),
+			SSHHost:          getEnv("OPNSENSE_SSH_HOST", "10.10.10.60:22"),
+			SSHUser:          getEnv("OPNSENSE_SSH_USER", "root"),
+			SSHPassword:      getEnv("OPNSENSE_SSH_PASSWORD", ""),
+			SSHPrivateKeyPEM: getEnv("OPNSENSE_SSH_PRIVATE_KEY", ""),
+			SSHHostKey:       getEnv("OPNSENSE_SSH_HOST_KEY", ""),
 		},
 		ObjectStore: ObjectStoreConfig{
 			Endpoint:  getEnv("OBJECTSTORE_ENDPOINT", ""),

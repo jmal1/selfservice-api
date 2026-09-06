@@ -75,7 +75,7 @@ func TestMintSessionToken_RejectsBadInput(t *testing.T) {
 		ttl       time.Duration
 		wantError string
 	}{
-		{"empty secret", []byte{}, "u", time.Minute, "jwtSecret is empty"},
+		{"empty secret", []byte{}, "u", time.Minute, "jwt secret is empty"},
 		{"empty uid", []byte("s"), "", time.Minute, "userID is empty"},
 		{"zero ttl", []byte("s"), "u", 0, "ttl must be positive"},
 		{"negative ttl", []byte("s"), "u", -time.Second, "ttl must be positive"},
