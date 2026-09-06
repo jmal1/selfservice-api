@@ -215,7 +215,7 @@ func validateLeaseRecoverySQL(query string) error {
 	for _, fragment := range []string{
 		"STATUS IN ('IN_PROGRESS', 'CLAIMED')",
 		"COMPLETED_AT IS NULL",
-		"CLAIMED_AT IS NULL OR CLAIMED_AT < NOW() - ($1 * INTERVAL '1 SECOND')",
+		"CLAIMED_AT IS NULL OR CLAIMED_AT < CLOCK_TIMESTAMP() - ($1 * INTERVAL '1 SECOND')",
 	} {
 		if !strings.Contains(sql, fragment) {
 			return fmt.Errorf("missing %q", fragment)
@@ -236,7 +236,7 @@ func TestRecoverStaleJobsRequiresExpiredLease(t *testing.T) {
 func TestRecoverStaleJobsLeaseGuardSabotageIsDetected(t *testing.T) {
 	sabotaged := strings.Replace(
 		recoverStaleJobsSQL,
-		"AND (claimed_at IS NULL OR claimed_at < now() - ($1 * interval '1 second'))",
+		"AND (claimed_at IS NULL OR claimed_at < clock_timestamp() - ($1 * interval '1 second'))",
 		"",
 		1,
 	)

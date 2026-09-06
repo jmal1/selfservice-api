@@ -247,3 +247,52 @@ func TestOwnershipLossBlocksStaleFinalization(t *testing.T) {
 		t.Fatal("superseded worker finalized a reclaimed job")
 	}
 }
+
+func TestLeaseConstantsMatchPlanBounds(t *testing.T) {
+	if JobLeaseDuration != 90*time.Second {
+		t.Fatalf("JobLeaseDuration = %s, want 90s liveness window", JobLeaseDuration)
+	}
+	if JobLeaseHeartbeatInterval != 15*time.Second {
+		t.Fatalf("JobLeaseHeartbeatInterval = %s, want 15s", JobLeaseHeartbeatInterval)
+	}
+	if JobLeaseRecoveryInterval != 15*time.Second {
+		t.Fatalf("JobLeaseRecoveryInterval = %s, want 15s", JobLeaseRecoveryInterval)
+	}
+	if JobLeaseDuration < 4*JobLeaseHeartbeatInterval {
+		t.Fatal("lease duration must cover multiple missed heartbeats")
+	}
+}
+
+func TestStaleOwnerCannotFinalizeAfterReclaim(t *testing.T) {
+	// Counterfactual: A pauses past expiry, B claims with a new token, A resumes.
+	workerA := "worker-a:claim-1"
+	workerB := "worker-b:claim-2"
+	claimedAt := time.Now()
+	job := &models.Job{
+		ID:        uuid.New(),
+		Type:      models.JobTypePodDestroy,
+		ClaimedBy: &workerA,
+		ClaimedAt: &claimedAt,
+	}
+	db := &ownershipGuardDB{owner: workerA}
+
+	result := processJobLifecycle(
+		context.Background(),
+		db,
+		nil,
+		job,
+		nil,
+		func(context.Context, *models.Job) error {
+			db.mu.Lock()
+			db.owner = workerB
+			db.mu.Unlock()
+			return nil
+		},
+	)
+	if !errors.Is(result, database.ErrJobLeaseLost) {
+		t.Fatalf("stale finalization result = %v, want ErrJobLeaseLost", result)
+	}
+	if db.completed {
+		t.Fatal("superseded claim token finalized a reclaimed job")
+	}
+}

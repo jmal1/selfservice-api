@@ -1263,7 +1263,7 @@ const claimJobSQL = `
 	UPDATE jobs SET
 		status = 'claimed',
 		claimed_by = $1,
-		claimed_at = now()
+		claimed_at = clock_timestamp()
 	WHERE id = (
 		SELECT id FROM jobs
 		WHERE status = 'pending'
@@ -1295,7 +1295,7 @@ const claimJobSQL = `
 		      AND payload->>'cleanup_only' = 'true'
 		    )
 		  )
-		  AND (next_attempt_at IS NULL OR next_attempt_at <= now())
+		  AND (next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp())
 		ORDER BY created_at ASC
 		FOR UPDATE SKIP LOCKED
 		LIMIT 1
@@ -1482,17 +1482,31 @@ func (q *Queries) FailTemplateProvisionJob(
 	return true, nil
 }
 
-// RenewJobLease refreshes claimed_at only while workerID still owns an active
-// claimed/in-progress job. A false result means the worker must cancel execution.
-func (q *Queries) RenewJobLease(ctx context.Context, id uuid.UUID, workerID string) (bool, error) {
-	tag, err := q.pool.Exec(ctx, `
+// RenewJobLease refreshes claimed_at only while claimToken still owns an active
+// claimed/in-progress job. A false result means the worker must cancel execution
+// and must not start the next irreversible external step. Uses clock_timestamp()
+// and a short statement timeout so a hung renew cannot block fencing forever.
+func (q *Queries) RenewJobLease(ctx context.Context, id uuid.UUID, claimToken string) (bool, error) {
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `SET LOCAL statement_timeout = '3s'`); err != nil {
+		return false, err
+	}
+	tag, err := tx.Exec(ctx, `
 		UPDATE jobs
-		SET claimed_at = now()
+		SET claimed_at = clock_timestamp()
 		WHERE id = $1
 		  AND claimed_by = $2
 		  AND status IN ('claimed', 'in_progress')
-	`, id, workerID)
+	`, id, claimToken)
 	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return false, err
 	}
 	return tag.RowsAffected() == 1, nil
@@ -1704,7 +1718,7 @@ const recoverStaleJobsSQL = `
 		UPDATE jobs SET status = 'pending', claimed_by = NULL, claimed_at = NULL, started_at = NULL
 		WHERE status IN ('in_progress', 'claimed')
 		  AND completed_at IS NULL
-		  AND (claimed_at IS NULL OR claimed_at < now() - ($1 * interval '1 second'))
+		  AND (claimed_at IS NULL OR claimed_at < clock_timestamp() - ($1 * interval '1 second'))
 `
 
 // RecoverStaleJobs resets only active claims whose heartbeat lease has expired.
@@ -3562,3 +3576,84 @@ func (q *Queries) SetBlueprintPin(ctx context.Context, blueprintID uuid.UUID, pi
 	`, pinned, pinOrder, pinnedBy, blueprintID)
 	return err
 }
+
+// TryClaimWorkLease claims a named reconciler lease when free or expired.
+// claim_token is a new UUID per successful claim (CAS fencing for renew/release).
+func (q *Queries) TryClaimWorkLease(
+	ctx context.Context,
+	name, workerID string,
+	leaseDuration time.Duration,
+) (claimToken uuid.UUID, generation int64, ok bool, err error) {
+	token := uuid.New()
+	err = q.pool.QueryRow(ctx, `
+		UPDATE worker_work_leases
+		SET claimed_by = $2,
+		    claim_token = $3,
+		    claimed_at = clock_timestamp(),
+		    generation = generation + 1
+		WHERE name = $1
+		  AND (
+		    claim_token IS NULL
+		    OR claimed_at IS NULL
+		    OR claimed_at < clock_timestamp() - ($4 * interval '1 second')
+		  )
+		RETURNING claim_token, generation
+	`, name, workerID, token, leaseDuration.Seconds()).Scan(&claimToken, &generation)
+	if err == pgx.ErrNoRows {
+		return uuid.Nil, 0, false, nil
+	}
+	if err != nil {
+		return uuid.Nil, 0, false, err
+	}
+	return claimToken, generation, true, nil
+}
+
+// RenewWorkLease bumps claimed_at only for the matching claim token.
+func (q *Queries) RenewWorkLease(
+	ctx context.Context,
+	name, workerID string,
+	claimToken uuid.UUID,
+) (bool, error) {
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `SET LOCAL statement_timeout = '3s'`); err != nil {
+		return false, err
+	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE worker_work_leases
+		SET claimed_at = clock_timestamp()
+		WHERE name = $1
+		  AND claimed_by = $2
+		  AND claim_token = $3
+	`, name, workerID, claimToken)
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// ReleaseWorkLease clears ownership only for the matching claim token.
+func (q *Queries) ReleaseWorkLease(
+	ctx context.Context,
+	name, workerID string,
+	claimToken uuid.UUID,
+) error {
+	_, err := q.pool.Exec(ctx, `
+		UPDATE worker_work_leases
+		SET claimed_by = NULL,
+		    claim_token = NULL,
+		    claimed_at = NULL
+		WHERE name = $1
+		  AND claimed_by = $2
+		  AND claim_token = $3
+	`, name, workerID, claimToken)
+	return err
+}
+
