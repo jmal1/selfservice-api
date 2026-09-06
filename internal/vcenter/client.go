@@ -69,9 +69,15 @@ type Config struct {
 	URL        string // e.g., "https://vcenter.lab.jmal.io/sdk"
 	User       string // e.g., "selfservice-svc@vsphere.local"
 	Password   string
-	Datacenter string // e.g., "JMAL-Datacenter"
-	Datastore  string // e.g., "NAS-vmstore"
-	VMFolder   string // e.g., "Student-VMs"
+	// ClientCertPEM / ClientKeyPEM enable STS Holder-of-Key login for a
+	// vSphere solution user (preferred). When both are set they take
+	// precedence over User/Password so Crucible is not tied to SSO password
+	// expiry. Store PEMs in Vault → ESO; never commit them.
+	ClientCertPEM []byte
+	ClientKeyPEM  []byte
+	Datacenter    string // e.g., "JMAL-Datacenter"
+	Datastore     string // e.g., "NAS-vmstore"
+	VMFolder      string // e.g., "Student-VMs"
 	// TemplateFolder is where template *build* VMs live, e.g.
 	// "/JMAL-Datacenter/vm/templates". It is deliberately separate from
 	// VMFolder: VMFolder holds ephemeral student pod VMs and is what the
@@ -116,15 +122,22 @@ func (c *Client) Connect(ctx context.Context) error {
 
 // connectLocked does the actual connection work. Caller must hold c.mu.
 func (c *Client) connectLocked(ctx context.Context) error {
+	useCert := c.config.HasClientCertificate()
+	client, err := Authenticate(ctx, c.config)
+	if err != nil {
+		if useCert {
+			return fmt.Errorf("connect to vCenter (client certificate): %w", err)
+		}
+		return fmt.Errorf("connect to vCenter: %w", err)
+	}
+
 	u, err := soap.ParseURL(c.config.URL)
 	if err != nil {
+		_ = client.Logout(ctx)
 		return fmt.Errorf("parse vCenter URL: %w", err)
 	}
-	u.User = url.UserPassword(c.config.User, c.config.Password)
-
-	client, err := govmomi.NewClient(ctx, u, c.config.Insecure)
-	if err != nil {
-		return fmt.Errorf("connect to vCenter: %w", err)
+	if !useCert {
+		u.User = url.UserPassword(c.config.User, c.config.Password)
 	}
 
 	// KeepAliveHandler with re-login: fires after 10 min idle, re-authenticates
@@ -133,16 +146,22 @@ func (c *Client) connectLocked(ctx context.Context) error {
 	// withRetry() on the next real operation will do a full reconnect.
 	client.RoundTripper = session.KeepAliveHandler(client.RoundTripper, 10*time.Minute,
 		func(rt soap.RoundTripper) error {
-			ctx := context.Background()
+			kctx := context.Background()
 			mgr := session.NewManager(client.Client)
-			active, err := mgr.SessionIsActive(ctx)
+			active, err := mgr.SessionIsActive(kctx)
 			if err == nil && active {
 				return nil
 			}
 			c.logger.Info("vCenter session expired, re-authenticating via keepalive")
-			if loginErr := mgr.Login(ctx, u.User); loginErr != nil {
+			if useCert {
+				// Password Login cannot refresh a cert session. ensureConnected
+				// / withRetry will call connectLocked for a full STS reconnect.
+				c.logger.Info("cert session expired; deferring full STS reconnect to next operation")
+				return nil
+			}
+			if loginErr := mgr.Login(kctx, u.User); loginErr != nil {
 				c.logger.Error("keepalive re-login failed, will reconnect on next operation", "error", loginErr)
-				return nil // keep goroutine alive; withRetry handles full reconnect
+				return nil
 			}
 			c.logger.Info("vCenter session re-authenticated via keepalive")
 			return nil
@@ -152,7 +171,6 @@ func (c *Client) connectLocked(ctx context.Context) error {
 	c.client = client
 	c.finder = find.NewFinder(client.Client, true)
 
-	// Set datacenter
 	dc, err := c.finder.Datacenter(ctx, c.config.Datacenter)
 	if err != nil {
 		return fmt.Errorf("find datacenter %s: %w", c.config.Datacenter, err)
@@ -160,7 +178,11 @@ func (c *Client) connectLocked(ctx context.Context) error {
 	c.datacenter = dc
 	c.finder.SetDatacenter(dc)
 
-	c.logger.Info("connected to vCenter", "url", c.config.URL, "datacenter", c.config.Datacenter)
+	authMode := "password"
+	if useCert {
+		authMode = "client_certificate"
+	}
+	c.logger.Info("connected to vCenter", "url", c.config.URL, "datacenter", c.config.Datacenter, "auth", authMode)
 	return nil
 }
 

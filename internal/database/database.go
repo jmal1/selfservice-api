@@ -4,11 +4,14 @@ import (
 	"context"
 	"embed"
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/database/postgres"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/jmal1/selfservice-api/internal/config"
@@ -25,6 +28,10 @@ var migrationsFS embed.FS
 //   api-gateway (20) + crucible-engine (20) + 4 × workers (5 + 1 leader conn) = 64
 // against max_connections = 100, leaving ~36 headroom for admin tools and
 // migrations. Adjust this comment when the fleet composition changes.
+//
+// When cfg.CredentialsFile is set, each new connection re-reads username and
+// password from that file (Vault Agent template) so dynamic DB leases rotate
+// without restarting the process.
 func Connect(ctx context.Context, cfg config.DatabaseConfig) (*pgxpool.Pool, error) {
 	poolCfg, err := pgxpool.ParseConfig(cfg.DSN())
 	if err != nil {
@@ -44,6 +51,19 @@ func Connect(ctx context.Context, cfg config.DatabaseConfig) (*pgxpool.Pool, err
 		poolCfg.MinConns = 1
 	}
 	poolCfg.MaxConnLifetime = 30 * time.Minute
+
+	if cfg.CredentialsFile != "" {
+		credPath := cfg.CredentialsFile
+		poolCfg.BeforeConnect = func(_ context.Context, cc *pgx.ConnConfig) error {
+			user, pass, err := readCredentialsFile(credPath)
+			if err != nil {
+				return err
+			}
+			cc.User = user
+			cc.Password = pass
+			return nil
+		}
+	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
@@ -99,4 +119,23 @@ func MigrateWithDriver(dsn string) error {
 	}
 
 	return nil
+}
+
+// readCredentialsFile loads dynamic DB credentials. Format: username on line 1,
+// password on line 2 (Vault Agent template output). Never log the contents.
+func readCredentialsFile(path string) (user, password string, err error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", "", fmt.Errorf("read DB credentials file: %w", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(lines) < 2 {
+		return "", "", fmt.Errorf("DB credentials file %s must contain username and password lines", path)
+	}
+	user = strings.TrimSpace(lines[0])
+	password = strings.TrimSpace(lines[1])
+	if user == "" || password == "" {
+		return "", "", fmt.Errorf("DB credentials file %s has empty username or password", path)
+	}
+	return user, password, nil
 }

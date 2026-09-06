@@ -62,6 +62,19 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.secrets.vcenter }}
                   key: vcenter-password
+                  optional: true
+            - name: VCENTER_CLIENT_CERT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.vcenter }}
+                  key: vcenter-client-cert
+                  optional: true
+            - name: VCENTER_CLIENT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.vcenter }}
+                  key: vcenter-client-key
+                  optional: true
             - name: VCENTER_DATACENTER
               value: {{ .Values.vcenter.datacenter | quote }}
             - name: VCENTER_DATASTORE

@@ -31,8 +31,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/vmware/govmomi"
-	"github.com/vmware/govmomi/vim25/soap"
+	"github.com/jmal1/selfservice-api/internal/vcenter"
 )
 
 // Config is the runtime configuration for a Probe. All fields except
@@ -42,10 +41,14 @@ type Config struct {
 	// VCenterURL is the SDK endpoint, e.g. https://vcenter.lab.jmal.io/sdk
 	VCenterURL string
 	// User in vsphere.local format, e.g. selfservice-svc@vsphere.local.
+	// Optional when ClientCertPEM+ClientKeyPEM are set (solution-user STS).
 	User string
 	// Password is the cleartext SSO password the probe attempts a fresh
-	// login with each cycle.
+	// login with each cycle. Optional when client certificate PEMs are set.
 	Password string
+	// ClientCertPEM / ClientKeyPEM enable STS Holder-of-Key login (preferred).
+	ClientCertPEM []byte
+	ClientKeyPEM  []byte
 	// Insecure skips TLS verification (matches the production vCenter
 	// client's setting; the homelab uses a self-signed CA).
 	Insecure bool
@@ -105,10 +108,21 @@ func New(cfg Config, logger *slog.Logger) (*Probe, error) {
 	if cfg.VCenterURL == "" {
 		return nil, fmt.Errorf("VCenterURL is required")
 	}
-	if cfg.User == "" {
+	vcCfg := vcenter.Config{
+		URL:           cfg.VCenterURL,
+		User:          cfg.User,
+		Password:      cfg.Password,
+		ClientCertPEM: cfg.ClientCertPEM,
+		ClientKeyPEM:  cfg.ClientKeyPEM,
+		Insecure:      cfg.Insecure,
+	}
+	if !vcCfg.HasClientCertificate() && !vcCfg.HasPasswordAuth() {
+		return nil, fmt.Errorf("vCenter probe requires client certificate PEMs or User+Password")
+	}
+	if !vcCfg.HasClientCertificate() && cfg.User == "" {
 		return nil, fmt.Errorf("User is required")
 	}
-	if cfg.Password == "" {
+	if !vcCfg.HasClientCertificate() && cfg.Password == "" {
 		return nil, fmt.Errorf("Password is required")
 	}
 	if cfg.ProbeTimeout == 0 {
@@ -192,16 +206,14 @@ func (p *Probe) probe(ctx context.Context) Result {
 	probeCtx, cancel := context.WithTimeout(ctx, p.cfg.ProbeTimeout)
 	defer cancel()
 
-	u, err := soap.ParseURL(p.cfg.VCenterURL)
-	if err != nil {
-		return Result{
-			Success: false, Duration: time.Since(start),
-			Err: fmt.Errorf("parse url: %w", err), At: time.Now(),
-		}
-	}
-	u.User = url.UserPassword(p.cfg.User, p.cfg.Password)
-
-	client, err := govmomi.NewClient(probeCtx, u, p.cfg.Insecure)
+	client, err := vcenter.Authenticate(probeCtx, vcenter.Config{
+		URL:           p.cfg.VCenterURL,
+		User:          p.cfg.User,
+		Password:      p.cfg.Password,
+		ClientCertPEM: p.cfg.ClientCertPEM,
+		ClientKeyPEM:  p.cfg.ClientKeyPEM,
+		Insecure:      p.cfg.Insecure,
+	})
 	dur := time.Since(start)
 	if err != nil {
 		return Result{Success: false, Duration: dur, Err: err, At: time.Now()}

@@ -66,6 +66,8 @@ func main() {
 		URL:        cfg.VCenter.URL,
 		User:       cfg.VCenter.User,
 		Password:   cfg.VCenter.Password,
+		ClientCertPEM: cfg.VCenter.ClientCertPEM,
+		ClientKeyPEM:  cfg.VCenter.ClientKeyPEM,
 		Datacenter: cfg.VCenter.Datacenter,
 		Datastore:  cfg.VCenter.Datastore,
 		VMFolder:   cfg.VCenter.VMFolder,
@@ -106,6 +108,7 @@ func main() {
 		APISecret:   cfg.OPNsense.APISecret,
 		SSHHost:     cfg.OPNsense.SSHHost,
 		SSHUser:     cfg.OPNsense.SSHUser,
+		SSHKey:      []byte(cfg.OPNsense.SSHPrivateKeyPEM),
 		SSHPassword: cfg.OPNsense.SSHPassword,
 		SSHHostKey:  cfg.OPNsense.SSHHostKey,
 	}

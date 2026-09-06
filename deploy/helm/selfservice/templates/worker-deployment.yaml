@@ -81,6 +81,19 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.secrets.vcenter }}
                   key: vcenter-password
+                  optional: true
+            - name: VCENTER_CLIENT_CERT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.vcenter }}
+                  key: vcenter-client-cert
+                  optional: true
+            - name: VCENTER_CLIENT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.vcenter }}
+                  key: vcenter-client-key
+                  optional: true
             - name: VCENTER_DATACENTER
               value: {{ .Values.vcenter.datacenter | quote }}
             - name: VCENTER_DATASTORE
@@ -128,6 +141,13 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.secrets.opnsense }}
                   key: opnsense-ssh-password
+                  optional: true
+            - name: OPNSENSE_SSH_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.opnsense }}
+                  key: opnsense-ssh-private-key
+                  optional: true
             - name: OPNSENSE_SSH_HOST_KEY
               {{- if .Values.opnsense.sshHostKey }}
               value: {{ .Values.opnsense.sshHostKey | quote }}
