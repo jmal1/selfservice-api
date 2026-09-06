@@ -10,7 +10,22 @@ import (
 	"math/big"
 	"testing"
 	"time"
+
+	"github.com/vmware/govmomi/vim25"
 )
+
+func TestCertGovmomiClient_WiresSessionManager(t *testing.T) {
+	// Regression for 82239b1 CrashLoop: &govmomi.Client{Client: vc} left
+	// SessionManager nil so Logout/UserSession panicked under cert auth.
+	vc := new(vim25.Client)
+	c := certGovmomiClient(vc, nil)
+	if c.SessionManager == nil {
+		t.Fatal("SessionManager must be non-nil")
+	}
+	if c.Client != vc {
+		t.Fatal("vim25 client must be preserved")
+	}
+}
 
 func TestConfig_HasClientCertificate(t *testing.T) {
 	certPEM, keyPEM := mustTestCertPEM(t)

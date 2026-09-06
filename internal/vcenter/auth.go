@@ -84,12 +84,25 @@ func loginWithCertificate(ctx context.Context, u *url.URL, cert tls.Certificate,
 		}
 	}
 
+	// Mirror govmomi.NewClient: SessionManager must be set on the returned
+	// client. LoginByToken alone authenticates the SOAP session but leaves
+	// Client.SessionManager nil — Logout/UserSession then panic (API health
+	// probe and worker DRS privilege checks).
+	sm := session.NewManager(vc)
 	header := soap.Header{Security: signer}
-	if err := session.NewManager(vc).LoginByToken(vc.WithHeader(ctx, header)); err != nil {
+	if err := sm.LoginByToken(vc.WithHeader(ctx, header)); err != nil {
 		return nil, fmt.Errorf("LoginByToken: %w", err)
 	}
 
-	return &govmomi.Client{Client: vc}, nil
+	return certGovmomiClient(vc, sm), nil
+}
+
+// certGovmomiClient binds an authenticated vim25 client to a SessionManager.
+func certGovmomiClient(vc *vim25.Client, sm *session.Manager) *govmomi.Client {
+	if sm == nil {
+		sm = session.NewManager(vc)
+	}
+	return &govmomi.Client{Client: vc, SessionManager: sm}
 }
 
 func loginWithPassword(ctx context.Context, u *url.URL, insecure bool) (*govmomi.Client, error) {
