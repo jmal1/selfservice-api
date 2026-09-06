@@ -2,10 +2,15 @@ package provisioner
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
 )
+
+// ErrReconcileNotOwned means this replica did not hold the work lease for the
+// reconciler. Schedulers must not ObserveRun/Push shared Pushgateway series.
+var ErrReconcileNotOwned = errors.New("reconcile not owned by this replica")
 
 type l1ValidationReconcileFunc func(context.Context) (L1TrustValidationCounts, error)
 
@@ -109,6 +114,10 @@ func (s *L1TrustValidationScheduler) run(ctx context.Context, reason string) {
 	}
 
 	counts, runErr := s.reconcile(ctx)
+	if errors.Is(runErr, ErrReconcileNotOwned) {
+		s.finishRun()
+		return
+	}
 	if s.metrics != nil {
 		s.metrics.ObserveRun(counts, runErr)
 		if err := s.metrics.Push(ctx); err != nil && ctx.Err() == nil {

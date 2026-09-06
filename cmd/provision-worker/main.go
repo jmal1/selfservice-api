@@ -558,7 +558,7 @@ func main() {
 					return e
 				})
 			if errors.Is(err, worklease.ErrNotClaimed) {
-				return counts, nil
+				return counts, provisioner.ErrReconcileNotOwned
 			}
 			return counts, err
 		}
@@ -701,7 +701,11 @@ func main() {
 	}
 
 	// Idle VM suspend evaluator ticker (disabled by default via dry-run; nil-safe).
+	// IdleEval is held continuously so the same replica both evaluates and pushes
+	// shared Pushgateway gauges (split leases would clobber last-run heartbeats).
 	var idleEvalTickerC <-chan time.Time
+	var holdIdle atomic.Bool
+	var idleLeaseCtx atomic.Value // context.Context while IdleEval is held
 	if idleEvalEnabled {
 		t := time.NewTicker(idleEvalInterval)
 		defer t.Stop()
@@ -709,12 +713,14 @@ func main() {
 		logger.Info("idle vm evaluator enabled",
 			"interval", idleEvalInterval,
 			"dry_run", dryRunResult.DryRun)
+		go holdWorkLease(ctx, leaseStore, worklease.IdleEval, workerID, logger, &holdIdle, &idleLeaseCtx,
+			func(leaseCtx context.Context) {
+				if _, err := prov.EvaluateIdleVMs(leaseCtx, idleEvalCfg); err != nil && leaseCtx.Err() == nil {
+					logger.Error("idle vm evaluator catch-up failed", "error", err)
+				}
+			})
 		if idleEvalPusher != nil {
-			// Only the suspend_metrics lease holder may push shared Pushgateway
-			// gauges (avoids stale last-run seeds from non-owners).
-			var holdSuspend atomic.Bool
-			go holdWorkLease(ctx, leaseStore, worklease.SuspendMetrics, workerID, logger, &holdSuspend)
-			go idleEvalPusher.RunSuspendMetricsPusher(ctx, 30*time.Second, holdSuspend.Load, logger)
+			go idleEvalPusher.RunSuspendMetricsPusher(ctx, 30*time.Second, holdIdle.Load, logger)
 		}
 	}
 
@@ -826,10 +832,16 @@ func main() {
 					return err
 				})
 			case <-idleEvalTickerC:
-				runLeased(ctx, leaseStore, worklease.IdleEval, workerID, logger, func(leaseCtx context.Context) error {
-					_, err := prov.EvaluateIdleVMs(leaseCtx, idleEvalCfg)
-					return err
-				})
+				if !holdIdle.Load() {
+					break
+				}
+				leaseCtx, _ := idleLeaseCtx.Load().(context.Context)
+				if leaseCtx == nil || leaseCtx.Err() != nil {
+					break
+				}
+				if _, err := prov.EvaluateIdleVMs(leaseCtx, idleEvalCfg); err != nil && leaseCtx.Err() == nil {
+					logger.Error("idle vm evaluator failed", "error", err)
+				}
 			case <-templateReconcilerTickerC:
 				runLeased(ctx, leaseStore, worklease.TemplateMetrics, workerID, logger, func(leaseCtx context.Context) error {
 					if _, err := prov.ReconcileTemplateMetrics(leaseCtx, provisioner.TemplateReconcilerConfig{
@@ -865,8 +877,7 @@ func main() {
 	// full ticker interval. Losers of the claim no-op.
 	go startupWorkLeaseCatchup(ctx, leaseStore, workerID, logger, prov, vcClient, cfg,
 		networkReconcilerEnabled, networkReconcilerCfg,
-		healthReconcilerEnabled, healthReconcilerCfg,
-		idleEvalEnabled, idleEvalCfg)
+		healthReconcilerEnabled, healthReconcilerCfg)
 
 	// Wait for shutdown signal
 	sigCh := make(chan os.Signal, 1)
@@ -1071,18 +1082,37 @@ func runLeased(
 	}
 }
 
+var cancelledLeaseCtx = func() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return ctx
+}()
+
 func holdWorkLease(
 	ctx context.Context,
 	store worklease.Store,
 	name, workerID string,
 	logger *slog.Logger,
 	held *atomic.Bool,
+	leaseCtxOut *atomic.Value,
+	onAcquire func(context.Context),
 ) {
 	for ctx.Err() == nil {
 		err := worklease.RunExclusive(ctx, store, name, workerID, logger,
 			func(leaseCtx context.Context, _ *worklease.Lease) error {
 				held.Store(true)
-				defer held.Store(false)
+				if leaseCtxOut != nil {
+					leaseCtxOut.Store(leaseCtx)
+				}
+				defer func() {
+					held.Store(false)
+					if leaseCtxOut != nil {
+						leaseCtxOut.Store(cancelledLeaseCtx)
+					}
+				}()
+				if onAcquire != nil {
+					onAcquire(leaseCtx)
+				}
 				<-leaseCtx.Done()
 				return nil
 			})
@@ -1113,8 +1143,6 @@ func startupWorkLeaseCatchup(
 	networkCfg provisioner.NetworkReconcilerConfig,
 	healthEnabled bool,
 	healthCfg provisioner.TemplateHealthReconcilerConfig,
-	idleEnabled bool,
-	idleCfg provisioner.IdleEvaluatorConfig,
 ) {
 	runLeased(ctx, store, worklease.ExpireStale, workerID, logger, func(leaseCtx context.Context) error {
 		prov.ExpireStale(leaseCtx)
@@ -1123,12 +1151,6 @@ func startupWorkLeaseCatchup(
 	if networkEnabled {
 		runLeased(ctx, store, worklease.NetworkReconcile, workerID, logger, func(leaseCtx context.Context) error {
 			_, err := prov.ReconcileNetwork(leaseCtx, networkCfg)
-			return err
-		})
-	}
-	if idleEnabled {
-		runLeased(ctx, store, worklease.IdleEval, workerID, logger, func(leaseCtx context.Context) error {
-			_, err := prov.EvaluateIdleVMs(leaseCtx, idleCfg)
 			return err
 		})
 	}

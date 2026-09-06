@@ -186,6 +186,23 @@ func TestL1SchedulerSuccessfulCatchUpRecordsCounts(t *testing.T) {
 	}
 }
 
+func TestL1SchedulerSkipsMetricsWhenNotOwned(t *testing.T) {
+	metrics := &fakeL1SchedulerMetrics{}
+	scheduler := NewL1TrustValidationScheduler(
+		func() bool { return true },
+		func(context.Context) (L1TrustValidationCounts, error) {
+			return L1TrustValidationCounts{Due: 9}, ErrReconcileNotOwned
+		},
+		metrics,
+		discardLogger(),
+	)
+	scheduler.Start(context.Background())
+	scheduler.Wait()
+	if metrics.pushes != 0 || len(metrics.observed) != 0 {
+		t.Fatalf("not-owned reconcile must not ObserveRun/Push; pushes=%d observed=%d", metrics.pushes, len(metrics.observed))
+	}
+}
+
 func TestL1SchedulerWaitTimeoutIsBounded(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})

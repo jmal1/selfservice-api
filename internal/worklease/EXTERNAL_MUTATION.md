@@ -9,7 +9,7 @@
 # | OPNsense network     | Desired-state reconcile; no non-idempotent appends   |
 # | vCenter orphan destroy | Re-validate identity/ownership immediately before destroy |
 # | Template orphan      | Same as above for Templates-folder disposables       |
-# | Idle suspend         | Recheck activity + lifecycle immediately before suspend |
+# | Idle suspend         | Recheck activity + lifecycle immediately before suspend; IdleEval lease holder both evaluates and pushes shared suspend gauges |
 # | Template health clone| Deterministic name / adopt existing healthcheck VM   |
 # | Pod / template clone | Job claim_token CAS; adopt-before-create where possible |
 #

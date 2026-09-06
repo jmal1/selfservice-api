@@ -21,6 +21,5 @@ INSERT INTO worker_work_leases (name) VALUES
     ('retry_pending'),
     ('l1_validation'),
     ('template_health'),
-    ('template_health_confirm'),
-    ('suspend_metrics')
+    ('template_health_confirm')
 ON CONFLICT (name) DO NOTHING;

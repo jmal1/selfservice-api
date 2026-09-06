@@ -18,7 +18,6 @@ const (
 	L1Validation          = "l1_validation"
 	TemplateHealth        = "template_health"
 	TemplateHealthConfirm = "template_health_confirm"
-	SuspendMetrics        = "suspend_metrics"
 )
 
 // AllNames is the canonical set seeded by migration 000040.
@@ -37,6 +36,5 @@ func AllNames() []string {
 		L1Validation,
 		TemplateHealth,
 		TemplateHealthConfirm,
-		SuspendMetrics,
 	}
 }
