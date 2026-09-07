@@ -305,7 +305,18 @@ func (c *Client) resolveSourceVM(ctx context.Context, ref string) (*object.Virtu
 		return object.NewVirtualMachine(c.client.Client,
 			types.ManagedObjectReference{Type: "VirtualMachine", Value: ref}), nil
 	}
-	return c.finder.VirtualMachine(ctx, ref)
+	var vm *object.VirtualMachine
+	if err := c.withRetry(ctx, "resolve source VM by name", func() error {
+		found, findErr := c.finder.VirtualMachine(ctx, ref)
+		if findErr != nil {
+			return findErr
+		}
+		vm = found
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return vm, nil
 }
 
 // isVMMoref reports whether s looks like a VirtualMachine managed-object
