@@ -620,10 +620,17 @@ func TestCleanupOnlyPodCreateCannotReachForwardProvisioning(t *testing.T) {
 	cleanupSucceeded := strings.Index(commonCleanupBody, "if len(cleanupErrs) > 0 {")
 	releaseCapacity := strings.Index(commonCleanupBody, "p.releaseVMPlacementCapacity(")
 	markVMTerminal := strings.Index(commonCleanupBody, "p.db.UpdatePodVMStatusFrom(")
+	finalizeNeverApplied := strings.Index(commonCleanupBody, "FinalizeNeverAppliedPodCreate(")
+	markCompensation := strings.Index(commonCleanupBody, "MarkJobCompensationCompleted(")
 	if cleanupSucceeded < rollback ||
 		releaseCapacity < cleanupSucceeded ||
 		markVMTerminal < releaseCapacity {
 		t.Fatal("pod-create compensation must finish exact cleanup and release capacity before terminal VM states")
+	}
+	if finalizeNeverApplied < 0 || markCompensation < 0 ||
+		finalizeNeverApplied < markVMTerminal ||
+		markCompensation < finalizeNeverApplied {
+		t.Fatal("never-applied create finalize must run after terminal VM states and before compensation completion")
 	}
 
 	failCleanupStart := strings.Index(src, "func (p *Provisioner) failPodCreateWithCleanup(")

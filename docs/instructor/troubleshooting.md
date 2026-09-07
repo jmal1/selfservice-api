@@ -461,6 +461,8 @@ the same resource-retention rule but remains retryable.
 
 If you delete a pod before provisioning ever starts, Crucible now cancels the pending `pod_create` job in the database, marks the pod and VM rows deleted, releases the VLAN, and never calls vCenter or OPNsense. That path is only taken while the create job is still pending and unclaimed and there is no VM MoRef, placement, or portgroup receipt evidence. Once any of those ownership signals exist, delete falls back to the normal destroy/manual cleanup path instead of pretending the pod was never started.
 
+When `pod_create` fails before a durable non-removed portgroup receipt exists (for example placement planning exhausted after a transient `NotAuthenticated` on template host resolve), create compensation finalizes the pod as `destroyed`, clears `error_message`, and releases `vlan_pool` without calling OPNsense or vCenter. Successful compensation still records the parent job as failed with `compensated: true`. If a non-removed receipt exists, compensation only undoes job rollback and leaves lifecycle to the normal destroy/receipt path — do not expect this helper to auto-destroy applied ownership.
+
 Authenticated clients can check the stable read-only contract at
 `GET /api/v1/provisioning/status`:
 
