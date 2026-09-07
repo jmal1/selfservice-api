@@ -1028,6 +1028,19 @@ func (p *Provisioner) cleanupPodCreateResources(
 			)
 		}
 	}
+	if podExists {
+		finalized, finalizeErr := p.db.FinalizeNeverAppliedPodCreate(cleanupCtx, podID)
+		if finalizeErr != nil {
+			return newPodCreateCleanupRetryError(
+				stage,
+				[]error{fmt.Errorf("finalize never-applied create for pod %s: %w", podID, finalizeErr)},
+			)
+		}
+		if finalized {
+			p.logger.Info("never-applied create compensation finalized pod and released VLAN",
+				"pod_id", podID, "stage", stage)
+		}
+	}
 	if err := p.db.MarkJobCompensationCompleted(cleanupCtx, job.ID, workerID); err != nil {
 		return newPodCreateCleanupRetryError(
 			stage,

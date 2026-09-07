@@ -759,6 +759,82 @@ func (q *Queries) FinalizePodDestroy(
 	return nil
 }
 
+// FinalizeNeverAppliedPodCreate marks a create-compensated pod destroyed and
+// releases its VLAN when no durable non-removed portgroup receipt exists.
+// Empty rollback after placement failure never created OPNsense/vCenter
+// ownership, so destroy must not be required to clear the VLAN hold.
+//
+// Returns finalized=false when a non-removed receipt still owns lifecycle
+// (normal destroy/receipt path). Safe statuses match BeginPodCreateCleanup.
+func (q *Queries) FinalizeNeverAppliedPodCreate(ctx context.Context, podID uuid.UUID) (finalized bool, err error) {
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("begin never-applied create finalization: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var status string
+	if err := tx.QueryRow(ctx, `
+		SELECT status
+		FROM pods
+		WHERE id = $1
+		FOR UPDATE
+	`, podID).Scan(&status); errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	} else if err != nil {
+		return false, fmt.Errorf("lock pod for never-applied create finalization: %w", err)
+	}
+	if !podCreateCleanupStatusSafe(status) {
+		return false, fmt.Errorf(
+			"%w: pod %s status=%s is unsafe for never-applied create finalization",
+			ErrUnsafePodCreateCleanupState,
+			podID,
+			status,
+		)
+	}
+
+	var liveReceipts int
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*)
+		FROM pod_portgroup_receipts
+		WHERE pod_id = $1
+		  AND removed_at IS NULL
+	`, podID).Scan(&liveReceipts); err != nil {
+		return false, fmt.Errorf("count live portgroup receipts for pod %s: %w", podID, err)
+	}
+	if liveReceipts > 0 {
+		return false, nil
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE pods
+		SET status = $2,
+		    error_message = '',
+		    updated_at = now()
+		WHERE id = $1
+		  AND status = ANY($3::text[])
+	`, podID, models.PodStatusDestroyed, []string{
+		models.PodStatusError,
+		models.PodStatusDestroying,
+		models.PodStatusDestroyFailed,
+		models.PodStatusDestroyed,
+	}); err != nil {
+		return false, fmt.Errorf("mark never-applied pod %s destroyed: %w", podID, err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE vlan_pool
+		SET pod_id = NULL,
+		    allocated_at = NULL
+		WHERE pod_id = $1
+	`, podID); err != nil {
+		return false, fmt.Errorf("release VLAN for never-applied pod %s: %w", podID, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("commit never-applied create finalization for %s: %w", podID, err)
+	}
+	return true, nil
+}
+
 type PodDestroyRecoverySnapshot struct {
 	PodID            uuid.UUID
 	PodStatus        string
@@ -3656,4 +3732,3 @@ func (q *Queries) ReleaseWorkLease(
 	`, name, workerID, claimToken)
 	return err
 }
-
