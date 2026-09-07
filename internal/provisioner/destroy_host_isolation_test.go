@@ -24,7 +24,8 @@ func validateDestroyHostIsolation(source string) error {
 
 	deleteStart := strings.Index(source, "WithVCenterPortGroupMutationLock")
 	deleteEnd := strings.Index(source[deleteStart:], "// --- Step 4")
-	finalizeDestroy := strings.Index(source, "FinalizePodDestroy")
+	// Call site only — comments may mention FinalizePodDestroy earlier.
+	finalizeDestroy := strings.Index(source, "p.db.FinalizePodDestroy(")
 	if deleteStart < 0 || deleteEnd < 0 || finalizeDestroy < 0 || deleteStart > finalizeDestroy {
 		return fmt.Errorf("portgroup cleanup does not precede atomic pod/VLAN finalization")
 	}
@@ -69,7 +70,6 @@ func TestDestroyIsolationGuardDetectsFallthrough(t *testing.T) {
 
 func TestUnsafePortGroupReceiptsRequireManualCleanup(t *testing.T) {
 	for _, err := range []error{
-		database.ErrPortGroupReceiptNotFound,
 		vcenter.ErrInvalidPortGroupReceipt,
 		vcenter.ErrLegacyPortGroupReceipt,
 		vcenter.ErrHostNotAllowed,
@@ -79,6 +79,9 @@ func TestUnsafePortGroupReceiptsRequireManualCleanup(t *testing.T) {
 		if !portGroupReceiptRequiresManualCleanup(err) {
 			t.Errorf("error %q did not require manual cleanup", err)
 		}
+	}
+	if portGroupReceiptRequiresManualCleanup(database.ErrPortGroupReceiptNotFound) {
+		t.Fatal("missing receipt must not require manual cleanup — destroy skips keyed delete and continues")
 	}
 	if portGroupReceiptRequiresManualCleanup(errors.New("temporary database outage")) {
 		t.Fatal("transient receipt load error incorrectly requires manual cleanup")
