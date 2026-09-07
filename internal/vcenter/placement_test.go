@@ -2,6 +2,7 @@ package vcenter
 
 import (
 	"errors"
+	"os"
 	"strings"
 	"testing"
 )
@@ -99,5 +100,41 @@ func TestAllowedHostLookupFailsClosed(t *testing.T) {
 	}
 	if _, err := client.allowedHostByMoRef("host-102"); !errors.Is(err, ErrHostNotAllowed) {
 		t.Fatalf("disallowed host error = %v, want ErrHostNotAllowed", err)
+	}
+}
+
+func TestPlacementHostResolveUsesSessionRetry(t *testing.T) {
+	body, err := os.ReadFile("placement.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(body)
+	resolveStart := strings.Index(src, "func (c *Client) resolveClonePlacement(")
+	if resolveStart < 0 {
+		t.Fatal("resolveClonePlacement not found")
+	}
+	resolveEnd := strings.Index(src[resolveStart+1:], "\nfunc ")
+	if resolveEnd < 0 {
+		t.Fatal("could not isolate resolveClonePlacement")
+	}
+	resolveBody := src[resolveStart : resolveStart+1+resolveEnd]
+	if !strings.Contains(resolveBody, `c.withRetry(ctx, "source VM host"`) {
+		t.Fatal("source host property read must use withRetry for NotAuthenticated session refresh")
+	}
+	existingStart := strings.Index(src, "func (c *Client) ResolveExistingClonePlacement(")
+	if existingStart < 0 {
+		t.Fatal("ResolveExistingClonePlacement not found")
+	}
+	existingEnd := strings.Index(src[existingStart+1:], "\nfunc ")
+	if existingEnd < 0 {
+		t.Fatal("could not isolate ResolveExistingClonePlacement")
+	}
+	existingBody := src[existingStart : existingStart+1+existingEnd]
+	if !strings.Contains(existingBody, `c.withRetry(ctx, "existing VM placement"`) {
+		t.Fatal("existing VM placement read must use withRetry for NotAuthenticated session refresh")
+	}
+	sabotaged := strings.ReplaceAll(resolveBody, `c.withRetry(ctx, "source VM host"`, `c.removedWithRetry(ctx, "source VM host"`)
+	if strings.Contains(sabotaged, `c.withRetry(ctx, "source VM host"`) {
+		t.Fatal("sabotage must remove source-host withRetry")
 	}
 }

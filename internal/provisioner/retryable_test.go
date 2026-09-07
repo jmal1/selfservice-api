@@ -54,6 +54,12 @@ func TestClassifyError_RetryableExamples(t *testing.T) {
 			wantOK:  true, wantReason: RetryReasonConnection,
 		},
 		{
+			name:    "placement NotAuthenticated is retryable",
+			err:     "resolve placement for pod VM x: placement unavailable: source vm-8002 host: ServerFaultCode: NotAuthenticated",
+			jobType: "pod_create",
+			wantOK:  true, wantReason: RetryReasonConnection,
+		},
+		{
 			name:    "context deadline exceeded",
 			err:     "wait clone task: context deadline exceeded",
 			jobType: "template_provision",
@@ -122,6 +128,10 @@ func TestClassifyError_NonRetryableRealExamples(t *testing.T) {
 		{
 			name: "guest auth failure",
 			err:  "run generalize script: Failed to authenticate with the guest operating system using the supplied credentials",
+		},
+		{
+			name: "permanent vCenter login rejection",
+			err:  "ServerFaultCode: Cannot complete login due to an incorrect user name or password.",
 		},
 	}
 

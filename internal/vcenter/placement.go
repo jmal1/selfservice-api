@@ -650,7 +650,9 @@ func (c *Client) ResolveExistingClonePlacement(
 		Value: vmMoref,
 	})
 	var props mo.VirtualMachine
-	if err := vm.Properties(ctx, vm.Reference(), []string{"runtime.host", "resourcePool"}, &props); err != nil {
+	if err := c.withRetry(ctx, "existing VM placement", func() error {
+		return vm.Properties(ctx, vm.Reference(), []string{"runtime.host", "resourcePool"}, &props)
+	}); err != nil {
 		return CloneVMParams{}, fmt.Errorf("read existing VM %s placement: %w", vmMoref, err)
 	}
 	if props.Runtime.Host == nil || props.Runtime.Host.Value == "" || props.ResourcePool == nil {
@@ -695,7 +697,9 @@ func (c *Client) resolveClonePlacement(
 			continue
 		}
 		var sourceProps mo.VirtualMachine
-		if err := source.Properties(ctx, source.Reference(), []string{"runtime.host"}, &sourceProps); err != nil {
+		if err := c.withRetry(ctx, "source VM host", func() error {
+			return source.Properties(ctx, source.Reference(), []string{"runtime.host"}, &sourceProps)
+		}); err != nil {
 			diagnostics = append(diagnostics, fmt.Sprintf("source %s host: %v", candidate.Ref, err))
 			continue
 		}

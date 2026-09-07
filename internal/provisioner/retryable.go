@@ -78,6 +78,8 @@ var deterministicPhrases = []string{
 	// Template / source not found in our DB — not a transient vCenter fault.
 	"not found in database",
 	"template_id not found",
+	// Permanent vCenter login rejection — not a stale session.
+	"incorrect user name or password",
 }
 
 // ClassifyError reports whether jobErr is safe to retry, and if so,
@@ -163,6 +165,11 @@ func ClassifyError(err error, jobType string) (retryable bool, reason string) {
 		"context deadline exceeded",
 		"read tcp",
 		"write tcp",
+		// Stale SOAP session during placement host resolve; withRetry refreshes
+		// once, and job-level retries cover remaining race windows.
+		"NotAuthenticated",
+		"not authenticated",
+		"session is not authenticated",
 	}
 	for _, phrase := range connectionPhrases {
 		if strings.Contains(strings.ToLower(s), strings.ToLower(phrase)) {
