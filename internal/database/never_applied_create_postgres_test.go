@@ -96,7 +96,18 @@ func (f *neverAppliedCreateFixture) insertLiveReceipt(t *testing.T) {
 	receipt, err := json.Marshal(map[string]any{
 		"name":    "Pod-VLAN" + f.subnet,
 		"vlan_id": f.vlanTag,
-		"hosts":   []any{},
+		"hosts": []map[string]any{{
+			"host_name":     "esxi1.lab.jmal.io",
+			"host_moref":    "host-1002",
+			"compute_moref": "domain-c9",
+			"vswitch_name":  "vSwitch0",
+			"security": map[string]any{
+				"allow_promiscuous": nil,
+				"mac_changes":       nil,
+				"forged_transmits":  nil,
+			},
+			"preexisting": false,
+		}},
 	})
 	if err != nil {
 		t.Fatal(err)
