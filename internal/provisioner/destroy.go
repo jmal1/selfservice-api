@@ -92,80 +92,91 @@ func (p *Provisioner) DestroyPod(ctx context.Context, job *models.Job) error {
 	p.publishProgress(job.ID, "portgroup_delete", fmt.Sprintf("Deleting port group %s", pgName))
 	receiptRecord, err := p.db.GetPodPortGroupReceipt(ctx, pod.ID)
 	if err != nil {
-		p.logger.Warn("failed to load durable port group receipt", "name", pgName, "error", err)
-		errors = append(errors, fmt.Errorf("load port group receipt: %w", err))
-		if portGroupReceiptRequiresManualCleanup(err) {
+		if stderrors.Is(err, database.ErrPortGroupReceiptNotFound) {
+			// Create can compensate before PersistPodPortGroupReceipt runs
+			// (placement/DHCP/firewall failures). No receipt means no durable
+			// switch ownership — skip keyed deletion; do not invent name-based
+			// deletes. Continue network cleanup so the destroy finalizer can
+			// release the VLAN instead of trapping destroy_failed forever.
+			p.logger.Info("no durable port group receipt; skipping receipt-gated port group delete",
+				"pod_id", pod.ID, "name", pgName)
+		} else {
+			p.logger.Warn("failed to load durable port group receipt", "name", pgName, "error", err)
+			errors = append(errors, fmt.Errorf("load port group receipt: %w", err))
+			if portGroupReceiptRequiresManualCleanup(err) {
+				return p.failPodDestroyManual(ctx, pod.ID, errors)
+			}
+			return p.failPodDestroy(ctx, pod.ID, errors)
+		}
+	} else {
+		var receipt vcenter.PortGroupReceipt
+		if err := json.Unmarshal(receiptRecord.Receipt, &receipt); err != nil {
+			errors = append(errors, fmt.Errorf("parse port group receipt: %w", err))
 			return p.failPodDestroyManual(ctx, pod.ID, errors)
 		}
-		return p.failPodDestroy(ctx, pod.ID, errors)
-	}
-	var receipt vcenter.PortGroupReceipt
-	if err := json.Unmarshal(receiptRecord.Receipt, &receipt); err != nil {
-		errors = append(errors, fmt.Errorf("parse port group receipt: %w", err))
-		return p.failPodDestroyManual(ctx, pod.ID, errors)
-	}
-	if receiptRecord.RemovedAt == nil {
-		if receiptRecord.State == database.PodPortGroupReceiptPlanned {
-			if err := p.db.MarkPodPortGroupRemoved(ctx, pod.ID, receiptRecord.Receipt); err != nil {
-				errors = append(errors, err)
+		if receiptRecord.RemovedAt == nil {
+			if receiptRecord.State == database.PodPortGroupReceiptPlanned {
+				if err := p.db.MarkPodPortGroupRemoved(ctx, pod.ID, receiptRecord.Receipt); err != nil {
+					errors = append(errors, err)
+					return p.failPodDestroy(ctx, pod.ID, errors)
+				}
+			} else if receiptRecord.State != database.PodPortGroupReceiptApplying &&
+				receiptRecord.State != database.PodPortGroupReceiptActive {
+				errors = append(errors, fmt.Errorf(
+					"invalid durable port group receipt state %q",
+					receiptRecord.State,
+				))
+				return p.failPodDestroyManual(ctx, pod.ID, errors)
+			}
+		}
+		if receiptRecord.RemovedAt == nil && receiptRecord.State != database.PodPortGroupReceiptPlanned {
+			receipt, err = vcenter.PortGroupReceiptWithKeys(receipt, receiptRecord.Keys)
+			if err != nil {
+				errors = append(errors, fmt.Errorf("load stable port group identities: %w", err))
+				return p.failPodDestroyManual(ctx, pod.ID, errors)
+			}
+			keys, captureErr := p.vc.CapturePortGroupKeys(ctx, receipt)
+			if captureErr != nil {
+				errors = append(errors, fmt.Errorf("capture stable port group identities: %w", captureErr))
+				if portGroupReceiptRequiresManualCleanup(captureErr) {
+					return p.failPodDestroyManual(ctx, pod.ID, errors)
+				}
 				return p.failPodDestroy(ctx, pod.ID, errors)
 			}
-		} else if receiptRecord.State != database.PodPortGroupReceiptApplying &&
-			receiptRecord.State != database.PodPortGroupReceiptActive {
-			errors = append(errors, fmt.Errorf(
-				"invalid durable port group receipt state %q",
-				receiptRecord.State,
-			))
-			return p.failPodDestroyManual(ctx, pod.ID, errors)
-		}
-	}
-	if receiptRecord.RemovedAt == nil && receiptRecord.State != database.PodPortGroupReceiptPlanned {
-		receipt, err = vcenter.PortGroupReceiptWithKeys(receipt, receiptRecord.Keys)
-		if err != nil {
-			errors = append(errors, fmt.Errorf("load stable port group identities: %w", err))
-			return p.failPodDestroyManual(ctx, pod.ID, errors)
-		}
-		keys, captureErr := p.vc.CapturePortGroupKeys(ctx, receipt)
-		if captureErr != nil {
-			errors = append(errors, fmt.Errorf("capture stable port group identities: %w", captureErr))
-			if portGroupReceiptRequiresManualCleanup(captureErr) {
+			if err := p.db.PersistPodPortGroupKeys(ctx, pod.ID, receiptRecord.Receipt, keys); err != nil {
+				errors = append(errors, err)
+				if portGroupReceiptRequiresManualCleanup(err) {
+					return p.failPodDestroyManual(ctx, pod.ID, errors)
+				}
+				return p.failPodDestroy(ctx, pod.ID, errors)
+			}
+			for host, key := range receiptRecord.Keys {
+				if _, exists := keys[host]; !exists {
+					keys[host] = key
+				}
+			}
+			receipt, err = vcenter.PortGroupReceiptWithKeys(receipt, keys)
+			if err != nil {
+				errors = append(errors, err)
 				return p.failPodDestroyManual(ctx, pod.ID, errors)
 			}
-			return p.failPodDestroy(ctx, pod.ID, errors)
-		}
-		if err := p.db.PersistPodPortGroupKeys(ctx, pod.ID, receiptRecord.Receipt, keys); err != nil {
-			errors = append(errors, err)
-			if portGroupReceiptRequiresManualCleanup(err) {
-				return p.failPodDestroyManual(ctx, pod.ID, errors)
+			if err := p.db.WithVCenterPortGroupMutationLock(ctx, func(lockCtx context.Context) error {
+				if err := p.vc.DeletePortGroupMutation(lockCtx, receipt); err != nil {
+					return err
+				}
+				return p.db.MarkPodPortGroupRemoved(lockCtx, pod.ID, receiptRecord.Receipt)
+			}); err != nil {
+				p.logger.Warn("failed to delete port groups", "name", pgName, "error", err)
+				errors = append(errors, fmt.Errorf("delete port groups: %w", err))
+				// Keep the VLAN and interface allocated so a retry can safely remove
+				// exactly the receipt-owned port groups before releasing network state.
+				if portGroupReceiptRequiresManualCleanup(err) {
+					return p.failPodDestroyManual(ctx, pod.ID, errors)
+				}
+				return p.failPodDestroy(ctx, pod.ID, errors)
 			}
-			return p.failPodDestroy(ctx, pod.ID, errors)
 		}
-		for host, key := range receiptRecord.Keys {
-			if _, exists := keys[host]; !exists {
-				keys[host] = key
-			}
-		}
-		receipt, err = vcenter.PortGroupReceiptWithKeys(receipt, keys)
-		if err != nil {
-			errors = append(errors, err)
-			return p.failPodDestroyManual(ctx, pod.ID, errors)
-		}
-		if err := p.db.WithVCenterPortGroupMutationLock(ctx, func(lockCtx context.Context) error {
-			if err := p.vc.DeletePortGroupMutation(lockCtx, receipt); err != nil {
-				return err
-			}
-			return p.db.MarkPodPortGroupRemoved(lockCtx, pod.ID, receiptRecord.Receipt)
-		}); err != nil {
-			p.logger.Warn("failed to delete port groups", "name", pgName, "error", err)
-			errors = append(errors, fmt.Errorf("delete port groups: %w", err))
-			// Keep the VLAN and interface allocated so a retry can safely remove
-			// exactly the receipt-owned port groups before releasing network state.
-			if portGroupReceiptRequiresManualCleanup(err) {
-				return p.failPodDestroyManual(ctx, pod.ID, errors)
-			}
-			return p.failPodDestroy(ctx, pod.ID, errors)
-		}
-	}
+	} // end receipt present
 
 	// --- Step 4: Remove DHCP subnet ---
 	p.publishProgress(job.ID, "dhcp_delete", fmt.Sprintf("Removing DHCP subnet %s", subnet))
@@ -275,8 +286,10 @@ func (p *Provisioner) failPodDestroyManual(ctx context.Context, podID uuid.UUID,
 }
 
 func portGroupReceiptRequiresManualCleanup(err error) bool {
-	return stderrors.Is(err, database.ErrPortGroupReceiptNotFound) ||
-		stderrors.Is(err, vcenter.ErrInvalidPortGroupReceipt) ||
+	// ErrPortGroupReceiptNotFound is intentionally NOT manual cleanup: create
+	// may compensate before any receipt exists. Destroy skips keyed portgroup
+	// deletion and continues so FinalizePodDestroy can release the VLAN.
+	return stderrors.Is(err, vcenter.ErrInvalidPortGroupReceipt) ||
 		stderrors.Is(err, vcenter.ErrLegacyPortGroupReceipt) ||
 		stderrors.Is(err, database.ErrPortGroupReceiptConflict) ||
 		stderrors.Is(err, vcenter.ErrHostNotAllowed) ||
