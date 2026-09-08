@@ -97,9 +97,20 @@ VLAN pool are infrastructure concerns you will usually touch less often.
 4. Results are stored in the database. The student sees a pass/fail
    summary plus any student-facing messages.
 
-The engine **does not** rerun parts of a workflow if one step fails. A workflow
-is one bash process with `set -euo pipefail`; if grading steps need to be
-independent, split them into separate workflows in the same playlist.
+The engine **does not** rerun parts of a workflow if one step fails, and a
+workflow is one bash process — so its steps share a shell, a working directory,
+and a context file.
+
+They do not, however, gate each other: with the recommended `set -uo pipefail`
+header a failing `run_action` is recorded and the script carries on, so a
+student gets a result for every check rather than stopping at the first red
+one. Add `set -e` only if you genuinely want later steps skipped, and be aware
+that they will then be missing from the results entirely rather than marked
+skipped.
+
+Steps in the same workflow still share state, which is what context passing is
+for. Split into separate workflows in the same playlist when steps need
+genuinely independent environments.
 
 ---
 

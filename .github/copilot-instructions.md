@@ -12,7 +12,7 @@ This repository is **Crucible**, a self-service VM lab and automated-assessment 
 - The `run_action`, `ctx_set`, `CTX_*` runtime contract (§5).
 - The current `supported_platforms` tag vocabulary (§6).
 - The reusable action library snapshot (§7).
-- Bash conventions (`set -euo pipefail`, `source /opt/crucible/lib/actions.sh`, quoting, timeouts) and anti-patterns (§§8, 10).
+- Bash conventions (`set -uo pipefail`, `source /opt/crucible/lib/actions.sh`, quoting, timeouts) and anti-patterns (§§8, 10).
 - Validation checks to run before declaring "done" (§12).
 
 If a user request would require bypassing approval gates, reaching outside the pod's VLAN, mutating the student VM destructively, or running privileged ops in the unprivileged runner pod, push back — see §13 of `AGENTS.md`.
