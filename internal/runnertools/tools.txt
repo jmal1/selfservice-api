@@ -62,6 +62,13 @@ ping                    iputils-ping
 dig                     dnsutils
 nc                      netcat-openbsd
 ssh                     openssh-client
+# Target-side actions authenticate as CRUCIBLE_TARGET_USERNAME with
+# CRUCIBLE_TARGET_PASSWORD, which the engine already injects. Without sshpass
+# there is no way to spend that password: openssh refuses to read one from a
+# pipe, and no key is provisioned into student VMs. The alternative -- checking
+# services and files on the runner instead of the target -- is what the five
+# actions fixed in this pass were doing.
+sshpass                 sshpass
 
 # --- assessment tooling (the reason the base image is Kali) ---
 nmap                    nmap

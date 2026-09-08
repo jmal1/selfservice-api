@@ -64,6 +64,7 @@ var alwaysAvailable = map[string]struct{}{
 var crucibleHelpers = map[string]struct{}{
 	"run_action": {}, "ctx_set": {}, "ctx_get": {}, "ctx_all": {},
 	"crucible_log": {}, "student_msg": {}, "fail_with": {},
+	"crucible_ssh": {}, "crucible_ssh_sudo": {},
 }
 
 // unknownCommandFindings reports commands a workflow script invokes that are
@@ -231,23 +232,56 @@ func definedFunctions(script string) map[string]struct{} {
 	return out
 }
 
-// stripQuotedAndComments blanks out single-quoted spans and trailing comments
-// so words inside them are not mistaken for commands.
+// stripQuotedAndComments blanks out quoted spans and trailing comments so
+// words inside them are not mistaken for commands.
 //
-// Double-quoted spans are deliberately NOT stripped: `$(...)` inside them is a
-// real command substitution and we want to see it. Single quotes suppress all
-// expansion, so nothing inside them can ever be a command in this context.
+// Single quotes suppress all expansion, so nothing inside them can ever be a
+// command and they are always blanked.
+//
+// A double-quoted span is blanked only when it contains no `$(` and no
+// backtick, because those are real command substitutions and this check exists
+// to see them. Keeping the rest of the span visible was producing a specific
+// false positive that mattered: a student-facing message such as
+// "(Apache: ServerTokens Prod; nginx: server_tokens off)" contains a `;`, and
+// cmdRe treats the next word as a new command — so a correct action was
+// reported as depending on nginx being installed in the runner image.
 func stripQuotedAndComments(line string) string {
 	var b strings.Builder
-	inSingle := false
 	for i := 0; i < len(line); i++ {
 		c := line[i]
 		switch {
 		case c == '\'':
-			inSingle = !inSingle
-			b.WriteByte(' ')
-		case inSingle:
-			b.WriteByte(' ')
+			end := strings.IndexByte(line[i+1:], '\'')
+			if end < 0 {
+				// Unterminated: the rest of the line is quoted.
+				b.WriteString(strings.Repeat(" ", len(line)-i))
+				return b.String()
+			}
+			b.WriteString(strings.Repeat(" ", end+2))
+			i += end + 1
+		case c == '"':
+			end := findUnescaped(line[i+1:], '"')
+			if end < 0 {
+				// Unterminated. A multi-line double-quoted string is legal
+				// bash, so blanking the remainder is the conservative choice
+				// only if it holds no substitution.
+				rest := line[i+1:]
+				if containsSubstitution(rest) {
+					b.WriteString(rest)
+					return b.String()
+				}
+				b.WriteString(strings.Repeat(" ", len(line)-i))
+				return b.String()
+			}
+			span := line[i+1 : i+1+end]
+			if containsSubstitution(span) {
+				b.WriteByte(' ')
+				b.WriteString(span)
+				b.WriteByte(' ')
+			} else {
+				b.WriteString(strings.Repeat(" ", end+2))
+			}
+			i += end + 1
 		case c == '#' && (i == 0 || line[i-1] == ' ' || line[i-1] == '\t'):
 			// Rest of the line is a comment.
 			return b.String()
@@ -256,4 +290,22 @@ func stripQuotedAndComments(line string) string {
 		}
 	}
 	return b.String()
+}
+
+func containsSubstitution(s string) bool {
+	return strings.Contains(s, "$(") || strings.Contains(s, "`")
+}
+
+// findUnescaped returns the index of the first unescaped occurrence of want.
+func findUnescaped(s string, want byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' {
+			i++
+			continue
+		}
+		if s[i] == want {
+			return i
+		}
+	}
+	return -1
 }

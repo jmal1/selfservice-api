@@ -150,9 +150,14 @@ func (e *Executor) RunWorkflow(ctx context.Context, wf WorkflowDef) WorkflowRunR
 		// Report action incrementally to engine
 		e.callback.ReportAction(wf.Slug, actionOut)
 
-		// Inject updated CTX_* env vars for the next action
-		// (the bash process inherits the original env, but new
-		// CTX_* vars are available via the sidecar snapshot)
+		// No CTX_* injection happens here, and none can: the workflow is one
+		// bash process (started below with cmd.Env fixed) and a process's
+		// environment cannot be modified from outside after it starts. This
+		// spot used to carry a comment claiming otherwise with no code under
+		// it, which is why cross-action context passing was documented for
+		// months while being impossible. run_action refreshes CTX_* from the
+		// context file itself — see _ctx_export in deploy/runner/actions.sh.
+		// BuildContextEnv below is still the correct seed for the first action.
 
 		if propagate && actionOut.Status != "pass" {
 			result.Status = actionOut.Status

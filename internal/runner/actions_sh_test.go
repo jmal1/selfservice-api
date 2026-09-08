@@ -172,6 +172,75 @@ func TestActionsSh_PassingActionEmitsNoStudentMessage(t *testing.T) {
 	}
 }
 
+// TestActionsSh_ContextReachesTheNextAction is the regression test for
+// cross-action context passing, which was documented but could not work.
+//
+// The engine's sidecar does build CTX_<PREFIX>_<FIELD> variables, but the
+// executor applies them to cmd.Env once, before the workflow's single bash
+// process starts, when the context file is still `{}`. Nothing can add an
+// environment variable to a process after it starts, so a value written by
+// action 1 was unreachable from action 2 — and because every workflow is told
+// to run under `set -euo pipefail`, reading the unset variable aborted the
+// whole workflow rather than merely returning empty. run_action now refreshes
+// CTX_* from the context file it owns.
+//
+// The body deliberately runs under `set -u` so a missing variable fails loudly
+// here in the same way it would in a real workflow.
+func TestActionsSh_ContextReachesTheNextAction(t *testing.T) {
+	lib := `discovers_port() {
+    ctx_set "discovered_port" "8443"
+    return 0
+}`
+	out := runActionsShScript(t, lib,
+		"set -u\n"+
+			"run_action \"Find port\" discovers_port\n"+
+			// An explicit ctx_set key, readable by its own name.
+			"echo \"EXPLICIT=$CTX_DISCOVERED_PORT\"\n"+
+			// And run_action's own auto-written keys, whose prefix comes from
+			// the label: "Find port" -> find_port.
+			"echo \"STATUS=$CTX_FIND_PORT_STATUS\"\n"+
+			// Readable from inside a later action too, not just the body.
+			"run_action \"Use port\" bash -c 'echo \"NESTED=$CTX_DISCOVERED_PORT\"'\n")
+
+	if !strings.Contains(out, "EXPLICIT=8443") {
+		t.Errorf("a value written with ctx_set was not exported as CTX_DISCOVERED_PORT, so no action "+
+			"can read what an earlier one discovered. Output:\n%s", out)
+	}
+	if !strings.Contains(out, "STATUS=0") {
+		t.Errorf("run_action's own <prefix>.status was not exported; the documented "+
+			"CTX_<PREFIX>_<FIELD> contract is still dead. Output:\n%s", out)
+	}
+	if !strings.Contains(out, "NESTED=8443") {
+		t.Errorf("CTX_* did not reach a subsequent action's subshell. Output:\n%s", out)
+	}
+	if strings.Contains(out, "unbound variable") {
+		t.Errorf("reading context under `set -u` still aborts the workflow:\n%s", out)
+	}
+}
+
+// TestActionsSh_ContextExportFlattensMultilineValues keeps the bash refresh
+// and the Go sidecar producing the same value for the same key. run_action
+// writes <prefix>.body, which is the action's entire captured output and so is
+// routinely multi-line; an env var cannot hold a newline safely, and
+// sanitizeForEnv in internal/runner/sidecar.go flattens them to spaces. If the
+// two disagree, a workflow behaves differently depending on whether the value
+// arrived at process start or mid-run, which is the worst kind of flake.
+func TestActionsSh_ContextExportFlattensMultilineValues(t *testing.T) {
+	lib := `emits_multiline() {
+    printf 'first\nsecond\n'
+    return 0
+}`
+	out := runActionsShScript(t, lib,
+		"set -u\n"+
+			"run_action \"Multi\" emits_multiline\n"+
+			"echo \"BODY=[$CTX_MULTI_BODY]\"\n")
+
+	if !strings.Contains(out, "BODY=[first second]") {
+		t.Errorf("multi-line context value was not flattened to a single line the way "+
+			"sanitizeForEnv does, output:\n%s", out)
+	}
+}
+
 func TestActionsSh_RunActionStillDispatchesExternalCommands(t *testing.T) {
 	// The function branch must not regress plain binaries, which is how every
 	// existing non-library action is invoked.
@@ -206,6 +275,43 @@ func TestActionsSh_ActionBodyFailureDoesNotAbortViaSetE(t *testing.T) {
 	}
 	if !strings.Contains(out, "RC_NONZERO") {
 		t.Errorf("body's own `return 1` must still surface as a failure, got:\n%s", out)
+	}
+}
+
+// TestActionsSh_WorkflowSetEStopsAtTheFirstFailedCheck pins down the reason
+// the seeded workflows in deploy/sql/library-workflows.sql open with
+// `set -uo pipefail` rather than the `set -euo pipefail` the authoring docs
+// used to prescribe.
+//
+// run_action returns the action's exit code, so under `set -e` the first
+// failing check terminates the workflow's single bash process. Every later
+// action never runs and never reports, and a student hardening six settings
+// sees one red check plus silence instead of six results. Nothing about it
+// looks like a script-level abort — the run simply has fewer results than the
+// workflow has actions.
+//
+// Both halves are asserted. Without the `-e` half this test would pass on a
+// run_action that had stopped propagating failure at all, which is the far
+// worse bug (every check green).
+func TestActionsSh_WorkflowSetEStopsAtTheFirstFailedCheck(t *testing.T) {
+	lib := `failing_action() { LAST_STUDENT_MSG="nope"; return 1; }
+passing_action() { return 0; }`
+
+	body := "run_action \"One\" failing_action\n" +
+		"run_action \"Two\" passing_action\n" +
+		"echo REACHED_SECOND_CHECK\n"
+
+	withSetE := runActionsShScript(t, lib, "set -e\n"+body)
+	if strings.Contains(withSetE, "REACHED_SECOND_CHECK") {
+		t.Errorf("run_action no longer propagates failure to the workflow shell; " +
+			"if a failing check cannot fail the script, the docs' `set -e` is harmless " +
+			"but every other failure path is suspect")
+	}
+
+	withoutSetE := runActionsShScript(t, lib, "set +e\n"+body)
+	if !strings.Contains(withoutSetE, "REACHED_SECOND_CHECK") {
+		t.Errorf("without `set -e` every check must still run so a student sees a "+
+			"complete result set. Output:\n%s", withoutSetE)
 	}
 }
 
