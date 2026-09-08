@@ -41,9 +41,14 @@ import (
 )
 
 // ImageImportPayload is the jobs.payload (JSONB) shape for an image_import
-// job. Kind/ObjectKey/Filename are captured at enqueue time so the worker
-// does not have to re-derive them; ImageID is the authoritative key and the
-// row is always re-read (and its status re-validated) before any work runs.
+// job.
+//
+// ImageID is the ONLY required field. Kind/ObjectKey/Filename are optional
+// enqueue-time hints; each falls back to the image_uploads row, which is
+// re-read (and its status re-validated) before any work runs. Making the row
+// authoritative is deliberate: the enqueue sites used to send a key that did
+// not match these tags, which silently produced an unusable payload on every
+// single import. Only the primary key needs to survive the JSON boundary.
 type ImageImportPayload struct {
 	ImageID   uuid.UUID `json:"image_id"`
 	Kind      string    `json:"kind"`
@@ -162,11 +167,14 @@ func importImage(
 	}
 	log := logger.With("component", "image_import", "image_id", payload.ImageID)
 
+	// image_id is the one field that cannot be recovered from anywhere else:
+	// without it there is no row to load and no row to mark errored, so this
+	// check necessarily stays above the fail() closure below. Every other
+	// missing field IS recordable and is therefore validated after fail()
+	// exists, so the operator sees a cause instead of a row frozen at
+	// "uploaded" with no explanation.
 	if payload.ImageID == uuid.Nil {
 		return fmt.Errorf("image_import: image_id is required")
-	}
-	if payload.ObjectKey == "" {
-		return fmt.Errorf("image_import: object_key is required")
 	}
 
 	// ── Pre-flight validation (no side effects on object store / vCenter) ──
@@ -203,6 +211,10 @@ func importImage(
 	if filename == "" {
 		filename = img.Filename
 	}
+	objectKey := strings.TrimSpace(payload.ObjectKey)
+	if objectKey == "" {
+		objectKey = strings.TrimSpace(img.ObjectKey)
+	}
 
 	start := time.Now()
 
@@ -218,9 +230,16 @@ func importImage(
 		return cause
 	}
 
-	rc, size, err := objects.Open(ctx, payload.ObjectKey)
+	// An empty key here means neither the payload nor the row carries a
+	// staged object, so there is nothing to stream. Recordable, unlike the
+	// image_id case above.
+	if objectKey == "" {
+		return fail(fmt.Errorf("image_import: no staged object key on the payload or image %s", payload.ImageID))
+	}
+
+	rc, size, err := objects.Open(ctx, objectKey)
 	if err != nil {
-		return fail(fmt.Errorf("open staged object %q: %w", payload.ObjectKey, err))
+		return fail(fmt.Errorf("open staged object %q: %w", objectKey, err))
 	}
 	defer rc.Close()
 
@@ -269,6 +288,17 @@ func importImage(
 		if progress != nil {
 			progress("import", "Importing OVA appliance into vCenter")
 		}
+		// Resolve the portgroup here rather than trusting the wiring to set
+		// it: ImportOVA hard-fails any OVA that declares a network when this
+		// is empty, which is every real appliance, and the worker wiring did
+		// omit it. Defaulting at the point of use is the same idiom as
+		// defaultISOFolder above and as the template staging fallback in
+		// template_jobs.go, and it lands an unbuilt appliance on the isolated
+		// staging VLAN instead of anywhere it could reach the real lab.
+		ovaNetwork := strings.TrimSpace(cfg.OVANetwork)
+		if ovaNetwork == "" {
+			ovaNetwork = models.CanonicalStagingNetwork
+		}
 		moref, err := vc.ImportOVA(ctx, vcenter.OVAImportParams{
 			Reader:       tee,
 			Size:         size,
@@ -276,7 +306,7 @@ func importImage(
 			FolderPath:   cfg.OVAFolder,
 			Datastore:    cfg.OVADatastore,
 			ResourcePool: cfg.OVAResourcePool,
-			Network:      cfg.OVANetwork,
+			Network:      ovaNetwork,
 		})
 		if err != nil {
 			return fail(fmt.Errorf("import OVA: %w", err))
@@ -301,9 +331,9 @@ func importImage(
 	// Best-effort object release. The import already succeeded; a leaked
 	// object is a lesser problem than failing the job and re-doing a multi-GB
 	// transfer, so a delete error is logged, not returned.
-	if err := objects.Remove(ctx, payload.ObjectKey); err != nil {
+	if err := objects.Remove(ctx, objectKey); err != nil {
 		log.Warn("import succeeded but failed to release staged object; it will occupy space on the MinIO host until reaped",
-			"object_key", payload.ObjectKey, "error", err)
+			"object_key", objectKey, "error", err)
 	}
 
 	if metrics != nil {

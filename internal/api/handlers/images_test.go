@@ -20,6 +20,7 @@ import (
 
 	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/models"
+	"github.com/jmal1/selfservice-api/internal/provisioner"
 	"github.com/jmal1/selfservice-api/internal/vcenter"
 )
 
@@ -294,8 +295,10 @@ type fakeImageDB struct {
 	refCountErr error
 
 	// CreateJob
-	createdJob   *models.Job
-	createJobErr error
+	createdJob        *models.Job
+	createJobErr      error
+	createdJobType    string
+	createdJobPayload []byte
 }
 
 func (f *fakeImageDB) CreateImageUpload(_ context.Context, img *models.ImageUpload) error {
@@ -351,7 +354,9 @@ func (f *fakeImageDB) CountTemplatesReferencingImage(_ context.Context, _, _ str
 	return f.refCount, f.refCountErr
 }
 
-func (f *fakeImageDB) CreateJob(_ context.Context, jobType string, _ []byte) (*models.Job, error) {
+func (f *fakeImageDB) CreateJob(_ context.Context, jobType string, payload []byte) (*models.Job, error) {
+	f.createdJobType = jobType
+	f.createdJobPayload = payload
 	if f.createJobErr != nil {
 		return nil, f.createJobErr
 	}
@@ -827,6 +832,202 @@ func TestAdminCompleteImageUpload_AutoEnqueuesImport(t *testing.T) {
 	var resp map[string]any
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode response: %v", err)
+	}
+}
+
+// TestAdminListVCenterOVAs_SurfacesSourceRef covers the OVF discovery gap:
+// imported OVAs are excluded from the ISO picker by design, so before this
+// endpoint the image_uploads.vcenter_vm_id an instructor must paste into a
+// source_type=ovf draft was only readable from the database.
+//
+// It also asserts in-flight, failed, and moref-less rows come back disabled
+// with a reason rather than being dropped — an OVA that vanished from the
+// list is indistinguishable from an upload that was lost.
+func TestAdminListVCenterOVAs_SurfacesSourceRef(t *testing.T) {
+	ready := models.ImageUpload{
+		ID:          uuid.New(),
+		Filename:    "vyos.ova",
+		Kind:        models.ImageKindOVA,
+		Status:      models.ImageUploadImported,
+		VCenterVMID: "vm-4242",
+		SizeBytes:   1 << 30,
+	}
+	importing := models.ImageUpload{
+		ID:       uuid.New(),
+		Filename: "pfsense.ova",
+		Kind:     models.ImageKindOVA,
+		Status:   models.ImageUploadImporting,
+	}
+	failed := models.ImageUpload{
+		ID:           uuid.New(),
+		Filename:     "broken.ova",
+		Kind:         models.ImageKindOVA,
+		Status:       models.ImageUploadError,
+		ErrorMessage: "no space left on device",
+	}
+	morefless := models.ImageUpload{
+		ID:       uuid.New(),
+		Filename: "amnesiac.ova",
+		Kind:     models.ImageKindOVA,
+		Status:   models.ImageUploadImported, // imported but no moref recorded
+	}
+	// An ISO must never appear in the OVA catalog.
+	iso := models.ImageUpload{
+		ID:            uuid.New(),
+		Filename:      "kali.iso",
+		Kind:          models.ImageKindISO,
+		Status:        models.ImageUploadImported,
+		DatastorePath: "[NAS-BackupsAndISOS] ISOs/kali.iso",
+	}
+
+	db := &fakeImageDB{listByStatusImgs: []models.ImageUpload{ready, importing, failed, morefless, iso}}
+	h := newImageHandler(db, &fakeImageStore{})
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/vcenter/ovas", nil)
+	w := httptest.NewRecorder()
+	h.AdminListVCenterOVAs(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200; body = %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		OVAs       []OVAEntry `json:"ovas"`
+		SourceType string     `json:"source_type"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.SourceType != models.TemplateSourceOVF {
+		t.Errorf("source_type = %q; want %q", resp.SourceType, models.TemplateSourceOVF)
+	}
+	if len(resp.OVAs) != 4 {
+		t.Fatalf("returned %d entries; want 4 OVAs and no ISO: %+v", len(resp.OVAs), resp.OVAs)
+	}
+
+	byName := map[string]OVAEntry{}
+	for _, e := range resp.OVAs {
+		byName[e.Name] = e
+	}
+	if _, ok := byName["kali.iso"]; ok {
+		t.Error("an ISO leaked into the OVA catalog; it can never be an ovf source")
+	}
+
+	got := byName["vyos.ova"]
+	if got.SourceRef != "vm-4242" {
+		t.Errorf("imported OVA source_ref = %q; want the recorded moref vm-4242", got.SourceRef)
+	}
+	if got.Disabled {
+		t.Error("an imported OVA with a moref must be selectable")
+	}
+
+	for _, name := range []string{"pfsense.ova", "broken.ova", "amnesiac.ova"} {
+		e := byName[name]
+		if !e.Disabled {
+			t.Errorf("%s must be disabled (status=%q)", name, e.Status)
+		}
+		if e.Reason == "" {
+			t.Errorf("%s is disabled with no reason; the wizard cannot explain it", name)
+		}
+		if e.SourceRef != "" {
+			t.Errorf("%s must not offer a source_ref (%q)", name, e.SourceRef)
+		}
+	}
+	if byName["broken.ova"].ErrorMessage != "no space left on device" {
+		t.Errorf("failed OVA lost its error_message: %q", byName["broken.ova"].ErrorMessage)
+	}
+}
+
+// TestImageImportEnqueue_PayloadSatisfiesWorkerContract is the guard that was
+// missing when both enqueue sites shipped `image_upload_id` while the worker
+// unmarshalled `image_id`. Every image_import job — ISO and OVA alike — failed
+// its required-field check before touching MinIO or vCenter, and no test
+// noticed because the worker-side tests all build ImageImportPayload as a Go
+// struct instead of decoding what the API actually enqueues.
+//
+// So this asserts the JSON boundary itself: drive the real handlers, take the
+// exact bytes they hand to CreateJob, and decode them with the real worker
+// type. Renaming the key on either side fails here.
+func TestImageImportEnqueue_PayloadSatisfiesWorkerContract(t *testing.T) {
+	newImg := func(id uuid.UUID, status string) *models.ImageUpload {
+		return &models.ImageUpload{
+			ID:        id,
+			Filename:  "mint.iso",
+			Kind:      models.ImageKindISO,
+			Status:    status,
+			ObjectKey: "crucible/" + id.String() + "/mint.iso",
+			UploadID:  "upload-mint",
+			SizeBytes: 2 << 30,
+		}
+	}
+
+	cases := []struct {
+		name    string
+		enqueue func(t *testing.T, id uuid.UUID, db *fakeImageDB)
+		db      func(id uuid.UUID) *fakeImageDB
+	}{
+		{
+			name: "auto-enqueue on complete",
+			db: func(id uuid.UUID) *fakeImageDB {
+				return &fakeImageDB{getImg: newImg(id, models.ImageUploadPending)}
+			},
+			enqueue: func(t *testing.T, id uuid.UUID, db *fakeImageDB) {
+				h := newImageHandler(db, &fakeImageStore{statSize: 2 << 30})
+				req := httptest.NewRequest(http.MethodPost,
+					"/admin/images/"+id.String()+"/complete",
+					strings.NewReader(`{"parts":[{"part_number":1,"etag":"e"}]}`))
+				req.Header.Set("Content-Type", "application/json")
+				req = withImageIDParam(req, id)
+				w := httptest.NewRecorder()
+				h.AdminCompleteImageUpload(w, req)
+				if w.Code != http.StatusOK {
+					t.Fatalf("complete status = %d; want 200; body = %s", w.Code, w.Body.String())
+				}
+			},
+		},
+		{
+			name: "manual retry via POST /import",
+			db: func(id uuid.UUID) *fakeImageDB {
+				return &fakeImageDB{getImg: newImg(id, models.ImageUploadUploaded)}
+			},
+			enqueue: func(t *testing.T, id uuid.UUID, db *fakeImageDB) {
+				h := newImageHandler(db, &fakeImageStore{})
+				req := httptest.NewRequest(http.MethodPost,
+					"/admin/images/"+id.String()+"/import", nil)
+				req = withImageIDParam(req, id)
+				w := httptest.NewRecorder()
+				h.AdminImportImage(w, req)
+				if w.Code != http.StatusOK && w.Code != http.StatusAccepted {
+					t.Fatalf("import status = %d; want 200/202; body = %s", w.Code, w.Body.String())
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			id := uuid.New()
+			db := tc.db(id)
+			tc.enqueue(t, id, db)
+
+			if db.createdJobType != models.JobTypeImageImport {
+				t.Fatalf("enqueued job type = %q; want %q", db.createdJobType, models.JobTypeImageImport)
+			}
+			if len(db.createdJobPayload) == 0 {
+				t.Fatal("no payload was enqueued")
+			}
+
+			var payload provisioner.ImageImportPayload
+			if err := json.Unmarshal(db.createdJobPayload, &payload); err != nil {
+				t.Fatalf("worker cannot decode the enqueued payload %s: %v",
+					db.createdJobPayload, err)
+			}
+			if payload.ImageID != id {
+				t.Fatalf("decoded image_id = %v, want %v; enqueued payload was %s "+
+					"(the worker rejects a nil image_id before doing any work)",
+					payload.ImageID, id, db.createdJobPayload)
+			}
+		})
 	}
 }
 

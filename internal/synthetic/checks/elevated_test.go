@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jmal1/selfservice-api/internal/synthetic"
 )
@@ -57,6 +58,9 @@ func TestElevated_UsesConfiguredClientNotRunners(t *testing.T) {
 	good := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
 		"/api/v1/admin/images":       func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`[]`)) },
 		"/api/v1/admin/vcenter/isos": func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{"isos":[]}`)) },
+		"/api/v1/admin/vcenter/ovas": func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`{"ovas":[],"source_type":"ovf"}`))
+		},
 		"/api/v1/admin/templates/guest-os-catalog": func(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(`{"options":[{"guest_id":"ubuntu64Guest"}]}`))
 		},
@@ -69,8 +73,8 @@ func TestElevated_UsesConfiguredClientNotRunners(t *testing.T) {
 		},
 	})
 	all := Elevated(ElevatedConfig{Client: synthetic.NewClient(good.URL, "instructor-cookie")})
-	if len(all) != 6 {
-		t.Fatalf("Elevated() returned %d checks, want 6", len(all))
+	if len(all) != 8 {
+		t.Fatalf("Elevated() returned %d checks, want 8", len(all))
 	}
 	for _, c := range all {
 		if _, err := c.Run(context.Background(), poisonClient(t)); err != nil {
@@ -313,6 +317,139 @@ func TestTemplateWizardState404_FailsOn403(t *testing.T) {
 	}
 }
 
+// -- image_import_pipeline_healthy -----------------------------------------
+
+// imagesServing builds a fake API whose /admin/images returns body.
+func imagesServing(t *testing.T, body string) string {
+	t.Helper()
+	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
+		"/api/v1/admin/images": func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(body)) },
+	})
+	return srv.URL
+}
+
+// TestImageImportPipelineHealthy_CatchesTheSilentStall is the regression this
+// check exists for. When the enqueue payload did not match what the worker
+// unmarshalled, its required-field guard returned above the error-recording
+// closure — so the row stayed at 'uploaded' with an empty error_message and
+// every other signal read healthy.
+func TestImageImportPipelineHealthy_CatchesTheSilentStall(t *testing.T) {
+	stale := time.Now().Add(-6 * time.Hour).UTC().Format(time.RFC3339)
+	body := `[{"filename":"mint.iso","kind":"iso","status":"uploaded","error_message":"","updated_at":"` + stale + `"}]`
+
+	_, err := elevatedFor(t, imagesServing(t, body), "image_import_pipeline_healthy").
+		Run(context.Background(), nil)
+	if err == nil {
+		t.Fatal("a row parked at 'uploaded' for six hours must fail: this is the exact shape of the broken-payload defect")
+	}
+	if !strings.Contains(err.Error(), "terminal state") {
+		t.Errorf("error %q should say the import never reached a terminal state", err)
+	}
+	if !strings.Contains(err.Error(), "mint.iso") {
+		t.Errorf("error %q should name the affected image", err)
+	}
+}
+
+func TestImageImportPipelineHealthy_FailsOnErrorRow(t *testing.T) {
+	body := `[{"filename":"fedora.iso","kind":"iso","status":"error","error_message":"no space left on device","updated_at":"` +
+		time.Now().UTC().Format(time.RFC3339) + `"}]`
+
+	_, err := elevatedFor(t, imagesServing(t, body), "image_import_pipeline_healthy").
+		Run(context.Background(), nil)
+	if err == nil {
+		t.Fatal("an errored import must fail the check")
+	}
+	if !strings.Contains(err.Error(), "no space left on device") {
+		t.Errorf("error %q should surface the recorded cause", err)
+	}
+}
+
+// TestImageImportPipelineHealthy_ToleratesNormalOperation keeps the check from
+// being noisy: an empty library, a finished import and an import that is
+// genuinely still running must all pass.
+func TestImageImportPipelineHealthy_ToleratesNormalOperation(t *testing.T) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	for _, body := range []string{
+		`[]`,
+		`null`,
+		`[{"filename":"done.iso","kind":"iso","status":"imported","updated_at":"` + now + `"}]`,
+		`[{"filename":"busy.ova","kind":"ova","status":"importing","updated_at":"` + now + `"}]`,
+		// A long-finished import must not be judged on its age.
+		`[{"filename":"old.iso","kind":"iso","status":"imported","updated_at":"2024-01-01T00:00:00Z"}]`,
+	} {
+		if _, err := elevatedFor(t, imagesServing(t, body), "image_import_pipeline_healthy").
+			Run(context.Background(), nil); err != nil {
+			t.Errorf("body %s should pass: %v", body, err)
+		}
+	}
+}
+
+// -- ova_catalog_reachable -------------------------------------------------
+
+func ovasServing(t *testing.T, status int, body string) string {
+	t.Helper()
+	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
+		"/api/v1/admin/vcenter/ovas": func(w http.ResponseWriter, r *http.Request) {
+			if status != http.StatusOK {
+				w.WriteHeader(status)
+			}
+			w.Write([]byte(body))
+		},
+	})
+	return srv.URL
+}
+
+func TestOVACatalogReachable_Happy(t *testing.T) {
+	body := `{"ovas":[{"name":"vyos.ova","source_ref":"vm-42","disabled":false},` +
+		`{"name":"busy.ova","disabled":true,"reason":"still being uploaded or imported"}],"source_type":"ovf"}`
+	if _, err := elevatedFor(t, ovasServing(t, http.StatusOK, body), "ova_catalog_reachable").
+		Run(context.Background(), nil); err != nil {
+		t.Fatalf("unexpected failure: %v", err)
+	}
+}
+
+// TestOVACatalogReachable_FailsOn404 is the reason this check exists: the OVA
+// catalog is the only place the MoRef for a source_type=ovf draft is exposed
+// so losing the route blocks OVA template authoring outright.
+func TestOVACatalogReachable_FailsOn404(t *testing.T) {
+	_, err := elevatedFor(t, ovasServing(t, http.StatusNotFound, ``), "ova_catalog_reachable").
+		Run(context.Background(), nil)
+	if err == nil {
+		t.Fatal("expected failure on 404")
+	}
+	if !strings.Contains(err.Error(), "source_type=ovf") {
+		t.Errorf("error %q should explain what breaks when the route is gone", err)
+	}
+}
+
+// TestOVACatalogReachable_FailsOnSelectableEntryWithNoRef guards the one thing
+// a caller cannot recover from: an entry the wizard would offer as a source
+// but that carries no MoRef produces a draft with a dangling source_ref.
+func TestOVACatalogReachable_FailsOnSelectableEntryWithNoRef(t *testing.T) {
+	body := `{"ovas":[{"name":"amnesiac.ova","disabled":false}],"source_type":"ovf"}`
+	_, err := elevatedFor(t, ovasServing(t, http.StatusOK, body), "ova_catalog_reachable").
+		Run(context.Background(), nil)
+	if err == nil {
+		t.Fatal("a selectable entry with no source_ref must fail")
+	}
+	if !strings.Contains(err.Error(), "dangling") {
+		t.Errorf("error %q should name the dangling-source consequence", err)
+	}
+}
+
+func TestOVACatalogReachable_FailsOnShapeDrift(t *testing.T) {
+	for _, body := range []string{
+		`{"source_type":"ovf"}`,                  // no 'ovas' key at all
+		`{"ovas":[]}`,                            // no source_type
+		`{"ovas":[],"source_type":"clone_vcenter"}`, // wrong source_type
+	} {
+		if _, err := elevatedFor(t, ovasServing(t, http.StatusOK, body), "ova_catalog_reachable").
+			Run(context.Background(), nil); err == nil {
+			t.Errorf("body %s should fail the shape assertions", body)
+		}
+	}
+}
+
 // TestElevated_HasFriendlyMetadata mirrors TestAll_HasFriendlyMetadata, which
 // only walks All() and therefore never sees the config-constructed checks.
 func TestElevated_HasFriendlyMetadata(t *testing.T) {
@@ -338,7 +475,9 @@ func TestElevated_HasFriendlyMetadata(t *testing.T) {
 func TestElevated_StableNames(t *testing.T) {
 	want := map[string]bool{
 		"image_list_contract":             true,
+		"image_import_pipeline_healthy":   true,
 		"iso_catalog_reachable":           true,
+		"ova_catalog_reachable":           true,
 		"guest_os_catalog_reachable":      true,
 		"template_wizard_state_404":       true,
 		"admin_runs_filter_contract":      true,

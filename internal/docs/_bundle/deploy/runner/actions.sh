@@ -24,6 +24,114 @@ ctx_set() {
     jq --arg k "$key" --arg v "$value" '.[$k] = $v' "$CRUCIBLE_CONTEXT" > "$tmp" && mv "$tmp" "$CRUCIBLE_CONTEXT"
 }
 
+# Export CTX_<KEY> for every value in the context file.
+#
+# This is what makes cross-action context passing work at all. The documented
+# contract is that an action reads an earlier action's output via
+# CTX_<PREFIX>_<FIELD>, and the Go sidecar does build exactly those variables
+# (Sidecar.BuildContextEnv) — but the executor only applies them to cmd.Env
+# once, before the workflow's single bash process starts, when the context file
+# is still `{}`. A process's environment cannot be changed from outside after
+# it starts, so a value written by action 1 could never reach action 2. Under
+# the `set -euo pipefail` header every workflow is told to use, referencing the
+# unset variable aborted the whole workflow.
+#
+# Doing it here, in the process that owns the context, is the only place it can
+# work. Sanitization mirrors sanitizeForEnv in internal/runner/sidecar.go
+# (strip NUL, flatten newlines, cap at 4096 bytes) so a value looks the same
+# whether it came from the sidecar or from this refresh. Keys are upper-cased
+# with every non-alphanumeric turned into `_`, matching the sidecar's
+# ToUpper + "."->"_" for the dotted keys run_action actually writes.
+_ctx_export() {
+    [ -f "$CRUCIBLE_CONTEXT" ] || return 0
+    local line envkey
+    # One line per entry is guaranteed by the newline flattening below, so
+    # splitting on the first `=` is unambiguous even for a value containing one.
+    while IFS= read -r line; do
+        envkey="${line%%=*}"
+        [ -n "$envkey" ] || continue
+        export "CTX_$envkey=${line#*=}"
+    done < <(jq -r '
+        to_entries[]
+        | (.key | ascii_upcase | gsub("[^A-Z0-9]"; "_")) as $k
+        | ((.value | tostring)
+            | gsub("\u0000"; "")
+            | gsub("[\n\r]"; " ")
+            | .[0:4096]) as $v
+        | "\($k)=\($v)"
+    ' "$CRUCIBLE_CONTEXT" 2>/dev/null)
+}
+
+# --- Target access ---
+
+# crucible_ssh <argv...> — run a command on the assessment target.
+#
+# This exists because "check the student's VM" had no implementation. Actions
+# like service-running and package-installed ran `systemctl` and `dpkg`
+# directly, which inside a kali_runner workflow inspects the RUNNER POD, not
+# the student's machine — an assessment that is green or red for reasons the
+# student cannot influence either way. Every target-side action now goes
+# through here.
+#
+# Arguments are quoted with `printf %q` before being handed to ssh, because ssh
+# concatenates its command arguments with spaces and lets the REMOTE shell
+# re-parse the result. Passing a value containing a space or a metacharacter
+# unquoted would silently split it, or execute it. To deliberately run remote
+# shell syntax, pass it as an explicit `bash -c '<script>'`, which quotes
+# correctly through the same path.
+#
+# Auth order is key first, password second. A key is the better credential and
+# is used whenever CRUCIBLE_SSH_KEY points at a readable file; otherwise the
+# generated guest password the engine already injects is spent through sshpass.
+# The password goes via the SSHPASS environment variable rather than `-p`,
+# because a `-p` argument is visible in the target's process list to any user
+# on the box — including the student being assessed.
+#
+# StrictHostKeyChecking is off and known_hosts is /dev/null: every pod VM is a
+# fresh clone with a fresh host key, so there is nothing to pin and a persisted
+# entry would make the second run of an assessment fail with a host-key warning.
+crucible_ssh() {
+    local host="${CRUCIBLE_TARGET_IP:-}"
+    local user="${CRUCIBLE_TARGET_USERNAME:-}"
+    if [ -z "$host" ] || [ -z "$user" ]; then
+        LAST_ERROR="crucible_ssh: CRUCIBLE_TARGET_IP and CRUCIBLE_TARGET_USERNAME must both be set"
+        return 78
+    fi
+
+    local remote
+    printf -v remote '%q ' "$@"
+
+    local opts=(
+        -o StrictHostKeyChecking=no
+        -o UserKnownHostsFile=/dev/null
+        -o ConnectTimeout=5
+        -o LogLevel=ERROR
+    )
+
+    if [ -n "${CRUCIBLE_SSH_KEY:-}" ] && [ -r "${CRUCIBLE_SSH_KEY}" ]; then
+        ssh -i "$CRUCIBLE_SSH_KEY" -o BatchMode=yes "${opts[@]}" "${user}@${host}" "$remote"
+        return $?
+    fi
+    if [ -n "${CRUCIBLE_TARGET_PASSWORD:-}" ]; then
+        SSHPASS="$CRUCIBLE_TARGET_PASSWORD" sshpass -e ssh \
+            -o PreferredAuthentications=password \
+            -o PubkeyAuthentication=no \
+            "${opts[@]}" "${user}@${host}" "$remote"
+        return $?
+    fi
+    LAST_ERROR="crucible_ssh: no CRUCIBLE_SSH_KEY and no CRUCIBLE_TARGET_PASSWORD; the target has no usable credential"
+    return 78
+}
+
+# crucible_ssh_sudo <argv...> — same, but elevated and non-interactive.
+#
+# `sudo -n` never prompts. If the student removed their own sudo access the
+# command fails immediately instead of hanging until the action times out,
+# which turns a 30-second stall into an explainable error.
+crucible_ssh_sudo() {
+    crucible_ssh sudo -n "$@"
+}
+
 ctx_get() {
     # ctx_get is for reading within the same action only.
     # NEVER use in command interpolation $(ctx_get ...) — use CTX_* env vars instead.
@@ -165,6 +273,12 @@ run_action() {
             [ -n "$val" ] && ctx_set "${prefix}.${field}" "$val"
         done
     fi
+
+    # Publish everything this action wrote as CTX_* for whatever runs next.
+    # Done after the writes above rather than before the dispatch so the values
+    # are visible both to the next run_action and to plain shell code between
+    # actions in the workflow body.
+    _ctx_export
 
     # Extract the student-facing message the action produced.
     #

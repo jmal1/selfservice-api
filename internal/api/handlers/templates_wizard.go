@@ -61,6 +61,11 @@ type CreateTemplateDraftRequest struct {
 	// without GuestOps generalize scripts. Rejected for unsafe source
 	// types (iso, clone_template). JSON/DB name is skip_generalize.
 	SkipGeneralize bool `json:"skip_generalize"`
+	// Kind selects the templates.kind the draft is created with. Empty
+	// defaults to clone_with_customize. Set clone_no_customize for an
+	// already-prepared source that cannot run guest customization — an OVA
+	// appliance without cloud-init. See models.ResolveWizardTemplateKind.
+	Kind string `json:"kind,omitempty"`
 
 	VCPUs  int `json:"vcpus,omitempty"`
 	RAMMB  int `json:"ram_mb,omitempty"`
@@ -174,6 +179,26 @@ func (h *Handler) AdminCreateTemplateDraft(w http.ResponseWriter, r *http.Reques
 	}
 	if err := models.ValidateSkipGeneralize(req.SourceType, req.SkipGeneralize); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	templateKind, err := models.ResolveWizardTemplateKind(req.SourceType, req.Kind)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	// A clone_no_customize template never receives guestinfo credential
+	// injection, so its persisted static credentials are the only way into
+	// any pod cloned from it. Empty ones produce an unloggable pod that the
+	// generated-credential gate cannot catch, because that gate is exactly
+	// what this kind bypasses — so require them at draft time, mirroring the
+	// clone_template guard below.
+	if templateKind == models.TemplateKindCloneNoCustomize &&
+		(strings.TrimSpace(req.DefaultUsername) == "" || strings.TrimSpace(req.DefaultPassword) == "") {
+		http.Error(w,
+			"kind=clone_no_customize requires both default_username and default_password: "+
+				"guest customization is skipped, so these static credentials are the only "+
+				"way to log into a pod cloned from this template.",
+			http.StatusBadRequest)
 		return
 	}
 	if req.SourceRef == "" {
@@ -293,7 +318,7 @@ func (h *Handler) AdminCreateTemplateDraft(w http.ResponseWriter, r *http.Reques
 		IconURL:         req.IconURL,
 		DefaultUsername: req.DefaultUsername,
 		DefaultPassword: req.DefaultPassword,
-		Kind:            models.TemplateKindCloneWithCustomize,
+		Kind:            templateKind,
 	})
 	if err != nil {
 		h.logger.Error("create template draft failed", "error", err)

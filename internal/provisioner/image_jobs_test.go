@@ -88,6 +88,7 @@ type fakeImageVC struct {
 	importCalls int
 	lastDS      string
 	lastRemote  string
+	lastOVA     vcenter.OVAImportParams
 
 	// For GetDatastoreFreeBytes
 	freeBytes    int64
@@ -117,6 +118,7 @@ func (f *fakeImageVC) UploadToDatastore(_ context.Context, datastore, remotePath
 
 func (f *fakeImageVC) ImportOVA(_ context.Context, p vcenter.OVAImportParams) (string, error) {
 	f.importCalls++
+	f.lastOVA = p
 	if f.importErr != nil {
 		return "", f.importErr
 	}
@@ -306,6 +308,94 @@ func TestImportImage_OVAHappyPath(t *testing.T) {
 	}
 	if vc.uploadCalls != 0 {
 		t.Errorf("UploadToDatastore calls = %d, want 0 for an OVA", vc.uploadCalls)
+	}
+}
+
+// TestImportImage_OVADefaultsToStagingNetwork pins the second reason OVA
+// import could never work in production: the worker wiring never set
+// OVANetwork, and ImportOVA hard-fails any OVA that declares a network when
+// the target portgroup is empty — which is essentially every real appliance.
+//
+// testImportConfig() deliberately still omits OVANetwork, mirroring the
+// production wiring exactly, so this test fails if the default is removed.
+func TestImportImage_OVADefaultsToStagingNetwork(t *testing.T) {
+	row := newImageRow(models.ImageKindOVA, "appliance.ova", models.ImageUploadUploaded)
+	row.ObjectKey = "crucible/" + row.ID.String() + "/appliance.ova"
+	db := &fakeImageDB{img: row}
+	vc := &fakeImageVC{moref: "vm-777"}
+	objects := &fakeImageObjects{payload: []byte("ova-bytes"), chunk: 4}
+
+	cfg := testImportConfig()
+	if cfg.OVANetwork != "" {
+		t.Fatalf("fixture regression: testImportConfig sets OVANetwork=%q, but this "+
+			"test must reproduce the empty production wiring", cfg.OVANetwork)
+	}
+
+	payload := ImageImportPayload{ImageID: row.ID}
+	if err := importImage(context.Background(), objects, vc, db, nil, nil, cfg, nil, payload); err != nil {
+		t.Fatalf("importImage: unexpected error: %v", err)
+	}
+
+	if vc.lastOVA.Network != models.CanonicalStagingNetwork {
+		t.Errorf("ImportOVA network = %q, want the isolated staging portgroup %q; "+
+			"an unbuilt appliance must never land on a network that reaches the real lab",
+			vc.lastOVA.Network, models.CanonicalStagingNetwork)
+	}
+}
+
+// TestImportImage_ObjectKeyFallsBackToRow proves the payload only has to carry
+// image_id. Every other field is an optional hint that resolves from the
+// authoritative image_uploads row, which is what stops a payload-shape drift
+// from silently disabling all imports again.
+func TestImportImage_ObjectKeyFallsBackToRow(t *testing.T) {
+	row := newImageRow(models.ImageKindISO, "mint.iso", models.ImageUploadUploaded)
+	row.ObjectKey = "crucible/" + row.ID.String() + "/mint.iso"
+	db := &fakeImageDB{img: row}
+	vc := &fakeImageVC{}
+	objects := &fakeImageObjects{payload: []byte("iso-bytes"), chunk: 4}
+
+	// Only image_id, exactly what the API enqueues.
+	payload := ImageImportPayload{ImageID: row.ID}
+	if err := importImage(context.Background(), objects, vc, db, nil, nil, testImportConfig(), nil, payload); err != nil {
+		t.Fatalf("importImage: unexpected error: %v", err)
+	}
+
+	if objects.openKey != row.ObjectKey {
+		t.Errorf("opened object key = %q, want the row's key %q", objects.openKey, row.ObjectKey)
+	}
+	if !db.importedCalled {
+		t.Error("SetImageUploadImported was not called; kind/filename should have resolved from the row too")
+	}
+	if want := "[NAS-BackupsAndISOS] ISOs/mint.iso"; db.importedDSPath != want {
+		t.Errorf("datastore_path = %q, want %q (filename resolved from the row)", db.importedDSPath, want)
+	}
+}
+
+// TestImportImage_MissingObjectKeyIsRecorded covers the silent-failure half of
+// the defect. The old code returned "object_key is required" ABOVE the fail()
+// closure, so a bad payload left the row frozen at "uploaded" with no error
+// message and invisible to the stuck-upload gauge. A recordable problem must
+// reach the operator.
+func TestImportImage_MissingObjectKeyIsRecorded(t *testing.T) {
+	row := newImageRow(models.ImageKindISO, "mint.iso", models.ImageUploadUploaded)
+	row.ObjectKey = "" // neither payload nor row carries a staged object
+	db := &fakeImageDB{img: row}
+	vc := &fakeImageVC{}
+	objects := &fakeImageObjects{payload: []byte("unused")}
+
+	err := importImage(context.Background(), objects, vc, db, nil, nil, testImportConfig(), nil,
+		ImageImportPayload{ImageID: row.ID})
+	if err == nil {
+		t.Fatal("importImage: want an error when no staged object key is available")
+	}
+	if !db.errorCalled {
+		t.Fatal("SetImageUploadError was not called; the row would sit at 'uploaded' with no cause")
+	}
+	if db.img.Status != models.ImageUploadError {
+		t.Errorf("row status = %q, want %q", db.img.Status, models.ImageUploadError)
+	}
+	if objects.opened {
+		t.Error("object store was opened despite having no key")
 	}
 }
 

@@ -106,9 +106,16 @@ func Log(ctx context.Context, db *database.Queries, action string, opts ...Optio
 		}
 	}
 
+	// audit_log.ip_address is INET, which rejects "host:port". Normalize here
+	// rather than at the call sites: every one of the ~30 callers passes
+	// r.RemoteAddr straight to IP(), and net/http always includes the port, so
+	// each of those inserts failed with SQLSTATE 22P02 and was swallowed by
+	// the error log below. The context path (WithClientIP) can carry a port
+	// too, and Log is the one point all three paths converge on.
+	// normalizeRemoteAddr is idempotent, so an already-bare IP is unchanged.
 	var ipPtr *string
-	if e.ipAddress != "" {
-		ipPtr = &e.ipAddress
+	if ip := normalizeRemoteAddr(e.ipAddress); ip != "" {
+		ipPtr = &ip
 	}
 
 	err := db.InsertAuditLog(ctx, models.AuditLog{

@@ -189,15 +189,27 @@ func (q *Queries) CountImageUploadsByStatus(ctx context.Context) (map[string]int
 }
 
 // CountStuckImageUploads returns how many rows have sat in a non-terminal
-// status (uploading/importing) longer than olderThan. A non-zero value
-// means either a browser walked away mid-upload or an import wedged;
+// status (pending/uploading/importing) longer than olderThan. A non-zero
+// value means either a browser walked away mid-upload or an import wedged;
 // both leak MinIO storage on a host with only ~85 GB free.
+//
+// "pending" is included because nothing ever writes "uploading": every
+// presigned part URL is issued in the single POST /admin/images call, so an
+// abandoned upload stays "pending" forever and used to escape this count
+// entirely — the exact leak the gauge exists to catch. Counting it cannot
+// produce a false positive: those URLs expire after PresignTTLSeconds
+// (15 minutes), which is well inside the default 30-minute threshold, so an
+// aged "pending" row can no longer be an upload in progress.
 func (q *Queries) CountStuckImageUploads(ctx context.Context, olderThan time.Duration) (int, error) {
 	var n int
 	err := q.pool.QueryRow(ctx, `
 		SELECT COUNT(*) FROM image_uploads
 		WHERE status = ANY($1) AND updated_at < now() - $2::interval
-	`, []string{models.ImageUploadUploading, models.ImageUploadImporting},
+	`, []string{
+		models.ImageUploadPending,
+		models.ImageUploadUploading,
+		models.ImageUploadImporting,
+	},
 		fmt.Sprintf("%d seconds", int(olderThan.Seconds()))).Scan(&n)
 	return n, err
 }

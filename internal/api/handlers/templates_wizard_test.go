@@ -1147,6 +1147,106 @@ func TestAdminCreateTemplateDraft_AllowsSkipGeneralizeOnOVF(t *testing.T) {
 	}
 }
 
+// TestAdminCreateTemplateDraft_OVFAcceptsCloneNoCustomize proves the wizard
+// can now author the only kind that works for an appliance OVA. Before this,
+// every draft was hard-coded clone_with_customize, so a published OVA
+// template produced pods that waited for VMware Tools to accept a generated
+// `student` credential no appliance ever creates, then failed into
+// compensation.
+func TestAdminCreateTemplateDraft_OVFAcceptsCloneNoCustomize(t *testing.T) {
+	rec := postDraft(t, CreateTemplateDraftRequest{
+		Name:            "VyOS Appliance",
+		OSType:          models.OSTypeLinux,
+		SourceType:      models.TemplateSourceOVF,
+		SourceRef:       "vm-123",
+		SkipGeneralize:  true,
+		Kind:            models.TemplateKindCloneNoCustomize,
+		DefaultUsername: "vyos",
+		DefaultPassword: "vyos",
+	})
+	if rec.Code == http.StatusBadRequest {
+		t.Fatalf("ovf + clone_no_customize was rejected: %s", rec.Body.String())
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d; want 401 after passing validation (no auth on Handler{})", rec.Code)
+	}
+}
+
+// TestAdminCreateTemplateDraft_CloneNoCustomizeRequiresCredentials covers the
+// hole this kind opens: it bypasses the generated-credential acceptance gate,
+// so static credentials are the only way into a pod cloned from it and the
+// gate that would normally catch empty ones is the very thing being skipped.
+func TestAdminCreateTemplateDraft_CloneNoCustomizeRequiresCredentials(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		username string
+		password string
+	}{
+		{"both empty", "", ""},
+		{"password missing", "vyos", ""},
+		{"username missing", "", "vyos"},
+		{"whitespace only", "  ", "  "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := postDraft(t, CreateTemplateDraftRequest{
+				Name:            "VyOS Appliance",
+				OSType:          models.OSTypeLinux,
+				SourceType:      models.TemplateSourceOVF,
+				SourceRef:       "vm-123",
+				Kind:            models.TemplateKindCloneNoCustomize,
+				DefaultUsername: tc.username,
+				DefaultPassword: tc.password,
+			})
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d; want 400 (clone_no_customize with no usable credentials)", rec.Code)
+			}
+			body := rec.Body.String()
+			if !strings.Contains(body, "default_username") || !strings.Contains(body, "default_password") {
+				t.Errorf("body = %q; want it to name both credential fields", body)
+			}
+		})
+	}
+}
+
+// TestAdminCreateTemplateDraft_RejectsCloneNoCustomizeOnBuiltSources keeps the
+// new kind scoped to already-prepared sources. A fresh ISO install or a
+// re-customized clone has no prepared credentials to fall back on.
+func TestAdminCreateTemplateDraft_RejectsCloneNoCustomizeOnBuiltSources(t *testing.T) {
+	for _, sourceType := range []string{models.TemplateSourceISO, models.TemplateSourceCloneTemplate} {
+		t.Run(sourceType, func(t *testing.T) {
+			rec := postDraft(t, CreateTemplateDraftRequest{
+				Name:            "Nope",
+				OSType:          models.OSTypeLinux,
+				SourceType:      sourceType,
+				SourceRef:       "[NAS] ISOs/ubuntu.iso",
+				GuestID:         "ubuntu64Guest",
+				Kind:            models.TemplateKindCloneNoCustomize,
+				DefaultUsername: "student",
+				DefaultPassword: "pw",
+			})
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d; want 400 for clone_no_customize on %s", rec.Code, sourceType)
+			}
+			if !strings.Contains(rec.Body.String(), models.TemplateKindCloneNoCustomize) {
+				t.Errorf("body = %q; want it to name the rejected kind", rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestAdminCreateTemplateDraft_OmittedKindStaysCustomize pins the default so
+// adding the kind field cannot change behavior for any existing caller — the
+// UI does not send one.
+func TestAdminCreateTemplateDraft_OmittedKindStaysCustomize(t *testing.T) {
+	resolved, err := models.ResolveWizardTemplateKind(models.TemplateSourceOVF, "")
+	if err != nil {
+		t.Fatalf("omitted kind must be accepted: %v", err)
+	}
+	if resolved != models.TemplateKindCloneWithCustomize {
+		t.Fatalf("default kind = %q; want %q", resolved, models.TemplateKindCloneWithCustomize)
+	}
+}
+
 func TestAdminCreateTemplateDraft_RejectsUnknownSourceType(t *testing.T) {
 	rec := postDraft(t, CreateTemplateDraftRequest{
 		Name:       "X",

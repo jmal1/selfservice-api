@@ -49,8 +49,8 @@ Don't guess paths or IPs — use the env vars.
 | `CRUCIBLE_SOCKET` | Socket `run_action` reports to | |
 | `CRUCIBLE_CONTEXT` | Per-workflow JSON context file | |
 
-That is the complete list, plus `CTX_*` values from earlier actions and `PARAM_*`
-for library actions. `PATH`, `HOME`, `TERM` and `LANG` are inherited.
+That is the complete list, plus the `CTX_*` values earlier actions published.
+`PATH`, `HOME`, `TERM` and `LANG` are inherited.
 
 > **Not provided:** `CRUCIBLE_TARGET_HOSTNAME`, `CRUCIBLE_POD_ID`,
 > `CRUCIBLE_RUN_ID`, `CRUCIBLE_WORKFLOW_SLUG`, `CRUCIBLE_PLAYLIST_SLUG`,
@@ -59,6 +59,11 @@ for library actions. `PATH`, `HOME`, `TERM` and `LANG` are inherited.
 > the runner. A script referencing one gets an **empty string**, and the script
 > validator declares these names so it will not warn you — so the mistake shows up
 > only as a confusing runtime failure (`ssh student@` with no host).
+
+> **Also not provided: `PARAM_*`.** An action's `params` field is stored and
+> never read; nothing turns it into an environment variable. Library actions
+> take `--flag value` arguments instead. See
+> [Building library actions](actions.md).
 
 Address the target with `CRUCIBLE_TARGET_IP`.
 

@@ -140,6 +140,73 @@ func TestValidateSkipGeneralize(t *testing.T) {
 	if err := ValidateSkipGeneralize(TemplateSourceOVF, true); err != nil {
 		t.Fatalf("skip_generalize=true on ovf should be allowed: %v", err)
 	}
+}
+
+// TestResolveWizardTemplateKind covers the kind the wizard assigns to a
+// draft. clone_no_customize is the only kind that works for an appliance OVA
+// with no cloud-init, and it must stay scoped to already-prepared sources —
+// the same set ValidateSkipGeneralize allows.
+func TestResolveWizardTemplateKind(t *testing.T) {
+	cases := []struct {
+		sourceType string
+		kind       string
+		want       string
+		wantErr    bool
+	}{
+		// Omitted kind keeps the historical behavior for every source type.
+		{TemplateSourceOVF, "", TemplateKindCloneWithCustomize, false},
+		{TemplateSourceISO, "", TemplateKindCloneWithCustomize, false},
+		{TemplateSourceCloneTemplate, "", TemplateKindCloneWithCustomize, false},
+		{TemplateSourceCloneVCenter, "", TemplateKindCloneWithCustomize, false},
+
+		// Explicit clone_with_customize is always fine.
+		{TemplateSourceISO, TemplateKindCloneWithCustomize, TemplateKindCloneWithCustomize, false},
+
+		// clone_no_customize: allowed only for already-prepared sources.
+		{TemplateSourceOVF, TemplateKindCloneNoCustomize, TemplateKindCloneNoCustomize, false},
+		{TemplateSourceCloneVCenter, TemplateKindCloneNoCustomize, TemplateKindCloneNoCustomize, false},
+		{TemplateSourceISO, TemplateKindCloneNoCustomize, "", true},
+		{TemplateSourceCloneTemplate, TemplateKindCloneNoCustomize, "", true},
+
+		// Not a wizard flow, and not a kind at all.
+		{TemplateSourceOVF, TemplateKindRegisteredExistingVM, "", true},
+		{TemplateSourceOVF, "clone", "", true},
+		{TemplateSourceOVF, "CLONE_NO_CUSTOMIZE", "", true},
+	}
+	for _, c := range cases {
+		got, err := ResolveWizardTemplateKind(c.sourceType, c.kind)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("ResolveWizardTemplateKind(%q, %q) = %q, nil; want an error",
+					c.sourceType, c.kind, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("ResolveWizardTemplateKind(%q, %q) unexpected error: %v",
+				c.sourceType, c.kind, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("ResolveWizardTemplateKind(%q, %q) = %q; want %q",
+				c.sourceType, c.kind, got, c.want)
+		}
+	}
+
+	// The allowed set must track ValidateSkipGeneralize rather than drifting
+	// from it: both answer "is this source already prepared?".
+	for _, st := range []string{
+		TemplateSourceOVF, TemplateSourceCloneVCenter,
+		TemplateSourceISO, TemplateSourceCloneTemplate,
+	} {
+		_, kindErr := ResolveWizardTemplateKind(st, TemplateKindCloneNoCustomize)
+		skipErr := ValidateSkipGeneralize(st, true)
+		if (kindErr == nil) != (skipErr == nil) {
+			t.Errorf("source_type %q: clone_no_customize allowed=%v but skip_generalize allowed=%v; "+
+				"these must describe the same already-prepared source set",
+				st, kindErr == nil, skipErr == nil)
+		}
+	}
 	if err := ValidateSkipGeneralize(TemplateSourceCloneVCenter, true); err != nil {
 		t.Fatalf("skip_generalize=true on clone_vcenter should be allowed: %v", err)
 	}

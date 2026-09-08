@@ -10,6 +10,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/jmal1/selfservice-api/internal/actionlibrary"
 	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/middleware"
 	"github.com/jmal1/selfservice-api/internal/models"
@@ -51,6 +52,7 @@ func (h *Handler) AdminCreatePlaylist(w http.ResponseWriter, r *http.Request) {
 		Name        string      `json:"name"`
 		Slug        string      `json:"slug"`
 		Description string      `json:"description"`
+		ScoringMode string      `json:"scoring_mode"`
 		WorkflowIDs []uuid.UUID `json:"workflow_ids"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -59,6 +61,20 @@ func (h *Handler) AdminCreatePlaylist(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Name == "" || req.Slug == "" {
 		respondError(w, r, http.StatusBadRequest, "name and slug are required")
+		return
+	}
+	if err := actionlibrary.ValidateSlug(req.Slug); err != nil {
+		respondError(w, r, http.StatusBadRequest, err.Error())
+		return
+	}
+	// scoring_mode is a column and a documented enum, but nothing computes a
+	// score: no code path reads actions.points or actions.penalty. Accepting
+	// "points" here would return 201 and then silently grade pass/fail, which
+	// is worse than refusing. Rejecting it keeps the API honest until the
+	// engine can actually total a score.
+	if req.ScoringMode != "" && req.ScoringMode != models.ScoringModePassFail {
+		respondError(w, r, http.StatusBadRequest,
+			"scoring_mode \"points\" is not implemented: the engine does not total action points or penalties. Omit scoring_mode or send \"pass_fail\".")
 		return
 	}
 

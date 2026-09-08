@@ -34,7 +34,7 @@ You produce a JSON payload for `POST /api/v1/admin/workflows`:
   "creation_mode": "script",
   "timeout_seconds": 60,
   "target_os": "linux",
-  "script": "source /opt/crucible/lib/actions.sh\nset -euo pipefail\nrun_action \"port-23-closed\" bash -c 'if nc -zw3 \"$CRUCIBLE_TARGET_IP\" 23; then echo \"STUDENT_MSG: Telnet is still reachable on port 23. Block it with: sudo ufw deny 23/tcp\"; exit 1; fi'\n",
+  "script": "source /opt/crucible/lib/actions.sh\nset -uo pipefail\nrun_action \"port-23-closed\" bash -c 'if nc -zw3 \"$CRUCIBLE_TARGET_IP\" 23; then echo \"STUDENT_MSG: Telnet is still reachable on port 23. Block it with: sudo ufw deny 23/tcp\"; exit 1; fi'\n",
   "visible_to_students": true,
   "status": "draft"
 }
@@ -57,23 +57,35 @@ You produce a JSON payload for `POST /api/v1/admin/actions`:
 {
   "name": "Systemd Service Running",
   "slug": "service-running",
-  "description": "Asserts the named systemd unit is active (running) on the target VM.",
-  "action_type": "command",
-  "action_category": "system",
+  "description": "Asserts the named systemd unit is active (running).",
+  "action_type": "service_check",
+  "action_category": "service",
   "supported_platforms": ["linux:ubuntu", "linux:debian"],
-  "params": {
-    "service": {"type": "string", "required": true, "description": "systemd unit name (without .service)"}
-  },
-  "input_context": [],
-  "output_context": ["service_running.status", "service_running.body"],
-  "timeout_seconds": 15,
-  "script": "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \"$CRUCIBLE_TARGET_USERNAME@$CRUCIBLE_TARGET_IP\" \"systemctl is-active --quiet ${PARAM_SERVICE}.service\"",
-  "student_fail_hint": "Service {{ params.service }} is not running on your target. Start it with: sudo systemctl start {{ params.service }}"
+  "input_context": [
+    {"key": "name", "type": "string", "description": "systemd service name"}
+  ],
+  "output_context": [
+    {"key": "service_NAME_status", "type": "string", "description": "Service status (active)"}
+  ],
+  "script": "local name=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --name) name=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif systemctl is-active --quiet \"$name\" 2>/dev/null; then\n    ctx_set \"service_${name}_status\" \"active\"\n    return 0\nelse\n    LAST_ERROR=\"Service $name is not running\"\n    LAST_STUDENT_MSG=\"Service $name is not running. Start it with: sudo systemctl start $name\"\n    return 1\nfi"
 }
 ```
 
+That is the real shipped body, and it shows the three conventions every library
+action follows:
+
+1. **Arguments are `--flag value` pairs** parsed by a `while` loop. There is no
+   `params` injection — see §3.2.
+2. **`ctx_set`** publishes anything a later step may need.
+3. **`LAST_ERROR` / `LAST_STUDENT_MSG` plus a non-zero `return`** report
+   failure. `run_action` re-emits both on the action's behalf.
+
+Declare each accepted flag in `input_context` so the editor and the script
+validator know about it. The declaration does not create the variable; the
+parse loop does.
+
 A workflow references this action with a display label followed by the generated
-snake-case callable: `run_action "Service is running" service_running ...`.
+snake-case callable: `run_action "Service is running" service_running --name ssh`.
 The library slug remains `service-running`; do not pass that kebab-case slug as
 the command.
 
@@ -111,18 +123,18 @@ All field types/values are enforced by Postgres CHECK constraints in [`internal/
 | `name` | string | required | Library: human title; in-workflow: action label |
 | `slug` | string \| null | required for library actions | `[a-z0-9-]+`, globally unique |
 | `description` | string | default `""` | What the action asserts |
-| `action_type` | string | default `"command"` | Currently only `"command"` is supported by the runner. Reserved future: `"http"`, `"file_check"`, etc. |
-| `action_category` | string | default `"general"` | Common: `network`, `system`, `auth`, `forensics`, `crypto`, `web` |
-| `params` | jsonb | default `{}` | JSON-Schema-ish: `{ "fieldName": {"type": "string", "required": true, "description": "..."} }` |
-| `script` | string | default `""` | The bash that gets run when the workflow invokes this action |
-| `input_context` | jsonb (array) | default `[]` | List of `CTX_*` keys this action reads (for the editor's lint) |
-| `output_context` | jsonb (array) | default `[]` | List of `CTX_*` keys this action will write |
-| `timeout_seconds` | int | default 60 | Per-action ceiling |
-| `student_fail_hint` | string \| null | optional | Shown to students on fail. Supports `{{ params.X }}` templating |
-| `points` | int \| null | optional | Used when parent playlist is `scoring_mode=points` |
-| `penalty` | int \| null | optional | Negative points awarded for failure |
+| `action_type` | string | default `"command"` | **Labelling only — the runner ignores it.** No CHECK constraint. Production uses `command`, `dns`, `http`, `port_check`, `service_check`, `file_check`, `ssh`. |
+| `action_category` | string | default `"general"` | **Labelling only.** No CHECK constraint. Production uses `general`, `network`, `file`, `service`, `ssh`, `firewall`. |
+| `params` | jsonb | default `{}` | **Accepted and stored, but inert.** Nothing injects `PARAM_*` env vars. Real actions take `--flag value` arguments; leave this `{}`. |
+| `script` | string | default `""` | The bash body. Rendered as a shell function, so it uses `local` and `return`, not `exit`. |
+| `input_context` | jsonb (array) | default `[]` | Array of `{"key","type","description"}` objects. Declares the `--flag` names the body parses and any `CTX_*` it reads. |
+| `output_context` | jsonb (array) | default `[]` | Array of `{"key","type","description"}` objects naming the `ctx_set` keys the body writes. |
+| `timeout_seconds` | int | default 60 | **Inert for library actions.** `run_action` applies the workflow-level `ACTION_TIMEOUT` (default 30s) to every action. |
+| `student_fail_hint` | string \| null | optional | **Accepted and stored, but inert.** Nothing renders it and `{{ params.X }}` is never templated. Assign `LAST_STUDENT_MSG` in the body instead. |
+| `points` | int \| null | optional | Reserved: `scoring_mode=points` is not currently reachable (playlists are created `pass_fail`). |
+| `penalty` | int \| null | optional | Reserved, same as `points`. |
 | `is_library` | bool | server-set to `true` for `POST /admin/actions` | Standalone library entries have no `workflow_id` |
-| `supported_platforms` | jsonb (array) | default `["any"]` | See §5 |
+| `supported_platforms` | jsonb (array) | default `["any"]` | See §6. Only `windows` changes behaviour: it excludes the action from the bash library. |
 
 ### 3.3 `Playlist`
 
@@ -167,10 +179,14 @@ Every `kali_runner` workflow `script` should start with:
 
 ```bash
 source /opt/crucible/lib/actions.sh
-set -euo pipefail
+set -uo pipefail
 ```
 
-This loads `run_action`, `ctx_set`, `ctx_get`, the generated **action library** (see §5.2b), and gives you safe failure semantics.
+This loads `run_action`, `ctx_set`, `ctx_get`, and the generated **action library** (see §5.2b).
+
+**Note `-uo`, not `-euo`.** `run_action` returns the action's exit code, so under `set -e` the first failing check terminates the workflow's single bash process. Every action after it never runs and never reports, and a student hardening six settings sees one red check followed by silence rather than six results — with nothing in the output that looks like an abort. The run just has fewer results than the workflow has actions. `set -u` and `set -o pipefail` are still wanted; only `-e` is harmful here. Pinned by `TestActionsSh_WorkflowSetEStopsAtTheFirstFailedCheck` in [`internal/runner/actions_sh_test.go`](internal/runner/actions_sh_test.go).
+
+Inside an *action* body the situation is different and already handled: `run_action` runs the body under `set +e` so it can detect its own failure and set `LAST_STUDENT_MSG` before returning.
 
 `vmware_tools` scripts cannot source `/opt/crucible/lib/actions.sh` (the file doesn't exist inside the guest). Use plain bash/PowerShell and print `STUDENT_MSG:` lines for student-facing feedback. Exit non-zero on fail.
 
@@ -193,8 +209,7 @@ When the runner pod executes a workflow's `script`, it provides these helpers an
 | `CRUCIBLE_WORKDIR` | A per-workflow scratch directory; deleted after run |
 | `CRUCIBLE_SOCKET` | Unix socket the sidecar listens on (used by `run_action`) |
 | `CRUCIBLE_CONTEXT` | Path to the per-workflow JSON context file (used by `ctx_set`/`ctx_get`) |
-| `CTX_<PREFIX>_<FIELD>` | Sanitized values produced by previous actions (see §5.4) |
-| `PARAM_<UPPER_FIELD>` | Action parameters injected from `params` (library actions only) |
+| `CTX_<KEY>` | Sanitized values produced by previous actions (see §5.4) |
 
 **Which VM is the target?**
 
@@ -251,7 +266,7 @@ underscores**:
 
 ```bash
 source /opt/crucible/lib/actions.sh
-set -euo pipefail
+set -uo pipefail
 
 run_action "HTTPS responds" http_get --url "https://$CRUCIBLE_TARGET_IP/" --expect-status 200
 run_action "SSH is open"    port_open --host "$CRUCIBLE_TARGET_IP" --port 22
@@ -293,7 +308,7 @@ those as `STUDENT_MSG:` / `ERROR:` lines on the action's behalf, so §5.3 applie
 - Print `STUDENT_MSG: <one-line message>` from stdout. The **last** such line in the action's output becomes the user-facing failure message. Use it for actionable remediation hints ("Service X is not running. Start with `sudo systemctl start X`").
 - The message is taken **verbatim** after trimming surrounding whitespace. Quotes, backslashes and Windows paths survive intact, so `STUDENT_MSG: Expected "200" but got C:\inetpub` reaches the student exactly as written. Only leading/trailing whitespace is removed; nothing else is re-quoted or word-split.
 - Everything else printed to stdout/stderr is captured as **instructor-only** output in `WorkflowResult.instructor_output`. Use it for debug info that students should never see (raw nmap output, full curl traces).
-- For library actions, `student_fail_hint` field is shown on fail and supports `{{ params.X }}` templating; prefer this over `STUDENT_MSG` for reusable actions.
+- Inside a **library action** body, assign `LAST_STUDENT_MSG` instead of echoing. `run_action` emits it as a `STUDENT_MSG:` line for you. The `student_fail_hint` column is stored but never rendered — do not rely on it.
 
 ### 5.4 Context passing between actions
 
@@ -313,15 +328,24 @@ run_action "fetch-banner" bash -c '
 ```
 
 Rules:
-- **NEVER** call `$(ctx_get foo)` in a command — `ctx_get` is for reading only inside the *same* action. Use the `CTX_*` env vars for cross-action reads. The sidecar sanitizes them; raw `ctx_get` does not, and a malicious previous output could shell-inject.
+- **NEVER** call `$(ctx_get foo)` in a command — `ctx_get` is for reading only inside the *same* action. Use the `CTX_*` env vars for cross-action reads.
+- The env name is the context key upper-cased with every non-alphanumeric character replaced by `_`, prefixed with `CTX_`. So `ctx_set "web_port" 8080` in a library action body is readable as `$CTX_WEB_PORT` by whatever runs next.
 - Auto-extracted JSON fields from stdout: any top-level `id`, `url`, `slug`, `name` keys are pulled into context automatically. To capture other fields, call `ctx_set` explicitly.
+- The export happens at the end of each `run_action`, so a value is visible to the next action and to plain shell between actions — never to the action that wrote it.
+- Values are flattened to one line and capped at 4096 bytes, matching what the sidecar would have produced.
 - Context is per-workflow, not per-run. Two workflows in the same playlist do not share context.
 
 ---
 
 ## 6. Platform tagging — `supported_platforms`
 
-Tells the engine + UI which target OSes an action works against. Format: JSON array of platform strings.
+Declares which target OSes an action works against. Format: JSON array of platform strings.
+
+**Only one tag changes runtime behaviour: `windows`.** An action tagged
+`["windows"]` is excluded from the generated bash library, because its body is
+PowerShell and the library is sourced as a single bash file — one unparseable
+body would take down every action in the run. Every other tag is documentation
+for the instructor and the admin UI; nothing filters or aborts on it.
 
 | Tag | Matches |
 |---|---|
@@ -337,38 +361,145 @@ Examples:
 - `["any"]` — pure network probe (e.g. `port-open`, `http-get`)
 - `["linux"]` — needs an SSH connection (`ssh-exec`)
 - `["linux:ubuntu", "linux:debian"]` — uses `ufw` or `apt`
-- `["windows"]` — uses PowerShell over WinRM
+- `["windows"]` — PowerShell body, for a `vmware_tools` workflow only
 
-When a workflow has `execution_mode = "vmware_tools"`, the engine cross-checks the target template's `os_type` against every referenced action's `supported_platforms`. A mismatch aborts the run with a clear error.
+A `windows`-tagged action is not callable with `run_action`, since it never
+reaches the runner's library. Tagging an otherwise-fine bash action `windows`
+silently makes it unavailable; that is the one tagging mistake with teeth.
 
 ---
 
-## 7. Action library catalog (curated snapshot)
+## 7. Action library catalog
 
-> **Live source of truth:** `GET /api/v1/admin/actions` (returns the full current library). The list below is a representative slice maintained by hand for AI context; when in doubt, query the API.
+> **In-repo source of truth:** [`deploy/sql/library-actions.sql`](deploy/sql/library-actions.sql)
+> — 65 library actions, each with its real bash body, convergent on slug.
+> Read a body there when you need its exact flags. `GET /api/v1/admin/actions`
+> returns what a given instance currently holds.
+>
+> The full-metadata mirror used by the corpus tests is
+> [`internal/scriptvalidator/testdata/actions.json`](internal/scriptvalidator/testdata/actions.json);
+> it is **generated** from the SQL by `go test ./internal/libraryseed -update`,
+> so do not hand-edit it.
 
-| Slug | Category | Platforms | What it asserts |
-|---|---|---|---|
-| `http-get` | network | any | `curl -fsS <url>` returns 2xx |
-| `http-post` | network | any | POST to URL succeeds with optional body match |
-| `port-open` | network | any | `nc -zw3 <host> <port>` succeeds |
-| `port-closed` | network | any | `nc -zw3 <host> <port>` fails (refused or filtered) |
-| `dns-resolves` | network | any | `dig +short <name>` returns ≥1 record |
-| `nmap-service` | network | any | `nmap -sV` reports specified service on port |
-| `smb-share-accessible` | network | any | `smbclient -L //host` succeeds |
-| `ssh-exec` | system | linux | `ssh user@host '<cmd>'` exits 0 |
-| `ssh-denied` | auth | linux | `ssh user@host true` fails (auth denied) |
-| `command-check` | system | linux | Run shell command on target via SSH, assert exit 0 |
-| `wait-for` | system | linux | Poll a condition with backoff up to N seconds |
-| `git-clone` | system | linux | Clone a repo into runner workdir |
-| `git-push` | system | linux | Push from a runner-staged repo |
-| `file-contains` | system | linux:ubuntu, linux:debian | Assert file on target contains regex (via SSH `grep`) |
-| `service-running` | system | linux:ubuntu, linux:debian | `systemctl is-active --quiet <unit>` |
-| `package-installed` | system | linux:ubuntu, linux:debian | `dpkg -l <pkg>` exit 0 |
-| `ufw-enabled` | system | linux:ubuntu, linux:debian | `ufw status` reports active |
-| `ufw-rule-exists` | system | linux:ubuntu, linux:debian | `ufw status numbered` contains the rule |
+Callables are the slug with hyphens replaced by underscores. Flags listed are
+exactly the ones each body's argument loop parses; anything else is ignored.
+Where a flag is omitted, most actions default `--host` to
+`$CRUCIBLE_TARGET_IP`.
 
-If you need an action that's not in the library, **prefer adding it as a library action** (via `POST /api/v1/admin/actions`) over inlining the logic in a workflow `script`. Library actions are reusable, tested once, and platform-tagged.
+**Anything that inspects the student's machine reaches it over SSH** using the
+`crucible_ssh` / `crucible_ssh_sudo` helpers in
+[`deploy/runner/actions.sh`](deploy/runner/actions.sh). Calling `systemctl`,
+`dpkg` or `ufw` directly in an action body inspects the unprivileged Kali
+runner pod instead — the defect that made `service_running --name ssh` grade
+the runner's own sshd, and made `ufw_enabled` unable to pass at all.
+
+### Network and recon (run from the runner)
+
+| Slug | Type / Category | Platforms | Flags | What it asserts |
+|---|---|---|---|---|
+| `http-get` | http / network | any | `--url --expect-status --expect-body --timeout --max-time --cookies --save-cookies` | HTTP GET returns the expected status and body |
+| `http-post` | http / network | any | `--url --data --json --expect-status --cookies --save-cookies` | HTTP POST returns the expected status |
+| `http-header-present` | http / network | any | `--url --header --value` | Response sends a header, optionally matching a regex |
+| `http-header-absent` | http / network | any | `--url --header --value` | Response does **not** send a header (version leaks) |
+| `http-redirects-to-https` | http / network | any | `--host --path` | Plain HTTP answers 30x with an `https://` Location |
+| `http-auth-required` | http / web | any | `--url` | Unauthenticated request is refused 401/403 |
+| `http-credentials-rejected` | http / web | any | `--url --user --pass` | A default credential pair is **not** accepted |
+| `directory-listing-disabled` | http / web | any | `--url` | URL returns no auto-generated directory index |
+| `web-technology-hidden` | http / web | any | `--url --deny` | `whatweb` fingerprint advertises no version |
+| `port-open` | port_check / network | any | `--host --port --timeout` | TCP port accepts a connection |
+| `port-closed` | port_check / firewall | any | `--host --port` | TCP port is refused or filtered |
+| `nmap-port-state` | port_check / network | any | `--host --port --state` | nmap reports open / closed / filtered |
+| `nmap-only-expected-ports` | port_check / firewall | any | `--host --allow --range` | Nothing outside an allowlist is open |
+| `nmap-service` | command / network | any | `--host --port --expect-service` | `nmap -sV` reports the expected service |
+| `nmap-script-output` | command / network | any | `--host --port --script --expect --absent` | An NSE script's output matches a regex |
+| `tcp-banner-matches` | port_check / network | any | `--host --port --expect --absent` | A service's connect banner matches a regex |
+| `host-responds-to-ping` | command / network | any | `--host --absent` | Host answers (or deliberately ignores) ICMP echo |
+| `dns-resolves` | dns / network | any | `--hostname --server --expect-ip` | Name resolves, optionally to an expected address |
+| `dns-server-refuses-recursion` | dns / network | any | `--host --probe` | Server does not advertise recursion to any client |
+| `tls-certificate-valid` | command / network | any | `--host --port --days` | Served certificate is valid and not near expiry |
+| `tls-protocol-refused` | command / network | any | `--host --port --protocol` | An obsolete TLS/SSL version is refused |
+| `smb-share-accessible` | command / network | any | `--host --share --user --pass` | SMB share is reachable |
+| `smb-share-listable` | command / network | any | `--host --expect-share --absent` | Anonymous share listing works, or is refused |
+| `smb-signing-required` | command / network | any | `--host` | SMB requires message signing (blocks relay) |
+| `ftp-anonymous-denied` | command / network | any | `--host --port` | FTP refuses the anonymous account |
+| `ldap-anonymous-bind-denied` | command / network | any | `--host --base` | Directory returns no entries to an anonymous bind |
+| `redis-auth-required` | command / network | any | `--host --port` | Redis rejects unauthenticated commands |
+
+### Runner-local utilities
+
+| Slug | Type / Category | Platforms | Flags | What it asserts |
+|---|---|---|---|---|
+| `command-check` | command / general | linux | `--cmd --expect-exit --expect-output` | Command run **on the runner** exits/prints as expected |
+| `wait-for` | command / general | linux | `--cmd --retries --delay --description` | Polls a condition until it passes |
+| `git-clone` | command / general | linux | `--url --dest` | Clones a repo into the runner workdir |
+| `git-push` | command / general | linux | `--repo --branch --file --content --message` | Commits and pushes from a staged repo |
+
+### Target-side: SSH and services
+
+| Slug | Type / Category | Platforms | Flags | What it asserts |
+|---|---|---|---|---|
+| `ssh-exec` | ssh / ssh | linux | `--host --user --key --command --expect-exit --expect-output` | Command over SSH exits/prints as expected |
+| `ssh-denied` | ssh / ssh | linux | `--host --user` | SSH auth is refused |
+| `ssh-key-auth-only` | ssh / ssh | linux | `--host --user` | sshd refuses password auth, proven from the network |
+| `sshd-directive` | ssh / ssh | linux | `--directive --value` | An `sshd -T` effective directive has a value |
+| `sshd-protocol-hardened` | ssh / ssh | linux | *(none)* | Root login and password auth are both off |
+| `service-running` | service_check / service | linux | `--name --quiet` | systemd unit is active on the target |
+| `service-enabled` | service_check / service | linux | `--name` | systemd unit is enabled at boot |
+| `service-stopped` | service_check / service | linux | `--name` | systemd unit is **not** running |
+| `service-listening-on` | command / network | linux | `--port --address` | Port is bound to an expected address, not `0.0.0.0` |
+| `package-installed` | service_check / service | linux | `--name` | Package is installed on the target |
+| `package-absent` | service_check / service | linux | `--name` | Package has been removed from the target |
+| `unattended-upgrades-enabled` | service_check / service | linux:ubuntu, linux:debian | *(none)* | Automatic security updates installed **and** switched on |
+
+### Target-side: hardening, accounts and files
+
+| Slug | Type / Category | Platforms | Flags | What it asserts |
+|---|---|---|---|---|
+| `ufw-enabled` | service_check / firewall | linux | *(none)* | `ufw status` reports active on the target |
+| `ufw-rule-exists` | service_check / firewall | linux | `--rule` | `ufw status numbered` contains the rule |
+| `ufw-default-deny-incoming` | service_check / firewall | linux | *(none)* | Default inbound policy is deny |
+| `file-contains` | file_check / file | linux | `--path --regex --value` | File on the target matches a regex or exact value |
+| `file-permissions` | file_check / file | linux | `--path --mode --at-most` | Path has an exact mode, or grants no more than one |
+| `file-owner` | file_check / file | linux | `--path --owner --group` | Path is owned by an expected user/group |
+| `no-world-writable` | file_check / file | linux | `--path --max-depth` | No world-writable regular files in a tree |
+| `user-exists` | command / system | linux | `--name` | A local account is present |
+| `user-absent` | command / system | linux | `--name` | A local account has been removed |
+| `user-in-group` | command / system | linux | `--user --group --absent` | Account is (or is not) a group member |
+| `account-locked` | command / system | linux | `--name` | Account cannot authenticate with a password |
+| `no-empty-passwords` | command / system | linux | *(none)* | No account in `/etc/shadow` has an empty password |
+| `no-extra-uid-zero` | command / system | linux | *(none)* | root is the only UID 0 account |
+| `no-passwordless-sudo` | command / system | linux | `--allow` | sudoers grants nobody unexpected NOPASSWD root |
+| `sysctl-value` | command / system | linux | `--key --value` | A **running** kernel parameter has a value |
+| `cron-entry-absent` | command / system | linux | `--pattern` | No crontab matches a pattern (scheduled persistence) |
+
+### Windows (`vmware_tools` only)
+
+`win-command-check`, `win-file-contains`, `win-firewall-enabled`,
+`win-firewall-rule-exists`, `win-package-installed`, `win-service-running`.
+
+Their bodies are PowerShell, so they are excluded from the bash library and are
+**not** callable with `run_action`; see §6.
+
+### Adding one
+
+Prefer a new library action over inlining logic in a workflow `script`:
+reusable, checked once, platform-tagged. Add it to
+[`deploy/sql/library-actions.sql`](deploy/sql/library-actions.sql) (its header
+has the authoring rules) and run `go test ./internal/libraryseed -update`. That
+verifies the slug, the bash body, tool availability and callable uniqueness,
+and regenerates both corpora. `POST /api/v1/admin/actions` applies the same
+validation for an ad-hoc addition, but an action created that way exists only
+in that one database.
+
+### Ready-made workflows
+
+[`deploy/sql/library-workflows.sql`](deploy/sql/library-workflows.sql) seeds 17
+assignable assessments across four areas — Linux hardening (SSH baseline, host
+firewall, account hygiene, kernel network settings, patching and persistence),
+recon (attack surface, service banners, SMB enumeration, DNS posture), web
+security (TLS configuration, security headers, access control, file hygiene),
+and service configuration (web stack, database exposure, file sharing, account
+provisioning). Each is `active` and calls only library actions.
 
 ---
 
@@ -376,7 +507,7 @@ If you need an action that's not in the library, **prefer adding it as a library
 
 ✅ **DO:**
 
-- `source /opt/crucible/lib/actions.sh` and `set -euo pipefail` at the top of every `kali_runner` workflow.
+- `source /opt/crucible/lib/actions.sh` and `set -uo pipefail` at the top of every `kali_runner` workflow. Not `-euo`: see §4.3 — `set -e` makes the first failing check silently discard every check after it.
 - Quote *every* variable expansion: `"$CRUCIBLE_TARGET_IP"`, not `$CRUCIBLE_TARGET_IP`.
 - Use `bash -c '...'` for any inline shell logic; this gives a clean per-action subshell.
 - Use `timeout <n>` only if you need a sub-action timeout — `run_action` already enforces `ACTION_TIMEOUT` (default 30s).
@@ -402,7 +533,7 @@ If you need an action that's not in the library, **prefer adding it as a library
 
 ```bash
 source /opt/crucible/lib/actions.sh
-set -euo pipefail
+set -uo pipefail
 
 run_action "port-23-closed" bash -c '
   if nc -zw3 "$CRUCIBLE_TARGET_IP" 23 2>/dev/null; then
@@ -416,7 +547,7 @@ run_action "port-23-closed" bash -c '
 
 ```bash
 source /opt/crucible/lib/actions.sh
-set -euo pipefail
+set -uo pipefail
 
 SSH="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=no \
      -i /opt/crucible/keys/student_rsa"
@@ -434,7 +565,7 @@ run_action "nginx-running" bash -c "
 
 ```bash
 source /opt/crucible/lib/actions.sh
-set -euo pipefail
+set -uo pipefail
 
 run_action "find-web-port" bash -c '
   PORT=$(nmap -p 80,443,8080,8443 --open "$CRUCIBLE_TARGET_IP" -oG - \
@@ -460,7 +591,7 @@ run_action "no-server-banner" bash -c '
 
 ```bash
 source /opt/crucible/lib/actions.sh
-set -euo pipefail
+set -uo pipefail
 
 SSH='ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5'
 
@@ -516,6 +647,22 @@ Whenever you generate a workflow or action, the instructor will likely paste it 
 6. **Timeouts are sane** — `timeout_seconds` should be 2-3× the slowest realistic action; default 60s for actions, 300s for workflows is usually right.
 7. **No leaked secrets** — never echo `$CRUCIBLE_TARGET_PASSWORD` or write it to a file outside `$CRUCIBLE_WORKDIR`.
 8. **Every `run_action` has label + callable** — for a library slug such as `port-open`, the second argument is `port_open`, not `port-open`.
+
+### 12.0 What the create/update API rejects outright
+
+These are `400`s (or `409` for the rename guard), enforced because the
+generated library is one bash file sourced by every runner pod: a single bad
+entry breaks `source` and fails every assessment in flight, not just its own.
+
+| Endpoint | Rejected |
+|---|---|
+| `POST /admin/actions` | Slug that is not lowercase kebab-case `^[a-z][a-z0-9]*(-[a-z0-9]+)*$`; a slug whose generated function collides with an existing action; a body that does not parse as bash when wrapped in `slug_name() { … }`. |
+| `PATCH /admin/actions/{id}` | The same three, validated against the *merged* row — a new script is checked against the stored slug. Plus `409` on a slug rename while any workflow script still calls the old function; the response names the workflows. |
+| `POST /admin/workflows` | Slug that is not kebab-case; an `execution_mode` or `creation_mode` outside the two legal values. |
+| `POST /admin/playlists` | Slug that is not kebab-case; `scoring_mode: "points"`, which is unimplemented — nothing totals `points`/`penalty`, so accepting it would return `201` and then silently grade pass/fail. |
+
+A `windows`-tagged action skips the bash parse, since its body is PowerShell
+and it is excluded from the bash library.
 
 ### 12.1 Admin script validator wrapper model (read before authoring action bodies)
 

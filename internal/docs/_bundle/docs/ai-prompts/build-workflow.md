@@ -24,7 +24,7 @@ Before producing any output, read the canonical schema and conventions document 
 
 - The exact JSON schema for workflows, actions, and playlists.
 - Every action type and execution mode the engine supports.
-- The complete bash runtime contract (`ctx_get`, `ctx_set`, `LAST_ERROR`, `LAST_STUDENT_MESSAGE`, `CRUCIBLE_*` env vars).
+- The complete bash runtime contract (`ctx_get`, `ctx_set`, `LAST_ERROR`, `LAST_STUDENT_MSG`, `CRUCIBLE_*` env vars).
 - The full list of in-library actions you can compose without writing new bash.
 - Anti-patterns and validator rules.
 
@@ -35,12 +35,14 @@ Before producing any output, read the canonical schema and conventions document 
 - Prefer composing **existing library actions** over authoring new bash. New bash means new code review, new validator findings, new failure modes.
 - Every `run_action` must include a display label followed by a callable: `run_action "SSH is open" port_open ...`. Library slugs are kebab-case database identifiers, but generated bash functions replace hyphens with underscores (`demo-http-service-reachable` → `demo_http_service_reachable`). Never write a label-only call or pass the kebab slug as the command.
 - One action per check — atomic, testable, single-purpose. "Check sshd is running AND check root login is disabled" is two actions, not one.
-- Every action returns `LAST_STUDENT_MESSAGE` with a helpful sentence the student will see. The validator nudges if you forget. Bad: `LAST_STUDENT_MESSAGE="check failed"`. Good: `LAST_STUDENT_MESSAGE="Port 22 is not open on $CRUCIBLE_TARGET_IP — install and start sshd, then retry."`
-- Use `LAST_ERROR` only for errors the *instructor* will read (logs/admin view). Use `LAST_STUDENT_MESSAGE` for everything the student will see.
+- Every action sets `LAST_STUDENT_MSG` to a helpful sentence the student will see, then `return 1`. `run_action` re-emits it as a `STUDENT_MSG:` line. Bad: `LAST_STUDENT_MSG="check failed"`. Good: `LAST_STUDENT_MSG="Port 22 is not open on $CRUCIBLE_TARGET_IP — install and start sshd, then retry."`
+- Use `LAST_ERROR` only for errors the *instructor* will read (logs/admin view). Use `LAST_STUDENT_MSG` for everything the student will see.
+- An action body takes **`--flag value` arguments** parsed by a `while`/`case` loop, and declares each flag in `input_context`. There is no `params` injection and no `PARAM_*` env var; the `params` and `student_fail_hint` fields are stored but never read.
+- The body is rendered as a shell function, so use `local` and `return`, never `exit`.
 - Pick the execution mode honestly:
   - `kali_runner` — outside-the-VM checks (port scans, HTTP probes, DNS lookups, etc.). Fast, no agent on student VM.
   - `vmware_tools` — inside-the-VM checks (file exists, service running, config correct). Requires VMware Tools running in the guest.
-- Set a realistic `timeout_seconds` per action — 5s for a single TCP connect, 30s for an nmap scan, 60s for an apt install fixture.
+- Set a realistic workflow `timeout_seconds`. A per-action `timeout_seconds` is inert: every action gets the workflow-level `ACTION_TIMEOUT`, 30s by default.
 
 ## Questions to ask the instructor (if not provided)
 
@@ -63,7 +65,7 @@ If you cannot satisfy a requirement with the current action library + execution 
 
 > **Instructor:** "I want to check that students have hardened SSH: no root login, key-based auth only, fail2ban running."
 >
-> **You:** Ask: which template (Ubuntu / Debian / RHEL)? Should each requirement be a separate pass/fail or one composite check? Once answered, produce three actions (`ssh.no-root-login`, `ssh.password-auth-off`, `service.fail2ban-running`), reusing the existing `library/sshd_config_check` and `library/systemctl_active` actions where possible. Provide a workflow that runs them in `vmware_tools` mode with a sensible 60s overall timeout.
+> **You:** Ask: which template (Ubuntu / Debian / RHEL)? Should each requirement be a separate pass/fail or one composite check? Once answered, compose the three checks from the existing library — `file_contains --path /etc/ssh/sshd_config --regex '^PermitRootLogin\s+no'`, the same against `PasswordAuthentication`, and `service_running --name fail2ban` — so no new bash is needed. Provide a `kali_runner` workflow with a sensible overall `timeout_seconds`.
 
 ---
 

@@ -253,6 +253,43 @@ func ValidateSkipGeneralize(sourceType string, skip bool) error {
 	}
 }
 
+// ResolveWizardTemplateKind decides the templates.kind a wizard draft is
+// created with, defaulting to clone_with_customize when the caller does not
+// ask for one.
+//
+// clone_no_customize exists for a source VM that cannot be customized at
+// clone time — an OVA appliance with no cloud-init / Cloudbase-Init being the
+// motivating case. Such a template MUST NOT be clone_with_customize: pods
+// cloned from it would sit in `configuring` waiting for VMware Tools to
+// accept a generated `student` credential that nothing inside the appliance
+// ever creates, then fail into compensation. The allowed source types
+// deliberately match ValidateSkipGeneralize: ovf and clone_vcenter are the
+// already-prepared sources.
+//
+// registered_existing_vm is rejected because it is not a wizard flow at all
+// (it adopts an existing VM as canonical rather than building one through
+// staging).
+func ResolveWizardTemplateKind(sourceType, kind string) (string, error) {
+	switch kind {
+	case "", TemplateKindCloneWithCustomize:
+		return TemplateKindCloneWithCustomize, nil
+	case TemplateKindCloneNoCustomize:
+		switch sourceType {
+		case TemplateSourceOVF, TemplateSourceCloneVCenter:
+			return TemplateKindCloneNoCustomize, nil
+		default:
+			return "", fmt.Errorf("kind=%s is not allowed for source_type=%s: only an already-prepared source (ovf, clone_vcenter) may skip guest customization",
+				TemplateKindCloneNoCustomize, sourceType)
+		}
+	case TemplateKindRegisteredExistingVM:
+		return "", fmt.Errorf("kind=%s cannot be created through the template wizard: it adopts an existing vCenter VM instead of building one through staging",
+			TemplateKindRegisteredExistingVM)
+	default:
+		return "", fmt.Errorf("kind %q is not a valid template kind (want %s or %s)",
+			kind, TemplateKindCloneWithCustomize, TemplateKindCloneNoCustomize)
+	}
+}
+
 // CanonicalStagingNetwork is the ONLY network a template build VM is ever
 // attached to. It is the isolated VLAN 30 staging port group (present on
 // every ESXi host) and is a deliberate network-segmentation control: build

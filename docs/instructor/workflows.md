@@ -18,7 +18,7 @@ A minimal workflow looks like this:
 
 ```bash
 source /opt/crucible/lib/actions.sh
-set -euo pipefail
+set -uo pipefail
 
 run_action "telnet-blocked" bash -c '
     if nc -zw3 "$CRUCIBLE_TARGET_IP" 23; then
@@ -33,8 +33,15 @@ Three things to notice:
 
 1. **`source /opt/crucible/lib/actions.sh`** — pulls in the `run_action`
    helper. Always at the top.
-2. **`set -euo pipefail`** — fail loud on errors, unset variables, and
-   broken pipes. Saves you from "passed because grep printed nothing".
+2. **`set -uo pipefail`** — fail loud on unset variables and broken pipes.
+   Saves you from "passed because grep printed nothing".
+
+   Note this is **not** `set -euo pipefail`. `run_action` returns the check's
+   exit code, so under `set -e` the first failing check ends the whole
+   workflow: every later check never runs and never reports, and the student
+   sees one red result followed by silence instead of a full list. Nothing in
+   the output looks like an abort — the run simply has fewer results than the
+   workflow has checks.
 3. **`run_action "<display label>" <command-or-function> [args...]`** — every grading step is wrapped in
    `run_action` so the engine can capture per-step pass/fail, output,
    and duration. The label and executable are separate required arguments.
@@ -60,7 +67,7 @@ is a thin wrapper around this endpoint.
   "creation_mode": "script",
   "timeout_seconds": 60,
   "target_os": "linux",
-  "script": "source /opt/crucible/lib/actions.sh\nset -euo pipefail\nrun_action \"port-23-closed\" bash -c '...'",
+  "script": "source /opt/crucible/lib/actions.sh\nset -uo pipefail\nrun_action \"port-23-closed\" bash -c '...'",
   "visible_to_students": true,
   "status": "draft"
 }
@@ -121,7 +128,7 @@ callables replace each hyphen with an underscore: `service-running` becomes
 
 ```bash
 source /opt/crucible/lib/actions.sh
-set -euo pipefail
+set -uo pipefail
 
 # Library action: checks systemd unit state via SSH to the target
 run_action "SSH service is active" service_running --name ssh

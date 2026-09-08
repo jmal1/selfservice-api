@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
+	"time"
 
 	"github.com/jmal1/selfservice-api/internal/synthetic"
 )
@@ -53,11 +55,199 @@ func (cfg ElevatedConfig) client() (*synthetic.Client, error) {
 func Elevated(cfg ElevatedConfig) []synthetic.Check {
 	return []synthetic.Check{
 		imageListContract(cfg),
+		imageImportPipelineHealthy(cfg),
 		isoCatalogReachable(cfg),
+		ovaCatalogReachable(cfg),
 		guestOSCatalogReachable(cfg),
 		templateWizardState404(cfg),
 		adminRunsFilterContract(cfg),
 		blueprintVMPlaylistsContract(cfg),
+	}
+}
+
+// importPipelineStallThreshold is how long an image_uploads row may sit in a
+// non-terminal status before this check calls it stalled.
+//
+// An import is a multi-GB stream to a datastore, so a legitimately busy one
+// can easily run for many minutes; two hours is comfortably longer than any
+// real transfer on this hardware while still catching a wedge within one
+// alerting window. It is deliberately much longer than the worker's own
+// 30-minute WORKER_STUCK_UPLOAD_STALE_THRESHOLD, because that gauge counts
+// abandoned browser uploads (whose presigned URLs die after 15 minutes) while
+// this one watches server-side import work.
+const importPipelineStallThreshold = 2 * time.Hour
+
+// imageImportPipelineHealthy asserts that no uploaded image is sitting in a
+// failed or stalled state.
+//
+// This is the check that was missing when the import pipeline was broken end
+// to end. The API enqueued image_import jobs under a key the worker did not
+// read, so its required-field guard rejected every payload — and because that
+// guard returned before the error-recording closure, each row silently stayed
+// at "uploaded" with no error_message. Nothing observed it: image_list_contract
+// only asserts the response is a JSON array, and the worker-side
+// crucible_image_uploads_stuck gauge did not count "uploaded" (nor, at the
+// time, "pending") at all. Uploading anything and waiting would have exposed
+// it immediately, which is precisely what this now does continuously.
+//
+// It is read-only: it never uploads or enqueues, it only judges rows that
+// instructors already created. An empty library passes, so a fresh
+// environment is not penalised for having no images.
+func imageImportPipelineHealthy(cfg ElevatedConfig) synthetic.Check {
+	return synthetic.CheckFunc{
+		NameVal:  "image_import_pipeline_healthy",
+		TitleVal: "Image Import Pipeline Terminates",
+		DescriptionVal: "Reads /admin/images as an instructor and requires that every row has either " +
+			"reached 'imported' or is still recent. Fails on any row in 'error' and on any row stuck " +
+			"in pending/uploading/uploaded/importing for over two hours. Catches the class of defect " +
+			"where imports never run at all -- a broken job payload contract or an unclaimed job type " +
+			"or a worker with no object store -- which otherwise leaves rows parked forever with no " +
+			"error message and no failing metric.",
+		SeverityVal: synthetic.SeverityWarning,
+		RunFn: func(ctx context.Context, _ *synthetic.Client) (int, error) {
+			c, err := cfg.client()
+			if err != nil {
+				return 0, err
+			}
+			resp, err := c.Do(ctx, http.MethodGet, "/api/v1/admin/images", nil)
+			if err != nil {
+				return 0, err
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 65536))
+
+			if resp.StatusCode != http.StatusOK {
+				return resp.StatusCode, fmt.Errorf(
+					"image library returned %d, want 200 (see image_list_contract for the wiring causes): %s",
+					resp.StatusCode, snippet(body))
+			}
+
+			var rows []struct {
+				Filename     string    `json:"filename"`
+				Kind         string    `json:"kind"`
+				Status       string    `json:"status"`
+				ErrorMessage string    `json:"error_message"`
+				UpdatedAt    time.Time `json:"updated_at"`
+			}
+			if err := json.Unmarshal(body, &rows); err != nil {
+				return resp.StatusCode, fmt.Errorf(
+					"image library body is not a JSON array: %w (body=%s)", err, snippet(body))
+			}
+
+			var failed, stalled []string
+			for _, row := range rows {
+				switch row.Status {
+				case "imported":
+					continue
+				case "error":
+					failed = append(failed, fmt.Sprintf("%s (%s): %s",
+						row.Filename, row.Kind, row.ErrorMessage))
+				default:
+					// pending / uploading / uploaded / importing, plus any
+					// status added later: all are non-terminal, so any of
+					// them sitting still is a stall.
+					age := time.Since(row.UpdatedAt)
+					if !row.UpdatedAt.IsZero() && age > importPipelineStallThreshold {
+						stalled = append(stalled, fmt.Sprintf("%s (%s): %s for %s",
+							row.Filename, row.Kind, row.Status, age.Round(time.Minute)))
+					}
+				}
+			}
+
+			switch {
+			case len(failed) > 0 && len(stalled) > 0:
+				return resp.StatusCode, fmt.Errorf(
+					"image imports failed [%s] and stalled [%s]",
+					strings.Join(failed, "; "), strings.Join(stalled, "; "))
+			case len(failed) > 0:
+				return resp.StatusCode, fmt.Errorf(
+					"image import(s) in error state: %s — retry with POST /admin/images/{id}/import once the cause is fixed",
+					strings.Join(failed, "; "))
+			case len(stalled) > 0:
+				return resp.StatusCode, fmt.Errorf(
+					"image import(s) never reached a terminal state: %s — check that the worker claims image_import jobs (WORKER_PROVISIONING_CLAIMS_ENABLED) and that OBJECTSTORE_* is wired",
+					strings.Join(stalled, "; "))
+			}
+			return resp.StatusCode, nil
+		},
+	}
+}
+
+// ovaCatalogReachable proves the OVF discovery surface responds and still
+// tells callers which field to use as a template source_ref.
+//
+// Imported OVAs are deliberately absent from /admin/vcenter/isos (they are
+// never mountable media), so this endpoint is the only place the
+// image_uploads.vcenter_vm_id needed by a source_type=ovf draft is exposed. If
+// it regresses, an instructor cannot author an OVA template at all, and no
+// other check touches it.
+func ovaCatalogReachable(cfg ElevatedConfig) synthetic.Check {
+	return synthetic.CheckFunc{
+		NameVal:  "ova_catalog_reachable",
+		TitleVal: "OVA Catalog (OVF Template Source)",
+		DescriptionVal: "Fetches /admin/vcenter/ovas as an instructor and requires 200 with an 'ovas' " +
+			"array and source_type=ovf. This is the only surface exposing the imported-OVA MoRef that " +
+			"a source_type=ovf template draft needs so a regression here silently blocks all OVA " +
+			"template authoring.",
+		SeverityVal: synthetic.SeverityWarning,
+		RunFn: func(ctx context.Context, _ *synthetic.Client) (int, error) {
+			c, err := cfg.client()
+			if err != nil {
+				return 0, err
+			}
+			resp, err := c.Do(ctx, http.MethodGet, "/api/v1/admin/vcenter/ovas", nil)
+			if err != nil {
+				return 0, err
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 32768))
+
+			switch resp.StatusCode {
+			case http.StatusOK:
+			case http.StatusNotFound:
+				return resp.StatusCode, fmt.Errorf(
+					"GET /api/v1/admin/vcenter/ovas returned 404 — the OVA discovery route is missing, so source_type=ovf drafts have no way to find an imported appliance")
+			case http.StatusServiceUnavailable:
+				return resp.StatusCode, fmt.Errorf(
+					"OVA catalog returned 503 — the image database surface is not wired into the API process")
+			case http.StatusForbidden:
+				return resp.StatusCode, fmt.Errorf(
+					"OVA catalog returned 403 to the instructor identity — the synthetic instructor user is missing, inactive, or no longer has role=instructor")
+			default:
+				return resp.StatusCode, fmt.Errorf(
+					"OVA catalog returned %d, want 200: %s", resp.StatusCode, snippet(body))
+			}
+
+			var parsed struct {
+				OVAs       *[]map[string]any `json:"ovas"`
+				SourceType string            `json:"source_type"`
+			}
+			if err := json.Unmarshal(body, &parsed); err != nil {
+				return resp.StatusCode, fmt.Errorf(
+					"OVA catalog returned 200 but body is not valid JSON: %v — body: %s", err, snippet(body))
+			}
+			if parsed.OVAs == nil {
+				return resp.StatusCode, fmt.Errorf(
+					"OVA catalog response has no 'ovas' key — the response shape changed: %s", snippet(body))
+			}
+			if parsed.SourceType != "ovf" {
+				return resp.StatusCode, fmt.Errorf(
+					"OVA catalog source_type = %q, want \"ovf\" — callers use this to build the draft", parsed.SourceType)
+			}
+			// An entry that claims to be selectable must carry the MoRef,
+			// otherwise the wizard would offer a draft with a dangling
+			// source_ref.
+			for i, entry := range *parsed.OVAs {
+				disabled, _ := entry["disabled"].(bool)
+				ref, _ := entry["source_ref"].(string)
+				if !disabled && ref == "" {
+					return resp.StatusCode, fmt.Errorf(
+						"OVA catalog entry %d is selectable but has no source_ref — a draft built from it would have a dangling source: %v",
+						i, entry)
+				}
+			}
+			return resp.StatusCode, nil
+		},
 	}
 }
 
@@ -192,8 +382,7 @@ func ElevatedIdentityConfigured(cfg ElevatedConfig) synthetic.Check {
 		NameVal:  "elevated_identity_configured",
 		TitleVal: "Instructor Synthetic Identity Present",
 		DescriptionVal: "Reports whether the monitor has an instructor-role identity to run the " +
-			"authenticated admin-surface checks with. When this fails the three elevated checks " +
-			"(image_list_contract / iso_catalog_reachable / template_wizard_state_404) are NOT " +
+			"authenticated admin-surface checks with. When this fails every elevated check is NOT " +
 			"RUNNING AT ALL and their series are absent from Prometheus entirely -- so no other " +
 			"alert can tell you the admin surface stopped being tested. Fix: confirm the " +
 			"synthetic-instructor row exists (deploy/sql/synthetic-instructor-user.sql) and that " +

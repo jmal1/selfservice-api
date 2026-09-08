@@ -496,7 +496,7 @@ Usual causes:
 
 | Cause | Fix |
 |---|---|
-| Forgot `set -e` (or `set -euo pipefail`) | Add it at the top of the script |
+| A check's logic never returns non-zero | `run_action` reports whatever exit code the command gives it. A body that only prints and always falls off the end returns 0 and passes. |
 | Used `\|\| true` somewhere — failures get swallowed | Remove the `\|\| true`, or replace with explicit error handling |
 | `grep` returned nothing but you didn't check the exit code | Use `grep -q ...` and check `$?`, or `if ! grep -q ...; then exit 1; fi` |
 | SSH command failed but you only checked the local exit code | The `ssh` exit code IS the remote exit code — check it explicitly |
@@ -672,8 +672,17 @@ if ! check_thing; then
 fi
 ```
 
-Or, for library actions, set `student_fail_hint` once and it applies
-everywhere the action is used.
+Inside a **library action** body, assign `LAST_STUDENT_MSG` instead of echoing —
+`run_action` emits it as a `STUDENT_MSG:` line for you, once, everywhere the
+action is used:
+
+```bash
+LAST_STUDENT_MSG="Service $name is not running. Start it with: sudo systemctl start $name"
+return 1
+```
+
+The `student_fail_hint` field is stored but never rendered; it will not reach
+the student. See [Building Actions](actions.md).
 
 ---
 

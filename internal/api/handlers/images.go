@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"net/http"
 	"path"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -422,7 +423,7 @@ func (h *Handler) AdminCompleteImageUpload(w http.ResponseWriter, r *http.Reques
 	//
 	// Failure to enqueue is logged but NOT fatal: the upload is safe in MinIO
 	// and the instructor can trigger import manually from /admin/images.
-	jobPayload, _ := json.Marshal(map[string]string{"image_upload_id": imageID.String()})
+	jobPayload, _ := json.Marshal(map[string]string{"image_id": imageID.String()})
 	job, enqErr := h.imgDB.CreateJob(r.Context(), models.JobTypeImageImport, jobPayload)
 	if enqErr != nil {
 		h.logger.Error("auto-enqueue image import failed; upload succeeded but import not started",
@@ -517,7 +518,7 @@ func (h *Handler) AdminImportImage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	payload, _ := json.Marshal(map[string]string{"image_upload_id": imageID.String()})
+	payload, _ := json.Marshal(map[string]string{"image_id": imageID.String()})
 	job, err := h.imgDB.CreateJob(r.Context(), models.JobTypeImageImport, payload)
 	if err != nil {
 		h.logger.Error("create image import job failed", "error", err, "id", imageID)
@@ -804,6 +805,102 @@ func (h *Handler) AdminListVCenterISOs(w http.ResponseWriter, r *http.Request) {
 		"datastore":         h.isoDatastore,
 		"cached":            cached,
 		"cache_age_seconds": age,
+	})
+}
+
+// OVAEntry is one entry in the /admin/vcenter/ovas response: an OVA that
+// came through the image pipeline, plus the source_ref an `ovf` template
+// draft needs.
+//
+// This exists because an imported OVA was previously undiscoverable. The ISO
+// picker excludes OVAs by design (they are never mounted as CD-ROM media),
+// and the templates-folder browser lists VM names with no link back to the
+// upload that produced them — so the vcenter_vm_id an instructor must paste
+// into source_ref was only visible by reading the database.
+type OVAEntry struct {
+	Name     string `json:"name"`
+	ImageID  string `json:"image_id"`
+	Status   string `json:"status"`
+	Disabled bool   `json:"disabled"`
+	// SourceRef is the imported VM's vCenter MoRef (image_uploads.vcenter_vm_id).
+	// Pass it as source_ref on a source_type=ovf draft. Empty while the
+	// import is still in flight or has failed.
+	SourceRef string `json:"source_ref,omitempty"`
+	// Reason explains a disabled entry so the wizard can say why an OVA is
+	// not selectable yet instead of silently greying it out.
+	Reason       string    `json:"reason,omitempty"`
+	ErrorMessage string    `json:"error_message,omitempty"`
+	SizeBytes    int64     `json:"size_bytes,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+// AdminListVCenterOVAs handles GET /api/v1/admin/vcenter/ovas. It lists every
+// OVA known to the image pipeline: imported ones are selectable and carry the
+// source_ref for an `ovf` draft, while in-flight and failed ones are returned
+// disabled with a reason — the same "show it, don't hide it" contract as the
+// ISO picker, so an instructor can see an import in progress rather than
+// wondering whether their upload was lost.
+func (h *Handler) AdminListVCenterOVAs(w http.ResponseWriter, r *http.Request) {
+	if h.imgDB == nil {
+		respondError(w, r, http.StatusServiceUnavailable, "image upload not configured")
+		return
+	}
+
+	rows, err := h.imgDB.ListImageUploadsByStatus(r.Context(), []string{
+		models.ImageUploadUploading,
+		models.ImageUploadUploaded,
+		models.ImageUploadImporting,
+		models.ImageUploadImported,
+		models.ImageUploadError,
+	})
+	if err != nil {
+		h.logger.Error("list image uploads for OVA catalog failed", "error", err)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	ovas := make([]OVAEntry, 0, len(rows))
+	for _, u := range rows {
+		if u.Kind != models.ImageKindOVA {
+			continue
+		}
+		entry := OVAEntry{
+			Name:      u.Filename,
+			ImageID:   u.ID.String(),
+			Status:    u.Status,
+			SizeBytes: u.SizeBytes,
+			CreatedAt: u.CreatedAt,
+		}
+		switch u.Status {
+		case models.ImageUploadImported:
+			// An imported row with no MoRef cannot be used as a source and
+			// is surfaced rather than dropped: silently omitting it would
+			// hide a real inconsistency in the import that wrote it.
+			if u.VCenterVMID == "" {
+				entry.Disabled = true
+				entry.Reason = "import finished without recording a vCenter VM id; re-import this OVA"
+			} else {
+				entry.SourceRef = u.VCenterVMID
+			}
+		case models.ImageUploadError:
+			entry.Disabled = true
+			entry.Reason = "import failed; retry with POST /admin/images/{id}/import"
+			entry.ErrorMessage = u.ErrorMessage
+		default:
+			entry.Disabled = true
+			entry.Reason = "still being uploaded or imported"
+		}
+		ovas = append(ovas, entry)
+	}
+
+	// Deterministic ordering; instructors scan this list visually.
+	sort.Slice(ovas, func(i, j int) bool { return ovas[i].Name < ovas[j].Name })
+
+	respondJSON(w, http.StatusOK, map[string]any{
+		"ovas": ovas,
+		// Echo the draft fields these entries feed, so the caller does not
+		// have to hard-code the coupling between this list and the wizard.
+		"source_type": models.TemplateSourceOVF,
 	})
 }
 
