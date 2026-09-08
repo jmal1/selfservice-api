@@ -1,15 +1,18 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/jmal1/selfservice-api/internal/actionlibrary"
 	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/middleware"
 	"github.com/jmal1/selfservice-api/internal/models"
@@ -115,6 +118,12 @@ func (h *Handler) AdminCreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		respondError(w, r, http.StatusBadRequest, "name and slug are required")
 		return
 	}
+	// The slug goes into URLs and the runner's config. It has the same shape
+	// rule as an action slug, minus the callable requirement.
+	if err := actionlibrary.ValidateSlug(req.Slug); err != nil {
+		respondError(w, r, http.StatusBadRequest, err.Error())
+		return
+	}
 	if req.TimeoutSeconds <= 0 {
 		req.TimeoutSeconds = 300
 	}
@@ -123,6 +132,17 @@ func (h *Handler) AdminCreateWorkflow(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.CreationMode == "" {
 		req.CreationMode = models.CreationModeVisual
+	}
+	// These are Postgres CHECK constraints. Without this, a typo surfaces as a
+	// 500 with the constraint name buried in the API log rather than a message
+	// naming the two legal values.
+	if req.ExecutionMode != models.ExecModeKaliRunner && req.ExecutionMode != models.ExecModeVMwareTools {
+		respondError(w, r, http.StatusBadRequest, fmt.Sprintf("execution_mode must be %q or %q", models.ExecModeKaliRunner, models.ExecModeVMwareTools))
+		return
+	}
+	if req.CreationMode != models.CreationModeVisual && req.CreationMode != models.CreationModeScript {
+		respondError(w, r, http.StatusBadRequest, fmt.Sprintf("creation_mode must be %q or %q", models.CreationModeVisual, models.CreationModeScript))
+		return
 	}
 
 	wf := &models.Workflow{
@@ -365,6 +385,13 @@ func (h *Handler) AdminCreateAction(w http.ResponseWriter, r *http.Request) {
 		respondError(w, r, http.StatusBadRequest, "name and slug are required")
 		return
 	}
+	if req.SupportedPlatforms == nil {
+		req.SupportedPlatforms = json.RawMessage(`["any"]`)
+	}
+	if msg, ok := h.validateLibraryAction(r, req.Slug, req.Script, req.SupportedPlatforms, uuid.Nil); !ok {
+		respondError(w, r, http.StatusBadRequest, msg)
+		return
+	}
 	if req.ActionType == "" {
 		req.ActionType = "command"
 	}
@@ -382,9 +409,6 @@ func (h *Handler) AdminCreateAction(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.OutputContext == nil {
 		req.OutputContext = json.RawMessage("[]")
-	}
-	if req.SupportedPlatforms == nil {
-		req.SupportedPlatforms = json.RawMessage(`["any"]`)
 	}
 
 	action := &models.Action{
@@ -441,6 +465,40 @@ func (h *Handler) AdminUpdateAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The update is a partial COALESCE, so validation has to run against the
+	// merged result rather than the request alone: a new script must be checked
+	// against the existing slug, and a new slug against the existing script.
+	if req.Slug != nil || req.Script != nil || req.SupportedPlatforms != nil {
+		existing, err := h.db.GetLibraryAction(r.Context(), id)
+		if err != nil {
+			respondError(w, r, http.StatusNotFound, "action not found")
+			return
+		}
+		slug := ""
+		if existing.Slug != nil {
+			slug = *existing.Slug
+		}
+		if req.Slug != nil {
+			slug = *req.Slug
+		}
+		script := existing.Script
+		if req.Script != nil {
+			script = *req.Script
+		}
+		platforms := existing.SupportedPlatforms
+		if req.SupportedPlatforms != nil {
+			platforms = *req.SupportedPlatforms
+		}
+		if msg, ok := h.validateLibraryAction(r, slug, script, platforms, id); !ok {
+			respondError(w, r, http.StatusBadRequest, msg)
+			return
+		}
+		if msg, ok := h.validateActionSlugRename(r, existing.Slug, req.Slug); !ok {
+			respondError(w, r, http.StatusConflict, msg)
+			return
+		}
+	}
+
 	// Convert json.RawMessage pointer to string pointer for the COALESCE query
 	var paramsStr *string
 	if req.Params != nil {
@@ -457,6 +515,76 @@ func (h *Handler) AdminUpdateAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	respondJSON(w, http.StatusOK, map[string]string{"status": "updated"})
+}
+
+// validateLibraryAction rejects an action that would break the generated action
+// library rather than merely fail on its own.
+//
+// The generated library is one bash file sourced by every runner pod, and
+// buildActionLibrary refuses to render it at all if any slug is unusable or two
+// slugs collide. So a single malformed action does not produce one red check --
+// it produces a total, unattributable failure of every assessment in flight.
+// These three checks are the same ones the engine and the runner perform, moved
+// forward to the one moment where a human is present to read the error.
+//
+// Returns a client-facing message and false when the action must be rejected.
+func (h *Handler) validateLibraryAction(r *http.Request, slug, script string, platforms json.RawMessage, excludeID uuid.UUID) (string, bool) {
+	if err := actionlibrary.ValidateSlug(slug); err != nil {
+		return err.Error(), false
+	}
+	callable, err := actionlibrary.CallableName(slug)
+	if err != nil {
+		return err.Error(), false
+	}
+
+	conflict, err := h.db.LibraryActionCallableConflict(r.Context(), callable, excludeID)
+	if err != nil {
+		h.logger.Error("failed to check action callable conflict", "error", err)
+		return "failed to validate action slug", false
+	}
+	if conflict != "" {
+		return fmt.Sprintf("slug %q generates the same runner function %q as existing action %q; one of them must be renamed", slug, callable, conflict), false
+	}
+
+	// A windows action's body is PowerShell and is excluded from the bash
+	// library entirely, so bash-parsing it would reject every legitimate one.
+	if bytes.Contains(platforms, []byte(`"windows"`)) {
+		return "", true
+	}
+	if err := actionlibrary.ValidateBody(callable, script); err != nil {
+		return err.Error(), false
+	}
+	return "", true
+}
+
+// validateActionSlugRename blocks a rename that would silently break workflows.
+//
+// The slug is the only handle a workflow script has on an action: renaming it
+// renames the generated shell function, and every workflow still calling the
+// old name fails with exit 127 at run time, inside a student's assessment.
+// Nothing else in the system would notice, because there is no foreign key
+// between a workflow's bash and the action catalog.
+func (h *Handler) validateActionSlugRename(r *http.Request, existing, requested *string) (string, bool) {
+	if requested == nil || existing == nil || *requested == *existing {
+		return "", true
+	}
+	oldCallable, err := actionlibrary.CallableName(*existing)
+	if err != nil {
+		// The old slug was never callable, so nothing can be referencing it.
+		return "", true
+	}
+	callers, err := h.db.WorkflowsCallingAction(r.Context(), oldCallable)
+	if err != nil {
+		h.logger.Error("failed to check workflows calling action", "error", err)
+		return "failed to validate slug rename", false
+	}
+	if len(callers) == 0 {
+		return "", true
+	}
+	return fmt.Sprintf(
+		"cannot rename slug %q to %q: %d workflow(s) still call %s(), including %s. Update those scripts first, or create a new action and retire this one.",
+		*existing, *requested, len(callers), oldCallable, strings.Join(callers, ", "),
+	), false
 }
 
 func (h *Handler) AdminDeleteAction(w http.ResponseWriter, r *http.Request) {
