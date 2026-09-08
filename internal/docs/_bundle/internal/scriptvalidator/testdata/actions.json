@@ -1,0 +1,1735 @@
+[
+  {
+    "slug": "account-locked",
+    "name": "Account Password Locked",
+    "action_type": "command",
+    "action_category": "system",
+    "input_context": [
+      {
+        "key": "name",
+        "type": "string",
+        "description": "login name"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "linux"
+    ],
+    "script": "\nlocal name=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --name) name=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$name\" ]]; then\n    LAST_ERROR=\"account-locked requires --name\"\n    return 2\nfi\n# `passwd -S` is used rather than reading /etc/shadow, so the hash itself never\n# crosses the wire or reaches instructor_output. The status letter is L\n# (locked), P (usable password) or NP (no password at all).\nlocal status field\nstatus=$(crucible_ssh_sudo passwd -S \"$name\" 2\u003e\u00261) || status=\"\"\nif [[ -z \"$status\" || \"$status\" == *\"does not exist\"* ]]; then\n    LAST_ERROR=\"Could not read password status for $name on $CRUCIBLE_TARGET_IP: $status\"\n    LAST_STUDENT_MSG=\"The account '$name' does not exist, so its password status could not be checked.\"\n    return 1\nfi\nfield=$(awk '{print $2}' \u003c\u003c\u003c\"$status\")\nif [[ \"$field\" == \"L\" ]]; then\n    return 0\nfi\nif [[ \"$field\" == \"NP\" ]]; then\n    LAST_ERROR=\"Account $name has NO password set at all (status NP)\"\n    LAST_STUDENT_MSG=\"The account '$name' has no password at all, which is worse than a weak one. Lock it with: sudo passwd -l $name\"\n    return 1\nfi\nLAST_ERROR=\"Account $name is not locked (passwd -S status: $field)\"\nLAST_STUDENT_MSG=\"The account '$name' can still log in with a password. Lock it with: sudo passwd -l $name\"\nreturn 1\n"
+  },
+  {
+    "slug": "command-check",
+    "name": "Command Check",
+    "action_type": "command",
+    "action_category": "general",
+    "input_context": [
+      {
+        "key": "cmd",
+        "type": "string",
+        "description": "Shell command to execute"
+      },
+      {
+        "key": "expect_output",
+        "type": "string",
+        "description": "Expected substring in output"
+      },
+      {
+        "key": "expect_exit",
+        "type": "number",
+        "description": "Expected exit code (default 0)"
+      }
+    ],
+    "output_context": [
+      {
+        "key": "command_output",
+        "type": "string",
+        "description": "Command stdout+stderr"
+      },
+      {
+        "key": "command_exit_code",
+        "type": "number",
+        "description": "Exit code"
+      }
+    ],
+    "supported_platforms": [
+      "linux"
+    ],
+    "script": "\nlocal cmd=\"\" expect_output=\"\" expect_exit=0\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --cmd) cmd=\"$2\"; shift 2;;\n        --expect-output) expect_output=\"$2\"; shift 2;;\n        --expect-exit) expect_exit=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nlocal output exit_code=0\noutput=$(eval \"$cmd\" 2\u003e\u00261) || exit_code=$?\nctx_set \"command_output\" \"$output\"\nctx_set \"command_exit_code\" \"$exit_code\"\nif [[ \"$exit_code\" != \"$expect_exit\" ]]; then\n    LAST_ERROR=\"Command exited $exit_code (expected $expect_exit)\"\n    return 1\nfi\nif [[ -n \"$expect_output\" \u0026\u0026 \"$output\" != *\"$expect_output\"* ]]; then\n    LAST_ERROR=\"Output does not contain '$expect_output'\"\n    return 1\nfi\nreturn 0\n"
+  },
+  {
+    "slug": "cron-entry-absent",
+    "name": "No Matching Cron Entry",
+    "action_type": "command",
+    "action_category": "system",
+    "input_context": [
+      {
+        "key": "pattern",
+        "type": "string",
+        "description": "extended regex matched against every crontab line"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "linux"
+    ],
+    "script": "\nlocal pattern=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --pattern) pattern=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$pattern\" ]]; then\n    LAST_ERROR=\"cron-entry-absent requires --pattern\"\n    return 2\nfi\n# Both the system crontabs and per-user spools; a backdoor lives in whichever\n# one the author did not think to check.\nlocal hits\nhits=$(crucible_ssh_sudo grep -rEl -- \"$pattern\" /etc/crontab /etc/cron.d /var/spool/cron 2\u003e/dev/null \\\n    | head -10 | tr -d '\\r' | tr '\\n' ' ') || hits=\"\"\nhits=\"${hits%% }\"\nif [[ -z \"$hits\" ]]; then\n    return 0\nfi\nLAST_ERROR=\"Cron entries matching '$pattern' found in: $hits\"\nLAST_STUDENT_MSG=\"A scheduled task matching '$pattern' is still present in: $hits. Remove it.\"\nreturn 1\n"
+  },
+  {
+    "slug": "directory-listing-disabled",
+    "name": "Directory Listing Disabled",
+    "action_type": "http",
+    "action_category": "web",
+    "input_context": [
+      {
+        "key": "url",
+        "type": "string",
+        "description": "directory URL to request, e.g. http://host/uploads/"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "any"
+    ],
+    "script": "\nlocal url=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --url) url=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$url\" ]]; then\n    LAST_ERROR=\"directory-listing-disabled requires --url\"\n    return 2\nfi\nlocal body status\nstatus=$(curl -sS -k -L --max-time 10 -o /dev/null -w '%{http_code}' \"$url\" 2\u003e/dev/null) || status=\"000\"\nif [[ \"$status\" == \"000\" ]]; then\n    LAST_ERROR=\"No response from $url\"\n    LAST_STUDENT_MSG=\"No response from $url. Is the web server running?\"\n    return 1\nfi\n# 403 or 404 is the desired outcome: the server is refusing rather than\n# enumerating.\nif [[ \"$status\" == \"403\" || \"$status\" == \"404\" ]]; then\n    return 0\nfi\nbody=$(curl -sS -k -L --max-time 10 \"$url\" 2\u003e/dev/null | head -c 8192) || body=\"\"\n# The three stock auto-index banners: Apache, nginx and lighttpd.\nif grep -qiE '\u003ctitle\u003eIndex of |\u003ch1\u003eIndex of |Directory listing for ' \u003c\u003c\u003c\"$body\"; then\n    LAST_ERROR=\"$url returns an auto-generated directory index\"\n    LAST_STUDENT_MSG=\"Browsing $url lists the directory's contents. Turn off automatic indexing (Apache: Options -Indexes; nginx: autoindex off).\"\n    return 1\nfi\nreturn 0\n"
+  },
+  {
+    "slug": "dns-resolves",
+    "name": "DNS Resolution",
+    "action_type": "dns",
+    "action_category": "network",
+    "input_context": [
+      {
+        "key": "hostname",
+        "type": "string",
+        "description": "Hostname to resolve"
+      },
+      {
+        "key": "server",
+        "type": "string",
+        "description": "DNS server to query (optional)"
+      },
+      {
+        "key": "expect_ip",
+        "type": "string",
+        "description": "Expected IP address (optional)"
+      }
+    ],
+    "output_context": [
+      {
+        "key": "dns_result",
+        "type": "string",
+        "description": "Resolved IP address"
+      }
+    ],
+    "supported_platforms": [
+      "any"
+    ],
+    "script": "\nlocal hostname=\"\" server=\"\" expect_ip=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --hostname) hostname=\"$2\"; shift 2;;\n        --server) server=\"$2\"; shift 2;;\n        --expect-ip) expect_ip=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nlocal result\nif [[ -n \"$server\" ]]; then\n    result=$(dig +short \"$hostname\" @\"$server\" 2\u003e/dev/null | head -1)\nelse\n    result=$(dig +short \"$hostname\" 2\u003e/dev/null | head -1)\nfi\nctx_set \"dns_result\" \"$result\"\nif [[ -z \"$result\" ]]; then\n    LAST_ERROR=\"DNS lookup failed for $hostname\"\n    LAST_STUDENT_MSG=\"$hostname does not resolve. Check your DNS configuration.\"\n    return 1\nfi\nif [[ -n \"$expect_ip\" \u0026\u0026 \"$result\" != \"$expect_ip\" ]]; then\n    LAST_ERROR=\"$hostname resolved to $result, expected $expect_ip\"\n    LAST_STUDENT_MSG=\"$hostname resolves to $result but should resolve to $expect_ip\"\n    return 1\nfi\nreturn 0\n"
+  },
+  {
+    "slug": "dns-server-refuses-recursion",
+    "name": "DNS Server Refuses Open Recursion",
+    "action_type": "dns",
+    "action_category": "network",
+    "input_context": [
+      {
+        "key": "host",
+        "type": "string",
+        "description": "DNS server to query, defaults to CRUCIBLE_TARGET_IP"
+      },
+      {
+        "key": "probe",
+        "type": "string",
+        "description": "name to attempt to resolve; defaults to a name the server cannot be authoritative for"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "any"
+    ],
+    "script": "\nlocal host=\"${CRUCIBLE_TARGET_IP:-}\" probe=\"recursion-probe.invalid\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --host) host=\"$2\"; shift 2;;\n        --probe) probe=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$host\" ]]; then\n    LAST_ERROR=\"dns-server-refuses-recursion requires --host or CRUCIBLE_TARGET_IP\"\n    return 2\nfi\nif ! nc -zuw3 \"$host\" 53 2\u003e/dev/null \u0026\u0026 ! nc -zw3 \"$host\" 53 2\u003e/dev/null; then\n    LAST_ERROR=\"Nothing is listening on ${host}:53\"\n    LAST_STUDENT_MSG=\"No DNS service is reachable on $host, so its recursion policy could not be checked.\"\n    return 1\nfi\n# The `ra` flag in the response header is the server saying \"recursion\n# available\", which is the property being asserted -- not whether this\n# particular name happened to resolve. The probe name is .invalid, which by\n# RFC 6761 can never exist, so nothing leaves the lab VLAN looking for it.\nlocal out\nout=$(dig +time=3 +tries=1 \"@${host}\" \"$probe\" A 2\u003e\u00261) || true\nif grep -qE '^;; flags:.*[[:space:]]ra([[:space:]]|;)' \u003c\u003c\u003c\"$out\"; then\n    LAST_ERROR=\"$host advertises recursion available to any client\"\n    LAST_STUDENT_MSG=\"Your DNS server offers recursive resolution to anyone, which makes it usable for amplification attacks. Restrict recursion to your own network.\"\n    return 1\nfi\nif grep -qi 'connection timed out; no servers could be reached' \u003c\u003c\u003c\"$out\"; then\n    LAST_ERROR=\"No DNS response from $host: $out\"\n    LAST_STUDENT_MSG=\"Your DNS server did not respond on port 53.\"\n    return 1\nfi\nreturn 0\n"
+  },
+  {
+    "slug": "file-contains",
+    "name": "File Contains",
+    "action_type": "file_check",
+    "action_category": "file",
+    "input_context": [
+      {
+        "key": "path",
+        "type": "string",
+        "description": "absolute path on the target"
+      },
+      {
+        "key": "value",
+        "type": "string",
+        "description": "literal string, or an extended regex when --regex is given"
+      },
+      {
+        "key": "regex",
+        "type": "boolean",
+        "description": "flag with no value; treat --value as an extended regex"
+      },
+      {
+        "key": "sudo",
+        "type": "boolean",
+        "description": "flag with no value; read the file as root"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "linux"
+    ],
+    "script": "\nlocal path=\"\" value=\"\" regex=false use_sudo=false\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --path) path=\"$2\"; shift 2;;\n        --value) value=\"$2\"; shift 2;;\n        --regex) regex=true; shift;;\n        --sudo) use_sudo=true; shift;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$path\" || -z \"$value\" ]]; then\n    LAST_ERROR=\"file-contains requires --path and --value\"\n    return 2\nfi\nlocal -a grep_cmd=(grep -q)\nif $regex; then grep_cmd+=(-E); else grep_cmd+=(-F); fi\ngrep_cmd+=(-- \"$value\" \"$path\")\n\nlocal rc=0\nif $use_sudo; then\n    crucible_ssh_sudo test -r \"$path\" \u003e/dev/null 2\u003e\u00261 || rc=$?\nelse\n    crucible_ssh test -r \"$path\" \u003e/dev/null 2\u003e\u00261 || rc=$?\nfi\nif [[ $rc -ne 0 ]]; then\n    LAST_ERROR=\"Cannot read $path on $CRUCIBLE_TARGET_IP (ssh/test exit $rc)\"\n    LAST_STUDENT_MSG=\"The file $path does not exist or is not readable.\"\n    return 1\nfi\n\nrc=0\nif $use_sudo; then\n    crucible_ssh_sudo \"${grep_cmd[@]}\" \u003e/dev/null 2\u003e\u00261 || rc=$?\nelse\n    crucible_ssh \"${grep_cmd[@]}\" \u003e/dev/null 2\u003e\u00261 || rc=$?\nfi\nif [[ $rc -eq 0 ]]; then\n    return 0\nfi\nLAST_ERROR=\"$path does not match '$value' on $CRUCIBLE_TARGET_IP\"\nLAST_STUDENT_MSG=\"Expected to find '$value' in $path\"\nreturn 1\n"
+  },
+  {
+    "slug": "file-owner",
+    "name": "File Owner",
+    "action_type": "file_check",
+    "action_category": "file",
+    "input_context": [
+      {
+        "key": "path",
+        "type": "string",
+        "description": "absolute path on the target"
+      },
+      {
+        "key": "owner",
+        "type": "string",
+        "description": "expected owning user"
+      },
+      {
+        "key": "group",
+        "type": "string",
+        "description": "expected owning group; optional"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "linux"
+    ],
+    "script": "\nlocal path=\"\" owner=\"\" group=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --path) path=\"$2\"; shift 2;;\n        --owner) owner=\"$2\"; shift 2;;\n        --group) group=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$path\" || -z \"$owner\" ]]; then\n    LAST_ERROR=\"file-owner requires --path and --owner\"\n    return 2\nfi\nlocal found\nfound=$(crucible_ssh_sudo stat -c '%U:%G' \"$path\" 2\u003e/dev/null | tr -d '\\r') || found=\"\"\nif [[ -z \"$found\" ]]; then\n    LAST_ERROR=\"Cannot stat $path on $CRUCIBLE_TARGET_IP\"\n    LAST_STUDENT_MSG=\"The file $path does not exist.\"\n    return 1\nfi\nlocal found_owner=\"${found%%:*}\" found_group=\"${found##*:}\"\nif [[ \"$found_owner\" != \"$owner\" ]]; then\n    LAST_ERROR=\"$path is owned by $found_owner, expected $owner\"\n    LAST_STUDENT_MSG=\"The file $path should be owned by $owner but is owned by $found_owner. Run: sudo chown $owner $path\"\n    return 1\nfi\nif [[ -n \"$group\" \u0026\u0026 \"$found_group\" != \"$group\" ]]; then\n    LAST_ERROR=\"$path has group $found_group, expected $group\"\n    LAST_STUDENT_MSG=\"The file $path should have group $group but has $found_group. Run: sudo chgrp $group $path\"\n    return 1\nfi\nreturn 0\n"
+  },
+  {
+    "slug": "file-permissions",
+    "name": "File Permissions",
+    "action_type": "file_check",
+    "action_category": "file",
+    "input_context": [
+      {
+        "key": "path",
+        "type": "string",
+        "description": "absolute path on the target"
+      },
+      {
+        "key": "mode",
+        "type": "string",
+        "description": "expected octal mode, e.g. 600"
+      },
+      {
+        "key": "at-most",
+        "type": "boolean",
+        "description": "flag with no value; pass when the mode grants no MORE than --mode"
+      }
+    ],
+    "output_context": [
+      {
+        "key": "mode_\u003cpath\u003e",
+        "type": "string",
+        "description": "the octal mode that was found"
+      }
+    ],
+    "supported_platforms": [
+      "linux"
+    ],
+    "script": "\nlocal path=\"\" mode=\"\" at_most=false\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --path) path=\"$2\"; shift 2;;\n        --mode) mode=\"$2\"; shift 2;;\n        --at-most) at_most=true; shift;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$path\" || -z \"$mode\" ]]; then\n    LAST_ERROR=\"file-permissions requires --path and --mode\"\n    return 2\nfi\nlocal found\nfound=$(crucible_ssh_sudo stat -c '%a' \"$path\" 2\u003e/dev/null | tr -d '\\r') || found=\"\"\nif [[ -z \"$found\" ]]; then\n    LAST_ERROR=\"Cannot stat $path on $CRUCIBLE_TARGET_IP\"\n    LAST_STUDENT_MSG=\"The file $path does not exist.\"\n    return 1\nfi\nctx_set \"mode_${path//\\//_}\" \"$found\"\nif [[ \"$found\" == \"$mode\" ]]; then\n    return 0\nfi\nif $at_most; then\n    # \"No more permissive than\" is a bitwise question, not a numeric one: 0640\n    # is not \u003c= 0600 as an integer, but it grants group read that 0600 does\n    # not. Any bit set in `found` that is clear in `mode` is an excess grant.\n    local excess=$(( 8#$found \u0026 ~8#$mode ))\n    if [[ \"$excess\" -eq 0 ]]; then\n        return 0\n    fi\n    LAST_ERROR=\"$path is mode $found, which grants more than $mode\"\n    LAST_STUDENT_MSG=\"The file $path is mode $found, which is more permissive than $mode. Run: sudo chmod $mode $path\"\n    return 1\nfi\nLAST_ERROR=\"$path is mode $found, expected $mode\"\nLAST_STUDENT_MSG=\"The file $path should be mode $mode but is $found. Run: sudo chmod $mode $path\"\nreturn 1\n"
+  },
+  {
+    "slug": "ftp-anonymous-denied",
+    "name": "Anonymous FTP Denied",
+    "action_type": "command",
+    "action_category": "network",
+    "input_context": [
+      {
+        "key": "host",
+        "type": "string",
+        "description": "target host, defaults to CRUCIBLE_TARGET_IP"
+      },
+      {
+        "key": "port",
+        "type": "string",
+        "description": "FTP port; defaults to 21"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "any"
+    ],
+    "script": "\nlocal host=\"${CRUCIBLE_TARGET_IP:-}\" port=\"21\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --host) host=\"$2\"; shift 2;;\n        --port) port=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$host\" ]]; then\n    LAST_ERROR=\"ftp-anonymous-denied requires --host or CRUCIBLE_TARGET_IP\"\n    return 2\nfi\nif ! nc -zw3 \"$host\" \"$port\" 2\u003e/dev/null; then\n    # No FTP service is the strongest possible form of \"anonymous FTP is\n    # denied\", so this is a pass, but it is worth saying which one happened.\n    ctx_set \"ftp_state\" \"closed\"\n    return 0\nfi\n# nmap's ftp-anon script does the login dance correctly, including the PASV\n# negotiation a hand-rolled nc conversation gets wrong.\nlocal out\nout=$(nmap -Pn -p \"$port\" --script ftp-anon --host-timeout 20s \"$host\" 2\u003e\u00261) || true\nif grep -qi 'Anonymous FTP login allowed' \u003c\u003c\u003c\"$out\"; then\n    LAST_ERROR=\"Anonymous FTP login is allowed on ${host}:${port}\"\n    LAST_STUDENT_MSG=\"Anyone can log into your FTP server as 'anonymous'. Disable anonymous access in the FTP server configuration.\"\n    return 1\nfi\nreturn 0\n"
+  },
+  {
+    "slug": "git-clone",
+    "name": "Git Clone",
+    "action_type": "command",
+    "action_category": "general",
+    "input_context": [
+      {
+        "key": "url",
+        "type": "string",
+        "description": "Git repository URL"
+      },
+      {
+        "key": "dest",
+        "type": "string",
+        "description": "Clone destination path (optional)"
+      }
+    ],
+    "output_context": [
+      {
+        "key": "git_repo_path",
+        "type": "string",
+        "description": "Path to cloned repo"
+      }
+    ],
+    "supported_platforms": [
+      "linux"
+    ],
+    "script": "\nlocal url=\"\" dest=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --url) url=\"$2\"; shift 2;;\n        --dest) dest=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\ndest=\"${dest:-$CRUCIBLE_WORKDIR/repo}\"\nif git clone \"$url\" \"$dest\" 2\u003e/dev/null; then\n    ctx_set \"git_repo_path\" \"$dest\"\n    return 0\nelse\n    LAST_ERROR=\"Git clone failed: $url\"\n    LAST_STUDENT_MSG=\"Cannot clone from $url. Is the Git server running?\"\n    return 1\nfi\n"
+  },
+  {
+    "slug": "git-push",
+    "name": "Git Push",
+    "action_type": "command",
+    "action_category": "general",
+    "input_context": [
+      {
+        "key": "repo",
+        "type": "string",
+        "description": "Repo path (or uses git_repo_path from context)"
+      },
+      {
+        "key": "file",
+        "type": "string",
+        "description": "File to modify"
+      },
+      {
+        "key": "content",
+        "type": "string",
+        "description": "Content to append"
+      },
+      {
+        "key": "message",
+        "type": "string",
+        "description": "Commit message"
+      },
+      {
+        "key": "branch",
+        "type": "string",
+        "description": "Branch name (default: main)"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "linux"
+    ],
+    "script": "\nlocal repo=\"\" file=\"\" content=\"\" message=\"\" branch=\"main\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --repo) repo=\"$2\"; shift 2;;\n        --file) file=\"$2\"; shift 2;;\n        --content) content=\"$2\"; shift 2;;\n        --message) message=\"$2\"; shift 2;;\n        --branch) branch=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nrepo=\"${repo:-$(ctx_get git_repo_path)}\"\ncd \"$repo\" || return 1\necho \"$content\" \u003e\u003e \"$file\"\ngit add \"$file\" \u0026\u0026 git commit -m \"$message\" 2\u003e/dev/null \u0026\u0026 git push origin \"$branch\" 2\u003e/dev/null\nlocal rc=$?\nif [ $rc -ne 0 ]; then\n    LAST_ERROR=\"Git push failed\"\n    LAST_STUDENT_MSG=\"Could not push to remote. Check authentication and permissions.\"\nfi\nreturn $rc\n"
+  },
+  {
+    "slug": "host-responds-to-ping",
+    "name": "Host Responds To Ping",
+    "action_type": "command",
+    "action_category": "network",
+    "input_context": [
+      {
+        "key": "host",
+        "type": "string",
+        "description": "target host, defaults to CRUCIBLE_TARGET_IP"
+      },
+      {
+        "key": "absent",
+        "type": "boolean",
+        "description": "flag with no value; assert the host does NOT answer"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "any"
+    ],
+    "script": "\nlocal host=\"${CRUCIBLE_TARGET_IP:-}\" want_absent=false\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --host) host=\"$2\"; shift 2;;\n        --absent) want_absent=true; shift;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$host\" ]]; then\n    LAST_ERROR=\"host-responds-to-ping requires --host or CRUCIBLE_TARGET_IP\"\n    return 2\nfi\nlocal alive=false\nif ping -c 2 -W 3 \"$host\" \u003e/dev/null 2\u003e\u00261; then\n    alive=true\nfi\nif $want_absent; then\n    if $alive; then\n        LAST_ERROR=\"$host still answers ICMP echo\"\n        LAST_STUDENT_MSG=\"Your host still responds to ping. Block ICMP echo requests if the task asks you to.\"\n        return 1\n    fi\n    return 0\nfi\nif $alive; then\n    return 0\nfi\nLAST_ERROR=\"$host does not answer ICMP echo\"\nLAST_STUDENT_MSG=\"Your host is not reachable on the network. Check that it is powered on and its network interface is up.\"\nreturn 1\n"
+  },
+  {
+    "slug": "http-auth-required",
+    "name": "HTTP Endpoint Requires Authentication",
+    "action_type": "http",
+    "action_category": "web",
+    "input_context": [
+      {
+        "key": "url",
+        "type": "string",
+        "description": "full URL to request"
+      }
+    ],
+    "output_context": [
+      {
+        "key": "http_auth_status",
+        "type": "string",
+        "description": "the status code returned"
+      }
+    ],
+    "supported_platforms": [
+      "any"
+    ],
+    "script": "\nlocal url=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --url) url=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$url\" ]]; then\n    LAST_ERROR=\"http-auth-required requires --url\"\n    return 2\nfi\n# No -L: a 302 to a login page is a redirect, not a refusal, and following it\n# would turn the login page's own 200 into a false pass.\nlocal status\nstatus=$(curl -sS -k --max-time 10 -o /dev/null -w '%{http_code}' \"$url\" 2\u003e/dev/null) || status=\"000\"\nctx_set \"http_auth_status\" \"$status\"\nif [[ \"$status\" == \"401\" || \"$status\" == \"403\" ]]; then\n    return 0\nfi\nif [[ \"$status\" == \"000\" ]]; then\n    LAST_ERROR=\"No response from $url\"\n    LAST_STUDENT_MSG=\"No response from $url. Is the web server running?\"\n    return 1\nfi\nLAST_ERROR=\"$url returned $status to an unauthenticated request, expected 401 or 403\"\nLAST_STUDENT_MSG=\"Anyone can reach $url without logging in (it returned $status). Require authentication for this path.\"\nreturn 1\n"
+  },
+  {
+    "slug": "http-credentials-rejected",
+    "name": "Default Credentials Rejected",
+    "action_type": "http",
+    "action_category": "web",
+    "input_context": [
+      {
+        "key": "url",
+        "type": "string",
+        "description": "full URL protected by HTTP basic auth"
+      },
+      {
+        "key": "user",
+        "type": "string",
+        "description": "username that must be rejected"
+      },
+      {
+        "key": "pass",
+        "type": "string",
+        "description": "password that must be rejected"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "any"
+    ],
+    "script": "\nlocal url=\"\" user=\"\" pass=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --url) url=\"$2\"; shift 2;;\n        --user) user=\"$2\"; shift 2;;\n        --pass) pass=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$url\" || -z \"$user\" ]]; then\n    LAST_ERROR=\"http-credentials-rejected requires --url and --user\"\n    return 2\nfi\nlocal status\nstatus=$(curl -sS -k --max-time 10 -o /dev/null -w '%{http_code}' -u \"${user}:${pass}\" \"$url\" 2\u003e/dev/null) || status=\"000\"\nif [[ \"$status\" == \"000\" ]]; then\n    LAST_ERROR=\"No response from $url\"\n    LAST_STUDENT_MSG=\"No response from $url. Is the web server running?\"\n    return 1\nfi\nif [[ \"$status\" == \"401\" || \"$status\" == \"403\" ]]; then\n    return 0\nfi\n# The password is deliberately not echoed into instructor_output.\nLAST_ERROR=\"$url accepted user '$user' with the default password (status $status)\"\nLAST_STUDENT_MSG=\"The default credentials for '$user' still work on $url. Change that account's password.\"\nreturn 1\n"
+  },
+  {
+    "slug": "http-get",
+    "name": "HTTP GET Check",
+    "action_type": "http",
+    "action_category": "network",
+    "input_context": [
+      {
+        "key": "url",
+        "type": "string",
+        "description": "URL to request"
+      },
+      {
+        "key": "expect_status",
+        "type": "string",
+        "description": "Expected HTTP status code"
+      },
+      {
+        "key": "expect_body",
+        "type": "string",
+        "description": "Expected substring in response body"
+      },
+      {
+        "key": "cookies",
+        "type": "string",
+        "description": "Cookie jar name to send"
+      },
+      {
+        "key": "save_cookies",
+        "type": "string",
+        "description": "Cookie jar name to save to"
+      }
+    ],
+    "output_context": [
+      {
+        "key": "last_http_status",
+        "type": "string",
+        "description": "HTTP status code received"
+      },
+      {
+        "key": "last_http_body_length",
+        "type": "number",
+        "description": "Response body length"
+      },
+      {
+        "key": "last_http_url",
+        "type": "string",
+        "description": "Requested URL"
+      }
+    ],
+    "supported_platforms": [
+      "any"
+    ],
+    "script": "\nlocal url=\"\" expect_status=\"\" expect_body=\"\" cookies=\"\" save_cookies=\"\" timeout=10\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --url) url=\"$2\"; shift 2;;\n        --expect-status) expect_status=\"$2\"; shift 2;;\n        --expect-body) expect_body=\"$2\"; shift 2;;\n        --cookies) cookies=\"$2\"; shift 2;;\n        --save-cookies) save_cookies=\"$2\"; shift 2;;\n        --timeout) timeout=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\n\nlocal curl_args=(-s -o /tmp/response_body -w \"%{http_code}\" --max-time \"$timeout\")\n[[ -n \"$cookies\" ]] \u0026\u0026 curl_args+=(-b \"/tmp/cookies_${cookies}\")\n[[ -n \"$save_cookies\" ]] \u0026\u0026 curl_args+=(-c \"/tmp/cookies_${save_cookies}\")\n\nlocal status_code\nstatus_code=$(curl \"${curl_args[@]}\" \"$url\")\nlocal body=$(cat /tmp/response_body)\n\nctx_set \"last_http_status\" \"$status_code\"\nctx_set \"last_http_body_length\" \"${#body}\"\nctx_set \"last_http_url\" \"$url\"\n\nif [[ -n \"$expect_status\" \u0026\u0026 \"$status_code\" != \"$expect_status\" ]]; then\n    LAST_ERROR=\"Expected HTTP $expect_status, got $status_code\"\n    LAST_STUDENT_MSG=\"Web server returned $status_code instead of $expect_status for $url\"\n    return 1\nfi\nif [[ -n \"$expect_body\" \u0026\u0026 \"$body\" != *\"$expect_body\"* ]]; then\n    LAST_ERROR=\"Response body does not contain '$expect_body'\"\n    LAST_STUDENT_MSG=\"Expected '$expect_body' in the response from $url\"\n    return 1\nfi\nreturn 0\n"
+  },
+  {
+    "slug": "http-header-absent",
+    "name": "HTTP Response Header Absent",
+    "action_type": "http",
+    "action_category": "network",
+    "input_context": [
+      {
+        "key": "url",
+        "type": "string",
+        "description": "full URL to request"
+      },
+      {
+        "key": "header",
+        "type": "string",
+        "description": "header name, matched case-insensitively"
+      },
+      {
+        "key": "value",
+        "type": "string",
+        "description": "only fail when the value matches this regex; optional"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "any"
+    ],
+    "script": "\nlocal url=\"\" header=\"\" value=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --url) url=\"$2\"; shift 2;;\n        --header) header=\"$2\"; shift 2;;\n        --value) value=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$url\" || -z \"$header\" ]]; then\n    LAST_ERROR=\"http-header-absent requires --url and --header\"\n    return 2\nfi\nlocal headers found\nheaders=$(curl -sS -k -I -L --max-time 10 \"$url\" 2\u003e\u00261) || headers=\"\"\nif [[ -z \"$headers\" ]]; then\n    LAST_ERROR=\"No response from $url\"\n    LAST_STUDENT_MSG=\"No response from $url. Is the web server running?\"\n    return 1\nfi\nfound=$(grep -iE \"^${header}:\" \u003c\u003c\u003c\"$headers\" | tail -1 | cut -d: -f2- | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')\nif [[ -z \"$found\" ]]; then\n    return 0\nfi\nif [[ -n \"$value\" ]] \u0026\u0026 ! grep -qE -- \"$value\" \u003c\u003c\u003c\"$found\"; then\n    return 0\nfi\nLAST_ERROR=\"$url still sends $header: $found\"\nLAST_STUDENT_MSG=\"Your web server still sends the $header header ('$found'), which tells an attacker what software and version you run. Suppress it in your server configuration.\"\nreturn 1\n"
+  },
+  {
+    "slug": "http-header-present",
+    "name": "HTTP Response Header Present",
+    "action_type": "http",
+    "action_category": "network",
+    "input_context": [
+      {
+        "key": "url",
+        "type": "string",
+        "description": "full URL to request"
+      },
+      {
+        "key": "header",
+        "type": "string",
+        "description": "header name, matched case-insensitively"
+      },
+      {
+        "key": "value",
+        "type": "string",
+        "description": "extended regex the header value must match; optional"
+      }
+    ],
+    "output_context": [
+      {
+        "key": "header_\u003cname\u003e",
+        "type": "string",
+        "description": "the header value that was found"
+      }
+    ],
+    "supported_platforms": [
+      "any"
+    ],
+    "script": "\nlocal url=\"\" header=\"\" value=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --url) url=\"$2\"; shift 2;;\n        --header) header=\"$2\"; shift 2;;\n        --value) value=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$url\" || -z \"$header\" ]]; then\n    LAST_ERROR=\"http-header-present requires --url and --header\"\n    return 2\nfi\n# -k because a student's lab TLS certificate is self-signed by definition and\n# rejecting it would make every header check fail for the wrong reason.\nlocal headers found\nheaders=$(curl -sS -k -I -L --max-time 10 \"$url\" 2\u003e\u00261) || headers=\"\"\nif [[ -z \"$headers\" ]]; then\n    LAST_ERROR=\"No response from $url\"\n    LAST_STUDENT_MSG=\"No response from $url. Is the web server running?\"\n    return 1\nfi\nfound=$(grep -iE \"^${header}:\" \u003c\u003c\u003c\"$headers\" | tail -1 | cut -d: -f2- | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')\nctx_set \"header_${header,,}\" \"$found\"\nif [[ -z \"$found\" ]]; then\n    LAST_ERROR=\"$url does not send a $header header\"\n    LAST_STUDENT_MSG=\"The response from $url is missing the $header header. Add it to your web server configuration.\"\n    return 1\nfi\nif [[ -n \"$value\" ]] \u0026\u0026 ! grep -qE -- \"$value\" \u003c\u003c\u003c\"$found\"; then\n    LAST_ERROR=\"$header on $url is '$found', which does not match '$value'\"\n    LAST_STUDENT_MSG=\"The $header header is '$found' but should match '$value'.\"\n    return 1\nfi\nreturn 0\n"
+  },
+  {
+    "slug": "http-post",
+    "name": "HTTP POST",
+    "action_type": "http",
+    "action_category": "network",
+    "input_context": [
+      {
+        "key": "url",
+        "type": "string",
+        "description": "URL to POST to"
+      },
+      {
+        "key": "data",
+        "type": "string",
+        "description": "Form data or JSON body"
+      },
+      {
+        "key": "expect_status",
+        "type": "string",
+        "description": "Expected HTTP status code"
+      }
+    ],
+    "output_context": [
+      {
+        "key": "last_http_status",
+        "type": "string",
+        "description": "HTTP status code received"
+      },
+      {
+        "key": "last_http_url",
+        "type": "string",
+        "description": "Requested URL"
+      }
+    ],
+    "supported_platforms": [
+      "any"
+    ],
+    "script": "\nlocal url=\"\" data=\"\" expect_status=\"\" cookies=\"\" save_cookies=\"\" content_type=\"application/x-www-form-urlencoded\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --url) url=\"$2\"; shift 2;;\n        --data) data=\"$2\"; shift 2;;\n        --json) data=\"$2\"; content_type=\"application/json\"; shift 2;;\n        --expect-status) expect_status=\"$2\"; shift 2;;\n        --cookies) cookies=\"$2\"; shift 2;;\n        --save-cookies) save_cookies=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\n\nlocal curl_args=(-s -o /tmp/response_body -w \"%{http_code}\" -X POST)\ncurl_args+=(-H \"Content-Type: $content_type\" -d \"$data\")\n[[ -n \"$cookies\" ]] \u0026\u0026 curl_args+=(-b \"/tmp/cookies_${cookies}\")\n[[ -n \"$save_cookies\" ]] \u0026\u0026 curl_args+=(-c \"/tmp/cookies_${save_cookies}\")\n\nlocal status_code\nstatus_code=$(curl \"${curl_args[@]}\" \"$url\")\n\nctx_set \"last_http_status\" \"$status_code\"\nctx_set \"last_http_url\" \"$url\"\n\nif [[ -n \"$expect_status\" \u0026\u0026 \"$status_code\" != \"$expect_status\" ]]; then\n    LAST_ERROR=\"Expected HTTP $expect_status, got $status_code from POST $url\"\n    LAST_STUDENT_MSG=\"Form submission returned $status_code instead of $expect_status\"\n    return 1\nfi\nreturn 0\n"
+  },
+  {
+    "slug": "http-redirects-to-https",
+    "name": "HTTP Redirects To HTTPS",
+    "action_type": "http",
+    "action_category": "network",
+    "input_context": [
+      {
+        "key": "host",
+        "type": "string",
+        "description": "target host, defaults to CRUCIBLE_TARGET_IP"
+      },
+      {
+        "key": "path",
+        "type": "string",
+        "description": "path to request; defaults to /"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "any"
+    ],
+    "script": "\nlocal host=\"${CRUCIBLE_TARGET_IP:-}\" path=\"/\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --host) host=\"$2\"; shift 2;;\n        --path) path=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$host\" ]]; then\n    LAST_ERROR=\"http-redirects-to-https requires --host or CRUCIBLE_TARGET_IP\"\n    return 2\nfi\n# No -L: following the redirect would hide whether one happened at all.\nlocal headers status location\nheaders=$(curl -sS -k -I --max-time 10 \"http://${host}${path}\" 2\u003e\u00261) || headers=\"\"\nif [[ -z \"$headers\" ]]; then\n    LAST_ERROR=\"No response from http://${host}${path}\"\n    LAST_STUDENT_MSG=\"No response on plain HTTP from $host. Is the web server running on port 80?\"\n    return 1\nfi\nstatus=$(grep -oE '^HTTP/[0-9.]+ [0-9]{3}' \u003c\u003c\u003c\"$headers\" | tail -1 | awk '{print $2}')\nlocation=$(grep -iE '^location:' \u003c\u003c\u003c\"$headers\" | tail -1 | cut -d: -f2- | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')\nif [[ \"$status\" =~ ^30[1278]$ ]] \u0026\u0026 [[ \"$location\" == https://* ]]; then\n    return 0\nfi\nLAST_ERROR=\"http://${host}${path} answered $status with Location '${location:-none}'\"\nLAST_STUDENT_MSG=\"Plain HTTP requests are not redirected to HTTPS (got status ${status:-none}). Configure your web server to redirect port 80 to https://.\"\nreturn 1\n"
+  },
+  {
+    "slug": "ldap-anonymous-bind-denied",
+    "name": "LDAP Anonymous Bind Denied",
+    "action_type": "command",
+    "action_category": "network",
+    "input_context": [
+      {
+        "key": "host",
+        "type": "string",
+        "description": "target host, defaults to CRUCIBLE_TARGET_IP"
+      },
+      {
+        "key": "base",
+        "type": "string",
+        "description": "search base DN"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "any"
+    ],
+    "script": "\nlocal host=\"${CRUCIBLE_TARGET_IP:-}\" base=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --host) host=\"$2\"; shift 2;;\n        --base) base=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$host\" || -z \"$base\" ]]; then\n    LAST_ERROR=\"ldap-anonymous-bind-denied requires --base, and --host or CRUCIBLE_TARGET_IP\"\n    return 2\nfi\nlocal out\nout=$(ldapsearch -x -H \"ldap://${host}\" -b \"$base\" -o nettimeout=10 -LLL '(objectClass=*)' dn 2\u003e\u00261) || true\nif grep -qE '^dn:' \u003c\u003c\u003c\"$out\"; then\n    LAST_ERROR=\"Anonymous LDAP bind returned entries from $host\"\n    LAST_STUDENT_MSG=\"Your directory returns entries to anyone without a password. Disable anonymous bind.\"\n    return 1\nfi\nreturn 0\n"
+  },
+  {
+    "slug": "nmap-only-expected-ports",
+    "name": "No Unexpected Open Ports",
+    "action_type": "port_check",
+    "action_category": "firewall",
+    "input_context": [
+      {
+        "key": "host",
+        "type": "string",
+        "description": "target host, defaults to CRUCIBLE_TARGET_IP"
+      },
+      {
+        "key": "allow",
+        "type": "string",
+        "description": "comma-separated ports that may be open, e.g. 22,80,443"
+      },
+      {
+        "key": "range",
+        "type": "string",
+        "description": "nmap port spec to scan; defaults to 1-1024"
+      }
+    ],
+    "output_context": [
+      {
+        "key": "unexpected_open_ports",
+        "type": "string",
+        "description": "comma-separated ports that were open but not allowed"
+      }
+    ],
+    "supported_platforms": [
+      "any"
+    ],
+    "script": "\nlocal host=\"${CRUCIBLE_TARGET_IP:-}\" allow=\"\" range=\"1-1024\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --host) host=\"$2\"; shift 2;;\n        --allow) allow=\"$2\"; shift 2;;\n        --range) range=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$host\" ]]; then\n    LAST_ERROR=\"nmap-only-expected-ports requires --host or CRUCIBLE_TARGET_IP\"\n    return 2\nfi\nlocal out open unexpected=\"\"\nout=$(nmap -Pn -p \"$range\" --open --host-timeout 60s \"$host\" 2\u003e\u00261) || true\n# A scan that produced no port table at all is a failed scan, not a clean\n# host. Reporting \"no unexpected ports\" for it would be a false pass on the\n# most important check in this file.\nif ! grep -qE '^PORT[[:space:]]+STATE' \u003c\u003c\u003c\"$out\"; then\n    LAST_ERROR=\"nmap produced no port table for $host: $out\"\n    LAST_STUDENT_MSG=\"This check could not scan $host. Please report it to your instructor.\"\n    return 2\nfi\nopen=$(grep -E '^[0-9]+/tcp[[:space:]]+open' \u003c\u003c\u003c\"$out\" | cut -d/ -f1)\nlocal port\nfor port in $open; do\n    if ! grep -qE \"(^|,)${port}(,|$)\" \u003c\u003c\u003c\"$allow\"; then\n        unexpected=\"${unexpected}${unexpected:+,}${port}\"\n    fi\ndone\nif [[ -z \"$unexpected\" ]]; then\n    return 0\nfi\nctx_set \"unexpected_open_ports\" \"$unexpected\"\nLAST_ERROR=\"Unexpected open ports on $host: $unexpected (allowed: ${allow:-none})\"\nLAST_STUDENT_MSG=\"These ports are open but should not be: $unexpected. Stop the services listening on them, or block them with your firewall.\"\nreturn 1\n"
+  },
+  {
+    "slug": "nmap-port-state",
+    "name": "Nmap Reports Port State",
+    "action_type": "port_check",
+    "action_category": "network",
+    "input_context": [
+      {
+        "key": "host",
+        "type": "string",
+        "description": "target host, defaults to CRUCIBLE_TARGET_IP"
+      },
+      {
+        "key": "port",
+        "type": "string",
+        "description": "single TCP port"
+      },
+      {
+        "key": "state",
+        "type": "string",
+        "description": "open, closed or filtered; defaults to open"
+      }
+    ],
+    "output_context": [
+      {
+        "key": "nmap_port_\u003cport\u003e_state",
+        "type": "string",
+        "description": "the state nmap reported"
+      }
+    ],
+    "supported_platforms": [
+      "any"
+    ],
+    "script": "\nlocal host=\"${CRUCIBLE_TARGET_IP:-}\" port=\"\" state=\"open\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --host) host=\"$2\"; shift 2;;\n        --port) port=\"$2\"; shift 2;;\n        --state) state=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$host\" || -z \"$port\" ]]; then\n    LAST_ERROR=\"nmap-port-state requires --port, and --host or CRUCIBLE_TARGET_IP\"\n    return 2\nfi\n# -Pn because a hardened target that drops ICMP would otherwise be reported as\n# \"host down\" and every port scan against it would return nothing at all --\n# indistinguishable from a closed port, and wrong.\nlocal out found\nout=$(nmap -Pn -p \"$port\" --host-timeout 20s \"$host\" 2\u003e\u00261) || true\nfound=$(grep -E \"^${port}/tcp\" \u003c\u003c\u003c\"$out\" | awk '{print $2}' | head -1)\nctx_set \"nmap_port_${port}_state\" \"${found:-unknown}\"\n# nmap reports a port that answers neither way as \"filtered\"; a firewall that\n# rejects rather than drops shows \"closed\". Both mean \"not reachable\", so a\n# request for either accepts the other.\nif [[ \"$found\" == \"$state\" ]]; then\n    return 0\nfi\nif [[ \"$state\" != \"open\" \u0026\u0026 \"$found\" != \"open\" \u0026\u0026 -n \"$found\" ]]; then\n    return 0\nfi\nLAST_ERROR=\"nmap reports port $port on $host as '${found:-no result}', expected '$state'\"\nif [[ \"$state\" == \"open\" ]]; then\n    LAST_STUDENT_MSG=\"Port $port is not open on $host (nmap says '${found:-no result}'). Make sure the service is listening and the firewall allows it.\"\nelse\n    LAST_STUDENT_MSG=\"Port $port is still open on $host. Stop the service or block the port with your firewall.\"\nfi\nreturn 1\n"
+  },
+  {
+    "slug": "nmap-script-output",
+    "name": "Nmap Script Output Matches",
+    "action_type": "command",
+    "action_category": "network",
+    "input_context": [
+      {
+        "key": "host",
+        "type": "string",
+        "description": "target host, defaults to CRUCIBLE_TARGET_IP"
+      },
+      {
+        "key": "port",
+        "type": "string",
+        "description": "TCP port"
+      },
+      {
+        "key": "script",
+        "type": "string",
+        "description": "NSE script name, e.g. ssl-enum-ciphers"
+      },
+      {
+        "key": "expect",
+        "type": "string",
+        "description": "extended regex the output must match"
+      },
+      {
+        "key": "absent",
+        "type": "boolean",
+        "description": "flag with no value; invert, so --expect must NOT appear"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "any"
+    ],
+    "script": "\nlocal host=\"${CRUCIBLE_TARGET_IP:-}\" port=\"\" script=\"\" expect=\"\" want_absent=false\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --host) host=\"$2\"; shift 2;;\n        --port) port=\"$2\"; shift 2;;\n        --script) script=\"$2\"; shift 2;;\n        --expect) expect=\"$2\"; shift 2;;\n        --absent) want_absent=true; shift;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$host\" || -z \"$port\" || -z \"$script\" || -z \"$expect\" ]]; then\n    LAST_ERROR=\"nmap-script-output requires --port, --script, --expect, and --host or CRUCIBLE_TARGET_IP\"\n    return 2\nfi\nlocal out\nout=$(nmap -Pn -p \"$port\" --script \"$script\" --host-timeout 25s \"$host\" 2\u003e\u00261) || true\nif ! grep -qE \"^${port}/tcp[[:space:]]+open\" \u003c\u003c\u003c\"$out\"; then\n    LAST_ERROR=\"Port $port on $host is not open, so $script produced nothing\"\n    LAST_STUDENT_MSG=\"Port $port is not open on $host, so this check could not run. Start the service first.\"\n    return 1\nfi\nif grep -qE -- \"$expect\" \u003c\u003c\u003c\"$out\"; then\n    if $want_absent; then\n        LAST_ERROR=\"$script output still matches '$expect' on $host:$port\"\n        LAST_STUDENT_MSG=\"The service on port $port still reports '$expect'. Reconfigure it.\"\n        return 1\n    fi\n    return 0\nfi\nif $want_absent; then\n    return 0\nfi\nLAST_ERROR=\"$script output does not match '$expect' on $host:$port\"\nLAST_STUDENT_MSG=\"The service on port $port does not report '$expect' as expected.\"\nreturn 1\n"
+  },
+  {
+    "slug": "nmap-service",
+    "name": "Nmap Service Scan",
+    "action_type": "command",
+    "action_category": "network",
+    "input_context": [
+      {
+        "key": "host",
+        "type": "string",
+        "description": "Target hostname or IP"
+      },
+      {
+        "key": "port",
+        "type": "number",
+        "description": "Port to scan"
+      },
+      {
+        "key": "expect_service",
+        "type": "string",
+        "description": "Expected service name (optional)"
+      }
+    ],
+    "output_context": [
+      {
+        "key": "nmap_output",
+        "type": "string",
+        "description": "Full nmap output"
+      }
+    ],
+    "supported_platforms": [
+      "any"
+    ],
+    "script": "\nlocal host=\"\" port=\"\" expect_service=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --host) host=\"$2\"; shift 2;;\n        --port) port=\"$2\"; shift 2;;\n        --expect-service) expect_service=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nlocal output\noutput=$(nmap -sV -p \"$port\" \"$host\" 2\u003e/dev/null)\nctx_set \"nmap_output\" \"$output\"\nif [[ -n \"$expect_service\" ]] \u0026\u0026 echo \"$output\" | grep -qi \"$expect_service\"; then\n    return 0\nelif [[ -z \"$expect_service\" ]] \u0026\u0026 echo \"$output\" | grep -q \"open\"; then\n    return 0\nelse\n    LAST_ERROR=\"Service not found on $host:$port\"\n    LAST_STUDENT_MSG=\"Expected service '$expect_service' on port $port but it's not running.\"\n    return 1\nfi\n"
+  },
+  {
+    "slug": "no-empty-passwords",
+    "name": "No Accounts With Empty Passwords",
+    "action_type": "command",
+    "action_category": "system",
+    "input_context": [],
+    "output_context": [
+      {
+        "key": "empty_password_accounts",
+        "type": "string",
+        "description": "space-separated names, when any were found"
+      }
+    ],
+    "supported_platforms": [
+      "linux"
+    ],
+    "script": "\n# Field 2 empty means \"authenticates with no password\". Only the account NAMES\n# are returned; the hashes never leave the target.\nlocal offenders\noffenders=$(crucible_ssh_sudo awk -F: '($2 == \"\") {print $1}' /etc/shadow 2\u003e/dev/null | tr -d '\\r' | tr '\\n' ' ') || offenders=\"\"\noffenders=\"${offenders%% }\"\nif [[ -z \"$offenders\" ]]; then\n    return 0\nfi\nctx_set \"empty_password_accounts\" \"$offenders\"\nLAST_ERROR=\"Accounts with empty passwords on $CRUCIBLE_TARGET_IP: $offenders\"\nLAST_STUDENT_MSG=\"These accounts can log in with no password at all: $offenders. Lock or set a password on each one.\"\nreturn 1\n"
+  },
+  {
+    "slug": "no-extra-uid-zero",
+    "name": "Root Is The Only UID 0",
+    "action_type": "command",
+    "action_category": "system",
+    "input_context": [],
+    "output_context": [
+      {
+        "key": "uid_zero_accounts",
+        "type": "string",
+        "description": "space-separated names of unexpected UID 0 accounts"
+      }
+    ],
+    "supported_platforms": [
+      "linux"
+    ],
+    "script": "\nlocal offenders\noffenders=$(crucible_ssh awk -F: '($3 == 0 \u0026\u0026 $1 != \"root\") {print $1}' /etc/passwd 2\u003e/dev/null | tr -d '\\r' | tr '\\n' ' ') || offenders=\"\"\noffenders=\"${offenders%% }\"\nif [[ -z \"$offenders\" ]]; then\n    return 0\nfi\nctx_set \"uid_zero_accounts\" \"$offenders\"\nLAST_ERROR=\"Non-root accounts with UID 0 on $CRUCIBLE_TARGET_IP: $offenders\"\nLAST_STUDENT_MSG=\"These accounts have root privileges through UID 0: $offenders. Any account with UID 0 is root. Remove them or give them a normal UID.\"\nreturn 1\n"
+  },
+  {
+    "slug": "no-passwordless-sudo",
+    "name": "No NOPASSWD Sudo Rules",
+    "action_type": "command",
+    "action_category": "system",
+    "input_context": [
+      {
+        "key": "allow",
+        "type": "string",
+        "description": "extended regex for entries that are permitted to be NOPASSWD; defaults to the assessment account"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "linux"
+    ],
+    "script": "\nlocal allow=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --allow) allow=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\n# The assessment account itself needs passwordless sudo -- crucible_ssh_sudo\n# runs `sudo -n`, so flagging it would make this action assert the absence of\n# the very mechanism it uses. Its own entry is exempt by default.\nif [[ -z \"$allow\" ]]; then\n    allow=\"^[[:space:]]*${CRUCIBLE_TARGET_USERNAME:-student}[[:space:]]\"\nfi\nlocal hits\nhits=$(crucible_ssh_sudo grep -rEn 'NOPASSWD' /etc/sudoers /etc/sudoers.d 2\u003e/dev/null | tr -d '\\r') || hits=\"\"\nif [[ -z \"$hits\" ]]; then\n    return 0\nfi\n# The grep output is file:line:text, so the allow pattern is matched against\n# the rule text only.\nlocal unexpected\nunexpected=$(awk -F: '{ $1=\"\"; $2=\"\"; print substr($0,3) }' \u003c\u003c\u003c\"$hits\" \\\n    | grep -vE '^[[:space:]]*#' \\\n    | grep -vE \"$allow\" \\\n    | grep -E 'NOPASSWD') || unexpected=\"\"\nif [[ -z \"$unexpected\" ]]; then\n    return 0\nfi\nLAST_ERROR=\"Unexpected NOPASSWD sudo rules on $CRUCIBLE_TARGET_IP: $unexpected\"\nLAST_STUDENT_MSG=\"Sudo is configured to allow root access with no password. Remove the NOPASSWD entries from /etc/sudoers and /etc/sudoers.d/ (edit with visudo).\"\nreturn 1\n"
+  },
+  {
+    "slug": "no-world-writable",
+    "name": "No World-Writable Files",
+    "action_type": "file_check",
+    "action_category": "file",
+    "input_context": [
+      {
+        "key": "path",
+        "type": "string",
+        "description": "directory to scan; defaults to /etc"
+      },
+      {
+        "key": "max-depth",
+        "type": "string",
+        "description": "how deep to descend; defaults to 4"
+      }
+    ],
+    "output_context": [
+      {
+        "key": "world_writable_files",
+        "type": "string",
+        "description": "space-separated offending paths"
+      }
+    ],
+    "supported_platforms": [
+      "linux"
+    ],
+    "script": "\nlocal path=\"/etc\" depth=\"4\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --path) path=\"$2\"; shift 2;;\n        --max-depth) depth=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\n# -type f only: /tmp and /var/tmp are legitimately world-writable directories,\n# and flagging them would make this action fail on every stock system.\n# The result is capped so one badly-permissioned tree cannot produce a\n# megabyte of instructor output.\nlocal offenders\noffenders=$(crucible_ssh_sudo find \"$path\" -maxdepth \"$depth\" -type f -perm -0002 -print 2\u003e/dev/null \\\n    | head -20 | tr -d '\\r' | tr '\\n' ' ') || offenders=\"\"\noffenders=\"${offenders%% }\"\nif [[ -z \"$offenders\" ]]; then\n    return 0\nfi\nctx_set \"world_writable_files\" \"$offenders\"\nLAST_ERROR=\"World-writable files under $path on $CRUCIBLE_TARGET_IP: $offenders\"\nLAST_STUDENT_MSG=\"These files can be modified by any user on the system: $offenders. Remove world-write with: sudo chmod o-w \u003cfile\u003e\"\nreturn 1\n"
+  },
+  {
+    "slug": "package-absent",
+    "name": "Package Not Installed",
+    "action_type": "service_check",
+    "action_category": "service",
+    "input_context": [
+      {
+        "key": "name",
+        "type": "string",
+        "description": "package name as dpkg knows it"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "linux:ubuntu",
+      "linux:debian"
+    ],
+    "script": "\nlocal name=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --name) name=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$name\" ]]; then\n    LAST_ERROR=\"package-absent requires --name\"\n    return 2\nfi\nlocal status\nstatus=$(crucible_ssh dpkg-query -W -f='${Status}' \"$name\" 2\u003e/dev/null) || status=\"\"\nif [[ \"$status\" == *\"install ok installed\"* ]]; then\n    LAST_ERROR=\"Package $name is still installed on $CRUCIBLE_TARGET_IP\"\n    LAST_STUDENT_MSG=\"The $name package is still installed. Remove it with: sudo apt purge $name\"\n    return 1\nfi\nreturn 0\n"
+  },
+  {
+    "slug": "package-installed",
+    "name": "Package Installed",
+    "action_type": "service_check",
+    "action_category": "service",
+    "input_context": [
+      {
+        "key": "name",
+        "type": "string",
+        "description": "package name as dpkg knows it"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "linux:ubuntu",
+      "linux:debian"
+    ],
+    "script": "\nlocal name=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --name) name=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$name\" ]]; then\n    LAST_ERROR=\"package-installed requires --name\"\n    return 2\nfi\n# dpkg-query -W -f '${Status}' is checked rather than `dpkg -l | grep ^ii`,\n# because `dpkg -l` pads and truncates its columns to the terminal width and\n# will silently mangle a long package name.\nlocal status\nstatus=$(crucible_ssh dpkg-query -W -f='${Status}' \"$name\" 2\u003e/dev/null) || status=\"\"\nif [[ \"$status\" == *\"install ok installed\"* ]]; then\n    return 0\nfi\nLAST_ERROR=\"Package $name is not installed on $CRUCIBLE_TARGET_IP (dpkg status: ${status:-absent})\"\nLAST_STUDENT_MSG=\"The $name package is not installed. Install it with: sudo apt install $name\"\nreturn 1\n"
+  },
+  {
+    "slug": "port-closed",
+    "name": "Port Closed Check",
+    "action_type": "port_check",
+    "action_category": "firewall",
+    "input_context": [
+      {
+        "key": "host",
+        "type": "string",
+        "description": "Target hostname or IP"
+      },
+      {
+        "key": "port",
+        "type": "number",
+        "description": "TCP port to check"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "any"
+    ],
+    "script": "\nlocal host=\"\" port=\"\" timeout=3\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --host) host=\"$2\"; shift 2;;\n        --port) port=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif ! timeout \"$timeout\" bash -c \"echo \u003e/dev/tcp/$host/$port\" 2\u003e/dev/null; then\n    return 0\nelse\n    LAST_ERROR=\"Port $port is open on $host (should be closed)\"\n    LAST_STUDENT_MSG=\"Port $port is still open. Configure the firewall to block it.\"\n    return 1\nfi\n"
+  },
+  {
+    "slug": "port-open",
+    "name": "Port Open Check",
+    "action_type": "port_check",
+    "action_category": "network",
+    "input_context": [
+      {
+        "key": "host",
+        "type": "string",
+        "description": "Target hostname or IP"
+      },
+      {
+        "key": "port",
+        "type": "number",
+        "description": "TCP port to check"
+      }
+    ],
+    "output_context": [
+      {
+        "key": "port_N_open",
+        "type": "boolean",
+        "description": "Whether the port is open"
+      }
+    ],
+    "supported_platforms": [
+      "any"
+    ],
+    "script": "\nlocal host=\"\" port=\"\" timeout=5\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --host) host=\"$2\"; shift 2;;\n        --port) port=\"$2\"; shift 2;;\n        --timeout) timeout=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif timeout \"$timeout\" bash -c \"echo \u003e/dev/tcp/$host/$port\" 2\u003e/dev/null; then\n    ctx_set \"port_${port}_open\" \"true\"\n    return 0\nelse\n    LAST_ERROR=\"Port $port is not open on $host\"\n    LAST_STUDENT_MSG=\"Port $port is not responding on $host. Is the service running?\"\n    return 1\nfi\n"
+  },
+  {
+    "slug": "redis-auth-required",
+    "name": "Redis Requires Authentication",
+    "action_type": "command",
+    "action_category": "network",
+    "input_context": [
+      {
+        "key": "host",
+        "type": "string",
+        "description": "target host, defaults to CRUCIBLE_TARGET_IP"
+      },
+      {
+        "key": "port",
+        "type": "string",
+        "description": "Redis port; defaults to 6379"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "any"
+    ],
+    "script": "\nlocal host=\"${CRUCIBLE_TARGET_IP:-}\" port=\"6379\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --host) host=\"$2\"; shift 2;;\n        --port) port=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$host\" ]]; then\n    LAST_ERROR=\"redis-auth-required requires --host or CRUCIBLE_TARGET_IP\"\n    return 2\nfi\n# A Redis that is not listening at all trivially \"requires auth\". That is a\n# different outcome from a protected one and must not be reported as a pass.\nif ! nc -zw3 \"$host\" \"$port\" 2\u003e/dev/null; then\n    LAST_ERROR=\"Nothing is listening on ${host}:${port}\"\n    LAST_STUDENT_MSG=\"No Redis service is reachable on ${host}:${port}, so its authentication could not be checked.\"\n    return 1\nfi\nlocal out\nout=$(redis-cli -h \"$host\" -p \"$port\" --timeout 5 INFO server 2\u003e\u00261) || true\nif grep -qiE 'NOAUTH|authentication required|operation not permitted' \u003c\u003c\u003c\"$out\"; then\n    return 0\nfi\nif grep -qi 'redis_version' \u003c\u003c\u003c\"$out\"; then\n    LAST_ERROR=\"Redis on ${host}:${port} answered INFO without authentication\"\n    LAST_STUDENT_MSG=\"Your Redis server answers commands from anyone. Set a password with the requirepass directive in redis.conf.\"\n    return 1\nfi\nLAST_ERROR=\"Unexpected reply from Redis on ${host}:${port}: $out\"\nLAST_STUDENT_MSG=\"Could not determine whether Redis requires a password on ${host}:${port}.\"\nreturn 1\n"
+  },
+  {
+    "slug": "service-enabled",
+    "name": "Service Enabled At Boot",
+    "action_type": "service_check",
+    "action_category": "service",
+    "input_context": [
+      {
+        "key": "name",
+        "type": "string",
+        "description": "systemd unit name"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "linux"
+    ],
+    "script": "\nlocal name=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --name) name=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$name\" ]]; then\n    LAST_ERROR=\"service-enabled requires --name\"\n    return 2\nfi\n# `is-enabled` is deliberately separate from `is-active`: a service started by\n# hand passes is-active and disappears on the next reboot, which is the exact\n# mistake this check is meant to catch.\nif crucible_ssh systemctl is-enabled --quiet \"$name\" \u003e/dev/null 2\u003e\u00261; then\n    return 0\nfi\nLAST_ERROR=\"Service $name is not enabled on $CRUCIBLE_TARGET_IP\"\nLAST_STUDENT_MSG=\"The $name service is not enabled at boot. Run: sudo systemctl enable $name\"\nreturn 1\n"
+  },
+  {
+    "slug": "service-listening-on",
+    "name": "Service Listens On Expected Address",
+    "action_type": "command",
+    "action_category": "network",
+    "input_context": [
+      {
+        "key": "port",
+        "type": "string",
+        "description": "TCP port"
+      },
+      {
+        "key": "address",
+        "type": "string",
+        "description": "expected bind address, e.g. 127.0.0.1"
+      }
+    ],
+    "output_context": [
+      {
+        "key": "listen_\u003cport\u003e",
+        "type": "string",
+        "description": "the address:port that was found bound"
+      }
+    ],
+    "supported_platforms": [
+      "linux"
+    ],
+    "script": "\nlocal port=\"\" address=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --port) port=\"$2\"; shift 2;;\n        --address) address=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$port\" || -z \"$address\" ]]; then\n    LAST_ERROR=\"service-listening-on requires --port and --address\"\n    return 2\nfi\n# `ss -H -ltn` gives one socket per line with no header. This is read on the\n# TARGET, because \"which interface is it bound to\" is not answerable from the\n# network: a socket on 0.0.0.0 and one on the VLAN address look identical to a\n# port scan.\nlocal sockets found\nsockets=$(crucible_ssh ss -H -ltn 2\u003e/dev/null | tr -d '\\r') || sockets=\"\"\nif [[ -z \"$sockets\" ]]; then\n    LAST_ERROR=\"Could not list listening sockets on $CRUCIBLE_TARGET_IP\"\n    LAST_STUDENT_MSG=\"This check could not read the listening sockets on your VM.\"\n    return 1\nfi\nfound=$(awk -v p=\":$port\" '$4 ~ p\"$\" {print $4}' \u003c\u003c\u003c\"$sockets\" | head -1)\nctx_set \"listen_${port}\" \"${found:-none}\"\nif [[ -z \"$found\" ]]; then\n    LAST_ERROR=\"Nothing is listening on port $port on $CRUCIBLE_TARGET_IP\"\n    LAST_STUDENT_MSG=\"No service is listening on port $port. Start the service first.\"\n    return 1\nfi\nif [[ \"$found\" == \"${address}:${port}\" || \"$found\" == \"[${address}]:${port}\" ]]; then\n    return 0\nfi\nLAST_ERROR=\"Port $port is bound to $found, expected ${address}:${port}\"\nLAST_STUDENT_MSG=\"The service on port $port is listening on $found instead of ${address}:${port}. Change its bind address in its configuration file.\"\nreturn 1\n"
+  },
+  {
+    "slug": "service-running",
+    "name": "Service Running",
+    "action_type": "service_check",
+    "action_category": "service",
+    "input_context": [
+      {
+        "key": "name",
+        "type": "string",
+        "description": "systemd unit name, with or without .service"
+      }
+    ],
+    "output_context": [
+      {
+        "key": "service_\u003cname\u003e_status",
+        "type": "string",
+        "description": "active, when the unit is running"
+      }
+    ],
+    "supported_platforms": [
+      "linux"
+    ],
+    "script": "\nlocal name=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --name) name=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$name\" ]]; then\n    LAST_ERROR=\"service-running requires --name\"\n    return 2\nfi\nif crucible_ssh systemctl is-active --quiet \"$name\" \u003e/dev/null 2\u003e\u00261; then\n    ctx_set \"service_${name}_status\" \"active\"\n    return 0\nfi\nLAST_ERROR=\"Service $name is not active on $CRUCIBLE_TARGET_IP\"\nLAST_STUDENT_MSG=\"The $name service is not running. Start it with: sudo systemctl start $name\"\nreturn 1\n"
+  },
+  {
+    "slug": "service-stopped",
+    "name": "Service Stopped And Disabled",
+    "action_type": "service_check",
+    "action_category": "service",
+    "input_context": [
+      {
+        "key": "name",
+        "type": "string",
+        "description": "systemd unit name"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "linux"
+    ],
+    "script": "\nlocal name=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --name) name=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$name\" ]]; then\n    LAST_ERROR=\"service-stopped requires --name\"\n    return 2\nfi\nif crucible_ssh systemctl is-active --quiet \"$name\" \u003e/dev/null 2\u003e\u00261; then\n    LAST_ERROR=\"Service $name is still active\"\n    LAST_STUDENT_MSG=\"The $name service is still running. Stop and disable it: sudo systemctl disable --now $name\"\n    return 1\nfi\nif crucible_ssh systemctl is-enabled --quiet \"$name\" \u003e/dev/null 2\u003e\u00261; then\n    LAST_ERROR=\"Service $name is stopped but still enabled\"\n    LAST_STUDENT_MSG=\"The $name service is stopped but will come back on reboot. Run: sudo systemctl disable $name\"\n    return 1\nfi\nreturn 0\n"
+  },
+  {
+    "slug": "smb-share-accessible",
+    "name": "SMB Share Check",
+    "action_type": "command",
+    "action_category": "network",
+    "input_context": [
+      {
+        "key": "host",
+        "type": "string",
+        "description": "SMB server hostname or IP"
+      },
+      {
+        "key": "share",
+        "type": "string",
+        "description": "Share name"
+      },
+      {
+        "key": "user",
+        "type": "string",
+        "description": "Username (optional for anonymous)"
+      },
+      {
+        "key": "pass",
+        "type": "string",
+        "description": "Password (optional)"
+      }
+    ],
+    "output_context": [
+      {
+        "key": "smb_accessible",
+        "type": "boolean",
+        "description": "Whether the share was accessible"
+      }
+    ],
+    "supported_platforms": [
+      "any"
+    ],
+    "script": "\nlocal host=\"\" share=\"\" user=\"\" pass=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --host) host=\"$2\"; shift 2;;\n        --share) share=\"$2\"; shift 2;;\n        --user) user=\"$2\"; shift 2;;\n        --pass) pass=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nlocal output\nif [[ -n \"$user\" ]]; then\n    output=$(smbclient \"//$host/$share\" -U \"$user%$pass\" -c \"ls\" 2\u003e\u00261)\nelse\n    output=$(smbclient \"//$host/$share\" -N -c \"ls\" 2\u003e\u00261)\nfi\nif echo \"$output\" | grep -q \"blocks\"; then\n    ctx_set \"smb_accessible\" \"true\"\n    return 0\nelse\n    LAST_ERROR=\"SMB share //$host/$share not accessible\"\n    LAST_STUDENT_MSG=\"Cannot access SMB share //$host/$share. Check share permissions.\"\n    return 1\nfi\n"
+  },
+  {
+    "slug": "smb-share-listable",
+    "name": "SMB Shares Are Enumerable",
+    "action_type": "command",
+    "action_category": "network",
+    "input_context": [
+      {
+        "key": "host",
+        "type": "string",
+        "description": "target host, defaults to CRUCIBLE_TARGET_IP"
+      },
+      {
+        "key": "expect-share",
+        "type": "string",
+        "description": "share name that must appear in the listing"
+      },
+      {
+        "key": "absent",
+        "type": "boolean",
+        "description": "flag with no value; assert anonymous listing is REFUSED"
+      }
+    ],
+    "output_context": [
+      {
+        "key": "smb_shares",
+        "type": "string",
+        "description": "space-separated share names that were listed"
+      }
+    ],
+    "supported_platforms": [
+      "any"
+    ],
+    "script": "\nlocal host=\"${CRUCIBLE_TARGET_IP:-}\" expect_share=\"\" want_absent=false\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --host) host=\"$2\"; shift 2;;\n        --expect-share) expect_share=\"$2\"; shift 2;;\n        --absent) want_absent=true; shift;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$host\" ]]; then\n    LAST_ERROR=\"smb-share-listable requires --host or CRUCIBLE_TARGET_IP\"\n    return 2\nfi\nlocal out rc=0\nout=$(smbclient -L \"//${host}\" -N -t 10 2\u003e\u00261) || rc=$?\nlocal shares\nshares=$(grep -E '^[[:space:]]+[A-Za-z0-9_$.-]+[[:space:]]+(Disk|IPC|Printer)' \u003c\u003c\u003c\"$out\" \\\n    | awk '{print $1}' | tr '\\n' ' ')\nshares=\"${shares%% }\"\nctx_set \"smb_shares\" \"$shares\"\n\nif $want_absent; then\n    if [[ $rc -eq 0 \u0026\u0026 -n \"$shares\" ]]; then\n        LAST_ERROR=\"Anonymous SMB listing still works on $host: $shares\"\n        LAST_STUDENT_MSG=\"Anyone can list your SMB shares without credentials ($shares). Disable guest access in smb.conf.\"\n        return 1\n    fi\n    return 0\nfi\nif [[ $rc -ne 0 ]]; then\n    LAST_ERROR=\"smbclient could not list shares on $host: $out\"\n    LAST_STUDENT_MSG=\"Could not list SMB shares on $host. Is Samba running and reachable on port 445?\"\n    return 1\nfi\nif [[ -n \"$expect_share\" ]] \u0026\u0026 ! grep -qE \"(^| )${expect_share}( |$)\" \u003c\u003c\u003c\"$shares\"; then\n    LAST_ERROR=\"Share '$expect_share' not present on $host (found: $shares)\"\n    LAST_STUDENT_MSG=\"The SMB share '$expect_share' does not exist. Shares found: ${shares:-none}\"\n    return 1\nfi\nreturn 0\n"
+  },
+  {
+    "slug": "smb-signing-required",
+    "name": "SMB Signing Required",
+    "action_type": "command",
+    "action_category": "network",
+    "input_context": [
+      {
+        "key": "host",
+        "type": "string",
+        "description": "target host, defaults to CRUCIBLE_TARGET_IP"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "any"
+    ],
+    "script": "\nlocal host=\"${CRUCIBLE_TARGET_IP:-}\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --host) host=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$host\" ]]; then\n    LAST_ERROR=\"smb-signing-required requires --host or CRUCIBLE_TARGET_IP\"\n    return 2\nfi\nif ! nc -zw3 \"$host\" 445 2\u003e/dev/null; then\n    LAST_ERROR=\"Nothing is listening on ${host}:445\"\n    LAST_STUDENT_MSG=\"No SMB service is reachable on $host, so its signing policy could not be checked.\"\n    return 1\nfi\nlocal out\nout=$(nmap -Pn -p 445 --script smb2-security-mode --host-timeout 25s \"$host\" 2\u003e\u00261) || true\nif grep -qi 'Message signing enabled and required' \u003c\u003c\u003c\"$out\"; then\n    return 0\nfi\nif grep -qi 'Message signing enabled but not required\\|Message signing disabled' \u003c\u003c\u003c\"$out\"; then\n    LAST_ERROR=\"SMB signing is not required on $host\"\n    LAST_STUDENT_MSG=\"Your SMB server does not require message signing, which allows relay attacks. Set 'server signing = mandatory' in smb.conf.\"\n    return 1\nfi\nLAST_ERROR=\"Could not determine SMB signing policy on $host: $out\"\nLAST_STUDENT_MSG=\"Could not determine your SMB signing policy. Is Samba running?\"\nreturn 1\n"
+  },
+  {
+    "slug": "ssh-denied",
+    "name": "SSH Login Denied",
+    "action_type": "ssh",
+    "action_category": "ssh",
+    "input_context": [
+      {
+        "key": "host",
+        "type": "string",
+        "description": "Target hostname or IP"
+      },
+      {
+        "key": "user",
+        "type": "string",
+        "description": "Username that should be denied"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "linux"
+    ],
+    "script": "\nlocal host=\"\" user=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --host) host=\"$2\"; shift 2;;\n        --user) user=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \"${user}@${host}\" exit 2\u003e/dev/null; then\n    LAST_ERROR=\"SSH login succeeded for $user@$host (should be denied)\"\n    LAST_STUDENT_MSG=\"SSH login as $user is still allowed. Disable it in sshd_config.\"\n    return 1\nfi\nreturn 0\n"
+  },
+  {
+    "slug": "ssh-exec",
+    "name": "SSH Command",
+    "action_type": "ssh",
+    "action_category": "ssh",
+    "input_context": [
+      {
+        "key": "host",
+        "type": "string",
+        "description": "Target hostname or IP"
+      },
+      {
+        "key": "user",
+        "type": "string",
+        "description": "SSH username"
+      },
+      {
+        "key": "command",
+        "type": "string",
+        "description": "Command to run"
+      },
+      {
+        "key": "expect_output",
+        "type": "string",
+        "description": "Expected substring in output"
+      },
+      {
+        "key": "expect_exit",
+        "type": "number",
+        "description": "Expected exit code (default 0)"
+      }
+    ],
+    "output_context": [
+      {
+        "key": "ssh_output",
+        "type": "string",
+        "description": "Command output"
+      },
+      {
+        "key": "ssh_exit_code",
+        "type": "number",
+        "description": "Exit code"
+      }
+    ],
+    "supported_platforms": [
+      "linux"
+    ],
+    "script": "\nlocal host=\"\" user=\"\" command=\"\" expect_output=\"\" expect_exit=0 key=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --host) host=\"$2\"; shift 2;;\n        --user) user=\"$2\"; shift 2;;\n        --command) command=\"$2\"; shift 2;;\n        --expect-output) expect_output=\"$2\"; shift 2;;\n        --expect-exit) expect_exit=\"$2\"; shift 2;;\n        --key) key=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nlocal ssh_args=(-o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes)\n[[ -n \"$key\" ]] \u0026\u0026 ssh_args+=(-i \"$key\")\nlocal output exit_code\noutput=$(ssh \"${ssh_args[@]}\" \"${user}@${host}\" \"$command\" 2\u003e\u00261) || exit_code=$?\nexit_code=${exit_code:-0}\nctx_set \"ssh_output\" \"$output\"\nctx_set \"ssh_exit_code\" \"$exit_code\"\nif [[ \"$exit_code\" != \"$expect_exit\" ]]; then\n    LAST_ERROR=\"SSH command exited $exit_code (expected $expect_exit): $output\"\n    LAST_STUDENT_MSG=\"Command failed on $host: $command\"\n    return 1\nfi\nif [[ -n \"$expect_output\" \u0026\u0026 \"$output\" != *\"$expect_output\"* ]]; then\n    LAST_ERROR=\"SSH output does not contain '$expect_output': $output\"\n    LAST_STUDENT_MSG=\"Expected '$expect_output' in the output of: $command\"\n    return 1\nfi\nreturn 0\n"
+  },
+  {
+    "slug": "ssh-key-auth-only",
+    "name": "SSH Rejects Password Login",
+    "action_type": "ssh",
+    "action_category": "ssh",
+    "input_context": [
+      {
+        "key": "host",
+        "type": "string",
+        "description": "target host, defaults to CRUCIBLE_TARGET_IP"
+      },
+      {
+        "key": "user",
+        "type": "string",
+        "description": "account to attempt, defaults to root"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "linux"
+    ],
+    "script": "\nlocal host=\"${CRUCIBLE_TARGET_IP:-}\" user=\"root\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --host) host=\"$2\"; shift 2;;\n        --user) user=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$host\" ]]; then\n    LAST_ERROR=\"ssh-key-auth-only requires --host or CRUCIBLE_TARGET_IP\"\n    return 2\nfi\n# Asking for password auth explicitly and reading what the server offers back.\n# A server with PasswordAuthentication no answers \"Permission denied\n# (publickey)\" -- the method list is the evidence, and it does not require\n# actually knowing a password.\nlocal out\nout=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \\\n         -o ConnectTimeout=5 -o LogLevel=ERROR -o BatchMode=yes \\\n         -o PreferredAuthentications=password -o PubkeyAuthentication=no \\\n         \"${user}@${host}\" true 2\u003e\u00261) || true\nif grep -qiE 'permission denied \\(publickey\\)' \u003c\u003c\u003c\"$out\"; then\n    return 0\nfi\nif grep -qi 'connection refused\\|no route to host\\|timed out' \u003c\u003c\u003c\"$out\"; then\n    LAST_ERROR=\"Could not reach sshd on $host: $out\"\n    LAST_STUDENT_MSG=\"Could not connect to SSH on $host. Is the ssh service running and allowed through the firewall?\"\n    return 1\nfi\nLAST_ERROR=\"sshd on $host still offers password authentication: $out\"\nLAST_STUDENT_MSG=\"Your SSH server still accepts password logins. Set PasswordAuthentication no in /etc/ssh/sshd_config and reload ssh.\"\nreturn 1\n"
+  },
+  {
+    "slug": "sshd-directive",
+    "name": "SSHD Effective Directive",
+    "action_type": "ssh",
+    "action_category": "ssh",
+    "input_context": [
+      {
+        "key": "directive",
+        "type": "string",
+        "description": "directive name, case-insensitive, e.g. permitrootlogin"
+      },
+      {
+        "key": "value",
+        "type": "string",
+        "description": "expected value, compared case-insensitively"
+      }
+    ],
+    "output_context": [
+      {
+        "key": "sshd_\u003cdirective\u003e",
+        "type": "string",
+        "description": "the effective value that was found"
+      }
+    ],
+    "supported_platforms": [
+      "linux"
+    ],
+    "script": "\nlocal directive=\"\" value=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --directive) directive=\"$2\"; shift 2;;\n        --value) value=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$directive\" || -z \"$value\" ]]; then\n    LAST_ERROR=\"sshd-directive requires --directive and --value\"\n    return 2\nfi\nlocal lower_directive lower_value dump found\nlower_directive=\"${directive,,}\"\nlower_value=\"${value,,}\"\n\n# `sshd -T` requires root because it reads the host keys.\ndump=$(crucible_ssh_sudo sshd -T 2\u003e\u00261) || dump=\"\"\nif [[ -z \"$dump\" ]]; then\n    LAST_ERROR=\"Could not read sshd effective config from $CRUCIBLE_TARGET_IP\"\n    LAST_STUDENT_MSG=\"This check could not read your SSH server configuration. Make sure the ssh service is installed and running.\"\n    return 1\nfi\nfound=$(grep -iE \"^${lower_directive}[[:space:]]\" \u003c\u003c\u003c\"$dump\" | head -1 | cut -d' ' -f2- | tr -d '\\r')\nctx_set \"sshd_${lower_directive}\" \"$found\"\nif [[ \"${found,,}\" == \"$lower_value\" ]]; then\n    return 0\nfi\nLAST_ERROR=\"sshd $directive is '${found:-unset}', expected '$value'\"\nLAST_STUDENT_MSG=\"SSH setting $directive should be '$value' but is '${found:-unset}'. Edit /etc/ssh/sshd_config (or a file in /etc/ssh/sshd_config.d/), then run: sudo systemctl reload ssh\"\nreturn 1\n"
+  },
+  {
+    "slug": "sshd-protocol-hardened",
+    "name": "SSH Root Login And Password Auth Disabled",
+    "action_type": "ssh",
+    "action_category": "ssh",
+    "input_context": [],
+    "output_context": [],
+    "supported_platforms": [
+      "linux"
+    ],
+    "script": "\nlocal dump\ndump=$(crucible_ssh_sudo sshd -T 2\u003e\u00261) || dump=\"\"\nif [[ -z \"$dump\" ]]; then\n    LAST_ERROR=\"Could not read sshd effective config from $CRUCIBLE_TARGET_IP\"\n    LAST_STUDENT_MSG=\"This check could not read your SSH server configuration. Make sure the ssh service is installed and running.\"\n    return 1\nfi\nlocal root_login password_auth problems=\"\"\nroot_login=$(grep -iE '^permitrootlogin[[:space:]]' \u003c\u003c\u003c\"$dump\" | head -1 | awk '{print $2}' | tr -d '\\r')\npassword_auth=$(grep -iE '^passwordauthentication[[:space:]]' \u003c\u003c\u003c\"$dump\" | head -1 | awk '{print $2}' | tr -d '\\r')\n\n# `prohibit-password` still permits key-based root login. It is a real\n# hardening step but not the one being asserted here, so it is called out\n# rather than quietly accepted.\nif [[ \"${root_login,,}\" != \"no\" ]]; then\n    problems=\"PermitRootLogin is '${root_login:-unset}' (want no)\"\nfi\nif [[ \"${password_auth,,}\" != \"no\" ]]; then\n    [[ -n \"$problems\" ]] \u0026\u0026 problems=\"$problems; \"\n    problems=\"${problems}PasswordAuthentication is '${password_auth:-unset}' (want no)\"\nfi\nif [[ -z \"$problems\" ]]; then\n    return 0\nfi\nLAST_ERROR=\"sshd is not hardened on $CRUCIBLE_TARGET_IP: $problems\"\nLAST_STUDENT_MSG=\"Your SSH server is not hardened: $problems. Fix it in /etc/ssh/sshd_config, then run: sudo systemctl reload ssh\"\nreturn 1\n"
+  },
+  {
+    "slug": "sysctl-value",
+    "name": "Kernel Parameter Value",
+    "action_type": "command",
+    "action_category": "system",
+    "input_context": [
+      {
+        "key": "key",
+        "type": "string",
+        "description": "sysctl key, e.g. net.ipv4.conf.all.rp_filter"
+      },
+      {
+        "key": "value",
+        "type": "string",
+        "description": "expected value"
+      }
+    ],
+    "output_context": [
+      {
+        "key": "sysctl_\u003ckey\u003e",
+        "type": "string",
+        "description": "the running value that was found"
+      }
+    ],
+    "supported_platforms": [
+      "linux"
+    ],
+    "script": "\nlocal key=\"\" value=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --key) key=\"$2\"; shift 2;;\n        --value) value=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$key\" || -z \"$value\" ]]; then\n    LAST_ERROR=\"sysctl-value requires --key and --value\"\n    return 2\nfi\n# The RUNNING value, not the file: a setting written to /etc/sysctl.conf and\n# never applied is the most common way this check is failed while looking\n# correct on disk.\nlocal found\nfound=$(crucible_ssh sysctl -n \"$key\" 2\u003e/dev/null | tr -d '\\r' | tr -s '[:space:]' ' ') || found=\"\"\nfound=\"${found%% }\"\nif [[ -z \"$found\" ]]; then\n    LAST_ERROR=\"sysctl key $key does not exist on $CRUCIBLE_TARGET_IP\"\n    LAST_STUDENT_MSG=\"The kernel setting $key does not exist on this system.\"\n    return 1\nfi\nctx_set \"sysctl_${key//./_}\" \"$found\"\nif [[ \"$found\" == \"$value\" ]]; then\n    return 0\nfi\nLAST_ERROR=\"sysctl $key is '$found', expected '$value'\"\nLAST_STUDENT_MSG=\"Kernel setting $key is '$found' but should be '$value'. Set it in /etc/sysctl.d/ and apply with: sudo sysctl --system\"\nreturn 1\n"
+  },
+  {
+    "slug": "tcp-banner-matches",
+    "name": "TCP Banner Matches",
+    "action_type": "port_check",
+    "action_category": "network",
+    "input_context": [
+      {
+        "key": "host",
+        "type": "string",
+        "description": "target host, defaults to CRUCIBLE_TARGET_IP"
+      },
+      {
+        "key": "port",
+        "type": "string",
+        "description": "TCP port"
+      },
+      {
+        "key": "expect",
+        "type": "string",
+        "description": "extended regex the banner must match"
+      },
+      {
+        "key": "absent",
+        "type": "boolean",
+        "description": "flag with no value; invert, so --expect must NOT appear"
+      }
+    ],
+    "output_context": [
+      {
+        "key": "banner_\u003cport\u003e",
+        "type": "string",
+        "description": "the banner text that was read"
+      }
+    ],
+    "supported_platforms": [
+      "any"
+    ],
+    "script": "\nlocal host=\"${CRUCIBLE_TARGET_IP:-}\" port=\"\" expect=\"\" want_absent=false\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --host) host=\"$2\"; shift 2;;\n        --port) port=\"$2\"; shift 2;;\n        --expect) expect=\"$2\"; shift 2;;\n        --absent) want_absent=true; shift;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$host\" || -z \"$port\" || -z \"$expect\" ]]; then\n    LAST_ERROR=\"tcp-banner-matches requires --port, --expect, and --host or CRUCIBLE_TARGET_IP\"\n    return 2\nfi\n# -w 5 bounds the read: a service that connects and says nothing would\n# otherwise hold the socket until the action's own timeout kills it, which\n# reports as a timeout rather than as an empty banner.\nlocal banner\nbanner=$(nc -w 5 \"$host\" \"$port\" \u003c/dev/null 2\u003e/dev/null | head -c 512 | tr -d '\\r') || banner=\"\"\nctx_set \"banner_${port}\" \"$banner\"\nif [[ -z \"$banner\" ]]; then\n    LAST_ERROR=\"No banner from ${host}:${port}\"\n    LAST_STUDENT_MSG=\"Nothing is listening on port $port, or the service sends no banner.\"\n    return 1\nfi\nif grep -qE -- \"$expect\" \u003c\u003c\u003c\"$banner\"; then\n    if $want_absent; then\n        LAST_ERROR=\"Banner on ${host}:${port} still matches '$expect': $banner\"\n        LAST_STUDENT_MSG=\"The service on port $port still announces '$expect'. Change its banner.\"\n        return 1\n    fi\n    return 0\nfi\nif $want_absent; then\n    return 0\nfi\nLAST_ERROR=\"Banner on ${host}:${port} does not match '$expect': $banner\"\nLAST_STUDENT_MSG=\"The service on port $port announced '$banner', which does not match the expected '$expect'.\"\nreturn 1\n"
+  },
+  {
+    "slug": "tls-certificate-valid",
+    "name": "TLS Certificate Is Currently Valid",
+    "action_type": "command",
+    "action_category": "network",
+    "input_context": [
+      {
+        "key": "host",
+        "type": "string",
+        "description": "target host, defaults to CRUCIBLE_TARGET_IP"
+      },
+      {
+        "key": "port",
+        "type": "string",
+        "description": "TLS port; defaults to 443"
+      },
+      {
+        "key": "days",
+        "type": "string",
+        "description": "fail if the certificate expires within this many days"
+      }
+    ],
+    "output_context": [
+      {
+        "key": "tls_not_after",
+        "type": "string",
+        "description": "the certificate expiry date"
+      }
+    ],
+    "supported_platforms": [
+      "any"
+    ],
+    "script": "\nlocal host=\"${CRUCIBLE_TARGET_IP:-}\" port=\"443\" days=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --host) host=\"$2\"; shift 2;;\n        --port) port=\"$2\"; shift 2;;\n        --days) days=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$host\" ]]; then\n    LAST_ERROR=\"tls-certificate-valid requires --host or CRUCIBLE_TARGET_IP\"\n    return 2\nfi\n# \u003c/dev/null so s_client does not sit waiting for stdin until the action times\n# out; -servername so a name-based virtual host serves the right certificate.\nlocal pem\npem=$(openssl s_client -connect \"${host}:${port}\" -servername \"$host\" \u003c/dev/null 2\u003e/dev/null \\\n    | openssl x509 2\u003e/dev/null) || pem=\"\"\nif [[ -z \"$pem\" ]]; then\n    LAST_ERROR=\"No TLS certificate served on ${host}:${port}\"\n    LAST_STUDENT_MSG=\"No TLS certificate was returned by ${host}:${port}. Is HTTPS configured and running?\"\n    return 1\nfi\nlocal not_after\nnot_after=$(openssl x509 -noout -enddate \u003c\u003c\u003c\"$pem\" 2\u003e/dev/null | cut -d= -f2-)\nctx_set \"tls_not_after\" \"$not_after\"\n\nif ! openssl x509 -noout -checkend 0 \u003c\u003c\u003c\"$pem\" \u003e/dev/null 2\u003e\u00261; then\n    LAST_ERROR=\"Certificate on ${host}:${port} expired at $not_after\"\n    LAST_STUDENT_MSG=\"Your TLS certificate expired on $not_after. Renew or reissue it.\"\n    return 1\nfi\nif [[ -n \"$days\" ]]; then\n    local seconds=$(( days * 86400 ))\n    if ! openssl x509 -noout -checkend \"$seconds\" \u003c\u003c\u003c\"$pem\" \u003e/dev/null 2\u003e\u00261; then\n        LAST_ERROR=\"Certificate on ${host}:${port} expires within $days days (at $not_after)\"\n        LAST_STUDENT_MSG=\"Your TLS certificate expires on $not_after, which is less than $days days away. Renew it.\"\n        return 1\n    fi\nfi\nreturn 0\n"
+  },
+  {
+    "slug": "tls-protocol-refused",
+    "name": "Obsolete TLS Protocol Refused",
+    "action_type": "command",
+    "action_category": "network",
+    "input_context": [
+      {
+        "key": "host",
+        "type": "string",
+        "description": "target host, defaults to CRUCIBLE_TARGET_IP"
+      },
+      {
+        "key": "port",
+        "type": "string",
+        "description": "TLS port; defaults to 443"
+      },
+      {
+        "key": "protocol",
+        "type": "string",
+        "description": "one of tls1, tls1_1, tls1_2, ssl3"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "any"
+    ],
+    "script": "\nlocal host=\"${CRUCIBLE_TARGET_IP:-}\" port=\"443\" protocol=\"tls1_1\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --host) host=\"$2\"; shift 2;;\n        --port) port=\"$2\"; shift 2;;\n        --protocol) protocol=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$host\" ]]; then\n    LAST_ERROR=\"tls-protocol-refused requires --host or CRUCIBLE_TARGET_IP\"\n    return 2\nfi\n# The allowlist is a quoted regex rather than a `case tls1|ssl3)` arm on\n# purpose: the authoring-time command checker reads a bare word after `|` as a\n# new command, and would report this action as depending on a `tls1` binary.\nif ! grep -qE '^(tls1|tls1_1|tls1_2|tls1_3|ssl3)$' \u003c\u003c\u003c\"$protocol\"; then\n    LAST_ERROR=\"tls-protocol-refused: unsupported --protocol '$protocol'\"\n    return 2\nfi\n# A version this openssl build refuses to even offer would look identical to a\n# server refusing it, which would be a false pass. The handshake output is\n# checked for a server-side alert rather than trusting the exit code alone.\nlocal out\nout=$(openssl s_client -connect \"${host}:${port}\" -servername \"$host\" \"-${protocol}\" \u003c/dev/null 2\u003e\u00261) || true\nif grep -qiE 'unknown option|unsupported protocol.*not (supported|compiled)' \u003c\u003c\u003c\"$out\"; then\n    LAST_ERROR=\"This runner's openssl cannot offer $protocol, so refusal could not be proven\"\n    LAST_STUDENT_MSG=\"This check could not test $protocol. Please report it to your instructor.\"\n    return 2\nfi\nif grep -qE 'Cipher[[:space:]]*:[[:space:]]*\\(NONE\\)|no peer certificate|handshake failure|alert protocol version|wrong version number' \u003c\u003c\u003c\"$out\"; then\n    return 0\nfi\nif grep -qE 'Verify return code|Cipher[[:space:]]*:' \u003c\u003c\u003c\"$out\"; then\n    LAST_ERROR=\"Server on ${host}:${port} completed a $protocol handshake\"\n    LAST_STUDENT_MSG=\"Your web server still accepts $protocol, which is obsolete. Restrict it to TLS 1.2 and above.\"\n    return 1\nfi\nLAST_ERROR=\"Could not reach ${host}:${port} to test $protocol: $out\"\nLAST_STUDENT_MSG=\"Could not connect to ${host}:${port} over TLS. Is HTTPS running?\"\nreturn 1\n"
+  },
+  {
+    "slug": "ufw-default-deny-incoming",
+    "name": "UFW Default Deny Incoming",
+    "action_type": "service_check",
+    "action_category": "firewall",
+    "input_context": [],
+    "output_context": [],
+    "supported_platforms": [
+      "linux:ubuntu",
+      "linux:debian"
+    ],
+    "script": "\nlocal status\nstatus=$(crucible_ssh_sudo ufw status verbose 2\u003e\u00261) || true\nif [[ \"$status\" == *\"a password is required\"* || \"$status\" == *\"not in the sudoers\"* ]]; then\n    LAST_ERROR=\"Cannot read ufw status: no passwordless sudo on the target\"\n    LAST_STUDENT_MSG=\"This check could not read your firewall policy because the assessment account lost sudo access. Please report it to your instructor.\"\n    return 2\nfi\n# The verbose line reads e.g. \"Default: deny (incoming), allow (outgoing), ...\".\nif grep -qE '^Default:[[:space:]]+deny[[:space:]]+\\(incoming\\)' \u003c\u003c\u003c\"$status\"; then\n    return 0\nfi\nLAST_ERROR=\"ufw default incoming policy is not deny on $CRUCIBLE_TARGET_IP\"\nLAST_STUDENT_MSG=\"Your firewall still accepts incoming traffic by default. Run: sudo ufw default deny incoming\"\nreturn 1\n"
+  },
+  {
+    "slug": "ufw-enabled",
+    "name": "UFW Enabled",
+    "action_type": "service_check",
+    "action_category": "firewall",
+    "input_context": [],
+    "output_context": [
+      {
+        "key": "ufw_status",
+        "type": "string",
+        "description": "active, when the firewall is up"
+      }
+    ],
+    "supported_platforms": [
+      "linux:ubuntu",
+      "linux:debian"
+    ],
+    "script": "\n# `ufw status` needs root even to read, so this is sudo on the TARGET. The\n# original body ran `sudo ufw` on the runner, which is unprivileged and has no\n# ufw installed — it could only ever fail.\nlocal status\nstatus=$(crucible_ssh_sudo ufw status 2\u003e\u00261) || true\nif [[ \"$status\" == *\"Status: active\"* ]]; then\n    ctx_set \"ufw_status\" \"active\"\n    return 0\nfi\nif [[ \"$status\" == *\"a password is required\"* || \"$status\" == *\"not in the sudoers\"* ]]; then\n    LAST_ERROR=\"Cannot read ufw status: $CRUCIBLE_TARGET_USERNAME has no passwordless sudo on the target\"\n    LAST_STUDENT_MSG=\"This check could not read your firewall status because the assessment account lost sudo access. Please report it to your instructor.\"\n    return 2\nfi\nLAST_ERROR=\"ufw is not active on $CRUCIBLE_TARGET_IP: $status\"\nLAST_STUDENT_MSG=\"The ufw firewall is not enabled. Run: sudo ufw enable\"\nreturn 1\n"
+  },
+  {
+    "slug": "ufw-rule-exists",
+    "name": "UFW Rule Exists",
+    "action_type": "service_check",
+    "action_category": "firewall",
+    "input_context": [
+      {
+        "key": "rule",
+        "type": "string",
+        "description": "extended regex matched against a line of ufw status, e.g. \"22/tcp .*ALLOW\""
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "linux:ubuntu",
+      "linux:debian"
+    ],
+    "script": "\nlocal rule=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --rule) rule=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$rule\" ]]; then\n    LAST_ERROR=\"ufw-rule-exists requires --rule\"\n    return 2\nfi\nlocal status\nstatus=$(crucible_ssh_sudo ufw status 2\u003e\u00261) || true\nif [[ \"$status\" == *\"a password is required\"* || \"$status\" == *\"not in the sudoers\"* ]]; then\n    LAST_ERROR=\"Cannot read ufw status: no passwordless sudo on the target\"\n    LAST_STUDENT_MSG=\"This check could not read your firewall rules because the assessment account lost sudo access. Please report it to your instructor.\"\n    return 2\nfi\nif grep -qE -- \"$rule\" \u003c\u003c\u003c\"$status\"; then\n    return 0\nfi\nLAST_ERROR=\"No ufw rule matching '$rule' on $CRUCIBLE_TARGET_IP\"\nLAST_STUDENT_MSG=\"No firewall rule matches '$rule'. Check your rules with: sudo ufw status numbered\"\nreturn 1\n"
+  },
+  {
+    "slug": "unattended-upgrades-enabled",
+    "name": "Automatic Security Updates Enabled",
+    "action_type": "service_check",
+    "action_category": "service",
+    "input_context": [],
+    "output_context": [],
+    "supported_platforms": [
+      "linux:ubuntu",
+      "linux:debian"
+    ],
+    "script": "\nlocal status\nstatus=$(crucible_ssh dpkg-query -W -f='${Status}' unattended-upgrades 2\u003e/dev/null) || status=\"\"\nif [[ \"$status\" != *\"install ok installed\"* ]]; then\n    LAST_ERROR=\"unattended-upgrades is not installed on $CRUCIBLE_TARGET_IP\"\n    LAST_STUDENT_MSG=\"Automatic security updates are not installed. Run: sudo apt install unattended-upgrades\"\n    return 1\nfi\n# The package can be installed while the periodic timer is set to 0, which\n# looks configured and updates nothing.\nlocal period\nperiod=$(crucible_ssh_sudo apt-config dump APT::Periodic::Unattended-Upgrade 2\u003e/dev/null | tr -d '\\r\"') || period=\"\"\nif [[ \"$period\" == *\"Unattended-Upgrade 0\"* || -z \"$period\" ]]; then\n    LAST_ERROR=\"unattended-upgrades is installed but APT::Periodic::Unattended-Upgrade is not enabled ($period)\"\n    LAST_STUDENT_MSG=\"Automatic security updates are installed but switched off. Run: sudo dpkg-reconfigure -plow unattended-upgrades\"\n    return 1\nfi\nreturn 0\n"
+  },
+  {
+    "slug": "user-absent",
+    "name": "User Account Removed",
+    "action_type": "command",
+    "action_category": "system",
+    "input_context": [
+      {
+        "key": "name",
+        "type": "string",
+        "description": "login name that must not exist"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "linux"
+    ],
+    "script": "\nlocal name=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --name) name=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$name\" ]]; then\n    LAST_ERROR=\"user-absent requires --name\"\n    return 2\nfi\nif crucible_ssh id -u \"$name\" \u003e/dev/null 2\u003e\u00261; then\n    LAST_ERROR=\"Account $name still exists on $CRUCIBLE_TARGET_IP\"\n    LAST_STUDENT_MSG=\"The account '$name' still exists. Remove it with: sudo deluser --remove-home $name\"\n    return 1\nfi\nreturn 0\n"
+  },
+  {
+    "slug": "user-exists",
+    "name": "User Account Exists",
+    "action_type": "command",
+    "action_category": "system",
+    "input_context": [
+      {
+        "key": "name",
+        "type": "string",
+        "description": "login name"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "linux"
+    ],
+    "script": "\nlocal name=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --name) name=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$name\" ]]; then\n    LAST_ERROR=\"user-exists requires --name\"\n    return 2\nfi\nif crucible_ssh id -u \"$name\" \u003e/dev/null 2\u003e\u00261; then\n    return 0\nfi\nLAST_ERROR=\"No account named $name on $CRUCIBLE_TARGET_IP\"\nLAST_STUDENT_MSG=\"The account '$name' does not exist. Create it with: sudo adduser $name\"\nreturn 1\n"
+  },
+  {
+    "slug": "user-in-group",
+    "name": "User Is In Group",
+    "action_type": "command",
+    "action_category": "system",
+    "input_context": [
+      {
+        "key": "user",
+        "type": "string",
+        "description": "login name"
+      },
+      {
+        "key": "group",
+        "type": "string",
+        "description": "group name, e.g. sudo"
+      },
+      {
+        "key": "absent",
+        "type": "boolean",
+        "description": "flag with no value; invert the assertion"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "linux"
+    ],
+    "script": "\nlocal user=\"\" group=\"\" want_absent=false\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --user) user=\"$2\"; shift 2;;\n        --group) group=\"$2\"; shift 2;;\n        --absent) want_absent=true; shift;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$user\" || -z \"$group\" ]]; then\n    LAST_ERROR=\"user-in-group requires --user and --group\"\n    return 2\nfi\nlocal groups\ngroups=$(crucible_ssh id -nG \"$user\" 2\u003e/dev/null) || groups=\"\"\nif [[ -z \"$groups\" ]]; then\n    # An account that does not exist is trivially not in the group, which is\n    # exactly what --absent asserts. Failing here would make \"prove tempadmin\n    # is no longer in sudo\" impossible to satisfy by the intended fix of\n    # deleting tempadmin.\n    if $want_absent; then\n        return 0\n    fi\n    LAST_ERROR=\"Could not read groups for $user on $CRUCIBLE_TARGET_IP\"\n    LAST_STUDENT_MSG=\"The account '$user' does not exist, so its group membership could not be checked.\"\n    return 1\nfi\n# Word-boundary match: a plain substring test would report that a user is in\n# \"sudo\" because they are in \"sudoers-readonly\".\nlocal is_member=false\nif grep -qE \"(^| )${group}( |$)\" \u003c\u003c\u003c\"$groups\"; then\n    is_member=true\nfi\nif $want_absent; then\n    if $is_member; then\n        LAST_ERROR=\"$user is still in group $group\"\n        LAST_STUDENT_MSG=\"The account '$user' should not be in the '$group' group. Remove it with: sudo deluser $user $group\"\n        return 1\n    fi\n    return 0\nfi\nif $is_member; then\n    return 0\nfi\nLAST_ERROR=\"$user is not in group $group (groups: $groups)\"\nLAST_STUDENT_MSG=\"The account '$user' is not in the '$group' group. Add it with: sudo usermod -aG $group $user\"\nreturn 1\n"
+  },
+  {
+    "slug": "wait-for",
+    "name": "Wait For Condition",
+    "action_type": "command",
+    "action_category": "general",
+    "input_context": [
+      {
+        "key": "description",
+        "type": "string",
+        "description": "Human-readable description of the condition"
+      },
+      {
+        "key": "cmd",
+        "type": "string",
+        "description": "Shell command to evaluate"
+      },
+      {
+        "key": "retries",
+        "type": "number",
+        "description": "Max attempts (default 10)"
+      },
+      {
+        "key": "delay",
+        "type": "number",
+        "description": "Seconds between retries (default 2)"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "linux"
+    ],
+    "script": "\nlocal description=\"\" cmd=\"\" retries=10 delay=2\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --description) description=\"$2\"; shift 2;;\n        --cmd) cmd=\"$2\"; shift 2;;\n        --retries) retries=\"$2\"; shift 2;;\n        --delay) delay=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nfor i in $(seq 1 \"$retries\"); do\n    if eval \"$cmd\" 2\u003e/dev/null; then\n        return 0\n    fi\n    sleep \"$delay\"\ndone\nLAST_ERROR=\"Timed out waiting for: $description\"\nLAST_STUDENT_MSG=\"$description did not become ready after ${retries} attempts.\"\nreturn 1\n"
+  },
+  {
+    "slug": "web-technology-hidden",
+    "name": "Web Server Version Not Advertised",
+    "action_type": "http",
+    "action_category": "web",
+    "input_context": [
+      {
+        "key": "url",
+        "type": "string",
+        "description": "full URL to fingerprint"
+      },
+      {
+        "key": "deny",
+        "type": "string",
+        "description": "extended regex that must NOT appear in the fingerprint; defaults to a version-number pattern"
+      }
+    ],
+    "output_context": [
+      {
+        "key": "whatweb_summary",
+        "type": "string",
+        "description": "the one-line fingerprint whatweb produced"
+      }
+    ],
+    "supported_platforms": [
+      "any"
+    ],
+    "script": "\nlocal url=\"\" deny=\"\"\nwhile [[ $# -gt 0 ]]; do\n    case \"$1\" in\n        --url) url=\"$2\"; shift 2;;\n        --deny) deny=\"$2\"; shift 2;;\n        *) shift;;\n    esac\ndone\nif [[ -z \"$url\" ]]; then\n    LAST_ERROR=\"web-technology-hidden requires --url\"\n    return 2\nfi\n# whatweb reports e.g. `Apache[2.4.52]`. The default pattern is that shape --\n# a bracketed dotted version after a product name -- rather than any digit,\n# which would match a page's own content.\nif [[ -z \"$deny\" ]]; then\n    deny='\\[[0-9]+\\.[0-9]+(\\.[0-9]+)?\\]'\nfi\nlocal out\nout=$(whatweb --color=never --no-errors -a 1 --open-timeout 10 --read-timeout 10 \"$url\" 2\u003e\u00261 | head -c 4000) || out=\"\"\nif [[ -z \"$out\" ]]; then\n    LAST_ERROR=\"whatweb returned nothing for $url\"\n    LAST_STUDENT_MSG=\"Could not fingerprint $url. Is the web server running?\"\n    return 1\nfi\nctx_set \"whatweb_summary\" \"$out\"\nif grep -qE -- \"$deny\" \u003c\u003c\u003c\"$out\"; then\n    LAST_ERROR=\"Fingerprint for $url still advertises a version: $out\"\n    LAST_STUDENT_MSG=\"Your web server advertises its exact version, which tells an attacker which exploits to try. Suppress version numbers in your server configuration (Apache: ServerTokens Prod; nginx: server_tokens off).\"\n    return 1\nfi\nreturn 0\n"
+  },
+  {
+    "slug": "win-command-check",
+    "name": "Windows Command Check",
+    "action_type": "command",
+    "action_category": "general",
+    "input_context": [
+      {
+        "key": "cmd",
+        "type": "string",
+        "description": "PowerShell command to execute"
+      },
+      {
+        "key": "expect_output",
+        "type": "string",
+        "description": "Expected substring in output"
+      },
+      {
+        "key": "expect_exit",
+        "type": "number",
+        "description": "Expected exit code (default 0)"
+      }
+    ],
+    "output_context": [
+      {
+        "key": "command_output",
+        "type": "string",
+        "description": "Command output"
+      },
+      {
+        "key": "command_exit_code",
+        "type": "number",
+        "description": "Exit code"
+      }
+    ],
+    "supported_platforms": [
+      "windows"
+    ],
+    "script": "\n$cmd = \"\"; $expectOutput = \"\"; $expectExit = 0\nfor ($i=0; $i -lt $args.Count; $i++) {\n    switch ($args[$i]) {\n        \"--cmd\" { $cmd = $args[++$i] }\n        \"--expect-output\" { $expectOutput = $args[++$i] }\n        \"--expect-exit\" { $expectExit = [int]$args[++$i] }\n    }\n}\ntry {\n    $output = Invoke-Expression $cmd 2\u003e\u00261 | Out-String\n    $exitCode = $LASTEXITCODE\n    if ($null -eq $exitCode) { $exitCode = 0 }\n} catch {\n    $output = $_.Exception.Message\n    $exitCode = 1\n}\nctx_set \"command_output\" $output\nctx_set \"command_exit_code\" $exitCode\nif ($exitCode -ne $expectExit) {\n    $env:LAST_ERROR = \"Command exited $exitCode (expected $expectExit)\"\n    exit 1\n}\nif ($expectOutput -and $output -notlike \"*$expectOutput*\") {\n    $env:LAST_ERROR = \"Output does not contain '$expectOutput'\"\n    exit 1\n}\nexit 0\n"
+  },
+  {
+    "slug": "win-file-contains",
+    "name": "Windows File Contains",
+    "action_type": "file_check",
+    "action_category": "file",
+    "input_context": [
+      {
+        "key": "path",
+        "type": "string",
+        "description": "File path"
+      },
+      {
+        "key": "value",
+        "type": "string",
+        "description": "String or regex to find"
+      },
+      {
+        "key": "regex",
+        "type": "boolean",
+        "description": "Use regex (default: false)"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "windows"
+    ],
+    "script": "\n$path = \"\"; $value = \"\"; $regex = $false\nfor ($i=0; $i -lt $args.Count; $i++) {\n    switch ($args[$i]) {\n        \"--path\" { $path = $args[++$i] }\n        \"--value\" { $value = $args[++$i] }\n        \"--regex\" { $regex = $true }\n    }\n}\nif (-not (Test-Path $path)) {\n    $env:LAST_ERROR = \"File not found: $path\"\n    $env:LAST_STUDENT_MSG = \"File $path does not exist.\"\n    exit 1\n}\nif ($regex) {\n    $match = Select-String -Path $path -Pattern $value -Quiet\n} else {\n    $match = Select-String -Path $path -SimpleMatch $value -Quiet\n}\nif ($match) { exit 0 }\n$env:LAST_ERROR = \"File $path does not contain '$value'\"\n$env:LAST_STUDENT_MSG = \"Expected '$value' in $path\"\nexit 1\n"
+  },
+  {
+    "slug": "win-firewall-enabled",
+    "name": "Windows Firewall Enabled",
+    "action_type": "service_check",
+    "action_category": "firewall",
+    "input_context": [],
+    "output_context": [
+      {
+        "key": "firewall_status",
+        "type": "string",
+        "description": "enabled if any profile is on"
+      },
+      {
+        "key": "firewall_profiles",
+        "type": "string",
+        "description": "Comma-separated active profile names"
+      }
+    ],
+    "supported_platforms": [
+      "windows"
+    ],
+    "script": "\n$profiles = Get-NetFirewallProfile | Where-Object { $_.Enabled -eq $true }\nif ($profiles.Count -ge 1) {\n    ctx_set \"firewall_status\" \"enabled\"\n    ctx_set \"firewall_profiles\" ($profiles.Name -join \",\")\n    exit 0\n} else {\n    $env:LAST_ERROR = \"Windows Firewall is not enabled\"\n    $env:LAST_STUDENT_MSG = \"Windows Firewall is disabled. Enable it in Windows Security settings.\"\n    exit 1\n}\n"
+  },
+  {
+    "slug": "win-firewall-rule-exists",
+    "name": "Windows Firewall Rule Exists",
+    "action_type": "service_check",
+    "action_category": "firewall",
+    "input_context": [
+      {
+        "key": "rule",
+        "type": "string",
+        "description": "Firewall rule display name pattern"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "windows"
+    ],
+    "script": "\n$ruleName = \"\"\nfor ($i=0; $i -lt $args.Count; $i++) {\n    if ($args[$i] -eq \"--rule\") { $ruleName = $args[++$i] }\n}\n$rule = Get-NetFirewallRule -DisplayName \"*$ruleName*\" -ErrorAction SilentlyContinue | Where-Object { $_.Enabled -eq \"True\" }\nif ($rule) { exit 0 }\n$env:LAST_ERROR = \"Firewall rule not found: $ruleName\"\n$env:LAST_STUDENT_MSG = \"Missing or disabled firewall rule: $ruleName\"\nexit 1\n"
+  },
+  {
+    "slug": "win-package-installed",
+    "name": "Windows Package Installed",
+    "action_type": "service_check",
+    "action_category": "service",
+    "input_context": [
+      {
+        "key": "name",
+        "type": "string",
+        "description": "Program/package name to search for"
+      }
+    ],
+    "output_context": [],
+    "supported_platforms": [
+      "windows"
+    ],
+    "script": "\n$name = \"\"\nfor ($i=0; $i -lt $args.Count; $i++) {\n    if ($args[$i] -eq \"--name\") { $name = $args[++$i] }\n}\n$found = Get-Package -Name \"*$name*\" -ErrorAction SilentlyContinue\nif (-not $found) {\n    $found = Get-ItemProperty \"HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*\" |\n        Where-Object { $_.DisplayName -like \"*$name*\" }\n}\nif ($found) { exit 0 }\n$env:LAST_ERROR = \"Package $name is not installed\"\n$env:LAST_STUDENT_MSG = \"Package $name is not installed on this Windows system.\"\nexit 1\n"
+  },
+  {
+    "slug": "win-service-running",
+    "name": "Windows Service Running",
+    "action_type": "service_check",
+    "action_category": "service",
+    "input_context": [
+      {
+        "key": "name",
+        "type": "string",
+        "description": "Windows service name"
+      }
+    ],
+    "output_context": [
+      {
+        "key": "service_NAME_status",
+        "type": "string",
+        "description": "Service status"
+      }
+    ],
+    "supported_platforms": [
+      "windows"
+    ],
+    "script": "\n$name = \"\"\nforeach ($arg in $args) {\n    if ($arg -eq \"--name\") { $name = $args[$args.IndexOf($arg)+1] }\n}\n$svc = Get-Service -Name $name -ErrorAction SilentlyContinue\nif ($svc -and $svc.Status -eq \"Running\") {\n    ctx_set \"service_${name}_status\" \"Running\"\n    exit 0\n} else {\n    $env:LAST_ERROR = \"Service $name is not running\"\n    $env:LAST_STUDENT_MSG = \"Service $name is not running. Start it in services.msc or with: Start-Service $name\"\n    exit 1\n}\n"
+  }
+]

@@ -30,7 +30,7 @@ authoring docs.
 | **Run** | One execution of a workflow or playlist against a pod. Has a UUID exposed as `CRUCIBLE_RUN_ID` to scripts. |
 | **Runner** | Synonym for "Kali runner". |
 | **Script mode** | A workflow `creation_mode` where the author writes raw bash directly (vs the visual builder). |
-| **`set -euo pipefail`** | The bash incantation you should put at the top of every workflow. Fails on errors, unset variables, and broken pipes. |
+| **`set -uo pipefail`** | The bash incantation you should put at the top of every workflow. Fails on unset variables and broken pipes. Deliberately not `-euo`: `set -e` would make the first failing check abort the workflow, discarding every check after it. |
 | **Setup script** | An optional workflow field that runs once before the main `script`. Hard 60s timeout. |
 | **Slug** | A `[a-z0-9-]+` identifier, globally unique within its type. Library slugs identify database records; their `run_action` callable replaces `-` with `_` (for example, `port-open` → `port_open`). |
 | **`STUDENT_MSG:`** | Output line prefix that surfaces text to the student. Every other line is instructor-only. |

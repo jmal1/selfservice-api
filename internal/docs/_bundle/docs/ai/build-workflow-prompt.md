@@ -16,11 +16,12 @@ Paste this prompt into **any** AI tool (ChatGPT, Claude.ai, Gemini, etc.) **imme
 > 2. **Pick `execution_mode` deliberately.** Default to `kali_runner` unless the check fundamentally needs to be inside the target VM (e.g. checking a systemd unit, file ownership, registry key).
 > 3. **Prefer reusing a library action over inlining the logic.** Check `AGENTS.md` §7 first. Only inline when no library action fits.
 > 4. **Always include a `STUDENT_MSG:` line on every fail path.** Make it actionable — tell the student what to do, not just what failed.
-> 5. **Quote every `$VAR`** in the bash script. Always set `set -euo pipefail`. Always `source /opt/crucible/lib/actions.sh` (kali_runner only).
+> 5. **Quote every `$VAR`** in the bash script. Always set `set -uo pipefail`. Always `source /opt/crucible/lib/actions.sh` (kali_runner only).
 > 6. **Write every `run_action` as label + callable.** Use `run_action "<display label>" <command-or-function> [args...]`. For a library slug such as `demo-http-service-reachable`, the generated callable is `demo_http_service_reachable`; never omit it or pass the kebab-case slug as the command.
-> 7. **Add reasonable timeouts.** `timeout_seconds: 60` for actions, `300` for workflows is usually right; tighten for fast checks.
-> 8. **Output the JSON in a code block, alone**, after a brief one-paragraph explanation of what it does and why you chose the design.
-> 9. **Self-check before finalizing**, per `AGENTS.md` §12 — verify JSON parses, no invented enum values, slug uniqueness, shellcheck-clean bash, no leaked secrets, timeouts sane.
+> 7. **Set the workflow timeout.** `timeout_seconds: 300` for a workflow is usually right; tighten for fast checks. An action's own `timeout_seconds` is inert — every action gets the workflow-level `ACTION_TIMEOUT` (30s default).
+> 8. **For a library action, take `--flag value` arguments and report failure with `LAST_STUDENT_MSG`.** Do not use `params` / `PARAM_*` env vars or `student_fail_hint` with `{{ params.X }}` — both fields are stored but never read. Declare each accepted flag in `input_context` and each `ctx_set` key in `output_context`, as arrays of `{key, type, description}` objects.
+> 9. **Output the JSON in a code block, alone**, after a brief one-paragraph explanation of what it does and why you chose the design.
+> 10. **Self-check before finalizing**, per `AGENTS.md` §12 — verify JSON parses, no invented enum values, slug uniqueness, shellcheck-clean bash, no leaked secrets, timeouts sane.
 >
 > My assessment idea:
 >

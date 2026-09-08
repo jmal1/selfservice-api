@@ -270,6 +270,13 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 				// see the NOTE above and the comment on that block.
 				r.Get("/vcenter/isos", h.AdminListVCenterISOs)
 
+				// OVA catalog: the discovery surface for source_type=ovf.
+				// Imported OVAs never appear in /vcenter/isos (they are not
+				// mountable media), so this is the only place the
+				// image_uploads.vcenter_vm_id needed for source_ref is
+				// exposed.
+				r.Get("/vcenter/ovas", h.AdminListVCenterOVAs)
+
 				// Image uploads (Epic A): browser → MinIO → vCenter.
 				//
 				// Nested inside this block on purpose so it inherits the
