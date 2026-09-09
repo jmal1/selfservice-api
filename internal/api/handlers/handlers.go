@@ -72,6 +72,10 @@ type Handler struct {
 	// WithRunsDB. See runsStore().
 	runsDB runsListDB
 
+	// podsDB is an optional override for the narrow DB surface used by
+	// ListPods. nil means h.db is used. Tests inject a fake via WithPodsDB.
+	podsDB podsListDB
+
 	// workflowActivationDB optionally overrides the activation boundary's
 	// narrow database surface for handler tests. Production defaults to h.db.
 	workflowActivationDB workflowActivationStore
@@ -306,6 +310,37 @@ func (h *Handler) WithRunsDB(db runsListDB) *Handler {
 	return h
 }
 
+// podsListDB is the narrow slice of *database.Queries that ListPods needs.
+// Declaring it as an interface lets tests inject a fake without a live pgxpool
+// — see Handler.podsStore() and WithPodsDB.
+type podsListDB interface {
+	ListAllPods(ctx context.Context) ([]models.Pod, error)
+	ListPodsByOwner(ctx context.Context, ownerID uuid.UUID) ([]models.Pod, error)
+}
+
+// podsStore returns the podsListDB in use. h.podsDB is non-nil only in
+// tests; production code always falls through to h.db.
+func (h *Handler) podsStore() podsListDB {
+	if h.podsDB != nil {
+		return h.podsDB
+	}
+	return h.db
+}
+
+// WithPodsDB injects a fake podsListDB for testing ListPods without a real
+// database connection. Do not call from production code.
+func (h *Handler) WithPodsDB(db podsListDB) *Handler {
+	h.podsDB = db
+	return h
+}
+
+// roleSeesAllPods reports whether the caller should receive every non-destroyed
+// pod (with owner attribution). Instructors and admins share this view; students
+// only see their own pods.
+func roleSeesAllPods(role string) bool {
+	return role == models.RoleAdmin || role == models.RoleInstructor
+}
+
 // PreflightVCenter is a type alias so the handlers package can name the
 // interface without importing the preflight package directly in every file.
 type PreflightVCenter = preflight.PreflightVCenter
@@ -356,17 +391,18 @@ func (h *Handler) auditLog(ctx context.Context, action string, opts ...audit.Opt
 
 // --- Pod Handlers ---
 
-// ListPods returns the user's pods (admin: all pods with owners).
+// ListPods returns the caller's pods. Instructors and admins receive every
+// non-destroyed pod with owner attribution; students receive only their own.
 func (h *Handler) ListPods(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.UserIDFromContext(r.Context())
 	role := middleware.RoleFromContext(r.Context())
 
 	var pods []models.Pod
 	var err error
-	if role == models.RoleAdmin {
-		pods, err = h.db.ListAllPods(r.Context())
+	if roleSeesAllPods(role) {
+		pods, err = h.podsStore().ListAllPods(r.Context())
 	} else {
-		pods, err = h.db.ListPodsByOwner(r.Context(), userID)
+		pods, err = h.podsStore().ListPodsByOwner(r.Context(), userID)
 	}
 	if err != nil {
 		h.logger.Error("list pods failed", "error", err, "user_id", userID)

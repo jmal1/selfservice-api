@@ -346,7 +346,8 @@ func (q *Queries) ListExplicitTemplateAccessForUser(ctx context.Context, userID 
 
 // ListAllTemplates returns all templates (admin). Uses the same pinning sort
 // order as ListTemplatesForUser: pinned items first (by pin_order, then pinned_at),
-// then unpinned items (by name).
+// then unpinned items (by name). Creator attribution is attached via a follow-up
+// lookup so templateSelectCols stays unambiguous across JOIN-free callers.
 func (q *Queries) ListAllTemplates(ctx context.Context) ([]models.Template, error) {
 	rows, err := q.pool.Query(ctx, `
 		SELECT `+templateSelectCols+`
@@ -366,7 +367,53 @@ func (q *Queries) ListAllTemplates(ctx context.Context) ([]models.Template, erro
 		}
 		templates = append(templates, t)
 	}
+	if err := attachTemplateCreators(ctx, q, templates); err != nil {
+		return nil, err
+	}
 	return templates, nil
+}
+
+type userLookup interface {
+	GetUserByID(ctx context.Context, id uuid.UUID) (*models.User, error)
+}
+
+// attachTemplateCreators fills Creator on templates that have created_by set.
+// Uses one lookup per distinct creator (lab-scale lists); a missing user leaves
+// Creator unset rather than failing the whole list.
+func attachTemplateCreators(ctx context.Context, users userLookup, templates []models.Template) error {
+	cache := make(map[uuid.UUID]*models.User)
+	for i := range templates {
+		id := templates[i].CreatedBy
+		if id == nil {
+			continue
+		}
+		if cached, ok := cache[*id]; ok {
+			templates[i].Creator = cached
+			continue
+		}
+		creator, err := users.GetUserByID(ctx, *id)
+		if err != nil {
+			return err
+		}
+		slim := slimAttributionUser(creator)
+		cache[*id] = slim
+		templates[i].Creator = slim
+	}
+	return nil
+}
+
+// slimAttributionUser keeps the Blueprint/Pod list shape: identity fields only.
+func slimAttributionUser(u *models.User) *models.User {
+	if u == nil {
+		return nil
+	}
+	return &models.User{
+		ID:          u.ID,
+		Username:    u.Username,
+		Email:       u.Email,
+		DisplayName: u.DisplayName,
+		Role:        u.Role,
+	}
 }
 
 // SetTemplateAccess replaces all access rules for a template.
