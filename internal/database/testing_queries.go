@@ -420,13 +420,18 @@ func (q *Queries) ListAllRunsFiltered(ctx context.Context, filter RunsListFilter
 
 // --- Workflow CRUD Queries ---
 
-// ListWorkflows returns all workflows.
+// ListWorkflows returns all workflows with creator and approver attribution.
 func (q *Queries) ListWorkflows(ctx context.Context) ([]models.Workflow, error) {
 	rows, err := q.pool.Query(ctx, `
-		SELECT id, name, slug, description, category, execution_mode,
-		       timeout_seconds, status, creation_mode, visible_to_students,
-		       created_by, approved_by, is_active, created_at, updated_at
-		FROM workflows ORDER BY name
+		SELECT w.id, w.name, w.slug, w.description, w.category, w.execution_mode,
+		       w.timeout_seconds, w.status, w.creation_mode, w.visible_to_students,
+		       w.created_by, w.approved_by, w.is_active, w.created_at, w.updated_at,
+		       cu.id, COALESCE(cu.username, ''), COALESCE(cu.email, ''), COALESCE(cu.display_name, ''), COALESCE(cu.role, ''),
+		       au.id, COALESCE(au.username, ''), COALESCE(au.email, ''), COALESCE(au.display_name, ''), COALESCE(au.role, '')
+		FROM workflows w
+		LEFT JOIN users cu ON cu.id = w.created_by
+		LEFT JOIN users au ON au.id = w.approved_by
+		ORDER BY w.name
 	`)
 	if err != nil {
 		return nil, err
@@ -436,11 +441,35 @@ func (q *Queries) ListWorkflows(ctx context.Context) ([]models.Workflow, error) 
 	var workflows []models.Workflow
 	for rows.Next() {
 		var w models.Workflow
+		var creatorID, approverID *uuid.UUID
+		var creatorUsername, creatorEmail, creatorDisplayName, creatorRole string
+		var approverUsername, approverEmail, approverDisplayName, approverRole string
 		if err := rows.Scan(&w.ID, &w.Name, &w.Slug, &w.Description, &w.Category,
 			&w.ExecutionMode, &w.TimeoutSeconds, &w.Status, &w.CreationMode,
 			&w.VisibleToStudents, &w.CreatedBy, &w.ApprovedBy, &w.IsActive,
-			&w.CreatedAt, &w.UpdatedAt); err != nil {
+			&w.CreatedAt, &w.UpdatedAt,
+			&creatorID, &creatorUsername, &creatorEmail, &creatorDisplayName, &creatorRole,
+			&approverID, &approverUsername, &approverEmail, &approverDisplayName, &approverRole,
+		); err != nil {
 			return nil, err
+		}
+		if creatorID != nil {
+			w.Creator = &models.User{
+				ID:          *creatorID,
+				Username:    creatorUsername,
+				Email:       creatorEmail,
+				DisplayName: creatorDisplayName,
+				Role:        creatorRole,
+			}
+		}
+		if approverID != nil {
+			w.Approver = &models.User{
+				ID:          *approverID,
+				Username:    approverUsername,
+				Email:       approverEmail,
+				DisplayName: approverDisplayName,
+				Role:        approverRole,
+			}
 		}
 		workflows = append(workflows, w)
 	}

@@ -58,12 +58,15 @@ type Template struct {
 	// TemplateState drives the wizard lifecycle (migration 000018).
 	// See models.TemplateState* constants and internal/templates/lifecycle.go
 	// for allowed transitions. Defaults to 'active' for legacy rows.
-	TemplateState  string     `json:"template_state" db:"template_state"`
-	CreatedBy      *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
-	VCenterVMID    string     `json:"vcenter_vm_id" db:"vcenter_vm_id"`
-	SourceType     string     `json:"source_type" db:"source_type"`
-	SourceRef      string     `json:"source_ref" db:"source_ref"`
-	StagingNetwork string     `json:"staging_network" db:"staging_network"`
+	TemplateState string     `json:"template_state" db:"template_state"`
+	CreatedBy     *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
+	// Creator is populated on admin list responses when created_by resolves.
+	// Omitted from ordinary SELECTs that only need the UUID.
+	Creator        *User  `json:"creator,omitempty" db:"-"`
+	VCenterVMID    string `json:"vcenter_vm_id" db:"vcenter_vm_id"`
+	SourceType     string `json:"source_type" db:"source_type"`
+	SourceRef      string `json:"source_ref" db:"source_ref"`
+	StagingNetwork string `json:"staging_network" db:"staging_network"`
 	// SkipGeneralize, when true, tells template_generalize to power the
 	// staging VM off and take the base-image snapshot without running
 	// GuestOps generalize scripts. Publish is unchanged: ready → verifying
