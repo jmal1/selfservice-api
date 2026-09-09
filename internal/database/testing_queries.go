@@ -426,8 +426,8 @@ func (q *Queries) ListWorkflows(ctx context.Context) ([]models.Workflow, error) 
 		SELECT w.id, w.name, w.slug, w.description, w.category, w.execution_mode,
 		       w.timeout_seconds, w.status, w.creation_mode, w.visible_to_students,
 		       w.created_by, w.approved_by, w.is_active, w.created_at, w.updated_at,
-		       cu.id, cu.username, cu.email, COALESCE(cu.display_name, ''), cu.role,
-		       au.id, au.username, au.email, COALESCE(au.display_name, ''), au.role
+		       cu.id, COALESCE(cu.username, ''), COALESCE(cu.email, ''), COALESCE(cu.display_name, ''), COALESCE(cu.role, ''),
+		       au.id, COALESCE(au.username, ''), COALESCE(au.email, ''), COALESCE(au.display_name, ''), COALESCE(au.role, '')
 		FROM workflows w
 		LEFT JOIN users cu ON cu.id = w.created_by
 		LEFT JOIN users au ON au.id = w.approved_by
