@@ -603,6 +603,14 @@ type fakeISOVC struct {
 	probeErrs   []error
 	recreateErr error
 
+	// guestPoweredOn / guestInfoErr drive GetGuestInfo, which the ISO path
+	// consults only to prove a VM is powered off before destroying its system
+	// disk. The zero value models a freshly created shell (powered off), which
+	// is what every disk-repair path legitimately operates on.
+	guestPoweredOn bool
+	guestInfoErr   error
+	guestInfoCalls int
+
 	// seq records the order of vCenter calls so a test can assert the ISO
 	// install sequence, not just that each call happened. Ordering is the
 	// whole contract here: detaching the installer media before the install
@@ -684,6 +692,17 @@ func (f *fakeISOVC) RecreateSystemDisk(_ context.Context, moref string, diskGB i
 	f.recreateMoref = moref
 	f.recreateGB = diskGB
 	return f.recreateErr
+}
+
+// GetGuestInfo models the power-state read that gates the disk recreate. It is
+// recorded in seq so a test can prove the check happens BEFORE the destroy.
+func (f *fakeISOVC) GetGuestInfo(_ context.Context, moref string) (*vcenter.GuestInfo, error) {
+	f.guestInfoCalls++
+	f.seq = append(f.seq, "guest_info")
+	if f.guestInfoErr != nil {
+		return nil, f.guestInfoErr
+	}
+	return &vcenter.GuestInfo{Name: moref, PoweredOn: f.guestPoweredOn}, nil
 }
 
 func (f *fakeISOVC) PowerOnVM(_ context.Context, moref string) error {

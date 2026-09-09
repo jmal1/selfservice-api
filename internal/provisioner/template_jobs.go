@@ -355,6 +355,10 @@ type isoProvisionVCenter interface {
 	// RecreateSystemDisk repairs a broken system disk by destroying it and
 	// adding a fresh one at the requested capacity.
 	RecreateSystemDisk(ctx context.Context, moref string, diskGB int) error
+	// GetGuestInfo is a single non-blocking property read. The ISO path uses
+	// it only to prove a staging VM is powered OFF before destroying its
+	// system disk — see the guard in repairSystemDisk.
+	GetGuestInfo(ctx context.Context, moref string) (*vcenter.GuestInfo, error)
 	PowerOnVM(ctx context.Context, moref string) error
 	// WaitForPowerOff, not WaitForTools, is the unattended install's completion
 	// signal — see the long comment at the call site.
@@ -387,6 +391,12 @@ var (
 //   - unattend_mode manual/empty skips the seed build AND WaitForTools (the OS
 //     is not installed yet, so Tools can never appear); it parks the template
 //     in 'configuring' for a hands-on console install.
+//   - On the manual path a power-on that fails because the datastore has not
+//     finished allocating the system disk does NOT fail the job and does NOT
+//     recreate the disk: the VM is handed over powered off and the template
+//     still reaches 'configuring', because the operator powers it on from the
+//     console regardless. Erroring instead leaves a usable staging VM on a
+//     template that has no resume edge.
 //   - Any other unattend_mode builds a seed ISO via unattend.BuildSeedISO and
 //     uploads it next to the installer. If the builder reports
 //     ErrPreseedRequiresRemaster (debian_preseed cannot be seeded from a second
@@ -504,6 +514,24 @@ func provisionTemplateFromISO(
 		if diskRecreated {
 			return fmt.Errorf("system disk still not readable after one recreate: %w", cause)
 		}
+		// RecreateSystemDisk deletes the disk's backing files
+		// (FileOperation=destroy), so it is only ever safe on a shell that has
+		// never run. A powered-on staging VM is either mid-install or holding
+		// a guest an operator installed by hand over the console, and throwing
+		// its disk away would destroy that work silently. No path reaches this
+		// helper with a powered-on VM today, so a trip here means an ordering
+		// assumption broke — fail closed rather than delete data.
+		info, ierr := vc.GetGuestInfo(ctx, moref)
+		if ierr != nil {
+			return fmt.Errorf(
+				"confirm staging VM %s is powered off before recreating its system disk (original disk fault: %v): %w",
+				moref, cause, ierr)
+		}
+		if info != nil && info.PoweredOn {
+			return fmt.Errorf(
+				"refusing to recreate the system disk on %s: the VM is powered on, and recreating destroys the disk's backing files along with any OS already installed on it (original disk fault: %w)",
+				moref, cause)
+		}
 		diskRecreated = true
 		logger.Warn("staging VM system disk did not allocate on the datastore; recreating it once",
 			"vm", moref, "template_id", payload.TemplateID, "disk_gb", payload.DiskGB, "cause", cause)
@@ -537,19 +565,45 @@ func provisionTemplateFromISO(
 	}
 
 	prog("power_on", "Powering on VM to begin install")
+	powerOnDeferred := false
 	if err := vc.PowerOnVM(ctx, moref); err != nil {
-		// Fallback classifier: the proactive probe passed but the hypervisor's
-		// own disk-open still faulted on the flat. Repair once and retry the
-		// power-on rather than burning the probe-clean path's guarantee and
-		// erroring the template.
 		if !vcenter.IsDiskNotReadyErr(err) {
 			return fmt.Errorf("power on: %w", err)
 		}
-		if rerr := repairSystemDisk(err); rerr != nil {
-			return rerr
-		}
-		if err := vc.PowerOnVM(ctx, moref); err != nil {
-			return fmt.Errorf("power on after disk recreate: %w", err)
+		// The probe above already opened this disk through vCenter, so the
+		// descriptor and its extent exist; a host-side disk-open fault here is
+		// the NFS datastore still allocating the flat. PowerOnVM has already
+		// ridden that out on its own bounded budget (~1 minute), and this
+		// datastore has been observed to need longer — see PowerOnVM's comment
+		// on the same fault succeeding "minutes later with no other change".
+		if unattended {
+			// An unattended install cannot start without power-on, and the
+			// disk is provably blank at this point, so a one-shot recreate is
+			// both necessary and safe here.
+			if rerr := repairSystemDisk(err); rerr != nil {
+				return rerr
+			}
+			if err := vc.PowerOnVM(ctx, moref); err != nil {
+				return fmt.Errorf("power on after disk recreate: %w", err)
+			}
+		} else {
+			// Manual install: power-on is a convenience, not a precondition.
+			// This branch's whole contract is to hand over a VM with the
+			// installer mounted, and the operator powers it on from the
+			// console anyway.
+			//
+			// Erroring here is actively harmful. It strands a usable VM on a
+			// template whose only lifecycle edge is error→draft, so there is
+			// no way to hand the guest back once an operator installs on it by
+			// hand — which is exactly how a completed Linux Mint install ended
+			// up on an errored template. Recreating the disk instead would be
+			// worse: it destroys the flat the datastore has spent the last
+			// minute allocating and restarts that allocation from zero.
+			powerOnDeferred = true
+			logger.Warn("staging VM did not power on because the datastore had not finished allocating the system disk; handing it over powered off for the manual install",
+				"vm", moref, "template_id", payload.TemplateID, "cause", err)
+			prog("power_on_deferred",
+				"The datastore had not finished allocating the system disk, so the VM was left powered off — power it on from the VM console to start the installer")
 		}
 	}
 
@@ -592,6 +646,11 @@ func provisionTemplateFromISO(
 			return fmt.Errorf(
 				"wait for VMware Tools after first boot of the installed system: %w (the install completed but the guest did not come up with open-vm-tools running)", err)
 		}
+	} else if powerOnDeferred {
+		// Same handover, but the message must not claim a power state the VM
+		// does not have — an operator who trusts "powered on" and sees a black
+		// console has no idea the first action is theirs.
+		prog("await_manual_install", "Blank VM has the installer ISO mounted but is still POWERED OFF (the datastore was slow to allocate its disk) — power it on from the VM console (WebMKS), install the OS, then run Generalize")
 	} else {
 		// Manual install: the OS is NOT installed yet, so WaitForTools would
 		// always time out. Skip it and hand the VM (installer still mounted)

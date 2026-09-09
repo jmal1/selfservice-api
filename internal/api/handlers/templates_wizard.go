@@ -649,11 +649,30 @@ func (h *Handler) AdminUnpublishTemplate(w http.ResponseWriter, r *http.Request)
 
 // AdminRetryTemplate (POST /admin/templates/:id/retry) — error → draft.
 // Resets a failed template back to draft so the instructor can re-run the
-// wizard. Does NOT destroy the staging VM if one exists — that's a separate
-// concern; the operator can hit /cancel first if they want the VM gone.
+// wizard. It never destroys a staging VM, so it REFUSES while one is still
+// recorded.
+//
+// Retrying with a leftover moref is a dead end that also destroys work:
+//
+//   - Re-provisioning cannot succeed. buildTemplateVMName is deterministic, so
+//     the next run computes the same VM name — preflight PF-09 blocks it, and
+//     an override just moves the failure to CreateBlankVM, which has no
+//     reuse-by-name path and faults DuplicateName.
+//   - It silently abandons a usable guest. A failed manual ISO provision can
+//     leave a staging VM an operator finished installing by hand over the
+//     console; error→draft keeps that moref pointed at a VM the wizard will
+//     never touch again, and the orphan reconciler destroys draft/error rows
+//     that still hold one.
+//
+// /cancel is the step that actually cleans up: it destroys the staging VM,
+// clears the moref, and lands the row in draft.
 func (h *Handler) AdminRetryTemplate(w http.ResponseWriter, r *http.Request) {
 	tmpl, ok := h.requireTemplateInState(w, r, models.TemplateStateError)
 	if !ok {
+		return
+	}
+	if reason, blocked := retryStagingVMConflict(tmpl); blocked {
+		h.writeStateConflict(w, tmpl, reason)
 		return
 	}
 	if !h.stateOnlyTransition(w, r, tmpl, models.TemplateStateError, models.TemplateStateDraft, "template.retry",
@@ -662,11 +681,33 @@ func (h *Handler) AdminRetryTemplate(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// AdminCancelTemplate (POST /admin/templates/:id/cancel) — early-cancel
-// from configuring or ready back to draft. Destroys the staging VM first
+// retryStagingVMConflict returns the operator-facing reason retry must refuse,
+// or ok=false when there is nothing to clean up first. Kept pure (no DB, no
+// HTTP) so both branches are directly testable — the same shape as
+// credentialContractPublishError.
+func retryStagingVMConflict(tmpl *models.Template) (string, bool) {
+	if tmpl == nil || tmpl.VCenterVMID == "" {
+		return "", false
+	}
+	return fmt.Sprintf(
+		"template still has staging VM %s in vCenter, and retry does not destroy it — re-provisioning would fail on the duplicate VM name. "+
+			"If that VM holds work you want (for example an OS you installed over the console), recover it before continuing, because it will be "+
+			"destroyed automatically once this row has sat in error/draft for 24h. POST /admin/templates/%s/cancel to destroy the staging VM and return to draft.",
+		tmpl.VCenterVMID, tmpl.ID), true
+}
+
+// AdminCancelTemplate (POST /admin/templates/:id/cancel) — cancel from
+// configuring, ready, or error back to draft. Destroys the staging VM first
 // (when present), then clears vcenter_vm_id, then transitions to draft —
 // same destroy-before-forget ordering as AdminDeleteTemplate so a failed
 // vCenter call keeps the moref for retry instead of orphaning inventory.
+//
+// `error` is accepted because it was the one state with a leftover staging VM
+// and no way to clean it up. Retry only moves error→draft and deliberately
+// leaves the VM, so a failed provision left a VM that nothing could destroy
+// through the API while the orphan reconciler quietly counted down to
+// destroying it 24h later. This is now the supported cleanup step, and the
+// docs point operators here instead of at Retry.
 func (h *Handler) AdminCancelTemplate(w http.ResponseWriter, r *http.Request) {
 	templateID, err := uuid.Parse(chi.URLParam(r, "templateID"))
 	if err != nil {
@@ -680,10 +721,12 @@ func (h *Handler) AdminCancelTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Both configuring and ready can cancel to draft.
+	// configuring, ready, and error can all cancel to draft.
 	from := tmpl.TemplateState
-	if from != models.TemplateStateConfiguring && from != models.TemplateStateReady {
-		h.writeStateConflict(w, tmpl, fmt.Sprintf("cancel only valid from configuring or ready, got %s", from))
+	if from != models.TemplateStateConfiguring &&
+		from != models.TemplateStateReady &&
+		from != models.TemplateStateError {
+		h.writeStateConflict(w, tmpl, fmt.Sprintf("cancel only valid from configuring, ready, or error, got %s", from))
 		return
 	}
 	if err := templates.CanTransition(from, models.TemplateStateDraft); err != nil {

@@ -55,14 +55,24 @@ type TemplateOrphanCounts struct {
 	SkippedOwned       int
 	SkippedRecent      int
 	UnknownDryRun      int
-	Destroyed          int
-	DestroyFailures    int
+	// SkippedPoweredOn counts DB candidates left alone because the staging VM
+	// was still running, and SkippedUndetermined those whose power state could
+	// not be read. Both need an operator, so they are surfaced rather than
+	// folded into the generic skip counters.
+	SkippedPoweredOn    int
+	SkippedUndetermined int
+	Destroyed           int
+	DestroyFailures     int
 }
 
 type templateOrphanVCenter interface {
 	ListVMsInFolder(ctx context.Context, folderPath string) ([]vcenter.FolderVM, error)
 	PowerOffVM(ctx context.Context, moref string) error
 	DestroyVM(ctx context.Context, moref string) error
+	// GetGuestInfo is a single non-blocking property read. The DB pass uses it
+	// to avoid destroying a staging VM that is still running — see the guard in
+	// reconcileTemplateOrphans.
+	GetGuestInfo(ctx context.Context, moref string) (*vcenter.GuestInfo, error)
 }
 
 type templateOrphanDB interface {
@@ -102,6 +112,32 @@ func reconcileTemplateOrphans(
 		return counts, fmt.Errorf("list stale wizard templates: %w", err)
 	}
 	for _, row := range stale {
+		// A powered-on staging VM is not an abandoned shell. It is either
+		// running an installer or holding a guest an operator installed by
+		// hand over the console — which is exactly what a failed manual ISO
+		// provision leaves behind, because the job errors while the VM stays
+		// perfectly usable. destroyTemplateOrphanVM powers the VM off and
+		// ignores the result before deleting it, so without this check the
+		// pass silently destroys that work 24h later with nothing to review.
+		//
+		// Leaving a powered-on VM in place is the safer default for a cleanup
+		// job: the cost is one VM an operator must dispose of through /cancel,
+		// against permanently deleting a finished build.
+		poweredOn, perr := templateOrphanVMPoweredOn(ctx, vc, row.VCenterVMID)
+		if perr != nil {
+			counts.SkippedUndetermined++
+			log.Warn("template orphan: cannot determine staging VM power state; leaving it in place",
+				"template_id", row.ID, "name", row.Name, "state", row.State,
+				"moref", row.VCenterVMID, "error", perr)
+			continue
+		}
+		if poweredOn {
+			counts.SkippedPoweredOn++
+			log.Warn("template orphan: stale wizard staging VM is powered on; leaving it for an operator to dispose of via cancel",
+				"template_id", row.ID, "name", row.Name, "state", row.State,
+				"moref", row.VCenterVMID, "updated_at", row.UpdatedAt)
+			continue
+		}
 		log.Info("template orphan: destroying stale wizard staging VM",
 			"template_id", row.ID, "name", row.Name, "state", row.State,
 			"moref", row.VCenterVMID, "updated_at", row.UpdatedAt)
@@ -181,6 +217,8 @@ func reconcileTemplateOrphans(
 		"inventory_destroyed", counts.InventoryDestroyed,
 		"skipped_owned", counts.SkippedOwned,
 		"skipped_recent", counts.SkippedRecent,
+		"skipped_powered_on", counts.SkippedPoweredOn,
+		"skipped_undetermined", counts.SkippedUndetermined,
 		"unknown_dryrun", counts.UnknownDryRun,
 		"destroyed", counts.Destroyed,
 		"destroy_failures", counts.DestroyFailures,
@@ -197,6 +235,23 @@ func reconcileTemplateOrphans(
 func destroyTemplateOrphanVM(ctx context.Context, vc templateOrphanVCenter, moref string) error {
 	_ = vc.PowerOffVM(ctx, moref)
 	return vc.DestroyVM(ctx, moref)
+}
+
+// templateOrphanVMPoweredOn reports whether the staging VM is running. A VM
+// that no longer exists is reported as not-powered-on so the DB pass proceeds
+// and clears the dangling moref instead of skipping the row forever.
+func templateOrphanVMPoweredOn(ctx context.Context, vc templateOrphanVCenter, moref string) (bool, error) {
+	info, err := vc.GetGuestInfo(ctx, moref)
+	if err != nil {
+		if vcenter.IsVMNotFoundError(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if info == nil {
+		return false, nil
+	}
+	return info.PoweredOn, nil
 }
 
 func isDisposableTemplateOrphanName(name string) bool {
