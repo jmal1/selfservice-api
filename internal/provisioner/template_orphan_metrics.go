@@ -63,6 +63,10 @@ func serializeTemplateOrphanCounts(folder string, c TemplateOrphanCounts) []byte
 		{"inventory_destroyed", c.InventoryDestroyed},
 		{"skipped_owned", c.SkippedOwned},
 		{"skipped_recent", c.SkippedRecent},
+		// A retained VM needs an operator, so it has to be visible somewhere
+		// other than a worker log line.
+		{"skipped_powered_on", c.SkippedPoweredOn},
+		{"skipped_undetermined", c.SkippedUndetermined},
 		{"unknown_dryrun", c.UnknownDryRun},
 	} {
 		fmt.Fprintf(&b, "crucible_template_orphans_total{folder=%q,category=%q} %d\n", folder, row.category, row.value)

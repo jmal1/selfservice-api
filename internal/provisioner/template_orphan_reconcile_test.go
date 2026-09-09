@@ -21,6 +21,12 @@ type fakeTemplateOrphanVC struct {
 	listErr     error
 	destroyErr  map[string]error
 	destroySeen []string
+
+	// poweredOn / guestInfoErr drive the DB pass's pre-destroy power-state
+	// check, keyed by moref. Absent entries model a powered-off VM, which is
+	// the ordinary abandoned-shell case the reaper exists to clean up.
+	poweredOn    map[string]bool
+	guestInfoErr map[string]error
 }
 
 func (f *fakeTemplateOrphanVC) ListVMsInFolder(_ context.Context, folder string) ([]vcenter.FolderVM, error) {
@@ -32,6 +38,13 @@ func (f *fakeTemplateOrphanVC) ListVMsInFolder(_ context.Context, folder string)
 }
 
 func (f *fakeTemplateOrphanVC) PowerOffVM(_ context.Context, _ string) error { return nil }
+
+func (f *fakeTemplateOrphanVC) GetGuestInfo(_ context.Context, moref string) (*vcenter.GuestInfo, error) {
+	if err, ok := f.guestInfoErr[moref]; ok {
+		return nil, err
+	}
+	return &vcenter.GuestInfo{Name: moref, PoweredOn: f.poweredOn[moref]}, nil
+}
 
 func (f *fakeTemplateOrphanVC) DestroyVM(_ context.Context, moref string) error {
 	f.destroySeen = append(f.destroySeen, moref)
@@ -200,6 +213,132 @@ func TestReconcileTemplateOrphans_DestroyFailureCounted(t *testing.T) {
 	}
 	if len(db.cleared) != 0 {
 		t.Fatalf("must not clear moref after destroy failure; got %v", db.cleared)
+	}
+}
+
+// TestReconcileTemplateOrphans_SkipsPoweredOnStagingVM is the data-loss guard.
+//
+// A manual ISO provision that failed on a slow datastore leaves the row in
+// `error` with its moref intact while the staging VM stays perfectly usable —
+// and an operator may well have finished installing an OS on it through the
+// vCenter console. destroyTemplateOrphanVM powers the VM off and ignores the
+// result before deleting it, so without this check the pass destroys that work
+// 24h later with nothing to review. A powered-on VM must be retained and
+// counted so an operator disposes of it deliberately via /cancel.
+func TestReconcileTemplateOrphans_SkipsPoweredOnStagingVM(t *testing.T) {
+	fixedNow := time.Date(2026, 9, 4, 0, 0, 0, 0, time.UTC)
+	old := fixedNow.Add(-25 * time.Hour)
+	installedID := uuid.New()
+	abandonedID := uuid.New()
+
+	vc := &fakeTemplateOrphanVC{
+		poweredOn: map[string]bool{"vm-27390": true},
+	}
+	db := &fakeTemplateOrphanDB{
+		stale: []database.StaleWizardTemplateVM{
+			// The Mint case: errored template, VM running a finished install.
+			{ID: installedID, Name: "Linux Mint 22.3 MATE", State: models.TemplateStateError, VCenterVMID: "vm-27390", UpdatedAt: old},
+			// A genuinely abandoned shell, powered off — still cleaned up.
+			{ID: abandonedID, Name: "abandoned", State: models.TemplateStateDraft, VCenterVMID: "vm-dead", UpdatedAt: old},
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	counts, err := reconcileTemplateOrphans(context.Background(), vc, db, logger,
+		TemplateOrphanReconcilerConfig{Folder: ""}, func() time.Time { return fixedNow })
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	for _, moref := range vc.destroySeen {
+		if moref == "vm-27390" {
+			t.Fatal("destroyed a powered-on staging VM that may hold a completed console install")
+		}
+	}
+	if counts.SkippedPoweredOn != 1 {
+		t.Errorf("skipped_powered_on=%d; want 1 so the retained VM is visible in metrics", counts.SkippedPoweredOn)
+	}
+	if counts.StaleFailed != 0 {
+		t.Errorf("stale_failed=%d; want 0 — the errored row was retained, not destroyed", counts.StaleFailed)
+	}
+	// The moref must survive so the row keeps pointing at the VM an operator
+	// still has to deal with.
+	for _, cleared := range db.cleared {
+		if cleared == installedID.String()+":vm-27390" {
+			t.Error("cleared the moref of a retained VM; the row would lose track of it")
+		}
+	}
+	// The abandoned shell is the reaper's actual job and must still go.
+	if counts.Destroyed != 1 || len(vc.destroySeen) != 1 || vc.destroySeen[0] != "vm-dead" {
+		t.Errorf("destroyed=%d seen=%v; want only the powered-off abandoned shell", counts.Destroyed, vc.destroySeen)
+	}
+}
+
+// TestReconcileTemplateOrphans_SkipsWhenPowerStateUnknown keeps the guard
+// fail-closed: an unreadable power state is not permission to assume the VM is
+// idle.
+func TestReconcileTemplateOrphans_SkipsWhenPowerStateUnknown(t *testing.T) {
+	fixedNow := time.Date(2026, 9, 4, 0, 0, 0, 0, time.UTC)
+	old := fixedNow.Add(-25 * time.Hour)
+	id := uuid.New()
+
+	vc := &fakeTemplateOrphanVC{
+		guestInfoErr: map[string]error{"vm-unknown": errors.New("ServerFaultCode: connection reset by peer")},
+	}
+	db := &fakeTemplateOrphanDB{
+		stale: []database.StaleWizardTemplateVM{
+			{ID: id, Name: "unreadable", State: models.TemplateStateError, VCenterVMID: "vm-unknown", UpdatedAt: old},
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	counts, err := reconcileTemplateOrphans(context.Background(), vc, db, logger,
+		TemplateOrphanReconcilerConfig{Folder: ""}, func() time.Time { return fixedNow })
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(vc.destroySeen) != 0 {
+		t.Fatalf("destroyed a VM whose power state could not be read; got %v", vc.destroySeen)
+	}
+	if counts.SkippedUndetermined != 1 {
+		t.Errorf("skipped_undetermined=%d; want 1", counts.SkippedUndetermined)
+	}
+	if counts.DestroyFailures != 0 {
+		t.Errorf("destroy_failures=%d; a skip is not a destroy failure", counts.DestroyFailures)
+	}
+}
+
+// TestReconcileTemplateOrphans_DestroysWhenVMAlreadyGone proves the guard does
+// not strand rows whose VM no longer exists. A missing VM must not read as
+// "cannot determine power state" forever, or the dangling moref is never
+// cleared.
+func TestReconcileTemplateOrphans_DestroysWhenVMAlreadyGone(t *testing.T) {
+	fixedNow := time.Date(2026, 9, 4, 0, 0, 0, 0, time.UTC)
+	old := fixedNow.Add(-25 * time.Hour)
+	id := uuid.New()
+
+	vc := &fakeTemplateOrphanVC{
+		guestInfoErr: map[string]error{
+			"vm-deleted": errors.New("ServerFaultCode: ManagedObjectNotFound: could not be found"),
+		},
+	}
+	db := &fakeTemplateOrphanDB{
+		stale: []database.StaleWizardTemplateVM{
+			{ID: id, Name: "already-gone", State: models.TemplateStateError, VCenterVMID: "vm-deleted", UpdatedAt: old},
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	counts, err := reconcileTemplateOrphans(context.Background(), vc, db, logger,
+		TemplateOrphanReconcilerConfig{Folder: ""}, func() time.Time { return fixedNow })
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if counts.SkippedUndetermined != 0 {
+		t.Errorf("skipped_undetermined=%d; a deleted VM is not an unreadable one", counts.SkippedUndetermined)
+	}
+	if len(db.cleared) != 1 {
+		t.Errorf("cleared=%v; want the dangling moref cleared", db.cleared)
 	}
 }
 

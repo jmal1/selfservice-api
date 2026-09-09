@@ -32,7 +32,7 @@ the page.
 | `ready` | Template is generalized and ready to publish | No (staging VM cleaned up) |
 | `verifying` | **Automated smoke test** — Crucible clones a throwaway pod, boots it unattended, confirms it comes up, then destroys it | No |
 | `active` | Published — students can launch pods from it | No |
-| `error` | A worker job failed; check Last error in the wizard | No |
+| `error` | A worker job failed; check Last error in the wizard | Sometimes — a failed provision can leave a usable staging VM |
 
 **Publish is gated by a smoke test.** When you click Publish, the template
 first enters `verifying`: Crucible clones a disposable VM from the
@@ -231,6 +231,17 @@ Click **Create draft**. You'll land on the wizard page for the new template.
 Click **Provision**. The worker clones the source VM into the Templates folder, attaches a NIC on the staging network, powers it on, and waits for VMware Tools. This is the slow step.
 
 Retryable clone or ISO failures leave the template in `provisioning` while the job waits for its next attempt; the job detail preserves the first failure and updates the current failure on every attempt. If a later attempt succeeds, the template advances to `configuring` and the stale failure result is replaced by success. Only a non-retryable failure or an exhausted retry budget moves both the job and template to their terminal error states.
+
+### Recovering an errored template
+
+`error` is terminal for the *job*, but the template offers two different moves, and they are not interchangeable:
+
+| Action | What it does | Use it when |
+|--------|--------------|-------------|
+| **Retry** | Resets the template to `draft`. Destroys nothing. | The provision failed before any VM was created (bad source ref, placement block, preflight rejection). Retry **refuses** while a staging VM is still recorded, because re-provisioning would fail on the duplicate VM name and the existing VM would be abandoned. |
+| **Cancel** | Destroys the staging VM, clears Crucible's reference to it, then returns the template to `draft`. | A VM was created. This is the only supported cleanup, and it works from `error`, `configuring`, and `ready`. |
+
+If the staging VM holds work you want to keep — most often a manual ISO install someone finished over the console — copy it out in vCenter **before** you Cancel. A staging VM on an errored template cannot be published; there is no path that promotes it to a template. Abandoned staging VMs are destroyed automatically 24 h after the template last changed, though a VM that is still **powered on** is skipped and left for you.
 
 Before creating anything, Crucible requires one explicitly allowlisted vCenter
 host that is compatible with the source/resource pool, connected, outside
@@ -485,7 +496,7 @@ on the template's **unattended install mode**:
 
 | Mode | What Provision does | How long |
 |------|--------------------|----------|
-| `manual` | Boots the installer and stops. **You install the OS yourself** through the Build Console, then click Generalize. | Up to you |
+| `manual` | Boots the installer and stops. **You install the OS yourself** through the Build Console, then click Generalize. Occasionally the VM is handed over **powered off** (see below) — power it on from the console. | Up to you |
 | `cloudinit_cidata` (Ubuntu Server) | Attaches a generated cloud-init seed CD and runs a **hands-off** autoinstall. No console input required. | 20–45 min |
 | `windows_autounattend` | Attaches a generated `autounattend.xml` seed CD and runs Windows Setup unattended. | 30–60 min |
 
@@ -532,8 +543,24 @@ to `configuring`.
 > will stall the same way.
 
 Progress messages in the wizard tell you which phase you're in:
-`create_vm` → `power_on` → `wait_install` → `detach_cdrom` → `boot_installed`
-→ `wait_tools` → `configuring`.
+`create_vm` → `verify_disk` → `power_on` → `wait_install` → `detach_cdrom` →
+`boot_installed` → `wait_tools` → `configuring`.
+
+Two phases only appear when the datastore is slow to allocate the new VM's
+system disk, which happens occasionally on NFS storage:
+
+| Phase | Meaning |
+|-------|---------|
+| `repair_disk` | The disk did not allocate and was recreated once. Harmless — it happens before anything is installed. |
+| `power_on_deferred` | **Manual builds only.** The disk was verified but the host could not open it yet, so the VM was left **powered off** and the template still advanced to `configuring`. Power the VM on from the Build Console to start the installer. |
+
+> [!note]
+> A manual build is never failed for a slow disk, because you supply the
+> power-on anyway. Unattended builds cannot start without power, so those
+> recreate the disk once and retry — and fail if it still will not open.
+> If you are looking at an **errored** template whose staging VM already has an
+> OS on it, click **Cancel**, not Retry — see
+> [Troubleshooting](troubleshooting.md).
 
 ## Step 3 — Configure (the new part)
 

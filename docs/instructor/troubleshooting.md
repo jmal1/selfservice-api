@@ -1104,6 +1104,57 @@ bug, not a mistake on your end.
 
 ---
 
+## "Provision errored with `disk still not readable`, but the VM looks fine"
+
+The wizard shows something like:
+
+```
+power on after disk recreate: disk still not readable after 20 attempts over
+~57s: The file specified is not a virtual disk
+```
+
+The staging VM's disk file existed but the NFS datastore had not finished
+allocating it, so the hypervisor could not open it at power-on. Nothing is
+wrong with your ISO, your settings, or the VM's contents.
+
+**On a `manual` build this no longer errors.** Crucible now hands the VM over
+**powered off** and still advances the template to `configuring`, because a
+manual install is yours to start anyway. The wizard says so explicitly: the
+progress step reads `power_on_deferred` and the handover message tells you the
+VM is powered off. Open the Build Console, power the VM on, and install as
+normal. If it refuses to power on, wait a minute and try again — the datastore
+is still working.
+
+> [!warning] If you are looking at an **errored** template whose VM already has
+> an OS installed on it, do **not** click Retry.
+>
+> Retry only resets the template to `draft`. It does **not** destroy the staging
+> VM, and it does not carry that VM forward — the next Provision computes the
+> same VM name and fails on the duplicate, while the VM you installed sits
+> abandoned until Crucible's cleanup job destroys it (24 h after the template
+> last changed). Retry now refuses outright while a staging VM is still
+> recorded, and tells you to Cancel instead.
+
+**Supported recovery, in order:**
+
+1. **If the VM holds work you want to keep,** save it *outside* the wizard
+   before doing anything else — clone it in vCenter, or export it. A staging VM
+   attached to an errored template is not a template and cannot be published;
+   Crucible has no path that turns it into one.
+2. **Click Cancel.** This is the cleanup step: it destroys the staging VM,
+   clears Crucible's reference to it, and returns the template to `draft`.
+   Cancel now works from `error` for exactly this reason.
+3. **Re-run the wizard** from `draft`. A manual ISO build will now reach
+   `configuring` even if the datastore is slow again.
+
+**What happens if you do nothing:** the cleanup job destroys abandoned staging
+VMs 24 h after the template last changed — but it now **skips any staging VM
+that is powered on**, so a machine you are actively installing on will not be
+deleted out from under you. That is a safety net, not a plan: the VM stays
+attached to a dead template until you Cancel.
+
+---
+
 ## "Generalize failed, or the template published but clones behave oddly"
 
 Generalize runs its cleanup through VMware guest ops, which gives it **no

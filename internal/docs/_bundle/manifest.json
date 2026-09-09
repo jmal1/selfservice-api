@@ -13,8 +13,8 @@
     {
       "path": "AGENTS.md",
       "title": "AGENTS.md — Crucible AI Authoring Reference",
-      "size": 96305,
-      "sha256": "cde7a67167ca54cb6071c8332dd74f565fb5ce0dab6f1bb22e6a2aecd2968032",
+      "size": 100230,
+      "sha256": "b97420d0d44faa24763398fa53836217e3f312c38f681c18f31290d44de06f56",
       "is_markdown": true,
       "links_out": [
         "deploy/runner/actions.sh",
@@ -23,6 +23,7 @@
         "deploy/sql/library-actions.sql",
         "deploy/sql/library-workflows.sql",
         "docs/ai/build-workflow-prompt.md",
+        "docs/instructor/troubleshooting.md",
         "docs/instructor/troubleshooting.md",
         "internal/api/routes/routes.go",
         "internal/database/migrations/000012_assessment_engine.up.sql",
@@ -209,14 +210,15 @@
     {
       "path": "docs/instructor/templates.md",
       "title": "Building a Template",
-      "size": 64189,
-      "sha256": "848563e95f9722653491bf6d045ea88d976ef84ba39fb92a3eddf4add89aa87c",
+      "size": 66535,
+      "sha256": "6267c3ee86328c9d1d714811bf0f1c40699b7df15cc43e4278f0c859f2066921",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/glossary.md",
         "docs/instructor/os-recipes.md",
         "docs/instructor/overview.md",
         "docs/instructor/overview.md",
+        "docs/instructor/troubleshooting.md",
         "docs/instructor/troubleshooting.md",
         "docs/instructor/troubleshooting.md",
         "docs/instructor/troubleshooting.md",
@@ -228,8 +230,8 @@
     {
       "path": "docs/instructor/troubleshooting.md",
       "title": "Troubleshooting",
-      "size": 64344,
-      "sha256": "3fc3b5db9343a96d5dac1d3cf1ea24d57b4bcdf85b985acc707b65bb2d382fe6",
+      "size": 66861,
+      "sha256": "2d76e68de16997359559a1dea62199a206e2cd454aac0092ac0f9562887ebf84",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/actions.md",
@@ -436,5 +438,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 731633
+  "total_bytes": 740421
 }
