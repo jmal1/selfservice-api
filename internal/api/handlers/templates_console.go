@@ -15,11 +15,13 @@ package handlers
 // admin-only.
 //
 // State gating: only allowed when template_state is one of
-//   provisioning, configuring, generalizing
+//   provisioning, configuring, generalizing, error
 // AND vcenter_vm_id is non-empty. Outside these states the staging VM
 // either doesn't exist yet (draft) or has been converted to the
 // published template artifact and may no longer be a usable VM
-// (ready/active), or sysprep is mid-flight (generalizing close to end).
+// (ready/active). `error` is included so an operator can fix guest
+// prerequisites (passwordless sudo, Tools) on a leftover staging VM
+// and then re-run Generalize.
 
 import (
 	"errors"
@@ -42,6 +44,7 @@ var templateConsoleStates = map[string]bool{
 	models.TemplateStateProvisioning: true,
 	models.TemplateStateConfiguring:  true,
 	models.TemplateStateGeneralizing: true,
+	models.TemplateStateError:        true,
 }
 
 // templateConsoleAuth is the shared auth + state-gating path for both
@@ -97,7 +100,7 @@ func validateTemplateConsoleAccess(tmpl *models.Template, userID uuid.UUID, role
 
 	// State gating
 	if !templateConsoleStates[tmpl.TemplateState] {
-		return fmt.Sprintf("template is in %q state; console is only available during provisioning, configuring, or generalizing", tmpl.TemplateState), http.StatusConflict
+		return fmt.Sprintf("template is in %q state; console is only available during provisioning, configuring, generalizing, or error (when a staging VM is recorded)", tmpl.TemplateState), http.StatusConflict
 	}
 
 	// Staging VM must actually exist in vCenter

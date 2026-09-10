@@ -121,11 +121,12 @@ type WizardStateResponse struct {
 	LastJobError      string    `json:"last_job_error,omitempty"`
 
 	// Build-VM access fields (Phase H). Populated for the wizard's
-	// `provisioning` / `configuring` / `generalizing` states so the
-	// instructor can SSH/RDP into the staging VM and see the bootstrap
-	// credentials if the OS locks them out. These are NOT secret data —
-	// they're the same defaults the template generalize step uses, and
-	// the wizard endpoint is already gated to template-owner + admin.
+	// `provisioning` / `configuring` / `generalizing` / `error` (when a
+	// staging VM is still recorded) so the instructor can SSH/RDP into
+	// the leftover guest after a failed generalize and see the bootstrap
+	// credentials. These are NOT secret data — they're the same defaults
+	// the template generalize step uses, and the wizard endpoint is
+	// already gated to template-owner + admin.
 	//
 	// BuildVMName + BuildVMIP come from a non-blocking vCenter
 	// property collector call; either may be empty while the guest
@@ -408,8 +409,10 @@ func (h *Handler) AdminProvisionTemplate(w http.ResponseWriter, r *http.Request)
 
 // AdminGeneralizeTemplate (POST /admin/templates/:id/generalize) — wizard step 4.
 //
-// Transitions configuring → generalizing and enqueues template_generalize.
-// Body: {"guest_password":"..."}. Username defaults to template.default_username.
+// Transitions configuring → generalizing (normal wizard) or error →
+// generalizing (re-run after a failed GuestOps pass that left a healthy
+// staging VM). Body: {"guest_password":"..."}. Username defaults to
+// template.default_username.
 func (h *Handler) AdminGeneralizeTemplate(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		GuestUsername string `json:"guest_username,omitempty"`
@@ -419,12 +422,29 @@ func (h *Handler) AdminGeneralizeTemplate(w http.ResponseWriter, r *http.Request
 		_ = json.NewDecoder(r.Body).Decode(&req) // body is optional; pulled from template if empty
 	}
 
-	tmpl, ok := h.requireTemplateInState(w, r, models.TemplateStateConfiguring)
-	if !ok {
+	templateID, err := uuid.Parse(chi.URLParam(r, "templateID"))
+	if err != nil {
+		http.Error(w, "invalid template id", http.StatusBadRequest)
 		return
 	}
-	if tmpl.VCenterVMID == "" {
-		http.Error(w, "template has no vCenter VM yet (provisioning never completed)", http.StatusConflict)
+	tmpl, err := h.provisionStore().GetTemplateByID(r.Context(), templateID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			http.Error(w, "template not found", http.StatusNotFound)
+		} else {
+			h.logger.Error("load template failed", "error", err, "template_id", templateID)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+		}
+		return
+	}
+	if tmpl == nil {
+		http.Error(w, "template not found", http.StatusNotFound)
+		return
+	}
+
+	from, reason, blocked := generalizeAdmission(tmpl)
+	if blocked {
+		h.writeStateConflict(w, tmpl, reason)
 		return
 	}
 
@@ -444,9 +464,41 @@ func (h *Handler) AdminGeneralizeTemplate(w http.ResponseWriter, r *http.Request
 		"vm_moref":       tmpl.VCenterVMID,
 		"snapshot_name":  "base-image",
 	}
-	if !h.advanceTemplateAndEnqueue(w, r, tmpl, models.TemplateStateConfiguring, models.TemplateStateGeneralizing,
+	if !h.advanceTemplateAndEnqueue(w, r, tmpl, from, models.TemplateStateGeneralizing,
 		models.JobTypeTemplateGeneralize, payload, "template.generalize") {
 		return
+	}
+}
+
+// generalizeAdmission decides whether POST /generalize may enqueue.
+// Kept pure (no DB, no HTTP) so the error→generalizing keep-the-VM path
+// and the "no moref" refusal are directly testable.
+//
+// Allowed from:
+//   - configuring, with a staging moref (normal wizard step 4)
+//   - error, with a staging moref (re-run after GuestOps failed closed
+//     without destroying the leftover VM — typically a missing
+//     guestinfo.crucible.generalize.job sentinel)
+//
+// Refused from error with an empty moref so a pre-clone provision
+// failure cannot skip provision. Retry remains the path back to draft
+// in that case.
+func generalizeAdmission(tmpl *models.Template) (from string, reason string, blocked bool) {
+	if tmpl == nil {
+		return "", "template not found", true
+	}
+	switch tmpl.TemplateState {
+	case models.TemplateStateConfiguring, models.TemplateStateError:
+		if tmpl.VCenterVMID == "" {
+			if tmpl.TemplateState == models.TemplateStateError {
+				return "", "cannot re-run Generalize: this template has no staging VM. POST /retry to return to draft and provision again.", true
+			}
+			return "", "template has no vCenter VM yet (provisioning never completed)", true
+		}
+		return tmpl.TemplateState, "", false
+	default:
+		return "", fmt.Sprintf("expected state %q or %q, got %q",
+			models.TemplateStateConfiguring, models.TemplateStateError, tmpl.TemplateState), true
 	}
 }
 
@@ -665,7 +717,9 @@ func (h *Handler) AdminUnpublishTemplate(w http.ResponseWriter, r *http.Request)
 //     that still hold one.
 //
 // /cancel is the step that actually cleans up: it destroys the staging VM,
-// clears the moref, and lands the row in draft.
+// clears the moref, and lands the row in draft. /generalize is the
+// keep-the-VM recovery when GuestOps failed after the OS was already
+// installed (error → generalizing, requires a recorded moref).
 func (h *Handler) AdminRetryTemplate(w http.ResponseWriter, r *http.Request) {
 	tmpl, ok := h.requireTemplateInState(w, r, models.TemplateStateError)
 	if !ok {
@@ -691,9 +745,10 @@ func retryStagingVMConflict(tmpl *models.Template) (string, bool) {
 	}
 	return fmt.Sprintf(
 		"template still has staging VM %s in vCenter, and retry does not destroy it — re-provisioning would fail on the duplicate VM name. "+
-			"If that VM holds work you want (for example an OS you installed over the console), recover it before continuing, because it will be "+
+			"If that VM is healthy (OS installed, VMware Tools running) and Generalize failed, POST /admin/templates/%s/generalize to re-run Generalize without destroying it. "+
+			"If that VM holds work you want to copy out first, recover it in vCenter before continuing, because it will be "+
 			"destroyed automatically once this row has sat in error/draft for 24h. POST /admin/templates/%s/cancel to destroy the staging VM and return to draft.",
-		tmpl.VCenterVMID, tmpl.ID), true
+		tmpl.VCenterVMID, tmpl.ID, tmpl.ID), true
 }
 
 // AdminCancelTemplate (POST /admin/templates/:id/cancel) — cancel from
@@ -1175,17 +1230,19 @@ func (h *Handler) wizardState(ctx stdcontext.Context, tmpl *models.Template) Wiz
 }
 
 // isBuildState reports whether the template is in a state where a real
-// staging VM exists in vCenter. The wizard only queries vCenter for live
-// VM info during these states — `draft` has no VM at all, `ready` /
+// staging VM may exist in vCenter. The wizard only queries vCenter for
+// live VM info during these states — `draft` has no VM at all, `ready` /
 // `active` have a (converted-to-template) VM that's powered off and
-// useless for SSH/RDP, and `error` could be either pre- or post-clone
-// but we leave it alone to avoid spurious vCenter calls during an
-// already-failed build.
+// useless for SSH/RDP. `error` is included because a failed generalize
+// (or a provision that cloned then failed) still holds a leftover
+// staging VM; wizardState already no-ops when vcenter_vm_id is empty,
+// so a pre-clone error does not hit vCenter.
 func isBuildState(state string) bool {
 	switch state {
 	case models.TemplateStateProvisioning,
 		models.TemplateStateConfiguring,
-		models.TemplateStateGeneralizing:
+		models.TemplateStateGeneralizing,
+		models.TemplateStateError:
 		return true
 	}
 	return false

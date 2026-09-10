@@ -32,6 +32,7 @@ func TestCanTransition_AllowedMoves(t *testing.T) {
 		{models.TemplateStateVerifying, models.TemplateStateError},
 		{models.TemplateStateActive, models.TemplateStateReady},
 		{models.TemplateStateError, models.TemplateStateDraft},
+		{models.TemplateStateError, models.TemplateStateGeneralizing},
 	}
 	for _, c := range cases {
 		t.Run(c.from+"→"+c.to, func(t *testing.T) {
@@ -124,7 +125,7 @@ func TestAllowedNextStates_ReturnsSortedSlice(t *testing.T) {
 		{models.TemplateStateReady, []string{models.TemplateStateConfiguring, models.TemplateStateDraft, models.TemplateStateVerifying}},
 		{models.TemplateStateVerifying, []string{models.TemplateStateActive, models.TemplateStateError, models.TemplateStateReady}},
 		{models.TemplateStateActive, []string{models.TemplateStateReady}},
-		{models.TemplateStateError, []string{models.TemplateStateDraft}},
+		{models.TemplateStateError, []string{models.TemplateStateDraft, models.TemplateStateGeneralizing}},
 	}
 	for _, c := range cases {
 		t.Run(c.from, func(t *testing.T) {
@@ -230,5 +231,29 @@ func TestTemplateLifecycle_NoDirectReadyToActive(t *testing.T) {
 	// than stranding it in verifying forever.
 	if err := CanTransition(models.TemplateStateVerifying, models.TemplateStateReady); err != nil {
 		t.Errorf("verifying -> ready must be allowed so a failed verify can unwind: %v", err)
+	}
+}
+
+// TestTemplateLifecycle_ErrorCanRerunGeneralize is the keep-the-VM recovery
+// guard. GuestOps can return success without stamping
+// guestinfo.crucible.generalize.job (passwordless sudo broken mid-script);
+// the leftover staging VM is still the thing to generalize. error→draft
+// via Retry refuses while a moref is set, and Cancel destroys the VM, so
+// error→generalizing is the only edge that re-runs the existing job
+// without throwing the guest away. The handler still requires
+// vcenter_vm_id so a pre-clone provision failure cannot skip provision.
+func TestTemplateLifecycle_ErrorCanRerunGeneralize(t *testing.T) {
+	if err := CanTransition(models.TemplateStateError, models.TemplateStateGeneralizing); err != nil {
+		t.Errorf("error -> generalizing must be allowed so a healthy leftover staging VM can re-run Generalize: %v", err)
+	}
+	// The destroy path must stay distinct; re-generalize must not replace it.
+	if err := CanTransition(models.TemplateStateError, models.TemplateStateDraft); err != nil {
+		t.Errorf("error -> draft must stay allowed for Cancel/Retry: %v", err)
+	}
+	// Do not invent error→configuring: the wizard already offers Generalize
+	// once allowed_next_states contains generalizing, and configuring would
+	// need a second handler the UI does not call from error.
+	if err := CanTransition(models.TemplateStateError, models.TemplateStateConfiguring); err == nil {
+		t.Error("error -> configuring is allowed; re-run Generalize from error instead of adding a resume-to-configuring hop")
 	}
 }

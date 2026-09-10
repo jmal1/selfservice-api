@@ -14,9 +14,14 @@ a vCenter account to build a template.
 
 ```
    draft ──Provision──▶ provisioning ──auto──▶ configuring ──Generalize──▶ generalizing ──auto──▶ ready ──Publish──▶ verifying ──auto──▶ active
-                                                  ▲                                                    │                    │
+                                                  ▲                         ▲                                 │                    │
                                                   └────────────── Reconfigure ─────────── Unpublish ◀──┘                    │
-                                                                                                       ▲── smoke test fails ─┘
+                                                                                │                      ▲── smoke test fails ─┘
+                                                                                │
+   error ──Generalize (staging VM present)──────────────────────────────────────┘
+     │
+     ├── Retry (no staging VM) ──▶ draft
+     └── Cancel (destroys staging VM) ──▶ draft
 ```
 
 Every state except `draft` has a **staging VM** living in vCenter's
@@ -32,7 +37,7 @@ the page.
 | `ready` | Template is generalized and ready to publish | No (staging VM cleaned up) |
 | `verifying` | **Automated smoke test** — Crucible clones a throwaway pod, boots it unattended, confirms it comes up, then destroys it | No |
 | `active` | Published — students can launch pods from it | No |
-| `error` | A worker job failed; check Last error in the wizard | Sometimes — a failed provision can leave a usable staging VM |
+| `error` | A worker job failed; check Last error in the wizard | **Yes**, when a staging VM is still recorded (`vcenter_vm_id` set) — use it to fix guest prerequisites, then re-run **Generalize** |
 
 **Publish is gated by a smoke test.** When you click Publish, the template
 first enters `verifying`: Crucible clones a disposable VM from the
@@ -234,14 +239,15 @@ Retryable clone or ISO failures leave the template in `provisioning` while the j
 
 ### Recovering an errored template
 
-`error` is terminal for the *job*, but the template offers two different moves, and they are not interchangeable:
+`error` is terminal for the *job*, but the template offers three different moves, and they are not interchangeable:
 
 | Action | What it does | Use it when |
 |--------|--------------|-------------|
-| **Retry** | Resets the template to `draft`. Destroys nothing. | The provision failed before any VM was created (bad source ref, placement block, preflight rejection). Retry **refuses** while a staging VM is still recorded, because re-provisioning would fail on the duplicate VM name and the existing VM would be abandoned. |
-| **Cancel** | Destroys the staging VM, clears Crucible's reference to it, then returns the template to `draft`. | A VM was created. This is the only supported cleanup, and it works from `error`, `configuring`, and `ready`. |
+| **Generalize** | Enqueues `template_generalize` against the existing staging VM (`error` → `generalizing`). Destroys nothing. | Generalize failed (script error, missing `guestinfo.crucible.generalize.job` sentinel, sudo) **and** the staging VM is still there. Fix guest prerequisites on the console, then click **Generalize** again. Do not publish until state is `ready`. |
+| **Retry** | Resets the template to `draft`. Destroys nothing. | The provision failed **before** any VM was created (bad source ref, placement block, preflight rejection). Retry **refuses** while a staging VM is still recorded, because re-provisioning would fail on the duplicate VM name and the existing VM would be abandoned. |
+| **Cancel** | Destroys the staging VM, clears Crucible's reference to it, then returns the template to `draft`. | You want to throw the leftover VM away and start over. This is the only supported **destroy** path, and it works from `error`, `configuring`, and `ready`. |
 
-If the staging VM holds work you want to keep — most often a manual ISO install someone finished over the console — copy it out in vCenter **before** you Cancel. A staging VM on an errored template cannot be published; there is no path that promotes it to a template. Abandoned staging VMs are destroyed automatically 24 h after the template last changed, though a VM that is still **powered on** is skipped and left for you.
+If the staging VM holds work you want to keep **and Generalize is not the next step** (for example a manual ISO install that never reached GuestOps), copy it out in vCenter **before** you Cancel. Abandoned staging VMs are destroyed automatically 24 h after the template last changed, though a VM that is still **powered on** is skipped and left for you.
 
 Before creating anything, Crucible requires one explicitly allowlisted vCenter
 host that is compatible with the source/resource pool, connected, outside
@@ -559,7 +565,9 @@ system disk, which happens occasionally on NFS storage:
 > power-on anyway. Unattended builds cannot start without power, so those
 > recreate the disk once and retry — and fail if it still will not open.
 > If you are looking at an **errored** template whose staging VM already has an
-> OS on it, click **Cancel**, not Retry — see
+> OS on it, do **not** click Retry. If Generalize is what failed, fix the guest
+> (passwordless sudo, Tools) and click **Generalize**. Click **Cancel** only if
+> you intend to destroy that VM and start over — see
 > [Troubleshooting](troubleshooting.md).
 
 ## Step 3 — Configure (the new part)
@@ -865,8 +873,10 @@ sudo -n true && echo "sudo OK"                       # must print sudo OK (req 5
 > **`sudo -n true` is the single most important line here.** It is the only
 > one that fails the way generalize fails: no tty, no prompt, non-zero
 > exit. If it does not print `sudo OK`, Generalize will abort partway and
-> leave the template with a populated `/etc/machine-id` and the original
-> SSH host keys — which means every clone shares them.
+> leave the template in `error` with a populated `/etc/machine-id` and the
+> original SSH host keys — which means every clone shares them. Fix sudo,
+> then click **Generalize** again (accepted from `error` while the staging
+> VM is still recorded). Do not publish.
 
 Also confirm the template row's **default_username is `student`** (for a
 customized Linux template) or holds real static credentials (for a
@@ -909,6 +919,9 @@ Which lifecycle states allow console access?
 
 - `provisioning`, `configuring`, `generalizing` — anywhere a real
   staging VM exists in vCenter
+- `error` — only when `vcenter_vm_id` is still set (leftover staging VM
+  after a failed provision or generalize). Use it to fix guest
+  prerequisites, then click **Generalize**.
 
 If you hit a `409 Conflict` when opening the console, the template has
 already moved past the interactive phase; refresh the wizard to see
@@ -922,10 +935,14 @@ If the console shows "Connecting…" indefinitely, the staging VM might not have
 power yet (early `provisioning`) or might have just rebooted. Click
 **Reconnect** in the console toolbar after about 30 seconds.
 
-If Generalize fails, open the console, log in with the credentials you
-provided, and check `/var/log/cloud-init.log` (Linux) or
+If Generalize fails, the template lands in `error` with the staging VM
+still recorded. Open the console (allowed from `error` when a moref is
+set), log in with the credentials you provided, fix the guest (see
+[passwordless sudo](#linux-template-contract)), then click **Generalize**
+again. Check `/var/log/cloud-init.log` (Linux) or
 `C:\Windows\System32\Sysprep\Panther\setupact.log` (Windows). The wizard's
-**Last error** field also shows the worker report.
+**Last error** field also shows the worker report. Do not click Retry or
+Cancel — those either refuse while the moref is set, or destroy the VM.
 
 The console disconnects after sysprep runs because sysprep reboots the guest and
 kills the WebMKS session. The wizard auto-advances to `ready` once the worker

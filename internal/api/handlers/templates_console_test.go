@@ -19,14 +19,16 @@ import (
 // integration suite and the Phase G9 cluster verification.
 
 func TestTemplateConsoleStates_OnlyInteractiveLifecycleStates(t *testing.T) {
-	// templateConsoleStates must be exactly the three in-flight states
-	// the wizard exposes to instructors. Anything else means either we
-	// expose a console too early (no VM yet) or too late (VM already
+	// templateConsoleStates must be exactly the in-flight states the
+	// wizard exposes to instructors, plus error (leftover staging VM
+	// after a failed generalize/provision). Anything else means either
+	// we expose a console too early (no VM yet) or too late (VM already
 	// converted/snapshotted away from the staging slot).
 	want := map[string]bool{
 		models.TemplateStateProvisioning: true,
 		models.TemplateStateConfiguring:  true,
 		models.TemplateStateGeneralizing: true,
+		models.TemplateStateError:        true,
 	}
 	if len(templateConsoleStates) != len(want) {
 		gotKeys := make([]string, 0, len(templateConsoleStates))
@@ -48,7 +50,6 @@ func TestTemplateConsoleStates_OnlyInteractiveLifecycleStates(t *testing.T) {
 		models.TemplateStateDraft,
 		models.TemplateStateReady,
 		models.TemplateStateActive,
-		models.TemplateStateError,
 	} {
 		if templateConsoleStates[never] {
 			t.Errorf("templateConsoleStates must NOT include %q (no staging VM)", never)
@@ -148,8 +149,15 @@ func TestValidateTemplateConsoleAccess(t *testing.T) {
 			wantStatus: http.StatusConflict,
 		},
 		{
-			name:       "error state rejected with conflict",
+			name:       "error state with staging VM allowed (re-run Generalize)",
 			tmpl:       mkTmpl(models.TemplateStateError, &ownerID, "vm-123"),
+			userID:     ownerID,
+			role:       models.RoleInstructor,
+			wantStatus: 0,
+		},
+		{
+			name:       "error state without staging VM rejected with conflict",
+			tmpl:       mkTmpl(models.TemplateStateError, &ownerID, ""),
 			userID:     ownerID,
 			role:       models.RoleInstructor,
 			wantStatus: http.StatusConflict,
