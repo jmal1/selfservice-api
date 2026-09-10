@@ -271,6 +271,9 @@ func TestAdminRetryTemplate_RefusesWhileStagingVMExists(t *testing.T) {
 	if !strings.Contains(body, "cancel") {
 		t.Errorf("conflict must point at the supported cleanup step (/cancel); got %s", body)
 	}
+	if !strings.Contains(body, "generalize") {
+		t.Errorf("conflict must point at re-running Generalize when the leftover VM is healthy; got %s", body)
+	}
 	if tmpl.TemplateState != models.TemplateStateError {
 		t.Errorf("template state mutated to %q; want error", tmpl.TemplateState)
 	}
@@ -307,6 +310,9 @@ func TestRetryStagingVMConflict(t *testing.T) {
 		}
 		if !strings.Contains(reason, "cancel") {
 			t.Errorf("reason must point at /cancel; got %q", reason)
+		}
+		if !strings.Contains(reason, "generalize") {
+			t.Errorf("reason must point at re-running Generalize; got %q", reason)
 		}
 		if !strings.Contains(reason, id.String()) {
 			t.Errorf("reason must give the concrete cancel URL; got %q", reason)

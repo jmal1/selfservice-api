@@ -282,6 +282,54 @@ func TestWizardStatePopulatesBuildVMFields(t *testing.T) {
 	}
 }
 
+func TestWizardStateQueriesVCenterInErrorWithStagingVM(t *testing.T) {
+	vc := &fakeVC{
+		info: &vcenter.GuestInfo{
+			Name:         "tpl-linux-mint-22-3-mate-127068",
+			IPAddress:    "10.10.30.77",
+			ToolsRunning: true,
+			PoweredOn:    true,
+		},
+	}
+	h := &Handler{vc: vc, logger: noopLogger(t)}
+	tmpl := &models.Template{
+		ID:            uuid.New(),
+		TemplateState: models.TemplateStateError,
+		VCenterVMID:   "vm-27858",
+	}
+	got := h.wizardState(context.Background(), tmpl)
+	if len(vc.gotCalls) != 1 || vc.gotCalls[0] != "info:vm-27858" {
+		t.Errorf("expected one info:vm-27858 call; got %v", vc.gotCalls)
+	}
+	if !got.BuildVMTools || !got.BuildVMPowerOn {
+		t.Errorf("tools=%v power=%v; want both true so the wizard can show a leftover VM is healthy",
+			got.BuildVMTools, got.BuildVMPowerOn)
+	}
+	foundGeneralizing := false
+	for _, s := range got.AllowedNextStates {
+		if s == models.TemplateStateGeneralizing {
+			foundGeneralizing = true
+		}
+	}
+	if !foundGeneralizing {
+		t.Errorf("allowed_next_states = %v; want generalizing so the UI can offer Generalize from error",
+			got.AllowedNextStates)
+	}
+}
+
+func TestWizardStateSkipsVCenterInErrorWithoutStagingVM(t *testing.T) {
+	vc := &fakeVC{}
+	h := &Handler{vc: vc, logger: noopLogger(t)}
+	tmpl := &models.Template{
+		ID:            uuid.New(),
+		TemplateState: models.TemplateStateError,
+	}
+	_ = h.wizardState(context.Background(), tmpl)
+	if len(vc.gotCalls) != 0 {
+		t.Errorf("vCenter was called for an error row with no moref: %v", vc.gotCalls)
+	}
+}
+
 func TestWizardStateSkipsVCenterOutsideBuildStates(t *testing.T) {
 	// The point of isBuildState() is to avoid hammering vCenter on every
 	// 5-s wizard poll for templates that aren't actively being built. We
@@ -1099,12 +1147,12 @@ func TestAdminCreateTemplateDraft_RejectsSkipGeneralizeOnISO(t *testing.T) {
 
 func TestAdminCreateTemplateDraft_RejectsSkipGeneralizeOnCloneTemplate(t *testing.T) {
 	rec := postDraft(t, CreateTemplateDraftRequest{
-		Name:           "Copy",
-		OSType:         models.OSTypeLinux,
-		SourceType:     models.TemplateSourceCloneTemplate,
-		SourceRef:      uuid.NewString(),
+		Name:            "Copy",
+		OSType:          models.OSTypeLinux,
+		SourceType:      models.TemplateSourceCloneTemplate,
+		SourceRef:       uuid.NewString(),
 		DefaultUsername: "student",
-		SkipGeneralize: true,
+		SkipGeneralize:  true,
 	})
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d; want 400", rec.Code)

@@ -45,7 +45,8 @@ var ErrUnknownState = errors.New("unknown template state")
 //   ready         → verifying, configuring (re-enter), draft (discard)
 //   verifying     → active (smoke passed), ready (smoke failed, retryable), error
 //   active        → ready (unpublish)
-//   error         → draft (retry/cleanup)
+//   error         → draft (retry/cleanup), generalizing (re-run when a
+//                   staging VM is still recorded — handler requires moref)
 var allowedTransitions = map[string]map[string]struct{}{
 	models.TemplateStateDraft: {
 		models.TemplateStateProvisioning: {},
@@ -93,8 +94,16 @@ var allowedTransitions = map[string]map[string]struct{}{
 	},
 	models.TemplateStateError: {
 		// Operator-driven recovery: cleans up any partial vCenter
-		// state and resets the row to draft.
+		// state and resets the row to draft. Retry (no VM) and
+		// Cancel (destroy leftover VM) both land here.
 		models.TemplateStateDraft: {},
+		// Re-run Generalize without destroying a healthy leftover
+		// staging VM. GuestOps can fail closed (missing sentinel,
+		// passwordless sudo) after the OS is already installed;
+		// the handler refuses this edge when vcenter_vm_id is
+		// empty so a pre-clone provision failure cannot skip
+		// provision and jump to generalize.
+		models.TemplateStateGeneralizing: {},
 	},
 }
 
@@ -129,7 +138,10 @@ func CanTransition(from, to string) error {
 // single transition, sorted alphabetically for deterministic output.
 // The UI calls this (via an API endpoint) to render only the buttons
 // that will actually succeed — for a row in `configuring`, the UI
-// should only offer "Generalize" and "Cancel", never "Publish".
+// should only offer "Generalize" and "Cancel", never "Publish". For a
+// row in `error`, allowed next states are `draft` (Retry/Cancel) and
+// `generalizing` (re-run Generalize when a staging VM is still
+// recorded; the handler refuses that edge if vcenter_vm_id is empty).
 //
 // Returns ErrUnknownState if `from` is not a recognised state.
 func AllowedNextStates(from string) ([]string, error) {

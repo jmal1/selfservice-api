@@ -1133,25 +1133,34 @@ is still working.
 > same VM name and fails on the duplicate, while the VM you installed sits
 > abandoned until Crucible's cleanup job destroys it (24 h after the template
 > last changed). Retry now refuses outright while a staging VM is still
-> recorded, and tells you to Cancel instead.
+> recorded.
+>
+> If **Generalize** is what failed (script error, missing completion sentinel,
+> passwordless sudo), fix the guest and click **Generalize** again — see
+> [below](#generalize-failed-or-the-template-published-but-clones-behave-oddly).
+> Click **Cancel** only when you intend to destroy the leftover VM and start
+> over.
 
 **Supported recovery, in order:**
 
-1. **If the VM holds work you want to keep,** save it *outside* the wizard
-   before doing anything else — clone it in vCenter, or export it. A staging VM
-   attached to an errored template is not a template and cannot be published;
-   Crucible has no path that turns it into one.
-2. **Click Cancel.** This is the cleanup step: it destroys the staging VM,
-   clears Crucible's reference to it, and returns the template to `draft`.
-   Cancel now works from `error` for exactly this reason.
-3. **Re-run the wizard** from `draft`. A manual ISO build will now reach
-   `configuring` even if the datastore is slow again.
+1. **If Generalize failed and the VM is still there,** stop. This is not a
+   provision failure. Open the Build Console, fix the guest, then click
+   **Generalize**. Do not Cancel.
+2. **If the VM holds work you want to keep and you are *not* going to
+   re-Generalize,** save it *outside* the wizard before doing anything else —
+   clone it in vCenter, or export it.
+3. **Click Cancel** only when you want the leftover VM gone. This destroys the
+   staging VM, clears Crucible's reference to it, and returns the template to
+   `draft`. Cancel works from `error` for exactly this reason.
+4. **Re-run the wizard** from `draft` after Cancel. A manual ISO build will now
+   reach `configuring` even if the datastore is slow again.
 
 **What happens if you do nothing:** the cleanup job destroys abandoned staging
 VMs 24 h after the template last changed — but it now **skips any staging VM
 that is powered on**, so a machine you are actively installing on will not be
-deleted out from under you. That is a safety net, not a plan: the VM stays
-attached to a dead template until you Cancel.
+deleted out from under you. That is a safety net, not a plan. If Generalize
+failed, click **Generalize** again after fixing the guest. Otherwise Cancel
+when you are ready to throw the leftover VM away.
 
 ---
 
@@ -1176,8 +1185,11 @@ sudo -n true && echo "sudo OK"
 
 If that does not print `sudo OK`, fix requirement 5 in the
 [Linux template contract](templates.md#linux-template-contract), then
-re-run Generalize. Being in the `sudo` group is **not** sufficient —
-Ubuntu's stock rule still demands a password.
+**click Generalize again**. The wizard accepts Generalize from `error`
+when a staging VM is still recorded (`POST /api/v1/admin/templates/{id}/generalize`).
+Do not click Retry (it refuses while the moref is set) and do not click
+Cancel (that destroys the VM). Being in the `sudo` group is **not**
+sufficient — Ubuntu's stock rule still demands a password.
 
 > [!warning]
 > These are the two failures that are **invisible on one clone**. A single
@@ -1224,8 +1236,8 @@ What that means for you:
 | Template state after Generalize | What it tells you |
 |---|---|
 | `ready` | The cleanup script ran to its final line and the marker was confirmed. Trustworthy. |
-| `error`, *"generalize script failed"* | The script returned a non-zero exit code — usually the `sudo` problem above. The message carries the guest's own error. Fix it and re-run Generalize; do not publish. |
-| `error`, *"never stamped the completion sentinel"* | The script reported success but left no marker, so the cleanup cannot be shown to have run. Re-run Generalize; do not publish. |
+| `error`, *"generalize script failed"* | The script returned a non-zero exit code — usually the `sudo` problem above. The message carries the guest's own error. Fix it on the Build Console (open from `error`) and click **Generalize**; do not publish. |
+| `error`, *"never stamped the completion sentinel"* | The script reported success but left no marker, so the cleanup cannot be shown to have run. Same recovery: fix sudo if needed, then click **Generalize**; do not publish. Retry will 409 while the staging VM is recorded. Cancel would destroy it. |
 
 Windows is exempt from the marker. Sysprep is launched fire-and-forget and
 powers the machine off on its own schedule, so there is no opportunity to
