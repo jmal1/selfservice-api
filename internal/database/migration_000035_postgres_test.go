@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
-	"os"
 	"reflect"
 	"testing"
 	"time"
@@ -18,10 +17,7 @@ import (
 )
 
 func TestMigration000035SkipsMalformedLegacyRollbackEvidence(t *testing.T) {
-	baseDSN := os.Getenv("TEST_DATABASE_URL")
-	if baseDSN == "" {
-		t.Skip("set TEST_DATABASE_URL to an isolated PostgreSQL database to run migration regressions")
-	}
+	baseDSN := requirePostgresDSN(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

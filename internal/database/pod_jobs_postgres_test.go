@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -29,10 +28,7 @@ type podJobsPostgresFixture struct {
 func newPodJobsPostgresFixture(t *testing.T, status string) *podJobsPostgresFixture {
 	t.Helper()
 
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("set TEST_DATABASE_URL to an isolated PostgreSQL database to run pod job serialization tests")
-	}
+	dsn := requirePostgresDSN(t)
 	if err := RunMigrations(dsn); err != nil {
 		t.Fatal(err)
 	}

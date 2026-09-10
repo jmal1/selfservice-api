@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"os"
 	"testing"
 	"time"
 
@@ -40,10 +39,7 @@ func insertOrphanDestroyJob(t *testing.T, pool *pgxpool.Pool, jobID, podID uuid.
 
 func newOrphanDestroyRecoveryFixture(t *testing.T) *orphanDestroyRecoveryFixture {
 	t.Helper()
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("set TEST_DATABASE_URL to an isolated PostgreSQL database to run orphaned destroy recovery tests")
-	}
+	dsn := requirePostgresDSN(t)
 	if err := RunMigrations(dsn); err != nil {
 		t.Fatal(err)
 	}

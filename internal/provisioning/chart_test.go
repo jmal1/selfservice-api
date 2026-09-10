@@ -76,6 +76,22 @@ type chartValues struct {
 	} `yaml:"synthetic"`
 }
 
+func requireHelmChart(t *testing.T) (helmPath, chartDir string) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("helm template suite skipped under -short; covered by full suite / helm-lint")
+	}
+	helmPath, err := exec.LookPath("helm")
+	if err != nil {
+		t.Skip("helm not available")
+	}
+	chartDir = filepath.Join("..", "..", "deploy", "helm", "selfservice")
+	if _, err := os.Stat(filepath.Join(chartDir, "charts")); err != nil {
+		t.Skip("chart dependencies not vendored; run `helm dependency build` in deploy/helm/selfservice first")
+	}
+	return helmPath, chartDir
+}
+
 func loadChartValues(t *testing.T, name string) chartValues {
 	t.Helper()
 	path := filepath.Join("..", "..", "deploy", "helm", "selfservice", name)
@@ -156,14 +172,7 @@ func TestChartProvisioningDefaultsRemainCompatible(t *testing.T) {
 }
 
 func TestInternalIngressCanonicalizesToPublicHost(t *testing.T) {
-	helmPath, err := exec.LookPath("helm")
-	if err != nil {
-		t.Skip("helm not available")
-	}
-	chartDir := filepath.Join("..", "..", "deploy", "helm", "selfservice")
-	if _, err := os.Stat(filepath.Join(chartDir, "charts")); err != nil {
-		t.Skip("chart dependencies not vendored; run `helm dependency build` in deploy/helm/selfservice first")
-	}
+	helmPath, chartDir := requireHelmChart(t)
 
 	values := loadChartValues(t, "values.yaml")
 	if values.Ingress.Hostname != "crucible.jmal.io" {
@@ -504,14 +513,7 @@ func TestSyntheticCronJobLifecycleEnabledAlwaysRendered(t *testing.T) {
 // unavailable rather than failing an offline `go test ./...` run. CI enforces
 // this unconditionally via .github/workflows/helm-lint.yaml.
 func TestSyntheticCronJobLifecycleEnabledRendersAcrossOverlays(t *testing.T) {
-	helmPath, err := exec.LookPath("helm")
-	if err != nil {
-		t.Skip("helm not available")
-	}
-	chartDir := filepath.Join("..", "..", "deploy", "helm", "selfservice")
-	if _, err := os.Stat(filepath.Join(chartDir, "charts")); err != nil {
-		t.Skip("chart dependencies not vendored; run `helm dependency build` in deploy/helm/selfservice first")
-	}
+	helmPath, chartDir := requireHelmChart(t)
 
 	render := func(overlay string) string {
 		t.Helper()
@@ -556,14 +558,7 @@ func TestSyntheticCronJobLifecycleEnabledRendersAcrossOverlays(t *testing.T) {
 }
 
 func TestCloneSyntheticCronJobsRenderSuspensionAcrossOverlays(t *testing.T) {
-	helmPath, err := exec.LookPath("helm")
-	if err != nil {
-		t.Skip("helm not available")
-	}
-	chartDir := filepath.Join("..", "..", "deploy", "helm", "selfservice")
-	if _, err := os.Stat(filepath.Join(chartDir, "charts")); err != nil {
-		t.Skip("chart dependencies not vendored; run `helm dependency build` in deploy/helm/selfservice first")
-	}
+	helmPath, chartDir := requireHelmChart(t)
 
 	assertSuspension := func(rendered, wantName string, wantSuspended bool) error {
 		var document struct {
@@ -646,14 +641,7 @@ func TestCloneSyntheticCronJobsRenderSuspensionAcrossOverlays(t *testing.T) {
 }
 
 func TestSyntheticJanitorCronJobRetainsJobEvidence(t *testing.T) {
-	helmPath, err := exec.LookPath("helm")
-	if err != nil {
-		t.Skip("helm not available")
-	}
-	chartDir := filepath.Join("..", "..", "deploy", "helm", "selfservice")
-	if _, err := os.Stat(filepath.Join(chartDir, "charts")); err != nil {
-		t.Skip("chart dependencies not vendored; run `helm dependency build` in deploy/helm/selfservice first")
-	}
+	helmPath, chartDir := requireHelmChart(t)
 
 	args := []string{"template", "selfservice", ".", "-f", "values.yaml", "-f", "values.prod.yaml", "--show-only", "templates/synthetic-janitor-cronjob.yaml"}
 	cmd := exec.Command(helmPath, args...)
@@ -690,14 +678,7 @@ func TestSyntheticJanitorCronJobRetainsJobEvidence(t *testing.T) {
 }
 
 func TestSyntheticRunnerCronJobRetainsJobEvidence(t *testing.T) {
-	helmPath, err := exec.LookPath("helm")
-	if err != nil {
-		t.Skip("helm not available")
-	}
-	chartDir := filepath.Join("..", "..", "deploy", "helm", "selfservice")
-	if _, err := os.Stat(filepath.Join(chartDir, "charts")); err != nil {
-		t.Skip("chart dependencies not vendored; run `helm dependency build` in deploy/helm/selfservice first")
-	}
+	helmPath, chartDir := requireHelmChart(t)
 
 	args := []string{"template", "selfservice", ".", "-f", "values.yaml", "-f", "values.prod.yaml", "--show-only", "templates/synthetic-runner-cronjob.yaml"}
 	cmd := exec.Command(helmPath, args...)
@@ -734,14 +715,7 @@ func TestSyntheticRunnerCronJobRetainsJobEvidence(t *testing.T) {
 }
 
 func TestSyntheticCronJobRunnerExpectedEnabledRendersAcrossOverlays(t *testing.T) {
-	helmPath, err := exec.LookPath("helm")
-	if err != nil {
-		t.Skip("helm not available")
-	}
-	chartDir := filepath.Join("..", "..", "deploy", "helm", "selfservice")
-	if _, err := os.Stat(filepath.Join(chartDir, "charts")); err != nil {
-		t.Skip("chart dependencies not vendored; run `helm dependency build` in deploy/helm/selfservice first")
-	}
+	helmPath, chartDir := requireHelmChart(t)
 
 	render := func(overlay string) string {
 		t.Helper()

@@ -2,7 +2,6 @@ package database
 
 import (
 	"context"
-	"os"
 	"testing"
 	"time"
 
@@ -13,10 +12,7 @@ import (
 )
 
 func TestListWorkflows_IncludesCreatorAndApprover(t *testing.T) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("set TEST_DATABASE_URL to an isolated PostgreSQL database to run workflow attribution tests")
-	}
+	dsn := requirePostgresDSN(t)
 	if err := RunMigrations(dsn); err != nil {
 		t.Fatal(err)
 	}
@@ -84,10 +80,7 @@ func TestListWorkflows_IncludesCreatorAndApprover(t *testing.T) {
 }
 
 func TestListWorkflows_NullApproverLeavesApproverNil(t *testing.T) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("set TEST_DATABASE_URL to an isolated PostgreSQL database to run workflow attribution tests")
-	}
+	dsn := requirePostgresDSN(t)
 	if err := RunMigrations(dsn); err != nil {
 		t.Fatal(err)
 	}

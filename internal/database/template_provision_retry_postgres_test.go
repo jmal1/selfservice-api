@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"os"
 	"reflect"
 	"testing"
 	"time"
@@ -25,10 +24,7 @@ type templateProvisionPostgresFixture struct {
 
 func newTemplateProvisionPostgresFixture(t *testing.T, maxRetries int) *templateProvisionPostgresFixture {
 	t.Helper()
-	baseDSN := os.Getenv("TEST_DATABASE_URL")
-	if baseDSN == "" {
-		t.Skip("set TEST_DATABASE_URL to run template provision retry transaction tests")
-	}
+	baseDSN := requirePostgresDSN(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
