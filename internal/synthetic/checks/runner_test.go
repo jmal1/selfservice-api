@@ -31,12 +31,12 @@ type runnerSmokeFakeAPI struct {
 	runs map[string]*runnerFakeRun
 
 	// Pod behaviour controls.
-	createActiveAfter int // GET calls on a pod before it flips to "active"
+	createActiveAfter int // GET calls on a pod before it flips to "active" (0 = first GET)
 
 	// Run behaviour controls.
 	createRunHTTPStatus int    // HTTP status for POST /testing/run (default 202)
 	runTerminalStatus   string // run status once terminal (default "completed")
-	runTerminalAfter    int    // GET calls before run becomes terminal (default 1)
+	runTerminalAfter    int    // GET calls before run becomes terminal (0 = first GET)
 	runResultCount      int    // number of results to include in terminal response (default 1)
 
 	// runResultStatuses, when non-nil, overrides runResultCount and emits one
@@ -63,10 +63,10 @@ func newRunnerSmokeFakeAPI() *runnerSmokeFakeAPI {
 		templates:           []map[string]string{{"id": "tmpl-runner-1", "name": "synthetic-noop"}},
 		pods:                map[string]*fakePod{},
 		runs:                map[string]*runnerFakeRun{},
-		createActiveAfter:   1,
+		createActiveAfter:   0,
 		createRunHTTPStatus: http.StatusAccepted,
 		runTerminalStatus:   "completed",
-		runTerminalAfter:    1,
+		runTerminalAfter:    0,
 		runResultCount:      1,
 	}
 }

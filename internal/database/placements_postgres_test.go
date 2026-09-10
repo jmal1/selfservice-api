@@ -28,10 +28,7 @@ type placementPostgresFixture struct {
 
 func newPlacementPostgresFixture(t *testing.T, vmCount int) *placementPostgresFixture {
 	t.Helper()
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("set TEST_DATABASE_URL to an isolated PostgreSQL database to run placement durability tests")
-	}
+	dsn := requirePostgresDSN(t)
 	if err := RunMigrations(dsn); err != nil {
 		t.Fatal(err)
 	}

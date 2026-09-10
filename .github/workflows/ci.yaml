@@ -198,6 +198,7 @@ jobs:
       - name: Verify wiki bundle
         run: make verify-wiki
 
+      # -short skips deploy.sh harness, vcsim, helm template, and Postgres integration.
       - name: "Fast fail: short Go suite"
         run: go test ./... -short -count=1
 

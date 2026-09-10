@@ -49,7 +49,7 @@ func newFakeLifecycleAPI() *podLifecycleFakeAPI {
 	return &podLifecycleFakeAPI{
 		pods:              map[string]*fakePod{},
 		templates:         []map[string]string{{"id": "tmpl-uuid-123", "name": "synthetic-noop"}},
-		createActiveAfter: 1, // Become active on the first GET after create.
+		createActiveAfter: 0, // Become active on the first GET after create.
 		destroyAfter:      1, // Become destroyed on the first GET after delete.
 	}
 }
@@ -350,6 +350,9 @@ func TestPodLifecycle_ReadyTimeout(t *testing.T) {
 
 func TestPodLifecycle_PodEntersErrorState(t *testing.T) {
 	fake := newFakeLifecycleAPI()
+	// Never auto-activate; the wrapper below flips pending → error after the
+	// first observed GET so waitForPodStatus sees a terminal failure.
+	fake.createActiveAfter = 99999
 	srv := httptest.NewServer(fake.handler())
 	defer srv.Close()
 

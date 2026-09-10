@@ -12,7 +12,6 @@ package database
 
 import (
 	"context"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -31,10 +30,7 @@ import (
 func imageUploadsTestPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 
-	baseDSN := os.Getenv("TEST_DATABASE_URL")
-	if baseDSN == "" {
-		t.Skip("set TEST_DATABASE_URL to an isolated PostgreSQL database to run image_uploads regressions")
-	}
+	baseDSN := requirePostgresDSN(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()

@@ -2,7 +2,6 @@ package database
 
 import (
 	"context"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -31,10 +30,7 @@ func TestDestroyRetryQueryExcludesManualCleanupFailures(t *testing.T) {
 }
 
 func TestListRetryableDestroyFailedPodsExcludesManualCleanupFailures(t *testing.T) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("set TEST_DATABASE_URL to an isolated PostgreSQL database to run the destroy retry query test")
-	}
+	dsn := requirePostgresDSN(t)
 	if err := RunMigrations(dsn); err != nil {
 		t.Fatal(err)
 	}

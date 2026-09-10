@@ -3,7 +3,6 @@ package database
 import (
 	"context"
 	"errors"
-	"os"
 	"testing"
 	"time"
 
@@ -15,10 +14,7 @@ import (
 )
 
 func TestActivateWorkflowValidatesPersistedScriptBeforeTransition(t *testing.T) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("set TEST_DATABASE_URL to an isolated PostgreSQL database to run workflow activation persistence tests")
-	}
+	dsn := requirePostgresDSN(t)
 
 	if err := RunMigrations(dsn); err != nil {
 		t.Fatal(err)
@@ -96,10 +92,7 @@ func TestActivateWorkflowValidatesPersistedScriptBeforeTransition(t *testing.T) 
 }
 
 func TestUpdateWorkflowReturnsReviewedContentToDraft(t *testing.T) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("set TEST_DATABASE_URL to an isolated PostgreSQL database to run workflow lifecycle persistence tests")
-	}
+	dsn := requirePostgresDSN(t)
 	if err := RunMigrations(dsn); err != nil {
 		t.Fatal(err)
 	}
@@ -165,10 +158,7 @@ func TestUpdateWorkflowReturnsReviewedContentToDraft(t *testing.T) {
 }
 
 func TestActivateWorkflowAllowsVMwareToolsGuestScript(t *testing.T) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("set TEST_DATABASE_URL to an isolated PostgreSQL database to run workflow activation persistence tests")
-	}
+	dsn := requirePostgresDSN(t)
 	if err := RunMigrations(dsn); err != nil {
 		t.Fatal(err)
 	}

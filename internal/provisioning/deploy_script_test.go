@@ -148,7 +148,7 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			configureRevision: baselineRevision + 1,
 		},
 		{
-			name: "matching enabled API monitor lifecycle",
+			name:              "matching enabled API monitor lifecycle",
 			manifest:          baselineManifest(true, "", "true"),
 			helmStatus:        "deployed",
 			args:              []string{"--verify-rollback-containment"},
@@ -157,7 +157,7 @@ func TestDeployScriptRollbackContainment(t *testing.T) {
 			configureRevision: baselineRevision + 1,
 		},
 		{
-			name: "live API monitor lifecycle differs from rollback target",
+			name:     "live API monitor lifecycle differs from rollback target",
 			manifest: baselineManifest(true, "", "true"),
 			liveResource: replaceEnvValue(
 				baselineManifest(true, "", "true"),
@@ -8930,6 +8930,9 @@ func assertManifestImagesPinned(t *testing.T, path, builtDigest, uiDigest, extra
 
 func requirePOSIXShell(t *testing.T) {
 	t.Helper()
+	if testing.Short() {
+		t.Skip("deploy.sh harness skipped under -short; covered by full suite")
+	}
 	if runtime.GOOS == "windows" {
 		t.Skip("deploy script semantics require a POSIX shell")
 	}

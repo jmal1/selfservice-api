@@ -58,6 +58,9 @@ func withSimulatorModel(
 	fn func(ctx context.Context, c *Client, vimc *vim25.Client, model *simulator.Model),
 ) {
 	t.Helper()
+	if testing.Short() {
+		t.Skip("vcsim suite skipped under -short; covered by full suite")
+	}
 
 	model := simulator.VPX()
 	// One DC + a couple of standalone hosts + a VM is plenty for these tests

@@ -3,7 +3,6 @@ package database
 import (
 	"context"
 	"errors"
-	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -24,10 +23,7 @@ func TestVCenterPortGroupAdvisoryLockKeyIsStable(t *testing.T) {
 }
 
 func TestVCenterPortGroupAdvisoryLockSerializesTwoClients(t *testing.T) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("set TEST_DATABASE_URL to an isolated PostgreSQL database to run the cross-client advisory-lock test")
-	}
+	dsn := requirePostgresDSN(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -84,10 +80,7 @@ func TestVCenterPortGroupAdvisoryLockSerializesTwoClients(t *testing.T) {
 }
 
 func TestVCenterPortGroupAdvisoryLockCancellationAndErrorRelease(t *testing.T) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("set TEST_DATABASE_URL to an isolated PostgreSQL database to run the advisory-lock release test")
-	}
+	dsn := requirePostgresDSN(t)
 
 	rootCtx, rootCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer rootCancel()

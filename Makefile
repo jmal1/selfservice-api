@@ -34,17 +34,17 @@ build: ## Build all command binaries into ./bin
 test: ## Run the full local CI-equivalent race suite (matches GitHub Actions)
 	$(GO) test ./... -race -count=1
 
-test-short: ## Run tests excluding -tags=integration
+test-short: ## Short suite: skips deploy.sh harness, vcsim, helm template, and Postgres integration
 	$(GO) test ./... -short -race -count=1
 
-ci-fast: ## Fast local gate: build + vet + wiki + short Go tests without the full race suite
+ci-fast: ## Fast local gate: build + vet + wiki + short Go tests (no deploy.sh/vcsim/Postgres/race)
 	@echo "==> Phase 1/4: build"
 	@$(GO) build ./...
 	@echo "==> Phase 2/4: vet"
 	@$(GO) vet ./...
 	@echo "==> Phase 3/4: wiki bundle"
 	@$(MAKE) verify-wiki
-	@echo "==> Phase 4/4: short tests"
+	@echo "==> Phase 4/4: short tests (excludes deploy.sh harness, vcsim, helm template, Postgres)"
 	@$(GO) test ./... -short -count=1
 
 verify-fast: ci-fast
