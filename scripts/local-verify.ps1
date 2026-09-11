@@ -434,31 +434,45 @@ if ($selectedTiers -contains 0) {
     else {
         Push-Location -LiteralPath $repoRoot
         try {
-            $gofmtProblems = Get-GoFormattingProblems -Root $repoRoot
-            if ($gofmtProblems.Count -gt 0) {
-                Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details ("gofmt failed: " + (Format-TrimmedOutput ($gofmtProblems | Out-String)))
+            $fpScript = Join-Path $repoRoot "scripts\check-public-fingerprints.ps1"
+            if (-not (Test-Path -LiteralPath $fpScript)) {
+                Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details "scripts/check-public-fingerprints.ps1 is missing."
                 $script:AnyFail = $true
             }
             else {
-                $buildOutput = & go build ./... 2>&1
+                $fpOutput = & pwsh -NoProfile -File $fpScript 2>&1
                 if ($LASTEXITCODE -ne 0) {
-                    Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details (Format-TrimmedOutput ($buildOutput | Out-String))
+                    Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details ("Public fingerprint hygiene failed: " + (Format-TrimmedOutput ($fpOutput | Out-String)))
                     $script:AnyFail = $true
                 }
                 else {
-                    $vetOutput = & go vet ./... 2>&1
-                    if ($LASTEXITCODE -ne 0) {
-                        Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details (Format-TrimmedOutput ($vetOutput | Out-String))
+                    $gofmtProblems = Get-GoFormattingProblems -Root $repoRoot
+                    if ($gofmtProblems.Count -gt 0) {
+                        Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details ("gofmt failed: " + (Format-TrimmedOutput ($gofmtProblems | Out-String)))
                         $script:AnyFail = $true
                     }
                     else {
-                        $testOutput = & go test ./... -short -count=1 2>&1
+                        $buildOutput = & go build ./... 2>&1
                         if ($LASTEXITCODE -ne 0) {
-                            Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details (Format-TrimmedOutput ($testOutput | Out-String))
+                            Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details (Format-TrimmedOutput ($buildOutput | Out-String))
                             $script:AnyFail = $true
                         }
                         else {
-                            Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "PASS" -Details "gofmt, build, vet, and short Go tests succeeded."
+                            $vetOutput = & go vet ./... 2>&1
+                            if ($LASTEXITCODE -ne 0) {
+                                Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details (Format-TrimmedOutput ($vetOutput | Out-String))
+                                $script:AnyFail = $true
+                            }
+                            else {
+                                $testOutput = & go test ./... -short -count=1 2>&1
+                                if ($LASTEXITCODE -ne 0) {
+                                    Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "FAIL" -Details (Format-TrimmedOutput ($testOutput | Out-String))
+                                    $script:AnyFail = $true
+                                }
+                                else {
+                                    Write-TierResult -Index 0 -Name "gofmt + go build + go vet + short Go tests" -State "PASS" -Details "fingerprint hygiene, gofmt, build, vet, and short Go tests succeeded."
+                                }
+                            }
                         }
                     }
                 }

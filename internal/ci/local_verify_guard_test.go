@@ -16,6 +16,7 @@ import (
 
 var requiredLocalVerificationTiers = map[string]int{
 	"ci.yaml|test|Checkout":                                                            0,
+	"ci.yaml|test|Public fingerprint hygiene":                                          0,
 	"ci.yaml|test|Set up Go":                                                           0,
 	"ci.yaml|test|Build":                                                               0,
 	"ci.yaml|test|Vet":                                                                 0,

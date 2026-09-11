@@ -436,17 +436,18 @@ func TestCIWorkflowTestJobStillRunsFullCoverage(t *testing.T) {
 		name := mustString(t, step["name"], fmt.Sprintf("jobs.test.steps[%d].name", i))
 		names = append(names, name)
 	}
-	wantNames := []string{"Checkout", "Set up Go", "Build", "Vet", "Verify wiki bundle", "Fast fail: short Go suite", "Test"}
+	wantNames := []string{"Checkout", "Public fingerprint hygiene", "Set up Go", "Build", "Vet", "Verify wiki bundle", "Fast fail: short Go suite", "Test"}
 	if !reflect.DeepEqual(names, wantNames) {
 		t.Fatalf("test step names = %v, want %v", names, wantNames)
 	}
 
 	expectRuns := map[string]string{
-		"Build":                     "go build ./...",
-		"Vet":                       "go vet ./...",
-		"Verify wiki bundle":        "make verify-wiki",
-		"Fast fail: short Go suite": "go test ./... -short -count=1",
-		"Test":                      "go test ./... -v -race",
+		"Public fingerprint hygiene": "./scripts/check-public-fingerprints.ps1",
+		"Build":                      "go build ./...",
+		"Vet":                        "go vet ./...",
+		"Verify wiki bundle":         "make verify-wiki",
+		"Fast fail: short Go suite":  "go test ./... -short -count=1",
+		"Test":                       "go test ./... -v -race",
 	}
 	for _, raw := range steps {
 		step := mustMap(t, raw, "jobs.test.steps")
