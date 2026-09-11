@@ -4183,9 +4183,10 @@ func TestDeployScriptForceConflictsInvariantDetectsMutatingLeakage(t *testing.T)
 			// existing --type flag line (no new line, no distinctive
 			// leading whitespace) is exactly the shape the old
 			// line-anchored regex check could not see.
+			// Unique to the contain path (value false); restore uses value true.
 			name: "inline on an existing flag line of a real mutating kubectl patch",
-			old:  "      --type strategic \\\n",
-			new:  "      --type strategic --force-conflicts \\\n",
+			old:  "  if ! kubectl patch \"cronjob/$api_cronjob\" \\\n      -n \"$NAMESPACE\" \\\n      --type strategic \\\n      -p '{\"spec\":{\"suspend\":false,\"jobTemplate\":{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"synthetic-api-monitor\",\"env\":[{\"name\":\"SYNTHETIC_LIFECYCLE_ENABLED\",\"value\":\"false\"}]}]}}}}}}'; then",
+			new:  "  if ! kubectl patch \"cronjob/$api_cronjob\" \\\n      -n \"$NAMESPACE\" \\\n      --type strategic --force-conflicts \\\n      -p '{\"spec\":{\"suspend\":false,\"jobTemplate\":{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"synthetic-api-monitor\",\"env\":[{\"name\":\"SYNTHETIC_LIFECYCLE_ENABLED\",\"value\":\"false\"}]}]}}}}}}'; then",
 		},
 		{
 			// contain_failed_atomic_upgrade's real
