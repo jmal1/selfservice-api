@@ -5253,6 +5253,26 @@ func stripForceConflictsFromFunction(t *testing.T, source, functionName string) 
 	return source[:start] + stripped + source[end:]
 }
 
+func TestDeployScriptValuesOverlayIsConfigurable(t *testing.T) {
+	deployBody, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(deployBody)
+	if !strings.Contains(source, `VALUES_OVERLAY="${VALUES_OVERLAY:-values.example.yaml}"`) {
+		t.Fatal("deploy.sh must default VALUES_OVERLAY to values.example.yaml")
+	}
+	if strings.Count(source, `-f "$VALUES_OVERLAY"`) < 2 {
+		t.Fatal("helm template and helm upgrade must both consume $VALUES_OVERLAY")
+	}
+	if strings.Contains(source, "-f values.example.yaml") {
+		t.Fatal("deploy.sh still hardcodes -f values.example.yaml; production applies would stomp real hostnames")
+	}
+	if !strings.Contains(source, `REQUIRE_NON_EXAMPLE_HOSTNAMES:-false`) {
+		t.Fatal("deploy.sh must honor REQUIRE_NON_EXAMPLE_HOSTNAMES for production applies")
+	}
+}
+
 func TestDeployScriptHelmTimeoutCoversWorkerAntiAffinityRollout(t *testing.T) {
 	// Required hostname anti-affinity + maxSurge=0 means each worker
 	// replacement waits out terminationGracePeriodSeconds before the

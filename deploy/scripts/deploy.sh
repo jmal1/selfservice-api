@@ -3,8 +3,9 @@
 #
 # Production topology overlays live in the private crucible-deploy repo.
 # This public chart ships values.example.yaml for lint/template validation only.
-# The apply path below still consumes -f values.example.yaml so in-repo
-# validation works; a production apply should substitute the private overlay.
+# Set VALUES_OVERLAY to the private production file (typically values.prod.yaml)
+# for real applies. Default remains values.example.yaml so in-repo validation
+# and unit tests keep working without the private overlay.
 #
 # Intended to run on the deploy host from a sparse-checkout where
 # ./deploy/helm/selfservice is the chart root.
@@ -39,6 +40,10 @@ NAMESPACE=selfservice
 # workers at 150s grace already consume 5m before ready probes; keep headroom
 # for API/engine/UI and image pulls. AGENTS.md helm deployment bound is 15m.
 TIMEOUT=15m
+# Second -f values file after values.yaml. Production must override this to the
+# private overlay; values.example.yaml uses *.example.test hostnames that make
+# cert-manager Certificate Ready=false forever under helm --wait --atomic.
+VALUES_OVERLAY="${VALUES_OVERLAY:-values.example.yaml}"
 
 DO_PULL=true
 DO_DRY_RUN=false
@@ -4280,7 +4285,7 @@ prepare_immutable_candidate() {
   helm template "$RELEASE" . \
     -n "$NAMESPACE" \
     -f values.yaml \
-    -f values.example.yaml \
+    -f "$VALUES_OVERLAY" \
     --is-upgrade \
     --skip-tests \
     --set-string global.postgresql.auth.password=crucible-template-validation-only \
@@ -4355,6 +4360,17 @@ CANDIDATE_UI_WORKFLOW_RUN_ATTEMPT=$PROVEN_UI_WORKFLOW_RUN_ATTEMPT
 echo "==> trusted UI source commit $UI_SOURCE_SHA has successful test and image builds"
 
 cd "$CHART_DIR"
+if [ ! -f "$VALUES_OVERLAY" ]; then
+  echo "ERROR: VALUES_OVERLAY=$VALUES_OVERLAY not found in $CHART_DIR" >&2
+  exit 1
+fi
+echo "==> using values overlay $VALUES_OVERLAY"
+if [ "${REQUIRE_NON_EXAMPLE_HOSTNAMES:-false}" = true ]; then
+  if grep -Eq 'example\.test' "$VALUES_OVERLAY"; then
+    echo "ERROR: VALUES_OVERLAY=$VALUES_OVERLAY still contains example.test hostnames; refusing production apply." >&2
+    exit 1
+  fi
+fi
 
 echo "==> helm dep build (uses Chart.lock for pinned subchart versions)"
 helm dep build
@@ -4453,7 +4469,7 @@ helm upgrade "$RELEASE" . \
   --namespace "$NAMESPACE" \
   --install \
   -f values.yaml \
-  -f values.example.yaml \
+  -f "$VALUES_OVERLAY" \
   --post-renderer "$APPLY_EXACT_CANDIDATE_SCRIPT" \
   --atomic \
   --timeout "$TIMEOUT"
