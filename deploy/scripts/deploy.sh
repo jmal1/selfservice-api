@@ -33,7 +33,12 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 CHART_DIR="$SCRIPT_DIR/../helm/selfservice"
 RELEASE=selfservice
 NAMESPACE=selfservice
-TIMEOUT=5m
+# Helm --wait budget. Worker uses required hostname anti-affinity with
+# maxSurge=0 on two untainted nodes, so each replica replacement waits out
+# terminationGracePeriodSeconds before the next pod can schedule. Two
+# workers at 150s grace already consume 5m before ready probes; keep headroom
+# for API/engine/UI and image pulls. AGENTS.md helm deployment bound is 15m.
+TIMEOUT=15m
 
 DO_PULL=true
 DO_DRY_RUN=false
@@ -1709,7 +1714,7 @@ pause_live_provisioning_claims() {
       kubectl set env "deployment/$RELEASE-worker" \
         -n "$NAMESPACE" \
         WORKER_PROVISIONING_CLAIMS_ENABLED=false
-      kubectl rollout status "deployment/$RELEASE-worker" -n "$NAMESPACE" --timeout=5m
+      kubectl rollout status "deployment/$RELEASE-worker" -n "$NAMESPACE" --timeout="$TIMEOUT"
       ;;
     *)
       echo "ERROR: live worker provisioning claims have invalid value $live_claims." >&2
@@ -1787,7 +1792,7 @@ resume_live_provisioning_claims() {
     echo "ERROR: could not restore WORKER_PROVISIONING_CLAIMS_ENABLED=true on the live worker." >&2
     return "$command_status"
   fi
-  kubectl rollout status "deployment/$RELEASE-worker" -n "$NAMESPACE" --timeout=5m
+  kubectl rollout status "deployment/$RELEASE-worker" -n "$NAMESPACE" --timeout="$TIMEOUT"
   command_status=$?
   if [ "$command_status" -ne 0 ]; then
     echo "ERROR: live worker provisioning claims restore did not stabilize." >&2
@@ -2436,7 +2441,7 @@ workload_health() {
   while IFS=$'\t' read -r kind name; do
     case "$kind" in
       Deployment|DaemonSet|StatefulSet)
-        kubectl rollout status "$kind/$name" -n "$NAMESPACE" --timeout=5m || {
+        kubectl rollout status "$kind/$name" -n "$NAMESPACE" --timeout="$TIMEOUT" || {
           echo "ERROR: $kind/$name did not stabilize during deployed candidate health verification." >&2
           return 1
         }
@@ -3659,7 +3664,7 @@ contain_failed_atomic_upgrade() {
     echo "ERROR: could not force provisioning claims disabled after atomic failure." >&2
     return 1
   fi
-  if ! kubectl rollout status "deployment/$RELEASE-worker" -n "$NAMESPACE" --timeout=5m; then
+  if ! kubectl rollout status "deployment/$RELEASE-worker" -n "$NAMESPACE" --timeout="$TIMEOUT"; then
     echo "ERROR: claims-disabled worker rollout did not stabilize after atomic failure." >&2
     return 1
   fi
@@ -4223,7 +4228,7 @@ prepare_claims_baseline() {
     kubectl set env "deployment/$RELEASE-worker" \
       -n "$NAMESPACE" \
       WORKER_PROVISIONING_CLAIMS_ENABLED=false
-    kubectl rollout status "deployment/$RELEASE-worker" -n "$NAMESPACE" --timeout=5m
+    kubectl rollout status "deployment/$RELEASE-worker" -n "$NAMESPACE" --timeout="$TIMEOUT"
     return 1
   fi
 

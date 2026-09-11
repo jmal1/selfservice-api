@@ -2681,14 +2681,14 @@ func TestDeployScriptDeployedCandidateOrderingIsLoadBearing(t *testing.T) {
 func revertWorkloadHealthPropagation(t *testing.T, source string) string {
 	t.Helper()
 	const fixedBlock = `      Deployment|DaemonSet|StatefulSet)
-        kubectl rollout status "$kind/$name" -n "$NAMESPACE" --timeout=5m || {
+        kubectl rollout status "$kind/$name" -n "$NAMESPACE" --timeout="$TIMEOUT" || {
           echo "ERROR: $kind/$name did not stabilize during deployed candidate health verification." >&2
           return 1
         }
         ;;
 `
 	const oldBlock = `      Deployment|DaemonSet|StatefulSet)
-        kubectl rollout status "$kind/$name" -n "$NAMESPACE" --timeout=5m
+        kubectl rollout status "$kind/$name" -n "$NAMESPACE" --timeout="$TIMEOUT"
         ;;
 `
 	if !strings.Contains(source, fixedBlock) {
@@ -5251,6 +5251,51 @@ func stripForceConflictsFromFunction(t *testing.T, source, functionName string) 
 		t.Fatalf("stripping --force-conflicts from %s() left a residual flag occurrence", functionName)
 	}
 	return source[:start] + stripped + source[end:]
+}
+
+func TestDeployScriptHelmTimeoutCoversWorkerAntiAffinityRollout(t *testing.T) {
+	// Required hostname anti-affinity + maxSurge=0 means each worker
+	// replacement waits out terminationGracePeriodSeconds before the
+	// successor can schedule. Production (values.example.yaml) runs two
+	// workers; a 5m Helm --wait is therefore mathematically insufficient
+	// at the chart's 150s grace before any ready-probe budget.
+	deployBody, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(deployBody)
+	if strings.Contains(source, "--timeout=5m") {
+		t.Fatal("deploy.sh still hardcodes --timeout=5m; rollout waits must use $TIMEOUT")
+	}
+	match := regexp.MustCompile(`(?m)^TIMEOUT=([0-9]+[smh])\s*$`).FindStringSubmatch(source)
+	if match == nil {
+		t.Fatal("could not locate TIMEOUT= assignment in deploy.sh")
+	}
+	timeout, err := time.ParseDuration(match[1])
+	if err != nil {
+		t.Fatalf("TIMEOUT=%q is not a duration: %v", match[1], err)
+	}
+
+	defaults := loadChartValues(t, "values.yaml")
+	example := loadChartValues(t, "values.example.yaml")
+	grace := time.Duration(defaults.Worker.ShutdownGracePeriodSeconds) * time.Second
+	replicas := example.ReplicaCount.Worker
+	if replicas < 2 {
+		t.Fatalf("values.example.yaml worker replicas = %d, want at least the two-node production topology", replicas)
+	}
+	const readyBudget = 2 * time.Minute
+	need := time.Duration(replicas)*grace + readyBudget
+	if timeout < need {
+		t.Fatalf(
+			"TIMEOUT=%s is below the anti-affinity worker rollout floor %s (%d replicas × %s grace + %s ready budget)",
+			timeout, need, replicas, grace, readyBudget,
+		)
+	}
+
+	// Sabotage: the previously shipped 5m budget fails the same floor.
+	if five := 5 * time.Minute; five >= need {
+		t.Fatalf("test floor %s no longer fails the old 5m TIMEOUT; update the bound", need)
+	}
 }
 
 func TestDeployScriptsAreExecutable(t *testing.T) {
