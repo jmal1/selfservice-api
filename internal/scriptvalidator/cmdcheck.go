@@ -5,7 +5,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/jmal1/selfservice-api/internal/runnertools"
+	"github.com/jmal1/selfservice-crucible-runner/runnertools"
 )
 
 // cmdRe matches a token in command position: the first word of a line, or the

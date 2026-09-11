@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jmal1/selfservice-api/internal/runner"
-	"github.com/jmal1/selfservice-api/internal/runnertools"
+	"github.com/jmal1/selfservice-crucible-runner/runner"
+	"github.com/jmal1/selfservice-crucible-runner/runnertools"
 	"github.com/jmal1/selfservice-api/internal/scriptvalidator"
 )
 

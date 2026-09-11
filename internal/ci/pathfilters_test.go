@@ -37,19 +37,14 @@ import (
 // .github/path-filters.yaml.  wiki-bundler is omitted because it is a
 // build-time tool with no matrix entry in ci.yaml and no deployed image.
 //
-// This map must list every component in ci.yaml's build matrix.  It previously
-// omitted crucible-runner, which is exactly where the drift was: the runner
-// channel globbed only deploy/runner/**, even though that Dockerfile's builder
-// stage runs `go build ./cmd/crucible-runner/`.  A thorough-looking guard with
-// a hole in it is worse than no guard, so
-// TestPathFilters_BinaryChannelsCoversCIMatrix now enforces the map's own
-// completeness against ci.yaml.
+// This map must list every component in ci.yaml's build matrix. The Kali
+// runner image is owned by jmal1/selfservice-crucible-runner and is intentionally
+// absent here.
 var binaryChannels = map[string]string{
 	"api-gateway":           "api-gateway",
 	"provision-worker":      "provision-worker",
 	"crucible-engine":       "crucible-engine",
 	"synthetic-api-monitor": "synthetic-api-monitor",
-	"crucible-runner":       "crucible-runner",
 }
 
 // findRepoRoot walks up from the test's working directory until it finds
@@ -328,8 +323,8 @@ func TestPathFilters_NoDanglingEntries(t *testing.T) {
 // reading ci.yaml's "Resolve Dockerfile + target" step, so this cannot drift from
 // the workflow that actually builds the images.
 //
-// Today that step is: crucible-runner -> deploy/runner/Dockerfile, everything else
-// -> the root Dockerfile built with target=<component>.
+// All four Alpine API images use the root multi-target Dockerfile. The Kali
+// runner image is built in jmal1/selfservice-crucible-runner.
 func dockerfileForComponent(t *testing.T, root string) map[string]string {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "ci.yaml"))
@@ -338,12 +333,9 @@ func dockerfileForComponent(t *testing.T, root string) map[string]string {
 	}
 	ci := string(data)
 
-	// Pin the two branches of the resolver. If the workflow grows a third
-	// Dockerfile, these assertions fail and this map has to be revisited --
-	// rather than silently checking the wrong file.
-	if !strings.Contains(ci, `file=deploy/runner/Dockerfile`) {
-		t.Fatal("ci.yaml no longer maps crucible-runner to deploy/runner/Dockerfile; " +
-			"update dockerfileForComponent to match the workflow")
+	if strings.Contains(ci, `file=deploy/runner/Dockerfile`) {
+		t.Fatal("ci.yaml still maps crucible-runner to deploy/runner/Dockerfile; " +
+			"runner builds moved to jmal1/selfservice-crucible-runner")
 	}
 	if !strings.Contains(ci, `echo "file=Dockerfile"`) {
 		t.Fatal("ci.yaml no longer falls back to the root Dockerfile; " +
@@ -352,11 +344,7 @@ func dockerfileForComponent(t *testing.T, root string) map[string]string {
 
 	out := map[string]string{}
 	for _, c := range ciMatrixComponents(t, root) {
-		if c == "crucible-runner" {
-			out[c] = "deploy/runner/Dockerfile"
-		} else {
-			out[c] = "Dockerfile"
-		}
+		out[c] = "Dockerfile"
 	}
 	return out
 }
@@ -370,15 +358,6 @@ var copyRe = regexp.MustCompile(`(?m)^\s*COPY\s+(.*)$`)
 //
 // TestPathFilters_CoverAllInternalPackages walks the *Go import graph*, so it
 // structurally cannot see a dependency that exists only as a Dockerfile COPY.
-// crucible-runner has exactly such an edge: it COPYs internal/runnertools/tools.txt
-// and derives its entire apt install list and its `command -v` verification loop
-// from that file. Without the matching channel entry, adding a tool to the manifest
-// would not rebuild the image that is supposed to contain the tool, and the miss
-// would surface as an exit 127 mid-assessment rather than as a build failure.
-//
-// Deriving the requirement from the Dockerfiles means a future COPY edge is caught
-// automatically instead of relying on someone remembering. Verified by deleting the
-// 'internal/runnertools/**' entry from the crucible-runner channel.
 func TestPathFilters_CoverDockerfileCopySources(t *testing.T) {
 	root := findRepoRoot(t)
 	filters := loadFilters(t, root)

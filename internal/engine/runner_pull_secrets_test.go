@@ -13,7 +13,7 @@ import (
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/jmal1/selfservice-api/internal/runner"
+	"github.com/jmal1/selfservice-crucible-runner/runner"
 )
 
 // provisionForTest runs ProvisionRunner against fake clients and returns the

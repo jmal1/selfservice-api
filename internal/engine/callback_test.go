@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jmal1/selfservice-api/internal/runner"
+	"github.com/jmal1/selfservice-crucible-runner/runner"
 )
 
 func TestCallbackRouter_InvalidToken(t *testing.T) {

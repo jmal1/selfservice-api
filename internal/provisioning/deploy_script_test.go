@@ -2745,9 +2745,25 @@ func TestDeployScriptRejectsUntrustedSource(t *testing.T) {
 			wantOutput: "not verified by GitHub",
 		},
 		{
-			name:       "missing required build",
-			configure:  func(env *deployScriptEnvironment) { env.missingBuild = "crucible-runner" },
-			wantOutput: "successful image build for crucible-runner",
+			name: "missing required runner pin",
+			configure: func(env *deployScriptEnvironment) {
+				env.omitRunnerSourceSHA = true
+			},
+			wantOutput: "require an explicit --runner-source-sha",
+		},
+		{
+			name: "missing alpine api build",
+			configure: func(env *deployScriptEnvironment) {
+				env.missingBuild = "api-gateway"
+			},
+			wantOutput: "successful image build for api-gateway",
+		},
+		{
+			name: "missing runner image build",
+			configure: func(env *deployScriptEnvironment) {
+				env.missingRunnerBuild = true
+			},
+			wantOutput: "successful image build",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -5115,7 +5131,7 @@ func TestDeployScriptsAreExecutable(t *testing.T) {
 	}
 }
 
-func TestProductionPushBuildsCompleteImageMatrix(t *testing.T) {
+func TestProductionPushPathFiltersImageMatrix(t *testing.T) {
 	requirePOSIXShell(t)
 	script := filepath.Join("..", "..", ".github", "scripts", "compute-image-matrix.sh")
 	workflow, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "ci.yaml"))
@@ -5130,6 +5146,9 @@ func TestProductionPushBuildsCompleteImageMatrix(t *testing.T) {
 		!strings.Contains(string(workflow), "${{ steps.build.outputs.digest }}") {
 		t.Fatal("image workflow does not persist each run-bound component digest artifact")
 	}
+	if !strings.Contains(string(workflow), "image-manifest.json") {
+		t.Fatal("image workflow does not aggregate image-manifest.json")
+	}
 	pushStart := strings.Index(string(workflow), "  push:")
 	pullRequestStart := strings.Index(string(workflow), "  pull_request:")
 	if pushStart < 0 || pullRequestStart <= pushStart {
@@ -5138,7 +5157,7 @@ func TestProductionPushBuildsCompleteImageMatrix(t *testing.T) {
 	if strings.Contains(string(workflow)[pushStart:pullRequestStart], "paths-ignore:") {
 		t.Fatal("main pushes can still skip the complete image workflow")
 	}
-	all := `["api-gateway","provision-worker","crucible-engine","synthetic-api-monitor","crucible-runner"]`
+	all := `["api-gateway","provision-worker","crucible-engine","synthetic-api-monitor"]`
 	for _, test := range []struct {
 		name    string
 		event   string
@@ -5146,15 +5165,21 @@ func TestProductionPushBuildsCompleteImageMatrix(t *testing.T) {
 		want    string
 	}{
 		{
-			name:    "partial main change still publishes all deployment images",
+			name:    "partial main API change rebuilds only that channel",
 			event:   "push",
 			changes: `["api-gateway","go-tests"]`,
-			want:    all,
+			want:    `["api-gateway"]`,
 		},
 		{
-			name:    "empty main matrix still publishes all deployment images",
+			name:    "empty main matrix rebuilds nothing",
 			event:   "push",
 			changes: `[]`,
+			want:    `[]`,
+		},
+		{
+			name:    "shared main change rebuilds every API image",
+			event:   "push",
+			changes: `["shared","go-tests"]`,
 			want:    all,
 		},
 		{
@@ -6551,6 +6576,10 @@ type deployScriptEnvironment struct {
 	commitVerified            bool
 	missingBuild              string
 	gitDirty                  bool
+	runnerSourceSHA           string
+	runnerCommitVerified      bool
+	missingRunnerBuild        bool
+	omitRunnerSourceSHA       bool
 	// Model Helm ownership metadata present live but absent from server-side dry-run objects.
 	liveHelmRelease   string
 	liveHelmNamespace string
@@ -6669,6 +6698,8 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 		immutableHelmStatus:       "superseded",
 		immutableChartVersion:     "0.1.0",
 		currentChartVersion:       "0.1.0",
+		runnerCommitVerified:      true,
+		runnerSourceSHA:           testSourceSHA,
 		packageTag:                testSourceSHA,
 		packageDigest:             testDigestB,
 		runArtifactDigest:         testDigestB,
@@ -8226,29 +8257,49 @@ case "$*" in
     ;;
   "run download "*)
     output_dir=
+    repo=jmal1/selfservice-api
     while [ "$#" -gt 0 ]; do
       if [ "$1" = "--dir" ]; then
         output_dir=$2
-        break
+      fi
+      if [ "$1" = "--repo" ]; then
+        repo=$2
       fi
       shift
     done
     [ -n "$output_dir" ]
-    for component in api-gateway provision-worker crucible-engine synthetic-api-monitor crucible-runner; do
-      artifact_dir="$output_dir/image-digest-$component"
+    if [ "$repo" = "jmal1/selfservice-crucible-runner" ]; then
+      artifact_dir="$output_dir/image-digest-crucible-runner"
       mkdir -p "$artifact_dir"
       printf '%s\t%s\tsha256:%s\t%s\n' \
-        "$component" \
-        "ghcr.io/jmal1/selfservice-$component" \
+        "crucible-runner" \
+        "ghcr.io/jmal1/selfservice-crucible-runner" \
         "$FAKE_RUN_ARTIFACT_DIGEST" \
-        "$FAKE_SOURCE_SHA" \
+        "$FAKE_RUNNER_SOURCE_SHA" \
         > "$artifact_dir/image-digest.tsv"
-    done
+    else
+      for component in api-gateway provision-worker crucible-engine synthetic-api-monitor; do
+        artifact_dir="$output_dir/image-digest-$component"
+        mkdir -p "$artifact_dir"
+        printf '%s\t%s\tsha256:%s\t%s\n' \
+          "$component" \
+          "ghcr.io/jmal1/selfservice-$component" \
+          "$FAKE_RUN_ARTIFACT_DIGEST" \
+          "$FAKE_SOURCE_SHA" \
+          > "$artifact_dir/image-digest.tsv"
+      done
+    fi
     ;;
   *"repos/jmal1/selfservice-api/commits/"*)
     jq -cn \
       --arg sha "$FAKE_SOURCE_SHA" \
       --argjson verified "$FAKE_COMMIT_VERIFIED" \
+      '{sha:$sha,commit:{verification:{verified:$verified}}}'
+    ;;
+  *"repos/jmal1/selfservice-crucible-runner/commits/"*)
+    jq -cn \
+      --arg sha "$FAKE_RUNNER_SOURCE_SHA" \
+      --argjson verified "$FAKE_RUNNER_COMMIT_VERIFIED" \
       '{sha:$sha,commit:{verification:{verified:$verified}}}'
     ;;
   *"repos/jmal1/selfservice-ui/commits/"*)
@@ -8264,6 +8315,24 @@ case "$*" in
        '{workflow_runs:[{id:9002,run_number:51,run_attempt:1,head_sha:$sha,head_branch:"master",event:"push",status:"completed",conclusion:"success"}]}'
     else
       printf '{"workflow_runs":[]}\n'
+    fi
+    ;;
+  *"repos/jmal1/selfservice-crucible-runner/actions/workflows/ci.yaml/runs"*)
+    if [ "$FAKE_MISSING_RUNNER_BUILD" = true ]; then
+      printf '{"workflow_runs":[]}\n'
+    elif [[ "$*" == *"head_sha=$FAKE_RUNNER_SOURCE_SHA"* ]]; then
+      jq -cn \
+        --arg sha "$FAKE_RUNNER_SOURCE_SHA" \
+        '{workflow_runs:[{id:9003,run_number:7,head_sha:$sha,head_branch:"main",event:"push",status:"completed",conclusion:"success"}]}'
+    else
+      printf '{"workflow_runs":[]}\n'
+    fi
+    ;;
+  *"repos/jmal1/selfservice-crucible-runner/actions/runs/9003/jobs"*)
+    if [ "$FAKE_MISSING_RUNNER_BUILD" = true ]; then
+      printf '{"jobs":[]}\n'
+    else
+      printf '{"jobs":[{"name":"Build runner image","status":"completed","conclusion":"success"}]}\n'
     fi
     ;;
   *"repos/jmal1/selfservice-ui/actions/runs/9002/jobs"*)
@@ -8287,7 +8356,7 @@ case "$*" in
   *"actions/runs/9001/jobs"*)
     jq -cn --arg missing "$FAKE_MISSING_BUILD" '{
       jobs: (
-        ["api-gateway","provision-worker","crucible-engine","synthetic-api-monitor","crucible-runner"]
+        ["api-gateway","provision-worker","crucible-engine","synthetic-api-monitor"]
         | map(select(. != $missing) | {name:("build (" + . + ")"),status:"completed",conclusion:"success"})
       )
     }'
@@ -8418,6 +8487,21 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 	if includeUI {
 		args = append(args, "--ui-source-sha", e.uiSourceSHA)
 	}
+	if !e.omitRunnerSourceSHA {
+		if e.runnerSourceSHA == "" {
+			e.runnerSourceSHA = testSourceSHA
+		}
+		hasRunnerArg := false
+		for _, a := range args {
+			if a == "--runner-source-sha" {
+				hasRunnerArg = true
+				break
+			}
+		}
+		if !hasRunnerArg {
+			args = append(args, "--runner-source-sha", e.runnerSourceSHA)
+		}
+	}
 	script := e.scriptPath
 	if script == "" {
 		script = filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
@@ -8526,6 +8610,9 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_DIGEST_A="+testDigestA,
 		"FAKE_DIGEST_B="+testDigestB,
 		"FAKE_SOURCE_SHA="+testSourceSHA,
+		"FAKE_RUNNER_SOURCE_SHA="+e.runnerSourceSHA,
+		"FAKE_RUNNER_COMMIT_VERIFIED="+strconv.FormatBool(e.runnerCommitVerified),
+		"FAKE_MISSING_RUNNER_BUILD="+strconv.FormatBool(e.missingRunnerBuild),
 		"FAKE_PACKAGE_TAG="+e.packageTag,
 		"FAKE_PACKAGE_ADDITIONAL_TAG="+e.packageAdditionalTag,
 		"FAKE_PACKAGE_DIGEST="+e.packageDigest,

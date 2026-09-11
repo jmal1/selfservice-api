@@ -3,20 +3,11 @@
 # Each top-level key is a "channel" used by dorny/paths-filter@v3 to decide
 # whether the corresponding matrix job has to run.
 #
-# Channels:
-#   shared           — paths that affect every binary; presence in a PR/push
-#                      forces ALL matrix jobs to run.
-#   <component>      — paths whose changes only require that component to
-#                      rebuild. Shared internal packages (e.g. internal/vcenter
-#                      used by api-gateway + provision-worker + crucible-engine)
-#                      are intentionally listed under EVERY consuming
-#                      component so they trigger the right subset.
+# The Kali assessment runner image is built in jmal1/selfservice-crucible-runner
+# (not this matrix). Engine/gateway still import that Go module via go.mod;
+# bumping the module version is a shared/go.mod change and rebuilds consumers.
 #
 # Source of truth for the per-component lists is `go list -deps ./cmd/<x>/`.
-# If you add a new internal package and a cmd that imports it, append it to
-# the corresponding component channel (or to `shared` if 2+ components use
-# it AND it changes often enough that listing it under each component would
-# be noisy).
 
 shared:
   - 'go.mod'
@@ -45,7 +36,6 @@ api-gateway:
   - 'internal/provisioner/**'
   - 'internal/provisioner/assets/**'
   - 'internal/rollback/**'
-  - 'internal/runnertools/**'
   - 'internal/scriptvalidator/**'
   - 'internal/templates/**'
   - 'internal/unattend/**'
@@ -67,7 +57,6 @@ provision-worker:
 crucible-engine:
   - 'cmd/crucible-engine/**'
   - 'internal/engine/**'
-  - 'internal/runner/**'
   - 'internal/vcenter/**'
 
 synthetic-api-monitor:
@@ -83,26 +72,8 @@ synthetic-api-monitor:
   - 'internal/unattend/**'
   - 'internal/vcenter/**'
 
-crucible-runner:
-  # deploy/runner/Dockerfile does NOT just package a bash library: its builder
-  # stage runs `go build ./cmd/crucible-runner/`. Listing only deploy/runner/**
-  # here meant a change to the runner's Go code did not rebuild the runner
-  # image, so the next deploy silently shipped a stale runner binary while
-  # every other component picked the change up. See TestPathFilters_*.
-  - 'deploy/runner/**'
-  - 'cmd/crucible-runner/**'
-  - 'internal/runner/**'
-  # internal/runnertools is NOT a Go dependency of cmd/crucible-runner -- the
-  # Dockerfile COPYs internal/runnertools/tools.txt and derives both the apt
-  # install list and the verification loop from it. TestPathFilters_* walks the
-  # Go import graph and therefore cannot see this edge, so it is listed by hand.
-  # Without it, adding a tool to the manifest would not rebuild the image that
-  # is supposed to contain the tool.
-  - 'internal/runnertools/**'
-
 # Also drive whether the Go `test` job has to run. Any Go source change
-# triggers it; deploy/runner-only changes (which only contain a Dockerfile
-# and bash scripts) do not.
+# triggers it.
 go-tests:
   - 'go.mod'
   - 'go.sum'

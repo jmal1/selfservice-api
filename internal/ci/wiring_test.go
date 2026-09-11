@@ -65,14 +65,12 @@ var requiredWiring = map[string][]struct {
 		{"worklease.TryRun", "work-lease gating must stay wired or every replica mutates OPNsense/vCenter"},
 		{"worklease.RunExclusive", "orphan/L1 passes must claim named leases for the whole mutating run"},
 	},
-	"cmd/crucible-runner/main.go": {
-		{"MaterializeActionLibrary", "without it the engine-generated action library is never written to disk, so every library action (http_get, port_open, ssh_exec, …) fails with exit 127 — the original defect, in which workflows appeared to run, the Job exited 0, and no action could possibly pass"},
-	},
 	"cmd/synthetic-api-monitor/main.go": {
 		{"checks.Elevated", "without it the instructor-role checks are never registered, so the authenticated admin surface (/admin/images, /admin/vcenter/isos, wizard-state) is unmonitored — and a 503 from an unwired dependency looks identical to a healthy deploy, because every other admin check only asserts a student is refused"},
 		{"SYNTHETIC_INSTRUCTOR_USER_ID", "the elevated client must be minted from a dedicated instructor row; elevating the primary synthetic user instead would turn five RBAC checks into tautologies that pass while proving nothing"},
 		{"RunnerSmoke(", "without it the runner_smoke check is never registered in SYNTHETIC_RUNNER_MODE: engine dispatch through Multus macvlan DHCP to Kali image pull to action execution to callback to results persisted is completely unmonitored -- silent failures look identical to a healthy deploy"},
 	},
+	// crucible-runner main lives in jmal1/selfservice-crucible-runner; MaterializeActionLibrary wiring is guarded there.
 	// Not a cmd/ main, but the same failure class: buildActionLibrary is a
 	// package-level func, so deleting its only call site still compiles and
 	// still passes every actionlibrary_test.go case (they call it directly).
@@ -436,7 +434,7 @@ func TestCIWorkflowTestJobStillRunsFullCoverage(t *testing.T) {
 		name := mustString(t, step["name"], fmt.Sprintf("jobs.test.steps[%d].name", i))
 		names = append(names, name)
 	}
-	wantNames := []string{"Checkout", "Set up Go", "Build", "Vet", "Verify wiki bundle", "Fast fail: short Go suite", "Test"}
+	wantNames := []string{"Checkout", "Set up Go", "Allow private/org Go modules", "Build", "Vet", "Verify wiki bundle", "Fast fail: short Go suite", "Test"}
 	if !reflect.DeepEqual(names, wantNames) {
 		t.Fatalf("test step names = %v, want %v", names, wantNames)
 	}

@@ -36,7 +36,7 @@ import (
 
 	"github.com/jmal1/selfservice-api/internal/actionlibrary"
 	"github.com/jmal1/selfservice-api/internal/database"
-	"github.com/jmal1/selfservice-api/internal/runnertools"
+	"github.com/jmal1/selfservice-crucible-runner/runnertools"
 	"github.com/jmal1/selfservice-api/internal/scriptvalidator"
 	"github.com/jmal1/selfservice-api/internal/workflowvalidation"
 )

@@ -11,6 +11,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
 	github.com/jackc/pgx/v5 v5.8.0
+	github.com/jmal1/selfservice-crucible-runner v0.0.0-20260911152818-fb43aa95b796
 	github.com/kdomanski/iso9660 v0.4.0
 	github.com/minio/minio-go/v7 v7.2.1
 	github.com/nats-io/nats.go v1.49.0

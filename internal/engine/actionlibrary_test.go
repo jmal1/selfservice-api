@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jmal1/selfservice-api/internal/runner"
+	"github.com/jmal1/selfservice-crucible-runner/runner"
 )
 
 // realisticBody mirrors the shape of an actual library action body: it uses
@@ -172,11 +172,15 @@ func TestBuildActionLibrary_EmptyInputYieldsEmptyOutput(t *testing.T) {
 	}
 }
 
-// --- contract with deploy/runner/actions.sh -------------------------------
+// --- contract with selfservice-crucible-runner actions.sh ----------------
 
 func actionsShPath(t *testing.T) string {
 	t.Helper()
-	p := filepath.Join("..", "..", "deploy", "runner", "actions.sh")
+	out, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/jmal1/selfservice-crucible-runner").Output()
+	if err != nil {
+		t.Fatalf("locate selfservice-crucible-runner module: %v", err)
+	}
+	p := filepath.Join(strings.TrimSpace(string(out)), "actions.sh")
 	if _, err := os.Stat(p); err != nil {
 		t.Fatalf("cannot find actions.sh at %s: %v", p, err)
 	}

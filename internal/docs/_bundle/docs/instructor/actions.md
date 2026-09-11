@@ -308,7 +308,7 @@ go test ./internal/libraryseed -update
 That applies both files to a throwaway database twice, then checks each entry:
 the slug is valid kebab-case, the body parses as bash when wrapped in its
 generated function, every command it calls exists in
-`internal/runnertools/tools.txt`, no two slugs generate the same function name,
+`runnertools/tools.txt` in `jmal1/selfservice-crucible-runner`, no two slugs generate the same function name,
 and every `run_action` in every seeded workflow names a callable the seed
 actually defines. `-update` also regenerates the two corpora
 that `internal/engine`'s guards run against — without it those guards keep

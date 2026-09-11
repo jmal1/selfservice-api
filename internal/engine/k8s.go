@@ -20,7 +20,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
-	"github.com/jmal1/selfservice-api/internal/runner"
+	"github.com/jmal1/selfservice-crucible-runner/runner"
 )
 
 // K8sClient wraps the Kubernetes client for runner pod lifecycle management.

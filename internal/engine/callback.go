@@ -12,7 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/jmal1/selfservice-api/internal/models"
-	"github.com/jmal1/selfservice-api/internal/runner"
+	"github.com/jmal1/selfservice-crucible-runner/runner"
 )
 
 // CallbackServer handles HTTP callbacks from runner pods.

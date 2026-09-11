@@ -6,10 +6,17 @@
 #
 # Usage:
 #   ./deploy.sh --ui-source-sha <full-sha>
+#   ./deploy.sh --ui-source-sha <full-sha> --runner-source-sha <full-sha>
 #   ./deploy.sh --no-pull --ui-source-sha <full-sha>
 #   ./deploy.sh --dry-run --ui-source-sha <full-sha>
 #   ./deploy.sh --verify-rollback-containment
 #   ./deploy.sh --prepare-claims-baseline --baseline-chart-dir /path/to/safe/chart
+#
+# Image pin map (SHA-based):
+#   API workloads (gateway/worker/engine/synthetic-api-monitor) → checked-out API main SHA
+#   UI → --ui-source-sha (required)
+#   Kali runner → API SHA when that push rebuilt crucible-runner; otherwise --runner-source-sha
+#   Future: --image-sha <component>=<full-sha> overlays (see future/Crucible-Deployment-Pipelines.md)
 #
 # Required on the deploy host:
 #   - kubectl with KUBECONFIG pointing at k3s (typically /etc/rancher/k3s/k3s.yaml)
@@ -37,6 +44,11 @@ BASELINE_CHART_DIR=
 UI_SOURCE_REPOSITORY=jmal1/selfservice-ui
 UI_SOURCE_WORKFLOW=ci.yaml
 UI_SOURCE_SHA=
+RUNNER_SOURCE_SHA=
+# When set by prove_successful_source_build, the API workflow run omitted the
+# Kali runner image and RUNNER_SOURCE_SHA must supply it.
+RUNNER_BUILD_ON_API_SHA=true
+PROVEN_RUNNER_WORKFLOW_RUN_ID=
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -69,6 +81,27 @@ while [ "$#" -gt 0 ]; do
       shift
       [ "$#" -gt 0 ] || { echo "ERROR: --ui-source-sha requires a full commit SHA" >&2; exit 64; }
       UI_SOURCE_SHA=$1
+      ;;
+    --runner-source-sha)
+      shift
+      [ "$#" -gt 0 ] || { echo "ERROR: --runner-source-sha requires a full commit SHA" >&2; exit 64; }
+      RUNNER_SOURCE_SHA=$1
+      ;;
+    --image-sha)
+      shift
+      [ "$#" -gt 0 ] || { echo "ERROR: --image-sha requires component=full-sha" >&2; exit 64; }
+      case "$1" in
+        crucible-runner=*|runner=*)
+          RUNNER_SOURCE_SHA=${1#*=}
+          ;;
+        ui=*)
+          UI_SOURCE_SHA=${1#*=}
+          ;;
+        *)
+          echo "ERROR: --image-sha currently supports ui=<sha> and crucible-runner=<sha> (or runner=<sha>); got $1" >&2
+          exit 64
+          ;;
+      esac
       ;;
     *) echo "Unknown arg: $1" >&2; exit 64 ;;
   esac
@@ -1064,8 +1097,7 @@ prove_successful_source_build() {
     api-gateway \
     provision-worker \
     crucible-engine \
-    synthetic-api-monitor \
-    crucible-runner; do
+    synthetic-api-monitor; do
     if ! jq -e --arg job "build ($component)" --arg release "Build release images ($component)" \
         '.jobs | any((.name == $job or .name == $release) and .status == "completed" and .conclusion == "success")' \
         >/dev/null <<< "$jobs_json"; then
@@ -1073,7 +1105,66 @@ prove_successful_source_build() {
       return 1
     fi
   done
+  if [ -z "$RUNNER_SOURCE_SHA" ]; then
+    echo "ERROR: production candidates require an explicit --runner-source-sha (or --image-sha crucible-runner=<sha>) from jmal1/selfservice-crucible-runner." >&2
+    return 1
+  fi
+  if [[ ! "$RUNNER_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "ERROR: --runner-source-sha must be a full lowercase 40-character commit SHA." >&2
+    return 1
+  fi
+  prove_successful_runner_build "$RUNNER_SOURCE_SHA"
+  RUNNER_BUILD_ON_API_SHA=false
   PROVEN_WORKFLOW_RUN_ID=$run_id
+}
+
+prove_successful_runner_build() {
+  local source_sha=$1
+  local commit_json runs_json run_id jobs_json
+  local runner_repo=${RUNNER_SOURCE_REPOSITORY:-jmal1/selfservice-crucible-runner}
+  local runner_workflow=${RUNNER_SOURCE_WORKFLOW:-ci.yaml}
+  local runner_branch=${RUNNER_SOURCE_BRANCH:-main}
+  commit_json="$(gh api "repos/$runner_repo/commits/$source_sha")"
+  if ! jq -e --arg sha "$source_sha" \
+      '.sha == $sha and .commit.verification.verified == true' \
+      >/dev/null <<< "$commit_json"; then
+    echo "ERROR: runner source commit $source_sha is missing or is not verified by GitHub." >&2
+    return 1
+  fi
+  runs_json="$(
+    gh api \
+      "repos/$runner_repo/actions/workflows/$runner_workflow/runs?head_sha=$source_sha&event=push&status=success&per_page=100"
+  )"
+  if ! run_id="$(
+    jq -er \
+      --arg sha "$source_sha" \
+      --arg branch "$runner_branch" \
+      '[
+        .workflow_runs[]
+        | select(
+            .head_sha == $sha and
+            .head_branch == $branch and
+            .event == "push" and
+            .status == "completed" and
+            .conclusion == "success"
+          )
+      ] | sort_by(.run_number) | last | .id' \
+      <<< "$runs_json"
+  )"; then
+    echo "ERROR: no successful completed $runner_workflow push run exists for runner commit $source_sha in $runner_repo." >&2
+    return 1
+  fi
+  jobs_json="$(
+    gh api "repos/$runner_repo/actions/runs/$run_id/jobs?per_page=100"
+  )"
+  if ! jq -e \
+      '.jobs | any((.name | test("build|Build")) and .status == "completed" and .conclusion == "success")' \
+      >/dev/null <<< "$jobs_json"; then
+    echo "ERROR: successful runner workflow run $run_id does not contain a successful image build." >&2
+    return 1
+  fi
+  PROVEN_RUNNER_WORKFLOW_RUN_ID=$run_id
+  RUNNER_SOURCE_REPOSITORY=$runner_repo
 }
 
 prove_successful_ui_build() {
@@ -1268,26 +1359,27 @@ load_run_image_digests() {
   local run_id=$1
   local source_sha=$2
   local output=$3
-  local tmp_dir component artifact record record_component repository digest record_sha
+  local repo=$4
+  shift 4
+  local components=("$@")
+  local tmp_dir component artifact record record_component repository digest record_sha expected_repo
   tmp_dir="$(mktemp -d)"
   : > "$output"
   if ! gh run download "$run_id" \
-      --repo "$SOURCE_REPOSITORY" \
-      --pattern 'image-digest-*' \
+      --repo "$repo" \
+      --pattern 'image-digest*' \
       --dir "$tmp_dir"; then
-    echo "ERROR: could not download immutable image digest artifacts from workflow run $run_id." >&2
+    echo "ERROR: could not download immutable image digest artifacts from workflow run $run_id in $repo." >&2
     rm -rf "$tmp_dir"
     return 1
   fi
-  for component in \
-    api-gateway \
-    provision-worker \
-    crucible-engine \
-    synthetic-api-monitor \
-    crucible-runner; do
+  for component in "${components[@]}"; do
     artifact="$tmp_dir/image-digest-$component/image-digest.tsv"
     if [ ! -f "$artifact" ]; then
-      echo "ERROR: workflow run $run_id is missing image-digest-$component." >&2
+      artifact="$(find "$tmp_dir" -name 'image-digest.tsv' | head -n1 || true)"
+    fi
+    if [ ! -f "$artifact" ]; then
+      echo "ERROR: workflow run $run_id is missing image-digest artifact for $component." >&2
       rm -rf "$tmp_dir"
       return 1
     fi
@@ -1298,11 +1390,14 @@ load_run_image_digests() {
       return 1
     fi
     IFS=$'\t' read -r record_component repository digest record_sha <<< "$record"
-    if [ "$record_component" != "$component" ] ||
-       [ "$repository" != "ghcr.io/$SOURCE_OWNER/selfservice-$component" ] ||
+    expected_repo="ghcr.io/$SOURCE_OWNER/selfservice-$component"
+    if [ "$component" = "crucible-runner" ]; then
+      expected_repo="ghcr.io/$SOURCE_OWNER/selfservice-crucible-runner"
+    fi
+    if [ "$repository" != "$expected_repo" ] ||
        [ "$record_sha" != "$source_sha" ] ||
        [[ ! "$digest" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
-      echo "ERROR: workflow digest artifact for $component has invalid component, repository, digest, or source identity." >&2
+      echo "ERROR: workflow digest artifact for $component has invalid repository, digest, or source identity (component=$record_component repo=$repository sha=$record_sha)." >&2
       rm -rf "$tmp_dir"
       return 1
     fi
@@ -1365,16 +1460,18 @@ resolve_commit_image() {
 resolve_candidate_images() {
   local source_sha=$1
   local output=$2
-  local component image run_digests run_digest
+  local component image run_digests run_digest runner_digests runner_sha runner_run_id
   run_digests="$output.run-digests"
+  runner_digests="$output.runner-digests"
   : > "$output"
-  load_run_image_digests "$PROVEN_WORKFLOW_RUN_ID" "$source_sha" "$run_digests"
+  load_run_image_digests "$PROVEN_WORKFLOW_RUN_ID" "$source_sha" "$run_digests" \
+    "$SOURCE_REPOSITORY" \
+    api-gateway provision-worker crucible-engine synthetic-api-monitor
   for component in \
     api-gateway \
     provision-worker \
     crucible-engine \
-    synthetic-api-monitor \
-    crucible-runner; do
+    synthetic-api-monitor; do
     run_digest="$(
       awk -F '\t' -v component="$component" '
         $1 == component { print $3; matches++ }
@@ -1387,7 +1484,23 @@ resolve_candidate_images() {
       "ghcr.io/$SOURCE_OWNER/selfservice-$component" \
       "$image" >> "$output"
   done
-  rm -f "$run_digests"
+  runner_sha=$RUNNER_SOURCE_SHA
+  runner_run_id=$PROVEN_RUNNER_WORKFLOW_RUN_ID
+  load_run_image_digests "$runner_run_id" "$runner_sha" "$runner_digests" \
+    "${RUNNER_SOURCE_REPOSITORY:-jmal1/selfservice-crucible-runner}" \
+    crucible-runner
+  run_digest="$(
+    awk -F '\t' '
+      $1 == "crucible-runner" { print $3; matches++ }
+      END { if (matches != 1) exit 3 }
+    ' "$runner_digests"
+  )"
+  image="$(resolve_commit_image "crucible-runner" "$runner_sha" "$run_digest")"
+  printf '%s\t%s\t%s\n' \
+    "crucible-runner" \
+    "ghcr.io/$SOURCE_OWNER/selfservice-crucible-runner" \
+    "$image" >> "$output"
+  rm -f "$run_digests" "$runner_digests"
 }
 
 selector_from_manifest() {
@@ -4228,6 +4341,7 @@ fi
 CANDIDATE_SOURCE_SHA="$(require_trusted_source_identity)"
 prove_successful_source_build "$CANDIDATE_SOURCE_SHA"
 echo "==> trusted source commit $CANDIDATE_SOURCE_SHA has successful required image builds"
+echo "==> runner image proven on selfservice-crucible-runner commit $RUNNER_SOURCE_SHA (workflow run $PROVEN_RUNNER_WORKFLOW_RUN_ID)"
 prove_successful_ui_build "$UI_SOURCE_SHA"
 CANDIDATE_UI_WORKFLOW_RUN_ID=$PROVEN_UI_WORKFLOW_RUN_ID
 CANDIDATE_UI_WORKFLOW_RUN_ATTEMPT=$PROVEN_UI_WORKFLOW_RUN_ATTEMPT

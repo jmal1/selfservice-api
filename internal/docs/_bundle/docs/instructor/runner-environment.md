@@ -114,7 +114,7 @@ metapackage. The image is pulled fresh for every assessment run, so it is
 deliberately kept under 3 GB.
 
 The authoritative list is
-[`internal/runnertools/tools.txt`](../../internal/runnertools/tools.txt).
+[`runnertools/tools.txt`](https://github.com/jmal1/selfservice-crucible-runner/blob/main/runnertools/tools.txt) in `jmal1/selfservice-crucible-runner`.
 The Dockerfile derives both its install list and its verification step from
 that file, and a guard test fails the build if this table drifts from it — so
 what you see here is what is actually in the image.

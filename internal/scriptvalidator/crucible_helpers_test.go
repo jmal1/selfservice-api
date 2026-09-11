@@ -2,22 +2,23 @@ package scriptvalidator
 
 import (
 	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 )
 
-// crucibleHelpers claims to be "kept in sync with deploy/runner/actions.sh" by
-// comment alone, and that invariant has already broken once: adding
-// crucible_ssh to actions.sh without registering it here made every action that
-// called it warn "not installed in the runner image" — the precise false
-// positive the map exists to prevent, and the kind that trains instructors to
-// ignore the linter.
-//
-// The load-bearing direction is actions.sh -> map. A stale entry in the map is
-// harmless noise; a missing one produces a wrong warning on correct code.
+// crucibleHelpers claims to be "kept in sync with actions.sh" in the
+// selfservice-crucible-runner module. The load-bearing direction is
+// actions.sh -> map. A stale entry in the map is harmless noise; a missing one
+// produces a wrong warning on correct code.
 func TestCrucibleHelpers_CoversEveryPublicFunctionInActionsSh(t *testing.T) {
-	src, err := os.ReadFile("../../deploy/runner/actions.sh")
+	mod, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/jmal1/selfservice-crucible-runner").Output()
+	if err != nil {
+		t.Fatalf("locate selfservice-crucible-runner module: %v", err)
+	}
+	src, err := os.ReadFile(filepath.Join(strings.TrimSpace(string(mod)), "actions.sh"))
 	if err != nil {
 		t.Fatalf("read actions.sh: %v", err)
 	}

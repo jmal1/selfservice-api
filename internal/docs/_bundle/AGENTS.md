@@ -184,7 +184,7 @@ set -uo pipefail
 
 This loads `run_action`, `ctx_set`, `ctx_get`, and the generated **action library** (see §5.2b).
 
-**Note `-uo`, not `-euo`.** `run_action` returns the action's exit code, so under `set -e` the first failing check terminates the workflow's single bash process. Every action after it never runs and never reports, and a student hardening six settings sees one red check followed by silence rather than six results — with nothing in the output that looks like an abort. The run just has fewer results than the workflow has actions. `set -u` and `set -o pipefail` are still wanted; only `-e` is harmful here. Pinned by `TestActionsSh_WorkflowSetEStopsAtTheFirstFailedCheck` in [`internal/runner/actions_sh_test.go`](internal/runner/actions_sh_test.go).
+**Note `-uo`, not `-euo`.** `run_action` returns the action's exit code, so under `set -e` the first failing check terminates the workflow's single bash process. Every action after it never runs and never reports, and a student hardening six settings sees one red check followed by silence rather than six results — with nothing in the output that looks like an abort. The run just has fewer results than the workflow has actions. `set -u` and `set -o pipefail` are still wanted; only `-e` is harmful here. Pinned by `TestActionsSh_WorkflowSetEStopsAtTheFirstFailedCheck` in the [`selfservice-crucible-runner`](https://github.com/jmal1/selfservice-crucible-runner) module (`runner/actions_sh_test.go`).
 
 Inside an *action* body the situation is different and already handled: `run_action` runs the body under `set +e` so it can detect its own failure and set `LAST_STUDENT_MSG` before returning.
 
@@ -388,7 +388,7 @@ Where a flag is omitted, most actions default `--host` to
 
 **Anything that inspects the student's machine reaches it over SSH** using the
 `crucible_ssh` / `crucible_ssh_sudo` helpers in
-[`deploy/runner/actions.sh`](deploy/runner/actions.sh). Calling `systemctl`,
+[`actions.sh`](https://github.com/jmal1/selfservice-crucible-runner/blob/main/actions.sh). Calling `systemctl`,
 `dpkg` or `ufw` directly in an action body inspects the unprivileged Kali
 runner pod instead — the defect that made `service_running --name ssh` grade
 the runner's own sshd, and made `ufw_enabled` unable to pass at all.
@@ -853,8 +853,8 @@ Recovery from `error` has exactly one supported cleanup step, and the wizard act
 
 - Workflow/Action/Playlist Go models: [`internal/models/workflow_models.go`](internal/models/workflow_models.go)
 - DB schema (the actual CHECK constraints): [`internal/database/migrations/000012_assessment_engine.up.sql`](internal/database/migrations/000012_assessment_engine.up.sql), [`000014_action_library.up.sql`](internal/database/migrations/000014_action_library.up.sql), [`000015_action_platforms.up.sql`](internal/database/migrations/000015_action_platforms.up.sql)
-- Runner script library (the `run_action` / `ctx_set` source): [`deploy/runner/actions.sh`](deploy/runner/actions.sh)
-- Runner executor (how scripts are launched): [`internal/runner/executor.go`](internal/runner/executor.go)
+- Runner script library (the `run_action` / `ctx_set` source): [`selfservice-crucible-runner/actions.sh`](https://github.com/jmal1/selfservice-crucible-runner/blob/main/actions.sh)
+- Runner executor (how scripts are launched): [`selfservice-crucible-runner/runner/executor.go`](https://github.com/jmal1/selfservice-crucible-runner/blob/main/runner/executor.go)
 - Engine (how runs are orchestrated): [`internal/engine/engine.go`](internal/engine/engine.go)
 - API routes: [`internal/api/routes/routes.go`](internal/api/routes/routes.go) — workflow + action endpoints under `/api/v1/admin/`
 - Live action catalog (the *real* source of truth for available actions): `GET /api/v1/admin/actions` against your Crucible instance.
