@@ -2098,6 +2098,41 @@ require_no_active_jobs() {
   echo "==> job drain verified: no durable claimed/in_progress/rollback work and no active storage/lifecycle-mutating Kubernetes Jobs"
 }
 
+# Helm upgrade reopens SYNTHETIC_LIFECYCLE_ENABLED=true from values, so a
+# scheduled */12 monitor can claim durable pod_lifecycle work during the
+# multi-minute post-upgrade verify window and falsely fail an otherwise
+# successful atomic apply (observed 2026-09-11T23:00Z). Wait for drain rather
+# than treating a transient in-flight synthetic as permanent containment failure.
+wait_for_no_active_jobs() {
+  local deadline_secs="${1:-180}"
+  local interval_secs="${2:-10}"
+  local deadline errfile
+  if [[ ! "$deadline_secs" =~ ^[0-9]+$ ]] || [ "$deadline_secs" -lt 1 ] || [ "$deadline_secs" -gt 900 ]; then
+    echo "ERROR: wait_for_no_active_jobs deadline_secs must be an integer from 1 through 900." >&2
+    return 1
+  fi
+  if [[ ! "$interval_secs" =~ ^[0-9]+$ ]] || [ "$interval_secs" -lt 1 ] || [ "$interval_secs" -gt 60 ]; then
+    echo "ERROR: wait_for_no_active_jobs interval_secs must be an integer from 1 through 60." >&2
+    return 1
+  fi
+  deadline=$((SECONDS + deadline_secs))
+  errfile="$(mktemp)"
+  while true; do
+    if require_no_active_jobs 2>"$errfile"; then
+      rm -f "$errfile"
+      return 0
+    fi
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      cat "$errfile" >&2 || true
+      rm -f "$errfile"
+      echo "ERROR: job drain did not clear within ${deadline_secs}s (post-Helm verify window)." >&2
+      return 1
+    fi
+    echo "==> waiting for durable/K8s jobs to drain before continuing (${interval_secs}s; ${deadline_secs}s budget)..."
+    sleep "$interval_secs"
+  done
+}
+
 require_no_nonterminal_synthetic_pod_jobs() {
   local postgres_pod=$1
   local synthetic_jobs
@@ -3615,6 +3650,63 @@ enforce_synthetic_rollback_containment() {
   echo "==> synthetic rollback containment enforced: API monitor active/non-lifecycle; clone CronJobs suspended"
 }
 
+# Inverse of enforce_synthetic_rollback_containment for a successful candidate
+# that renders lifecycle=true and unsuspended clone CronJobs. Must run only
+# after verify_deployed_candidate so the post-Helm drain cannot race a reopened
+# lifecycle monitor.
+restore_synthetic_foundation_after_verify() {
+  local api_cronjob="$RELEASE-synthetic-api-monitor"
+  local clone_cronjob suspended tmp_manifest
+  if ! kubectl patch "cronjob/$api_cronjob" \
+      -n "$NAMESPACE" \
+      --type strategic \
+      -p '{"spec":{"suspend":false,"jobTemplate":{"spec":{"template":{"spec":{"containers":[{"name":"synthetic-api-monitor","env":[{"name":"SYNTHETIC_LIFECYCLE_ENABLED","value":"true"}]}]}}}}}}'; then
+    echo "ERROR: could not restore API monitor lifecycle after successful verify." >&2
+    return 1
+  fi
+  for clone_cronjob in "$RELEASE-synthetic-janitor" "$RELEASE-synthetic-runner"; do
+    if kubectl get "cronjob/$clone_cronjob" -n "$NAMESPACE" >/dev/null 2>&1; then
+      if ! kubectl patch "cronjob/$clone_cronjob" \
+          -n "$NAMESPACE" \
+          --type merge \
+          -p '{"spec":{"suspend":false}}'; then
+        echo "ERROR: could not unsuspend CronJob/$clone_cronjob after successful verify." >&2
+        return 1
+      fi
+    fi
+  done
+  tmp_manifest="$(mktemp)"
+  if ! kubectl get "cronjob/$api_cronjob" -n "$NAMESPACE" -o yaml > "$tmp_manifest"; then
+    rm -f "$tmp_manifest"
+    echo "ERROR: could not re-read CronJob/$api_cronjob after synthetic foundation restore." >&2
+    return 1
+  fi
+  if [ "$(cronjob_suspend_from_manifest "$tmp_manifest")" != "false" ]; then
+    rm -f "$tmp_manifest"
+    echo "ERROR: API monitor restore did not leave the monitor unsuspended." >&2
+    return 1
+  fi
+  if [ "$(env_from_manifest SYNTHETIC_LIFECYCLE_ENABLED < "$tmp_manifest")" != "true" ]; then
+    rm -f "$tmp_manifest"
+    echo "ERROR: API monitor restore did not restore SYNTHETIC_LIFECYCLE_ENABLED=true." >&2
+    return 1
+  fi
+  rm -f "$tmp_manifest"
+  for clone_cronjob in "$RELEASE-synthetic-janitor" "$RELEASE-synthetic-runner"; do
+    if kubectl get "cronjob/$clone_cronjob" -n "$NAMESPACE" >/dev/null 2>&1; then
+      suspended="$(
+        kubectl get "cronjob/$clone_cronjob" -n "$NAMESPACE" \
+          -o jsonpath='{.spec.suspend}'
+      )"
+      if [ "$suspended" != "false" ]; then
+        echo "ERROR: clone-producing CronJob/$clone_cronjob is not unsuspended after restore (observed: ${suspended:-<empty>})." >&2
+        return 1
+      fi
+    fi
+  done
+  echo "==> synthetic foundation restored: API monitor lifecycle on; clone CronJobs unsuspended"
+}
+
 # Atomic Helm rollback restores CronJob templates to the baseline digest, but
 # retained Jobs created while the failed candidate revision was briefly live
 # keep the candidate ImageID. live_effective_image trusts the newest retained
@@ -4548,9 +4640,25 @@ if [ "$helm_upgrade_status" -ne 0 ]; then
   exit "$helm_upgrade_status"
 fi
 
+# Helm applied the candidate with lifecycle=true / clone CronJobs unsuspended,
+# undoing the pre-upgrade containment window. Re-contain before the multi-minute
+# verify so a */12 synthetic cannot claim durable pod_lifecycle work mid-flight,
+# wait out any already-started jobs, verify, then restore foundation synthetics.
 HELM_RELEASE_LOCK_PRESERVE=true
+if ! enforce_synthetic_rollback_containment; then
+  echo "ERROR: Helm succeeded but post-upgrade synthetic containment could not be enforced. The release lock is intentionally retained; manual intervention is required." >&2
+  exit 1
+fi
+if ! wait_for_no_active_jobs 180 10; then
+  echo "ERROR: Helm succeeded but post-upgrade job drain did not clear. The release lock is intentionally retained; manual intervention is required." >&2
+  exit 1
+fi
 if ! verify_deployed_candidate; then
   echo "ERROR: Helm reported success but exact candidate containment failed. The release lock is intentionally retained; manual intervention is required." >&2
+  exit 1
+fi
+if ! restore_synthetic_foundation_after_verify; then
+  echo "ERROR: candidate verified but synthetic foundation could not be restored. The release lock is intentionally retained; manual intervention is required." >&2
   exit 1
 fi
 HELM_RELEASE_LOCK_PRESERVE=false
