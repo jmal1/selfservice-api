@@ -2517,6 +2517,26 @@ func TestDeployScriptClaimsExitRestorationIsLoadBearing(t *testing.T) {
 	}
 }
 
+func TestDeployScriptSeedsCronJobEvidenceBeforeHealth(t *testing.T) {
+	deployBody, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(deployBody)
+	seedIdx := strings.Index(source, `seed_runnable_cronjob_health_evidence "$inventory" "$CANDIDATE_IMAGE_MAP"`)
+	if seedIdx < 0 {
+		t.Fatal("verify_deployed_candidate must seed CronJob health evidence after containment wipes Jobs")
+	}
+	healthIdx := strings.Index(source[seedIdx:], `workload_health "$inventory"`)
+	if healthIdx < 0 {
+		t.Fatal("verify_deployed_candidate must still call workload_health after seeding CronJob evidence")
+	}
+	imageIdx := strings.Index(source[seedIdx:], `verify_external_candidate_images \`)
+	if imageIdx < 0 || imageIdx < healthIdx {
+		t.Fatal("warmer/controller health must still run before ImageID verification")
+	}
+}
+
 func TestDeployScriptDeployedCandidateWaitsForWarmerRolloutBeforeImageVerification(t *testing.T) {
 	requirePOSIXShell(t)
 	live := baselineManifest(true, "", "true")
@@ -2607,7 +2627,11 @@ func TestDeployScriptDeployedCandidateWaitsForWarmerRolloutBeforeImageVerificati
 
 func revertVerifyDeployedCandidateOrdering(t *testing.T, source string) string {
 	t.Helper()
-	const fixedBlock = `  workload_health "$inventory"
+	const fixedBlock = `  if ! seed_runnable_cronjob_health_evidence "$inventory" "$CANDIDATE_IMAGE_MAP"; then
+    echo "ERROR: could not seed CronJob health evidence after atomic upgrade." >&2
+    return 1
+  fi
+  workload_health "$inventory"
   workload_health_status=$?
   if [ "$workload_health_status" -ne 0 ]; then
     echo "ERROR: deployed candidate workloads are not healthy." >&2
