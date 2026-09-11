@@ -2577,7 +2577,7 @@ func TestDeployScriptRestoresSyntheticFoundationAfterSuccessfulVerify(t *testing
 	if _, statErr := os.Stat(env.syntheticRestoredMark); statErr != nil {
 		t.Fatalf("post-verify synthetic restore never ran: %v", statErr)
 	}
-	if got := manifestEnvValue(t, mustRead(t, env.baselineManifest), "SYNTHETIC_LIFECYCLE_ENABLED"); got != "true" {
+	if got := manifestEnvValue(t, mustRead(t, env.livePostUpgradeManifest), "SYNTHETIC_LIFECYCLE_ENABLED"); got != "true" {
 		t.Fatalf("post-upgrade live lifecycle after restore = %q, want true", got)
 	}
 }
@@ -6804,6 +6804,7 @@ type deployScriptEnvironment struct {
 	candidateManifest         string
 	upgradeHookManifest       string
 	baselineManifest          string
+	livePostUpgradeManifest   string
 	appliedManifest           string
 	upgradedMarker            string
 	upgradeLog                string
@@ -6952,6 +6953,7 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 		candidateManifest:         filepath.Join(root, "candidate.yaml"),
 		upgradeHookManifest:       filepath.Join(root, "upgrade-hook.yaml"),
 		baselineManifest:          filepath.Join(root, "baseline.yaml"),
+		livePostUpgradeManifest:   filepath.Join(root, "live-post-upgrade.yaml"),
 		appliedManifest:           filepath.Join(root, "applied.yaml"),
 		upgradedMarker:            filepath.Join(root, "upgraded"),
 		upgradeLog:                filepath.Join(root, "upgrade.log"),
@@ -7194,6 +7196,9 @@ case "$1 $2" in
           "$FAKE_BASELINE_MANIFEST" > "$FAKE_BASELINE_MANIFEST.mutated"
         mv "$FAKE_BASELINE_MANIFEST.mutated" "$FAKE_BASELINE_MANIFEST"
       fi
+      # Live cluster view is distinct from helm get manifest so post-upgrade
+      # kubectl containment patches cannot poison the Helm revision object set.
+      cp "$FAKE_BASELINE_MANIFEST" "$FAKE_LIVE_POST_UPGRADE_MANIFEST"
       : > "$FAKE_CANDIDATE_APPLIED_MARKER"
     fi
     : > "$FAKE_UPGRADED_MARKER"
@@ -7215,7 +7220,7 @@ current_manifest() {
   if [ -f "$FAKE_CLAIMS_RESUMED_MARKER" ]; then
     printf '%s' "$FAKE_LIVE_RESOURCE_MANIFEST"
   elif [ -f "$FAKE_UPGRADED_MARKER" ]; then
-    printf '%s' "$FAKE_BASELINE_MANIFEST"
+    printf '%s' "$FAKE_LIVE_POST_UPGRADE_MANIFEST"
   elif [ -f "$FAKE_ATOMIC_FAILED_MARKER" ]; then
     if [ -f "$FAKE_SYNTHETIC_CONTAINED_MARKER" ]; then
       printf '%s' "$FAKE_CONTAINED_ROLLBACK_MANIFEST"
@@ -8841,6 +8846,7 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_CANDIDATE_MANIFEST="+e.candidateManifest,
 		"FAKE_UPGRADE_HOOK_MANIFEST="+e.upgradeHookManifest,
 		"FAKE_BASELINE_MANIFEST="+e.baselineManifest,
+		"FAKE_LIVE_POST_UPGRADE_MANIFEST="+e.livePostUpgradeManifest,
 		"FAKE_APPLIED_MANIFEST="+e.appliedManifest,
 		"FAKE_UPGRADED_MARKER="+e.upgradedMarker,
 		"FAKE_UPGRADE_LOG="+e.upgradeLog,
