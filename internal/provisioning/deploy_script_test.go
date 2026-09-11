@@ -1168,6 +1168,87 @@ func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 		}
 	})
 
+	t.Run("prior synthetic containment does not brick redeploy", func(t *testing.T) {
+		// Live API monitor already has SYNTHETIC_LIFECYCLE_ENABLED=false from a
+		// previous atomic-failure containment, while the Helm revision still
+		// renders true. Redeploy must contain-then-prove, not require live==rendered first.
+		candidate := baselineManifest(true, "*", "true")
+		env := newDeployScriptEnvironment(t, live, candidate)
+		writeFile(t, env.liveResource, replaceEnvValue(
+			live,
+			"SYNTHETIC_LIFECYCLE_ENABLED",
+			"true",
+			"false",
+		))
+
+		output, err := env.run("--no-pull")
+		if err != nil {
+			t.Fatalf("prior containment bricked redeploy: %v\n%s", err, output)
+		}
+		if !strings.Contains(string(output), "deployed exact source") {
+			t.Fatalf("prior containment redeploy did not finish:\n%s", output)
+		}
+		if _, statErr := os.Stat(env.lockFile); !os.IsNotExist(statErr) {
+			t.Fatalf("prior containment redeploy retained the release lock: %v", statErr)
+		}
+		if _, statErr := os.Stat(env.syntheticContainedMark); statErr != nil {
+			t.Fatalf("prior containment redeploy skipped synthetic containment: %v", statErr)
+		}
+	})
+
+	t.Run("uncontained-first rollback proof is load-bearing against prior containment", func(t *testing.T) {
+		deployPath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
+		deployBody, err := os.ReadFile(deployPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		original := string(deployBody)
+		const fixed = `pause_live_provisioning_claims
+# Enforce synthetic containment BEFORE the first rollback-containment proof.
+# A prior failed atomic upgrade leaves SYNTHETIC_LIFECYCLE_ENABLED=false on the
+# live API monitor while the Helm revision still renders true; proving
+# uncontained live==rendered first permanently bricks redeploy. Contain first,
+# then prove images/health under the contained contract.
+enforce_synthetic_rollback_containment
+require_no_active_jobs
+verify_rollback_containment "$ROLLBACK_BASELINE_MIGRATION" true
+ROLLBACK_CURRENT_REVISION=$VERIFIED_BASELINE_REVISION
+ROLLBACK_BASELINE_MIGRATION=$VERIFIED_MIGRATION_STATE
+`
+		const broken = `pause_live_provisioning_claims
+verify_rollback_containment "$ROLLBACK_BASELINE_MIGRATION"
+ROLLBACK_CURRENT_REVISION=$VERIFIED_BASELINE_REVISION
+enforce_synthetic_rollback_containment
+require_no_active_jobs
+ROLLBACK_BASELINE_MIGRATION=$VERIFIED_MIGRATION_STATE
+`
+		if strings.Count(original, fixed) != 1 {
+			t.Fatalf("expected the contain-then-prove apply sequence exactly once, found %d", strings.Count(original, fixed))
+		}
+		scriptDir := filepath.Dir(deployPath)
+		sabotagedPath := filepath.Join(scriptDir, "deploy-sabotaged-uncontained-first-test.sh")
+		writeExecutable(t, sabotagedPath, strings.Replace(original, fixed, broken, 1))
+		t.Cleanup(func() { os.Remove(sabotagedPath) })
+
+		candidate := baselineManifest(true, "*", "true")
+		env := newDeployScriptEnvironment(t, live, candidate)
+		env.scriptPath = sabotagedPath
+		writeFile(t, env.liveResource, replaceEnvValue(
+			live,
+			"SYNTHETIC_LIFECYCLE_ENABLED",
+			"true",
+			"false",
+		))
+
+		output, runErr := env.run("--no-pull")
+		if runErr == nil {
+			t.Fatalf("uncontained-first sabotage unexpectedly succeeded with prior containment:\n%s", output)
+		}
+		if !strings.Contains(string(output), "live SYNTHETIC_LIFECYCLE_ENABLED=false differs from the Helm rollback target value true") {
+			t.Fatalf("sabotage did not reproduce the prior-containment brick: %v\n%s", runErr, output)
+		}
+	})
+
 	for _, test := range []struct {
 		name                   string
 		configure              func(*deployScriptEnvironment)
