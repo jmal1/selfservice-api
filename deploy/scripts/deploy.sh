@@ -4377,10 +4377,15 @@ acquire_helm_release_lock
 require_clean_migration
 ROLLBACK_BASELINE_MIGRATION=$VERIFIED_MIGRATION_STATE
 pause_live_provisioning_claims
-verify_rollback_containment "$ROLLBACK_BASELINE_MIGRATION"
-ROLLBACK_CURRENT_REVISION=$VERIFIED_BASELINE_REVISION
+# Enforce synthetic containment BEFORE the first rollback-containment proof.
+# A prior failed atomic upgrade leaves SYNTHETIC_LIFECYCLE_ENABLED=false on the
+# live API monitor while the Helm revision still renders true; proving
+# uncontained live==rendered first permanently bricks redeploy. Contain first,
+# then prove images/health under the contained contract.
 enforce_synthetic_rollback_containment
 require_no_active_jobs
+verify_rollback_containment "$ROLLBACK_BASELINE_MIGRATION" true
+ROLLBACK_CURRENT_REVISION=$VERIFIED_BASELINE_REVISION
 ROLLBACK_BASELINE_MIGRATION=$VERIFIED_MIGRATION_STATE
 
 if [ "$(require_trusted_source_identity "$CANDIDATE_SOURCE_SHA")" != "$CANDIDATE_SOURCE_SHA" ]; then
