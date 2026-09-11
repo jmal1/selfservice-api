@@ -3542,6 +3542,114 @@ enforce_synthetic_rollback_containment() {
   echo "==> synthetic rollback containment enforced: API monitor active/non-lifecycle; clone CronJobs suspended"
 }
 
+# Atomic Helm rollback restores CronJob templates to the baseline digest, but
+# retained Jobs created while the failed candidate revision was briefly live
+# keep the candidate ImageID. live_effective_image trusts the newest retained
+# Job, so that stale evidence falsely fails rollback containment and retains
+# the release lock. Delete every synthetic CronJob-owned Job, then re-prove the
+# unsuspended API monitor from the rolled-back CronJob template.
+reset_synthetic_cronjob_evidence_after_atomic_rollback() {
+  local cronjob jobs_json job_name live_manifest declared tmp_dir previous_tmp status
+  echo "==> resetting synthetic CronJob evidence Jobs after atomic rollback" >&2
+  for cronjob in \
+      "$RELEASE-synthetic-api-monitor" \
+      "$RELEASE-synthetic-janitor" \
+      "$RELEASE-synthetic-runner"; do
+    if ! kubectl get "cronjob/$cronjob" -n "$NAMESPACE" >/dev/null 2>&1; then
+      continue
+    fi
+    if ! jobs_json="$(kubectl get jobs -n "$NAMESPACE" -o json)"; then
+      echo "ERROR: could not list Jobs while resetting CronJob/$cronjob evidence after atomic rollback." >&2
+      return 1
+    fi
+    local owned_jobs
+    if ! owned_jobs="$(
+      jq -r --arg cronjob "$cronjob" '
+        if (.items | type) != "array" then
+          error("items must be an array")
+        else
+          [
+            .items[]
+            | select(
+                ((.metadata.ownerReferences // [])
+                  | map(select(
+                      .kind == "CronJob" and
+                      .name == $cronjob and
+                      .controller == true
+                    ))
+                  | length) == 1
+              )
+            | .metadata.name
+          ]
+          | .[]
+        end
+      ' <<< "$jobs_json"
+    )"; then
+      echo "ERROR: could not parse Jobs owned by CronJob/$cronjob while resetting evidence." >&2
+      return 1
+    fi
+    while IFS= read -r job_name; do
+      [ -n "$job_name" ] || continue
+      echo "==> deleting retained Job/$job_name owned by CronJob/$cronjob before re-proving rollback image identity" >&2
+      if ! kubectl delete "job/$job_name" -n "$NAMESPACE" --wait=true --timeout=2m; then
+        echo "ERROR: could not delete stale evidence Job/$job_name for CronJob/$cronjob." >&2
+        return 1
+      fi
+    done <<< "$owned_jobs"
+  done
+
+  live_manifest="$(mktemp)"
+  if ! kubectl get "cronjob/$RELEASE-synthetic-api-monitor" -n "$NAMESPACE" -o yaml > "$live_manifest"; then
+    rm -f "$live_manifest"
+    echo "ERROR: could not read CronJob/$RELEASE-synthetic-api-monitor after evidence reset." >&2
+    return 1
+  fi
+  if ! declared="$(
+    manifest_workload_inventory "$live_manifest" \
+      | awk -F '\t' \
+          -v kind="CronJob" \
+          -v name="$RELEASE-synthetic-api-monitor" \
+          -v type="containers" \
+          -v container="synthetic-api-monitor" \
+          '$1 == kind && $2 == name && $3 == type && $4 == container {
+             image = $5
+             matches++
+           }
+           END {
+             if (matches != 1) exit 3
+             print image
+           }'
+  )"; then
+    rm -f "$live_manifest"
+    echo "ERROR: CronJob/$RELEASE-synthetic-api-monitor does not declare exactly one synthetic-api-monitor image after evidence reset." >&2
+    return 1
+  fi
+  rm -f "$live_manifest"
+  if ! is_digest_image "$declared"; then
+    echo "ERROR: CronJob/$RELEASE-synthetic-api-monitor declares a mutable image after atomic rollback: $declared" >&2
+    return 1
+  fi
+
+  tmp_dir="$(mktemp -d)"
+  previous_tmp="${CANDIDATE_TMP_DIR:-}"
+  CANDIDATE_TMP_DIR="$tmp_dir"
+  set +e
+  verify_candidate_cronjob_image \
+    "$RELEASE-synthetic-api-monitor" \
+    containers \
+    synthetic-api-monitor \
+    "$declared"
+  status=$?
+  set -e
+  CANDIDATE_TMP_DIR="$previous_tmp"
+  rm -rf "$tmp_dir"
+  if [ "$status" -ne 0 ]; then
+    echo "ERROR: could not re-prove CronJob/$RELEASE-synthetic-api-monitor image identity from the rolled-back template." >&2
+    return "$status"
+  fi
+  echo "==> synthetic CronJob evidence reset: stale Jobs deleted; API monitor re-proved from rolled-back template" >&2
+}
+
 contain_failed_atomic_upgrade() {
   local expected_inventory expected_runner
   echo "==> atomic upgrade failed; proving rollback containment before releasing the lock" >&2
@@ -3556,6 +3664,9 @@ contain_failed_atomic_upgrade() {
     return 1
   fi
   if ! enforce_synthetic_rollback_containment; then
+    return 1
+  fi
+  if ! reset_synthetic_cronjob_evidence_after_atomic_rollback; then
     return 1
   fi
   expected_inventory=$VERIFIED_BASELINE_IMAGE_INVENTORY_SHA256
