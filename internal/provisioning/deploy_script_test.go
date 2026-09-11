@@ -1193,6 +1193,24 @@ func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 			wantOutput: "atomic failure contained by the currently deployed rollback baseline",
 		},
 		{
+			name: "stale API monitor Job after atomic failure is reset and contained",
+			configure: func(env *deployScriptEnvironment) {
+				env.failAtomicUpgrade = true
+				env.staleAPIMonitorEvidence = true
+				writeFile(t, env.liveManifest, rollbackManifestWithHistoricalSynthetics(false))
+				writeFile(t, env.liveResource, replaceEnvValue(
+					rollbackManifestWithHistoricalSynthetics(true),
+					"SYNTHETIC_LIFECYCLE_ENABLED",
+					"false",
+					"true",
+				))
+				writeFile(t, env.atomicRollbackManifest, rollbackManifestWithHistoricalSynthetics(false))
+				writeFile(t, env.containedRollbackManifest, rollbackManifestWithHistoricalSynthetics(true))
+				writeFile(t, env.immutableRollbackManifest, rollbackManifestWithHistoricalSynthetics(false))
+			},
+			wantOutput: "synthetic CronJob evidence reset",
+		},
+		{
 			name: "pending synthetic pod destroy after rollback retains lock",
 			configure: func(env *deployScriptEnvironment) {
 				env.failAtomicUpgrade = true
@@ -1269,12 +1287,25 @@ func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 			if !test.wantLockRetained && !os.IsNotExist(lockErr) {
 				t.Fatalf("proven atomic rollback did not release lock: %v", lockErr)
 			}
-			if strings.Contains(test.name, "synthetic") || test.name == "contained atomic failure" {
+			if strings.Contains(test.name, "synthetic") ||
+				test.name == "contained atomic failure" ||
+				test.name == "stale API monitor Job after atomic failure is reset and contained" {
 				if _, statErr := os.Stat(env.syntheticContainedMark); statErr != nil {
 					t.Fatalf("atomic rollback did not enforce synthetic containment: %v", statErr)
 				}
 				if _, statErr := os.Stat(env.claimsPausedMark); statErr != nil {
 					t.Fatalf("atomic rollback did not retain claims-disabled state: %v", statErr)
+				}
+			}
+			if test.name == "stale API monitor Job after atomic failure is reset and contained" {
+				if _, statErr := os.Stat(env.staleAPIMonitorPurgedMark); statErr != nil {
+					t.Fatalf("stale API monitor evidence was not deleted: %v", statErr)
+				}
+				if _, statErr := os.Stat(env.cronjobVerifyMark); statErr != nil {
+					t.Fatalf("API monitor was not re-proved from the rolled-back CronJob: %v", statErr)
+				}
+				if _, lockErr := os.Stat(env.lockFile); !os.IsNotExist(lockErr) {
+					t.Fatalf("stale CronJob evidence reset still retained the release lock: %v", lockErr)
 				}
 			}
 			_, upgradedErr := os.Stat(env.upgradedMarker)
@@ -1283,6 +1314,50 @@ func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("stale CronJob evidence reset is load-bearing", func(t *testing.T) {
+		deployPath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
+		deployBody, err := os.ReadFile(deployPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		original := string(deployBody)
+		const call = "  if ! reset_synthetic_cronjob_evidence_after_atomic_rollback; then\n    return 1\n  fi\n"
+		if strings.Count(original, call) != 1 {
+			t.Fatalf("expected exactly one evidence-reset call in contain_failed_atomic_upgrade, found %d", strings.Count(original, call))
+		}
+		scriptDir := filepath.Dir(deployPath)
+		sabotagedPath := filepath.Join(scriptDir, "deploy-sabotaged-stale-cronjob-evidence-test.sh")
+		writeExecutable(t, sabotagedPath, strings.Replace(original, call, "", 1))
+		t.Cleanup(func() { os.Remove(sabotagedPath) })
+
+		env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "true"))
+		env.failAtomicUpgrade = true
+		env.staleAPIMonitorEvidence = true
+		env.scriptPath = sabotagedPath
+		writeFile(t, env.liveManifest, rollbackManifestWithHistoricalSynthetics(false))
+		writeFile(t, env.liveResource, replaceEnvValue(
+			rollbackManifestWithHistoricalSynthetics(true),
+			"SYNTHETIC_LIFECYCLE_ENABLED",
+			"false",
+			"true",
+		))
+		writeFile(t, env.atomicRollbackManifest, rollbackManifestWithHistoricalSynthetics(false))
+		writeFile(t, env.containedRollbackManifest, rollbackManifestWithHistoricalSynthetics(true))
+		writeFile(t, env.immutableRollbackManifest, rollbackManifestWithHistoricalSynthetics(false))
+
+		output, runErr := env.run("--no-pull")
+		if runErr == nil {
+			t.Fatalf("sabotaged deploy without evidence reset unexpectedly succeeded:\n%s", output)
+		}
+		if !strings.Contains(string(output), "digest mismatch") &&
+			!strings.Contains(string(output), "manual intervention is required") {
+			t.Fatalf("sabotaged deploy did not retain lock for stale CronJob evidence: %v\n%s", runErr, output)
+		}
+		if _, lockErr := os.Stat(env.lockFile); lockErr != nil {
+			t.Fatalf("sabotaged deploy without evidence reset did not retain the release lock: %v\n%s", lockErr, output)
+		}
+	})
 }
 
 func TestDeployScriptPostUpgradeActiveJobContainment(t *testing.T) {
@@ -6585,7 +6660,9 @@ type deployScriptEnvironment struct {
 	preflightQueryFailure             string
 	failJobsList                      bool
 	failAtomicUpgrade                 bool
+	staleAPIMonitorEvidence           bool
 	atomicRollbackMismatch            string
+	staleAPIMonitorPurgedMark         string
 	postUpgradeMismatch               string
 	postUpgradeObjectMutation         bool
 	retainLiveJanitorTTLBeforeUpgrade bool
@@ -6657,6 +6734,7 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 		cronjobVerifyMark:         filepath.Join(root, "cronjob-verified"),
 		cronjobVerifyManifest:     filepath.Join(root, "cronjob-verification-job.json"),
 		cronjobCreateLog:          filepath.Join(root, "cronjob-create.log"),
+		staleAPIMonitorPurgedMark: filepath.Join(root, "stale-api-monitor-purged"),
 		claimsPausedMark:          filepath.Join(root, "claims-paused.marker"),
 		claimsResumedMark:         filepath.Join(root, "claims-resumed.marker"),
 		warmerRolloutMark:         filepath.Join(root, "warmer-rollout.marker"),
@@ -7375,9 +7453,19 @@ image_for_container() {
       return 0
     fi
   fi
-  if [ "$container" = synthetic-api-monitor ] &&
-     [ -f "$FAKE_CRONJOB_VERIFY_MARKER" ]; then
-    digest=$FAKE_DIGEST_B
+  if [ "$container" = synthetic-api-monitor ]; then
+    if [ -f "$FAKE_CRONJOB_VERIFY_MARKER" ]; then
+      # Candidate verify proves digest B; post-atomic evidence reset re-proves baseline A.
+      if [ -f "$FAKE_ATOMIC_FAILED_MARKER" ]; then
+        digest=$FAKE_DIGEST_A
+      else
+        digest=$FAKE_DIGEST_B
+      fi
+    elif [ "$FAKE_STALE_API_MONITOR_EVIDENCE" = true ] &&
+         [ -f "$FAKE_ATOMIC_FAILED_MARKER" ]; then
+      # Retained Job still carries the failed candidate ImageID.
+      digest=$FAKE_DIGEST_B
+    fi
   fi
   [ "$container" = "$FAKE_MISMATCH_CONTAINER" ] && digest=$FAKE_DIGEST_B
   if [ -f "$FAKE_CANDIDATE_APPLIED_MARKER" ]; then
@@ -7444,10 +7532,26 @@ case "$1" in
           if [ -f "$FAKE_CANDIDATE_APPLIED_MARKER" ]; then
             post_upgrade=$FAKE_POST_UPGRADE_ACTIVE_KUBERNETES_JOB
           fi
+          retained_evidence=false
+          evidence_job=selfservice-synthetic-api-monitor-1
+          if [ -f "$FAKE_ATOMIC_FAILED_MARKER" ]; then
+            if [ -f "$FAKE_CRONJOB_VERIFY_MARKER" ]; then
+              retained_evidence=true
+              if [ -f "$FAKE_CRONJOB_CREATE_LOG" ]; then
+                evidence_job=$(tail -n 1 "$FAKE_CRONJOB_CREATE_LOG")
+              else
+                evidence_job=selfservice-synthetic-api-monitor-deploy-verify-1
+              fi
+            elif [ ! -f "$FAKE_STALE_API_MONITOR_PURGED_MARKER" ]; then
+              retained_evidence=true
+            fi
+          fi
           jq -cn \
             --argjson active "$FAKE_ACTIVE_KUBERNETES_JOBS" \
             --argjson synthetic "$FAKE_ACTIVE_MUTATING_SYNTHETIC_JOBS" \
             --argjson completed "$FAKE_COMPLETED_MUTATING_SYNTHETIC_JOB" \
+            --argjson retained_evidence "$retained_evidence" \
+            --arg evidence_job "$evidence_job" \
             --arg post_upgrade "$post_upgrade" \
             '{
               items: (
@@ -7551,6 +7655,20 @@ case "$1" in
                      },
                      status:{conditions:[{type:"Complete",status:"True"}]}
                    }]
+                 else [] end) +
+                (if $retained_evidence then
+                   [{
+                     metadata:{
+                       name:$evidence_job,
+                       ownerReferences:[{
+                         apiVersion:"batch/v1",
+                         kind:"CronJob",
+                         name:"selfservice-synthetic-api-monitor",
+                         controller:true
+                       }]
+                     },
+                     status:{succeeded:1,failed:0,active:0}
+                   }]
                  else [] end)
               )
             }'
@@ -7562,6 +7680,17 @@ case "$1" in
         elif [[ "$*" == *'eq .name "selfservice-synthetic-runner"'* ]] &&
            [ "$FAKE_NO_RETAINED_RUNNER_JOB" = true ]; then
         :
+        elif [ -f "$FAKE_ATOMIC_FAILED_MARKER" ] &&
+             [ -f "$FAKE_STALE_API_MONITOR_PURGED_MARKER" ] &&
+             [ ! -f "$FAKE_CRONJOB_VERIFY_MARKER" ]; then
+        :
+        elif [ -f "$FAKE_ATOMIC_FAILED_MARKER" ] &&
+             [ -f "$FAKE_CRONJOB_VERIFY_MARKER" ]; then
+          if [ -f "$FAKE_CRONJOB_CREATE_LOG" ]; then
+            tail -n 1 "$FAKE_CRONJOB_CREATE_LOG"
+          else
+            printf 'selfservice-synthetic-api-monitor-deploy-verify-1\n'
+          fi
         else
         printf 'selfservice-synthetic-api-monitor-1\n'
         fi
@@ -8054,6 +8183,10 @@ case "$1" in
     fi
     ;;
   delete)
+    if [[ "${2:-}" == job/* ]] || { [ "${2:-}" = "job" ] && [ -n "${3:-}" ]; }; then
+      : > "$FAKE_STALE_API_MONITOR_PURGED_MARKER"
+      exit 0
+    fi
     if [[ "$*" == *"--raw="* ]]; then
       delete_options=
       previous=
@@ -8470,6 +8603,8 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_CRONJOB_VERIFY_MANIFEST="+e.cronjobVerifyManifest,
 		"FAKE_CRONJOB_CREATE_LOG="+e.cronjobCreateLog,
 		"FAKE_CRONJOB_VERIFICATION_SHAPE="+e.cronjobVerificationShape,
+		"FAKE_STALE_API_MONITOR_EVIDENCE="+strconv.FormatBool(e.staleAPIMonitorEvidence),
+		"FAKE_STALE_API_MONITOR_PURGED_MARKER="+e.staleAPIMonitorPurgedMark,
 		"FAKE_CLAIMS_PAUSED_MARKER="+e.claimsPausedMark,
 		"FAKE_CLAIMS_RESUMED_MARKER="+e.claimsResumedMark,
 		"FAKE_FAIL_CLAIMS_RESUME="+strconv.FormatBool(e.failClaimsResume),
