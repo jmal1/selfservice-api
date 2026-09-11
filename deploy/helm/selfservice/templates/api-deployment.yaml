@@ -1,0 +1,201 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-api
+  labels:
+    app.kubernetes.io/name: selfservice-api
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: api-gateway
+spec:
+  replicas: {{ .Values.replicaCount.api }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: selfservice-api
+      app.kubernetes.io/component: api-gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: selfservice-api
+        app.kubernetes.io/component: api-gateway
+      {{- if .Values.vault.enabled }}
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: {{ .Values.vault.role | quote }}
+        vault.hashicorp.com/agent-inject-secret-oidc: {{ .Values.vault.secretPaths.oidc | quote }}
+        vault.hashicorp.com/agent-inject-secret-db: {{ .Values.vault.secretPaths.database | quote }}
+        vault.hashicorp.com/agent-inject-secret-jwt: {{ .Values.vault.secretPaths.jwt | quote }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ .Release.Name }}-api
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: api-gateway
+          image: "{{ .Values.image.api }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.api.port }}
+              protocol: TCP
+          env:
+            - name: SERVER_PORT
+              value: {{ .Values.api.port | quote }}
+            - name: DB_HOST
+              value: {{ .Values.database.host | quote }}
+            - name: DB_PORT
+              value: {{ .Values.database.port | quote }}
+            - name: DB_NAME
+              value: {{ .Values.database.name | quote }}
+            - name: DB_USER
+              value: {{ .Values.database.user | quote }}
+            - name: DB_SSLMODE
+              value: {{ .Values.database.sslmode | quote }}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.db }}
+                  key: password
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.jwt }}
+                  key: jwt-secret
+                  optional: true
+            - name: JWT_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.jwt }}
+                  key: jwt-private-key
+                  optional: true
+            - name: JWT_PUBLIC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.jwt }}
+                  key: jwt-public-key
+                  optional: true
+            - name: OIDC_ISSUER_URL
+              value: {{ .Values.oidc.issuerURL | quote }}
+            - name: OIDC_REDIRECT_URL
+              value: {{ .Values.oidc.redirectURL | quote }}
+            - name: OIDC_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.oidc }}
+                  key: client-id
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.oidc }}
+                  key: client-secret
+            - name: NATS_URL
+              value: {{ .Values.natsURL | quote }}
+            - name: PROVISIONING_ENABLED
+              value: {{ .Values.provisioning.enabled | quote }}
+            - name: PROVISIONING_PUSHGATEWAY_URL
+              value: {{ .Values.api.provisioningPushgatewayURL | quote }}
+            - name: PROVISIONING_PUSHGATEWAY_JOB
+              value: {{ .Values.api.provisioningPushgatewayJob | quote }}
+            # vCenter credentials for console access
+            - name: VCENTER_URL
+              value: {{ .Values.vcenter.url | quote }}
+            - name: VCENTER_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.vcenter }}
+                  key: vcenter-user
+            - name: VCENTER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.vcenter }}
+                  key: vcenter-password
+                  optional: true
+            - name: VCENTER_CLIENT_CERT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.vcenter }}
+                  key: vcenter-client-cert
+                  optional: true
+            - name: VCENTER_CLIENT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.vcenter }}
+                  key: vcenter-client-key
+                  optional: true
+            - name: VCENTER_DATACENTER
+              value: {{ .Values.vcenter.datacenter | quote }}
+            - name: VCENTER_DATASTORE
+              value: {{ .Values.vcenter.datastore | quote }}
+            - name: VCENTER_RESOURCE_POOLS
+              value: {{ .Values.vcenter.resourcePools | quote }}
+            - name: VCENTER_HOSTS
+              value: {{ .Values.vcenter.hosts | quote }}
+            - name: VCENTER_PLACEMENT_RESERVED_MEMORY_MB
+              value: {{ .Values.vcenter.placementReservedMemoryMB | quote }}
+            - name: VCENTER_INSECURE
+              value: {{ .Values.vcenter.insecure | quote }}
+            {{- if .Values.vcenter.templatesFolder }}
+            - name: VCENTER_TEMPLATES_FOLDER
+              value: {{ .Values.vcenter.templatesFolder | quote }}
+            {{- end }}
+            {{- if .Values.vcenter.healthPushgatewayURL }}
+            - name: VCENTER_HEALTH_PUSHGATEWAY_URL
+              value: {{ .Values.vcenter.healthPushgatewayURL | quote }}
+            - name: VCENTER_HEALTH_INTERVAL
+              value: {{ .Values.vcenter.healthInterval | default "5m" | quote }}
+            {{- end }}
+            {{- if .Values.api.allowedOrigins }}
+            - name: ALLOWED_ORIGINS
+              value: {{ .Values.api.allowedOrigins | quote }}
+            {{- end }}
+            # Engine health probe target — release-scoped so the
+            # default (selfservice-engine) tracks the helm release name
+            # automatically. Used by GET /api/v1/admin/health.
+            - name: ENGINE_HEALTH_URL
+              value: "http://{{ .Release.Name }}-engine.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.engine.port | default 8081 }}/healthz"
+            {{- if .Values.objectstore.enabled }}
+            # Staging store for browser-uploaded installer images. The endpoint
+            # must be the address the *browser* can reach, because presigned PUT
+            # URLs are SigV4-signed for this exact host.
+            #
+            # useSSL is deliberately NOT piped through `default`: Helm treats
+            # false as empty, so `default true` would silently force TLS back on.
+            - name: OBJECTSTORE_ENDPOINT
+              value: {{ .Values.objectstore.endpoint | quote }}
+            - name: OBJECTSTORE_BUCKET
+              value: {{ .Values.objectstore.bucket | quote }}
+            - name: OBJECTSTORE_PREFIX
+              value: {{ .Values.objectstore.prefix | quote }}
+            - name: OBJECTSTORE_USE_SSL
+              value: {{ .Values.objectstore.useSSL | quote }}
+            - name: OBJECTSTORE_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.objectstore }}
+                  key: access-key
+            - name: OBJECTSTORE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.objectstore }}
+                  key: secret-key
+            # API-side pipeline metrics for image upload lifecycle events.
+            - name: PIPELINE_PUSHGATEWAY_URL
+              value: {{ .Values.api.pipelinePushgatewayURL | default "" | quote }}
+            - name: PIPELINE_PUSHGATEWAY_JOB
+              value: {{ .Values.api.pipelinePushgatewayJob | default "crucible_pipeline_api" | quote }}
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}

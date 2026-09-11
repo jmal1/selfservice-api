@@ -1,0 +1,85 @@
+# Runner tool manifest — the single source of truth for what is installed in
+# the assessment runner image.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# The tool inventory used to live in three places that could drift apart
+# independently:
+#
+#   1. the apt-get install list in deploy/runner/Dockerfile
+#   2. the `command -v` verification loop in the same Dockerfile
+#   3. nothing at all on the Go side, so the authoring-time script validator
+#      had no idea which commands a workflow could actually call
+#
+# Drift between (1) and (2) means a tool is installed but never verified, so a
+# Kali wrapper-script rename silently produces a runner that is missing a
+# command while the build stays green. Drift against (3) means an instructor
+# can save a workflow calling `gobuster`, ship it to students, and only find
+# out at grading time that it exits 127 — the exact failure class that cost us
+# a full debugging cycle.
+#
+# All three now derive from this file. Adding a tool is a one-line change here.
+#
+# WHY IT LIVES UNDER internal/ RATHER THAN deploy/runner/
+# -------------------------------------------------------
+# Go's //go:embed cannot reference a path outside its own package directory,
+# and the Go side is the consumer that most needs to stay honest. The
+# Dockerfile can COPY from anywhere in the build context, so it is the side
+# that bends.
+#
+# FORMAT
+# ------
+#   <check>  <package>
+#
+#   <check>    If it starts with '/', it is a filesystem path verified with
+#              `test -e`. Otherwise it is a command name verified with
+#              `command -v` and exposed to the script validator as a callable.
+#   <package>  The apt package that provides it. Several checks may map to the
+#              same package (impacket-scripts ships many binaries).
+#
+# Blank lines and '#' comments are ignored.
+#
+# SIZE BUDGET: the image must stay under 3 GB. Do NOT add kali-linux-large,
+# kali-linux-everything, or metasploit-framework — each adds several GB and
+# blows the runner Job's cold-pull budget.
+
+# --- base shell + runtime ---
+bash                    bash
+/etc/ssl/certs          ca-certificates
+/usr/share/zoneinfo     tzdata
+curl                    curl
+wget                    wget
+jq                      jq
+socat                   socat
+git                     git
+openssl                 openssl
+python3                 python3
+pip3                    python3-pip
+
+# --- network basics ---
+ip                      iproute2
+ping                    iputils-ping
+dig                     dnsutils
+nc                      netcat-openbsd
+ssh                     openssh-client
+# Target-side actions authenticate as CRUCIBLE_TARGET_USERNAME with
+# CRUCIBLE_TARGET_PASSWORD, which the engine already injects. Without sshpass
+# there is no way to spend that password: openssh refuses to read one from a
+# pipe, and no key is provisioned into student VMs. The alternative -- checking
+# services and files on the runner instead of the target -- is what the five
+# actions fixed in this pass were doing.
+sshpass                 sshpass
+
+# --- assessment tooling (the reason the base image is Kali) ---
+nmap                    nmap
+smbclient               smbclient
+netexec                 netexec
+hydra                   hydra
+enum4linux-ng           enum4linux-ng
+nikto                   nikto
+whatweb                 whatweb
+smbmap                  smbmap
+redis-cli               redis-tools
+ldapsearch              ldap-utils
+impacket-secretsdump    impacket-scripts
+/usr/share/seclists     seclists

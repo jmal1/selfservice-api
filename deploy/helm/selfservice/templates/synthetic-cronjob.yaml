@@ -1,0 +1,160 @@
+{{- if .Values.synthetic.enabled -}}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ .Release.Name }}-synthetic-api-monitor
+  labels:
+    app.kubernetes.io/name: selfservice-synthetic-api-monitor
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: synthetic-monitor
+spec:
+  schedule: {{ required "synthetic.schedule is required" .Values.synthetic.schedule | quote }}
+  suspend: {{ .Values.synthetic.suspend }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  startingDeadlineSeconds: 120
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: {{ if .Values.synthetic.lifecycle.enabled }}{{ required "synthetic.lifecycle.activeDeadlineSeconds is required" .Values.synthetic.lifecycle.activeDeadlineSeconds }}{{ else }}300{{ end }}
+      ttlSecondsAfterFinished: 1800
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: selfservice-synthetic-api-monitor
+            app.kubernetes.io/component: synthetic-monitor
+        spec:
+          restartPolicy: Never
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: synthetic-api-monitor
+              image: "{{ .Values.synthetic.image }}:{{ .Values.synthetic.imageTag | default .Values.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              env:
+                - name: SYNTHETIC_BASE_URL
+                  value: {{ .Values.synthetic.baseURL | quote }}
+                - name: SYNTHETIC_PUSHGATEWAY_URL
+                  value: {{ .Values.synthetic.pushgatewayURL | quote }}
+                - name: SYNTHETIC_JOB
+                  value: {{ .Values.synthetic.job | quote }}
+                - name: SYNTHETIC_LAYER
+                  value: {{ .Values.synthetic.layer | quote }}
+                - name: SYNTHETIC_USERNAME
+                  value: {{ .Values.synthetic.username | quote }}
+                - name: SYNTHETIC_ROLE
+                  value: {{ .Values.synthetic.role | quote }}
+                - name: SYNTHETIC_CHECK_TIMEOUT
+                  value: {{ .Values.synthetic.checkTimeout | quote }}
+                - name: SYNTHETIC_PROVISIONING_EXPECTED_ENABLED
+                  value: {{ .Values.synthetic.provisioningExpectedEnabled | quote }}
+                - name: SYNTHETIC_RUNNER_EXPECTED_ENABLED
+                  value: {{ and .Values.synthetic.runner.enabled (not .Values.synthetic.runner.suspend) | quote }}
+                - name: SYNTHETIC_USER_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.synthetic.secretName }}
+                      key: user-id
+                - name: SYNTHETIC_JWT_SECRET
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.secrets.jwt }}
+                      key: jwt-secret
+                      optional: true
+                - name: JWT_PRIVATE_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.secrets.jwt }}
+                      key: jwt-private-key
+                      optional: true
+                - name: JWT_PUBLIC_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.secrets.jwt }}
+                      key: jwt-public-key
+                      optional: true
+                # Elevated (instructor-role) identity. Deliberately a
+                # SEPARATE users row rather than a higher role on the
+                # primary synthetic user: admin_list_users_403,
+                # admin_audit_403, wiki_index_rbac,
+                # pod_testing_dashboard_404 and image_upload_rbac all
+                # assert the primary identity is REFUSED, so elevating it
+                # would leave five checks passing while proving nothing.
+                #
+                # optional: true means a cluster whose secret predates the
+                # instructor row starts cleanly and logs a warning, rather
+                # than CrashLoopBackOff-ing the whole monitor.
+                # Bootstrap the row with deploy/sql/synthetic-instructor-user.sql.
+                - name: SYNTHETIC_INSTRUCTOR_USER_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.synthetic.secretName }}
+                      key: instructor-user-id
+                      optional: true
+                - name: SYNTHETIC_INSTRUCTOR_USERNAME
+                  value: {{ .Values.synthetic.instructorUsername | quote }}
+                - name: SYNTHETIC_CONTENT_FILTER_EXPECTED
+                  value: {{ .Values.worker.contentFilter.enabled | default false | quote }}
+                - name: SYNTHETIC_CONTENT_FILTER_SOURCE_NETWORK
+                  value: {{ .Values.worker.contentFilter.sourceNetwork | default "10.100.0.0/16" | quote }}
+                - name: SYNTHETIC_CONTENT_FILTER_CATEGORY_FEED_BASE_URL
+                  value: {{ .Values.worker.contentFilter.categoryFeedBaseURL | default "" | quote }}
+                - name: SYNTHETIC_CONTENT_FILTER_ALLOWLIST
+                  value: {{ join "," (.Values.worker.contentFilter.allowlist | default (list)) | quote }}
+                - name: SYNTHETIC_CONTENT_FILTER_MAX_GENERATED_RULES
+                  value: {{ .Values.synthetic.contentFilter.maxGeneratedRules | default 256 | quote }}
+                - name: SYNTHETIC_OPNSENSE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.synthetic.contentFilter.opnsenseSecretName }}
+                      key: opnsense-url
+                      optional: true
+                - name: SYNTHETIC_OPNSENSE_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.synthetic.contentFilter.opnsenseSecretName }}
+                      key: opnsense-api-key
+                      optional: true
+                - name: SYNTHETIC_OPNSENSE_API_SECRET
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.synthetic.contentFilter.opnsenseSecretName }}
+                      key: opnsense-api-secret
+                      optional: true
+                # SYNTHETIC_LIFECYCLE_ENABLED is always rendered (never wrapped
+                # in the lifecycle-enabled conditional below). The deploy
+                # safety contract's validate_foundation_intent reads it via
+                # env_from_manifest, which requires EXACTLY ONE match - an
+                # absent key (as happens when this is conditional) fails
+                # closed with a misleading "must keep ...=false" error instead
+                # of asserting the real, explicit intent. See AGENTS.md and
+                # deploy/scripts/deploy.sh.
+                - name: SYNTHETIC_LIFECYCLE_ENABLED
+                  value: {{ .Values.synthetic.lifecycle.enabled | quote }}
+                {{- if .Values.synthetic.lifecycle.enabled }}
+                - name: SYNTHETIC_LIFECYCLE_TEMPLATE
+                  value: {{ .Values.synthetic.lifecycle.template | quote }}
+                - name: SYNTHETIC_LIFECYCLE_READY_TIMEOUT
+                  value: {{ .Values.synthetic.lifecycle.readyTimeout | quote }}
+                - name: SYNTHETIC_LIFECYCLE_DESTROY_TIMEOUT
+                  value: {{ .Values.synthetic.lifecycle.destroyTimeout | quote }}
+                - name: SYNTHETIC_LIFECYCLE_MAX_ATTEMPTS
+                  value: {{ .Values.synthetic.lifecycle.maxAttempts | default 2 | quote }}
+                - name: SYNTHETIC_LIFECYCLE_RETRY_BACKOFF
+                  value: {{ .Values.synthetic.lifecycle.retryBackoff | default "30s" | quote }}
+                {{- end }}
+              resources:
+                {{- toYaml .Values.synthetic.resources | nindent 16 }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                runAsNonRoot: true
+                runAsUser: 65534
+                runAsGroup: 65534
+                capabilities:
+                  drop:
+                    - ALL
+{{- end }}

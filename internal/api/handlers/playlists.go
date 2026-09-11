@@ -1,0 +1,392 @@
+package handlers
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+
+	"github.com/jmal1/selfservice-api/internal/actionlibrary"
+	"github.com/jmal1/selfservice-api/internal/database"
+	"github.com/jmal1/selfservice-api/internal/middleware"
+	"github.com/jmal1/selfservice-api/internal/models"
+)
+
+// --- Admin Playlist Routes ---
+
+// AdminListPlaylists returns all playlists.
+func (h *Handler) AdminListPlaylists(w http.ResponseWriter, r *http.Request) {
+	playlists, err := h.db.ListPlaylists(r.Context())
+	if err != nil {
+		respondError(w, r, http.StatusInternalServerError, "failed to list playlists")
+		return
+	}
+	respondJSON(w, http.StatusOK, playlists)
+}
+
+// AdminGetPlaylist returns a single playlist with workflows.
+func (h *Handler) AdminGetPlaylist(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "playlistID"))
+	if err != nil {
+		respondError(w, r, http.StatusBadRequest, "invalid playlist ID")
+		return
+	}
+
+	pl, err := h.db.GetPlaylistWithWorkflows(r.Context(), id)
+	if err != nil {
+		respondError(w, r, http.StatusNotFound, "playlist not found")
+		return
+	}
+	respondJSON(w, http.StatusOK, pl)
+}
+
+// AdminCreatePlaylist creates a new playlist.
+func (h *Handler) AdminCreatePlaylist(w http.ResponseWriter, r *http.Request) {
+	userID := middleware.UserIDFromContext(r.Context())
+
+	var req struct {
+		Name        string      `json:"name"`
+		Slug        string      `json:"slug"`
+		Description string      `json:"description"`
+		ScoringMode string      `json:"scoring_mode"`
+		WorkflowIDs []uuid.UUID `json:"workflow_ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Name == "" || req.Slug == "" {
+		respondError(w, r, http.StatusBadRequest, "name and slug are required")
+		return
+	}
+	if err := actionlibrary.ValidateSlug(req.Slug); err != nil {
+		respondError(w, r, http.StatusBadRequest, err.Error())
+		return
+	}
+	// scoring_mode is a column and a documented enum, but nothing computes a
+	// score: no code path reads actions.points or actions.penalty. Accepting
+	// "points" here would return 201 and then silently grade pass/fail, which
+	// is worse than refusing. Rejecting it keeps the API honest until the
+	// engine can actually total a score.
+	if req.ScoringMode != "" && req.ScoringMode != models.ScoringModePassFail {
+		respondError(w, r, http.StatusBadRequest,
+			"scoring_mode \"points\" is not implemented: the engine does not total action points or penalties. Omit scoring_mode or send \"pass_fail\".")
+		return
+	}
+
+	pl := &models.Playlist{
+		Name:        req.Name,
+		Slug:        req.Slug,
+		Description: req.Description,
+		ScoringMode: models.ScoringModePassFail,
+		CreatedBy:   userID,
+		IsActive:    true,
+	}
+
+	if err := h.db.CreatePlaylist(r.Context(), pl, req.WorkflowIDs); err != nil {
+		h.logger.Error("failed to create playlist", "error", err)
+		respondError(w, r, http.StatusInternalServerError, "failed to create playlist")
+		return
+	}
+
+	respondJSON(w, http.StatusCreated, pl)
+}
+
+// AdminUpdatePlaylist updates a playlist's metadata and workflow membership.
+func (h *Handler) AdminUpdatePlaylist(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "playlistID"))
+	if err != nil {
+		respondError(w, r, http.StatusBadRequest, "invalid playlist ID")
+		return
+	}
+
+	var req struct {
+		Name        *string     `json:"name"`
+		Description *string     `json:"description"`
+		WorkflowIDs []uuid.UUID `json:"workflow_ids"`
+		IsActive    *bool       `json:"is_active"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if err := h.db.UpdatePlaylist(r.Context(), id, req.Name, req.Description, req.IsActive, req.WorkflowIDs); err != nil {
+		h.logger.Error("failed to update playlist", "error", err)
+		respondError(w, r, http.StatusInternalServerError, "failed to update playlist")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]string{"status": "updated"})
+}
+
+// AdminDeletePlaylist soft-deletes a playlist.
+func (h *Handler) AdminDeletePlaylist(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "playlistID"))
+	if err != nil {
+		respondError(w, r, http.StatusBadRequest, "invalid playlist ID")
+		return
+	}
+
+	if err := h.db.DeactivatePlaylist(r.Context(), id); err != nil {
+		respondError(w, r, http.StatusInternalServerError, "failed to delete playlist")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// AdminSetTemplatePlaylists assigns playlists to a template.
+func (h *Handler) AdminSetTemplatePlaylists(w http.ResponseWriter, r *http.Request) {
+	templateID, err := uuid.Parse(chi.URLParam(r, "templateID"))
+	if err != nil {
+		respondError(w, r, http.StatusBadRequest, "invalid template ID")
+		return
+	}
+
+	var req struct {
+		PlaylistIDs []uuid.UUID `json:"playlist_ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if err := h.db.SetTemplatePlaylists(r.Context(), templateID, req.PlaylistIDs); err != nil {
+		h.logger.Error("failed to set template playlists", "error", err)
+		respondError(w, r, http.StatusInternalServerError, "failed to set playlists")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]string{"status": "updated"})
+}
+
+// AdminGetTemplatePlaylists returns playlist IDs assigned to a template.
+func (h *Handler) AdminGetTemplatePlaylists(w http.ResponseWriter, r *http.Request) {
+	templateID, err := uuid.Parse(chi.URLParam(r, "templateID"))
+	if err != nil {
+		respondError(w, r, http.StatusBadRequest, "invalid template ID")
+		return
+	}
+
+	ids, err := h.db.GetTemplatePlaylists(r.Context(), templateID)
+	if err != nil {
+		h.logger.Error("failed to get template playlists", "error", err)
+		respondError(w, r, http.StatusInternalServerError, "failed to get playlists")
+		return
+	}
+	if ids == nil {
+		ids = []uuid.UUID{}
+	}
+
+	respondJSON(w, http.StatusOK, map[string]any{"playlist_ids": ids})
+}
+
+// AdminSetBlueprintVMPlaylists assigns playlist overrides to a blueprint VM slot.
+func (h *Handler) AdminSetBlueprintVMPlaylists(w http.ResponseWriter, r *http.Request) {
+	blueprintID, err := uuid.Parse(chi.URLParam(r, "blueprintID"))
+	if err != nil {
+		respondError(w, r, http.StatusBadRequest, "invalid blueprint ID")
+		return
+	}
+
+	var req struct {
+		VMSlot      int         `json:"vm_slot"`
+		PlaylistIDs []uuid.UUID `json:"playlist_ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if err := h.db.SetBlueprintVMPlaylists(r.Context(), blueprintID, req.VMSlot, req.PlaylistIDs); err != nil {
+		h.logger.Error("failed to set blueprint VM playlists", "error", err)
+		respondError(w, r, http.StatusInternalServerError, "failed to set playlists")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]string{"status": "updated"})
+}
+
+// AdminGetBlueprintVMPlaylistsResolved returns the resolved playlists for each VM slot on a blueprint,
+// with source labeling ("blueprint_override" or "template_default").
+func (h *Handler) AdminGetBlueprintVMPlaylistsResolved(w http.ResponseWriter, r *http.Request) {
+	blueprintID, err := uuid.Parse(chi.URLParam(r, "blueprintID"))
+	if err != nil {
+		respondError(w, r, http.StatusBadRequest, "invalid blueprint ID")
+		return
+	}
+
+	rows, err := h.db.GetBlueprintVMPlaylistsResolved(r.Context(), blueprintID)
+	if err != nil {
+		if err.Error() == "sql: no rows in result set" {
+			respondError(w, r, http.StatusNotFound, "blueprint not found")
+			return
+		}
+		h.logger.Error("failed to get blueprint VM playlists", "error", err)
+		respondError(w, r, http.StatusInternalServerError, "failed to get playlists")
+		return
+	}
+
+	// Transform flat rows into a grouped response: vm_slot -> playlists array
+	type PlaylistInfo struct {
+		PlaylistID     uuid.UUID `json:"playlist_id"`
+		Name           string    `json:"name"`
+		Slug           string    `json:"slug"`
+		Source         string    `json:"source"` // "blueprint_override" or "template_default"
+		ExecutionOrder int       `json:"execution_order"`
+	}
+
+	type VMPlaylistSlot struct {
+		VMSlot    int            `json:"vm_slot"`
+		Playlists []PlaylistInfo `json:"playlists"`
+	}
+
+	// Group by VM slot
+	vmMap := make(map[int][]PlaylistInfo)
+	for _, row := range rows {
+		vmMap[row.VMSlot] = append(vmMap[row.VMSlot], PlaylistInfo{
+			PlaylistID:     row.PlaylistID,
+			Name:           row.PlaylistName,
+			Slug:           row.PlaylistSlug,
+			Source:         row.Source,
+			ExecutionOrder: row.ExecutionOrder,
+		})
+	}
+
+	// Convert to sorted list
+	var vmPlaylists []VMPlaylistSlot
+	for vmSlot, playlists := range vmMap {
+		vmPlaylists = append(vmPlaylists, VMPlaylistSlot{
+			VMSlot:    vmSlot,
+			Playlists: playlists,
+		})
+	}
+
+	// Sort by VM slot for consistent ordering
+	for i := 0; i < len(vmPlaylists)-1; i++ {
+		for j := i + 1; j < len(vmPlaylists); j++ {
+			if vmPlaylists[j].VMSlot < vmPlaylists[i].VMSlot {
+				vmPlaylists[i], vmPlaylists[j] = vmPlaylists[j], vmPlaylists[i]
+			}
+		}
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{"vm_playlists": vmPlaylists})
+}
+
+// AdminDeleteBlueprintVMPlaylistsOverride removes playlist overrides for a blueprint VM slot,
+// reverting it to inherit the template's default playlists.
+func (h *Handler) AdminDeleteBlueprintVMPlaylistsOverride(w http.ResponseWriter, r *http.Request) {
+	blueprintID, err := uuid.Parse(chi.URLParam(r, "blueprintID"))
+	if err != nil {
+		respondError(w, r, http.StatusBadRequest, "invalid blueprint ID")
+		return
+	}
+
+	vmSlotStr := chi.URLParam(r, "vmSlot")
+	vmSlot := 0
+	_, err = fmt.Sscanf(vmSlotStr, "%d", &vmSlot)
+	if err != nil {
+		respondError(w, r, http.StatusBadRequest, "invalid vm slot")
+		return
+	}
+
+	// Delete override by setting empty playlist list
+	if err := h.db.SetBlueprintVMPlaylists(r.Context(), blueprintID, vmSlot, []uuid.UUID{}); err != nil {
+		h.logger.Error("failed to delete blueprint VM playlists override", "error", err)
+		respondError(w, r, http.StatusInternalServerError, "failed to delete override")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]string{"status": "override removed"})
+}
+
+// AdminListRuns returns all runs across all pods (admin view), with optional filtering.
+func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+
+	filter := database.RunsListFilter{}
+
+	// Parse triggered_by filter (UUID or username/display_name substring)
+	if triggeredBy := q.Get("triggered_by"); triggeredBy != "" {
+		if id, err := uuid.Parse(triggeredBy); err == nil {
+			filter.TriggeredBy = &id
+		} else {
+			filter.TriggeredByStr = triggeredBy
+		}
+	}
+
+	// Parse pod_owner filter (UUID or username/display_name substring)
+	if podOwner := q.Get("pod_owner"); podOwner != "" {
+		if id, err := uuid.Parse(podOwner); err == nil {
+			filter.PodOwner = &id
+		} else {
+			filter.PodOwnerStr = podOwner
+		}
+	}
+
+	// Parse status filter
+	if status := q.Get("status"); status != "" {
+		filter.Status = status
+	}
+
+	// Parse from/to date range (RFC3339 format)
+	if from := q.Get("from"); from != "" {
+		if t, err := time.Parse(time.RFC3339, from); err == nil {
+			filter.From = &t
+		}
+	}
+	if to := q.Get("to"); to != "" {
+		if t, err := time.Parse(time.RFC3339, to); err == nil {
+			filter.To = &t
+		}
+	}
+
+	// Parse pagination (limit and offset)
+	if limit := q.Get("limit"); limit != "" {
+		if n, err := strconv.Atoi(limit); err == nil && n > 0 {
+			filter.Limit = n
+		}
+	}
+	if offset := q.Get("offset"); offset != "" {
+		if n, err := strconv.Atoi(offset); err == nil && n >= 0 {
+			filter.Offset = n
+		}
+	}
+
+	runs, err := h.runsStore().ListAllRunsFiltered(r.Context(), filter)
+	if err != nil {
+		h.logger.Error("admin list runs failed", "error", err)
+		respondError(w, r, http.StatusInternalServerError, "failed to list runs")
+		return
+	}
+
+	// Always return non-nil slice to match API expectations
+	if runs == nil {
+		runs = []models.Run{}
+	}
+
+	respondJSON(w, http.StatusOK, runs)
+}
+
+// AdminGetRun returns a single run with attribution and workflow results.
+func (h *Handler) AdminGetRun(w http.ResponseWriter, r *http.Request) {
+	runID, err := uuid.Parse(chi.URLParam(r, "runID"))
+	if err != nil {
+		respondError(w, r, http.StatusBadRequest, "invalid run ID")
+		return
+	}
+
+	run, err := h.db.GetRunWithResults(r.Context(), runID)
+	if err != nil {
+		respondError(w, r, http.StatusNotFound, "run not found")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, run)
+}

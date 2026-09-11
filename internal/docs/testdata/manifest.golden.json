@@ -1,0 +1,29 @@
+{
+  "generated_at": "2026-01-01T00:00:00Z",
+  "seeds": [
+    "docs/instructor/overview.md",
+    "AGENTS.md"
+  ],
+  "files": [
+    {
+      "path": "docs/instructor/overview.md",
+      "title": "Crucible for Instructors — Overview",
+      "size": 1234,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "is_markdown": true,
+      "links_out": [
+        "docs/instructor/workflows.md"
+      ],
+      "from_seed": true
+    },
+    {
+      "path": "internal/api/routes/routes.go",
+      "title": "routes.go (Go)",
+      "size": 5678,
+      "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "is_markdown": false,
+      "from_seed": false
+    }
+  ],
+  "total_bytes": 6912
+}

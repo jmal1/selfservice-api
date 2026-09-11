@@ -1,0 +1,306 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-worker
+  labels:
+    app.kubernetes.io/name: selfservice-api
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: provision-worker
+spec:
+  replicas: {{ .Values.replicaCount.worker }}
+  # Hard hostname anti-affinity + only two untainted nodes (k3sv03 is
+  # NoSchedule/runner) means a surge pod has nowhere to land. Replace
+  # in place: PDB keeps minAvailable = replicas-1 during the gap.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: selfservice-api
+      app.kubernetes.io/component: provision-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: selfservice-api
+        app.kubernetes.io/component: provision-worker
+      {{- if .Values.vault.enabled }}
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: {{ .Values.vault.role | quote }}
+        vault.hashicorp.com/agent-inject-secret-vcenter: "selfservice/data/vcenter"
+        vault.hashicorp.com/agent-inject-secret-opnsense-api: "selfservice/data/opnsense-api"
+        vault.hashicorp.com/agent-inject-secret-opnsense-ssh: "selfservice/data/opnsense-ssh"
+        vault.hashicorp.com/agent-inject-secret-db: {{ .Values.vault.secretPaths.database | quote }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ .Release.Name }}-worker
+      terminationGracePeriodSeconds: {{ .Values.worker.shutdownGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: provision-worker
+          image: "{{ .Values.image.worker }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: DB_HOST
+              value: {{ .Values.database.host | quote }}
+            - name: DB_PORT
+              value: {{ .Values.database.port | quote }}
+            - name: DB_NAME
+              value: {{ .Values.database.name | quote }}
+            - name: DB_USER
+              value: {{ .Values.database.user | quote }}
+            - name: DB_SSLMODE
+              value: {{ .Values.database.sslmode | quote }}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.db }}
+                  key: password
+            - name: NATS_URL
+              value: {{ .Values.natsURL | quote }}
+            - name: WORKER_PROVISIONING_CLAIMS_ENABLED
+              value: {{ .Values.provisioning.workerClaimsEnabled | quote }}
+            # vCenter configuration
+            - name: VCENTER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.vcenter }}
+                  key: vcenter-url
+            - name: VCENTER_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.vcenter }}
+                  key: vcenter-user
+            - name: VCENTER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.vcenter }}
+                  key: vcenter-password
+                  optional: true
+            - name: VCENTER_CLIENT_CERT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.vcenter }}
+                  key: vcenter-client-cert
+                  optional: true
+            - name: VCENTER_CLIENT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.vcenter }}
+                  key: vcenter-client-key
+                  optional: true
+            - name: VCENTER_DATACENTER
+              value: {{ .Values.vcenter.datacenter | quote }}
+            - name: VCENTER_DATASTORE
+              value: {{ .Values.vcenter.datastore | quote }}
+            - name: VCENTER_VM_FOLDER
+              value: {{ .Values.vcenter.vmFolder | quote }}
+            {{- if .Values.vcenter.templatesFolder }}
+            # Where source_type=iso parks the blank template build VM. The API
+            # already gets this; the worker is the process that actually
+            # creates the VM, so without it here the two disagree and the
+            # worker silently falls back to the compiled-in default.
+            - name: VCENTER_TEMPLATES_FOLDER
+              value: {{ .Values.vcenter.templatesFolder | quote }}
+            {{- end }}
+            - name: VCENTER_RESOURCE_POOLS
+              value: {{ .Values.vcenter.resourcePools | quote }}
+            - name: VCENTER_HOSTS
+              value: {{ .Values.vcenter.hosts | quote }}
+            - name: VCENTER_PLACEMENT_RESERVED_MEMORY_MB
+              value: {{ .Values.vcenter.placementReservedMemoryMB | quote }}
+            - name: VCENTER_INSECURE
+              value: {{ .Values.vcenter.insecure | quote }}
+            # OPNsense configuration
+            - name: OPNSENSE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.opnsense }}
+                  key: opnsense-url
+            - name: OPNSENSE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.opnsense }}
+                  key: opnsense-api-key
+            - name: OPNSENSE_API_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.opnsense }}
+                  key: opnsense-api-secret
+            - name: OPNSENSE_SSH_HOST
+              value: {{ .Values.opnsense.sshHost | quote }}
+            - name: OPNSENSE_SSH_USER
+              value: {{ .Values.opnsense.sshUser | quote }}
+            - name: OPNSENSE_SSH_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.opnsense }}
+                  key: opnsense-ssh-password
+                  optional: true
+            - name: OPNSENSE_SSH_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.opnsense }}
+                  key: opnsense-ssh-private-key
+                  optional: true
+            - name: OPNSENSE_SSH_HOST_KEY
+              {{- if .Values.opnsense.sshHostKey }}
+              value: {{ .Values.opnsense.sshHostKey | quote }}
+              {{- else }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.opnsense }}
+                  key: opnsense-ssh-host-key
+              {{- end }}
+            # Pushgateway destination for the worker's DestroyFailedPusher,
+            # which surfaces pods stuck in destroy_failed via the
+            # CruciblePodsStuckInDestroyFailed Prometheus alert. Leaving
+            # pushgatewayURL empty disables the pusher cleanly.
+            - name: WORKER_PUSHGATEWAY_URL
+              value: {{ .Values.worker.pushgatewayURL | default "" | quote }}
+            - name: WORKER_PUSHGATEWAY_JOB
+              value: {{ .Values.worker.pushgatewayJob | default "crucible_provision_worker" | quote }}
+            # vCenter orphan reconciler: opt-in scan of the configured Student-VMs
+            # folder. Auto-destroys synthetic VMs whose pod is terminal; logs +
+            # counts everything else for operator review.
+            - name: WORKER_ORPHAN_RECONCILER_ENABLED
+              value: {{ .Values.worker.orphanReconciler.enabled | default false | quote }}
+            - name: WORKER_ORPHAN_RECONCILER_FOLDER
+              value: {{ .Values.worker.orphanReconciler.folder | default "" | quote }}
+            - name: WORKER_ORPHAN_RECONCILER_INTERVAL
+              value: {{ .Values.worker.orphanReconciler.interval | default "1h" | quote }}
+            - name: WORKER_ORPHAN_RECONCILER_MIN_AGE
+              value: {{ .Values.worker.orphanReconciler.minAge | default "1h" | quote }}
+            # Templates-folder orphan reconciler: stale error/draft wizard VMs
+            # and unmatched disposable inventory leftovers.
+            - name: WORKER_TEMPLATE_ORPHAN_RECONCILER_ENABLED
+              value: {{ .Values.worker.templateOrphanReconciler.enabled | default false | quote }}
+            - name: WORKER_TEMPLATE_ORPHAN_RECONCILER_FOLDER
+              value: {{ .Values.worker.templateOrphanReconciler.folder | default "" | quote }}
+            - name: WORKER_TEMPLATE_ORPHAN_RECONCILER_INTERVAL
+              value: {{ .Values.worker.templateOrphanReconciler.interval | default "1h" | quote }}
+            - name: WORKER_TEMPLATE_ORPHAN_RECONCILER_INACTIVE_AGE
+              value: {{ .Values.worker.templateOrphanReconciler.inactiveAge | default "24h" | quote }}
+            - name: WORKER_TEMPLATE_ORPHAN_RECONCILER_MIN_AGE
+              value: {{ .Values.worker.templateOrphanReconciler.minAge | default "1h" | quote }}
+            # OPNsense network reconciler: heals missing VLAN/interface/Kea
+            # bindings for active pods and releases stale vlan_pool
+            # allocations for terminal pods.
+            - name: WORKER_NETWORK_RECONCILER_ENABLED
+              value: {{ .Values.worker.networkReconciler.enabled | default false | quote }}
+            - name: WORKER_NETWORK_RECONCILER_INTERVAL
+              value: {{ .Values.worker.networkReconciler.interval | default "5m" | quote }}
+            - name: WORKER_NETWORK_RECONCILER_MAX_FIREWALL_RULES
+              value: {{ .Values.worker.networkReconciler.maxFirewallRules | default 4096 | quote }}
+            - name: WORKER_NETWORK_RECONCILER_FIREWALL_CLEANUP_LIMIT
+              value: {{ .Values.worker.networkReconciler.firewallCleanupLimit | default 100 | quote }}
+            - name: WORKER_CONTENT_FILTER_ENABLED
+              value: {{ .Values.worker.contentFilter.enabled | default false | quote }}
+            - name: WORKER_CONTENT_FILTER_SOURCE_NETWORK
+              value: {{ .Values.worker.contentFilter.sourceNetwork | default "10.100.0.0/16" | quote }}
+            - name: WORKER_CONTENT_FILTER_CATEGORY_FEED_BASE_URL
+              value: {{ .Values.worker.contentFilter.categoryFeedBaseURL | default "" | quote }}
+            - name: WORKER_CONTENT_FILTER_ALLOWLIST
+              value: {{ join "," (.Values.worker.contentFilter.allowlist | default (list)) | quote }}
+            # Template pipeline reconciler: refreshes crucible_template_state
+            # and crucible_template_stuck from the live templates table.
+            - name: WORKER_PIPELINE_RECONCILER_ENABLED
+              value: {{ .Values.worker.pipelineReconciler.enabled | default false | quote }}
+            - name: WORKER_PIPELINE_RECONCILER_INTERVAL
+              value: {{ .Values.worker.pipelineReconciler.interval | default "5m" | quote }}
+            - name: WORKER_PIPELINE_RECONCILER_STALE_THRESHOLD
+              value: {{ .Values.worker.pipelineReconciler.staleThreshold | default "2h" | quote }}
+            # L1 template revalidation: poll persisted due state frequently;
+            # enqueue at most one active revalidation job per template.
+            - name: WORKER_L1_VALIDATION_ENABLED
+              value: {{ .Values.worker.l1Validation.enabled | quote }}
+            - name: WORKER_L1_VALIDATION_INTERVAL
+              value: {{ .Values.worker.l1Validation.validationInterval | default "168h" | quote }}
+            - name: WORKER_L1_VALIDATION_SCHEDULER_INTERVAL
+              value: {{ .Values.worker.l1Validation.schedulerInterval | default "5m" | quote }}
+            # Template health checks (roadmap J-2). Structural check on every
+            # student-visible template each cycle + one rotating deep check.
+            # Leader-gated, so only one replica runs it. Off by default so
+            # deployers opt in rather than hitting vCenter by surprise.
+            - name: WORKER_TEMPLATE_HEALTH_ENABLED
+              value: {{ .Values.worker.templateHealth.enabled | default false | quote }}
+            - name: WORKER_TEMPLATE_HEALTH_INTERVAL
+              value: {{ .Values.worker.templateHealth.interval | default "12h" | quote }}
+            - name: WORKER_TEMPLATE_HEALTH_DEEP_TIMEOUT
+              value: {{ .Values.worker.templateHealth.deepTimeout | default "10m" | quote }}
+            - name: WORKER_TEMPLATE_HEALTH_CONFIRMATION_BACKOFF
+              value: {{ .Values.worker.templateHealth.confirmationBackoff | default "5m" | quote }}
+            - name: WORKER_TEMPLATE_HEALTH_CONFIRMATION_RECONCILE_INTERVAL
+              value: {{ .Values.worker.templateHealth.confirmationReconcileInterval | default "1m" | quote }}
+            # Idle-VM suspend evaluator. dryRun is the safety switch: when true
+            # the evaluator logs what it WOULD suspend and makes no vCenter
+            # mutations. Previously these were settable only via
+            # `kubectl set env`, which a helm upgrade silently reverts — so an
+            # armed evaluator would quietly disarm itself on the next deploy.
+            #
+            # NOTE: deliberately no `| default` filter here. Helm's `default`
+            # treats boolean false as empty, so `dryRun | default true` would
+            # render "true" even when dryRun is explicitly false — silently
+            # making it impossible to arm. An empty value is safe anyway: the
+            # worker defaults to dry-run ON when WORKER_IDLE_EVALUATOR_DRY_RUN
+            # is unset, enabled when *_ENABLED is unset, and 15m when *_INTERVAL
+            # is unset.
+            - name: WORKER_IDLE_EVALUATOR_ENABLED
+              value: {{ .Values.worker.idleEvaluator.enabled | quote }}
+            - name: WORKER_IDLE_EVALUATOR_DRY_RUN
+              value: {{ .Values.worker.idleEvaluator.dryRun | quote }}
+            - name: WORKER_IDLE_EVALUATOR_INTERVAL
+              value: {{ .Values.worker.idleEvaluator.interval | quote }}
+            # Pushgateway job label for the template/image pipeline metric
+            # families. Keep distinct from WORKER_PUSHGATEWAY_JOB so the
+            # destroy_failed pusher and the pipeline collector don't overwrite
+            # each other's series.
+            - name: WORKER_PIPELINE_PUSHGATEWAY_JOB
+              value: {{ .Values.worker.pipelinePushgatewayJob | default "crucible_pipeline" | quote }}
+            {{- if .Values.objectstore.enabled }}
+            # The image_import job streams the staged object out of MinIO and
+            # into vCenter, so the worker needs the same credentials the API
+            # uses to presign. See api-deployment.yaml for why useSSL is not
+            # piped through `default`.
+            - name: OBJECTSTORE_ENDPOINT
+              value: {{ .Values.objectstore.endpoint | quote }}
+            - name: OBJECTSTORE_BUCKET
+              value: {{ .Values.objectstore.bucket | quote }}
+            - name: OBJECTSTORE_PREFIX
+              value: {{ .Values.objectstore.prefix | quote }}
+            - name: OBJECTSTORE_USE_SSL
+              value: {{ .Values.objectstore.useSSL | quote }}
+            - name: OBJECTSTORE_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.objectstore }}
+                  key: access-key
+            - name: OBJECTSTORE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.objectstore }}
+                  key: secret-key
+            {{- end }}
+            # Pool cap for the worker's pgxpool. The worker claims jobs and
+            # holds short-lived work-lease connections from the pool (no
+            # dedicated advisory-lock session). Platform budget: api(20) +
+            # engine(20) + 4 × workers(5) = 60 / 100.
+            - name: DB_MAX_CONNS
+              value: {{ .Values.worker.dbMaxConns | default 5 | quote }}
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+      affinity:
+        podAntiAffinity:
+          # Required: Wave D keeps two workers on distinct nodes. Soft
+          # preference previously allowed both replicas on one host.
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: selfservice-api
+                  app.kubernetes.io/component: provision-worker
+              topologyKey: kubernetes.io/hostname

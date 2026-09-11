@@ -1,0 +1,33 @@
+{{- /*
+  PodDisruptionBudget for the provision-worker Deployment.
+
+  With N replicas, keep at least N-1 available during voluntary disruptions
+  (node drain, rolling upgrade) so job claiming and leader election can
+  continue. A single-replica Deployment uses maxUnavailable: 1 so the only
+  pod is not permanently stuck behind minAvailable > replicas (the failure
+  mode that blocked worker rollouts while replicaCount was still 1 and this
+  PDB hard-coded minAvailable: 2).
+
+  NOTE: this PDB only covers voluntary disruptions (kubectl drain, cluster
+  upgrades, Helm rolling restarts). It does not prevent involuntary pod
+  eviction due to OOMKill or node failure.
+*/}}
+{{- $replicas := int .Values.replicaCount.worker }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .Release.Name }}-worker-pdb
+  labels:
+    app.kubernetes.io/name: selfservice-api
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: provision-worker
+spec:
+  {{- if le $replicas 1 }}
+  maxUnavailable: 1
+  {{- else }}
+  minAvailable: {{ sub $replicas 1 }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: selfservice-api
+      app.kubernetes.io/component: provision-worker

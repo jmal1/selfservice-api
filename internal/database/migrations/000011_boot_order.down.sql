@@ -1,0 +1,1 @@
+ALTER TABLE pod_vms DROP COLUMN IF EXISTS boot_order;

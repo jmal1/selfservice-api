@@ -1,0 +1,230 @@
+name: Build and Push Images
+
+on:
+  push:
+    branches: [main]
+  # Stacked pull requests target parent branches, so PR CI intentionally has no target-branch filter.
+  pull_request: {}
+
+# Cancel in-flight PR runs for the same pull request number. Main pushes get a
+# unique run_id-based group so no distinct default-branch SHA can be canceled
+# or replaced while still keeping PR retries cancelable.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_BASE: ghcr.io/${{ github.repository_owner }}/selfservice
+
+permissions:
+  contents: read
+  packages: write
+  pull-requests: read
+
+jobs:
+  # `changes` runs dorny/paths-filter against the diff and produces two
+  # outputs the rest of the workflow keys off:
+  #   - components: JSON array of matrix components that have to rebuild.
+  #     Every main push builds all five so the exact merge commit has a complete
+  #     full-SHA deployment image set; pull requests remain path-filtered.
+  #   - run_tests: 'true' if any Go source / module file changed.
+  # See .github/path-filters.yaml for the actual path lists.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      components: ${{ steps.matrix.outputs.components }}
+      run_tests: ${{ steps.matrix.outputs.run_tests }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Filter changed paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: .github/path-filters.yaml
+
+      - name: Compute matrix
+        id: matrix
+        env:
+          CHANGES: ${{ steps.filter.outputs.changes }}
+          GO_TESTS: ${{ steps.filter.outputs.go-tests }}
+        run: |
+          set -euo pipefail
+          all='["api-gateway","provision-worker","crucible-engine","synthetic-api-monitor","crucible-runner"]'
+          components=$(.github/scripts/compute-image-matrix.sh "$GITHUB_EVENT_NAME" "$CHANGES" "$all")
+          echo "components selected: $components" >&2
+          echo "components=$components" >> "$GITHUB_OUTPUT"
+          echo "run_tests=$GO_TESTS" >> "$GITHUB_OUTPUT"
+
+  build-pr:
+    name: Build PR images
+    needs: changes
+    if: |
+      github.event_name == 'pull_request' &&
+      needs.changes.outputs.components != '[]'
+    runs-on: ubuntu-latest
+    strategy: &build_strategy
+      fail-fast: false
+      matrix:
+        component: ${{ fromJSON(needs.changes.outputs.components) }}
+    steps: &build_steps
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve Dockerfile + target
+        id: dockerfile
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.component }}" = "crucible-runner" ]; then
+            echo "file=deploy/runner/Dockerfile" >> "$GITHUB_OUTPUT"
+            echo "target=" >> "$GITHUB_OUTPUT"
+          else
+            echo "file=Dockerfile" >> "$GITHUB_OUTPUT"
+            echo "target=${{ matrix.component }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_BASE }}-${{ matrix.component }}
+          tags: |
+            type=raw,value=${{ github.sha }}
+            type=sha,prefix=
+            type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ steps.dockerfile.outputs.file }}
+          target: ${{ steps.dockerfile.outputs.target }}
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Record immutable deployment digest
+        if: github.event_name == 'push'
+        env:
+          COMPONENT: ${{ matrix.component }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          REPOSITORY: ${{ env.IMAGE_BASE }}-${{ matrix.component }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          printf '%s\t%s\t%s\t%s\n' \
+            "$COMPONENT" "$REPOSITORY" "$DIGEST" "$SOURCE_SHA" \
+            > image-digest.tsv
+
+      - name: Upload immutable deployment digest
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-digest-${{ matrix.component }}
+          path: image-digest.tsv
+          if-no-files-found: error
+          retention-days: 90
+
+  build:
+    name: Build release images
+    needs: [changes, test]
+    if: |
+      always() &&
+      github.event_name == 'push' &&
+      needs.changes.outputs.components != '[]' &&
+      (needs.test.result == 'success' || needs.test.result == 'skipped')
+    runs-on: ubuntu-latest
+    strategy: *build_strategy
+    steps: *build_steps
+
+  test:
+    name: Go build + vet + wiki + race tests
+    needs: changes
+    if: needs.changes.outputs.run_tests == 'true'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: selfservice
+          POSTGRES_DB: selfservice_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U selfservice -d selfservice_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://selfservice@localhost:5432/selfservice_test?sslmode=disable
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Public fingerprint hygiene
+        shell: pwsh
+        run: ./scripts/check-public-fingerprints.ps1
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # The instructor wiki at /wiki is served from internal/docs/_bundle, which
+      # embeds both the markdown docs AND source files like routes.go. Editing a
+      # seed (or a bundled source file) without re-running `make wiki-bundle`
+      # silently ships instructors and AI authoring agents a stale reference.
+      # This guard was documented as existing but was never actually wired into CI.
+      - name: Verify wiki bundle
+        run: make verify-wiki
+
+      # -short skips deploy.sh harness, vcsim, helm template, and Postgres integration.
+      - name: "Fast fail: short Go suite"
+        run: go test ./... -short -count=1
+
+      - name: Test
+        run: go test ./... -v -race
+
+  ci-required:
+    if: always() && github.event_name == 'pull_request'
+    needs: [changes, build-pr, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require successful PR CI
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          BUILD_PR_RESULT: ${{ needs.build-pr.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          set -euo pipefail
+          test "$CHANGES_RESULT" = "success"
+          for result in "$BUILD_PR_RESULT" "$TEST_RESULT"; do
+            case "$result" in
+              success|skipped) ;;
+              *) echo "required PR job failed or was cancelled: $result" >&2; exit 1 ;;
+            esac
+          done
