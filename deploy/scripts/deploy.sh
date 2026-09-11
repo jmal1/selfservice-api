@@ -3432,6 +3432,61 @@ verify_external_candidate_images() {
   done < "$external_map"
 }
 
+seed_runnable_cronjob_health_evidence() {
+  # After atomic containment deletes CronJob-owned Jobs, runnable CronJobs have
+  # no retained health evidence. Create the same contained deploy-verify Jobs
+  # verify_external_candidate_images would create, before workload_health runs.
+  local inventory=$1
+  local image_map=$2
+  local kind name container_type container_name expected job_name suspended
+  local seen_tmp
+  seen_tmp="$(mktemp)"
+  while IFS=$'\t' read -r kind name; do
+    [ "$kind" = CronJob ] || continue
+    if ! grep -Fxq "$name" "$seen_tmp"; then
+      printf '%s\n' "$name" >> "$seen_tmp"
+    else
+      continue
+    fi
+    if ! job_name="$(latest_cronjob_job "$name")"; then
+      rm -f "$seen_tmp"
+      echo "ERROR: failed to list retained Jobs for CronJob/$name while seeding health evidence." >&2
+      return 1
+    fi
+    if [ -n "$job_name" ]; then
+      continue
+    fi
+    if ! suspended="$(kubectl get "CronJob/$name" -n "$NAMESPACE" -o jsonpath='{.spec.suspend}')"; then
+      rm -f "$seen_tmp"
+      echo "ERROR: failed to read CronJob/$name suspension state while seeding health evidence." >&2
+      return 1
+    fi
+    if [ "$suspended" = true ]; then
+      continue
+    fi
+    if ! row="$(
+      awk -F '\t' -v name="$name" '
+        $1 == "CronJob" && $2 == name && $3 == "containers" {
+          print $3 "\t" $4 "\t" $5
+          found++
+        }
+        END { exit found == 1 ? 0 : 3 }
+      ' "$image_map"
+    )"; then
+      rm -f "$seen_tmp"
+      echo "ERROR: CronJob/$name has no unique containers image pin in the candidate image map." >&2
+      return 1
+    fi
+    IFS=$'\t' read -r container_type container_name expected <<< "$row"
+    echo "==> seeding CronJob/$name health evidence via contained deploy-verify Job" >&2
+    if ! verify_candidate_cronjob_image "$name" "$container_type" "$container_name" "$expected"; then
+      rm -f "$seen_tmp"
+      return 1
+    fi
+  done < <(cut -f1,2 "$inventory" | sort -u)
+  rm -f "$seen_tmp"
+}
+
 verify_deployed_candidate() {
   local revision status tmp_dir manifest inventory expected_canonical deployed_canonical workload_health_status
   if ! read -r revision status <<< "$(latest_helm_revision_record)"; then
@@ -3471,6 +3526,14 @@ verify_deployed_candidate() {
     return 1
   fi
   if ! require_no_active_jobs; then
+    return 1
+  fi
+  # Atomic containment / evidence reset deletes CronJob-owned Jobs. Runnable
+  # CronJobs (janitor/runner/api-monitor) then fail workload_health before
+  # verify_external_candidate_images can recreate deploy-verify Jobs. Seed
+  # missing evidence first while preserving warmer rollout-before-ImageID order.
+  if ! seed_runnable_cronjob_health_evidence "$inventory" "$CANDIDATE_IMAGE_MAP"; then
+    echo "ERROR: could not seed CronJob health evidence after atomic upgrade." >&2
     return 1
   fi
   workload_health "$inventory"
