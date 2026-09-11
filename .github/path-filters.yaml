@@ -114,3 +114,6 @@ go-tests:
   - '.github/scripts/**'
   - '.github/path-filters.yaml'
   - '.github/workflows/ci.yaml'
+
+# verified-merge noop 2026-09-11T10:50:35.2416900-07:00 — forces shared channel rebuild
+
