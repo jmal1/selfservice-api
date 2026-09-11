@@ -1,0 +1,3 @@
+# Don't commit downloaded subcharts — Chart.lock pins versions, deploy.sh
+# runs `helm dep build` to fetch them on each deploy.
+charts/

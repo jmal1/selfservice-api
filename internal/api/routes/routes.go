@@ -1,0 +1,370 @@
+package routes
+
+import (
+	"github.com/go-chi/chi/v5"
+	chimiddleware "github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
+
+	"github.com/jmal1/selfservice-api/internal/api/handlers"
+	"github.com/jmal1/selfservice-api/internal/auth"
+	"github.com/jmal1/selfservice-api/internal/database"
+	"github.com/jmal1/selfservice-api/internal/middleware"
+	"github.com/jmal1/selfservice-api/internal/models"
+)
+
+// Setup creates the chi router with all routes.
+func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Queries, allowedOrigins []string) *chi.Mux {
+	r := chi.NewRouter()
+
+	// Global middleware
+	r.Use(chimiddleware.RequestID)
+	r.Use(chimiddleware.RealIP)
+	// Recover is our JSON-emitting panic handler; it replaces chi's built-in
+	// Recoverer (which writes a bodyless text/plain 500 the UI can't parse).
+	r.Use(middleware.Recover(nil))
+	r.Use(cors.Handler(cors.Options{
+		AllowedOrigins:   allowedOrigins,
+		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"Accept", "Content-Type", "Authorization"},
+		AllowCredentials: true,
+		MaxAge:           300,
+	}))
+
+	// Health check (unauthenticated)
+	r.Get("/healthz", h.Health)
+	r.Get("/readyz", h.Health)
+
+	// WebSocket routes — mounted before Logger/Compress which break http.Hijacker
+	r.Route("/api/v1/pods/{podID}/vms/{vmID}/console", func(r chi.Router) {
+		r.Use(middleware.Auth(authProvider))
+		r.Get("/ws", h.VMConsoleWS)
+	})
+
+	// Template build-VM console WebSocket — instructors building a
+	// template need browser console access to the staging VM while it
+	// is in provisioning/configuring/generalizing. Auth + state gating
+	// happen inside the handler (see templates_console.go).
+	// RequireRole(RoleInstructor) here keeps unauth/non-instructor
+	// users out at the route layer; per-template ownership check is in
+	// the handler.
+	//
+	// IMPORTANT: register as a single Get(), NOT chi.Route(prefix), so
+	// chi doesn't take ownership of the /...templates/{id}/console/*
+	// subtree. The sibling /ticket endpoint lives in the Logger group
+	// below and would be shadowed otherwise.
+	r.With(
+		middleware.Auth(authProvider),
+		middleware.RequireRole(models.RoleInstructor),
+	).Get("/api/v1/admin/templates/{templateID}/console/ws", h.TemplateBuildConsoleWS)
+
+	// Run progress WebSocket — streams live workflow_start/action_complete/
+	// workflow_complete events for a given run. Replaces 2s polling.
+	r.Route("/api/v1/runs/{runID}", func(r chi.Router) {
+		r.Use(middleware.Auth(authProvider))
+		r.Get("/progress/ws", h.RunProgressWS)
+	})
+
+	// Non-WebSocket routes get Logger + Compress
+	r.Group(func(r chi.Router) {
+		r.Use(chimiddleware.Logger)
+		r.Use(chimiddleware.Compress(5))
+
+		// Auth routes (unauthenticated)
+		r.Route("/auth", func(r chi.Router) {
+			r.Get("/login", authProvider.LoginHandler)
+			r.Get("/callback", authProvider.CallbackHandler)
+			r.Post("/logout", authProvider.LogoutHandler)
+
+			// Authenticated
+			r.Group(func(r chi.Router) {
+				r.Use(middleware.Auth(authProvider))
+				r.Get("/me", h.GetMe)
+			})
+		})
+
+		// API v1 (authenticated)
+		r.Route("/api/v1", func(r chi.Router) {
+			r.Use(middleware.Auth(authProvider))
+			r.Use(h.ProvisioningAdmission)
+			r.Use(middleware.AuditRequests(db))
+
+			r.Get("/provisioning/status", h.GetProvisioningStatus)
+
+			// Pods
+			r.Route("/pods", func(r chi.Router) {
+				r.Get("/", h.ListPods)
+				r.Post("/", h.CreatePod)
+				r.Get("/{podID}", h.GetPod)
+				r.Delete("/{podID}", h.DeletePod)
+
+				// VM sub-routes
+				r.Post("/{podID}/vms", h.AddVM)
+				r.Delete("/{podID}/vms/{vmID}", h.DeleteVM)
+
+				// VM power operations
+				r.Post("/{podID}/vms/{vmID}/start", h.VMPowerAction)
+				r.Post("/{podID}/vms/{vmID}/stop", h.VMPowerAction)
+				r.Post("/{podID}/vms/{vmID}/restart", h.VMPowerAction)
+				r.Post("/{podID}/vms/{vmID}/reset", h.VMPowerAction)
+
+				// VM snapshot operations
+				r.Get("/{podID}/vms/{vmID}/snapshots", h.ListVMSnapshots)
+				r.Post("/{podID}/vms/{vmID}/snapshots", h.CreateVMSnapshot)
+				r.Post("/{podID}/vms/{vmID}/snapshots/revert-initial", h.RevertToInitial)
+				r.Post("/{podID}/vms/{vmID}/snapshots/{snapID}/revert", h.RevertToSnapshot)
+				r.Delete("/{podID}/vms/{vmID}/snapshots/{snapID}", h.DeleteVMSnapshot)
+
+				// Pod expiration
+				r.Post("/{podID}/extend", h.ExtendPod)
+
+				// Testing (assessments)
+				r.Route("/{podID}/testing", func(r chi.Router) {
+					r.Get("/", h.GetTestingDashboard)
+					r.Post("/run", h.CreateTestingRun)
+					r.Get("/runs", h.ListTestingRuns)
+					r.Get("/runs/{runID}", h.GetTestingRun)
+					r.Post("/runs/{runID}/cancel", h.CancelTestingRun)
+				})
+			})
+
+			// Templates
+			r.Get("/templates", h.ListTemplates)
+
+			// Blueprints
+			r.Route("/blueprints", func(r chi.Router) {
+				r.Get("/", h.ListBlueprints)
+				r.Get("/{blueprintID}", h.GetBlueprint)
+				r.Post("/{blueprintID}/deploy", h.DeployBlueprint)
+			})
+
+			// Jobs
+			r.Get("/jobs", h.ListMyJobs)
+			r.Get("/jobs/{jobID}/status", h.GetJobStatus)
+
+			// Wiki — instructor + admin authoring reference. Embedded bundle
+			// is built by cmd/wiki-bundler (see make wiki-bundle). Gated to
+			// instructor+ since the docs include implementation details
+			// (action library bash, validator internals) that students
+			// shouldn't need and shouldn't be tempted to mine.
+			r.Route("/wiki", func(r chi.Router) {
+				r.Use(middleware.RequireRole(models.RoleInstructor))
+				r.Get("/index", h.WikiIndex)
+				r.Get("/bundle.zip", h.WikiZip)
+				r.Get("/page/*", h.WikiPage)
+			})
+
+			// Student Guide — a deliberately filtered view of the shared
+			// documentation bundle. This remains inside the authenticated API
+			// group, but does not inherit the instructor-only Wiki gate.
+			r.Route("/student-guide", func(r chi.Router) {
+				r.Get("/index", h.StudentGuideIndex)
+				r.Get("/page/*", h.StudentGuidePage)
+			})
+
+			// All /admin/templates/* routes live here. The wizard subset is
+			// open to instructors (lab-instructors AuthN group); the CRUD
+			// subset is admin-only. We must declare them in one chi.Route
+			// because chi's Mount takes exclusive ownership of the prefix —
+			// registering /templates routes in the sibling /admin block
+			// would be silently shadowed and return 404.
+			r.Route("/admin/templates", func(r chi.Router) {
+				r.Use(middleware.RequireRole(models.RoleInstructor))
+
+				// Template health status — all student-visible templates with
+				// their last check timestamps and pass/fail state. The checker
+				// runs every 12h; rows appear here after the first cycle.
+				// Protected at RoleInstructor: students must never read this.
+				// The template_health_status_rbac synthetic check asserts a 403
+				// for student callers continuously.
+				r.Get("/health", h.AdminListTemplateHealth)
+
+				// Wizard (T4) — instructor-accessible.
+				r.Post("/draft", h.AdminCreateTemplateDraft)
+				r.Get("/guest-os-catalog", h.AdminListGuestOSCatalog)
+				r.Get("/{templateID}/wizard-state", h.AdminGetWizardState)
+				r.Post("/{templateID}/provision", h.AdminProvisionTemplate)
+				r.Post("/{templateID}/preflight", h.AdminPreflightTemplate)
+				r.Post("/{templateID}/generalize", h.AdminGeneralizeTemplate)
+				r.Post("/{templateID}/publish", h.AdminPublishTemplate)
+				r.Post("/{templateID}/unpublish", h.AdminUnpublishTemplate)
+				r.Post("/{templateID}/cancel", h.AdminCancelTemplate)
+				r.Post("/{templateID}/retry", h.AdminRetryTemplate)
+
+				// Staging-VM power controls. The staging VM is a raw vCenter
+				// moref (tmpl.vcenter_vm_id), not a pod VM, so this is separate
+				// from the pod-power path. Body: {"action":"start|stop|restart|reset"}.
+				r.Post("/{templateID}/power", h.AdminTemplatePowerAction)
+
+				r.Get("/{templateID}/resolved-credentials", h.AdminGetResolvedCredentials)
+
+				// Build-VM console ticket (G4 / Phase G). The WS endpoint
+				// itself is registered above in the pre-Logger WebSocket
+				// section; this just hands the UI the URL + metadata.
+				r.Get("/{templateID}/console/ticket", h.TemplateBuildConsoleTicket)
+
+				// Template CRUD + access + playlists — instructor-accessible
+				// (lab-instructors get the full admin surface; the block guard
+				// above already requires RoleInstructor).
+				r.Get("/", h.AdminListTemplates)
+				r.Post("/", h.AdminCreateTemplate)
+				r.Patch("/{templateID}", h.AdminUpdateTemplate)
+				r.Delete("/{templateID}", h.AdminDeleteTemplate)
+				r.Post("/{templateID}/access", h.AdminSetTemplateAccess)
+				r.Get("/{templateID}/dependents", h.AdminListTemplateDependents)
+				r.Get("/{templateID}/playlists", h.AdminGetTemplatePlaylists)
+				r.Post("/{templateID}/playlists", h.AdminSetTemplatePlaylists)
+				r.Get("/{templateID}/source-replicas", h.AdminListTemplateSourceReplicas)
+				r.Post("/{templateID}/source-replicas", h.AdminCreateTemplateSourceReplica)
+				r.Delete("/{templateID}/source-replicas/{replicaID}", h.AdminDeleteTemplateSourceReplica)
+				r.Post("/{templateID}/source-replica-builds", h.AdminCreateTemplateReplicaBuild)
+				r.Get("/{templateID}/source-replica-builds/{buildID}", h.AdminGetTemplateReplicaBuild)
+				r.Post("/{templateID}/source-replica-builds/{buildID}/retry", h.AdminRetryTemplateReplicaBuild)
+				r.Post("/{templateID}/source-replica-builds/{buildID}/cleanup", h.AdminCleanupTemplateReplicaBuild)
+				r.Post("/{id}/pin", h.AdminSetTemplatePin)
+				r.Delete("/{id}/pin", h.AdminUnpinTemplate)
+				r.Post("/reorder", h.AdminReorderTemplates)
+			})
+
+			// Admin routes.
+			//
+			// The block guard is RoleInstructor: lab-instructors get the full
+			// admin surface (users, templates, blueprints, actions, workflows,
+			// playlists, runs, VLAN pool, jobs, health). The only endpoints that
+			// remain admin-only are the Audit Log and active-Sessions listings,
+			// carved out in the RoleAdmin group below. RequireRole is level-based
+			// (RoleInstructor=2 < RoleAdmin=3), so admins still pass everywhere.
+			r.Route("/admin", func(r chi.Router) {
+				r.Use(middleware.RequireRole(models.RoleInstructor))
+
+				// Audit log + active sessions — admin only. Instructor actions
+				// are still recorded in the audit log by each handler; instructors
+				// just cannot read it.
+				r.Group(func(r chi.Router) {
+					r.Use(middleware.RequireRole(models.RoleAdmin))
+					r.Get("/audit", h.AdminListAuditLog)
+					r.Get("/audit/search", h.AdminSearchAuditLog)
+					r.Get("/sessions", h.AdminListSessions)
+				})
+
+				// Platform health dashboard — probes all backend dependencies
+				// (db, nats, vcenter, opnsense, engine) in parallel with a 5s
+				// per-probe timeout. See internal/api/handlers/admin_health.go.
+				r.Get("/health", h.AdminHealth)
+
+				r.Get("/users", h.AdminListUsers)
+				r.Patch("/users/{userID}/quotas", h.AdminUpdateQuotas)
+
+				// NOTE: /admin/templates/* is registered in a dedicated
+				// chi.Route block above (chi Mount owns the entire prefix).
+
+				// vCenter folder browser for template registration UI (cached 5 min).
+				r.Get("/vcenter/templates-folder", h.AdminListVCenterTemplatesFolder)
+
+				// ISO catalog: browses the ISO datastore so the template
+				// wizard can offer images that were placed there outside
+				// Crucible, alongside ones uploaded via /admin/images.
+				//
+				// This lives under /admin/vcenter/* (next to its sibling
+				// above) rather than under /admin/templates/vcenter/* because
+				// the /admin/templates prefix is a separate chi.Route block —
+				// see the NOTE above and the comment on that block.
+				r.Get("/vcenter/isos", h.AdminListVCenterISOs)
+
+				// OVA catalog: the discovery surface for source_type=ovf.
+				// Imported OVAs never appear in /vcenter/isos (they are not
+				// mountable media), so this is the only place the
+				// image_uploads.vcenter_vm_id needed for source_ref is
+				// exposed.
+				r.Get("/vcenter/ovas", h.AdminListVCenterOVAs)
+
+				// Image uploads (Epic A): browser → MinIO → vCenter.
+				//
+				// Nested inside this block on purpose so it inherits the
+				// RequireRole(RoleInstructor) guard above. Students must
+				// never reach these — the `image_upload_rbac` synthetic
+				// asserts a 403 for the student role continuously.
+				r.Route("/images", func(r chi.Router) {
+					r.Get("/", h.AdminListImages)
+					r.Post("/", h.AdminCreateImageUpload)
+					r.Get("/{imageID}", h.AdminGetImage)
+					r.Delete("/{imageID}", h.AdminDeleteImage)
+					r.Post("/{imageID}/complete", h.AdminCompleteImageUpload)
+					r.Post("/{imageID}/import", h.AdminImportImage)
+				})
+
+				r.Get("/jobs", h.AdminListJobs)
+
+				r.Get("/vlans", h.AdminListVLANPool)
+				r.Post("/vlans", h.AdminAddVLAN)
+				r.Patch("/vlans/{vlanID}", h.AdminUpdateVLAN)
+				r.Delete("/vlans/{vlanID}", h.AdminRemoveVLAN)
+
+				// Blueprints
+				r.Get("/blueprints", h.AdminListBlueprints)
+				r.Post("/blueprints", h.AdminCreateBlueprint)
+				r.Put("/blueprints/{blueprintID}", h.AdminUpdateBlueprint)
+				r.Delete("/blueprints/{blueprintID}", h.AdminDeleteBlueprint)
+				r.Post("/blueprints/{blueprintID}/access", h.AdminSetBlueprintAccess)
+				r.Post("/blueprints/{id}/pin", h.AdminSetBlueprintPin)
+				r.Delete("/blueprints/{id}/pin", h.AdminUnpinBlueprint)
+				r.Post("/blueprints/reorder", h.AdminReorderBlueprints)
+
+				// Admin pod management
+				r.Post("/pods/{podID}/extend", h.AdminExtendPod)
+				r.Post("/pods/{podID}/finalize-orphaned-destroy", h.AdminFinalizeOrphanedPodDestroy)
+
+				// Workflows (assessment scripts)
+				r.Route("/workflows", func(r chi.Router) {
+					r.Get("/", h.AdminListWorkflows)
+					r.Post("/", h.AdminCreateWorkflow)
+					r.Post("/import", h.AdminImportWorkflows)
+					r.Get("/export", h.AdminExportWorkflows)
+					r.Get("/{workflowID}", h.AdminGetWorkflow)
+					r.Put("/{workflowID}", h.AdminUpdateWorkflow)
+					r.Delete("/{workflowID}", h.AdminDeleteWorkflow)
+					r.Post("/{workflowID}/submit", h.AdminSubmitWorkflow)
+					r.Post("/{workflowID}/approve", h.AdminApproveWorkflow)
+					r.Post("/{workflowID}/activate", h.AdminActivateWorkflow)
+				})
+
+				// Actions (reusable action library)
+				r.Route("/actions", func(r chi.Router) {
+					r.Get("/", h.AdminListActions)
+					r.Post("/", h.AdminCreateAction)
+					r.Get("/{actionID}", h.AdminGetAction)
+					r.Put("/{actionID}", h.AdminUpdateAction)
+					r.Delete("/{actionID}", h.AdminDeleteAction)
+				})
+
+				// Script validator (shellcheck-backed) — used by the workflow
+				// + action editor to surface lint findings as Monaco markers.
+				r.Post("/scripts/validate", h.AdminValidateScript)
+
+				// Playlists
+				r.Route("/playlists", func(r chi.Router) {
+					r.Get("/", h.AdminListPlaylists)
+					r.Post("/", h.AdminCreatePlaylist)
+					r.Get("/{playlistID}", h.AdminGetPlaylist)
+					r.Put("/{playlistID}", h.AdminUpdatePlaylist)
+					r.Delete("/{playlistID}", h.AdminDeletePlaylist)
+				})
+
+				// Template playlist assignment is registered above in the
+				// dedicated /admin/templates chi.Route block (chi Mount owns
+				// the prefix, so sibling-block /templates/... routes would
+				// be silently shadowed).
+
+				// Blueprint VM playlist overrides
+				r.Post("/blueprints/{blueprintID}/vm-playlists", h.AdminSetBlueprintVMPlaylists)
+				r.Get("/blueprints/{blueprintID}/vm-playlists", h.AdminGetBlueprintVMPlaylistsResolved)
+				r.Delete("/blueprints/{blueprintID}/vm-playlists/{vmSlot}", h.AdminDeleteBlueprintVMPlaylistsOverride)
+
+				// Testing runs (admin view)
+				r.Get("/runs", h.AdminListRuns)
+				r.Get("/runs/{runID}", h.AdminGetRun)
+			})
+		})
+	}) // close r.Group for Logger/Compress
+
+	return r
+}

@@ -1,0 +1,10 @@
+DROP INDEX IF EXISTS idx_actions_slug;
+DROP INDEX IF EXISTS idx_actions_library;
+ALTER TABLE actions DROP COLUMN IF EXISTS updated_at;
+ALTER TABLE actions DROP COLUMN IF EXISTS slug;
+ALTER TABLE actions DROP COLUMN IF EXISTS action_category;
+ALTER TABLE actions DROP COLUMN IF EXISTS is_library;
+ALTER TABLE actions DROP COLUMN IF EXISTS output_context;
+ALTER TABLE actions DROP COLUMN IF EXISTS input_context;
+ALTER TABLE actions DROP COLUMN IF EXISTS script;
+ALTER TABLE actions ALTER COLUMN workflow_id SET NOT NULL;

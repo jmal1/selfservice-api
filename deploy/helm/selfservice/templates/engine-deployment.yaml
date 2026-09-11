@@ -1,0 +1,131 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-engine
+  labels:
+    app.kubernetes.io/name: selfservice-api
+    app.kubernetes.io/component: crucible-engine
+spec:
+  replicas: {{ .Values.replicaCount.engine | default 1 }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: selfservice-api
+      app.kubernetes.io/component: crucible-engine
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: selfservice-api
+        app.kubernetes.io/component: crucible-engine
+    spec:
+      serviceAccountName: {{ .Release.Name }}-engine
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: engine
+          image: "{{ .Values.image.engine | default "ghcr.io/jmal1/selfservice-crucible-engine" }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            # Database
+            - name: DB_HOST
+              value: {{ .Values.database.host | quote }}
+            - name: DB_PORT
+              value: {{ .Values.database.port | quote }}
+            - name: DB_NAME
+              value: {{ .Values.database.name | quote }}
+            - name: DB_USER
+              value: {{ .Values.database.user | quote }}
+            - name: DB_SSLMODE
+              value: {{ .Values.database.sslmode | quote }}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.db }}
+                  key: password
+            # NATS
+            - name: NATS_URL
+              value: {{ .Values.natsURL | quote }}
+            # vCenter host allowlist for vmware_tools workflows
+            - name: VCENTER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.vcenter }}
+                  key: vcenter-url
+            - name: VCENTER_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.vcenter }}
+                  key: vcenter-user
+            - name: VCENTER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.vcenter }}
+                  key: vcenter-password
+                  optional: true
+            - name: VCENTER_CLIENT_CERT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.vcenter }}
+                  key: vcenter-client-cert
+                  optional: true
+            - name: VCENTER_CLIENT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.vcenter }}
+                  key: vcenter-client-key
+                  optional: true
+            - name: VCENTER_DATACENTER
+              value: {{ .Values.vcenter.datacenter | quote }}
+            - name: VCENTER_DATASTORE
+              value: {{ .Values.vcenter.datastore | quote }}
+            - name: VCENTER_RESOURCE_POOLS
+              value: {{ .Values.vcenter.resourcePools | quote }}
+            - name: VCENTER_HOSTS
+              value: {{ .Values.vcenter.hosts | quote }}
+            - name: VCENTER_PLACEMENT_RESERVED_MEMORY_MB
+              value: {{ .Values.vcenter.placementReservedMemoryMB | quote }}
+            - name: VCENTER_INSECURE
+              value: {{ .Values.vcenter.insecure | quote }}
+            # Runner provisioner
+            - name: ENGINE_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: RUNNER_IMAGE
+              value: {{ .Values.engine.runnerImage | default "ghcr.io/jmal1/selfservice-crucible-runner:latest" | quote }}
+            - name: RUNNER_NODE
+              value: {{ .Values.engine.runnerNode | default "k3sv03" | quote }}
+            - name: RUNNER_TRUNK_NIC
+              value: {{ .Values.engine.trunkNIC | default "ens34" | quote }}
+            {{- if .Values.imagePullSecrets }}
+            # The runner Job's pod spec is built in Go, not by Helm, so it does
+            # not inherit the imagePullSecrets every other workload gets from
+            # the template above. Crucible's GHCR packages are private: without
+            # this the kubelet requests an anonymous token, gets 401, and the
+            # Job sits in ImagePullBackOff until ActiveDeadlineSeconds kills it.
+            {{- $pullSecretNames := list }}
+            {{- range .Values.imagePullSecrets }}
+            {{- $pullSecretNames = append $pullSecretNames .name }}
+            {{- end }}
+            - name: RUNNER_IMAGE_PULL_SECRETS
+              value: {{ join "," $pullSecretNames | quote }}
+            {{- end }}
+            - name: ENGINE_CALLBACK_URL
+              value: "http://{{ .Release.Name }}-engine.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.engine.port | default 8081 }}"
+            {{- if .Values.engine.pushgatewayURL }}
+            # Without this the engine logs "runner metrics disabled" and every
+            # RunnerMetrics call is a no-op, so runner provisioning duration,
+            # job outcomes, cleanup failures and orphan counts never reach
+            # Prometheus even though the code to record them exists.
+            - name: ENGINE_PUSHGATEWAY_URL
+              value: {{ .Values.engine.pushgatewayURL | quote }}
+            - name: ENGINE_PUSHGATEWAY_JOB
+              value: {{ .Values.engine.pushgatewayJob | default "crucible_engine" | quote }}
+            {{- end }}
+          ports:
+            - name: callback
+              containerPort: {{ .Values.engine.port | default 8081 }}
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.engine.resources | nindent 12 }}

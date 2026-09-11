@@ -1,0 +1,165 @@
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// CreatePodRequest is the API request to create a new pod.
+type CreatePodRequest struct {
+	Name string       `json:"name" validate:"required,min=1,max=64"`
+	VMs  []VMRequest  `json:"vms" validate:"required,min=1,max=10,dive"`
+}
+
+// VMRequest describes a VM to create within a pod.
+type VMRequest struct {
+	TemplateID  uuid.UUID `json:"template_id" validate:"required"`
+	DisplayName string    `json:"display_name" validate:"required,min=1,max=64"`
+	VCPUs       *int      `json:"vcpus,omitempty" validate:"omitempty,min=1,max=16"`
+	RAMMB       *int      `json:"ram_mb,omitempty" validate:"omitempty,min=512,max=65536"`
+	DiskGB      *int      `json:"disk_gb,omitempty" validate:"omitempty,min=10,max=500"`
+}
+
+// AddVMRequest is the API request to add a VM to an existing pod.
+type AddVMRequest struct {
+	TemplateID  uuid.UUID `json:"template_id" validate:"required"`
+	DisplayName string    `json:"display_name" validate:"required,min=1,max=64"`
+	VCPUs       *int      `json:"vcpus,omitempty" validate:"omitempty,min=1,max=16"`
+	RAMMB       *int      `json:"ram_mb,omitempty" validate:"omitempty,min=512,max=65536"`
+	DiskGB      *int      `json:"disk_gb,omitempty" validate:"omitempty,min=10,max=500"`
+}
+
+// CreateTemplateRequest is the admin API request to create a template.
+type CreateTemplateRequest struct {
+	Name            string `json:"name" validate:"required,min=1,max=128"`
+	VCenterTemplate string `json:"vcenter_template" validate:"required"`
+	OSType          string `json:"os_type" validate:"required,oneof=linux windows"`
+	DefaultVCPUs    int    `json:"default_vcpus" validate:"required,min=1,max=16"`
+	DefaultRAMMB    int    `json:"default_ram_mb" validate:"required,min=512,max=65536"`
+	DefaultDiskGB   int    `json:"default_disk_gb" validate:"required,min=10,max=500"`
+	MinVCPUs        int    `json:"min_vcpus" validate:"required,min=1"`
+	MinRAMMB        int    `json:"min_ram_mb" validate:"required,min=512"`
+	Description     string `json:"description,omitempty"`
+	IconURL         string `json:"icon_url,omitempty"`
+	DefaultUsername string `json:"default_username,omitempty"`
+	DefaultPassword string `json:"default_password,omitempty"`
+	// Kind controls the provisioner intake mode. Defaults to
+	// "clone_with_customize" if omitted, matching today's behavior.
+	Kind string `json:"kind,omitempty" validate:"omitempty,oneof=clone_with_customize clone_no_customize registered_existing_vm"`
+	// AssignIP, when explicitly false, tells the provisioner NOT to assign an
+	// IP from the pod VLAN DHCP scope. Defaults to true if omitted. Use false
+	// for registered_existing_vm or for clone_no_customize templates whose
+	// guests manage their own networking.
+	AssignIP *bool `json:"assign_ip,omitempty"`
+	// Visibility controls whether students can see and use this template.
+	// Defaults to 'public' if omitted. Valid values: 'public', 'instructor_only'.
+	Visibility *string `json:"visibility,omitempty" validate:"omitempty,oneof=public instructor_only"`
+}
+
+// UpdateTemplateRequest is the admin API request to update a template.
+type UpdateTemplateRequest struct {
+	Name            *string `json:"name,omitempty" validate:"omitempty,min=1,max=128"`
+	Description     *string `json:"description,omitempty"`
+	IconURL         *string `json:"icon_url,omitempty"`
+	DefaultVCPUs    *int    `json:"default_vcpus,omitempty" validate:"omitempty,min=1,max=16"`
+	DefaultRAMMB    *int    `json:"default_ram_mb,omitempty" validate:"omitempty,min=512,max=65536"`
+	DefaultDiskGB   *int    `json:"default_disk_gb,omitempty" validate:"omitempty,min=10,max=500"`
+	IsActive        *bool   `json:"is_active,omitempty"`
+	DefaultUsername *string `json:"default_username,omitempty"`
+	DefaultPassword *string `json:"default_password,omitempty"`
+	Kind            *string `json:"kind,omitempty" validate:"omitempty,oneof=clone_with_customize clone_no_customize registered_existing_vm"`
+	AssignIP        *bool   `json:"assign_ip,omitempty"`
+	// Visibility controls whether students can see and use this template.
+	// Valid values: 'public', 'instructor_only'. If omitted, the current
+	// value is preserved.
+	Visibility *string `json:"visibility,omitempty" validate:"omitempty,oneof=public instructor_only"`
+	// ExpectedUpdatedAt enables optimistic concurrency control. When set
+	// the database UPDATE will only succeed if the row's current
+	// updated_at matches; otherwise UpdateTemplate returns
+	// ErrTemplateStale so the handler can return HTTP 409. Clients
+	// should populate this from the value they received on the most
+	// recent GET so concurrent admin edits cannot silently overwrite
+	// each other.
+	ExpectedUpdatedAt *time.Time `json:"expected_updated_at,omitempty"`
+}
+
+// UpdateQuotaRequest is the admin API request to update user quotas.
+type UpdateQuotaRequest struct {
+	MaxVCPUs *int `json:"max_vcpus,omitempty" validate:"omitempty,min=1"`
+	MaxRAMMB *int `json:"max_ram_mb,omitempty" validate:"omitempty,min=512"`
+	MaxPods  *int `json:"max_pods,omitempty" validate:"omitempty,min=1"`
+}
+
+// SetTemplateAccessRequest sets access rules for a template.
+type SetTemplateAccessRequest struct {
+	Rules []AccessRule `json:"rules" validate:"required,dive"`
+}
+
+// AccessRule defines who can access a template.
+type AccessRule struct {
+	UserID *uuid.UUID `json:"user_id,omitempty"`
+	Role   *string    `json:"role,omitempty" validate:"omitempty,oneof=student instructor admin"`
+}
+
+// AddVLANRequest is the admin API request to add VLANs to the pool.
+type AddVLANRequest struct {
+	VLANTag   int    `json:"vlan_tag" validate:"required,min=1,max=4094"`
+	Subnet    string `json:"subnet" validate:"required"`
+	HostScope string `json:"host_scope" validate:"required,oneof=all switch1"`
+}
+
+// UpdateVLANRequest is the admin API request to update a VLAN pool entry.
+type UpdateVLANRequest struct {
+	HostScope *string `json:"host_scope,omitempty" validate:"omitempty,oneof=all switch1"`
+}
+
+// PodResponse extends Pod with computed fields for API responses.
+type PodResponse struct {
+	Pod
+	OwnerUsername string `json:"owner_username,omitempty"`
+}
+
+// JobStatusResponse is returned when polling job status.
+type JobStatusResponse struct {
+	ID        uuid.UUID `json:"id"`
+	Type      string    `json:"type"`
+	Status    string    `json:"status"`
+	CreatedAt string    `json:"created_at"`
+	Result    any       `json:"result,omitempty"`
+}
+
+// ResourceUsage shows a user's current resource consumption.
+type ResourceUsage struct {
+	UsedVCPUs    int `json:"used_vcpus"`
+	UsedRAMMB    int `json:"used_ram_mb"`
+	UsedStorageGB int `json:"used_storage_gb"`
+	ActivePods   int `json:"active_pods"`
+	MaxVCPUs     int `json:"max_vcpus"`
+	MaxRAMMB     int `json:"max_ram_mb"`
+	MaxPods      int `json:"max_pods"`
+}
+
+// MeResponse is returned by GET /auth/me.
+type MeResponse struct {
+	User          User          `json:"user"`
+	ResourceUsage ResourceUsage `json:"resource_usage"`
+}
+
+// TemplateDependentVM represents a VM that depends on a template's base disk (linked clone).
+type TemplateDependentVM struct {
+	VMID      string `json:"vm_id"`
+	VMName    string `json:"vm_name"`
+	PodName   string `json:"pod_name"`
+	PodID     string `json:"pod_id"`
+	OwnerName string `json:"owner_name"`
+	Status    string `json:"status"`
+}
+
+// TemplateDependentsResponse is returned by GET /admin/templates/{id}/dependents.
+type TemplateDependentsResponse struct {
+	TemplateID   string                `json:"template_id"`
+	TemplateName string                `json:"template_name"`
+	ActiveVMs    int                   `json:"active_vms"`
+	VMs          []TemplateDependentVM `json:"vms"`
+}

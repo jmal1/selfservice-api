@@ -1,0 +1,513 @@
+# Default values for selfservice portal
+# Secrets come from K8s secrets (Vault integration deferred)
+
+replicaCount:
+  api: 1
+  worker: 1
+  engine: 1
+
+# Independent maintenance controls. API admission and worker claims are
+# separate so operators can start a worker for cleanup while pod deployment,
+# add-VM, and template smoke-clone jobs remain queued. Invalid environment
+# values fail process startup.
+provisioning:
+  enabled: true
+  workerClaimsEnabled: true
+
+image:
+  api: ghcr.io/jmal1/selfservice-api-gateway
+  worker: ghcr.io/jmal1/selfservice-provision-worker
+  engine: ghcr.io/jmal1/selfservice-crucible-engine
+  ui: ghcr.io/jmal1/selfservice-ui
+  tag: "latest"
+  pullPolicy: Always
+
+imagePullSecrets:
+  - name: ghcr-pull-secret
+
+api:
+  port: 8080
+  # Fork-friendly default. Production origins live in private crucible-deploy.
+  allowedOrigins: "https://crucible.example.test"
+  # Pushgateway destination for the API gateway's image-upload lifecycle
+  # metrics. Kept separate from the worker's pipeline job label so the two
+  # processes do not overwrite each other's Pushgateway group.
+  pipelinePushgatewayURL: "http://pushgateway.observability:9091"
+  pipelinePushgatewayJob: "crucible_pipeline_api"
+  provisioningPushgatewayURL: "http://pushgateway.observability:9091"
+  provisioningPushgatewayJob: "crucible_provisioning_admission"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+worker:
+  # The worker bounds in-process durable handoff at two minutes. Leave enough
+  # pod termination grace for that handoff and process teardown.
+  shutdownGracePeriodSeconds: 150
+  # Pushgateway endpoint for the DestroyFailedPusher (drives the
+  # CruciblePodsStuckInDestroyFailed Prometheus alert). Set to empty
+  # string to disable cleanly. Job label is the Pushgateway grouping key.
+  pushgatewayURL: "http://pushgateway.observability:9091"
+  pushgatewayJob: "crucible_provision_worker"
+  # Work leases: exclusive reconcilers claim named Postgres rows with
+  # claim_token + claimed_at heartbeats (no process-wide leader election).
+  # Job claiming remains multi-worker via FOR UPDATE SKIP LOCKED.
+  # DB connection pool cap for the worker's pgxpool.
+  # Workers claim jobs and hold short-lived work-lease connections from the pool.
+  # Platform budget at 4 workers: api(20) + engine(20) + 4×5 = 60/100.
+  dbMaxConns: 5
+  # vCenter orphan reconciler. When enabled, the worker scans
+  # `orphanReconciler.folder` on `orphanReconciler.interval` and:
+  #   - auto-destroys any VM whose linked pod name starts with the synthetic
+  #     prefix AND whose pod is in a terminal state for >= minAge,
+  #   - logs + counts everything else (non-synthetic terminal pods, VMs with
+  #     no pod_vms row at all) via crucible_vcenter_orphans_* metrics so the
+  #     operator can review before any destructive action.
+  # Disabled by default; opt in with enabled: true after observing the
+  # dry-run metric counts for at least one tick.
+  orphanReconciler:
+    enabled: false
+    # Empty falls back to vcenter.vmFolder.
+    folder: ""
+    interval: "1h"
+    minAge: "1h"
+  # Templates-folder orphan reconciler. Destroys leftover wizard staging VMs
+  # for error/draft rows idle longer than inactiveAge, and unmatched disposable
+  # inventory names (tpl-*, crucible-healthcheck-*, smoke-*) with no DB owner.
+  # Never touches owned published/active templates or non-prefixed names.
+  # Disabled by default; prod/full-fleet enable it.
+  templateOrphanReconciler:
+    enabled: false
+    # Empty falls back to vcenter.templatesFolder.
+    folder: ""
+    interval: "1h"
+    inactiveAge: "24h"
+    minAge: "1h"
+  # OPNsense + vlan_pool network reconciler. Converges VLAN/interface/DHCP
+  # state for non-terminal pods and releases vlan_pool allocations for
+  # terminal pods.
+  networkReconciler:
+    enabled: true
+    interval: "5m"
+    # Hard fail-closed inventory bound. The live 2026-08-21 incident reached
+    # 3,088 rules, so 4,096 permits diagnosis/repair without accepting unbounded
+    # memory use or mutation against an implausibly large model.
+    maxFirewallRules: 4096
+    # Delete at most this many exact blank/Crucible-owned generated rules per
+    # pass, apply once, then report cleanup_limited until the next pass.
+    firewallCleanupLimit: 100
+  # Student egress/DNS content policy. Activation is deliberately separate
+  # from the network reconciler and defaults off. Do not enable until the
+  # supervised firewall inventory check is clean and categoryFeedBaseURL is the
+  # validated internal publisher base. Activation also
+  # remains read-only until transactional custom-view ownership and effective
+  # student-source verification are implemented.
+  contentFilter:
+    enabled: false
+    sourceNetwork: "10.100.0.0/16"
+  # Example feed base would be https://student-filter-feed.example.test.
+  # Keep empty until the effective student-source runtime-verification blocker
+  # is closed. The worker expands this base into the deployment-reviewed list set.
+    categoryFeedBaseURL: ""
+    # Permanent deployment-reviewed exceptions only. There is intentionally no
+    # student/instructor mutation API for this list.
+    allowlist: []
+  # Image-upload reconciler: refreshes crucible_image_uploads_stuck and
+  # crucible_template_stuck by scanning for rows wedged in a non-terminal
+  # state past staleThreshold. Feeds the CrucibleImageUploadStuck and
+  # CrucibleTemplateStuck alerts.
+  pipelineReconciler:
+    enabled: true
+    interval: "5m"
+    staleThreshold: "2h"
+  # L1 template revalidation. The scheduler wakes frequently but uses
+  # templates.last_validated_at as its durable clock; validationInterval is the
+  # SLA cadence, not a process-local ticker. Database enqueue dedup permits safe
+  # startup catch-up and leader failover.
+  l1Validation:
+    enabled: true
+    validationInterval: "168h"
+    schedulerInterval: "5m"
+  # Template health checks (roadmap J-2). Every cycle runs a cheap structural
+  # check (vCenter object exists, powered off, has a base-image snapshot,
+  # datastore accessible) against every student-visible template, plus ONE deep
+  # check (clone -> power on -> wait for IP -> destroy) on the
+  # least-recently-deep-checked template. One deep check per cycle is
+  # deliberate: cloning every template every cycle would put recurring heavy
+  # clone load on the NFS 4.1 datastores that have known stale-handle clone
+  # failures, i.e. the check would cause the incidents it exists to detect.
+  #
+  # Anti-flap: a first failed deep cycle schedules a durable confirmation using
+  # fresh clone artifacts. Raw failures never directly drive confirmed status.
+  #
+  # Runs under the template_health work lease (claim_token + heartbeat); with 4
+  # worker replicas an ungated reconciler would run this 4x against vCenter.
+  templateHealth:
+    enabled: false
+    interval: "12h"
+    deepTimeout: "10m"
+    confirmationBackoff: "5m"
+    confirmationReconcileInterval: "1m"
+  # Idle-VM suspend evaluator (Epic S). Suspends pod VMs that have been idle —
+  # BOTH no Crucible console activity AND low vCenter CPU/net — for longer than
+  # the per-pod idle timeout (global default 6h, in the suspend_settings table).
+  #
+  # dryRun is the safety switch, and it defaults to TRUE: the evaluator logs the
+  # VMs it would suspend and makes zero vCenter mutations. Only set it to false
+  # after watching a dry-run cycle report suspended=0 against live data.
+  #
+  # Requires the vCenter role to hold VirtualMachine.Interact.Suspend. Without
+  # it every attempt fails with "Permission to perform this operation was
+  # denied" — and the dry-run cannot detect that, because it never calls
+  # vCenter. CrucibleVMSuspendFailing alerts on exactly that condition.
+  idleEvaluator:
+    enabled: true
+    dryRun: false
+    interval: "15m"
+  # Pushgateway job for the template/image pipeline metric families
+  # (crucible_image_*, crucible_template_*). Separate job label from
+  # pushgatewayJob above so the two metric sets can be scoped
+  # independently in alert rules.
+  pipelinePushgatewayJob: "crucible_pipeline"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+
+# OIDC Configuration (non-secret values). Production IdP URLs live in
+# private crucible-deploy; these defaults are fork-friendly placeholders.
+oidc:
+  issuerURL: "https://authentik.example.test/application/o/selfservice/"
+  redirectURL: "https://crucible.example.test/auth/callback"
+
+# K8s secret names
+secrets:
+  db: selfservice-db-creds
+  jwt: selfservice-jwt-secret
+  oidc: selfservice-oidc
+  vcenter: selfservice-vcenter-creds
+  # Keys: opnsense-url, opnsense-api-key, opnsense-api-secret,
+  # opnsense-ssh-password, and the pinned OpenSSH public key
+  # opnsense-ssh-host-key. Secret material comes from your secret store.
+  opnsense: selfservice-opnsense-creds
+  # Scoped object-store service account for image uploads. Keys: access-key,
+  # secret-key. Deliberately NOT the store root credential; policy should be
+  # bound to the crucible/* prefix of the bucket below.
+  objectstore: selfservice-objectstore-creds
+
+# Object storage used to stage browser uploads of installer ISOs and OVAs
+# before a worker job imports them into vCenter.
+#
+# endpoint MUST be https: the Crucible UI is served over TLS, so a
+# plain-http presigned PUT is blocked by the browser as mixed content.
+# Production endpoint/topology lives in private crucible-deploy.
+objectstore:
+  enabled: true
+  endpoint: "https://s3.example.test"
+  # The bucket is "isos"; Crucible namespaces its objects under the "crucible/"
+  # prefix below, which is also the boundary the service-account policy enforces.
+  bucket: "isos"
+  prefix: "crucible"
+  useSSL: true
+  # Lifetime of a presigned upload URL. Short by design: a leaked URL is
+  # a write primitive into the bucket.
+  presignTTL: "15m"
+  # Per-file upload cap. Size against your object-store free space.
+  maxUploadSize: "16Gi"
+  # Refuse new uploads that would leave less than this much free on the
+  # object-store host, rather than discovering it partway through a multi-GB PUT.
+  minFreeSpace: "20Gi"
+  multipartPartSize: "64Mi"
+
+# vCenter configuration (non-secret values; credentials from K8s secret).
+# Defaults are empty/example placeholders — set real topology via overlay
+# (private crucible-deploy for production).
+vcenter:
+  # SDK URL (also wired into the API Deployment as VCENTER_URL).
+  url: "https://vcenter.example.test/sdk"
+  datacenter: Example-Datacenter
+  datastore: Example-Datastore
+  vmFolder: Example-Student-VMs
+  resourcePools: "/Example-Datacenter/host/Example-Cluster/Resources/Example-Student-VMs"
+  hosts: "esxi1.example.test,esxi2.example.test"
+  # Optional comma-separated host=megabytes map. Every key must also appear in
+  # hosts. Placement leaves this much memory free after planned VM demand.
+  placementReservedMemoryMB: ""
+  insecure: "true"
+  # Inventory path to the vCenter folder that houses source/base template VMs.
+  # Drives the wizard's "Source vCenter VM" dropdown (folder enumeration via
+  # /api/v1/admin/vcenter/templates-folder). Empty disables the endpoint.
+  # NOTE: vCenter inventory paths are CASE-SENSITIVE — match the folder name exactly.
+  templatesFolder: "/Example-Datacenter/vm/templates"
+  # Datastore that holds installer ISOs and OVAs uploaded through
+  # /admin/images, and the folder within it. Separate from
+  # `datastore` (which holds running VM disks).
+  isoDatastore: "Example-ISO-Datastore"
+  isoFolder: "ISOs"
+  # vCenter credentials health probe (OP-1). Set healthPushgatewayURL to the
+  # Pushgateway endpoint and the api-gateway will perform a fresh login
+  # every healthInterval, pushing vsphere_login_success{user=...}. Catches
+  # rotated SSO passwords that would otherwise be masked by cached sessions
+  # for weeks (the failure mode that triggered this probe on 2026-06-07).
+  healthPushgatewayURL: "http://pushgateway.observability:9091"
+  healthInterval: "5m"
+
+# OPNsense configuration (non-secret values; credentials from K8s secret).
+# Use an RFC5737 documentation address in examples; real IP lives in crucible-deploy.
+opnsense:
+  sshHost: "192.0.2.60:22"
+  sshUser: root
+  # Optional explicit OpenSSH host public key. When empty, the worker requires
+  # `opnsense-ssh-host-key` in secrets.opnsense. Generate the value from a
+  # trusted console with: ssh-keyscan -t ed25519 <host> | awk '{print $2, $3}'
+  sshHostKey: ""
+
+# Database connection (non-secret values; password from K8s secret)
+database:
+  host: selfservice-postgresql
+  port: 5432
+  name: selfservice
+  user: selfservice
+  sslmode: disable
+
+# NATS connection
+natsURL: "nats://selfservice-nats:4222"
+
+# Crucible Engine (assessment runner provisioner)
+engine:
+  port: 8081
+  runnerImage: "ghcr.io/jmal1/selfservice-crucible-runner:latest"
+  runnerNode: "example-node"
+  trunkNIC: "ens224"
+  # Hard kill for a runner Job, in seconds. Raised from the original 600
+  # to accommodate a cold Kali image pull on the runner node before the
+  # workflow starts. CrucibleRunnerProvisionSlow alerts well before this trips.
+  # See internal/engine/k8s.go.
+  runnerActiveDeadlineSeconds: 900
+  # Keeps runnerImage resident on runnerNode so a student's assessment never
+  # pays the cold pull, and so kubelet image GC cannot silently evict it.
+  # Costs one idle `sleep infinity` pod on the runner node. See
+  # templates/runner-image-warmer.yaml; deploy.sh must restart it after an
+  # upgrade because the :latest tag leaves the pod spec unchanged.
+  runnerImageWarmer:
+    enabled: true
+  # Pushgateway for runner metrics (provision duration, job outcomes, cleanup
+  # failures, orphaned resources). The engine is a short-lived-job orchestrator
+  # with no scrapable steady state, so it pushes rather than being scraped —
+  # same pattern as the synthetic monitors.
+  #
+  # Leaving this empty is not "metrics off by default"; it silently disables
+  # the entire RunnerMetrics path, which is how runner observability shipped
+  # dead. Keep it set.
+  pushgatewayURL: "http://pushgateway.observability:9091"
+  pushgatewayJob: "crucible_engine"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+# Synthetic API Monitor (customer-emulating runner; see internal/synthetic)
+# Deploys a K8s CronJob that exercises live API routes as a real user and
+# pushes results to Pushgateway → Prometheus → Grafana alerts.
+synthetic:
+  enabled: true
+  suspend: false
+  # Expected response from GET /api/v1/provisioning/status. Keep explicit so
+  # planned maintenance reads green only when the API reports the same state.
+  provisioningExpectedEnabled: true
+  image: ghcr.io/jmal1/selfservice-synthetic-api-monitor
+  imageTag: ""  # defaults to .Values.image.tag
+  # The lifecycle-enabled monitor can consume 10m30s. A 12-minute cadence
+  # leaves 90 seconds before concurrencyPolicy=Forbid would skip the next run.
+  schedule: "*/12 * * * *"
+  baseURL: "https://crucible.example.test"
+  pushgatewayURL: "http://pushgateway.observability:9091"
+  job: "crucible_synthetic_api"
+  layer: "api"
+  username: "synthetic"
+  role: "student"
+  checkTimeout: "30s"
+  # Name of the K8s Secret holding the synthetic user's DB user-id. The
+  # secret MUST contain key `user-id` whose value is the UUID of the
+  # synthetic user row in the users table. Bootstrap via the SQL in
+  # deploy/sql/synthetic-user.sql.
+  secretName: selfservice-synthetic-user
+  # Username claim for the elevated identity. MUST match the users row
+  # created by deploy/sql/synthetic-instructor-user.sql. The UUID itself
+  # lives in the same secret as the primary user, under key
+  # `instructor-user-id`; when that key is absent the elevated checks are
+  # skipped with a warning rather than failing the monitor.
+  instructorUsername: "synthetic-instructor"
+  contentFilter:
+    # A dedicated read-only OPNsense API identity. Secret keys:
+    # opnsense-url, opnsense-api-key, opnsense-api-secret.
+    # Refs are optional while policy is disabled; once worker.contentFilter is
+    # enabled, missing credentials make content_filter_policy red.
+    opnsenseSecretName: selfservice-opnsense-monitor-creds
+    # One generated broad pass is expected per live pod. The /16 source design
+    # can never legitimately require more than 256 distinct /24 pod passes.
+    maxGeneratedRules: 256
+  resources:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+  # Optional pod_lifecycle check (creates+destroys a real pod every cycle).
+  # Disabled by default; enable only after the named template exists.
+  lifecycle:
+    enabled: false
+    template: "synthetic-noop"
+    # readyTimeout: upper bound for waiting on PodStatusActive.
+    # 150 s is calibrated to 24h production telemetry: longest successful
+    # pod_lifecycle run was 125.2 s; 150 s adds a 20% margin. Worst-case
+    # cycle time with 2 attempts, 60 s per-attempt overhead, and 30 s backoff:
+    #   2 × (150 s + 90 s + 60 s) + 30 s = 630 s = 10 m 30 s.
+    # The */12 schedule leaves 90 s before the next run.
+    # TestPodLifecycleRetry_WorstCaseDerivedFromHelmValues enforces this.
+    readyTimeout: "150s"
+    destroyTimeout: "90s"
+    # Retry configuration. maxAttempts=2 means one retry on failure.
+    # Retry is applied ONLY to pod_lifecycle and runner_smoke — cheap
+    # contract checks (healthz, *_403, *_404) remain single-shot.
+    maxAttempts: 2
+    retryBackoff: "30s"
+    # activeDeadlineSeconds for the CronJob pod when lifecycle is enabled.
+    # Must exceed the exact Runner-authorized 630 s cycle.
+    # 900 s (15 min) gives 4.5 min headroom.
+    activeDeadlineSeconds: 900
+  # Standalone orphan-pod janitor (defense-in-depth for synthetic monitoring).
+  # Runs independently of the */12 monitor so synthetic pods don't accumulate
+  # even if pod_lifecycle is broken or paused. The check name is
+  # `synthetic_janitor`; severity is warning. See checks/janitor.go.
+  janitor:
+    enabled: false
+    suspend: false
+    # Daily at 04:17 UTC — offset to avoid colliding with backup or monitor cron.
+    schedule: "17 4 * * *"
+    # Orphan-age cutoff. Pods named synthetic-noop-* and older than this are
+    # destroyed. 1h is conservative given lifecycle runs complete in <5min.
+    maxAge: "1h"
+    # 10 minutes is plenty for listing pods + a handful of DELETEs.
+    activeDeadlineSeconds: 600
+    # Per-check timeout — janitor only does one list + N deletes, but DELETE
+    # is async (returns 202) so we don't poll; 2 minutes is generous.
+    checkTimeout: "120s"
+    # Distinct Pushgateway layer label keeps janitor results separate from
+    # the regular */12 monitor in dashboards and alerts.
+    layer: "janitor"  # Standalone Kali-runner smoke check. Provisions a real pod, runs a
+  # 4-action playlist through the engine -> Multus macvlan -> Kali runner
+  # path, asserts the results, and destroys the pod. This is the ONLY
+  # continuous proof that path works end to end.
+  #
+  # Expensive (a full pod lifecycle plus a runner Job), so it runs hourly
+  # rather than every 12 minutes.
+  #
+  # NOTE the layer label is deliberately NOT "api". runner mode registers a
+  # strict SUBSET of the check family, and PushResults POSTs the whole
+  # family -- Pushgateway replaces a family wholesale within a grouping on
+  # POST, so sharing the api grouping would DELETE the other 13 series.
+  # Every alert is shaped `1 - crucible_synthetic_check_success > 0`, which
+  # cannot match an absent series, so the board would read green rather
+  # than red. main.go defaults the layer per-mode and refuses an explicit
+  # collision; this key exists to make the intent visible, not to enable it.
+  runner:
+    enabled: false
+    suspend: false
+    # Hourly at :37 -- offset from the */12 monitor and the 04:17 janitor so
+    # three synthetic pods never contend for the same vCenter clone slot.
+    schedule: "37 * * * *"
+    # templates.name to clone (NOT vcenter_template). Wrong value = every
+    # run fails at resolve-template.
+    template: "synthetic-noop"
+    # Playlist UUID, seeded by deploy/sql/synthetic-runner-smoke-playlist.sql.
+    # The playlist IS this check's assertion set, so it is version-controlled
+    # and applied convergently rather than created by hand.
+    playlistID: "5e7c0a00-0000-4000-a000-000000000001"
+    readyTimeout: "8m"
+    # Covers a cold Kali image pull on the runner node plus workflow execution plus
+    # the callback. The runner Job's own ActiveDeadlineSeconds is 600s, so a
+    # pull slower than this surfaces as a runner timeout, not a check hang.
+    runTimeout: "10m"
+    destroyTimeout: "90s"
+    # Retry configuration. Mirrors lifecycle retry semantics.
+    maxAttempts: 2
+    retryBackoff: "30s"
+    # Must exceed the Runner-authorized retry cycle:
+    # 2×(480s+600s+90s+60s per-attempt overhead) + 30s = 2490s = 41m30s.
+    # 2700s (45 min) leaves 270s margin and still fits the hourly schedule
+    # (60 min - 45 min = 15 min gap before the next run).
+    # TestRunnerSmokeRetry_WorstCaseDerivedFromHelmValues enforces this and the
+    # derived 20m30s per-attempt context plus 46-minute session JWT TTL.
+    # This is the outer Kubernetes bound. If it is smaller than the retry cycle,
+    # the pod is SIGKILLed mid-attempt and pushes no metric (stale series).
+    activeDeadlineSeconds: 2700
+    # Runtime derives a 46-minute runner-only JWT from the 45-minute Job
+    # deadline plus the 30-second cleanup reserve and 30-second token margin.
+    # The independently declared interval is guarded against the cron schedule.
+    scheduleInterval: "1h"
+    # ActiveDeadline termination may arrive while a synthetic pod still exists.
+    # Leave twice the 30-second cleanup reserve before Kubernetes sends SIGKILL.
+    terminationGracePeriodSeconds: 60
+    layer: "runner"
+
+# Optional Vault sidecar annotations (disabled by default).
+vault:
+  enabled: false
+  role: selfservice
+  secretPaths:
+    oidc: "selfservice/data/oidc"
+    database: "selfservice/data/db"
+    jwt: "selfservice/data/jwt"
+
+# Traefik IngressRoute. Internal hostname should share the same cert and
+# route set as the public hostname so split-DNS resolves cleanly to the same
+# TLS endpoint without changing the public route or bypassing Authentik.
+# Production hostnames live in private crucible-deploy.
+ingress:
+  enabled: true
+  hostname: crucible.example.test
+  internalHostname: crucible-internal.example.test
+
+# PostgreSQL subchart values
+postgresql:
+  enabled: true
+  auth:
+    database: selfservice
+    username: selfservice
+    existingSecret: selfservice-db-creds
+  primary:
+    persistence:
+      enabled: true
+      storageClass: nfs-client
+      size: 10Gi
+    # Detect dead clients holding session state (e.g. abandoned work) within
+    # ~minutes instead of OS defaults (~2h). Reloadable; no restart required.
+    extendedConfiguration: |-
+      tcp_keepalives_idle = 60
+      tcp_keepalives_interval = 10
+      tcp_keepalives_count = 5
+      client_connection_check_interval = 30s
+
+# NATS subchart values
+nats:
+  enabled: true
+  config:
+    jetstream:
+      enabled: true
+      fileStore:
+        pvc:
+          enabled: true
+          storageClassName: nfs-client
+          size: 5Gi

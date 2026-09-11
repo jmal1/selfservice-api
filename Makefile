@@ -1,0 +1,102 @@
+.PHONY: build test test-race lint fmt vet tidy clean dev-up dev-down dev-logs help wiki-bundle verify-wiki verify-fast verify-local ci-fast ci-local
+
+GO            ?= go
+GOFLAGS       ?=
+BUILD_FLAGS   ?= -trimpath
+BIN_DIR       ?= bin
+CMDS          := api-gateway provision-worker crucible-engine crucible-runner synthetic-api-monitor
+COMPOSE       ?= docker compose -f docker-compose.dev.yaml
+
+# Seed list for cmd/wiki-bundler. Adding a new top-level instructor doc
+# is a two-step change: drop the .md in the repo, add it here, run
+# `make wiki-bundle`. The bundler will then walk its links recursively.
+WIKI_SEEDS    := \
+	docs/instructor/overview.md \
+	docs/instructor/templates.md \
+	docs/instructor/os-recipes.md \
+	docs/instructor/playlists.md \
+	AGENTS.md \
+	docs/ai-prompts/build-workflow.md \
+	docs/ai-prompts/create-a-template.md \
+	docs/ai/build-workflow-prompt.md
+WIKI_OUT      := internal/docs/_bundle
+
+help: ## Show this help
+	@awk 'BEGIN {FS = ":.*##"; printf "Usage:\n  make \033[36m<target>\033[0m\n\nTargets:\n"} /^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+
+build: ## Build all command binaries into ./bin
+	@mkdir -p $(BIN_DIR)
+	@for cmd in $(CMDS); do \
+		echo "==> building $$cmd"; \
+		$(GO) build $(BUILD_FLAGS) -o $(BIN_DIR)/$$cmd ./cmd/$$cmd || exit 1; \
+	done
+
+test: ## Run the full local CI-equivalent race suite (matches GitHub Actions)
+	$(GO) test ./... -race -count=1
+
+test-short: ## Short suite: skips deploy.sh harness, vcsim, helm template, and Postgres integration
+	$(GO) test ./... -short -race -count=1
+
+ci-fast: ## Fast local gate: build + vet + wiki + short Go tests (no deploy.sh/vcsim/Postgres/race)
+	@echo "==> Phase 1/4: build"
+	@$(GO) build ./...
+	@echo "==> Phase 2/4: vet"
+	@$(GO) vet ./...
+	@echo "==> Phase 3/4: wiki bundle"
+	@$(MAKE) verify-wiki
+	@echo "==> Phase 4/4: short tests (excludes deploy.sh harness, vcsim, helm template, Postgres)"
+	@$(GO) test ./... -short -count=1
+
+verify-fast: ci-fast
+
+verify-local: ## Run the Windows-first local CI mirror before opening a PR
+	@pwsh ./scripts/local-verify.ps1
+
+ci-local: verify-local
+
+vet: ## Run go vet
+	$(GO) vet ./...
+
+fmt: ## Run gofmt against the tree
+	$(GO) fmt ./...
+
+tidy: ## Tidy go.mod / go.sum
+	$(GO) mod tidy
+
+lint: vet ## Run static analysis (vet today; golangci-lint when installed)
+	@command -v golangci-lint >/dev/null 2>&1 && golangci-lint run ./... || echo "golangci-lint not installed; ran go vet only"
+
+dev-up: ## Bring up local Postgres + NATS for development
+	$(COMPOSE) up -d
+	@echo ""
+	@echo "Stack is up. Export the following before running ./bin/api-gateway:"
+	@echo "  export DB_HOST=localhost DB_PASSWORD=dev DB_NAME=selfservice DB_USER=selfservice"
+	@echo "  export NATS_URL=nats://localhost:4222"
+
+dev-down: ## Stop the local stack and drop data
+	$(COMPOSE) down -v
+
+dev-logs: ## Tail logs from the local stack
+	$(COMPOSE) logs -f
+
+clean: ## Remove build artifacts
+	rm -rf $(BIN_DIR)
+
+wiki-bundle: ## Build the instructor wiki bundle (run after editing seeds)
+	@$(GO) run ./cmd/wiki-bundler \
+		-repo-root . \
+		-out $(WIKI_OUT) \
+		$(addprefix -seed ,$(WIKI_SEEDS))
+
+verify-wiki: ## Fail if wiki bundle is out of date (CI guard)
+	@tmp=$$(mktemp -d) && \
+		$(GO) run ./cmd/wiki-bundler -repo-root . -out $$tmp $(addprefix -seed ,$(WIKI_SEEDS)) && \
+		diff -r $$tmp $(WIKI_OUT) > $$tmp.diff 2>&1 || { \
+			echo "FAIL: $(WIKI_OUT) is stale. Run 'make wiki-bundle' and commit."; \
+			echo "--- differences (fresh build vs committed) ---"; \
+			head -c 4000 $$tmp.diff; \
+			rm -rf $$tmp $$tmp.diff; exit 1; \
+		}; \
+		rm -rf $$tmp $$tmp.diff; \
+		echo "OK: wiki bundle is up to date"
+

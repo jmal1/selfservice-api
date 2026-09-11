@@ -1,0 +1,63 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Release.Name }}-ingress
+  labels:
+    app.kubernetes.io/name: selfservice
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: {{ .Values.ingress.hostname }}
+      http:
+        paths:
+          # /healthz is an exact-match route to the API so the synthetic
+          # monitor (and external uptime checks) hit the JSON {"status":"ok"}
+          # response instead of falling through to the UI catch-all which
+          # returns plain text "ok".
+          - path: /healthz
+            pathType: Exact
+            backend:
+              service:
+                name: {{ .Release.Name }}-api
+                port:
+                  number: {{ .Values.api.port }}
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ .Release.Name }}-api
+                port:
+                  number: {{ .Values.api.port }}
+          - path: /auth
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ .Release.Name }}-api
+                port:
+                  number: {{ .Values.api.port }}
+          - path: /ws
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ .Release.Name }}-api
+                port:
+                  number: {{ .Values.api.port }}
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ .Release.Name }}-ui
+                port:
+                  number: 8080
+  tls:
+    - hosts:
+        - {{ .Values.ingress.hostname }}
+        {{- if and .Values.ingress.internalHostname (ne .Values.ingress.internalHostname .Values.ingress.hostname) }}
+        - {{ .Values.ingress.internalHostname }}
+        {{- end }}
+      secretName: selfservice-tls
+{{- end }}

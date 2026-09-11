@@ -1,0 +1,59 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-engine
+  labels:
+    app.kubernetes.io/name: selfservice-api
+    app.kubernetes.io/component: crucible-engine
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-engine-runner
+  labels:
+    app.kubernetes.io/name: selfservice-api
+    app.kubernetes.io/component: crucible-engine
+rules:
+  # Jobs: create runner jobs, list for cleanup, delete on completion
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "delete"]
+  # Secrets: create runner configs, delete after completion
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "get", "delete"]
+  # Pods: list runner pods (for status checking), delete (for cancellation)
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete"]
+  # NetworkAttachmentDefinitions: create per-VLAN NADs, and update them when the
+  # CNI config we generate no longer matches the live one.
+  #
+  # `update` is NOT optional. ensureNAD reconciles config, not just existence
+  # (see internal/engine/k8s.go). Without it, any NAD created by an older engine
+  # keeps its original CNI config forever and every corrected config is silently
+  # unreachable. That is exactly how the macvlan->vlan fix nearly shipped as a
+  # no-op: pod-vlan-119 was already live with the broken config, so the fix could
+  # never have applied to it. Guarded by TestEngineChartGrantsNADUpdate.
+  #
+  # `delete` is deliberately NOT granted: NADs are keyed by VLAN and reused
+  # across runs, so the engine never removes one.
+  - apiGroups: ["k8s.cni.cncf.io"]
+    resources: ["network-attachment-definitions"]
+    verbs: ["create", "get", "list", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-engine-runner
+  labels:
+    app.kubernetes.io/name: selfservice-api
+    app.kubernetes.io/component: crucible-engine
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-engine-runner
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-engine
+    namespace: {{ .Release.Namespace }}

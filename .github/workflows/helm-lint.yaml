@@ -1,0 +1,106 @@
+name: Helm Lint
+
+on:
+  pull_request:
+    paths:
+      - 'deploy/helm/**'
+      - '.github/workflows/helm-lint.yaml'
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.20.0'
+
+      - name: Add chart repos
+        run: |
+          helm repo add bitnami https://charts.bitnami.com/bitnami
+          helm repo add nats https://nats-io.github.io/k8s/helm/charts/
+
+      - name: helm dependency build
+        working-directory: deploy/helm/selfservice
+        run: helm dep build
+
+      # Lint catches schema-level chart errors.
+      - name: helm lint (defaults)
+        working-directory: deploy/helm/selfservice
+        run: helm lint . -f values.yaml
+
+      - name: helm lint (defaults + prod overrides)
+        working-directory: deploy/helm/selfservice
+        run: helm lint . -f values.yaml -f values.example.yaml
+
+      # Template catches missing required values that lint won't (the bug from
+      # 2026-06-09 night when `synthetic.janitor.schedule` was added to
+      # values.yaml without `--reset-then-reuse-values` would have been caught
+      # here).
+      - name: helm template (defaults + prod overrides)
+        working-directory: deploy/helm/selfservice
+        run: helm template selfservice . -f values.yaml -f values.example.yaml > rendered-prod.yaml
+
+      # Guards explicit boolean foundation facts in the production overlay
+      # (Helm 176 live contract). Mutating synthetics stay false until canaries pass.
+      - name: assert production overlay foundation env
+        working-directory: deploy/helm/selfservice
+        run: |
+          set -euo pipefail
+          assert_env() {
+            local name=$1
+            local want=$2
+            local count value
+            count=$(grep -c "^[[:space:]]*- name: ${name}$" rendered-prod.yaml)
+            if [ "$count" -ne 1 ]; then
+              echo "ERROR: prod render has $name $count times, want exactly 1" >&2
+              exit 1
+            fi
+            value=$(grep -A1 "^[[:space:]]*- name: ${name}$" rendered-prod.yaml | tail -1)
+            if ! echo "$value" | grep -Eq "^[[:space:]]*value: \"${want}\"$"; then
+              echo "ERROR: prod render's $name is not explicit ${want}: $value" >&2
+              exit 1
+            fi
+          }
+          assert_env PROVISIONING_ENABLED true
+          assert_env SYNTHETIC_PROVISIONING_EXPECTED_ENABLED true
+          assert_env SYNTHETIC_RUNNER_EXPECTED_ENABLED true
+          assert_env SYNTHETIC_LIFECYCLE_ENABLED true
+
+      - name: helm lint and template (approved full-fleet overlay)
+        working-directory: deploy/helm/selfservice
+        run: |
+          helm lint . -f values.yaml -f values.example-full.yaml
+          helm template selfservice . -f values.yaml -f values.example-full.yaml > rendered-full-fleet.yaml
+
+      - name: assert SYNTHETIC_LIFECYCLE_ENABLED=true in full-fleet render
+        working-directory: deploy/helm/selfservice
+        run: |
+          set -euo pipefail
+          assert_env() {
+            local name=$1
+            local want=$2
+            local count value
+            count=$(grep -c "^[[:space:]]*- name: ${name}$" rendered-full-fleet.yaml)
+            if [ "$count" -ne 1 ]; then
+              echo "ERROR: full-fleet render has $name $count times, want exactly 1" >&2
+              exit 1
+            fi
+            value=$(grep -A1 "^[[:space:]]*- name: ${name}$" rendered-full-fleet.yaml | tail -1)
+            if ! echo "$value" | grep -Eq "^[[:space:]]*value: \"${want}\"$"; then
+              echo "ERROR: full-fleet render's $name is not explicit ${want}: $value" >&2
+              exit 1
+            fi
+          }
+          assert_env PROVISIONING_ENABLED true
+          assert_env SYNTHETIC_PROVISIONING_EXPECTED_ENABLED true
+          assert_env SYNTHETIC_RUNNER_EXPECTED_ENABLED true
+          assert_env SYNTHETIC_LIFECYCLE_ENABLED true

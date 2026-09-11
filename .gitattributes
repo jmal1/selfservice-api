@@ -1,0 +1,20 @@
+# Keep generated wiki bundle byte-identical across platforms so the
+# `make verify-wiki` CI check (which diffs against a fresh local
+# regeneration) doesn't fail on Windows checkouts that would otherwise
+# rewrite LF to CRLF.
+internal/docs/_bundle/** -text eol=lf
+
+# Golden-test fixtures must stay LF-only so the schema diff is
+# deterministic across Windows and Linux contributors.
+internal/docs/testdata/*.json text eol=lf
+
+# Seed SQL carries bash action bodies inside dollar-quoted literals, which
+# preserve bytes exactly. A CRLF checkout would store `\r` at the end of every
+# line of every action, producing a library whose `if` conditions silently
+# never match. LF is not cosmetic here.
+deploy/sql/*.sql text eol=lf
+
+# Deployment scripts and jq filters are executed directly on Linux deploy hosts.
+deploy/scripts/*.sh text eol=lf
+deploy/scripts/*.jq text eol=lf
+.github/scripts/*.sh text eol=lf

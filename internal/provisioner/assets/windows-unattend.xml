@@ -1,0 +1,149 @@
+<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+
+  <!-- Specialize pass: runs during Windows setup after hardware detection -->
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64"
+      publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+      xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <ComputerName>*</ComputerName>
+      <TimeZone>Eastern Standard Time</TimeZone>
+    </component>
+
+    <!-- Enable RDP -->
+    <component name="Microsoft-Windows-TerminalServices-LocalSessionManager" processorArchitecture="amd64"
+      publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+      xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <fDenyTSConnections>false</fDenyTSConnections>
+    </component>
+
+    <!-- Allow RDP through firewall -->
+    <component name="Networking-MPSSVC-Svc" processorArchitecture="amd64"
+      publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+      xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <FirewallGroups>
+        <FirewallGroup wcm:action="add" wcm:keyValue="RemoteDesktop">
+          <Active>true</Active>
+          <Group>Remote Desktop</Group>
+          <Profile>all</Profile>
+        </FirewallGroup>
+      </FirewallGroups>
+    </component>
+
+    <!-- Disable NLA requirement for RDP (allow connections before login) -->
+    <component name="Microsoft-Windows-TerminalServices-RDP-WinStationExtensions" processorArchitecture="amd64"
+      publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+      xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <UserAuthentication>0</UserAuthentication>
+    </component>
+
+    <!-- Enable cloudbase-init on clone first boot in a SKU-agnostic way.
+         The FirstLogonCommands below (oobeSystem pass) are SILENTLY SKIPPED on
+         Windows *Server* SKUs when SkipMachineOOBE/SkipUserOOBE are set, so on
+         Server 2022/2025 the cloudbase-init service was never re-enabled and
+         the per-clone Student password was never applied (guest auth failed,
+         template_verify + real pods broke). The specialize pass runs on ALL
+         SKUs, so we set the service to delayed-auto here: it then starts ~2 min
+         into the OOBE boot, once VMware Tools + guestinfo metadata are ready.
+         Redundant-but-harmless on Windows 11 (its FirstLogonCommands already
+         start the service immediately; cloudbase-init is idempotent per
+         instance id). -->
+    <component name="Microsoft-Windows-Deployment" processorArchitecture="amd64"
+      publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+      xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>cmd.exe /c sc config cloudbase-init start= delayed-auto</Path>
+          <Description>Enable cloudbase-init (FirstLogonCommands are skipped on Server SKUs)</Description>
+          <WillReboot>Never</WillReboot>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+  </settings>
+
+  <!-- OOBE pass: runs during first boot experience -->
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64"
+      publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+      xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+
+      <!-- Skip all OOBE screens -->
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideLocalAccountScreen>true</HideLocalAccountScreen>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <ProtectYourPC>3</ProtectYourPC>
+        <SkipMachineOOBE>true</SkipMachineOOBE>
+        <SkipUserOOBE>true</SkipUserOOBE>
+      </OOBE>
+
+      <!-- Create local Student account (cloudbase-init will set the password)
+           Password is base64-encoded UTF-16LE of "REPLACE_WITH_BUILD_PASSWORD" + "Password"
+           with PlainText=false. Sysprep ONLY scrubs PlainText=true passwords;
+           the encoded form survives the L2 wizard generalize so L3 clones can
+           still create the Student account on first boot. Re-encode any
+           bootstrap password change with:
+             [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($pw + 'Password'))
+           See: https://learn.microsoft.com/en-us/windows-hardware/customize/desktop/unattend/microsoft-windows-shell-setup-useraccounts-localaccounts-localaccount-password
+      -->
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Name>Student</Name>
+            <Group>Administrators</Group>
+            <Password>
+              <Value>UgBFAFAATABBAEMARQBfAFcASQBUAEgAXwBCAFUASQBMAEQAXwBQAEEAUwBTAFcATwBSAEQAUABhAHMAcwB3AG8AcgBkAA==</Value>
+              <PlainText>false</PlainText>
+            </Password>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+
+      <!-- Auto-login as Student on first boot (cloudbase-init runs, then reboot)
+           Same base64-UTF-16LE("REPLACE_WITH_BUILD_PASSWORDPassword") encoding as above so
+           sysprep doesn't strip it. -->
+      <AutoLogon>
+        <Enabled>true</Enabled>
+        <Username>Student</Username>
+        <Password>
+          <Value>UgBFAFAATABBAEMARQBfAFcASQBUAEgAXwBCAFUASQBMAEQAXwBQAEEAUwBTAFcATwBSAEQAUABhAHMAcwB3AG8AcgBkAA==</Value>
+          <PlainText>false</PlainText>
+        </Password>
+        <LogonCount>1</LogonCount>
+      </AutoLogon>
+
+      <!-- First-logon commands: re-enable cloudbase-init and open RDP firewall -->
+      <FirstLogonCommands>
+        <SynchronousCommand wcm:order="1">
+          <CommandLine>sc config cloudbase-init start= auto</CommandLine>
+          <Description>Re-enable cloudbase-init auto-start</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+        <SynchronousCommand wcm:order="2">
+          <CommandLine>netsh advfirewall firewall set rule group="Remote Desktop" new enable=Yes</CommandLine>
+          <Description>Ensure RDP firewall rule is active</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+        <SynchronousCommand wcm:order="3">
+          <CommandLine>net start cloudbase-init</CommandLine>
+          <Description>Start cloudbase-init to apply guestinfo userdata</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+      </FirstLogonCommands>
+
+    </component>
+
+    <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64"
+      publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+      xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <InputLocale>en-US</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UserLocale>en-US</UserLocale>
+    </component>
+  </settings>
+
+</unattend>
