@@ -74,6 +74,27 @@ jobs:
           assert_env SYNTHETIC_PROVISIONING_EXPECTED_ENABLED true
           assert_env SYNTHETIC_RUNNER_EXPECTED_ENABLED true
           assert_env SYNTHETIC_LIFECYCLE_ENABLED true
+          # ISO picker + worker import both need these. Count is 2 (api + worker).
+          # A values-only isoDatastore with no env is the 503 regression.
+          assert_env_n() {
+            local name=$1
+            local want=$2
+            local expect=$3
+            local count
+            count=$(grep -c "^[[:space:]]*- name: ${name}$" rendered-prod.yaml)
+            if [ "$count" -ne "$expect" ]; then
+              echo "ERROR: prod render has $name $count times, want exactly $expect" >&2
+              exit 1
+            fi
+            while IFS= read -r line; do
+              if ! echo "$line" | grep -Eq "^[[:space:]]*value: \"${want}\"$"; then
+                echo "ERROR: prod render's $name value is not ${want}: $line" >&2
+                exit 1
+              fi
+            done < <(grep -A1 "^[[:space:]]*- name: ${name}$" rendered-prod.yaml | grep 'value:')
+          }
+          assert_env_n VCENTER_ISO_DATASTORE Example-ISO-Datastore 2
+          assert_env_n VCENTER_ISO_FOLDER ISOs 2
 
       - name: helm lint and template (approved full-fleet overlay)
         working-directory: deploy/helm/selfservice
