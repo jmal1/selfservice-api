@@ -19,7 +19,10 @@
 --   kubectl -n selfservice create secret generic selfservice-synthetic-user \
 --     --from-literal=user-id="$USER_ID"
 --
--- Re-runnable: ON CONFLICT does nothing.
+-- Re-runnable: ON CONFLICT repairs quotas if a migration or operator lowered
+-- them. The synthetic-noop template requires at least 1 vCPU / 1024 MiB; these
+-- values match the production recovery and leave room for the lifecycle
+-- check's create/cleanup path.
 INSERT INTO users (
     oidc_sub,
     username,
@@ -36,8 +39,12 @@ INSERT INTO users (
     'synthetic@example.com',
     'Synthetic API Monitor',
     'student',                              -- intentionally low privilege; admin_403 check relies on this
-    1,                                      -- caps; not used by synthetic checks today
-    512,
-    1,
+    3,
+    3072,
+    3,
     true
-) ON CONFLICT (oidc_sub) DO NOTHING;
+) ON CONFLICT DO UPDATE SET
+    max_vcpus = GREATEST(users.max_vcpus, EXCLUDED.max_vcpus),
+    max_ram_mb = GREATEST(users.max_ram_mb, EXCLUDED.max_ram_mb),
+    max_pods = GREATEST(users.max_pods, EXCLUDED.max_pods),
+    updated_at = now();
