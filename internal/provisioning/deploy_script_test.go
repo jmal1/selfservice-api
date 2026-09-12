@@ -2517,22 +2517,19 @@ func TestDeployScriptClaimsExitRestorationIsLoadBearing(t *testing.T) {
 	}
 }
 
-func TestDeployScriptPostHelmContainWaitRestoreOrdering(t *testing.T) {
+func TestDeployScriptPostHelmWaitVerifyOrdering(t *testing.T) {
 	deployBody, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	source := string(deployBody)
-	const seq = `# Helm applied the candidate with lifecycle=true / clone CronJobs unsuspended,
-# undoing the pre-upgrade containment window. Re-contain before the multi-minute
-# verify so a */12 synthetic cannot claim durable pod_lifecycle work mid-flight,
-# wait out any already-started jobs, verify, then restore foundation synthetics.
+	const seq = `# Helm reopens SYNTHETIC_LIFECYCLE_ENABLED=true from values, so a scheduled
+# */12 monitor can claim durable pod_lifecycle work during the multi-minute
+# post-upgrade verify window and falsely fail an otherwise-successful atomic
+# apply (observed 2026-09-11T23:00Z). Wait for drain before verify rather than
+# treating a transient in-flight synthetic as permanent containment failure.
 HELM_RELEASE_LOCK_PRESERVE=true
-if ! enforce_synthetic_rollback_containment; then
-  echo "ERROR: Helm succeeded but post-upgrade synthetic containment could not be enforced. The release lock is intentionally retained; manual intervention is required." >&2
-  exit 1
-fi
-if ! wait_for_no_active_jobs "${POST_HELM_DRAIN_DEADLINE_SECS:-180}" "${POST_HELM_DRAIN_INTERVAL_SECS:-10}"; then
+if ! wait_for_no_active_jobs "${POST_HELM_DRAIN_DEADLINE_SECS:-300}" "${POST_HELM_DRAIN_INTERVAL_SECS:-10}"; then
   echo "ERROR: Helm succeeded but post-upgrade job drain did not clear. The release lock is intentionally retained; manual intervention is required." >&2
   exit 1
 fi
@@ -2540,55 +2537,14 @@ if ! verify_deployed_candidate; then
   echo "ERROR: Helm reported success but exact candidate containment failed. The release lock is intentionally retained; manual intervention is required." >&2
   exit 1
 fi
-if ! restore_synthetic_foundation_after_verify; then
-  echo "ERROR: candidate verified but synthetic foundation could not be restored. The release lock is intentionally retained; manual intervention is required." >&2
-  exit 1
-fi
 HELM_RELEASE_LOCK_PRESERVE=false
 echo "==> deployed exact source $CANDIDATE_SOURCE_SHA with immutable workload and RUNNER_IMAGE digests"`
 	if strings.Count(source, seq) != 1 {
-		t.Fatalf("expected the post-Helm contain→wait→verify→restore sequence exactly once, found %d", strings.Count(source, seq))
+		t.Fatalf("expected the post-Helm wait→verify sequence exactly once, found %d", strings.Count(source, seq))
 	}
 	if !strings.Contains(source, "wait_for_no_active_jobs()") {
 		t.Fatal("wait_for_no_active_jobs helper missing")
 	}
-	if !strings.Contains(source, "restore_synthetic_foundation_after_verify()") {
-		t.Fatal("restore_synthetic_foundation_after_verify helper missing")
-	}
-}
-
-func TestDeployScriptRestoresSyntheticFoundationAfterSuccessfulVerify(t *testing.T) {
-	requirePOSIXShell(t)
-	live := baselineManifest(true, "", "true")
-	candidate := baselineManifest(true, "*", "true")
-	env := newDeployScriptEnvironment(t, live, candidate)
-	writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
-
-	output, err := env.run("--no-pull")
-	if err != nil {
-		t.Fatalf("deploy failed: %v\n%s", err, output)
-	}
-	if !strings.Contains(string(output), "synthetic foundation restored") {
-		t.Fatalf("successful deploy did not restore synthetic foundation:\n%s", output)
-	}
-	if _, statErr := os.Stat(env.syntheticContainedMark); statErr != nil {
-		t.Fatalf("post-Helm containment never ran: %v", statErr)
-	}
-	if _, statErr := os.Stat(env.syntheticRestoredMark); statErr != nil {
-		t.Fatalf("post-verify synthetic restore never ran: %v", statErr)
-	}
-	if got := manifestEnvValue(t, mustRead(t, env.livePostUpgradeManifest), "SYNTHETIC_LIFECYCLE_ENABLED"); got != "true" {
-		t.Fatalf("post-upgrade live lifecycle after restore = %q, want true", got)
-	}
-}
-
-func mustRead(t *testing.T, path string) string {
-	t.Helper()
-	body, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return string(body)
 }
 
 func TestDeployScriptSeedsCronJobEvidenceBeforeHealth(t *testing.T) {
@@ -4177,16 +4133,9 @@ func TestDeployScriptForceConflictsInvariantDetectsMutatingLeakage(t *testing.T)
 		new  string
 	}{
 		{
-			// enforce_synthetic_rollback_containment's real, unconditional
-			// `kubectl patch cronjob/... --type strategic -p '...'` mutates
-			// a live CronJob. Attaching --force-conflicts inline on its
-			// existing --type flag line (no new line, no distinctive
-			// leading whitespace) is exactly the shape the old
-			// line-anchored regex check could not see.
-			// Unique to the contain path (value false); restore uses value true.
 			name: "inline on an existing flag line of a real mutating kubectl patch",
-			old:  "  if ! kubectl patch \"cronjob/$api_cronjob\" \\\n      -n \"$NAMESPACE\" \\\n      --type strategic \\\n      -p '{\"spec\":{\"suspend\":false,\"jobTemplate\":{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"synthetic-api-monitor\",\"env\":[{\"name\":\"SYNTHETIC_LIFECYCLE_ENABLED\",\"value\":\"false\"}]}]}}}}}}'; then",
-			new:  "  if ! kubectl patch \"cronjob/$api_cronjob\" \\\n      -n \"$NAMESPACE\" \\\n      --type strategic --force-conflicts \\\n      -p '{\"spec\":{\"suspend\":false,\"jobTemplate\":{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"synthetic-api-monitor\",\"env\":[{\"name\":\"SYNTHETIC_LIFECYCLE_ENABLED\",\"value\":\"false\"}]}]}}}}}}'; then",
+			old:  "      --type strategic \\\n",
+			new:  "      --type strategic --force-conflicts \\\n",
 		},
 		{
 			// contain_failed_atomic_upgrade's real
@@ -6804,7 +6753,6 @@ type deployScriptEnvironment struct {
 	candidateManifest         string
 	upgradeHookManifest       string
 	baselineManifest          string
-	livePostUpgradeManifest   string
 	appliedManifest           string
 	upgradedMarker            string
 	upgradeLog                string
@@ -6823,7 +6771,6 @@ type deployScriptEnvironment struct {
 	atomicFailedMark          string
 	candidateAppliedMark      string
 	syntheticContainedMark    string
-	syntheticRestoredMark     string
 	atomicRollbackManifest    string
 	containedRollbackManifest string
 	immutableRollbackManifest string
@@ -6953,7 +6900,6 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 		candidateManifest:         filepath.Join(root, "candidate.yaml"),
 		upgradeHookManifest:       filepath.Join(root, "upgrade-hook.yaml"),
 		baselineManifest:          filepath.Join(root, "baseline.yaml"),
-		livePostUpgradeManifest:   filepath.Join(root, "live-post-upgrade.yaml"),
 		appliedManifest:           filepath.Join(root, "applied.yaml"),
 		upgradedMarker:            filepath.Join(root, "upgraded"),
 		upgradeLog:                filepath.Join(root, "upgrade.log"),
@@ -6972,7 +6918,6 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 		atomicFailedMark:          filepath.Join(root, "atomic-failed"),
 		candidateAppliedMark:      filepath.Join(root, "candidate-applied"),
 		syntheticContainedMark:    filepath.Join(root, "synthetic-contained"),
-		syntheticRestoredMark:     filepath.Join(root, "synthetic-restored"),
 		atomicRollbackManifest:    filepath.Join(root, "atomic-rollback.yaml"),
 		containedRollbackManifest: filepath.Join(root, "atomic-rollback-contained.yaml"),
 		immutableRollbackManifest: filepath.Join(root, "immutable-rollback.yaml"),
@@ -7196,9 +7141,6 @@ case "$1 $2" in
           "$FAKE_BASELINE_MANIFEST" > "$FAKE_BASELINE_MANIFEST.mutated"
         mv "$FAKE_BASELINE_MANIFEST.mutated" "$FAKE_BASELINE_MANIFEST"
       fi
-      # Live cluster view is distinct from helm get manifest so post-upgrade
-      # kubectl containment patches cannot poison the Helm revision object set.
-      cp "$FAKE_BASELINE_MANIFEST" "$FAKE_LIVE_POST_UPGRADE_MANIFEST"
       : > "$FAKE_CANDIDATE_APPLIED_MARKER"
     fi
     : > "$FAKE_UPGRADED_MARKER"
@@ -7220,7 +7162,7 @@ current_manifest() {
   if [ -f "$FAKE_CLAIMS_RESUMED_MARKER" ]; then
     printf '%s' "$FAKE_LIVE_RESOURCE_MANIFEST"
   elif [ -f "$FAKE_UPGRADED_MARKER" ]; then
-    printf '%s' "$FAKE_LIVE_POST_UPGRADE_MANIFEST"
+    printf '%s' "$FAKE_BASELINE_MANIFEST"
   elif [ -f "$FAKE_ATOMIC_FAILED_MARKER" ]; then
     if [ -f "$FAKE_SYNTHETIC_CONTAINED_MARKER" ]; then
       printf '%s' "$FAKE_CONTAINED_ROLLBACK_MANIFEST"
@@ -8503,34 +8445,13 @@ case "$1" in
     fi
     ;;
   patch)
+    : > "$FAKE_SYNTHETIC_CONTAINED_MARKER"
     if [ "$2" = "cronjob/selfservice-synthetic-api-monitor" ] &&
        [[ "$*" == *"SYNTHETIC_LIFECYCLE_ENABLED"* ]]; then
       manifest=$(current_manifest)
-      if [[ "$*" == *'"value":"true"'* ]]; then
-        sed '/- name: SYNTHETIC_LIFECYCLE_ENABLED/{n;s/value: "false"/value: "true"/;}' \
-          "$manifest" > "$manifest.patched"
-        mv "$manifest.patched" "$manifest"
-        : > "$FAKE_SYNTHETIC_RESTORED_MARKER"
-      else
-        : > "$FAKE_SYNTHETIC_CONTAINED_MARKER"
-        sed '/- name: SYNTHETIC_LIFECYCLE_ENABLED/{n;s/value: "true"/value: "false"/;}' \
-          "$manifest" > "$manifest.patched"
-        mv "$manifest.patched" "$manifest"
-      fi
-    else
-      : > "$FAKE_SYNTHETIC_CONTAINED_MARKER"
-      if [[ "$2" == cronjob/selfservice-synthetic-janitor || "$2" == cronjob/selfservice-synthetic-runner ]]; then
-        manifest=$(current_manifest)
-        if [[ "$*" == *'"suspend":false'* ]]; then
-          sed '/name: '"${2#cronjob/}"'/,/^---$/ s/^  suspend: true$/  suspend: false/' \
-            "$manifest" > "$manifest.patched" || cp "$manifest" "$manifest.patched"
-          mv "$manifest.patched" "$manifest"
-        elif [[ "$*" == *'"suspend":true'* ]]; then
-          sed '/name: '"${2#cronjob/}"'/,/^---$/ s/^  suspend: false$/  suspend: true/' \
-            "$manifest" > "$manifest.patched" || cp "$manifest" "$manifest.patched"
-          mv "$manifest.patched" "$manifest"
-        fi
-      fi
+      sed '/- name: SYNTHETIC_LIFECYCLE_ENABLED/{n;s/value: "true"/value: "false"/;}' \
+        "$manifest" > "$manifest.patched"
+      mv "$manifest.patched" "$manifest"
     fi
     ;;
   set)
@@ -8846,7 +8767,6 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_CANDIDATE_MANIFEST="+e.candidateManifest,
 		"FAKE_UPGRADE_HOOK_MANIFEST="+e.upgradeHookManifest,
 		"FAKE_BASELINE_MANIFEST="+e.baselineManifest,
-		"FAKE_LIVE_POST_UPGRADE_MANIFEST="+e.livePostUpgradeManifest,
 		"FAKE_APPLIED_MANIFEST="+e.appliedManifest,
 		"FAKE_UPGRADED_MARKER="+e.upgradedMarker,
 		"FAKE_UPGRADE_LOG="+e.upgradeLog,
@@ -8866,7 +8786,6 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_ATOMIC_FAILED_MARKER="+e.atomicFailedMark,
 		"FAKE_CANDIDATE_APPLIED_MARKER="+e.candidateAppliedMark,
 		"FAKE_SYNTHETIC_CONTAINED_MARKER="+e.syntheticContainedMark,
-		"FAKE_SYNTHETIC_RESTORED_MARKER="+e.syntheticRestoredMark,
 		"POST_HELM_DRAIN_DEADLINE_SECS=2",
 		"POST_HELM_DRAIN_INTERVAL_SECS=1",
 		"FAKE_ATOMIC_ROLLBACK_MANIFEST="+e.atomicRollbackManifest,
