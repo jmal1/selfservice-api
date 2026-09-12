@@ -2517,6 +2517,36 @@ func TestDeployScriptClaimsExitRestorationIsLoadBearing(t *testing.T) {
 	}
 }
 
+func TestDeployScriptPostHelmWaitVerifyOrdering(t *testing.T) {
+	deployBody, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(deployBody)
+	const seq = `# Helm reopens SYNTHETIC_LIFECYCLE_ENABLED=true from values, so a scheduled
+# */12 monitor can claim durable pod_lifecycle work during the multi-minute
+# post-upgrade verify window and falsely fail an otherwise-successful atomic
+# apply (observed 2026-09-11T23:00Z). Wait for drain before verify rather than
+# treating a transient in-flight synthetic as permanent containment failure.
+HELM_RELEASE_LOCK_PRESERVE=true
+if ! wait_for_no_active_jobs "${POST_HELM_DRAIN_DEADLINE_SECS:-300}" "${POST_HELM_DRAIN_INTERVAL_SECS:-10}"; then
+  echo "ERROR: Helm succeeded but post-upgrade job drain did not clear. The release lock is intentionally retained; manual intervention is required." >&2
+  exit 1
+fi
+if ! verify_deployed_candidate; then
+  echo "ERROR: Helm reported success but exact candidate containment failed. The release lock is intentionally retained; manual intervention is required." >&2
+  exit 1
+fi
+HELM_RELEASE_LOCK_PRESERVE=false
+echo "==> deployed exact source $CANDIDATE_SOURCE_SHA with immutable workload and RUNNER_IMAGE digests"`
+	if strings.Count(source, seq) != 1 {
+		t.Fatalf("expected the post-Helm wait→verify sequence exactly once, found %d", strings.Count(source, seq))
+	}
+	if !strings.Contains(source, "wait_for_no_active_jobs()") {
+		t.Fatal("wait_for_no_active_jobs helper missing")
+	}
+}
+
 func TestDeployScriptSeedsCronJobEvidenceBeforeHealth(t *testing.T) {
 	deployBody, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
 	if err != nil {
@@ -4103,12 +4133,6 @@ func TestDeployScriptForceConflictsInvariantDetectsMutatingLeakage(t *testing.T)
 		new  string
 	}{
 		{
-			// enforce_synthetic_rollback_containment's real, unconditional
-			// `kubectl patch cronjob/... --type strategic -p '...'` mutates
-			// a live CronJob. Attaching --force-conflicts inline on its
-			// existing --type flag line (no new line, no distinctive
-			// leading whitespace) is exactly the shape the old
-			// line-anchored regex check could not see.
 			name: "inline on an existing flag line of a real mutating kubectl patch",
 			old:  "      --type strategic \\\n",
 			new:  "      --type strategic --force-conflicts \\\n",
@@ -8762,6 +8786,8 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_ATOMIC_FAILED_MARKER="+e.atomicFailedMark,
 		"FAKE_CANDIDATE_APPLIED_MARKER="+e.candidateAppliedMark,
 		"FAKE_SYNTHETIC_CONTAINED_MARKER="+e.syntheticContainedMark,
+		"POST_HELM_DRAIN_DEADLINE_SECS=2",
+		"POST_HELM_DRAIN_INTERVAL_SECS=1",
 		"FAKE_ATOMIC_ROLLBACK_MANIFEST="+e.atomicRollbackManifest,
 		"FAKE_CONTAINED_ROLLBACK_MANIFEST="+e.containedRollbackManifest,
 		"FAKE_IMMUTABLE_ROLLBACK_MANIFEST="+e.immutableRollbackManifest,
