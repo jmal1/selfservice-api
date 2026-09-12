@@ -5,8 +5,8 @@ ALTER TABLE suspend_settings
     ALTER COLUMN idle_timeout_seconds SET DEFAULT 7200;
 
 ALTER TABLE pods
-    ADD COLUMN destroy_retry_count INTEGER NOT NULL DEFAULT 0,
-    ADD COLUMN destroy_retry_after TIMESTAMPTZ;
+    ADD COLUMN IF NOT EXISTS destroy_retry_count INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS destroy_retry_after TIMESTAMPTZ;
 
 UPDATE suspend_settings
 SET idle_timeout_seconds = 7200
@@ -32,33 +32,25 @@ SET max_pods = LEAST(max_pods, 3),
     updated_at = now()
 WHERE role = 'instructor';
 
--- Re-seed the deliberately smaller deploy/sql bootstrap identities after the
--- role-wide clamps. These values mirror those files exactly.
-INSERT INTO users (oidc_sub, username, email, display_name, role, max_vcpus, max_ram_mb, max_pods, is_active)
-VALUES ('synthetic-monitor-no-oidc', 'synthetic', 'synthetic@example.com', 'Synthetic API Monitor', 'student', 1, 512, 1, true)
-ON CONFLICT (oidc_sub) DO UPDATE
-SET username = EXCLUDED.username,
-    email = EXCLUDED.email,
-    display_name = EXCLUDED.display_name,
-    role = EXCLUDED.role,
-    max_vcpus = EXCLUDED.max_vcpus,
-    max_ram_mb = EXCLUDED.max_ram_mb,
-    max_pods = EXCLUDED.max_pods,
-    is_active = EXCLUDED.is_active,
-    updated_at = now();
+-- Restore deliberately smaller deploy/sql bootstrap quotas after role-wide
+-- clamps. UPDATE-only: live rows may already own username "synthetic" under a
+-- different oidc_sub than the bootstrap sentinel, so INSERT ... ON CONFLICT
+-- (oidc_sub) collides on users_username_key.
+UPDATE users
+SET max_vcpus = 1,
+    max_ram_mb = 512,
+    max_pods = 1,
+    updated_at = now()
+WHERE oidc_sub = 'synthetic-monitor-no-oidc'
+   OR username = 'synthetic';
 
-INSERT INTO users (oidc_sub, username, email, display_name, role, max_vcpus, max_ram_mb, max_pods, is_active)
-VALUES ('synthetic-instructor-no-oidc', 'synthetic-instructor', 'synthetic-instructor@example.com', 'Synthetic API Monitor (Instructor)', 'instructor', 0, 0, 0, true)
-ON CONFLICT (oidc_sub) DO UPDATE
-SET username = EXCLUDED.username,
-    email = EXCLUDED.email,
-    display_name = EXCLUDED.display_name,
-    role = EXCLUDED.role,
-    max_vcpus = EXCLUDED.max_vcpus,
-    max_ram_mb = EXCLUDED.max_ram_mb,
-    max_pods = EXCLUDED.max_pods,
-    is_active = EXCLUDED.is_active,
-    updated_at = now();
+UPDATE users
+SET max_vcpus = 0,
+    max_ram_mb = 0,
+    max_pods = 0,
+    updated_at = now()
+WHERE oidc_sub = 'synthetic-instructor-no-oidc'
+   OR username = 'synthetic-instructor';
 
 UPDATE pods p
 SET expires_at = LEAST(
