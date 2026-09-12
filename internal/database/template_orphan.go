@@ -25,7 +25,7 @@ type StaleWizardTemplateVM struct {
 // a vCenter VM and whose updated_at is older than olderThan.
 func (q *Queries) ListStaleWizardTemplateVMs(ctx context.Context, olderThan time.Duration) ([]StaleWizardTemplateVM, error) {
 	if olderThan <= 0 {
-		olderThan = 24 * time.Hour
+		olderThan = models.TemplateOrphanInactiveAge
 	}
 	rows, err := q.pool.Query(ctx, `
 		SELECT id, name, template_state, vcenter_vm_id, updated_at
@@ -51,6 +51,24 @@ func (q *Queries) ListStaleWizardTemplateVMs(ctx context.Context, olderThan time
 		out = append(out, row)
 	}
 	return out, rows.Err()
+}
+
+// ClaimStaleWizardTemplateVM atomically leases a candidate by advancing its
+// activity timestamp. A failed destroy is therefore retried only after another
+// full inactivity window, and concurrent reconcilers cannot destroy it twice.
+func (q *Queries) ClaimStaleWizardTemplateVM(ctx context.Context, row StaleWizardTemplateVM) (bool, error) {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE templates
+		SET updated_at = now()
+		WHERE id = $1
+		  AND vcenter_vm_id = $2
+		  AND template_state = $3
+		  AND updated_at = $4
+	`, row.ID, row.VCenterVMID, row.State, row.UpdatedAt)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
 // ListOwnedTemplateFolderMorefs returns every MoRef Crucible currently claims
@@ -133,17 +151,14 @@ func (q *Queries) ListOwnedTemplateFolderMorefs(ctx context.Context) (map[string
 	return out, nil
 }
 
-// ClearTemplateVCenterVMIfMatch clears templates.vcenter_vm_id only when it
-// still equals expectedMoref. Prevents a race where a concurrent provision
-// wrote a new moref after this reconciler decided to destroy an older one.
+// ClearTemplateVCenterVMIfMatch removes a stale disposable wizard row only
+// when it still owns the destroyed moref and remains draft/error.
 func (q *Queries) ClearTemplateVCenterVMIfMatch(ctx context.Context, id uuid.UUID, expectedMoref string) error {
 	_, err := q.pool.Exec(ctx, `
-		UPDATE templates
-		SET vcenter_vm_id = '',
-		    guest_credentials_verified_at = NULL,
-		    updated_at = NOW()
+		DELETE FROM templates
 		WHERE id = $1
 		  AND vcenter_vm_id = $2
-	`, id, expectedMoref)
+		  AND template_state = ANY($3)
+	`, id, expectedMoref, []string{models.TemplateStateDraft, models.TemplateStateError})
 	return err
 }

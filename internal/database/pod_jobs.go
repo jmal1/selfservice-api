@@ -20,6 +20,7 @@ var (
 	ErrPodJobRejected              = errors.New("pod does not accept new mutator jobs")
 	ErrPodDestroyNotNeeded         = errors.New("pod destroy is no longer needed")
 	ErrPodExtensionRejected        = errors.New("pod cannot be extended")
+	ErrPodExtensionsExhausted      = errors.New("pod extension limit reached")
 	ErrPodAlreadyDestroyed         = errors.New("pod is already destroyed")
 	ErrPodDestroyJobObsolete       = errors.New("pod destroy job is not authoritative")
 	ErrPodDestroyOwnershipLost     = errors.New("pod no longer owns its exact VLAN")
@@ -374,6 +375,7 @@ type podDestroyRequirement int
 const (
 	podDestroyAlways podDestroyRequirement = iota
 	podDestroyIfExpired
+	podDestroyIfSuspendedTooLong
 	podDestroyIfEmpty
 	podDestroyIfFailed
 )
@@ -395,6 +397,14 @@ func (q *Queries) CreateExpiredPodDestroyJob(
 	payload []byte,
 ) (_ *models.Job, created bool, err error) {
 	return q.createPodDestroyJob(ctx, podID, payload, podDestroyIfExpired, nil)
+}
+
+func (q *Queries) CreateSuspendedPodDestroyJob(
+	ctx context.Context,
+	podID uuid.UUID,
+	payload []byte,
+) (_ *models.Job, created bool, err error) {
+	return q.createPodDestroyJob(ctx, podID, payload, podDestroyIfSuspendedTooLong, nil)
 }
 
 // CreateEmptyPodDestroyJob revalidates that no non-deleted VM remains while
@@ -695,6 +705,18 @@ func podDestroyRequirementSatisfied(
 		return true, nil
 	case podDestroyIfExpired:
 		return status == models.PodStatusActive && expired, nil
+	case podDestroyIfSuspendedTooLong:
+		var eligible bool
+		err := tx.QueryRow(ctx, `
+			SELECT COUNT(*) > 0
+			   AND BOOL_AND(status = $2)
+			   AND MIN(suspended_at) <= now() - $3::interval
+			FROM pod_vms
+			WHERE pod_id = $1 AND status <> $4
+		`, podID, models.VMStatusSuspended,
+			fmt.Sprintf("%d seconds", int(models.SuspendedDestroyAfter.Seconds())),
+			models.VMStatusDeleted).Scan(&eligible)
+		return status == models.PodStatusActive && eligible, err
 	case podDestroyIfEmpty:
 		var empty bool
 		if err := tx.QueryRow(ctx, `
@@ -875,6 +897,13 @@ func (q *Queries) ExtendPod(
 	}
 	if destroyExists {
 		return nil, fmt.Errorf("pod %s has authoritative destroy intent: %w", podID, ErrPodExtensionRejected)
+	}
+	var extensionCount int
+	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM pod_attestations WHERE pod_id = $1`, podID).Scan(&extensionCount); err != nil {
+		return nil, fmt.Errorf("count pod %s extensions: %w", podID, err)
+	}
+	if extensionCount >= models.MaxPodExtensions {
+		return nil, fmt.Errorf("pod %s has %d extensions: %w", podID, extensionCount, ErrPodExtensionsExhausted)
 	}
 
 	attestation := &models.PodAttestation{

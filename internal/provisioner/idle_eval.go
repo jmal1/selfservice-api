@@ -113,6 +113,7 @@ type idleEvalVCenter interface {
 // idleEvalDB is the database interface the idle evaluator needs.
 type idleEvalDB interface {
 	ListRunningPodVMsForIdleEval(ctx context.Context) ([]database.IdleSuspendCandidate, error)
+	IdleSuspendCandidateStillEligible(ctx context.Context, podVMID uuid.UUID) (bool, error)
 	TouchVMActivityAt(ctx context.Context, id uuid.UUID, t time.Time) error
 	SetVMSuspended(ctx context.Context, id uuid.UUID, t time.Time, reason string) error
 	GetIdleTimeoutSeconds(ctx context.Context, podID uuid.UUID) (int, error)
@@ -343,6 +344,12 @@ func evaluateIdleVMs(
 			"net_usage", perf.NetUsage,
 			"last_activity_at", c.LastActivityAt)
 
+		stillEligible, eligibilityErr := db.IdleSuspendCandidateStillEligible(ctx, c.PodVMID)
+		if eligibilityErr != nil || !stillEligible {
+			vmLog.Warn("idle-eval: final role/status revalidation refused suspension", "error", eligibilityErr)
+			counts.Errors++
+			continue
+		}
 		if serr := vc.SuspendVM(ctx, c.VCenterVMID); serr != nil {
 			vmLog.Error("idle-eval: SuspendVM failed", "error", serr)
 			counts.Errors++

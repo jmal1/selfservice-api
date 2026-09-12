@@ -227,15 +227,11 @@ func (h *Handler) DeployBlueprint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Set expiration
-	var expiresAt *time.Time
-	switch role {
-	case models.RoleStudent:
-		t := time.Now().Add(7 * 24 * time.Hour)
-		expiresAt = &t
-	case models.RoleInstructor:
-		t := time.Now().Add(30 * 24 * time.Hour)
-		expiresAt = &t
+	expiresAt, err := models.NewExpiresAt(role, time.Now())
+	if err != nil {
+		h.logger.Error("resolve blueprint pod expiration failed", "role", role, "error", err)
+		respondError(w, r, http.StatusForbidden, "unsupported user role")
+		return
 	}
 
 	tx, err := h.db.Pool().Begin(r.Context())

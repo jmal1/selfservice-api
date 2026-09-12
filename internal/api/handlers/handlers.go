@@ -589,15 +589,11 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Compute expiration based on role
-	var expiresAt *time.Time
-	switch role {
-	case models.RoleStudent:
-		t := time.Now().Add(7 * 24 * time.Hour)
-		expiresAt = &t
-	case models.RoleInstructor:
-		t := time.Now().Add(30 * 24 * time.Hour)
-		expiresAt = &t
+	expiresAt, err := models.NewExpiresAt(role, time.Now())
+	if err != nil {
+		h.logger.Error("resolve pod expiration failed", "role", role, "error", err)
+		respondError(w, r, http.StatusForbidden, "unsupported user role")
+		return
 	}
 
 	// Generate a short random salt for VM naming
@@ -962,18 +958,26 @@ func (h *Handler) ExtendPod(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Calculate new expiry based on role (+7d student, +30d instructor/admin)
-	var extension time.Duration
-	switch role {
-	case models.RoleInstructor, models.RoleAdmin:
-		extension = 30 * 24 * time.Hour
-	default:
-		extension = 7 * 24 * time.Hour
+	owner := pod.Owner
+	if owner == nil {
+		owner, err = h.db.GetUserByID(r.Context(), pod.OwnerID)
 	}
-	newExpiry := time.Now().Add(extension)
+	if err != nil || owner == nil {
+		respondError(w, r, http.StatusInternalServerError, "pod owner not found")
+		return
+	}
+	newExpiry, extension, err := models.ExtendExpiresAt(owner.Role, time.Now())
+	if err != nil {
+		respondError(w, r, http.StatusConflict, "pod owner has unsupported role")
+		return
+	}
 
 	attestation, err := h.db.ExtendPod(r.Context(), podID, userID, newExpiry)
 	if err != nil {
+		if errors.Is(err, database.ErrPodExtensionsExhausted) {
+			respondError(w, r, http.StatusConflict, "pod extension limit reached")
+			return
+		}
 		if errors.Is(err, database.ErrPodExtensionRejected) {
 			respondError(w, r, http.StatusConflict, "pod cannot be extended after destruction is queued")
 			return
@@ -1016,10 +1020,26 @@ func (h *Handler) AdminExtendPod(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	owner := pod.Owner
+	if owner == nil {
+		owner, err = h.db.GetUserByID(r.Context(), pod.OwnerID)
+	}
+	if err != nil || owner == nil {
+		respondError(w, r, http.StatusInternalServerError, "pod owner not found")
+		return
+	}
 	userID := middleware.UserIDFromContext(r.Context())
-	newExpiry := time.Now().Add(30 * 24 * time.Hour)
+	newExpiry, extension, err := models.ExtendExpiresAt(owner.Role, time.Now())
+	if err != nil {
+		respondError(w, r, http.StatusConflict, "pod owner has unsupported role")
+		return
+	}
 
 	if _, err := h.db.ExtendPod(r.Context(), podID, userID, newExpiry); err != nil {
+		if errors.Is(err, database.ErrPodExtensionsExhausted) {
+			respondError(w, r, http.StatusConflict, "pod extension limit reached")
+			return
+		}
 		if errors.Is(err, database.ErrPodExtensionRejected) {
 			respondError(w, r, http.StatusConflict, "pod cannot be extended after destruction is queued")
 			return
@@ -1038,7 +1058,7 @@ func (h *Handler) AdminExtendPod(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, map[string]any{
 		"pod_id":           podID,
 		"expires_at":       newExpiry.Format(time.RFC3339),
-		"extended_by_days": 30,
+		"extended_by_days": int(extension.Hours() / 24),
 	})
 }
 
@@ -1617,10 +1637,17 @@ func (h *Handler) GetMe(w http.ResponseWriter, r *http.Request) {
 	usage.MaxVCPUs = user.MaxVCPUs
 	usage.MaxRAMMB = user.MaxRAMMB
 	usage.MaxPods = user.MaxPods
+	limits, err := models.LimitsForRole(user.Role)
+	if err != nil {
+		h.logger.Error("resolve user limits failed", "role", user.Role, "error", err)
+		respondError(w, r, http.StatusInternalServerError, "unsupported user role")
+		return
+	}
 
 	respondJSON(w, http.StatusOK, models.MeResponse{
 		User:          *user,
 		ResourceUsage: *usage,
+		Limits:        limits,
 	})
 }
 

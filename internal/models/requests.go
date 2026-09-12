@@ -8,8 +8,8 @@ import (
 
 // CreatePodRequest is the API request to create a new pod.
 type CreatePodRequest struct {
-	Name string       `json:"name" validate:"required,min=1,max=64"`
-	VMs  []VMRequest  `json:"vms" validate:"required,min=1,max=10,dive"`
+	Name string      `json:"name" validate:"required,min=1,max=64"`
+	VMs  []VMRequest `json:"vms" validate:"required,min=1,max=10,dive"`
 }
 
 // VMRequest describes a VM to create within a pod.
@@ -131,19 +131,20 @@ type JobStatusResponse struct {
 
 // ResourceUsage shows a user's current resource consumption.
 type ResourceUsage struct {
-	UsedVCPUs    int `json:"used_vcpus"`
-	UsedRAMMB    int `json:"used_ram_mb"`
+	UsedVCPUs     int `json:"used_vcpus"`
+	UsedRAMMB     int `json:"used_ram_mb"`
 	UsedStorageGB int `json:"used_storage_gb"`
-	ActivePods   int `json:"active_pods"`
-	MaxVCPUs     int `json:"max_vcpus"`
-	MaxRAMMB     int `json:"max_ram_mb"`
-	MaxPods      int `json:"max_pods"`
+	ActivePods    int `json:"active_pods"`
+	MaxVCPUs      int `json:"max_vcpus"`
+	MaxRAMMB      int `json:"max_ram_mb"`
+	MaxPods       int `json:"max_pods"`
 }
 
 // MeResponse is returned by GET /auth/me.
 type MeResponse struct {
 	User          User          `json:"user"`
 	ResourceUsage ResourceUsage `json:"resource_usage"`
+	Limits        RoleLimits    `json:"limits"`
 }
 
 // TemplateDependentVM represents a VM that depends on a template's base disk (linked clone).

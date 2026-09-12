@@ -45,6 +45,10 @@ func (p *Provisioner) SnapshotVM(ctx context.Context, job *models.Job) error {
 
 	p.publishProgress(job.ID, "snapshot_create", fmt.Sprintf("Creating snapshot %q for %s", payload.Name, podVM.DisplayName))
 
+	existing, err := p.db.ListVMSnapshots(ctx, podVMID)
+	if err != nil {
+		return fmt.Errorf("list existing snapshots for %s: %w", podVM.DisplayName, err)
+	}
 	snapMoref, err := p.vc.CreateVMSnapshot(ctx, *podVM.VCenterVMID, payload.Name, payload.Description)
 	if err != nil {
 		p.logger.Error("snapshot failed: vCenter create", "job_id", job.ID, "vm_name", podVM.DisplayName, "snapshot_name", payload.Name, "error", err)
@@ -61,8 +65,49 @@ func (p *Provisioner) SnapshotVM(ctx context.Context, job *models.Job) error {
 		p.logger.Error("snapshot failed: save record", "job_id", job.ID, "vm_name", podVM.DisplayName, "snapshot_name", payload.Name, "error", err)
 		return fmt.Errorf("save snapshot record for %s: %w", podVM.DisplayName, err)
 	}
+	// Replace only after the new snapshot is durable. A create failure leaves
+	// every previous recovery point intact.
+	for _, old := range existing {
+		if old.IsInitial {
+			continue
+		}
+		if err := p.vc.RemoveVMSnapshot(ctx, *podVM.VCenterVMID, old.VCenterSnapshotID); err != nil {
+			return fmt.Errorf("new snapshot saved but replacing old snapshot %s failed: %w", old.ID, err)
+		}
+		if err := p.db.DeleteVMSnapshot(ctx, old.ID); err != nil {
+			return fmt.Errorf("new snapshot saved but deleting old snapshot record %s failed: %w", old.ID, err)
+		}
+	}
 
 	p.logger.Info("snapshot created", "job_id", job.ID, "pod_vm_id", podVMID, "vm_name", podVM.DisplayName, "snapshot", payload.Name, "moref", snapMoref)
+	return nil
+}
+
+// ReconcileExcessSnapshots removes durable leftovers from interrupted
+// create-new-then-delete-old replacement jobs.
+func (p *Provisioner) ReconcileExcessSnapshots(ctx context.Context) error {
+	excess, err := p.db.ListExcessUserSnapshots(ctx)
+	if err != nil {
+		return err
+	}
+	for _, snap := range excess {
+		vm, err := p.db.GetPodVM(ctx, snap.PodVMID)
+		if err != nil || vm == nil || vm.VCenterVMID == nil || *vm.VCenterVMID == "" {
+			p.logger.Warn("snapshot cleanup: VM unavailable", "snapshot_id", snap.ID, "error", err)
+			continue
+		}
+		if err := p.validatePersistedVMPlacement(ctx, snap.PodVMID, *vm.VCenterVMID); err != nil {
+			p.logger.Warn("snapshot cleanup: placement validation failed", "snapshot_id", snap.ID, "error", err)
+			continue
+		}
+		if err := p.vc.RemoveVMSnapshot(ctx, *vm.VCenterVMID, snap.VCenterSnapshotID); err != nil {
+			p.logger.Warn("snapshot cleanup: vCenter delete failed", "snapshot_id", snap.ID, "error", err)
+			continue
+		}
+		if err := p.db.DeleteVMSnapshot(ctx, snap.ID); err != nil {
+			p.logger.Warn("snapshot cleanup: DB delete failed", "snapshot_id", snap.ID, "error", err)
+		}
+	}
 	return nil
 }
 

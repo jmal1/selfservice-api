@@ -83,6 +83,10 @@ func (f *fakeIdleDB) ListRunningPodVMsForIdleEval(_ context.Context) ([]database
 	return f.candidates, nil
 }
 
+func (f *fakeIdleDB) IdleSuspendCandidateStillEligible(_ context.Context, _ uuid.UUID) (bool, error) {
+	return true, nil
+}
+
 func (f *fakeIdleDB) TouchVMActivityAt(_ context.Context, id uuid.UUID, t time.Time) error {
 	f.activityTouched[id] = t
 	return nil

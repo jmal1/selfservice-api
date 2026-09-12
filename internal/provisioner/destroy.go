@@ -14,7 +14,8 @@ import (
 
 // DestroyPodPayload is the expected shape of job.Payload for pod_destroy.
 type DestroyPodPayload struct {
-	PodID string `json:"pod_id"`
+	PodID  string `json:"pod_id"`
+	Reason string `json:"reason,omitempty"`
 }
 
 // DestroyPod executes the pod destruction workflow.
@@ -35,6 +36,15 @@ func (p *Provisioner) DestroyPod(ctx context.Context, job *models.Job) error {
 	claimOwner, _, err := claimedJobLease(job)
 	if err != nil {
 		return err
+	}
+	if payload.Reason == "suspended_too_long" {
+		eligible, checkErr := p.db.PodVMsAllSuspendedPastRetention(ctx, podID)
+		if checkErr != nil {
+			return fmt.Errorf("recheck suspended-too-long pod: %w", checkErr)
+		}
+		if !eligible {
+			return fmt.Errorf("suspended-too-long destroy no longer eligible: %w", database.ErrPodDestroyNotNeeded)
+		}
 	}
 
 	pod, err := p.db.PreparePodDestroy(ctx, podID, job.ID, claimOwner)
@@ -316,6 +326,10 @@ func (p *Provisioner) RetryFailedDestroys(ctx context.Context) {
 
 	p.logger.Info("retrying failed destroys", "count", len(pods))
 	for _, pod := range pods {
+		if err := p.db.RecordDestroyFailedRetry(ctx, pod.ID); err != nil {
+			p.logger.Warn("failed to reserve destroy retry", "pod_id", pod.ID, "error", err)
+			continue
+		}
 		payload, _ := json.Marshal(DestroyPodPayload{PodID: pod.ID.String()})
 		job, queued, err := p.db.RequeueFailedPodDestroyJob(ctx, pod.ID, payload)
 		if err != nil {
