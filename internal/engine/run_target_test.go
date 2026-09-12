@@ -102,6 +102,52 @@ func TestGetRunTargetInfo_OrdersDeterministically(t *testing.T) {
 	}
 }
 
+// TestGetRunTargetInfo_SkipsUnreachableVMs guards the empty-target.ip incident.
+//
+// Live failure (2026-09-12): GetRunTargetInfo ordered all pod_vms rows by
+// boot_order/created_at/id with no status filter. A pod that had replaced its
+// Ubuntu VM still had the original deleted row as the oldest boot_order=0
+// entry, so the engine shipped runner-config.json with target.ip="", the
+// runner exited 1 immediately ("invalid config: target.ip is required"), and
+// the run stayed status=running until the 10-minute watchdog — because orphan
+// Job cleanup deletes Failed Jobs without updating the run row.
+//
+// Preferring status=running is also load-bearing for multi-VM pods where a
+// suspended sibling shares boot_order=0 and an earlier created_at: without it
+// we would grade the suspended Windows box instead of the live Ubuntu.
+func TestGetRunTargetInfo_SkipsUnreachableVMs(t *testing.T) {
+	lits := funcStringLiterals(t, "queries.go", "GetRunTargetInfo")
+
+	var query string
+	for _, lit := range lits {
+		lower := strings.ToLower(lit)
+		if strings.Contains(lower, "from pod_vms") && strings.Contains(lower, "order by") {
+			query = lower
+			break
+		}
+	}
+	if query == "" {
+		t.Fatal("could not find the pod_vms target-selection query in GetRunTargetInfo — guard is vacuous")
+	}
+
+	if !strings.Contains(query, "deleted") {
+		t.Error("GetRunTargetInfo no longer excludes status='deleted'.\n" +
+			"  Deleted rebuild residue would again be selected as the primary VM,\n" +
+			"  target.ip would be empty, and every assessment on that pod would\n" +
+			"  crash the runner then hang as status=running for 10 minutes.")
+	}
+	if !strings.Contains(query, "ip_address") || !strings.Contains(query, "<> ''") {
+		t.Error("GetRunTargetInfo no longer requires a non-empty ip_address.\n" +
+			"  The runner rejects empty target.ip at startup; filtering here fails\n" +
+			"  the run at claim time instead of shipping a doomed Job.")
+	}
+	if !strings.Contains(query, "status = 'running'") {
+		t.Error("GetRunTargetInfo no longer prefers status='running'.\n" +
+			"  A suspended sibling with the same boot_order and an earlier\n" +
+			"  created_at would steal grading from the live target VM.")
+	}
+}
+
 // TestGetRunTargetInfo_SelectsTargetIdentity guards the other half: the query
 // must actually read the identity of the row it picked.
 //
