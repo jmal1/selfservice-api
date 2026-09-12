@@ -304,8 +304,8 @@
     {
       "path": "docs/student/snapshots.md",
       "title": "Snapshots and Recovery",
-      "size": 1407,
-      "sha256": "42f0c82c2840ca360321b0f017203ccb5e7ae2e5c39e513edd88556641acafef",
+      "size": 1551,
+      "sha256": "f93c129459a5e07831ce5778db3c7992e9cd62ca8237ab41c5512bf8bbb2b1d3",
       "is_markdown": true,
       "from_seed": false
     },
@@ -438,5 +438,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 741417
+  "total_bytes": 741561
 }

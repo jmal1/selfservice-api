@@ -99,17 +99,6 @@ func (h *Handler) CreateVMSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	count, err := h.db.CountUserSnapshots(r.Context(), vmID)
-	if err != nil {
-		h.logger.Error("count user snapshots failed", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	if count >= models.MaxUserSnapshots {
-		http.Error(w, "snapshot limit reached (max 2)", http.StatusConflict)
-		return
-	}
-
 	payload, _ := json.Marshal(map[string]string{
 		"pod_id":      podID.String(),
 		"pod_vm_id":   vmID.String(),

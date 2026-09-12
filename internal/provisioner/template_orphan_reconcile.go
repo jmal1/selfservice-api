@@ -16,7 +16,7 @@ import (
 
 // DefaultTemplateOrphanInactiveAge is how long an error/draft wizard may sit
 // with a leftover staging VM before the reconciler destroys it.
-const DefaultTemplateOrphanInactiveAge = 24 * time.Hour
+const DefaultTemplateOrphanInactiveAge = models.TemplateOrphanInactiveAge
 
 // Template orphan disposable name prefixes. Inventory VMs without a DB owner
 // are only auto-destroyed when the name matches one of these Crucible-owned
@@ -35,7 +35,7 @@ type TemplateOrphanReconcilerConfig struct {
 	Folder string
 
 	// InactiveAge gates the DB pass for error/draft rows with a leftover
-	// moref. Empty falls back to DefaultTemplateOrphanInactiveAge (24h).
+	// moref. Empty falls back to DefaultTemplateOrphanInactiveAge (72h).
 	InactiveAge time.Duration
 
 	// MinAge is the inventory grace window for unmatched disposable VMs
@@ -77,6 +77,7 @@ type templateOrphanVCenter interface {
 
 type templateOrphanDB interface {
 	ListStaleWizardTemplateVMs(ctx context.Context, olderThan time.Duration) ([]database.StaleWizardTemplateVM, error)
+	ClaimStaleWizardTemplateVM(ctx context.Context, row database.StaleWizardTemplateVM) (bool, error)
 	ListOwnedTemplateFolderMorefs(ctx context.Context) (map[string]struct{}, error)
 	ClearTemplateVCenterVMIfMatch(ctx context.Context, id uuid.UUID, expectedMoref string) error
 }
@@ -112,17 +113,16 @@ func reconcileTemplateOrphans(
 		return counts, fmt.Errorf("list stale wizard templates: %w", err)
 	}
 	for _, row := range stale {
-		// A powered-on staging VM is not an abandoned shell. It is either
-		// running an installer or holding a guest an operator installed by
-		// hand over the console — which is exactly what a failed manual ISO
-		// provision leaves behind, because the job errors while the VM stays
-		// perfectly usable. destroyTemplateOrphanVM powers the VM off and
-		// ignores the result before deleting it, so without this check the
-		// pass silently destroys that work 24h later with nothing to review.
-		//
-		// Leaving a powered-on VM in place is the safer default for a cleanup
-		// job: the cost is one VM an operator must dispose of through /cancel,
-		// against permanently deleting a finished build.
+		claimed, claimErr := db.ClaimStaleWizardTemplateVM(ctx, row)
+		if claimErr != nil {
+			counts.DestroyFailures++
+			log.Warn("template orphan: claim failed", "template_id", row.ID, "error", claimErr)
+			continue
+		}
+		if !claimed {
+			counts.SkippedRecent++
+			continue
+		}
 		poweredOn, perr := templateOrphanVMPoweredOn(ctx, vc, row.VCenterVMID)
 		if perr != nil {
 			counts.SkippedUndetermined++
@@ -132,11 +132,9 @@ func reconcileTemplateOrphans(
 			continue
 		}
 		if poweredOn {
-			counts.SkippedPoweredOn++
-			log.Warn("template orphan: stale wizard staging VM is powered on; leaving it for an operator to dispose of via cancel",
+			log.Warn("template orphan: stale powered-on wizard VM exceeded 72h claim window; powering off before destroy",
 				"template_id", row.ID, "name", row.Name, "state", row.State,
 				"moref", row.VCenterVMID, "updated_at", row.UpdatedAt)
-			continue
 		}
 		log.Info("template orphan: destroying stale wizard staging VM",
 			"template_id", row.ID, "name", row.Name, "state", row.State,

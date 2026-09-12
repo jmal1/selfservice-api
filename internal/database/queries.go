@@ -1105,6 +1105,9 @@ func (q *Queries) GetPodByID(ctx context.Context, id uuid.UUID) (*models.Pod, er
 	if err == nil && owner != nil {
 		p.Owner = owner
 	}
+	if err := q.populatePodExtensionPolicy(ctx, &p); err != nil {
+		return nil, err
+	}
 
 	// Load VMs
 	rows, err := q.pool.Query(ctx, `
@@ -1182,6 +1185,9 @@ func (q *Queries) ListPodsByOwner(ctx context.Context, ownerID uuid.UUID) ([]mod
 		}
 		pods[i].VMs = vms
 	}
+	if err := q.populatePodExtensionPolicyBatch(ctx, pods); err != nil {
+		return nil, err
+	}
 
 	return pods, nil
 }
@@ -1224,8 +1230,84 @@ func (q *Queries) ListAllPods(ctx context.Context) ([]models.Pod, error) {
 		}
 		pods[i].VMs = vms
 	}
+	if err := q.populatePodExtensionPolicyBatch(ctx, pods); err != nil {
+		return nil, err
+	}
 
 	return pods, nil
+}
+
+func (q *Queries) CountPodAttestations(ctx context.Context, podID uuid.UUID) (int, error) {
+	var count int
+	if err := q.pool.QueryRow(ctx, `SELECT COUNT(*) FROM pod_attestations WHERE pod_id = $1`, podID).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count pod attestations: %w", err)
+	}
+	return count, nil
+}
+
+func (q *Queries) CountPodAttestationsBatch(ctx context.Context, podIDs []uuid.UUID) (map[uuid.UUID]int, error) {
+	counts := make(map[uuid.UUID]int, len(podIDs))
+	if len(podIDs) == 0 {
+		return counts, nil
+	}
+	rows, err := q.pool.Query(ctx, `
+		SELECT pod_id, COUNT(*)
+		FROM pod_attestations
+		WHERE pod_id = ANY($1)
+		GROUP BY pod_id
+	`, podIDs)
+	if err != nil {
+		return nil, fmt.Errorf("count pod attestations batch: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id uuid.UUID
+		var count int
+		if err := rows.Scan(&id, &count); err != nil {
+			return nil, err
+		}
+		counts[id] = count
+	}
+	return counts, rows.Err()
+}
+
+func (q *Queries) populatePodExtensionPolicy(ctx context.Context, pod *models.Pod) error {
+	count, err := q.CountPodAttestations(ctx, pod.ID)
+	if err != nil {
+		return err
+	}
+	return setPodExtensionPolicy(pod, count)
+}
+
+func (q *Queries) populatePodExtensionPolicyBatch(ctx context.Context, pods []models.Pod) error {
+	ids := make([]uuid.UUID, len(pods))
+	for i := range pods {
+		ids[i] = pods[i].ID
+	}
+	counts, err := q.CountPodAttestationsBatch(ctx, ids)
+	if err != nil {
+		return err
+	}
+	for i := range pods {
+		if err := setPodExtensionPolicy(&pods[i], counts[pods[i].ID]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func setPodExtensionPolicy(pod *models.Pod, used int) error {
+	if pod.Owner == nil {
+		return fmt.Errorf("pod %s owner role unavailable", pod.ID)
+	}
+	extension, err := models.PodExtend(pod.Owner.Role)
+	if err != nil {
+		return err
+	}
+	pod.ExtensionsUsed = used
+	pod.ExtensionsRemaining = max(0, models.MaxPodExtensions-used)
+	pod.ExtendDays = int(extension.Hours() / 24)
+	return nil
 }
 
 // listPodVMsActive returns non-deleted VMs for a pod.
@@ -2040,6 +2122,8 @@ const listRetryableDestroyFailedPodsSQL = `
 	FROM pods
 	WHERE status = 'destroy_failed'
 	  AND LEFT(COALESCE(error_message, ''), LENGTH($1)) <> $1
+	  AND destroy_retry_count < $2
+	  AND (destroy_retry_after IS NULL OR destroy_retry_after <= now())
 	ORDER BY updated_at ASC
 `
 
@@ -2051,6 +2135,7 @@ func (q *Queries) ListRetryableDestroyFailedPods(ctx context.Context) ([]models.
 		ctx,
 		listRetryableDestroyFailedPodsSQL,
 		models.PodErrorManualCleanupRequiredPrefix,
+		models.MaxDestroyFailedRetries,
 	)
 	if err != nil {
 		return nil, err
@@ -2067,6 +2152,22 @@ func (q *Queries) ListRetryableDestroyFailedPods(ctx context.Context) ([]models.
 		pods = append(pods, p)
 	}
 	return pods, rows.Err()
+}
+
+func (q *Queries) RecordDestroyFailedRetry(ctx context.Context, podID uuid.UUID) error {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE pods
+		SET destroy_retry_count = destroy_retry_count + 1,
+		    destroy_retry_after = now() + ($2 * power(2, destroy_retry_count)) * interval '1 second'
+		WHERE id = $1 AND status = 'destroy_failed'
+	`, podID, int(models.DestroyFailedRetryAfter.Seconds()))
+	if err != nil {
+		return fmt.Errorf("record destroy retry: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("record destroy retry: pod %s no longer destroy_failed", podID)
+	}
+	return nil
 }
 
 // CountDestroyFailedPods returns every pod in destroy_failed status, including
@@ -3237,6 +3338,34 @@ func (q *Queries) CountUserSnapshots(ctx context.Context, podVMID uuid.UUID) (in
 	return count, nil
 }
 
+// ListExcessUserSnapshots returns every non-initial snapshot except the newest
+// allowed snapshot for each VM. The worker removes these durably.
+func (q *Queries) ListExcessUserSnapshots(ctx context.Context) ([]models.VMSnapshot, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT id, pod_vm_id, name, description, vcenter_snapshot_id, is_initial, created_at
+		FROM (
+			SELECT s.*, row_number() OVER (PARTITION BY pod_vm_id ORDER BY created_at DESC, id DESC) AS rn
+			FROM vm_snapshots s
+			WHERE is_initial = false
+		) ranked
+		WHERE rn > $1
+		ORDER BY created_at ASC
+	`, models.MaxUserSnapshots)
+	if err != nil {
+		return nil, fmt.Errorf("list excess user snapshots: %w", err)
+	}
+	defer rows.Close()
+	var snapshots []models.VMSnapshot
+	for rows.Next() {
+		var s models.VMSnapshot
+		if err := rows.Scan(&s.ID, &s.PodVMID, &s.Name, &s.Description, &s.VCenterSnapshotID, &s.IsInitial, &s.CreatedAt); err != nil {
+			return nil, err
+		}
+		snapshots = append(snapshots, s)
+	}
+	return snapshots, rows.Err()
+}
+
 // ListExpiredPods returns active pods that have passed their expiration time.
 func (q *Queries) ListExpiredPods(ctx context.Context) ([]uuid.UUID, error) {
 	rows, err := q.pool.Query(ctx, `
@@ -3257,6 +3386,48 @@ func (q *Queries) ListExpiredPods(ctx context.Context) ([]uuid.UUID, error) {
 		ids = append(ids, id)
 	}
 	return ids, nil
+}
+
+// ListSuspendedPodsPastRetention returns active pods whose remaining VMs are
+// all suspended and whose oldest suspension has exceeded the retention limit.
+func (q *Queries) ListSuspendedPodsPastRetention(ctx context.Context) ([]uuid.UUID, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT p.id
+		FROM pods p
+		JOIN pod_vms vm ON vm.pod_id = p.id AND vm.status <> $1
+		WHERE p.status = $2
+		GROUP BY p.id
+		HAVING BOOL_AND(vm.status = $3)
+		   AND MIN(vm.suspended_at) <= now() - $4::interval
+	`, models.VMStatusDeleted, models.PodStatusActive, models.VMStatusSuspended,
+		fmt.Sprintf("%d seconds", int(models.SuspendedDestroyAfter.Seconds())))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+func (q *Queries) PodVMsAllSuspendedPastRetention(ctx context.Context, podID uuid.UUID) (bool, error) {
+	var eligible bool
+	err := q.pool.QueryRow(ctx, `
+		SELECT COUNT(*) > 0
+		   AND BOOL_AND(status = $2)
+		   AND MIN(suspended_at) <= now() - $3::interval
+		FROM pod_vms
+		WHERE pod_id = $1 AND status <> $4
+	`, podID, models.VMStatusSuspended,
+		fmt.Sprintf("%d seconds", int(models.SuspendedDestroyAfter.Seconds())),
+		models.VMStatusDeleted).Scan(&eligible)
+	return eligible, err
 }
 
 // --- Blueprints ---

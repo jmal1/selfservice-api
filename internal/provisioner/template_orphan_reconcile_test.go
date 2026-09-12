@@ -63,6 +63,10 @@ type fakeTemplateOrphanDB struct {
 	clearErr error
 }
 
+func (d *fakeTemplateOrphanDB) ClaimStaleWizardTemplateVM(_ context.Context, _ database.StaleWizardTemplateVM) (bool, error) {
+	return true, nil
+}
+
 func (d *fakeTemplateOrphanDB) ListStaleWizardTemplateVMs(_ context.Context, _ time.Duration) ([]database.StaleWizardTemplateVM, error) {
 	if d.staleErr != nil {
 		return nil, d.staleErr
@@ -216,18 +220,9 @@ func TestReconcileTemplateOrphans_DestroyFailureCounted(t *testing.T) {
 	}
 }
 
-// TestReconcileTemplateOrphans_SkipsPoweredOnStagingVM is the data-loss guard.
-//
-// A manual ISO provision that failed on a slow datastore leaves the row in
-// `error` with its moref intact while the staging VM stays perfectly usable —
-// and an operator may well have finished installing an OS on it through the
-// vCenter console. destroyTemplateOrphanVM powers the VM off and ignores the
-// result before deleting it, so without this check the pass destroys that work
-// 24h later with nothing to review. A powered-on VM must be retained and
-// counted so an operator disposes of it deliberately via /cancel.
-func TestReconcileTemplateOrphans_SkipsPoweredOnStagingVM(t *testing.T) {
+func TestReconcileTemplateOrphans_DestroysPoweredOnAfterThreeDays(t *testing.T) {
 	fixedNow := time.Date(2026, 9, 4, 0, 0, 0, 0, time.UTC)
-	old := fixedNow.Add(-25 * time.Hour)
+	old := fixedNow.Add(-73 * time.Hour)
 	installedID := uuid.New()
 	abandonedID := uuid.New()
 
@@ -250,27 +245,11 @@ func TestReconcileTemplateOrphans_SkipsPoweredOnStagingVM(t *testing.T) {
 		t.Fatalf("reconcile: %v", err)
 	}
 
-	for _, moref := range vc.destroySeen {
-		if moref == "vm-27390" {
-			t.Fatal("destroyed a powered-on staging VM that may hold a completed console install")
-		}
+	if counts.Destroyed != 2 || counts.StaleFailed != 1 || counts.StaleDraft != 1 {
+		t.Errorf("counts=%+v; want both stale rows destroyed", counts)
 	}
-	if counts.SkippedPoweredOn != 1 {
-		t.Errorf("skipped_powered_on=%d; want 1 so the retained VM is visible in metrics", counts.SkippedPoweredOn)
-	}
-	if counts.StaleFailed != 0 {
-		t.Errorf("stale_failed=%d; want 0 — the errored row was retained, not destroyed", counts.StaleFailed)
-	}
-	// The moref must survive so the row keeps pointing at the VM an operator
-	// still has to deal with.
-	for _, cleared := range db.cleared {
-		if cleared == installedID.String()+":vm-27390" {
-			t.Error("cleared the moref of a retained VM; the row would lose track of it")
-		}
-	}
-	// The abandoned shell is the reaper's actual job and must still go.
-	if counts.Destroyed != 1 || len(vc.destroySeen) != 1 || vc.destroySeen[0] != "vm-dead" {
-		t.Errorf("destroyed=%d seen=%v; want only the powered-off abandoned shell", counts.Destroyed, vc.destroySeen)
+	if len(vc.destroySeen) != 2 {
+		t.Fatalf("destroyed=%v; want both powered-on and powered-off stale VMs", vc.destroySeen)
 	}
 }
 

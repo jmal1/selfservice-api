@@ -128,6 +128,56 @@ func podDestroyPayload(t *testing.T, podID uuid.UUID, source string) []byte {
 	return payload
 }
 
+func TestExtendPodPostgresCapsExtensionsAtomically(t *testing.T) {
+	fixture := newPodJobsPostgresFixture(t, models.PodStatusActive)
+	ctx := context.Background()
+	for i := 0; i < models.MaxPodExtensions; i++ {
+		if _, err := fixture.queries.ExtendPod(ctx, fixture.podID, fixture.ownerID, time.Now().Add(24*time.Hour)); err != nil {
+			t.Fatalf("extension %d: %v", i+1, err)
+		}
+	}
+	if _, err := fixture.queries.ExtendPod(ctx, fixture.podID, fixture.ownerID, time.Now().Add(24*time.Hour)); !errors.Is(err, ErrPodExtensionsExhausted) {
+		t.Fatalf("third extension error = %v, want %v", err, ErrPodExtensionsExhausted)
+	}
+	count, err := fixture.queries.CountPodAttestations(ctx, fixture.podID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != models.MaxPodExtensions {
+		t.Fatalf("attestations = %d, want %d", count, models.MaxPodExtensions)
+	}
+}
+
+func TestExtendPodPostgresConcurrentCap(t *testing.T) {
+	fixture := newPodJobsPostgresFixture(t, models.PodStatusActive)
+	results := make(chan error, models.MaxPodExtensions+1)
+	var wg sync.WaitGroup
+	for i := 0; i < models.MaxPodExtensions+1; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := fixture.queries.ExtendPod(context.Background(), fixture.podID, fixture.ownerID, time.Now().Add(24*time.Hour))
+			results <- err
+		}()
+	}
+	wg.Wait()
+	close(results)
+	var succeeded, exhausted int
+	for err := range results {
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, ErrPodExtensionsExhausted):
+			exhausted++
+		default:
+			t.Fatalf("unexpected extension error: %v", err)
+		}
+	}
+	if succeeded != models.MaxPodExtensions || exhausted != 1 {
+		t.Fatalf("succeeded=%d exhausted=%d", succeeded, exhausted)
+	}
+}
+
 func vmJobPayload(t *testing.T, podID, podVMID uuid.UUID) []byte {
 	t.Helper()
 	payload, err := json.Marshal(map[string]string{

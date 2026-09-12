@@ -9,7 +9,7 @@ Snapshots save a point-in-time state for one VM so you can return to it after an
 3. Enter a short, specific name and an optional description of what you want to preserve.
 4. Wait for the snapshot job to finish before making the next major change.
 
-**Expected result:** The named snapshot appears in that VM's snapshot list. You can keep up to two snapshots you create for a VM.
+**Expected result:** The named snapshot appears in that VM's snapshot list. Each VM keeps its protected original snapshot plus one snapshot you create. Creating another named snapshot replaces the previous named snapshot only after the new snapshot is created successfully.
 
 ## Revert to a named snapshot
 

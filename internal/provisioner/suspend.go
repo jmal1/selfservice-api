@@ -40,6 +40,13 @@ func (p *Provisioner) SuspendVM(ctx context.Context, job *models.Job) error {
 	if podVM.VCenterVMID == nil || *podVM.VCenterVMID == "" {
 		return fmt.Errorf("VM %q has no vCenter reference", podVM.DisplayName)
 	}
+	pod, err := p.db.GetPodByID(ctx, podVM.PodID)
+	if err != nil || pod == nil || pod.Owner == nil {
+		return fmt.Errorf("vm_suspend: pod owner unavailable")
+	}
+	if pod.Status != models.PodStatusActive || podVM.Status != models.VMStatusRunning || !models.IdleSuspendApplies(pod.Owner.Role) {
+		return fmt.Errorf("vm_suspend: idle suspension no longer applies")
+	}
 	moref := *podVM.VCenterVMID
 	if err := p.validatePersistedVMPlacement(ctx, podVMID, moref); err != nil {
 		return fmt.Errorf(

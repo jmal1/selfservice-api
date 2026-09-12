@@ -425,21 +425,24 @@ type TemplateAccess struct {
 
 // Pod represents a student's isolated environment (1 VLAN + N VMs).
 type Pod struct {
-	ID               uuid.UUID  `json:"id" db:"id"`
-	OwnerID          uuid.UUID  `json:"owner_id" db:"owner_id"`
-	Name             string     `json:"name" db:"name"`
-	Salt             string     `json:"salt" db:"salt"`
-	VLANID           int        `json:"vlan_id" db:"vlan_id"`
-	Subnet           string     `json:"subnet" db:"subnet"`
-	Status           string     `json:"status" db:"status"`
-	ErrorMessage     *string    `json:"error_message,omitempty" db:"error_message"`
-	ExpiresAt        *time.Time `json:"expires_at,omitempty" db:"expires_at"`
-	BlueprintID      *uuid.UUID `json:"blueprint_id,omitempty" db:"blueprint_id"`
-	AllowVMAdditions bool       `json:"allow_vm_additions" db:"allow_vm_additions"`
-	CreatedAt        time.Time  `json:"created_at" db:"created_at"`
-	UpdatedAt        time.Time  `json:"updated_at" db:"updated_at"`
-	VMs              []PodVM    `json:"vms,omitempty"`
-	Owner            *User      `json:"owner,omitempty"`
+	ID                  uuid.UUID  `json:"id" db:"id"`
+	OwnerID             uuid.UUID  `json:"owner_id" db:"owner_id"`
+	Name                string     `json:"name" db:"name"`
+	Salt                string     `json:"salt" db:"salt"`
+	VLANID              int        `json:"vlan_id" db:"vlan_id"`
+	Subnet              string     `json:"subnet" db:"subnet"`
+	Status              string     `json:"status" db:"status"`
+	ErrorMessage        *string    `json:"error_message,omitempty" db:"error_message"`
+	ExpiresAt           *time.Time `json:"expires_at,omitempty" db:"expires_at"`
+	BlueprintID         *uuid.UUID `json:"blueprint_id,omitempty" db:"blueprint_id"`
+	AllowVMAdditions    bool       `json:"allow_vm_additions" db:"allow_vm_additions"`
+	CreatedAt           time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt           time.Time  `json:"updated_at" db:"updated_at"`
+	VMs                 []PodVM    `json:"vms,omitempty"`
+	Owner               *User      `json:"owner,omitempty"`
+	ExtensionsUsed      int        `json:"extensions_used"`
+	ExtensionsRemaining int        `json:"extensions_remaining"`
+	ExtendDays          int        `json:"extend_days"`
 }
 
 // PodVM represents a virtual machine within a pod.
@@ -496,9 +499,6 @@ type PodAttestation struct {
 	NewExpiresAt      time.Time  `json:"new_expires_at" db:"new_expires_at"`
 	CreatedAt         time.Time  `json:"created_at" db:"created_at"`
 }
-
-// MaxUserSnapshots is the maximum number of user-created snapshots per VM.
-const MaxUserSnapshots = 2
 
 // Blueprint is a reusable pod template created by instructors/admins.
 type Blueprint struct {
@@ -684,6 +684,6 @@ var DefaultQuotas = map[string]struct {
 	MaxPods  int
 }{
 	RoleStudent:    {MaxVCPUs: 4, MaxRAMMB: 8192, MaxPods: 2},
-	RoleInstructor: {MaxVCPUs: 20, MaxRAMMB: 40960, MaxPods: 10},
+	RoleInstructor: {MaxVCPUs: 8, MaxRAMMB: 16384, MaxPods: 3},
 	RoleAdmin:      {MaxVCPUs: 999, MaxRAMMB: 999999, MaxPods: 999},
 }

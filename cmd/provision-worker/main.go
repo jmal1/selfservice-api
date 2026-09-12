@@ -63,14 +63,14 @@ func main() {
 
 	// Initialize vCenter client
 	vcClient := vcenter.New(vcenter.Config{
-		URL:        cfg.VCenter.URL,
-		User:       cfg.VCenter.User,
-		Password:   cfg.VCenter.Password,
+		URL:           cfg.VCenter.URL,
+		User:          cfg.VCenter.User,
+		Password:      cfg.VCenter.Password,
 		ClientCertPEM: cfg.VCenter.ClientCertPEM,
 		ClientKeyPEM:  cfg.VCenter.ClientKeyPEM,
-		Datacenter: cfg.VCenter.Datacenter,
-		Datastore:  cfg.VCenter.Datastore,
-		VMFolder:   cfg.VCenter.VMFolder,
+		Datacenter:    cfg.VCenter.Datacenter,
+		Datastore:     cfg.VCenter.Datastore,
+		VMFolder:      cfg.VCenter.VMFolder,
 		// Template build VMs (source_type=iso creates a blank shell here)
 		// belong beside every other template, NOT in VMFolder — that folder
 		// holds ephemeral student pod VMs and is what the orphan reconciler
@@ -630,7 +630,7 @@ func main() {
 	// Retry any pods stuck in destroy_failed from previous runs (work-lease gated).
 	runLeased(ctx, leaseStore, worklease.RetryFailedDestroys, workerID, logger, func(leaseCtx context.Context) error {
 		prov.RetryFailedDestroys(leaseCtx)
-		return nil
+		return prov.ReconcileExcessSnapshots(leaseCtx)
 	})
 
 	jobRuns := &jobRunner{}
@@ -808,7 +808,7 @@ func main() {
 			case <-retryTicker.C:
 				runLeased(ctx, leaseStore, worklease.RetryFailedDestroys, workerID, logger, func(leaseCtx context.Context) error {
 					prov.RetryFailedDestroys(leaseCtx)
-					return nil
+					return prov.ReconcileExcessSnapshots(leaseCtx)
 				})
 			case <-expirationCronTicker.C:
 				runLeased(ctx, leaseStore, worklease.ExpireStale, workerID, logger, func(leaseCtx context.Context) error {
@@ -1191,4 +1191,3 @@ func startupWorkLeaseCatchup(
 		})
 	}
 }
-
