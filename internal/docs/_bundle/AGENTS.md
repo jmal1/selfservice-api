@@ -213,16 +213,17 @@ When the runner pod executes a workflow's `script`, it provides these helpers an
 
 **Which VM is the target?**
 
-A workflow runs against **one** VM: the pod's *primary* VM. It is chosen by
-`boot_order` ascending, ties broken by creation time and finally by VM id. Since
-every VM in a pod is created in a single operation, they normally share a
-creation time and a `boot_order` of 0 — so for a multi-VM pod the practical rule
-is **set `boot_order` on the blueprint to say which VM should be assessed**.
-Without that, the tiebreaker still guarantees the *same* VM every run, but which
-one it lands on is not meaningful.
+A workflow run grades **exactly one** VM: the `target_pod_vm_id` chosen when the
+student (or API client) starts the assessment. The testing dashboard lists
+playlists **per reachable pod VM**, so two VMs cloned from the same template
+appear as separate assessment targets even though they share the same playlist
+set. `POST /pods/{id}/testing/run` requires both `playlist_id` and
+`target_pod_vm_id`; the engine fails closed if a run has no target.
 
-The VM that was assessed is recorded on the run and shown as **Assessed VM** on
-the run detail page, so you can always confirm what a given result refers to.
+The VM that was assessed is recorded on the run (`target_vm_name` /
+`target_vm_ip`) and shown as **Assessed VM** / **Target VM** on the run detail
+page (including on each workflow/check row), so you can always confirm what a
+given result refers to.
 
 ### 5.2 `run_action "<label>" <command...>`
 

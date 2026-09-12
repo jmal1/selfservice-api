@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
 	"strings"
 	"testing"
 )
@@ -49,126 +50,60 @@ func funcStringLiterals(t *testing.T, file, fnName string) []string {
 	return lits
 }
 
-// TestGetRunTargetInfo_OrdersDeterministically guards the target-selection fix.
-//
-// The production defect: target selection was `ORDER BY pv.created_at ASC LIMIT 1`
-// with no tiebreaker. CreatePod inserts all of a pod's VMs in a single statement,
-// so a multi-VM pod's rows carry an identical created_at to the microsecond, and
-// boot_order defaults to 0 for every one of them. Postgres plans that as an
-// unstable quicksort (verified on the live database: "Sort Method: quicksort",
-// two rows, equal keys), so "the pod's primary VM" was whichever row the sort
-// happened to emit first.
-//
-// Consequence if this regresses: the same pod, playlist and code can grade a
-// DIFFERENT machine between runs. A student's web-server workflow silently runs
-// against their database VM and reports a failure they cannot reproduce. It is
-// invisible rather than loud, because the run itself succeeds.
-//
-// pv.id is a unique primary key, so requiring it in the ORDER BY makes the
-// ordering total regardless of what the other keys do.
-func TestGetRunTargetInfo_OrdersDeterministically(t *testing.T) {
-	lits := funcStringLiterals(t, "queries.go", "GetRunTargetInfo")
-
-	var orderBy string
+func podVMsQueryLiteral(t *testing.T, fnName string) string {
+	t.Helper()
+	lits := funcStringLiterals(t, "queries.go", fnName)
 	for _, lit := range lits {
 		lower := strings.ToLower(lit)
-		if strings.Contains(lower, "from pod_vms") && strings.Contains(lower, "order by") {
-			orderBy = lit
-			break
+		if strings.Contains(lower, "from pod_vms") {
+			return lower
 		}
 	}
-	// Assert the premise. If the query is ever restructured so that no literal
-	// matches, this guard would otherwise pass while checking nothing at all.
-	if orderBy == "" {
-		t.Fatal("could not find the pod_vms target-selection query in GetRunTargetInfo. " +
-			"This guard is now vacuous — fix it rather than leaving it green.")
-	}
+	t.Fatalf("could not find the pod_vms query in %s — guard is vacuous", fnName)
+	return ""
+}
 
-	lower := strings.ToLower(orderBy)
-	idx := strings.Index(lower, "order by")
-	clause := lower[idx:]
-	if end := strings.Index(clause, "limit"); end != -1 {
-		clause = clause[:end]
+// TestGetRunTargetInfo_PinsExactPodVMID guards the twin-VM selection contract.
+//
+// Same-template twins used to share one playlist offer and the engine always
+// graded "primary" via ORDER BY … LIMIT 1. Selecting VM B in the UI still
+// graded VM A. The query must bind pv.id to the run's target_pod_vm_id ($2).
+func TestGetRunTargetInfo_PinsExactPodVMID(t *testing.T) {
+	query := podVMsQueryLiteral(t, "GetRunTargetInfo")
+	if !strings.Contains(query, "pv.id = $2") {
+		t.Error("GetRunTargetInfo no longer pins pv.id = $2.\n" +
+			"  Twin VMs from the same template would again grade whichever row\n" +
+			"  an ORDER BY / LIMIT 1 picked, ignoring the student's selection.")
 	}
-
-	if !strings.Contains(clause, "pv.id") {
-		t.Errorf("GetRunTargetInfo's ORDER BY has no unique-key tiebreaker.\n"+
-			"  Got: %s\n"+
-			"  A pod's VMs are inserted in one statement, so created_at is identical\n"+
-			"  across them and boot_order defaults to 0 for all. Without pv.id the\n"+
-			"  ordering is not total, Postgres sorts it with an unstable quicksort,\n"+
-			"  and which VM gets graded is undefined between runs.",
-			strings.TrimSpace(clause))
+	if strings.Contains(query, "order by") || strings.Contains(query, "limit 1") {
+		t.Error("GetRunTargetInfo still uses ORDER BY / LIMIT 1 primary selection.\n" +
+			"  Exact target_pod_vm_id selection must not fall back to primary.")
 	}
 }
 
 // TestGetRunTargetInfo_SkipsUnreachableVMs guards the empty-target.ip incident.
 //
-// Live failure (2026-09-12): GetRunTargetInfo ordered all pod_vms rows by
-// boot_order/created_at/id with no status filter. A pod that had replaced its
-// Ubuntu VM still had the original deleted row as the oldest boot_order=0
-// entry, so the engine shipped runner-config.json with target.ip="", the
-// runner exited 1 immediately ("invalid config: target.ip is required"), and
-// the run stayed status=running until the 10-minute watchdog — because orphan
-// Job cleanup deletes Failed Jobs without updating the run row.
-//
-// Preferring status=running is also load-bearing for multi-VM pods where a
-// suspended sibling shares boot_order=0 and an earlier created_at: without it
-// we would grade the suspended Windows box instead of the live Ubuntu.
+// Live failure (2026-09-12): a deleted rebuild residue could be selected and
+// ship target.ip="", hanging the run as status=running for 10 minutes.
 func TestGetRunTargetInfo_SkipsUnreachableVMs(t *testing.T) {
-	lits := funcStringLiterals(t, "queries.go", "GetRunTargetInfo")
-
-	var query string
-	for _, lit := range lits {
-		lower := strings.ToLower(lit)
-		if strings.Contains(lower, "from pod_vms") && strings.Contains(lower, "order by") {
-			query = lower
-			break
-		}
-	}
-	if query == "" {
-		t.Fatal("could not find the pod_vms target-selection query in GetRunTargetInfo — guard is vacuous")
-	}
+	query := podVMsQueryLiteral(t, "GetRunTargetInfo")
 
 	if !strings.Contains(query, "deleted") {
 		t.Error("GetRunTargetInfo no longer excludes status='deleted'.\n" +
-			"  Deleted rebuild residue would again be selected as the primary VM,\n" +
-			"  target.ip would be empty, and every assessment on that pod would\n" +
-			"  crash the runner then hang as status=running for 10 minutes.")
+			"  Deleted rebuild residue could be selected again, target.ip would\n" +
+			"  be empty, and the runner would crash then hang for 10 minutes.")
 	}
 	if !strings.Contains(query, "ip_address") || !strings.Contains(query, "<> ''") {
 		t.Error("GetRunTargetInfo no longer requires a non-empty ip_address.\n" +
 			"  The runner rejects empty target.ip at startup; filtering here fails\n" +
 			"  the run at claim time instead of shipping a doomed Job.")
 	}
-	if !strings.Contains(query, "status = 'running'") {
-		t.Error("GetRunTargetInfo no longer prefers status='running'.\n" +
-			"  A suspended sibling with the same boot_order and an earlier\n" +
-			"  created_at would steal grading from the live target VM.")
-	}
 }
 
 // TestGetRunTargetInfo_SelectsTargetIdentity guards the other half: the query
 // must actually read the identity of the row it picked.
-//
-// Before this change it selected only ip/os/username/password, so the engine
-// never learned WHICH pod_vms row it had chosen. Nothing downstream could record
-// it, which is why a completed assessment left no trace of the machine it
-// graded — the only evidence was incidental, e.g. nmap printing the scanned IP
-// into its own stdout.
 func TestGetRunTargetInfo_SelectsTargetIdentity(t *testing.T) {
-	lits := funcStringLiterals(t, "queries.go", "GetRunTargetInfo")
-
-	var query string
-	for _, lit := range lits {
-		if strings.Contains(strings.ToLower(lit), "from pod_vms") {
-			query = strings.ToLower(lit)
-			break
-		}
-	}
-	if query == "" {
-		t.Fatal("could not find the pod_vms query in GetRunTargetInfo — guard is vacuous")
-	}
+	query := podVMsQueryLiteral(t, "GetRunTargetInfo")
 
 	selectPart := query
 	if end := strings.Index(selectPart, "from pod_vms"); end != -1 {
@@ -182,6 +117,39 @@ func TestGetRunTargetInfo_SelectsTargetIdentity(t *testing.T) {
 				"  record has no target attribution at all.",
 				col, strings.TrimSpace(selectPart))
 		}
+	}
+}
+
+// TestGetVMwareToolsTarget_PinsExactPodVMID keeps guest-ops on the same VM the
+// student selected for kali_runner grading.
+func TestGetVMwareToolsTarget_PinsExactPodVMID(t *testing.T) {
+	query := podVMsQueryLiteral(t, "GetVMwareToolsTarget")
+	if !strings.Contains(query, "pv.id = $2") {
+		t.Error("GetVMwareToolsTarget no longer pins pv.id = $2.\n" +
+			"  Mixed-mode playlists would guest-ops the oldest VM while kali\n" +
+			"  graded the selected twin.")
+	}
+}
+
+// TestExecuteRun_RequiresTargetPodVMID guards fail-closed create→engine contract.
+func TestExecuteRun_RequiresTargetPodVMID(t *testing.T) {
+	raw, err := os.ReadFile("engine.go")
+	if err != nil {
+		t.Fatalf("read engine.go: %v", err)
+	}
+	src := string(raw)
+	idx := strings.Index(src, "func (e *Engine) executeRun(")
+	if idx < 0 {
+		t.Fatal("executeRun not found")
+	}
+	body := src[idx:]
+	if end := strings.Index(body[1:], "\nfunc "); end >= 0 {
+		body = body[:end+1]
+	}
+	if !strings.Contains(body, "TargetPodVMID") || !strings.Contains(body, "has no target_pod_vm_id") {
+		t.Error("executeRun no longer fail-closes when TargetPodVMID is nil.\n" +
+			"  Legacy/synthetic runs without a selected VM would again pick an\n" +
+			"  ambiguous primary target.")
 	}
 }
 
@@ -216,8 +184,6 @@ func TestExecuteRun_RecordsTargetVM(t *testing.T) {
 		return true
 	})
 
-	// Premise check: if the engine no longer resolves a target at all, this guard
-	// is meaningless and should fail loudly rather than pass.
 	if !callsGetTarget {
 		t.Fatal("engine.go never calls GetRunTargetInfo — this guard is vacuous. " +
 			"If target resolution moved, move this guard with it.")
