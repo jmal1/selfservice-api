@@ -2,14 +2,17 @@ package handlers
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/jmal1/selfservice-api/internal/middleware"
 	"github.com/jmal1/selfservice-api/internal/models"
@@ -18,7 +21,8 @@ import (
 
 // --- Student Testing Routes ---
 
-// GetTestingDashboard returns playlists assigned to a pod's VM (template defaults or blueprint overrides).
+// GetTestingDashboard returns assessment offers grouped by reachable pod VM,
+// plus recent runs for the pod.
 func (h *Handler) GetTestingDashboard(w http.ResponseWriter, r *http.Request) {
 	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
 	if err != nil {
@@ -45,11 +49,10 @@ func (h *Handler) GetTestingDashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve playlists for this pod (template defaults → blueprint overrides)
-	playlists, err := h.db.GetPlaylistsForPod(r.Context(), podID)
+	targets, err := h.db.GetTestingTargetsForPod(r.Context(), podID)
 	if err != nil {
-		h.logger.Error("failed to get playlists for pod", "pod_id", podID, "error", err)
-		respondError(w, r, http.StatusInternalServerError, "failed to load playlists")
+		h.logger.Error("failed to get testing targets for pod", "pod_id", podID, "error", err)
+		respondError(w, r, http.StatusInternalServerError, "failed to load assessments")
 		return
 	}
 
@@ -61,12 +64,12 @@ func (h *Handler) GetTestingDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respondJSON(w, http.StatusOK, map[string]any{
-		"playlists":   playlists,
+		"targets":     targets,
 		"recent_runs": runs,
 	})
 }
 
-// CreateTestingRun triggers a new assessment run for a pod.
+// CreateTestingRun triggers a new assessment run for a pod against a specific VM.
 func (h *Handler) CreateTestingRun(w http.ResponseWriter, r *http.Request) {
 	podID, err := uuid.Parse(chi.URLParam(r, "podID"))
 	if err != nil {
@@ -95,8 +98,9 @@ func (h *Handler) CreateTestingRun(w http.ResponseWriter, r *http.Request) {
 
 	// Parse request
 	var req struct {
-		PlaylistID  *uuid.UUID  `json:"playlist_id"`
-		WorkflowIDs []uuid.UUID `json:"workflow_ids"`
+		PlaylistID    *uuid.UUID  `json:"playlist_id"`
+		TargetPodVMID *uuid.UUID  `json:"target_pod_vm_id"`
+		WorkflowIDs   []uuid.UUID `json:"workflow_ids"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondError(w, r, http.StatusBadRequest, "invalid request body")
@@ -116,6 +120,32 @@ func (h *Handler) CreateTestingRun(w http.ResponseWriter, r *http.Request) {
 	// playlist_id.
 	if req.PlaylistID == nil {
 		respondError(w, r, http.StatusBadRequest, "ad-hoc workflow_ids are not supported yet; supply playlist_id")
+		return
+	}
+	if req.TargetPodVMID == nil {
+		respondError(w, r, http.StatusBadRequest, "target_pod_vm_id is required")
+		return
+	}
+
+	target, err := h.db.GetRunnablePodVMTarget(r.Context(), podID, *req.TargetPodVMID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, sql.ErrNoRows) {
+			respondError(w, r, http.StatusBadRequest, "target_pod_vm_id is not a runnable VM on this pod")
+			return
+		}
+		h.logger.Error("lookup target VM failed", "pod_id", podID, "pod_vm_id", *req.TargetPodVMID, "error", err)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	offered, err := h.db.PlaylistOfferedForPodVM(r.Context(), podID, *req.TargetPodVMID, *req.PlaylistID)
+	if err != nil {
+		h.logger.Error("validate playlist for VM failed", "pod_id", podID, "error", err)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if !offered {
+		respondError(w, r, http.StatusBadRequest, "playlist is not offered for the selected VM")
 		return
 	}
 
@@ -147,6 +177,7 @@ func (h *Handler) CreateTestingRun(w http.ResponseWriter, r *http.Request) {
 	rand.Read(tokenBytes)
 	callbackToken := hex.EncodeToString(tokenBytes)
 
+	targetID := target.PodVMID
 	// Create the run
 	run := &models.Run{
 		PodID:         podID,
@@ -154,6 +185,9 @@ func (h *Handler) CreateTestingRun(w http.ResponseWriter, r *http.Request) {
 		TriggeredBy:   userID,
 		CallbackToken: callbackToken,
 		Status:        models.RunStatusPending,
+		TargetPodVMID: &targetID,
+		TargetVMName:  target.DisplayName,
+		TargetVMIP:    target.IPAddress,
 	}
 
 	if err := h.db.CreateRun(r.Context(), run); err != nil {

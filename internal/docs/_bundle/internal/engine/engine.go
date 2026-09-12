@@ -126,6 +126,9 @@ func (e *Engine) executeRun(ctx context.Context, run *models.Run) error {
 	if run.PlaylistID == nil {
 		return fmt.Errorf("run %s has no playlist", run.ID)
 	}
+	if run.TargetPodVMID == nil {
+		return fmt.Errorf("run %s has no target_pod_vm_id", run.ID)
+	}
 
 	workflows, err := e.queries.GetWorkflowsForPlaylist(ctx, *run.PlaylistID)
 	if err != nil {
@@ -233,8 +236,8 @@ func (e *Engine) executeRun(ctx context.Context, run *models.Run) error {
 			}
 		}
 
-		// Resolve target info
-		target, pod, targetVM, err := e.queries.GetRunTargetInfo(ctx, run.PodID)
+		// Resolve the VM the student selected at create time.
+		target, pod, targetVM, err := e.queries.GetRunTargetInfo(ctx, run.PodID, *run.TargetPodVMID)
 		if err != nil {
 			return fmt.Errorf("get target info: %w", err)
 		}
@@ -331,7 +334,7 @@ func (e *Engine) dispatchVMwareTools(ctx context.Context, run *models.Run, workf
 		return fmt.Errorf("vmware_tools dispatcher not configured")
 	}
 
-	moref, osType, username, password, err := e.queries.GetVMwareToolsTarget(ctx, run.PodID)
+	moref, osType, username, password, err := e.queries.GetVMwareToolsTarget(ctx, run.PodID, *run.TargetPodVMID)
 	if err != nil {
 		return fmt.Errorf("resolve vmware_tools target: %w", err)
 	}

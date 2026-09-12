@@ -292,9 +292,18 @@ func runRunnerSmoke(ctx context.Context, c *synthetic.Client, cfg RunnerSmokeCon
 	}
 	log.Info("runner_smoke: pod reached active")
 
+	// 5b. Resolve a runnable target VM id. CreateTestingRun requires
+	// target_pod_vm_id so same-template twins are graded explicitly.
+	targetVMID, status, err := resolveRunnablePodVMID(ctx, c, podID)
+	if err != nil {
+		log.Error("runner_smoke: resolve target VM failed", "http_status", status, "error", err.Error())
+		return status, fmt.Errorf("resolve target VM: %w", err)
+	}
+	log.Info("runner_smoke: target VM resolved", "target_pod_vm_id", targetVMID)
+
 	// 6. POST /testing/run to trigger the assessment.
-	log.Info("runner_smoke: triggering assessment run", "playlist_id", cfg.PlaylistID)
-	runID, status, err := createTestingRun(ctx, c, podID, cfg.PlaylistID)
+	log.Info("runner_smoke: triggering assessment run", "playlist_id", cfg.PlaylistID, "target_pod_vm_id", targetVMID)
+	runID, status, err := createTestingRun(ctx, c, podID, cfg.PlaylistID, targetVMID)
 	if err != nil {
 		log.Error("runner_smoke: create testing run failed", "http_status", status, "error", err.Error())
 		return status, fmt.Errorf("create testing run: %w", err)
@@ -414,13 +423,15 @@ func runnerCleanupContext(
 }
 
 // createTestingRun POSTs to /api/v1/pods/{podID}/testing/run with the given
-// playlist UUID. Expects 202 with a run_id in the response body.
+// playlist and target VM UUIDs. Expects 202 with a run_id in the response body.
 //
-// Note: workflow_ids is explicitly rejected by the API with 400; only
-// playlist_id is supported. See handlers/testing.go CreateTestingRun.
-func createTestingRun(ctx context.Context, c *synthetic.Client, podID, playlistID string) (string, int, error) {
+// Note: workflow_ids is explicitly rejected by the API with 400; both
+// playlist_id and target_pod_vm_id are required. See handlers/testing.go
+// CreateTestingRun.
+func createTestingRun(ctx context.Context, c *synthetic.Client, podID, playlistID, targetPodVMID string) (string, int, error) {
 	payload, _ := json.Marshal(map[string]any{
-		"playlist_id": playlistID,
+		"playlist_id":      playlistID,
+		"target_pod_vm_id": targetPodVMID,
 	})
 	resp, err := c.Do(ctx, http.MethodPost, "/api/v1/pods/"+podID+"/testing/run", strings.NewReader(string(payload)))
 	if err != nil {
@@ -464,6 +475,40 @@ func createTestingRun(ctx context.Context, c *synthetic.Client, podID, playlistI
 		return "", resp.StatusCode, fmt.Errorf("testing/run response missing run_id: %s", snippet(body))
 	}
 	return parsed.RunID, resp.StatusCode, nil
+}
+
+// resolveRunnablePodVMID GETs the pod and returns the first VM with a non-empty
+// id and ip_address. Matches create-time eligibility for assessments.
+func resolveRunnablePodVMID(ctx context.Context, c *synthetic.Client, podID string) (string, int, error) {
+	resp, err := c.Do(ctx, http.MethodGet, "/api/v1/pods/"+podID, nil)
+	if err != nil {
+		return "", 0, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return "", resp.StatusCode, fmt.Errorf("GET /pods/%s returned %d: %s", podID, resp.StatusCode, snippet(body))
+	}
+	var pod struct {
+		VMs []struct {
+			ID        string  `json:"id"`
+			IPAddress *string `json:"ip_address"`
+			Status    string  `json:"status"`
+		} `json:"vms"`
+	}
+	if err := json.Unmarshal(body, &pod); err != nil {
+		return "", resp.StatusCode, fmt.Errorf("pod body not JSON: %w", err)
+	}
+	for _, vm := range pod.VMs {
+		if vm.ID == "" || vm.Status == "deleted" || vm.Status == "error" {
+			continue
+		}
+		if vm.IPAddress == nil || strings.TrimSpace(*vm.IPAddress) == "" {
+			continue
+		}
+		return vm.ID, resp.StatusCode, nil
+	}
+	return "", resp.StatusCode, fmt.Errorf("pod %s has no runnable VM with an IP for assessment targeting", podID)
 }
 
 // waitForRunTerminal polls GET /api/v1/pods/{podID}/testing/runs/{runID}

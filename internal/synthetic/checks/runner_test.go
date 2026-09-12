@@ -50,6 +50,7 @@ type runnerSmokeFakeAPI struct {
 	deleteCalls        int
 	createRunCalls     int
 	postedPlaylistID   string
+	postedTargetVMID   string
 	lastCreatedPodName string
 }
 
@@ -129,12 +130,14 @@ func (f *runnerSmokeFakeAPI) handler() http.Handler {
 				http.NotFound(w, r)
 				return
 			}
-			// Decode the playlist_id so tests can assert it was sent correctly.
+			// Decode playlist + target so tests can assert they were sent.
 			var req struct {
-				PlaylistID string `json:"playlist_id"`
+				PlaylistID    string `json:"playlist_id"`
+				TargetPodVMID string `json:"target_pod_vm_id"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&req)
 			f.postedPlaylistID = req.PlaylistID
+			f.postedTargetVMID = req.TargetPodVMID
 
 			if f.createRunHTTPStatus != http.StatusAccepted {
 				http.Error(w, "create run failed", f.createRunHTTPStatus)
@@ -219,6 +222,14 @@ func (f *runnerSmokeFakeAPI) handler() http.Handler {
 				"id":     p.ID,
 				"name":   p.Name,
 				"status": p.Status,
+				"vms": []map[string]any{
+					{
+						"id":           p.ID + "-vm-1",
+						"display_name": "synthetic-target",
+						"status":       "running",
+						"ip_address":   "10.30.0.10",
+					},
+				},
 			})
 
 		// DELETE /api/v1/pods/{podID}
@@ -292,6 +303,9 @@ func TestRunnerSmoke_HappyPath(t *testing.T) {
 	}
 	if fake.postedPlaylistID != wantPlaylistID {
 		t.Errorf("postedPlaylistID=%q, want %q", fake.postedPlaylistID, wantPlaylistID)
+	}
+	if fake.postedTargetVMID == "" || !strings.HasSuffix(fake.postedTargetVMID, "-vm-1") {
+		t.Errorf("postedTargetVMID=%q, want a runnable pod VM id suffix -vm-1", fake.postedTargetVMID)
 	}
 }
 

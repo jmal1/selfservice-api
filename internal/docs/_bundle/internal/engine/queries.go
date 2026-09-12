@@ -40,11 +40,13 @@ func (q *Queries) ClaimPendingRun(ctx context.Context, engineID string) (*models
 			LIMIT 1
 		)
 		RETURNING id, pod_id, playlist_id, triggered_by, callback_token, status,
+		          target_pod_vm_id, target_vm_name, target_vm_ip,
 		          total_workflows, passed_workflows, failed_workflows,
 		          error_message, started_at, completed_at, created_at, updated_at
 	`, models.RunStatusProvisioning, models.RunStatusPending).Scan(
 		&run.ID, &run.PodID, &run.PlaylistID, &run.TriggeredBy,
 		&run.CallbackToken, &run.Status,
+		&run.TargetPodVMID, &run.TargetVMName, &run.TargetVMIP,
 		&run.TotalWorkflows, &run.PassedWorkflows, &run.FailedWorkflows,
 		&run.ErrorMessage, &run.StartedAt, &run.CompletedAt,
 		&run.CreatedAt, &run.UpdatedAt,
@@ -304,39 +306,19 @@ type TargetVM struct {
 	IP          string
 }
 
-// GetRunTargetInfo retrieves the primary target VM info and pod network config
-// for building the runner config. Returns the target VM's connection details,
-// pod network metadata, and the identity of the pod_vms row that was chosen.
+// GetRunTargetInfo retrieves target VM info and pod network config for building
+// the runner config. targetPodVMID is the VM the student selected when creating
+// the run; the engine must grade that exact row, not an ambiguous "primary".
 //
-// Target selection is "the pod's primary reachable VM":
-//   - skip deleted/error rows (replace/rebuild leaves them in pod_vms forever)
-//   - skip rows with no IP (runner config requires target.ip)
-//   - prefer status=running over suspended/stopped so a suspended sibling does
-//     not steal grading from the live machine when boot_order ties at 0
-//   - then boot_order, created_at, and pv.id as a final tiebreaker
-//
-// The tiebreaker is load-bearing, not defensive. This previously ordered by
-// created_at alone, and CreatePod inserts every VM of a pod in one statement --
-// so a multi-VM pod's rows share an identical created_at to the microsecond, and
-// boot_order defaults to 0 for all of them. Postgres plans that ORDER BY as an
-// unstable quicksort, so with equal keys and no tiebreaker "the first VM" was
-// whichever row the sort happened to emit first. Same pod, same playlist, same
-// code could grade a different machine between runs. Because nothing recorded
-// the target either, that would have been invisible: a student's web-server
-// workflow could run against their database VM and simply report a failure.
-// pv.id is a unique primary key, so including it makes the ordering total.
-//
-// Skipping deleted was added after a live incident: a pod with replaced Ubuntu
-// VMs still had the original deleted row as the oldest boot_order=0 entry, so
-// GetRunTargetInfo returned an empty IP, the runner exited immediately with
-// "target.ip is required", and the run sat in status=running until the
-// 10-minute watchdog.
-func (q *Queries) GetRunTargetInfo(ctx context.Context, podID uuid.UUID) (runner.TargetConfig, runner.PodConfig, TargetVM, error) {
+// Eligibility matches create-time validation:
+//   - belongs to the pod
+//   - skip deleted/error rows
+//   - require a non-empty ip_address
+func (q *Queries) GetRunTargetInfo(ctx context.Context, podID, targetPodVMID uuid.UUID) (runner.TargetConfig, runner.PodConfig, TargetVM, error) {
 	var target runner.TargetConfig
 	var pod runner.PodConfig
 	var vm TargetVM
 
-	// Get the pod's primary VM, with its credentials and its identity.
 	err := q.pool.QueryRow(ctx, `
 		SELECT pv.id, COALESCE(pv.display_name, ''),
 		       COALESCE(pv.ip_address, ''), COALESCE(t.os_type, 'linux'),
@@ -344,12 +326,10 @@ func (q *Queries) GetRunTargetInfo(ctx context.Context, podID uuid.UUID) (runner
 		FROM pod_vms pv
 		JOIN templates t ON pv.template_id = t.id
 		WHERE pv.pod_id = $1
+		  AND pv.id = $2
 		  AND pv.status NOT IN ('deleted', 'error')
 		  AND COALESCE(pv.ip_address, '') <> ''
-		ORDER BY CASE WHEN pv.status = 'running' THEN 0 ELSE 1 END,
-		         pv.boot_order ASC, pv.created_at ASC, pv.id ASC
-		LIMIT 1
-	`, podID).Scan(&vm.ID, &vm.DisplayName, &target.IP, &target.OS, &target.Username, &target.Password)
+	`, podID, targetPodVMID).Scan(&vm.ID, &vm.DisplayName, &target.IP, &target.OS, &target.Username, &target.Password)
 	if err != nil {
 		return target, pod, vm, fmt.Errorf("get target VM: %w", err)
 	}
@@ -379,7 +359,7 @@ func (q *Queries) GetRunTargetInfo(ctx context.Context, podID uuid.UUID) (runner
 }
 
 // GetVMwareToolsTarget loads the moref + guest credentials needed to dispatch
-// a vmware_tools workflow against a pod's primary VM.
+// a vmware_tools workflow against the run's selected pod VM.
 //
 // Resolution rules:
 //   - moref comes from pod_vms.vcenter_vm_id (required; if missing the VM
@@ -392,7 +372,7 @@ func (q *Queries) GetRunTargetInfo(ctx context.Context, podID uuid.UUID) (runner
 //
 // Returns ErrNoVMwareToolsTarget if no eligible VM is found, so the caller
 // can produce a clean per-workflow error rather than a generic 500.
-func (q *Queries) GetVMwareToolsTarget(ctx context.Context, podID uuid.UUID) (string, string, string, string, error) {
+func (q *Queries) GetVMwareToolsTarget(ctx context.Context, podID, targetPodVMID uuid.UUID) (string, string, string, string, error) {
 	var moref, osType, username, password string
 	err := q.pool.QueryRow(ctx, `
 		SELECT
@@ -403,9 +383,9 @@ func (q *Queries) GetVMwareToolsTarget(ctx context.Context, podID uuid.UUID) (st
 		FROM pod_vms pv
 		JOIN templates t ON pv.template_id = t.id
 		WHERE pv.pod_id = $1
-		ORDER BY pv.created_at ASC
-		LIMIT 1
-	`, podID).Scan(&moref, &osType, &username, &password)
+		  AND pv.id = $2
+		  AND pv.status NOT IN ('deleted', 'error')
+	`, podID, targetPodVMID).Scan(&moref, &osType, &username, &password)
 	if err != nil {
 		return "", "", "", "", fmt.Errorf("get vmware_tools target: %w", err)
 	}

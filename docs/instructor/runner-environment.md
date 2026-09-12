@@ -69,15 +69,15 @@ Address the target with `CRUCIBLE_TARGET_IP`.
 
 ### Which VM does a workflow run against?
 
-A workflow runs against **one** VM: the pod's *primary* VM, chosen by `boot_order`
-ascending, ties broken by creation time and then VM id. All of a pod's VMs are
-created together, so they normally share a creation time and `boot_order` of 0 —
-which means for a multi-VM pod you should **set `boot_order` in the blueprint** to
-declare which VM is the one being assessed. The tiebreaker guarantees the same VM
-is picked every run either way, but only `boot_order` makes that choice meaningful.
+A run grades **exactly one** VM: the `target_pod_vm_id` the student selects when
+starting the assessment. The Assessments page lists playlists **per reachable
+pod VM**, so two clones from the same template show as separate targets even
+when they share the same playlist options. Starting a run without
+`target_pod_vm_id` is rejected.
 
-The VM that was assessed is recorded on the run and displayed as **Assessed VM** on
-the run detail page, so a result can always be traced to the machine it came from.
+The VM that was assessed is recorded on the run and displayed as **Assessed VM**
+/ **Target VM** on the run detail page (and on each workflow/check row), so a
+result can always be traced to the machine it came from.
 
 ---
 

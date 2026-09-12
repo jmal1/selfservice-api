@@ -14,37 +14,86 @@ import (
 
 // --- Testing / Run Queries ---
 
-// GetPlaylistsForPod resolves playlists for a pod using the two-level model:
-// 1. Check blueprint_vm_playlists for overrides
-// 2. Fall back to template_playlists defaults
+// GetTestingTargetsForPod returns each reachable pod VM with the playlists
+// offered against it. Same-template twins each appear once so the student can
+// choose which machine to grade. Playlists use the two-level model per VM:
+// blueprint_vm_playlists for slots whose blueprint_vms.template_id matches the
+// VM, else template_playlists defaults for that template.
 //
-// The override join keys blueprint_vm_playlists.vm_slot (INT, migration 000013)
-// against blueprint_vms.boot_order (INT, migration 000010). Migration 000013
-// introduced `vm_slot` to identify "a VM within a blueprint" but never added a
-// matching column, and `boot_order` is the only ordinal in blueprint_vms that
-// carries that meaning.
-//
-// This previously read `bv.slot`, a column no migration has ever created, so
-// the query failed with SQLSTATE 42703 for *every* pod. Because the error was
-// returned rather than swallowed, GET /pods/{id}/testing returned 500 and the
-// template_playlists fallback below was unreachable — the override feature has
-// never worked, and it took the working fallback down with it.
-func (q *Queries) GetPlaylistsForPod(ctx context.Context, podID uuid.UUID) ([]models.Playlist, error) {
-	// First try blueprint-level overrides
+// Reachability matches grading: skip deleted/error rows and rows with no IP.
+func (q *Queries) GetTestingTargetsForPod(ctx context.Context, podID uuid.UUID) ([]models.TestingTarget, error) {
 	rows, err := q.pool.Query(ctx, `
-		SELECT p.id, p.name, p.slug, p.description, p.scoring_mode, p.created_by,
-		       p.is_active, p.created_at, p.updated_at
-		FROM playlists p
-		JOIN blueprint_vm_playlists bvp ON p.id = bvp.playlist_id
-		JOIN pods pod ON pod.id = $1
-		JOIN blueprint_vms bv ON bv.blueprint_id = pod.blueprint_id AND bv.boot_order = bvp.vm_slot
-		JOIN pod_vms pv ON pv.pod_id = pod.id AND pv.template_id = bv.template_id
-		WHERE bvp.blueprint_id = pod.blueprint_id
-		  AND p.is_active = true
-		ORDER BY bvp.execution_order
+		SELECT pv.id, COALESCE(pv.display_name, ''), COALESCE(pv.ip_address, ''),
+		       pv.template_id, COALESCE(t.name, ''), pv.status
+		FROM pod_vms pv
+		JOIN templates t ON t.id = pv.template_id
+		WHERE pv.pod_id = $1
+		  AND pv.status NOT IN ('deleted', 'error')
+		  AND COALESCE(pv.ip_address, '') <> ''
+		ORDER BY CASE WHEN pv.status = 'running' THEN 0 ELSE 1 END,
+		         pv.boot_order ASC, pv.created_at ASC, pv.id ASC
 	`, podID)
 	if err != nil {
-		return nil, fmt.Errorf("get blueprint playlists: %w", err)
+		return nil, fmt.Errorf("list testing target VMs: %w", err)
+	}
+	defer rows.Close()
+
+	var targets []models.TestingTarget
+	for rows.Next() {
+		var t models.TestingTarget
+		if err := rows.Scan(&t.PodVMID, &t.DisplayName, &t.IPAddress,
+			&t.TemplateID, &t.TemplateName, &t.Status); err != nil {
+			return nil, fmt.Errorf("scan testing target VM: %w", err)
+		}
+		playlists, err := q.GetPlaylistsForPodVM(ctx, podID, t.PodVMID)
+		if err != nil {
+			return nil, err
+		}
+		if playlists == nil {
+			playlists = []models.Playlist{}
+		}
+		t.Playlists = playlists
+		targets = append(targets, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if targets == nil {
+		targets = []models.TestingTarget{}
+	}
+	return targets, nil
+}
+
+// GetPlaylistsForPodVM resolves playlists offered for one pod VM using the
+// two-level model scoped to that VM's template:
+// 1. blueprint_vm_playlists for slots whose blueprint_vms row uses this template
+// 2. else template_playlists defaults for the VM's template_id
+//
+// The override join keys blueprint_vm_playlists.vm_slot (INT, migration 000013)
+// against blueprint_vms.boot_order (INT, migration 000010).
+func (q *Queries) GetPlaylistsForPodVM(ctx context.Context, podID, podVMID uuid.UUID) ([]models.Playlist, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT id, name, slug, description, scoring_mode, created_by,
+		       is_active, created_at, updated_at
+		FROM (
+			SELECT DISTINCT ON (p.id)
+			       p.id, p.name, p.slug, p.description, p.scoring_mode, p.created_by,
+			       p.is_active, p.created_at, p.updated_at, bvp.execution_order
+			FROM playlists p
+			JOIN blueprint_vm_playlists bvp ON p.id = bvp.playlist_id
+			JOIN pods pod ON pod.id = $1
+			JOIN pod_vms pv ON pv.id = $2 AND pv.pod_id = pod.id
+			JOIN blueprint_vms bv ON bv.blueprint_id = pod.blueprint_id
+			                     AND bv.boot_order = bvp.vm_slot
+			                     AND bv.template_id = pv.template_id
+			WHERE bvp.blueprint_id = pod.blueprint_id
+			  AND p.is_active = true
+			ORDER BY p.id, bvp.execution_order
+		) overrides
+		ORDER BY execution_order, name
+	`, podID, podVMID)
+	if err != nil {
+		return nil, fmt.Errorf("get blueprint playlists for VM: %w", err)
 	}
 	defer rows.Close()
 
@@ -57,24 +106,25 @@ func (q *Queries) GetPlaylistsForPod(ctx context.Context, podID uuid.UUID) ([]mo
 		}
 		playlists = append(playlists, p)
 	}
-
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	if len(playlists) > 0 {
-		return playlists, nil // Blueprint overrides found
+		return playlists, nil
 	}
 
-	// Fall back to template-level defaults
 	rows2, err := q.pool.Query(ctx, `
-		SELECT DISTINCT p.id, p.name, p.slug, p.description, p.scoring_mode, p.created_by,
+		SELECT p.id, p.name, p.slug, p.description, p.scoring_mode, p.created_by,
 		       p.is_active, p.created_at, p.updated_at
 		FROM playlists p
 		JOIN template_playlists tp ON p.id = tp.playlist_id
-		JOIN pod_vms pv ON pv.template_id = tp.template_id
+		JOIN pod_vms pv ON pv.id = $2 AND pv.template_id = tp.template_id
 		WHERE pv.pod_id = $1
 		  AND p.is_active = true
-		ORDER BY p.name
-	`, podID)
+		ORDER BY tp.execution_order, p.name
+	`, podID, podVMID)
 	if err != nil {
-		return nil, fmt.Errorf("get template playlists: %w", err)
+		return nil, fmt.Errorf("get template playlists for VM: %w", err)
 	}
 	defer rows2.Close()
 
@@ -86,8 +136,43 @@ func (q *Queries) GetPlaylistsForPod(ctx context.Context, podID uuid.UUID) ([]mo
 		}
 		playlists = append(playlists, p)
 	}
+	return playlists, rows2.Err()
+}
 
-	return playlists, nil
+// GetRunnablePodVMTarget loads identity for a pod VM that is eligible to be
+// graded (belongs to the pod, not deleted/error, has an IP).
+func (q *Queries) GetRunnablePodVMTarget(ctx context.Context, podID, podVMID uuid.UUID) (models.TestingTarget, error) {
+	var t models.TestingTarget
+	err := q.pool.QueryRow(ctx, `
+		SELECT pv.id, COALESCE(pv.display_name, ''), COALESCE(pv.ip_address, ''),
+		       pv.template_id, COALESCE(tmpl.name, ''), pv.status
+		FROM pod_vms pv
+		JOIN templates tmpl ON tmpl.id = pv.template_id
+		WHERE pv.id = $2
+		  AND pv.pod_id = $1
+		  AND pv.status NOT IN ('deleted', 'error')
+		  AND COALESCE(pv.ip_address, '') <> ''
+	`, podID, podVMID).Scan(&t.PodVMID, &t.DisplayName, &t.IPAddress,
+		&t.TemplateID, &t.TemplateName, &t.Status)
+	if err != nil {
+		return t, err
+	}
+	return t, nil
+}
+
+// PlaylistOfferedForPodVM reports whether playlistID is in the offer set for
+// the given pod VM (same rules as GetPlaylistsForPodVM).
+func (q *Queries) PlaylistOfferedForPodVM(ctx context.Context, podID, podVMID, playlistID uuid.UUID) (bool, error) {
+	playlists, err := q.GetPlaylistsForPodVM(ctx, podID, podVMID)
+	if err != nil {
+		return false, err
+	}
+	for _, p := range playlists {
+		if p.ID == playlistID {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // HasActiveRun checks if a pod has a run in pending/provisioning/running status.
@@ -111,13 +196,19 @@ func (q *Queries) CountRecentRuns(ctx context.Context, podID, userID uuid.UUID, 
 	return count, err
 }
 
-// CreateRun inserts a new run record.
+// CreateRun inserts a new run record, including the chosen target VM so
+// attribution exists before the engine finishes (and so the engine grades the
+// VM the student selected, not an ambiguous primary).
 func (q *Queries) CreateRun(ctx context.Context, run *models.Run) error {
 	return q.pool.QueryRow(ctx, `
-		INSERT INTO runs (pod_id, playlist_id, triggered_by, callback_token, status)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO runs (
+			pod_id, playlist_id, triggered_by, callback_token, status,
+			target_pod_vm_id, target_vm_name, target_vm_ip
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING id, created_at, updated_at
 	`, run.PodID, run.PlaylistID, run.TriggeredBy, run.CallbackToken, run.Status,
+		run.TargetPodVMID, run.TargetVMName, run.TargetVMIP,
 	).Scan(&run.ID, &run.CreatedAt, &run.UpdatedAt)
 }
 

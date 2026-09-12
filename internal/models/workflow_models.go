@@ -137,6 +137,19 @@ type Playlist struct {
 	Workflows []Workflow `json:"workflows,omitempty" db:"-"`
 }
 
+// TestingTarget is one runnable pod VM and the playlists offered against it.
+// Same-template twins each get their own entry so the student can choose which
+// machine an assessment will grade.
+type TestingTarget struct {
+	PodVMID      uuid.UUID  `json:"pod_vm_id"`
+	DisplayName  string     `json:"display_name"`
+	IPAddress    string     `json:"ip_address"`
+	TemplateID   uuid.UUID  `json:"template_id"`
+	TemplateName string     `json:"template_name"`
+	Status       string     `json:"status"`
+	Playlists    []Playlist `json:"playlists"`
+}
+
 // PlaylistWorkflow is the join table for playlist membership.
 type PlaylistWorkflow struct {
 	PlaylistID     uuid.UUID `json:"playlist_id" db:"playlist_id"`
