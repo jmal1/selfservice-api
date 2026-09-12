@@ -21,6 +21,14 @@ If you need an audit trail, ask a platform admin.
 
 ---
 
+## Student lab limits
+
+Students receive a 5-day lab TTL with up to two extensions; each extension resets expiration to 5 days from the time it is requested. Student labs suspend after 2 idle hours and are destroyed after 5 days suspended. The student quota is 2 pods, 4 vCPUs, and 8 GB of RAM, with one protected original snapshot plus one replaceable user snapshot per VM.
+
+Deleting a lab queues cleanup, so **Marked for destruction** is expected while destruction runs.
+
+---
+
 ## "Provisioning is temporarily unavailable for maintenance"
 
 Crucible can intentionally pause **new** pod and VM provisioning while

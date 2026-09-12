@@ -10,6 +10,13 @@ Create a lab from the templates or blueprints your instructor has shared with yo
 
 **Expected result:** Your lab appears in **My Labs** with one or more VM cards.
 
+## Understand your limits
+
+- A new lab expires after 5 days. **Extend** sets its expiration to 5 days from the time you extend it, and each lab can be extended at most twice.
+- Student labs automatically suspend after 2 hours without activity. A lab that remains suspended for 5 days is destroyed.
+- Your total quota is 2 labs (pods), 4 vCPUs, and 8 GB of RAM.
+- Each VM keeps its protected original snapshot plus one replaceable snapshot that you create.
+
 ## Manage a VM
 
 1. Open your lab and select the VM you want to manage.
@@ -24,6 +31,6 @@ Create a lab from the templates or blueprints your instructor has shared with yo
 2. If your active lab needs more time, select **Extend** and confirm the request. Crucible shows the new expiration time.
 3. When you are finished, select **Delete** for the lab and confirm.
 
-**Expected result:** An extension updates the displayed expiration. Deleting a lab permanently removes its VMs and their work; create a snapshot first if you may need to recover a VM state.
+**Expected result:** An extension updates the displayed expiration. Deleting a lab queues permanent destruction of its VMs and their work, so its status may show **Marked for destruction** while cleanup runs. Create a snapshot first if you may need to recover a VM state.
 
 See [Snapshots and Recovery](snapshots.md) before making a risky change.

@@ -230,8 +230,8 @@
     {
       "path": "docs/instructor/troubleshooting.md",
       "title": "Troubleshooting",
-      "size": 66873,
-      "sha256": "e7813eb7681afcf5fc86ec700dd4ed63fdc573a71523320f6729c86acd71e596",
+      "size": 67351,
+      "sha256": "c5a18b4e0e28ce12809bb40f7d95205b5a8a8cc555d6e3f485c1f954ef0aad09",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/actions.md",
@@ -280,8 +280,8 @@
     {
       "path": "docs/student/labs.md",
       "title": "Creating and Managing Labs",
-      "size": 1369,
-      "sha256": "9c0680052ea9fe6e32250a54ec8cb0b7b711c8de882eb25a7a066f5b4f11336f",
+      "size": 1908,
+      "sha256": "59579b4d6d1e31037a65f774c4746acfa87ad3ecde514f0ef94a2094b36cfd2f",
       "is_markdown": true,
       "links_out": [
         "docs/student/snapshots.md"
@@ -438,5 +438,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 741561
+  "total_bytes": 742578
 }
