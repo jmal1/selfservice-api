@@ -4649,7 +4649,7 @@ if ! enforce_synthetic_rollback_containment; then
   echo "ERROR: Helm succeeded but post-upgrade synthetic containment could not be enforced. The release lock is intentionally retained; manual intervention is required." >&2
   exit 1
 fi
-if ! wait_for_no_active_jobs 180 10; then
+if ! wait_for_no_active_jobs "${POST_HELM_DRAIN_DEADLINE_SECS:-180}" "${POST_HELM_DRAIN_INTERVAL_SECS:-10}"; then
   echo "ERROR: Helm succeeded but post-upgrade job drain did not clear. The release lock is intentionally retained; manual intervention is required." >&2
   exit 1
 fi

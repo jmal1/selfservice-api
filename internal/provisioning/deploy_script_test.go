@@ -2532,7 +2532,7 @@ if ! enforce_synthetic_rollback_containment; then
   echo "ERROR: Helm succeeded but post-upgrade synthetic containment could not be enforced. The release lock is intentionally retained; manual intervention is required." >&2
   exit 1
 fi
-if ! wait_for_no_active_jobs 180 10; then
+if ! wait_for_no_active_jobs "\${POST_HELM_DRAIN_DEADLINE_SECS:-180}" "\${POST_HELM_DRAIN_INTERVAL_SECS:-10}"; then
   echo "ERROR: Helm succeeded but post-upgrade job drain did not clear. The release lock is intentionally retained; manual intervention is required." >&2
   exit 1
 fi
@@ -8867,6 +8867,8 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_CANDIDATE_APPLIED_MARKER="+e.candidateAppliedMark,
 		"FAKE_SYNTHETIC_CONTAINED_MARKER="+e.syntheticContainedMark,
 		"FAKE_SYNTHETIC_RESTORED_MARKER="+e.syntheticRestoredMark,
+		"POST_HELM_DRAIN_DEADLINE_SECS=2",
+		"POST_HELM_DRAIN_INTERVAL_SECS=1",
 		"FAKE_ATOMIC_ROLLBACK_MANIFEST="+e.atomicRollbackManifest,
 		"FAKE_CONTAINED_ROLLBACK_MANIFEST="+e.containedRollbackManifest,
 		"FAKE_IMMUTABLE_ROLLBACK_MANIFEST="+e.immutableRollbackManifest,
