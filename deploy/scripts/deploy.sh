@@ -2182,8 +2182,10 @@ require_no_pending_provisioning_jobs() {
         -U "${POSTGRES_USER:-postgres}" \
         -d "${POSTGRES_DATABASE:-${POSTGRES_DB:-postgres}}" \
         -Atc "SELECT count(*) /* gate_a4_provisioning_preflight */
-              FROM jobs
-              WHERE type IN (
+              FROM jobs AS j
+              LEFT JOIN pods AS p
+                ON p.id::text = j.payload->>'"'"'pod_id'"'"'
+              WHERE j.type IN (
                 '"'"'pod_create'"'"',
                 '"'"'vm_add'"'"',
                 '"'"'template_provision'"'"',
@@ -2194,7 +2196,11 @@ require_no_pending_provisioning_jobs() {
                 '"'"'template_replica_build'"'"',
                 '"'"'image_import'"'"'
               )
-                AND status NOT IN ('"'"'completed'"'"', '"'"'failed'"'"')"
+                AND j.status NOT IN ('"'"'completed'"'"', '"'"'failed'"'"')
+                AND NOT (
+                  coalesce(j.payload->>'"'"'pod_name'"'"', '"'"''"'"') LIKE '"'"'synthetic-noop-%'"'"'
+                  OR coalesce(p.name, '"'"''"'"') LIKE '"'"'synthetic-noop-%'"'"'
+                )"
     '
   )"; then
     echo "ERROR: PostgreSQL provisioning-job preflight query failed; refusing deployment." >&2

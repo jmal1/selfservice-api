@@ -2188,6 +2188,27 @@ func TestDeployScriptSyntheticQuotaIdentityIsLoadBearing(t *testing.T) {
 	}
 }
 
+func TestDeployScriptProvisioningPreflightExcludesSyntheticNoop(t *testing.T) {
+	deployBody, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(deployBody)
+	idx := strings.Index(source, "require_no_pending_provisioning_jobs() {")
+	if idx < 0 {
+		t.Fatal("require_no_pending_provisioning_jobs missing")
+	}
+	rest := source[idx:]
+	end := strings.Index(rest[1:], "\nrequire_synthetic_pod_quota() {")
+	if end < 0 {
+		t.Fatal("could not bound require_no_pending_provisioning_jobs")
+	}
+	body := rest[:end+1]
+	if !strings.Contains(body, "synthetic-noop-%") || !strings.Contains(body, "LEFT JOIN pods") {
+		t.Fatal("provisioning preflight must exclude synthetic-noop jobs (same race as advisory durable drain)")
+	}
+}
+
 func TestDeployScriptMigrationContiguityIsLoadBearing(t *testing.T) {
 	requirePOSIXShell(t)
 	deployPath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
@@ -7936,12 +7957,19 @@ case "$1" in
   exec)
     if [[ "$*" == *"gate_a4_provisioning_preflight"* ]]; then
       [ "$FAKE_PREFLIGHT_QUERY_FAILURE" != provisioning ] || exit 97
+      # CD must ignore in-flight */12 synthetic-noop pod_create rows; real
+      # instructor/user provisioning still fail-closes.
+      [[ "$*" == *"synthetic-noop-%"* && "$*" == *"LEFT JOIN pods"* ]] || {
+        echo "provisioning preflight omitted synthetic-noop exclusion" >&2
+        exit 96
+      }
       query_count=0
       [ ! -f "$FAKE_PROVISIONING_QUERY_COUNT" ] || query_count=$(cat "$FAKE_PROVISIONING_QUERY_COUNT")
       query_count=$((query_count + 1))
       printf '%s' "$query_count" > "$FAKE_PROVISIONING_QUERY_COUNT"
       if [ "$FAKE_UNKNOWN_PROVISIONING_JOB_STATUS" = true ]; then
-        if [[ "$*" == *"status NOT IN ('completed', 'failed')"* ]]; then
+        if [[ "$*" == *"status NOT IN ('completed', 'failed')"* ]] ||
+           [[ "$*" == *"j.status NOT IN ('completed', 'failed')"* ]]; then
           printf '1\n'
         else
           printf '0\n'
