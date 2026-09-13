@@ -1504,6 +1504,57 @@ func TestAuthoritativePodDestroyPostgresRejectsLaterVMWork(t *testing.T) {
 	}
 }
 
+func TestTerminalPodDestroyPostgresDoesNotBrickVMMutators(t *testing.T) {
+	// A failed/completed retention destroy must not permanently reject
+	// vm_start (resume) or vm_destroy while the pod is still active.
+	ctx := context.Background()
+
+	for _, terminal := range []string{models.JobStatusFailed, models.JobStatusCompleted} {
+		t.Run(terminal, func(t *testing.T) {
+			fx := newPodJobsPostgresFixture(t, models.PodStatusActive)
+			if _, err := fx.pool.Exec(ctx, `
+				UPDATE pod_vms SET status = $2 WHERE id = $1
+			`, fx.podVMID, models.VMStatusSuspended); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fx.pool.Exec(ctx, `
+				INSERT INTO jobs (id, type, payload, status, completed_at)
+				VALUES ($1, 'pod_destroy', jsonb_build_object('pod_id', $2::text, 'reason', 'suspended_too_long'), $3, now())
+			`, uuid.New(), fx.podID, terminal); err != nil {
+				t.Fatal(err)
+			}
+
+			job, err := fx.queries.CreateVMJob(
+				ctx,
+				fx.podID,
+				fx.podVMID,
+				models.JobTypeVMStart,
+				vmJobPayload(t, fx.podID, fx.podVMID),
+			)
+			if err != nil {
+				t.Fatalf("CreateVMJob(vm_start) after terminal pod_destroy(%s): %v", terminal, err)
+			}
+			if job.Status != models.JobStatusPending {
+				t.Fatalf("vm_start status = %q, want pending", job.Status)
+			}
+
+			destroyJob, err := fx.queries.CreateVMJob(
+				ctx,
+				fx.podID,
+				fx.podVMID,
+				models.JobTypeVMDestroy,
+				vmJobPayload(t, fx.podID, fx.podVMID),
+			)
+			if err != nil {
+				t.Fatalf("CreateVMJob(vm_destroy) after terminal pod_destroy(%s): %v", terminal, err)
+			}
+			if destroyJob.Status != models.JobStatusPending {
+				t.Fatalf("vm_destroy status = %q, want pending", destroyJob.Status)
+			}
+		})
+	}
+}
+
 func TestVMAddPostgresTerminalRaceLeavesNoOrphanVM(t *testing.T) {
 	fixture := newPodJobsPostgresFixture(t, models.PodStatusActive)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
