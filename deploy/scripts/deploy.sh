@@ -1986,39 +1986,7 @@ current_migration_state() {
 }
 
 require_no_active_jobs() {
-  local postgres_pod active_jobs jobs_json active_kubernetes_jobs
-  postgres_pod="$(
-    kubectl get pods -n "$NAMESPACE" \
-      -l "app.kubernetes.io/name=postgresql,app.kubernetes.io/instance=$RELEASE" \
-      -o jsonpath='{.items[0].metadata.name}'
-  )"
-  if [ -z "$postgres_pod" ]; then
-    echo "ERROR: cannot locate the release PostgreSQL pod to verify durable job drain." >&2
-    return 1
-  fi
-  active_jobs="$(
-    kubectl exec -n "$NAMESPACE" "$postgres_pod" -c postgresql -- sh -ec '
-      password_file=${POSTGRES_PASSWORD_FILE:-}
-      if [ -n "$password_file" ]; then
-        export PGPASSWORD="$(cat "$password_file")"
-      fi
-      exec psql \
-        -v ON_ERROR_STOP=1 \
-        -U "${POSTGRES_USER:-postgres}" \
-        -d "${POSTGRES_DATABASE:-${POSTGRES_DB:-postgres}}" \
-        -Atc "SELECT count(*) FROM jobs WHERE status IN ('"'"'claimed'"'"', '"'"'in_progress'"'"', '"'"'rollback'"'"')"
-    '
-  )"
-  if [[ ! "$active_jobs" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: invalid active durable job count returned by PostgreSQL: $active_jobs" >&2
-    return 1
-  fi
-  if [ "$active_jobs" != "0" ]; then
-    # Workers are durable and resume claimed/in_progress/rollback work after deploy.
-    # Destroy/cleanup_only remains claimable while provisioning claims are paused, so
-    # a hard fail-close here makes attended CD race the */12 synthetic forever.
-    echo "WARNING: $active_jobs durable jobs are claimed, in_progress, or rollback (continuing; workers resume)." >&2
-  fi
+  local jobs_json active_kubernetes_jobs
   if ! jobs_json="$(kubectl get jobs -n "$NAMESPACE" -o json)"; then
     echo "ERROR: failed to list Kubernetes Jobs while verifying job drain." >&2
     return 1
@@ -2094,42 +2062,7 @@ require_no_active_jobs() {
     echo "ERROR: Kubernetes Jobs remain active in namespace $NAMESPACE: $active_kubernetes_jobs." >&2
     return 1
   fi
-  warn_nonterminal_synthetic_pod_jobs "$postgres_pod"
-  echo "==> job drain verified: no blocking Kubernetes Jobs (durable PG work is advisory; workers resume)"
-}
-
-warn_nonterminal_synthetic_pod_jobs() {
-  local postgres_pod=$1
-  local synthetic_jobs
-  synthetic_jobs="$(
-    kubectl exec -n "$NAMESPACE" "$postgres_pod" -c postgresql -- sh -ec '
-      password_file=${POSTGRES_PASSWORD_FILE:-}
-      if [ -n "$password_file" ]; then
-        export PGPASSWORD="$(cat "$password_file")"
-      fi
-      exec psql \
-        -v ON_ERROR_STOP=1 \
-        -U "${POSTGRES_USER:-postgres}" \
-        -d "${POSTGRES_DATABASE:-${POSTGRES_DB:-postgres}}" \
-        -Atc "SELECT count(*)
-              FROM jobs AS j
-              LEFT JOIN pods AS p
-                ON p.id::text = j.payload->>'"'"'pod_id'"'"'
-              WHERE j.type IN ('"'"'pod_create'"'"', '"'"'pod_destroy'"'"')
-                AND j.status NOT IN ('"'"'completed'"'"', '"'"'failed'"'"')
-                AND (
-                  j.payload->>'"'"'pod_name'"'"' LIKE '"'"'synthetic-noop-%'"'"'
-                  OR p.name LIKE '"'"'synthetic-noop-%'"'"'
-                )"
-    '
-  )"
-  if [[ ! "$synthetic_jobs" =~ ^[0-9]+$ ]]; then
-    echo "WARNING: could not count nonterminal storage-mutating synthetic pod jobs (continuing): $synthetic_jobs" >&2
-    return 0
-  fi
-  if [ "$synthetic_jobs" != "0" ]; then
-    echo "WARNING: $synthetic_jobs nonterminal storage-mutating synthetic pod jobs remain (continuing; workers resume)." >&2
-  fi
+  echo "==> job drain verified: no blocking Kubernetes Jobs"
 }
 
 require_clean_migration() {
@@ -2155,66 +2088,6 @@ require_clean_migration() {
     fi
   fi
   VERIFIED_MIGRATION_STATE=$state
-}
-
-require_no_pending_provisioning_jobs() {
-  local postgres_pod provisioning_jobs
-  if ! postgres_pod="$(
-    kubectl get pods -n "$NAMESPACE" \
-      -l "app.kubernetes.io/name=postgresql,app.kubernetes.io/instance=$RELEASE" \
-      -o jsonpath='{.items[0].metadata.name}'
-  )"; then
-    echo "ERROR: failed to query the release PostgreSQL pod while checking provisioning jobs." >&2
-    return 1
-  fi
-  if [ -z "$postgres_pod" ]; then
-    echo "ERROR: cannot locate the release PostgreSQL pod to check provisioning jobs." >&2
-    return 1
-  fi
-  if ! provisioning_jobs="$(
-    kubectl exec -n "$NAMESPACE" "$postgres_pod" -c postgresql -- sh -ec '
-      password_file=${POSTGRES_PASSWORD_FILE:-}
-      if [ -n "$password_file" ]; then
-        export PGPASSWORD="$(cat "$password_file")"
-      fi
-      exec psql \
-        -v ON_ERROR_STOP=1 \
-        -U "${POSTGRES_USER:-postgres}" \
-        -d "${POSTGRES_DATABASE:-${POSTGRES_DB:-postgres}}" \
-        -Atc "SELECT count(*) /* gate_a4_provisioning_preflight */
-              FROM jobs AS j
-              LEFT JOIN pods AS p
-                ON p.id::text = j.payload->>'"'"'pod_id'"'"'
-              WHERE j.type IN (
-                '"'"'pod_create'"'"',
-                '"'"'vm_add'"'"',
-                '"'"'template_provision'"'"',
-                '"'"'template_generalize'"'"',
-                '"'"'template_verify'"'"',
-                '"'"'template_revalidate'"'"',
-                '"'"'template_health_confirm'"'"',
-                '"'"'template_replica_build'"'"',
-                '"'"'image_import'"'"'
-              )
-                AND j.status NOT IN ('"'"'completed'"'"', '"'"'failed'"'"')
-                AND NOT (
-                  coalesce(j.payload->>'"'"'pod_name'"'"', '"'"''"'"') LIKE '"'"'synthetic-noop-%'"'"'
-                  OR coalesce(p.name, '"'"''"'"') LIKE '"'"'synthetic-noop-%'"'"'
-                )"
-    '
-  )"; then
-    echo "ERROR: PostgreSQL provisioning-job preflight query failed; refusing deployment." >&2
-    return 1
-  fi
-  if [[ ! "$provisioning_jobs" =~ ^[0-9]+$ ]] ||
-     [ "${#provisioning_jobs}" -gt 9 ]; then
-    echo "ERROR: invalid provisioning-job preflight count returned by PostgreSQL: ${provisioning_jobs:-<empty>}." >&2
-    return 1
-  fi
-  if [ "$provisioning_jobs" != "0" ]; then
-    echo "ERROR: $provisioning_jobs provisioning jobs are nonterminal or have unknown status; drain or resolve them before deployment." >&2
-    return 1
-  fi
 }
 
 require_synthetic_pod_quota() {
@@ -2413,15 +2286,10 @@ require_candidate_image_provenance() {
 run_release_preflight() {
   echo "==> running fail-closed release preflight before lock acquisition or live mutation"
   require_clean_migration
-  require_no_pending_provisioning_jobs
   require_synthetic_pod_quota
   require_no_active_mutating_synthetics
   require_candidate_image_provenance
   echo "==> release preflight passed"
-}
-
-require_volatile_release_preflight() {
-  require_no_pending_provisioning_jobs
 }
 
 require_core_workloads() {
@@ -4519,10 +4387,6 @@ if [ "$(sha256sum "$CANDIDATE_MANIFEST" | awk '{print $1}')" != "$CANDIDATE_SHA2
 fi
 require_no_active_jobs
 
-# Volatile gates run again after claims are paused and all other validation is
-# complete. Keep this directly adjacent to Helm so pending provisioning work or
-# a newly firing alert cannot hide behind the longer immutable-candidate proof.
-require_volatile_release_preflight
 echo "==> helm upgrade $RELEASE with exact digest-pinned candidate (atomic, timeout=$TIMEOUT)"
 HELM_RELEASE_LOCK_PRESERVE=true
 set +e

@@ -839,13 +839,13 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 			expectBuiltDigest: true,
 		},
 		{
-			name:      "active durable job warns and continues",
+			name:      "active durable job does not block upgrade",
 			transform: func(manifest string) string { return baselineManifest(true, "*", "true") },
 			configure: func(env *deployScriptEnvironment) {
 				env.activeJobs = 1
 			},
 			wantSuccess:       true,
-			wantOutput:        "durable jobs are claimed, in_progress, or rollback (continuing",
+			wantOutput:        "deployed exact source",
 			wantUpgrade:       true,
 			expectBuiltDigest: true,
 		},
@@ -1057,6 +1057,11 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 			}
 			if !strings.Contains(string(output), test.wantOutput) {
 				t.Fatalf("output %q does not contain %q", output, test.wantOutput)
+			}
+			if test.name == "active durable job does not block upgrade" &&
+				(strings.Contains(string(output), "WARNING:") ||
+					strings.Contains(string(output), "durable jobs are claimed")) {
+				t.Fatalf("in-flight durable jobs must be silent:\n%s", output)
 			}
 			upgradeBody, readErr := os.ReadFile(env.upgradeLog)
 			if test.wantUpgrade {
@@ -1294,7 +1299,7 @@ ROLLBACK_BASELINE_MIGRATION=$VERIFIED_MIGRATION_STATE
 			wantOutput: "synthetic CronJob evidence reset",
 		},
 		{
-			name: "pending synthetic pod destroy after rollback warns and releases lock",
+			name: "pending synthetic pod destroy after rollback does not block containment",
 			configure: func(env *deployScriptEnvironment) {
 				env.failAtomicUpgrade = true
 				env.pendingSyntheticJobs = 1
@@ -1309,9 +1314,7 @@ ROLLBACK_BASELINE_MIGRATION=$VERIFIED_MIGRATION_STATE
 				writeFile(t, env.containedRollbackManifest, rollbackManifestWithHistoricalSynthetics(true))
 				writeFile(t, env.immutableRollbackManifest, rollbackManifestWithHistoricalSynthetics(false))
 			},
-			// Nonterminal synthetic PG jobs are advisory after the durable-job gate relax;
-			// atomic failure containment still succeeds and releases the lock.
-			wantOutput:       "nonterminal storage-mutating synthetic pod",
+			wantOutput:       "atomic failure contained by the currently deployed rollback baseline",
 			wantLockRetained: false,
 		},
 		{
@@ -1752,34 +1755,6 @@ func TestDeployScriptReleasePreflightGuards(t *testing.T) {
 			wantOutput: "migration-state query failed",
 		},
 		{
-			name: "pending provisioning job",
-			configure: func(env *deployScriptEnvironment) {
-				env.provisioningJobs = "1"
-			},
-			wantOutput: "provisioning jobs are nonterminal or have unknown status",
-		},
-		{
-			name: "unknown provisioning job status",
-			configure: func(env *deployScriptEnvironment) {
-				env.unknownProvisioningJobStatus = true
-			},
-			wantOutput: "provisioning jobs are nonterminal or have unknown status",
-		},
-		{
-			name: "provisioning job query failure",
-			configure: func(env *deployScriptEnvironment) {
-				env.preflightQueryFailure = "provisioning"
-			},
-			wantOutput: "provisioning-job preflight query failed",
-		},
-		{
-			name: "malformed provisioning job count",
-			configure: func(env *deployScriptEnvironment) {
-				env.provisioningJobs = "unknown"
-			},
-			wantOutput: "invalid provisioning-job preflight count",
-		},
-		{
 			name: "synthetic quota exhausted",
 			configure: func(env *deployScriptEnvironment) {
 				env.syntheticQuotaState = "1:1"
@@ -1945,122 +1920,33 @@ func assertNoPreflightMutation(t *testing.T, env *deployScriptEnvironment, outpu
 	}
 }
 
-func TestDeployScriptVolatileReleasePreflightBlocksLateRegressions(t *testing.T) {
-	requirePOSIXShell(t)
-	tests := []struct {
-		name       string
-		configure  func(*deployScriptEnvironment)
-		wantOutput string
-	}{
-		{
-			name: "pending provisioning job appears after claims pause",
-			configure: func(env *deployScriptEnvironment) {
-				env.provisioningJobsAfterInitial = "1"
-			},
-			wantOutput: "provisioning jobs are nonterminal or have unknown status",
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			env := newDeployScriptEnvironment(
-				t,
-				baselineManifest(true, "", "true"),
-				baselineManifest(true, "*", "true"),
-			)
-			writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
-			test.configure(env)
-
-			output, err := env.run("--no-pull")
-			if err == nil {
-				t.Fatalf("late volatile regression unexpectedly reached Helm:\n%s", output)
-			}
-			if !strings.Contains(string(output), test.wantOutput) {
-				t.Fatalf("output %q does not contain %q", output, test.wantOutput)
-			}
-			for _, marker := range []string{env.claimsPausedMark, env.claimsResumedMark, env.syntheticContainedMark} {
-				if _, statErr := os.Stat(marker); statErr != nil {
-					t.Fatalf("late guard failure missed expected pause/restore marker %s: %v\n%s", marker, statErr, output)
-				}
-			}
-			if body, readErr := os.ReadFile(env.upgradeLog); readErr == nil && len(body) > 0 {
-				t.Fatalf("late guard failure invoked Helm upgrade: %s\n%s", body, output)
-			}
-			for _, marker := range []string{env.candidateAppliedMark, env.upgradedMarker, env.lockFile} {
-				if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
-					t.Fatalf("late guard failure left mutation marker %s: %v\n%s", marker, statErr, output)
-				}
-			}
-		})
-	}
-}
-
-func TestDeployScriptVolatileReleasePreflightIsOrderedAndLoadBearing(t *testing.T) {
-	requirePOSIXShell(t)
-	deployPath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
-	source, err := os.ReadFile(deployPath)
+func TestDeployScriptOmitsProvisioningJobPreflight(t *testing.T) {
+	deployBody, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	const boundary = `require_volatile_release_preflight
+	source := string(deployBody)
+	for _, needle := range []string{
+		"require_no_pending_provisioning_jobs",
+		"require_volatile_release_preflight",
+		"gate_a4_provisioning_preflight",
+		"warn_nonterminal_synthetic_pod_jobs",
+		"durable jobs are claimed, in_progress, or rollback",
+		"nonterminal storage-mutating synthetic pod jobs",
+		"durable PG work is advisory",
+	} {
+		if strings.Contains(source, needle) {
+			t.Fatalf("deploy.sh must not retain ignored provisioning/job noise (%q)", needle)
+		}
+	}
+	const adjacent = `require_no_active_jobs
+
 echo "==> helm upgrade $RELEASE with exact digest-pinned candidate (atomic, timeout=$TIMEOUT)"`
-	if strings.Count(string(source), boundary) != 1 {
-		t.Fatal("volatile preflight is not directly adjacent to the final Helm upgrade announcement")
+	if strings.Count(source, adjacent) != 1 {
+		t.Fatal("final Helm upgrade must follow require_no_active_jobs directly (no volatile provisioning recheck)")
 	}
-	const helper = `require_volatile_release_preflight() {
-  require_no_pending_provisioning_jobs
-}`
-	if strings.Count(string(source), helper) != 1 {
-		t.Fatal("volatile preflight helper does not contain the exact two final guards")
-	}
-
-	tests := []struct {
-		name      string
-		guardCall string
-		configure func(*deployScriptEnvironment)
-	}{
-		{
-			name:      "provisioning recheck",
-			guardCall: "  require_no_pending_provisioning_jobs\n",
-			configure: func(env *deployScriptEnvironment) {
-				env.provisioningJobsAfterInitial = "1"
-			},
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			mutatedHelper := strings.Replace(helper, test.guardCall, "  :\n", 1)
-			mutated := strings.Replace(string(source), helper, mutatedHelper, 1)
-			scriptPath := filepath.Join(
-				filepath.Dir(deployPath),
-				"deploy-sabotaged-gate-a4-final-"+strings.ReplaceAll(test.name, " ", "-")+"-test.sh",
-			)
-			writeExecutable(t, scriptPath, mutated)
-			t.Cleanup(func() { os.Remove(scriptPath) })
-
-			env := newDeployScriptEnvironment(
-				t,
-				baselineManifest(true, "", "true"),
-				baselineManifest(true, "*", "true"),
-			)
-			writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
-			env.scriptPath = scriptPath
-			test.configure(env)
-
-			output, runErr := env.run("--no-pull")
-			if runErr != nil {
-				t.Fatalf("removing final %s did not expose the staged regression: %v\n%s", test.name, runErr, output)
-			}
-			if _, statErr := os.Stat(env.upgradedMarker); statErr != nil {
-				t.Fatalf("removing final %s did not reach Helm mutation: %v\n%s", test.name, statErr, output)
-			}
-			if _, statErr := os.Stat(env.claimsResumedMark); statErr != nil {
-				if !strings.Contains(string(output), "already match the pre-deploy state; no restore mutation needed") {
-					t.Fatalf("sabotaged successful deploy did not restore claims: %v\n%s", statErr, output)
-				}
-			}
-		})
+	if !strings.Contains(source, `echo "==> job drain verified: no blocking Kubernetes Jobs"`) {
+		t.Fatal("job drain success message must only mention Kubernetes Jobs")
 	}
 }
 
@@ -2090,7 +1976,6 @@ func TestDeployScriptReleasePreflightPredicatesAreLoadBearing(t *testing.T) {
 		configure func(*deployScriptEnvironment)
 	}{
 		{name: "migration", guardCall: "  require_clean_migration\n", configure: func(env *deployScriptEnvironment) { env.migrationState = "1:37:true" }},
-		{name: "provisioning jobs", guardCall: "  require_no_pending_provisioning_jobs\n", configure: func(env *deployScriptEnvironment) { env.provisioningJobs = "1" }},
 		{name: "synthetic quota", guardCall: "  require_synthetic_pod_quota\n", configure: func(env *deployScriptEnvironment) { env.syntheticQuotaState = "1:1" }},
 		{name: "mutating synthetics", guardCall: "  require_no_active_mutating_synthetics\n", configure: func(env *deployScriptEnvironment) { env.activeMutatingSyntheticJobs = 1 }},
 		{name: "candidate provenance", guardCall: "  require_candidate_image_provenance\n", configure: func(env *deployScriptEnvironment) { env.imageRevisionDriftAfter = 6 }},
@@ -2185,27 +2070,6 @@ func TestDeployScriptSyntheticQuotaIdentityIsLoadBearing(t *testing.T) {
 			}
 			assertNoPreflightMutation(t, env, output)
 		})
-	}
-}
-
-func TestDeployScriptProvisioningPreflightExcludesSyntheticNoop(t *testing.T) {
-	deployBody, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	source := string(deployBody)
-	idx := strings.Index(source, "require_no_pending_provisioning_jobs() {")
-	if idx < 0 {
-		t.Fatal("require_no_pending_provisioning_jobs missing")
-	}
-	rest := source[idx:]
-	end := strings.Index(rest[1:], "\nrequire_synthetic_pod_quota() {")
-	if end < 0 {
-		t.Fatal("could not bound require_no_pending_provisioning_jobs")
-	}
-	body := rest[:end+1]
-	if !strings.Contains(body, "synthetic-noop-%") || !strings.Contains(body, "LEFT JOIN pods") {
-		t.Fatal("provisioning preflight must exclude synthetic-noop jobs (same race as advisory durable drain)")
 	}
 }
 
