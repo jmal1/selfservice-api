@@ -4,8 +4,9 @@
 # whether the corresponding matrix job has to run.
 #
 # Channels:
-#   shared           — paths that affect every binary; presence in a PR/push
-#                      forces ALL matrix jobs to run.
+#   shared           — paths that affect every Alpine binary; presence in a PR/push
+#                      forces the four Alpine matrix jobs. Kali (crucible-runner) is
+#                      NOT included — it only rebuilds via its own channel (Crucible#51).
 #   <component>      — paths whose changes only require that component to
 #                      rebuild. Shared internal packages (e.g. internal/vcenter
 #                      used by api-gateway + provision-worker + crucible-engine)
@@ -89,6 +90,10 @@ crucible-runner:
   # here meant a change to the runner's Go code did not rebuild the runner
   # image, so the next deploy silently shipped a stale runner binary while
   # every other component picked the change up. See TestPathFilters_*.
+  # go.mod/go.sum must stay here: shared no longer forces Kali (Crucible#51),
+  # but the builder stage still compiles against the module graph.
+  - 'go.mod'
+  - 'go.sum'
   - 'deploy/runner/**'
   - 'cmd/crucible-runner/**'
   - 'internal/runner/**'
