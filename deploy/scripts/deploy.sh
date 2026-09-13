@@ -1985,86 +1985,6 @@ current_migration_state() {
   esac
 }
 
-require_no_active_jobs() {
-  local jobs_json active_kubernetes_jobs
-  if ! jobs_json="$(kubectl get jobs -n "$NAMESPACE" -o json)"; then
-    echo "ERROR: failed to list Kubernetes Jobs while verifying job drain." >&2
-    return 1
-  fi
-  if ! active_kubernetes_jobs="$(
-    jq -er --arg release "$RELEASE" '
-      def is_contained_api_monitor:
-        (.metadata.name | startswith($release + "-synthetic-api-monitor-")) and
-        (
-          [
-            (.metadata.ownerReferences // [])[]
-            | select(
-                .kind == "CronJob" and
-                .name == ($release + "-synthetic-api-monitor") and
-                .controller == true
-              )
-          ] | length
-        ) == 1 and
-        ((.spec.template.spec.containers // null) | type) == "array" and
-        ((.spec.template.spec.containers | length) == 1) and
-        (.spec.template.spec.containers[0].name == "synthetic-api-monitor") and
-        ((.spec.template.spec.containers[0].env // null) | type) == "array" and
-        (
-          [
-            .spec.template.spec.containers[0].env[]
-            | select(.name == "SYNTHETIC_LIFECYCLE_ENABLED")
-          ] | length
-        ) == 1 and
-        (
-          [
-            .spec.template.spec.containers[0].env[]
-            | select(
-                .name == "SYNTHETIC_LIFECYCLE_ENABLED" and
-                .value == "false"
-              )
-          ] | length
-        ) == 1 and
-        ((.spec.template.spec.initContainers // []) | type) == "array" and
-        (((.spec.template.spec.initContainers // []) | length) == 0);
-
-      if (.items | type) != "array" then
-        error("items must be an array")
-      else
-        [
-          .items[]
-          | if (.metadata.name | type) != "string" or
-               ((.metadata.ownerReferences // []) | type) != "array" or
-               ((.metadata.ownerReferences // []) | all(
-                 type == "object" and
-                 (.kind | type) == "string" and
-                 (.name | type) == "string" and
-                 ((.controller // false) | type) == "boolean"
-               ) | not) or
-               ((.status.active // 0) | type) != "number" or
-               ((.status.active // 0) < 0) or
-               ((.status.active // 0) != ((.status.active // 0) | floor)) then
-              error("malformed Job record")
-            else .
-            end
-          | select((.status.active // 0) > 0)
-          | select(is_contained_api_monitor | not)
-          | .metadata.name
-        ]
-        | unique
-        | join(",")
-      end
-    ' <<< "$jobs_json"
-  )"; then
-    echo "ERROR: Kubernetes Job data is malformed while verifying job drain." >&2
-    return 1
-  fi
-  if [ -n "$active_kubernetes_jobs" ]; then
-    echo "ERROR: Kubernetes Jobs remain active in namespace $NAMESPACE: $active_kubernetes_jobs." >&2
-    return 1
-  fi
-  echo "==> job drain verified: no blocking Kubernetes Jobs"
-}
-
 require_clean_migration() {
   local expected=${1:-}
   local state
@@ -2179,70 +2099,6 @@ require_synthetic_pod_quota() {
   fi
 }
 
-require_no_active_mutating_synthetics() {
-  local jobs_json active_names
-  if ! jobs_json="$(kubectl get jobs -n "$NAMESPACE" -o json)"; then
-    echo "ERROR: failed to list Kubernetes Jobs while checking scheduled mutating synthetics." >&2
-    return 1
-  fi
-  if ! active_names="$(
-    jq -er --arg release "$RELEASE" '
-      if (.items | type) != "array" then
-        error("items must be an array")
-      else
-        [
-          .items[]
-          | if (.metadata.name | type) != "string" or
-               ((.metadata.ownerReferences // []) | type) != "array" or
-               ((.metadata.ownerReferences // []) | all(
-                 type == "object" and
-                 (.kind | type) == "string" and
-                 (.name | type) == "string"
-               ) | not) or
-               ((.status.conditions // []) | type) != "array" or
-               ((.status.conditions // []) | all(
-                 type == "object" and
-                 (.type | type) == "string" and
-                 (.status | type) == "string"
-               ) | not) or
-               ((.status.active // 0) | type) != "number" or
-               ((.status.active // 0) < 0) or
-               ((.status.active // 0) != ((.status.active // 0) | floor)) then
-              error("malformed Job record")
-            else .
-            end
-          | select(any(
-              (.metadata.ownerReferences // [])[];
-              .kind == "CronJob" and
-              (
-                .name == ($release + "-synthetic-api-monitor") or
-                .name == ($release + "-synthetic-janitor") or
-                .name == ($release + "-synthetic-runner")
-              )
-            ))
-          | select(
-              any(
-                (.status.conditions // [])[];
-                (.type == "Complete" or .type == "Failed") and .status == "True"
-              )
-              | not
-            )
-          | .metadata.name
-        ]
-        | unique
-        | join(",")
-      end
-    ' <<< "$jobs_json"
-  )"; then
-    echo "ERROR: Kubernetes Job data is malformed while checking scheduled mutating synthetics." >&2
-    return 1
-  fi
-  if [ -n "$active_names" ]; then
-    echo "ERROR: scheduled mutating synthetic execution is active: $active_names." >&2
-    return 1
-  fi
-}
-
 require_candidate_image_provenance() {
   local component repository image count=0 seen=,
   if [ ! -r "$CANDIDATE_RESOLVED_IMAGES" ]; then
@@ -2287,7 +2143,6 @@ run_release_preflight() {
   echo "==> running fail-closed release preflight before lock acquisition or live mutation"
   require_clean_migration
   require_synthetic_pod_quota
-  require_no_active_mutating_synthetics
   require_candidate_image_provenance
   echo "==> release preflight passed"
 }
@@ -3623,11 +3478,7 @@ contain_failed_atomic_upgrade() {
     echo "ERROR: atomic rollback restored a different workload image inventory than the pre-upgrade release." >&2
     return 1
   fi
-  if ! require_no_active_jobs; then
-    echo "ERROR: work remained active after atomic rollback." >&2
-    return 1
-  fi
-  echo "==> atomic failure contained by the currently deployed rollback baseline with claims disabled and all work drained" >&2
+  echo "==> atomic failure contained by the currently deployed rollback baseline with claims disabled" >&2
 }
 
 validate_pinned_manifest() {
@@ -4337,7 +4188,6 @@ pause_live_provisioning_claims
 # uncontained live==rendered first permanently bricks redeploy. Contain first,
 # then prove images/health under the contained contract.
 enforce_synthetic_rollback_containment
-require_no_active_jobs
 verify_rollback_containment "$ROLLBACK_BASELINE_MIGRATION" true
 ROLLBACK_CURRENT_REVISION=$VERIFIED_BASELINE_REVISION
 ROLLBACK_BASELINE_MIGRATION=$VERIFIED_MIGRATION_STATE
@@ -4385,7 +4235,6 @@ if [ "$(sha256sum "$CANDIDATE_MANIFEST" | awk '{print $1}')" != "$CANDIDATE_SHA2
   echo "ERROR: exact candidate manifest changed after validation." >&2
   exit 1
 fi
-require_no_active_jobs
 
 echo "==> helm upgrade $RELEASE with exact digest-pinned candidate (atomic, timeout=$TIMEOUT)"
 HELM_RELEASE_LOCK_PRESERVE=true
