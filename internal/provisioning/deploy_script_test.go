@@ -850,13 +850,15 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 			expectBuiltDigest: true,
 		},
 		{
-			name:      "active Kubernetes job blocks upgrade",
+			name:      "active Kubernetes job does not block upgrade",
 			transform: func(manifest string) string { return baselineManifest(true, "*", "true") },
 			configure: func(env *deployScriptEnvironment) {
 				env.activeKubernetesJobs = 1
 			},
-			wantOutput:  "Kubernetes Jobs remain active",
-			wantUpgrade: false,
+			wantSuccess:       true,
+			wantOutput:        "deployed exact source",
+			wantUpgrade:       true,
+			expectBuiltDigest: true,
 		},
 		{
 			name:        "floating package tag",
@@ -1058,10 +1060,18 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 			if !strings.Contains(string(output), test.wantOutput) {
 				t.Fatalf("output %q does not contain %q", output, test.wantOutput)
 			}
-			if test.name == "active durable job does not block upgrade" &&
-				(strings.Contains(string(output), "WARNING:") ||
-					strings.Contains(string(output), "durable jobs are claimed")) {
-				t.Fatalf("in-flight durable jobs must be silent:\n%s", output)
+			if test.name == "active durable job does not block upgrade" ||
+				test.name == "active Kubernetes job does not block upgrade" {
+				for _, noise := range []string{
+					"WARNING:",
+					"durable jobs are claimed",
+					"Kubernetes Jobs remain active",
+					"scheduled mutating synthetic",
+				} {
+					if strings.Contains(string(output), noise) {
+						t.Fatalf("in-flight jobs must be silent, found %q in:\n%s", noise, output)
+					}
+				}
 			}
 			upgradeBody, readErr := os.ReadFile(env.upgradeLog)
 			if test.wantUpgrade {
@@ -1217,7 +1227,6 @@ func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 # uncontained live==rendered first permanently bricks redeploy. Contain first,
 # then prove images/health under the contained contract.
 enforce_synthetic_rollback_containment
-require_no_active_jobs
 verify_rollback_containment "$ROLLBACK_BASELINE_MIGRATION" true
 ROLLBACK_CURRENT_REVISION=$VERIFIED_BASELINE_REVISION
 ROLLBACK_BASELINE_MIGRATION=$VERIFIED_MIGRATION_STATE
@@ -1226,7 +1235,6 @@ ROLLBACK_BASELINE_MIGRATION=$VERIFIED_MIGRATION_STATE
 verify_rollback_containment "$ROLLBACK_BASELINE_MIGRATION"
 ROLLBACK_CURRENT_REVISION=$VERIFIED_BASELINE_REVISION
 enforce_synthetic_rollback_containment
-require_no_active_jobs
 ROLLBACK_BASELINE_MIGRATION=$VERIFIED_MIGRATION_STATE
 `
 		if strings.Count(original, fixed) != 1 {
@@ -1832,35 +1840,6 @@ func TestDeployScriptReleasePreflightGuards(t *testing.T) {
 			wantOutput: "quota query returned invalid or missing",
 		},
 		{
-			name: "mutating synthetic active",
-			configure: func(env *deployScriptEnvironment) {
-				env.activeMutatingSyntheticJobs = 1
-			},
-			wantOutput: "scheduled mutating synthetic execution is active",
-		},
-		{
-			name: "completed mutating synthetic passes",
-			configure: func(env *deployScriptEnvironment) {
-				env.completedMutatingSyntheticJob = true
-			},
-			wantOutput: "release preflight passed",
-			wantPass:   true,
-		},
-		{
-			name: "Kubernetes jobs malformed",
-			configure: func(env *deployScriptEnvironment) {
-				env.malformedJobsJSON = true
-			},
-			wantOutput: "Kubernetes Job data is malformed",
-		},
-		{
-			name: "Kubernetes jobs query failure",
-			configure: func(env *deployScriptEnvironment) {
-				env.failJobsList = true
-			},
-			wantOutput: "failed to list Kubernetes Jobs",
-		},
-		{
 			name: "candidate revision mismatch",
 			configure: func(env *deployScriptEnvironment) {
 				env.imageRevision = otherSourceSHA
@@ -1920,7 +1899,7 @@ func assertNoPreflightMutation(t *testing.T, env *deployScriptEnvironment, outpu
 	}
 }
 
-func TestDeployScriptOmitsProvisioningJobPreflight(t *testing.T) {
+func TestDeployScriptOmitsJobActivityGates(t *testing.T) {
 	deployBody, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
 	if err != nil {
 		t.Fatal(err)
@@ -1931,22 +1910,27 @@ func TestDeployScriptOmitsProvisioningJobPreflight(t *testing.T) {
 		"require_volatile_release_preflight",
 		"gate_a4_provisioning_preflight",
 		"warn_nonterminal_synthetic_pod_jobs",
+		"require_no_active_jobs",
+		"require_no_active_mutating_synthetics",
 		"durable jobs are claimed, in_progress, or rollback",
 		"nonterminal storage-mutating synthetic pod jobs",
 		"durable PG work is advisory",
+		"Kubernetes Jobs remain active",
+		"scheduled mutating synthetic execution is active",
+		"job drain verified",
 	} {
 		if strings.Contains(source, needle) {
-			t.Fatalf("deploy.sh must not retain ignored provisioning/job noise (%q)", needle)
+			t.Fatalf("deploy.sh must not retain ignored job-activity gates (%q)", needle)
 		}
 	}
-	const adjacent = `require_no_active_jobs
+	const adjacent = `if [ "$(sha256sum "$CANDIDATE_MANIFEST" | awk '{print $1}')" != "$CANDIDATE_SHA256" ]; then
+  echo "ERROR: exact candidate manifest changed after validation." >&2
+  exit 1
+fi
 
 echo "==> helm upgrade $RELEASE with exact digest-pinned candidate (atomic, timeout=$TIMEOUT)"`
 	if strings.Count(source, adjacent) != 1 {
-		t.Fatal("final Helm upgrade must follow require_no_active_jobs directly (no volatile provisioning recheck)")
-	}
-	if !strings.Contains(source, `echo "==> job drain verified: no blocking Kubernetes Jobs"`) {
-		t.Fatal("job drain success message must only mention Kubernetes Jobs")
+		t.Fatal("final Helm upgrade must follow candidate validation directly (no job-activity recheck)")
 	}
 }
 
@@ -1977,7 +1961,6 @@ func TestDeployScriptReleasePreflightPredicatesAreLoadBearing(t *testing.T) {
 	}{
 		{name: "migration", guardCall: "  require_clean_migration\n", configure: func(env *deployScriptEnvironment) { env.migrationState = "1:37:true" }},
 		{name: "synthetic quota", guardCall: "  require_synthetic_pod_quota\n", configure: func(env *deployScriptEnvironment) { env.syntheticQuotaState = "1:1" }},
-		{name: "mutating synthetics", guardCall: "  require_no_active_mutating_synthetics\n", configure: func(env *deployScriptEnvironment) { env.activeMutatingSyntheticJobs = 1 }},
 		{name: "candidate provenance", guardCall: "  require_candidate_image_provenance\n", configure: func(env *deployScriptEnvironment) { env.imageRevisionDriftAfter = 6 }},
 	}
 
@@ -2175,11 +2158,11 @@ func TestDeployScriptRestoresProvisioningClaimsOnEveryPostPauseExit(t *testing.T
 
 	t.Run("early post-pause set-e failure", func(t *testing.T) {
 		env := newLiveClaimsEnvironment(t)
-		// Durable PG jobs only warn; an unexpected active K8s Job still fail-closes.
-		env.activeKubernetesJobs = 1
+		// Force a real post-pause fail-close via final server dry-run (Job activity is not a gate).
+		env.failFinalServerDryRun = true
 		output, err := env.run("--no-pull")
-		if got := exitCode(t, err); got != 1 {
-			t.Fatalf("post-pause failure exit code = %d, want 1\n%s", got, output)
+		if got := exitCode(t, err); got != 95 {
+			t.Fatalf("post-pause failure exit code = %d, want 95\n%s", got, output)
 		}
 		assertRestored(t, env, output)
 	})
@@ -2231,16 +2214,16 @@ func TestDeployScriptRestoresProvisioningClaimsOnEveryPostPauseExit(t *testing.T
 
 	t.Run("resume failure preserves an existing failure", func(t *testing.T) {
 		env := newLiveClaimsEnvironment(t)
-		env.activeKubernetesJobs = 1
+		env.failFinalServerDryRun = true
 		env.failClaimsResume = true
 		output, err := env.run("--no-pull")
-		if got := exitCode(t, err); got != 1 {
-			t.Fatalf("existing failure was replaced by resume status: got %d want 1\n%s", got, output)
+		if got := exitCode(t, err); got != 95 {
+			t.Fatalf("existing failure was replaced by resume status: got %d want 95\n%s", got, output)
 		}
 		if _, err := os.Stat(env.lockFile); err != nil {
 			t.Fatalf("resume failure did not preserve the lock: %v\n%s", err, output)
 		}
-		if !strings.Contains(string(output), "original exit code: 1, resume exit code: 86") {
+		if !strings.Contains(string(output), "original exit code: 95, resume exit code: 86") {
 			t.Fatalf("combined failure did not log both statuses:\n%s", output)
 		}
 	})
@@ -2358,8 +2341,8 @@ func TestDeployScriptClaimsExitRestorationIsLoadBearing(t *testing.T) {
 		baselineManifest(true, "*", "true"),
 	)
 	writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
-	// Durable PG jobs only warn; force a real post-pause fail-close via K8s Jobs.
-	env.activeKubernetesJobs = 1
+	// Force a real post-pause fail-close; Job activity is not a release gate.
+	env.failFinalServerDryRun = true
 	env.scriptPath = scriptPath
 	output, runErr := env.run("--no-pull")
 	if runErr == nil {
