@@ -269,8 +269,8 @@
     {
       "path": "docs/student/connecting.md",
       "title": "Connecting to Your VM",
-      "size": 2000,
-      "sha256": "754a72359a73d0531135dc96f49f68ef4032eb78ac05b180f04f1c53649c2669",
+      "size": 2372,
+      "sha256": "0a10b74c5623ca7d1d8c293497122995832bde603b2fb704634561c29080b0cc",
       "is_markdown": true,
       "links_out": [
         "docs/student/troubleshooting.md"
@@ -438,5 +438,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 742578
+  "total_bytes": 742950
 }

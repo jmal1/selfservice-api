@@ -1117,7 +1117,8 @@ func (q *Queries) GetPodByID(ctx context.Context, id uuid.UUID) (*models.Pod, er
 		       pv.generated_username, pv.generated_password, pv.guest_credentials_verified_at,
 		       pv.guest_credentials_verified_vm_id,
 		       pv.boot_order, pv.created_at,
-		       COALESCE(t.name, ''), COALESCE(t.kind, 'clone_with_customize'), COALESCE(t.os_type, '')
+		       COALESCE(t.name, ''), COALESCE(t.kind, 'clone_with_customize'), COALESCE(t.os_type, ''),
+		       COALESCE(t.assign_ip, true), COALESCE(t.skip_generalize, false)
 		FROM pod_vms pv
 		LEFT JOIN templates t ON pv.template_id = t.id
 		WHERE pv.pod_id = $1 AND pv.status != 'deleted' ORDER BY pv.boot_order, pv.created_at
@@ -1137,6 +1138,7 @@ func (q *Queries) GetPodByID(ctx context.Context, id uuid.UUID) (*models.Pod, er
 			&vm.GuestCredentialsVerifiedVMID,
 			&vm.BootOrder, &vm.CreatedAt,
 			&vm.TemplateName, &vm.TemplateKind, &vm.OSType,
+			&vm.AssignIP, &vm.SkipGeneralize,
 		); err != nil {
 			return nil, err
 		}
@@ -1319,7 +1321,8 @@ func (q *Queries) listPodVMsActive(ctx context.Context, podID uuid.UUID) ([]mode
 		       pv.generated_username, pv.generated_password, pv.guest_credentials_verified_at,
 		       pv.guest_credentials_verified_vm_id,
 		       pv.boot_order, pv.created_at,
-		       COALESCE(t.name, ''), COALESCE(t.kind, 'clone_with_customize'), COALESCE(t.os_type, '')
+		       COALESCE(t.name, ''), COALESCE(t.kind, 'clone_with_customize'), COALESCE(t.os_type, ''),
+		       COALESCE(t.assign_ip, true), COALESCE(t.skip_generalize, false)
 		FROM pod_vms pv
 		LEFT JOIN templates t ON pv.template_id = t.id
 		WHERE pv.pod_id = $1 AND pv.status != 'deleted' ORDER BY pv.boot_order, pv.created_at
@@ -1340,6 +1343,7 @@ func (q *Queries) listPodVMsActive(ctx context.Context, podID uuid.UUID) ([]mode
 			&vm.GuestCredentialsVerifiedVMID,
 			&vm.BootOrder, &vm.CreatedAt,
 			&vm.TemplateName, &vm.TemplateKind, &vm.OSType,
+			&vm.AssignIP, &vm.SkipGeneralize,
 		); err != nil {
 			return nil, err
 		}
@@ -2195,7 +2199,8 @@ func (q *Queries) ListPodVMs(ctx context.Context, podID uuid.UUID) ([]models.Pod
 		       COALESCE(t.default_username, ''), COALESCE(t.default_password, ''),
 		       pv.generated_username, pv.generated_password, pv.guest_credentials_verified_at,
 		       pv.guest_credentials_verified_vm_id, pv.created_at,
-		       COALESCE(t.name, ''), COALESCE(t.kind, 'clone_with_customize'), COALESCE(t.os_type, '')
+		       COALESCE(t.name, ''), COALESCE(t.kind, 'clone_with_customize'), COALESCE(t.os_type, ''),
+		       COALESCE(t.assign_ip, true), COALESCE(t.skip_generalize, false)
 		FROM pod_vms pv
 		LEFT JOIN templates t ON pv.template_id = t.id
 		WHERE pv.pod_id = $1
@@ -2213,7 +2218,8 @@ func (q *Queries) ListPodVMs(ctx context.Context, podID uuid.UUID) ([]models.Pod
 			&vm.DefaultUsername, &vm.DefaultPassword,
 			&vm.GeneratedUsername, &vm.GeneratedPassword, &vm.GuestCredentialsVerifiedAt,
 			&vm.GuestCredentialsVerifiedVMID, &vm.CreatedAt,
-			&vm.TemplateName, &vm.TemplateKind, &vm.OSType)
+			&vm.TemplateName, &vm.TemplateKind, &vm.OSType,
+			&vm.AssignIP, &vm.SkipGeneralize)
 		if err != nil {
 			return nil, err
 		}
@@ -2231,7 +2237,8 @@ func (q *Queries) GetPodVM(ctx context.Context, id uuid.UUID) (*models.PodVM, er
 		       COALESCE(t.default_username, ''), COALESCE(t.default_password, ''),
 		       pv.generated_username, pv.generated_password, pv.guest_credentials_verified_at,
 		       pv.guest_credentials_verified_vm_id, pv.created_at,
-		       COALESCE(t.name, ''), COALESCE(t.kind, 'clone_with_customize'), COALESCE(t.os_type, '')
+		       COALESCE(t.name, ''), COALESCE(t.kind, 'clone_with_customize'), COALESCE(t.os_type, ''),
+		       COALESCE(t.assign_ip, true), COALESCE(t.skip_generalize, false)
 		FROM pod_vms pv
 		LEFT JOIN templates t ON pv.template_id = t.id
 		WHERE pv.id = $1
@@ -2240,7 +2247,8 @@ func (q *Queries) GetPodVM(ctx context.Context, id uuid.UUID) (*models.PodVM, er
 		&vm.DefaultUsername, &vm.DefaultPassword,
 		&vm.GeneratedUsername, &vm.GeneratedPassword, &vm.GuestCredentialsVerifiedAt,
 		&vm.GuestCredentialsVerifiedVMID, &vm.CreatedAt,
-		&vm.TemplateName, &vm.TemplateKind, &vm.OSType)
+		&vm.TemplateName, &vm.TemplateKind, &vm.OSType,
+		&vm.AssignIP, &vm.SkipGeneralize)
 	if err != nil {
 		return nil, err
 	}

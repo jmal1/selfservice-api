@@ -6,7 +6,8 @@ Connect only to the VM IP address and credentials displayed for **your own** lab
 
 1. Open your lab in **My Labs** and select the VM.
 2. Select the console option and wait for the browser console to open.
-3. Sign in with the username and password shown for that VM.
+3. Sign in with the username and password shown in the console helper (or on the lab card) for that VM. The console page shows credentials so you can copy them while logging in.
+4. If the console shows a **Network** helper (legacy / non-generalized images, or templates that manage their own networking), configure the guest NIC for DHCP on the listed lab VLAN and subnet. When Crucible has already observed an address, use that IP.
 
 **Expected result:** You see and can use that VM's desktop or terminal in the browser.
 
