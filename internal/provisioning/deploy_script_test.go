@@ -1294,7 +1294,7 @@ ROLLBACK_BASELINE_MIGRATION=$VERIFIED_MIGRATION_STATE
 			wantOutput: "synthetic CronJob evidence reset",
 		},
 		{
-			name: "pending synthetic pod destroy after rollback retains lock",
+			name: "pending synthetic pod destroy after rollback warns and releases lock",
 			configure: func(env *deployScriptEnvironment) {
 				env.failAtomicUpgrade = true
 				env.pendingSyntheticJobs = 1
@@ -1309,8 +1309,10 @@ ROLLBACK_BASELINE_MIGRATION=$VERIFIED_MIGRATION_STATE
 				writeFile(t, env.containedRollbackManifest, rollbackManifestWithHistoricalSynthetics(true))
 				writeFile(t, env.immutableRollbackManifest, rollbackManifestWithHistoricalSynthetics(false))
 			},
+			// Nonterminal synthetic PG jobs are advisory after the durable-job gate relax;
+			// atomic failure containment still succeeds and releases the lock.
 			wantOutput:       "nonterminal storage-mutating synthetic pod",
-			wantLockRetained: true,
+			wantLockRetained: false,
 		},
 		{
 			name: "atomic rollback image drift retains lock",
@@ -2288,7 +2290,8 @@ func TestDeployScriptRestoresProvisioningClaimsOnEveryPostPauseExit(t *testing.T
 
 	t.Run("early post-pause set-e failure", func(t *testing.T) {
 		env := newLiveClaimsEnvironment(t)
-		env.activeJobs = 1
+		// Durable PG jobs only warn; an unexpected active K8s Job still fail-closes.
+		env.activeKubernetesJobs = 1
 		output, err := env.run("--no-pull")
 		if got := exitCode(t, err); got != 1 {
 			t.Fatalf("post-pause failure exit code = %d, want 1\n%s", got, output)
@@ -2343,7 +2346,7 @@ func TestDeployScriptRestoresProvisioningClaimsOnEveryPostPauseExit(t *testing.T
 
 	t.Run("resume failure preserves an existing failure", func(t *testing.T) {
 		env := newLiveClaimsEnvironment(t)
-		env.activeJobs = 1
+		env.activeKubernetesJobs = 1
 		env.failClaimsResume = true
 		output, err := env.run("--no-pull")
 		if got := exitCode(t, err); got != 1 {
@@ -2470,7 +2473,8 @@ func TestDeployScriptClaimsExitRestorationIsLoadBearing(t *testing.T) {
 		baselineManifest(true, "*", "true"),
 	)
 	writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
-	env.activeJobs = 1
+	// Durable PG jobs only warn; force a real post-pause fail-close via K8s Jobs.
+	env.activeKubernetesJobs = 1
 	env.scriptPath = scriptPath
 	output, runErr := env.run("--no-pull")
 	if runErr == nil {
@@ -2726,17 +2730,11 @@ func revertFinalDeployedCandidateHealthFence(t *testing.T, source string) string
     echo "ERROR: deployed candidate workloads regressed after live image verification." >&2
     return 1
   fi
-  if ! require_no_active_jobs; then
-    return 1
-  fi
 `
 	const oldBlock = `  if ! verify_external_candidate_images \
       "$CANDIDATE_IMAGE_MAP" \
       "$tmp_dir/live-images" \
       candidate; then
-    return 1
-  fi
-  if ! require_no_active_jobs; then
     return 1
   fi
 `
