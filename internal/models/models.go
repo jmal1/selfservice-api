@@ -472,6 +472,12 @@ type PodVM struct {
 	TemplateName                 string    `json:"template_name,omitempty"`
 	TemplateKind                 string    `json:"template_kind,omitempty"`
 	OSType                       string    `json:"os_type,omitempty"`
+	// AssignIP mirrors templates.assign_ip so the console/UI can decide
+	// whether Crucible expects a DHCP lease without a nested template object.
+	AssignIP bool `json:"assign_ip"`
+	// SkipGeneralize mirrors templates.skip_generalize for student-facing
+	// console helper gating (non-generalized / OVA appliances).
+	SkipGeneralize bool `json:"skip_generalize"`
 	// Activity tracking — set by migration 000025.
 	LastConsoleAt  *time.Time `json:"last_console_at,omitempty" db:"last_console_at"`
 	LastActivityAt *time.Time `json:"last_activity_at,omitempty" db:"last_activity_at"`
