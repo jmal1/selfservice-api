@@ -2161,8 +2161,8 @@ func TestDeployScriptRestoresProvisioningClaimsOnEveryPostPauseExit(t *testing.T
 		// Force a real post-pause fail-close via final server dry-run (Job activity is not a gate).
 		env.failFinalServerDryRun = true
 		output, err := env.run("--no-pull")
-		if got := exitCode(t, err); got != 1 {
-			t.Fatalf("post-pause failure exit code = %d, want 1\n%s", got, output)
+		if got := exitCode(t, err); got != 95 {
+			t.Fatalf("post-pause failure exit code = %d, want 95\n%s", got, output)
 		}
 		assertRestored(t, env, output)
 	})
@@ -2217,13 +2217,13 @@ func TestDeployScriptRestoresProvisioningClaimsOnEveryPostPauseExit(t *testing.T
 		env.failFinalServerDryRun = true
 		env.failClaimsResume = true
 		output, err := env.run("--no-pull")
-		if got := exitCode(t, err); got != 1 {
-			t.Fatalf("existing failure was replaced by resume status: got %d want 1\n%s", got, output)
+		if got := exitCode(t, err); got != 95 {
+			t.Fatalf("existing failure was replaced by resume status: got %d want 95\n%s", got, output)
 		}
 		if _, err := os.Stat(env.lockFile); err != nil {
 			t.Fatalf("resume failure did not preserve the lock: %v\n%s", err, output)
 		}
-		if !strings.Contains(string(output), "original exit code: 1, resume exit code: 86") {
+		if !strings.Contains(string(output), "original exit code: 95, resume exit code: 86") {
 			t.Fatalf("combined failure did not log both statuses:\n%s", output)
 		}
 	})
