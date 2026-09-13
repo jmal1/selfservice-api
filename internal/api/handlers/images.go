@@ -590,7 +590,9 @@ func (h *Handler) AdminGetImage(w http.ResponseWriter, r *http.Request) {
 }
 
 // AdminDeleteImage removes the object and the row. It refuses with 409
-// if a template still references the image.
+// if a template still references the image. An unreferenced imported OVA
+// also destroys the exact vcenter_vm_id VM so the next upload of the same
+// filename does not fault DuplicateName.
 func (h *Handler) AdminDeleteImage(w http.ResponseWriter, r *http.Request) {
 	if h.imageStore == nil || h.imgDB == nil {
 		respondError(w, r, http.StatusServiceUnavailable, "image upload not configured")
@@ -630,6 +632,22 @@ func (h *Handler) AdminDeleteImage(w http.ResponseWriter, r *http.Request) {
 			"message":        fmt.Sprintf("image is referenced by %d template(s); remove those references first", refCount),
 		})
 		return
+	}
+
+	// Unreferenced imported OVAs own a Templates-folder VM. Destroy that
+	// exact moref before dropping MinIO/DB state so a failed destroy leaves
+	// a recoverable row. ISO delete is unchanged: installer files are not
+	// vCenter VMs. DestroyVM is idempotent when the VM is already gone.
+	if img.Kind == models.ImageKindOVA && strings.TrimSpace(img.VCenterVMID) != "" {
+		if h.vc == nil {
+			respondError(w, r, http.StatusServiceUnavailable, "vCenter is not configured; cannot destroy the imported OVA VM")
+			return
+		}
+		if err := h.vc.DestroyVM(r.Context(), img.VCenterVMID); err != nil {
+			h.logger.Error("destroy imported OVA VM failed", "error", err, "id", imageID, "moref", img.VCenterVMID)
+			respondError(w, r, http.StatusInternalServerError, "failed to destroy imported OVA VM: "+err.Error())
+			return
+		}
 	}
 
 	// Delete the object store object first so that a failure leaves a

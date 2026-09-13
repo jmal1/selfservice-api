@@ -376,6 +376,8 @@ func TestChartWiresEveryProvisioningControl(t *testing.T) {
 		"worker-deployment.yaml": {
 			"WORKER_PROVISIONING_CLAIMS_ENABLED",
 			".Values.provisioning.workerClaimsEnabled",
+			"VCENTER_OVA_NETWORK",
+			".Values.vcenter.ovaNetwork",
 			"VCENTER_INSECURE",
 			".Values.vcenter.insecure",
 			"OPNSENSE_SSH_HOST_KEY",

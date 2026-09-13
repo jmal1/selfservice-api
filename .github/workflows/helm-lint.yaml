@@ -95,6 +95,8 @@ jobs:
           }
           assert_env_n VCENTER_ISO_DATASTORE Example-ISO-Datastore 2
           assert_env_n VCENTER_ISO_FOLDER ISOs 2
+          # Worker-only: API does not import OVAs. Count is 1.
+          assert_env_n VCENTER_OVA_NETWORK PG-VM-Lab 1
 
       - name: helm lint and template (approved full-fleet overlay)
         working-directory: deploy/helm/selfservice

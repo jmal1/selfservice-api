@@ -285,16 +285,33 @@ func importImage(
 		datastorePath = vcenter.DatastorePath(cfg.ISODatastore, remotePath)
 
 	case models.ImageKindOVA:
+		if cfg.OVADatastore == "" {
+			return fail(fmt.Errorf("ova import: OVA datastore is not configured"))
+		}
+
+		// Same headroom gate as ISO: a confirmed shortfall is fatal so we do
+		// not start an NFC lease that will fail at 95%. A probe error is
+		// non-fatal (log + continue) so a transient govmomi hiccup does not
+		// block every in-flight import.
+		freeBytes, fsErr := vc.GetDatastoreFreeBytes(ctx, cfg.OVADatastore)
+		if fsErr != nil {
+			log.Warn("could not determine datastore free space; proceeding without capacity check",
+				"datastore", cfg.OVADatastore, "error", fsErr)
+		} else if freeBytes < size {
+			return fail(fmt.Errorf("ova import: not enough free space on datastore %q: need %d bytes, have %d bytes",
+				cfg.OVADatastore, size, freeBytes))
+		}
+
 		if progress != nil {
 			progress("import", "Importing OVA appliance into vCenter")
 		}
 		// Resolve the portgroup here rather than trusting the wiring to set
 		// it: ImportOVA hard-fails any OVA that declares a network when this
-		// is empty, which is every real appliance, and the worker wiring did
-		// omit it. Defaulting at the point of use is the same idiom as
-		// defaultISOFolder above and as the template staging fallback in
-		// template_jobs.go, and it lands an unbuilt appliance on the isolated
-		// staging VLAN instead of anywhere it could reach the real lab.
+		// is empty, which is every real appliance. Defaulting at the point of
+		// use is the same idiom as defaultISOFolder above and as the template
+		// staging fallback in template_jobs.go, and it lands an unbuilt
+		// appliance on the isolated staging VLAN instead of anywhere it could
+		// reach the real lab.
 		ovaNetwork := strings.TrimSpace(cfg.OVANetwork)
 		if ovaNetwork == "" {
 			ovaNetwork = models.CanonicalStagingNetwork
@@ -369,9 +386,11 @@ func byteProgress(size int64, progress func(step, message string)) func(sent int
 	}
 }
 
-// ovaVMName derives a vCenter VM name from the uploaded filename, falling back
-// to the image ID when the filename yields nothing usable. vCenter's OVF
-// importer requires a non-empty entity name.
+// ovaVMName derives a vCenter VM name from the uploaded filename plus a
+// short image-id suffix. The suffix is load-bearing: re-uploading the same
+// filename (or leaving a prior import VM in the Templates folder) otherwise
+// faults DuplicateName. vCenter's OVF importer requires a non-empty entity
+// name; an empty stem falls back to "ova-<suffix>".
 func ovaVMName(filename string, id uuid.UUID) string {
 	base := strings.TrimSpace(filename)
 	if i := strings.LastIndexAny(base, `/\`); i >= 0 {
@@ -381,8 +400,15 @@ func ovaVMName(filename string, id uuid.UUID) string {
 		base = base[:i]
 	}
 	base = strings.TrimSpace(base)
-	if base == "" {
-		return "ova-" + id.String()
+	suffix := strings.ReplaceAll(id.String(), "-", "")
+	if len(suffix) > 8 {
+		suffix = suffix[:8]
 	}
-	return base
+	if suffix == "" {
+		suffix = "imported"
+	}
+	if base == "" {
+		return "ova-" + suffix
+	}
+	return base + "-" + suffix
 }
