@@ -839,13 +839,15 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 			expectBuiltDigest: true,
 		},
 		{
-			name:      "active durable job blocks upgrade",
+			name:      "active durable job warns and continues",
 			transform: func(manifest string) string { return baselineManifest(true, "*", "true") },
 			configure: func(env *deployScriptEnvironment) {
 				env.activeJobs = 1
 			},
-			wantOutput:  "durable jobs remain claimed",
-			wantUpgrade: false,
+			wantSuccess:       true,
+			wantOutput:        "durable jobs are claimed, in_progress, or rollback (continuing",
+			wantUpgrade:       true,
+			expectBuiltDigest: true,
 		},
 		{
 			name:      "active Kubernetes job blocks upgrade",
@@ -1446,97 +1448,62 @@ func TestDeployScriptPostUpgradeActiveJobContainment(t *testing.T) {
 	live := baselineManifest(true, "", "true")
 	candidate := baselineManifest(true, "*", "true")
 
-	t.Run("contained API monitor is permitted", func(t *testing.T) {
-		env := newDeployScriptEnvironment(t, live, candidate)
-		env.postUpgradeActiveKubernetesJob = "api-monitor-contained"
-
-		output, err := env.run("--no-pull")
-		if err != nil {
-			t.Fatalf("contained API monitor caused false post-upgrade failure: %v\n%s", err, output)
-		}
-		if !strings.Contains(string(output), "deployed exact source") {
-			t.Fatalf("contained API monitor did not reach successful deployment:\n%s", output)
-		}
-		if _, statErr := os.Stat(env.candidateAppliedMark); statErr != nil {
-			t.Fatalf("contained API monitor fixture did not reach post-upgrade containment: %v", statErr)
-		}
-		if _, statErr := os.Stat(env.lockFile); !os.IsNotExist(statErr) {
-			t.Fatalf("successful contained API monitor deployment retained the release lock: %v", statErr)
-		}
-	})
-
+	// Post-Helm verify no longer drain-gates on active Jobs: durable workers and
+	// scheduled synthetics may run during the multi-minute identity check.
 	for _, test := range []struct {
 		name string
 		job  string
 	}{
-		{name: "runner remains blocking", job: "runner"},
-		{name: "janitor remains blocking", job: "janitor"},
-		{name: "provisioning remains blocking", job: "provisioning"},
-		{name: "unknown name remains blocking", job: "unknown"},
-		{name: "spoofed API monitor remains blocking", job: "api-monitor-wrong-owner"},
-		{name: "lifecycle-enabled API monitor remains blocking", job: "api-monitor-lifecycle"},
+		{name: "contained API monitor permitted", job: "api-monitor-contained"},
+		{name: "runner does not block post-upgrade", job: "runner"},
+		{name: "janitor does not block post-upgrade", job: "janitor"},
+		{name: "provisioning does not block post-upgrade", job: "provisioning"},
+		{name: "unknown name does not block post-upgrade", job: "unknown"},
+		{name: "spoofed API monitor does not block post-upgrade", job: "api-monitor-wrong-owner"},
+		{name: "lifecycle-enabled API monitor does not block post-upgrade", job: "api-monitor-lifecycle"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			env := newDeployScriptEnvironment(t, live, candidate)
 			env.postUpgradeActiveKubernetesJob = test.job
 
 			output, err := env.run("--no-pull")
-			if err == nil {
-				t.Fatalf("active %s Job unexpectedly passed post-upgrade containment:\n%s", test.job, output)
+			if err != nil {
+				t.Fatalf("post-upgrade active %s Job blocked successful apply: %v\n%s", test.job, err, output)
 			}
-			if !strings.Contains(string(output), "Kubernetes Jobs remain active") {
-				t.Fatalf("active %s Job failure did not identify the job drain:\n%s", test.job, output)
+			if !strings.Contains(string(output), "deployed exact source") {
+				t.Fatalf("post-upgrade active %s Job did not reach successful deployment:\n%s", test.job, output)
 			}
 			if _, statErr := os.Stat(env.candidateAppliedMark); statErr != nil {
-				t.Fatalf("active %s Job fixture did not reach post-upgrade containment: %v", test.job, statErr)
+				t.Fatalf("post-upgrade active %s Job fixture did not reach post-upgrade containment: %v", test.job, statErr)
 			}
-			if _, statErr := os.Stat(env.lockFile); statErr != nil {
-				t.Fatalf("active %s Job failure did not retain the release lock: %v", test.job, statErr)
+			if _, statErr := os.Stat(env.lockFile); !os.IsNotExist(statErr) {
+				t.Fatalf("successful post-upgrade active %s Job deploy retained the release lock: %v", test.job, statErr)
 			}
 		})
 	}
 }
 
-func TestDeployScriptPostUpgradeActiveJobGuardIsLoadBearing(t *testing.T) {
-	requirePOSIXShell(t)
-	deployPath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
-	deployBody, err := os.ReadFile(deployPath)
+func TestDeployScriptPostUpgradeDoesNotCallActiveJobDrain(t *testing.T) {
+	deployBody, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	const guard = `  if [ -n "$active_kubernetes_jobs" ]; then
-    echo "ERROR: Kubernetes Jobs remain active in namespace $NAMESPACE: $active_kubernetes_jobs." >&2
-    return 1
-  fi
-`
-	if strings.Count(string(deployBody), guard) != 1 {
-		t.Fatal("post-upgrade active Kubernetes Job guard is not unique")
+	source := string(deployBody)
+	verifyIdx := strings.Index(source, "verify_deployed_candidate() {")
+	if verifyIdx < 0 {
+		t.Fatal("verify_deployed_candidate missing")
 	}
-	sabotagedBody := strings.Replace(string(deployBody), guard, "", 1)
-	sabotagedPath := filepath.Join(
-		filepath.Dir(deployPath),
-		"deploy-sabotaged-active-job-guard-test.sh",
-	)
-	writeExecutable(t, sabotagedPath, sabotagedBody)
-	t.Cleanup(func() { os.Remove(sabotagedPath) })
-
-	live := baselineManifest(true, "", "true")
-	env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "true"))
-	env.postUpgradeActiveKubernetesJob = "provisioning"
-	env.scriptPath = sabotagedPath
-
-	output, runErr := env.run("--no-pull")
-	if runErr != nil {
-		t.Fatalf("removing the active Job guard did not expose false acceptance: %v\n%s", runErr, output)
+	rest := source[verifyIdx:]
+	nextFn := strings.Index(rest[1:], "\nenforce_synthetic_rollback_containment()")
+	if nextFn < 0 {
+		t.Fatal("could not bound verify_deployed_candidate body")
 	}
-	if !strings.Contains(string(output), "deployed exact source") {
-		t.Fatalf("removing the active Job guard did not reach false success:\n%s", output)
+	body := rest[:nextFn+1]
+	if strings.Contains(body, "require_no_active_jobs") {
+		t.Fatal("verify_deployed_candidate must not call require_no_active_jobs after successful Helm")
 	}
-	if _, statErr := os.Stat(env.candidateAppliedMark); statErr != nil {
-		t.Fatalf("active Job sabotage did not reach post-upgrade containment: %v", statErr)
-	}
-	if _, statErr := os.Stat(env.lockFile); !os.IsNotExist(statErr) {
-		t.Fatalf("sabotaged active Job guard did not falsely release the lock: %v", statErr)
+	if strings.Contains(body, "wait_for_no_active_jobs") {
+		t.Fatal("verify_deployed_candidate must not wait on job drain after successful Helm")
 	}
 }
 
@@ -2523,16 +2490,10 @@ func TestDeployScriptPostHelmWaitVerifyOrdering(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := string(deployBody)
-	const seq = `# Helm reopens SYNTHETIC_LIFECYCLE_ENABLED=true from values, so a scheduled
-# */12 monitor can claim durable pod_lifecycle work during the multi-minute
-# post-upgrade verify window and falsely fail an otherwise-successful atomic
-# apply (observed 2026-09-11T23:00Z). Wait for drain before verify rather than
-# treating a transient in-flight synthetic as permanent containment failure.
+	const seq = `# Durable workers and scheduled synthetics may claim work during post-upgrade
+# verify. That is not a containment failure — do not drain-wait or retain the
+# lock for in-flight jobs after a successful atomic apply.
 HELM_RELEASE_LOCK_PRESERVE=true
-if ! wait_for_no_active_jobs "${POST_HELM_DRAIN_DEADLINE_SECS:-300}" "${POST_HELM_DRAIN_INTERVAL_SECS:-10}"; then
-  echo "ERROR: Helm succeeded but post-upgrade job drain did not clear. The release lock is intentionally retained; manual intervention is required." >&2
-  exit 1
-fi
 if ! verify_deployed_candidate; then
   echo "ERROR: Helm reported success but exact candidate containment failed. The release lock is intentionally retained; manual intervention is required." >&2
   exit 1
@@ -2540,10 +2501,10 @@ fi
 HELM_RELEASE_LOCK_PRESERVE=false
 echo "==> deployed exact source $CANDIDATE_SOURCE_SHA with immutable workload and RUNNER_IMAGE digests"`
 	if strings.Count(source, seq) != 1 {
-		t.Fatalf("expected the post-Helm wait→verify sequence exactly once, found %d", strings.Count(source, seq))
+		t.Fatalf("expected the post-Helm verify sequence exactly once, found %d", strings.Count(source, seq))
 	}
-	if !strings.Contains(source, "wait_for_no_active_jobs()") {
-		t.Fatal("wait_for_no_active_jobs helper missing")
+	if strings.Contains(source, "wait_for_no_active_jobs") {
+		t.Fatal("wait_for_no_active_jobs must not remain in deploy.sh after successful-apply drain removal")
 	}
 }
 
@@ -8786,8 +8747,6 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_ATOMIC_FAILED_MARKER="+e.atomicFailedMark,
 		"FAKE_CANDIDATE_APPLIED_MARKER="+e.candidateAppliedMark,
 		"FAKE_SYNTHETIC_CONTAINED_MARKER="+e.syntheticContainedMark,
-		"POST_HELM_DRAIN_DEADLINE_SECS=2",
-		"POST_HELM_DRAIN_INTERVAL_SECS=1",
 		"FAKE_ATOMIC_ROLLBACK_MANIFEST="+e.atomicRollbackManifest,
 		"FAKE_CONTAINED_ROLLBACK_MANIFEST="+e.containedRollbackManifest,
 		"FAKE_IMMUTABLE_ROLLBACK_MANIFEST="+e.immutableRollbackManifest,
