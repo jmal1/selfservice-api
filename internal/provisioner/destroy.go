@@ -43,7 +43,11 @@ func (p *Provisioner) DestroyPod(ctx context.Context, job *models.Job) error {
 			return fmt.Errorf("recheck suspended-too-long pod: %w", checkErr)
 		}
 		if !eligible {
-			return fmt.Errorf("suspended-too-long destroy no longer eligible: %w", database.ErrPodDestroyNotNeeded)
+			// Complete as a no-op. A failed "not needed" row used to brick
+			// CreateVMJob forever via bare EXISTS on any pod_destroy.
+			p.logger.Info("suspended-too-long destroy no longer needed; completing as no-op",
+				"pod_id", podID, "job_id", job.ID)
+			return nil
 		}
 	}
 
