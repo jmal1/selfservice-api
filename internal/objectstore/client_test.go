@@ -191,3 +191,36 @@ func TestClampPresignTTL(t *testing.T) {
 		})
 	}
 }
+
+func TestNew_PublicEndpointUsesSeparatePresignCore(t *testing.T) {
+	cfg := validConfig()
+	cfg.Endpoint = "https://s3.lab.example.test"
+	cfg.PublicEndpoint = "https://s3.example.test"
+
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if client.presignURL != "s3.example.test" {
+		t.Fatalf("presignURL = %q, want s3.example.test", client.presignURL)
+	}
+	if client.endpoint != "s3.lab.example.test" {
+		t.Fatalf("endpoint = %q, want s3.lab.example.test", client.endpoint)
+	}
+	if client.presign == client.core {
+		t.Fatal("presign core must be distinct when PublicEndpoint differs")
+	}
+}
+
+func TestNew_EmptyPublicEndpointSharesCore(t *testing.T) {
+	client, err := New(validConfig())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if client.presignURL != "" {
+		t.Fatalf("presignURL = %q, want empty", client.presignURL)
+	}
+	if client.presign != client.core {
+		t.Fatal("presign core must equal internal core when PublicEndpoint is empty")
+	}
+}

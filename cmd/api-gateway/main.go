@@ -154,12 +154,13 @@ func main() {
 	// rather than nil-panicking, so the gateway still serves everything else.
 	if cfg.ObjectStore.Endpoint != "" {
 		objects, err := objectstore.New(objectstore.Config{
-			Endpoint:  cfg.ObjectStore.Endpoint,
-			AccessKey: cfg.ObjectStore.AccessKey,
-			SecretKey: cfg.ObjectStore.SecretKey,
-			Bucket:    cfg.ObjectStore.Bucket,
-			Prefix:    cfg.ObjectStore.Prefix,
-			UseSSL:    cfg.ObjectStore.UseSSL,
+			Endpoint:       cfg.ObjectStore.Endpoint,
+			PublicEndpoint: cfg.ObjectStore.PublicEndpoint,
+			AccessKey:      cfg.ObjectStore.AccessKey,
+			SecretKey:      cfg.ObjectStore.SecretKey,
+			Bucket:         cfg.ObjectStore.Bucket,
+			Prefix:         cfg.ObjectStore.Prefix,
+			UseSSL:         cfg.ObjectStore.UseSSL,
 		})
 		if err != nil {
 			logger.Error("object store init failed — image upload disabled", "error", err)
@@ -170,7 +171,9 @@ func main() {
 				go pipeline.RunPusher(ctx, 30*time.Second, logger)
 			}
 			logger.Info("image upload enabled",
-				"endpoint", cfg.ObjectStore.Endpoint, "bucket", cfg.ObjectStore.Bucket)
+				"endpoint", cfg.ObjectStore.Endpoint,
+				"public_endpoint", cfg.ObjectStore.PublicEndpoint,
+				"bucket", cfg.ObjectStore.Bucket)
 		}
 	} else {
 		logger.Info("image upload disabled (object store not configured)")
