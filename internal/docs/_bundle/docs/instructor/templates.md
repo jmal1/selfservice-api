@@ -112,10 +112,10 @@ what this password is and is not.
 |-------------|-------------------|----------------------------|
 | **Clone an existing Crucible template** | You want to start from a template that already works (fastest, safest) | Pick a template from the dropdown (`source_ref` = template UUID) |
 | **Clone an existing vCenter VM** | A teacher/admin points you at a specific VM | Pick the VM from the dropdown (`source_ref` = vCenter VM moref, e.g. `vm-123`) |
-| **OVF / imported OVA** | You already imported an OVA on **Admin → Images** | The imported VM's vCenter moref (`source_ref` = `vm-123`, same shape as clone_vcenter) |
+| **OVF / imported OVA** | You already imported an OVA on **Admin → Images** | Pick it from the OVA catalog (`GET /admin/vcenter/ovas`). Selectable rows carry `source_ref` = `vm-123`. In-flight and failed imports are listed but disabled. |
 | **ISO install** | You're installing an OS from scratch off an installer disc | Pick your `.iso` from the dropdown |
 
-**`skip_generalize`** (boolean, default `false`): when `true`, the generalize step powers the staging VM off (if needed), takes the `base-image` snapshot, and moves the template to `ready` **without** running GuestOps cloud-init clean / sysprep. Publish is unchanged: `ready` → `verifying` → `active` via the existing smoke test. `skip_generalize=true` is rejected for `iso` (a fresh install must be generalized) and `clone_template` (a customized clone must be re-generalized). It is allowed for `ovf` and `clone_vcenter`.
+**`skip_generalize`** (boolean; API default `false`, wizard default **checked** for OVF/OVA): when `true`, the generalize step powers the staging VM off (if needed), takes the `base-image` snapshot, and moves the template to `ready` **without** running GuestOps cloud-init clean / sysprep. Publish is unchanged: `ready` → `verifying` → `active` via the existing smoke test. `skip_generalize=true` is rejected for `iso` (a fresh install must be generalized) and `clone_template` (a customized clone must be re-generalized). It is allowed for `ovf` and `clone_vcenter`. Uncheck the wizard box only if the OVA is a raw OS that still needs generalize.
 
 > [!warning]
 > Before you click **Provision** for an existing Windows VM or template with a
@@ -512,12 +512,20 @@ If the import fails (shown in the image list as an error with a message), click
 **Retry import** to re-run the import without re-uploading the file.
 
 OVAs are imported into vCenter's Templates folder as ready-to-clone VMs and are
-**not** ISO install media. After import, author a template with
-`source_type=ovf` and `source_ref` set to the imported VM's vCenter moref
-(the same `vm-123` shape as `clone_vcenter`). Set `skip_generalize=true` when
-the appliance is already prepared and must not run GuestOps generalize
-scripts. Publish still requires the existing `ready` → `verifying` → `active`
-smoke gate.
+**not** ISO install media. Disks land on the VM datastore (`vcenter.datastore`),
+not the ISO datastore. After import, the wizard's OVF/OVA picker calls
+`GET /api/v1/admin/vcenter/ovas`: imported rows are selectable (`source_ref` =
+the VM moref); uploading, importing, and error rows are listed disabled with a
+reason and a retry path. Author a template with `source_type=ovf` and that
+moref. The wizard defaults `skip_generalize=true` when the source is OVF/OVA
+(prepared appliance — skip sysprep/cloud-init clean; **Verify still runs**).
+Publish still requires the existing `ready` → `verifying` → `active` smoke gate.
+
+If the import fails (shown in the image list as an error with a message), click
+**Retry import** to re-run the import without re-uploading the file. Deleting an
+unreferenced OVA image also destroys the imported Templates-folder VM; the API
+returns 409 while any template still references it. Pack a vCenter OVF folder
+export into a single `.ova` before uploading — a bare `.ovf` is rejected.
 
 The "ISO install" picker may show previously-uploaded ISOs that are still
 importing (`Importing…`, greyed-out). Wait for the import to finish or check the

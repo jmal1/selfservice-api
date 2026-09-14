@@ -836,7 +836,11 @@ The template creation wizard's "ISO install" step calls `GET /api/v1/admin/vcent
 
 ### 15.4 OVA behaviour
 
-OVAs are imported into vCenter's Templates folder as a VM (moref stored in `vcenter_vm_id`). They are **not** mounted as CD-ROM media and **never appear** in the ISO picker. To use an OVA-sourced VM as a template source, create a wizard draft with `source_type=ovf` and `source_ref` set to that imported VM moref (same `vm-123` shape as `clone_vcenter`). `skip_generalize=true` skips GuestOps generalize scripts and still requires `ready` → `verifying` → `active`.
+OVAs are imported into vCenter's Templates folder as a VM (moref stored in `vcenter_vm_id`). Disks land on `vcenter.datastore` (the VM datastore), not `isoDatastore`. They are **not** mounted as CD-ROM media and **never appear** in the ISO picker.
+
+The wizard discovers them only through `GET /api/v1/admin/vcenter/ovas` (imported rows selectable with `source_ref`; uploading/importing/error rows disabled with a reason). Create a draft with `source_type=ovf` and `source_ref` set to that moref. The New Template wizard defaults `skip_generalize=true` for OVF/OVA (prepared appliance — GuestOps sysprep/cloud-init clean is skipped; verify/publish still run). Uncheck only if the OVA is a raw OS that still needs generalize.
+
+Deleting an unreferenced OVA image destroys the exact imported VM (`vcenter_vm_id`). A 409 is returned while any template still references it. Retry a failed import with `POST /admin/images/{id}/import`. Pack a bare `.ovf` folder into a single `.ova` (tar of `.ovf` + disks) before uploading; the API rejects `.ovf`.
 
 ### 15.5 Error retry
 

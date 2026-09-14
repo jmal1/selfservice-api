@@ -152,6 +152,12 @@ func validatePodJobPayload(payload []byte, podID uuid.UUID, podVMID *uuid.UUID) 
 	return nil
 }
 
+// podHasAuthoritativeDestroyJob reports live destroy intent that must block
+// VM mutators and extensions. Only non-terminal pod_destroy rows count:
+// terminal "not needed" / obsolete failures must not permanently brick an
+// otherwise active pod (resume, delete-VM, extend). Pod statuses
+// destroying/destroy_failed/destroyed are rejected separately by
+// podRejectsMutatorJob / ExtendPod's active-only check.
 func podHasAuthoritativeDestroyJob(ctx context.Context, tx pgx.Tx, podID uuid.UUID) (bool, error) {
 	var exists bool
 	if err := tx.QueryRow(ctx, `
@@ -160,8 +166,10 @@ func podHasAuthoritativeDestroyJob(ctx context.Context, tx pgx.Tx, podID uuid.UU
 			FROM jobs
 			WHERE type = $1
 			  AND payload->>'pod_id' = $2
+			  AND status NOT IN ($3, $4)
 		)
-	`, models.JobTypePodDestroy, podID.String()).Scan(&exists); err != nil {
+	`, models.JobTypePodDestroy, podID.String(),
+		models.JobStatusCompleted, models.JobStatusFailed).Scan(&exists); err != nil {
 		return false, fmt.Errorf("check authoritative pod_destroy job for %s: %w", podID, err)
 	}
 	return exists, nil
@@ -430,9 +438,11 @@ func (q *Queries) RequeueFailedPodDestroyJob(
 }
 
 // createPodDestroyJob serializes every pod_destroy producer on the pod row.
-// The first destroy job ID is authoritative forever, across every job status.
-// Terminal work is restarted on that same ID only while the pod remains
-// recoverable and owns its exact VLAN allocation.
+// The first destroy job ID remains the durable identity for requeue across
+// terminal statuses. Live mutator blocking (CreateVMJob / ExtendPod) only
+// treats non-terminal destroy rows as authoritative intent — see
+// podHasAuthoritativeDestroyJob. Terminal work is restarted on that same ID
+// only while the pod remains recoverable and owns its exact VLAN allocation.
 func (q *Queries) createPodDestroyJob(
 	ctx context.Context,
 	podID uuid.UUID,

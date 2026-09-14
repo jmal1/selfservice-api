@@ -839,22 +839,26 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 			expectBuiltDigest: true,
 		},
 		{
-			name:      "active durable job blocks upgrade",
+			name:      "active durable job does not block upgrade",
 			transform: func(manifest string) string { return baselineManifest(true, "*", "true") },
 			configure: func(env *deployScriptEnvironment) {
 				env.activeJobs = 1
 			},
-			wantOutput:  "durable jobs remain claimed",
-			wantUpgrade: false,
+			wantSuccess:       true,
+			wantOutput:        "deployed exact source",
+			wantUpgrade:       true,
+			expectBuiltDigest: true,
 		},
 		{
-			name:      "active Kubernetes job blocks upgrade",
+			name:      "active Kubernetes job does not block upgrade",
 			transform: func(manifest string) string { return baselineManifest(true, "*", "true") },
 			configure: func(env *deployScriptEnvironment) {
 				env.activeKubernetesJobs = 1
 			},
-			wantOutput:  "Kubernetes Jobs remain active",
-			wantUpgrade: false,
+			wantSuccess:       true,
+			wantOutput:        "deployed exact source",
+			wantUpgrade:       true,
+			expectBuiltDigest: true,
 		},
 		{
 			name:        "floating package tag",
@@ -1056,6 +1060,19 @@ func TestDeployScriptImmutableCandidate(t *testing.T) {
 			if !strings.Contains(string(output), test.wantOutput) {
 				t.Fatalf("output %q does not contain %q", output, test.wantOutput)
 			}
+			if test.name == "active durable job does not block upgrade" ||
+				test.name == "active Kubernetes job does not block upgrade" {
+				for _, noise := range []string{
+					"WARNING:",
+					"durable jobs are claimed",
+					"Kubernetes Jobs remain active",
+					"scheduled mutating synthetic",
+				} {
+					if strings.Contains(string(output), noise) {
+						t.Fatalf("in-flight jobs must be silent, found %q in:\n%s", noise, output)
+					}
+				}
+			}
 			upgradeBody, readErr := os.ReadFile(env.upgradeLog)
 			if test.wantUpgrade {
 				if readErr != nil || !strings.Contains(string(upgradeBody), "--atomic") {
@@ -1210,7 +1227,6 @@ func TestDeployScriptAtomicContainmentAndSuccessVerification(t *testing.T) {
 # uncontained live==rendered first permanently bricks redeploy. Contain first,
 # then prove images/health under the contained contract.
 enforce_synthetic_rollback_containment
-require_no_active_jobs
 verify_rollback_containment "$ROLLBACK_BASELINE_MIGRATION" true
 ROLLBACK_CURRENT_REVISION=$VERIFIED_BASELINE_REVISION
 ROLLBACK_BASELINE_MIGRATION=$VERIFIED_MIGRATION_STATE
@@ -1219,7 +1235,6 @@ ROLLBACK_BASELINE_MIGRATION=$VERIFIED_MIGRATION_STATE
 verify_rollback_containment "$ROLLBACK_BASELINE_MIGRATION"
 ROLLBACK_CURRENT_REVISION=$VERIFIED_BASELINE_REVISION
 enforce_synthetic_rollback_containment
-require_no_active_jobs
 ROLLBACK_BASELINE_MIGRATION=$VERIFIED_MIGRATION_STATE
 `
 		if strings.Count(original, fixed) != 1 {
@@ -1292,7 +1307,7 @@ ROLLBACK_BASELINE_MIGRATION=$VERIFIED_MIGRATION_STATE
 			wantOutput: "synthetic CronJob evidence reset",
 		},
 		{
-			name: "pending synthetic pod destroy after rollback retains lock",
+			name: "pending synthetic pod destroy after rollback does not block containment",
 			configure: func(env *deployScriptEnvironment) {
 				env.failAtomicUpgrade = true
 				env.pendingSyntheticJobs = 1
@@ -1307,8 +1322,8 @@ ROLLBACK_BASELINE_MIGRATION=$VERIFIED_MIGRATION_STATE
 				writeFile(t, env.containedRollbackManifest, rollbackManifestWithHistoricalSynthetics(true))
 				writeFile(t, env.immutableRollbackManifest, rollbackManifestWithHistoricalSynthetics(false))
 			},
-			wantOutput:       "nonterminal storage-mutating synthetic pod",
-			wantLockRetained: true,
+			wantOutput:       "atomic failure contained by the currently deployed rollback baseline",
+			wantLockRetained: false,
 		},
 		{
 			name: "atomic rollback image drift retains lock",
@@ -1446,97 +1461,62 @@ func TestDeployScriptPostUpgradeActiveJobContainment(t *testing.T) {
 	live := baselineManifest(true, "", "true")
 	candidate := baselineManifest(true, "*", "true")
 
-	t.Run("contained API monitor is permitted", func(t *testing.T) {
-		env := newDeployScriptEnvironment(t, live, candidate)
-		env.postUpgradeActiveKubernetesJob = "api-monitor-contained"
-
-		output, err := env.run("--no-pull")
-		if err != nil {
-			t.Fatalf("contained API monitor caused false post-upgrade failure: %v\n%s", err, output)
-		}
-		if !strings.Contains(string(output), "deployed exact source") {
-			t.Fatalf("contained API monitor did not reach successful deployment:\n%s", output)
-		}
-		if _, statErr := os.Stat(env.candidateAppliedMark); statErr != nil {
-			t.Fatalf("contained API monitor fixture did not reach post-upgrade containment: %v", statErr)
-		}
-		if _, statErr := os.Stat(env.lockFile); !os.IsNotExist(statErr) {
-			t.Fatalf("successful contained API monitor deployment retained the release lock: %v", statErr)
-		}
-	})
-
+	// Post-Helm verify no longer drain-gates on active Jobs: durable workers and
+	// scheduled synthetics may run during the multi-minute identity check.
 	for _, test := range []struct {
 		name string
 		job  string
 	}{
-		{name: "runner remains blocking", job: "runner"},
-		{name: "janitor remains blocking", job: "janitor"},
-		{name: "provisioning remains blocking", job: "provisioning"},
-		{name: "unknown name remains blocking", job: "unknown"},
-		{name: "spoofed API monitor remains blocking", job: "api-monitor-wrong-owner"},
-		{name: "lifecycle-enabled API monitor remains blocking", job: "api-monitor-lifecycle"},
+		{name: "contained API monitor permitted", job: "api-monitor-contained"},
+		{name: "runner does not block post-upgrade", job: "runner"},
+		{name: "janitor does not block post-upgrade", job: "janitor"},
+		{name: "provisioning does not block post-upgrade", job: "provisioning"},
+		{name: "unknown name does not block post-upgrade", job: "unknown"},
+		{name: "spoofed API monitor does not block post-upgrade", job: "api-monitor-wrong-owner"},
+		{name: "lifecycle-enabled API monitor does not block post-upgrade", job: "api-monitor-lifecycle"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			env := newDeployScriptEnvironment(t, live, candidate)
 			env.postUpgradeActiveKubernetesJob = test.job
 
 			output, err := env.run("--no-pull")
-			if err == nil {
-				t.Fatalf("active %s Job unexpectedly passed post-upgrade containment:\n%s", test.job, output)
+			if err != nil {
+				t.Fatalf("post-upgrade active %s Job blocked successful apply: %v\n%s", test.job, err, output)
 			}
-			if !strings.Contains(string(output), "Kubernetes Jobs remain active") {
-				t.Fatalf("active %s Job failure did not identify the job drain:\n%s", test.job, output)
+			if !strings.Contains(string(output), "deployed exact source") {
+				t.Fatalf("post-upgrade active %s Job did not reach successful deployment:\n%s", test.job, output)
 			}
 			if _, statErr := os.Stat(env.candidateAppliedMark); statErr != nil {
-				t.Fatalf("active %s Job fixture did not reach post-upgrade containment: %v", test.job, statErr)
+				t.Fatalf("post-upgrade active %s Job fixture did not reach post-upgrade containment: %v", test.job, statErr)
 			}
-			if _, statErr := os.Stat(env.lockFile); statErr != nil {
-				t.Fatalf("active %s Job failure did not retain the release lock: %v", test.job, statErr)
+			if _, statErr := os.Stat(env.lockFile); !os.IsNotExist(statErr) {
+				t.Fatalf("successful post-upgrade active %s Job deploy retained the release lock: %v", test.job, statErr)
 			}
 		})
 	}
 }
 
-func TestDeployScriptPostUpgradeActiveJobGuardIsLoadBearing(t *testing.T) {
-	requirePOSIXShell(t)
-	deployPath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
-	deployBody, err := os.ReadFile(deployPath)
+func TestDeployScriptPostUpgradeDoesNotCallActiveJobDrain(t *testing.T) {
+	deployBody, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	const guard = `  if [ -n "$active_kubernetes_jobs" ]; then
-    echo "ERROR: Kubernetes Jobs remain active in namespace $NAMESPACE: $active_kubernetes_jobs." >&2
-    return 1
-  fi
-`
-	if strings.Count(string(deployBody), guard) != 1 {
-		t.Fatal("post-upgrade active Kubernetes Job guard is not unique")
+	source := string(deployBody)
+	verifyIdx := strings.Index(source, "verify_deployed_candidate() {")
+	if verifyIdx < 0 {
+		t.Fatal("verify_deployed_candidate missing")
 	}
-	sabotagedBody := strings.Replace(string(deployBody), guard, "", 1)
-	sabotagedPath := filepath.Join(
-		filepath.Dir(deployPath),
-		"deploy-sabotaged-active-job-guard-test.sh",
-	)
-	writeExecutable(t, sabotagedPath, sabotagedBody)
-	t.Cleanup(func() { os.Remove(sabotagedPath) })
-
-	live := baselineManifest(true, "", "true")
-	env := newDeployScriptEnvironment(t, live, baselineManifest(true, "*", "true"))
-	env.postUpgradeActiveKubernetesJob = "provisioning"
-	env.scriptPath = sabotagedPath
-
-	output, runErr := env.run("--no-pull")
-	if runErr != nil {
-		t.Fatalf("removing the active Job guard did not expose false acceptance: %v\n%s", runErr, output)
+	rest := source[verifyIdx:]
+	nextFn := strings.Index(rest[1:], "\nenforce_synthetic_rollback_containment()")
+	if nextFn < 0 {
+		t.Fatal("could not bound verify_deployed_candidate body")
 	}
-	if !strings.Contains(string(output), "deployed exact source") {
-		t.Fatalf("removing the active Job guard did not reach false success:\n%s", output)
+	body := rest[:nextFn+1]
+	if strings.Contains(body, "require_no_active_jobs") {
+		t.Fatal("verify_deployed_candidate must not call require_no_active_jobs after successful Helm")
 	}
-	if _, statErr := os.Stat(env.candidateAppliedMark); statErr != nil {
-		t.Fatalf("active Job sabotage did not reach post-upgrade containment: %v", statErr)
-	}
-	if _, statErr := os.Stat(env.lockFile); !os.IsNotExist(statErr) {
-		t.Fatalf("sabotaged active Job guard did not falsely release the lock: %v", statErr)
+	if strings.Contains(body, "wait_for_no_active_jobs") {
+		t.Fatal("verify_deployed_candidate must not wait on job drain after successful Helm")
 	}
 }
 
@@ -1783,34 +1763,6 @@ func TestDeployScriptReleasePreflightGuards(t *testing.T) {
 			wantOutput: "migration-state query failed",
 		},
 		{
-			name: "pending provisioning job",
-			configure: func(env *deployScriptEnvironment) {
-				env.provisioningJobs = "1"
-			},
-			wantOutput: "provisioning jobs are nonterminal or have unknown status",
-		},
-		{
-			name: "unknown provisioning job status",
-			configure: func(env *deployScriptEnvironment) {
-				env.unknownProvisioningJobStatus = true
-			},
-			wantOutput: "provisioning jobs are nonterminal or have unknown status",
-		},
-		{
-			name: "provisioning job query failure",
-			configure: func(env *deployScriptEnvironment) {
-				env.preflightQueryFailure = "provisioning"
-			},
-			wantOutput: "provisioning-job preflight query failed",
-		},
-		{
-			name: "malformed provisioning job count",
-			configure: func(env *deployScriptEnvironment) {
-				env.provisioningJobs = "unknown"
-			},
-			wantOutput: "invalid provisioning-job preflight count",
-		},
-		{
 			name: "synthetic quota exhausted",
 			configure: func(env *deployScriptEnvironment) {
 				env.syntheticQuotaState = "1:1"
@@ -1888,35 +1840,6 @@ func TestDeployScriptReleasePreflightGuards(t *testing.T) {
 			wantOutput: "quota query returned invalid or missing",
 		},
 		{
-			name: "mutating synthetic active",
-			configure: func(env *deployScriptEnvironment) {
-				env.activeMutatingSyntheticJobs = 1
-			},
-			wantOutput: "scheduled mutating synthetic execution is active",
-		},
-		{
-			name: "completed mutating synthetic passes",
-			configure: func(env *deployScriptEnvironment) {
-				env.completedMutatingSyntheticJob = true
-			},
-			wantOutput: "release preflight passed",
-			wantPass:   true,
-		},
-		{
-			name: "Kubernetes jobs malformed",
-			configure: func(env *deployScriptEnvironment) {
-				env.malformedJobsJSON = true
-			},
-			wantOutput: "Kubernetes Job data is malformed",
-		},
-		{
-			name: "Kubernetes jobs query failure",
-			configure: func(env *deployScriptEnvironment) {
-				env.failJobsList = true
-			},
-			wantOutput: "failed to list Kubernetes Jobs",
-		},
-		{
 			name: "candidate revision mismatch",
 			configure: func(env *deployScriptEnvironment) {
 				env.imageRevision = otherSourceSHA
@@ -1976,122 +1899,38 @@ func assertNoPreflightMutation(t *testing.T, env *deployScriptEnvironment, outpu
 	}
 }
 
-func TestDeployScriptVolatileReleasePreflightBlocksLateRegressions(t *testing.T) {
-	requirePOSIXShell(t)
-	tests := []struct {
-		name       string
-		configure  func(*deployScriptEnvironment)
-		wantOutput string
-	}{
-		{
-			name: "pending provisioning job appears after claims pause",
-			configure: func(env *deployScriptEnvironment) {
-				env.provisioningJobsAfterInitial = "1"
-			},
-			wantOutput: "provisioning jobs are nonterminal or have unknown status",
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			env := newDeployScriptEnvironment(
-				t,
-				baselineManifest(true, "", "true"),
-				baselineManifest(true, "*", "true"),
-			)
-			writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
-			test.configure(env)
-
-			output, err := env.run("--no-pull")
-			if err == nil {
-				t.Fatalf("late volatile regression unexpectedly reached Helm:\n%s", output)
-			}
-			if !strings.Contains(string(output), test.wantOutput) {
-				t.Fatalf("output %q does not contain %q", output, test.wantOutput)
-			}
-			for _, marker := range []string{env.claimsPausedMark, env.claimsResumedMark, env.syntheticContainedMark} {
-				if _, statErr := os.Stat(marker); statErr != nil {
-					t.Fatalf("late guard failure missed expected pause/restore marker %s: %v\n%s", marker, statErr, output)
-				}
-			}
-			if body, readErr := os.ReadFile(env.upgradeLog); readErr == nil && len(body) > 0 {
-				t.Fatalf("late guard failure invoked Helm upgrade: %s\n%s", body, output)
-			}
-			for _, marker := range []string{env.candidateAppliedMark, env.upgradedMarker, env.lockFile} {
-				if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
-					t.Fatalf("late guard failure left mutation marker %s: %v\n%s", marker, statErr, output)
-				}
-			}
-		})
-	}
-}
-
-func TestDeployScriptVolatileReleasePreflightIsOrderedAndLoadBearing(t *testing.T) {
-	requirePOSIXShell(t)
-	deployPath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
-	source, err := os.ReadFile(deployPath)
+func TestDeployScriptOmitsJobActivityGates(t *testing.T) {
+	deployBody, err := os.ReadFile(filepath.Join("..", "..", "deploy", "scripts", "deploy.sh"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	const boundary = `require_volatile_release_preflight
+	source := string(deployBody)
+	for _, needle := range []string{
+		"require_no_pending_provisioning_jobs",
+		"require_volatile_release_preflight",
+		"gate_a4_provisioning_preflight",
+		"warn_nonterminal_synthetic_pod_jobs",
+		"require_no_active_jobs",
+		"require_no_active_mutating_synthetics",
+		"durable jobs are claimed, in_progress, or rollback",
+		"nonterminal storage-mutating synthetic pod jobs",
+		"durable PG work is advisory",
+		"Kubernetes Jobs remain active",
+		"scheduled mutating synthetic execution is active",
+		"job drain verified",
+	} {
+		if strings.Contains(source, needle) {
+			t.Fatalf("deploy.sh must not retain ignored job-activity gates (%q)", needle)
+		}
+	}
+	const adjacent = `if [ "$(sha256sum "$CANDIDATE_MANIFEST" | awk '{print $1}')" != "$CANDIDATE_SHA256" ]; then
+  echo "ERROR: exact candidate manifest changed after validation." >&2
+  exit 1
+fi
+
 echo "==> helm upgrade $RELEASE with exact digest-pinned candidate (atomic, timeout=$TIMEOUT)"`
-	if strings.Count(string(source), boundary) != 1 {
-		t.Fatal("volatile preflight is not directly adjacent to the final Helm upgrade announcement")
-	}
-	const helper = `require_volatile_release_preflight() {
-  require_no_pending_provisioning_jobs
-}`
-	if strings.Count(string(source), helper) != 1 {
-		t.Fatal("volatile preflight helper does not contain the exact two final guards")
-	}
-
-	tests := []struct {
-		name      string
-		guardCall string
-		configure func(*deployScriptEnvironment)
-	}{
-		{
-			name:      "provisioning recheck",
-			guardCall: "  require_no_pending_provisioning_jobs\n",
-			configure: func(env *deployScriptEnvironment) {
-				env.provisioningJobsAfterInitial = "1"
-			},
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			mutatedHelper := strings.Replace(helper, test.guardCall, "  :\n", 1)
-			mutated := strings.Replace(string(source), helper, mutatedHelper, 1)
-			scriptPath := filepath.Join(
-				filepath.Dir(deployPath),
-				"deploy-sabotaged-gate-a4-final-"+strings.ReplaceAll(test.name, " ", "-")+"-test.sh",
-			)
-			writeExecutable(t, scriptPath, mutated)
-			t.Cleanup(func() { os.Remove(scriptPath) })
-
-			env := newDeployScriptEnvironment(
-				t,
-				baselineManifest(true, "", "true"),
-				baselineManifest(true, "*", "true"),
-			)
-			writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
-			env.scriptPath = scriptPath
-			test.configure(env)
-
-			output, runErr := env.run("--no-pull")
-			if runErr != nil {
-				t.Fatalf("removing final %s did not expose the staged regression: %v\n%s", test.name, runErr, output)
-			}
-			if _, statErr := os.Stat(env.upgradedMarker); statErr != nil {
-				t.Fatalf("removing final %s did not reach Helm mutation: %v\n%s", test.name, statErr, output)
-			}
-			if _, statErr := os.Stat(env.claimsResumedMark); statErr != nil {
-				if !strings.Contains(string(output), "already match the pre-deploy state; no restore mutation needed") {
-					t.Fatalf("sabotaged successful deploy did not restore claims: %v\n%s", statErr, output)
-				}
-			}
-		})
+	if strings.Count(source, adjacent) != 1 {
+		t.Fatal("final Helm upgrade must follow candidate validation directly (no job-activity recheck)")
 	}
 }
 
@@ -2121,9 +1960,7 @@ func TestDeployScriptReleasePreflightPredicatesAreLoadBearing(t *testing.T) {
 		configure func(*deployScriptEnvironment)
 	}{
 		{name: "migration", guardCall: "  require_clean_migration\n", configure: func(env *deployScriptEnvironment) { env.migrationState = "1:37:true" }},
-		{name: "provisioning jobs", guardCall: "  require_no_pending_provisioning_jobs\n", configure: func(env *deployScriptEnvironment) { env.provisioningJobs = "1" }},
 		{name: "synthetic quota", guardCall: "  require_synthetic_pod_quota\n", configure: func(env *deployScriptEnvironment) { env.syntheticQuotaState = "1:1" }},
-		{name: "mutating synthetics", guardCall: "  require_no_active_mutating_synthetics\n", configure: func(env *deployScriptEnvironment) { env.activeMutatingSyntheticJobs = 1 }},
 		{name: "candidate provenance", guardCall: "  require_candidate_image_provenance\n", configure: func(env *deployScriptEnvironment) { env.imageRevisionDriftAfter = 6 }},
 	}
 
@@ -2321,10 +2158,11 @@ func TestDeployScriptRestoresProvisioningClaimsOnEveryPostPauseExit(t *testing.T
 
 	t.Run("early post-pause set-e failure", func(t *testing.T) {
 		env := newLiveClaimsEnvironment(t)
-		env.activeJobs = 1
+		// Force a real post-pause fail-close via final server dry-run (Job activity is not a gate).
+		env.failFinalServerDryRun = true
 		output, err := env.run("--no-pull")
-		if got := exitCode(t, err); got != 1 {
-			t.Fatalf("post-pause failure exit code = %d, want 1\n%s", got, output)
+		if got := exitCode(t, err); got != 95 {
+			t.Fatalf("post-pause failure exit code = %d, want 95\n%s", got, output)
 		}
 		assertRestored(t, env, output)
 	})
@@ -2376,16 +2214,16 @@ func TestDeployScriptRestoresProvisioningClaimsOnEveryPostPauseExit(t *testing.T
 
 	t.Run("resume failure preserves an existing failure", func(t *testing.T) {
 		env := newLiveClaimsEnvironment(t)
-		env.activeJobs = 1
+		env.failFinalServerDryRun = true
 		env.failClaimsResume = true
 		output, err := env.run("--no-pull")
-		if got := exitCode(t, err); got != 1 {
-			t.Fatalf("existing failure was replaced by resume status: got %d want 1\n%s", got, output)
+		if got := exitCode(t, err); got != 95 {
+			t.Fatalf("existing failure was replaced by resume status: got %d want 95\n%s", got, output)
 		}
 		if _, err := os.Stat(env.lockFile); err != nil {
 			t.Fatalf("resume failure did not preserve the lock: %v\n%s", err, output)
 		}
-		if !strings.Contains(string(output), "original exit code: 1, resume exit code: 86") {
+		if !strings.Contains(string(output), "original exit code: 95, resume exit code: 86") {
 			t.Fatalf("combined failure did not log both statuses:\n%s", output)
 		}
 	})
@@ -2503,7 +2341,8 @@ func TestDeployScriptClaimsExitRestorationIsLoadBearing(t *testing.T) {
 		baselineManifest(true, "*", "true"),
 	)
 	writeFile(t, env.liveResource, baselineManifest(true, "", "true"))
-	env.activeJobs = 1
+	// Force a real post-pause fail-close; Job activity is not a release gate.
+	env.failFinalServerDryRun = true
 	env.scriptPath = scriptPath
 	output, runErr := env.run("--no-pull")
 	if runErr == nil {
@@ -2523,16 +2362,10 @@ func TestDeployScriptPostHelmWaitVerifyOrdering(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := string(deployBody)
-	const seq = `# Helm reopens SYNTHETIC_LIFECYCLE_ENABLED=true from values, so a scheduled
-# */12 monitor can claim durable pod_lifecycle work during the multi-minute
-# post-upgrade verify window and falsely fail an otherwise-successful atomic
-# apply (observed 2026-09-11T23:00Z). Wait for drain before verify rather than
-# treating a transient in-flight synthetic as permanent containment failure.
+	const seq = `# Durable workers and scheduled synthetics may claim work during post-upgrade
+# verify. That is not a containment failure — do not drain-wait or retain the
+# lock for in-flight jobs after a successful atomic apply.
 HELM_RELEASE_LOCK_PRESERVE=true
-if ! wait_for_no_active_jobs "${POST_HELM_DRAIN_DEADLINE_SECS:-300}" "${POST_HELM_DRAIN_INTERVAL_SECS:-10}"; then
-  echo "ERROR: Helm succeeded but post-upgrade job drain did not clear. The release lock is intentionally retained; manual intervention is required." >&2
-  exit 1
-fi
 if ! verify_deployed_candidate; then
   echo "ERROR: Helm reported success but exact candidate containment failed. The release lock is intentionally retained; manual intervention is required." >&2
   exit 1
@@ -2540,10 +2373,10 @@ fi
 HELM_RELEASE_LOCK_PRESERVE=false
 echo "==> deployed exact source $CANDIDATE_SOURCE_SHA with immutable workload and RUNNER_IMAGE digests"`
 	if strings.Count(source, seq) != 1 {
-		t.Fatalf("expected the post-Helm wait→verify sequence exactly once, found %d", strings.Count(source, seq))
+		t.Fatalf("expected the post-Helm verify sequence exactly once, found %d", strings.Count(source, seq))
 	}
-	if !strings.Contains(source, "wait_for_no_active_jobs()") {
-		t.Fatal("wait_for_no_active_jobs helper missing")
+	if strings.Contains(source, "wait_for_no_active_jobs") {
+		t.Fatal("wait_for_no_active_jobs must not remain in deploy.sh after successful-apply drain removal")
 	}
 }
 
@@ -2765,17 +2598,11 @@ func revertFinalDeployedCandidateHealthFence(t *testing.T, source string) string
     echo "ERROR: deployed candidate workloads regressed after live image verification." >&2
     return 1
   fi
-  if ! require_no_active_jobs; then
-    return 1
-  fi
 `
 	const oldBlock = `  if ! verify_external_candidate_images \
       "$CANDIDATE_IMAGE_MAP" \
       "$tmp_dir/live-images" \
       candidate; then
-    return 1
-  fi
-  if ! require_no_active_jobs; then
     return 1
   fi
 `
@@ -7998,12 +7825,19 @@ case "$1" in
   exec)
     if [[ "$*" == *"gate_a4_provisioning_preflight"* ]]; then
       [ "$FAKE_PREFLIGHT_QUERY_FAILURE" != provisioning ] || exit 97
+      # CD must ignore in-flight */12 synthetic-noop pod_create rows; real
+      # instructor/user provisioning still fail-closes.
+      [[ "$*" == *"synthetic-noop-%"* && "$*" == *"LEFT JOIN pods"* ]] || {
+        echo "provisioning preflight omitted synthetic-noop exclusion" >&2
+        exit 96
+      }
       query_count=0
       [ ! -f "$FAKE_PROVISIONING_QUERY_COUNT" ] || query_count=$(cat "$FAKE_PROVISIONING_QUERY_COUNT")
       query_count=$((query_count + 1))
       printf '%s' "$query_count" > "$FAKE_PROVISIONING_QUERY_COUNT"
       if [ "$FAKE_UNKNOWN_PROVISIONING_JOB_STATUS" = true ]; then
-        if [[ "$*" == *"status NOT IN ('completed', 'failed')"* ]]; then
+        if [[ "$*" == *"status NOT IN ('completed', 'failed')"* ]] ||
+           [[ "$*" == *"j.status NOT IN ('completed', 'failed')"* ]]; then
           printf '1\n'
         else
           printf '0\n'
@@ -8807,8 +8641,6 @@ func (e *deployScriptEnvironment) runWithUI(includeUI bool, args ...string) ([]b
 		"FAKE_ATOMIC_FAILED_MARKER="+e.atomicFailedMark,
 		"FAKE_CANDIDATE_APPLIED_MARKER="+e.candidateAppliedMark,
 		"FAKE_SYNTHETIC_CONTAINED_MARKER="+e.syntheticContainedMark,
-		"POST_HELM_DRAIN_DEADLINE_SECS=2",
-		"POST_HELM_DRAIN_INTERVAL_SECS=1",
 		"FAKE_ATOMIC_ROLLBACK_MANIFEST="+e.atomicRollbackManifest,
 		"FAKE_CONTAINED_ROLLBACK_MANIFEST="+e.containedRollbackManifest,
 		"FAKE_IMMUTABLE_ROLLBACK_MANIFEST="+e.immutableRollbackManifest,

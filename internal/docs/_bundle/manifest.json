@@ -13,8 +13,8 @@
     {
       "path": "AGENTS.md",
       "title": "AGENTS.md — Crucible AI Authoring Reference",
-      "size": 100290,
-      "sha256": "3be1a3ae2103ba9395663415df38f214768d60a8d6615408969ba9b0c0cffd8a",
+      "size": 100865,
+      "sha256": "aae166ce27da3709358dbc57bc4f0788d3afef8252eb3307c4990ccfbed8e641",
       "is_markdown": true,
       "links_out": [
         "deploy/runner/actions.sh",
@@ -210,8 +210,8 @@
     {
       "path": "docs/instructor/templates.md",
       "title": "Building a Template",
-      "size": 66717,
-      "sha256": "7bbe63e3b645623d26a569561209480e46547b84d6bbe4caf504188c1330da4b",
+      "size": 67553,
+      "sha256": "6d3bfe603b5f8cbfd84cb0b713c3c444afa1fa9644693ef917d045a719ca9cc8",
       "is_markdown": true,
       "links_out": [
         "docs/instructor/glossary.md",
@@ -269,8 +269,8 @@
     {
       "path": "docs/student/connecting.md",
       "title": "Connecting to Your VM",
-      "size": 2000,
-      "sha256": "754a72359a73d0531135dc96f49f68ef4032eb78ac05b180f04f1c53649c2669",
+      "size": 2372,
+      "sha256": "0a10b74c5623ca7d1d8c293497122995832bde603b2fb704634561c29080b0cc",
       "is_markdown": true,
       "links_out": [
         "docs/student/troubleshooting.md"
@@ -438,5 +438,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 742578
+  "total_bytes": 744361
 }

@@ -105,6 +105,8 @@ spec:
               value: {{ .Values.vcenter.isoDatastore | quote }}
             - name: VCENTER_ISO_FOLDER
               value: {{ .Values.vcenter.isoFolder | default "ISOs" | quote }}
+            - name: VCENTER_OVA_NETWORK
+              value: {{ .Values.vcenter.ovaNetwork | default "PG-VM-Lab" | quote }}
             - name: VCENTER_VM_FOLDER
               value: {{ .Values.vcenter.vmFolder | quote }}
             {{- if .Values.vcenter.templatesFolder }}

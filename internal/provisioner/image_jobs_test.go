@@ -93,6 +93,7 @@ type fakeImageVC struct {
 	// For GetDatastoreFreeBytes
 	freeBytes    int64
 	freeBytesErr error
+	lastFreeDS   string
 }
 
 func (f *fakeImageVC) drain(r io.Reader) {
@@ -126,7 +127,8 @@ func (f *fakeImageVC) ImportOVA(_ context.Context, p vcenter.OVAImportParams) (s
 	return f.moref, nil
 }
 
-func (f *fakeImageVC) GetDatastoreFreeBytes(_ context.Context, _ string) (int64, error) {
+func (f *fakeImageVC) GetDatastoreFreeBytes(_ context.Context, datastore string) (int64, error) {
+	f.lastFreeDS = datastore
 	if f.freeBytesErr != nil {
 		return 0, f.freeBytesErr
 	}
@@ -308,6 +310,13 @@ func TestImportImage_OVAHappyPath(t *testing.T) {
 	}
 	if vc.uploadCalls != 0 {
 		t.Errorf("UploadToDatastore calls = %d, want 0 for an OVA", vc.uploadCalls)
+	}
+	wantName := ovaVMName("appliance.ova", row.ID)
+	if vc.lastOVA.VMName != wantName {
+		t.Errorf("ImportOVA VMName = %q, want unique name %q", vc.lastOVA.VMName, wantName)
+	}
+	if vc.lastFreeDS != testImportConfig().OVADatastore {
+		t.Errorf("GetDatastoreFreeBytes datastore = %q, want OVA datastore %q", vc.lastFreeDS, testImportConfig().OVADatastore)
 	}
 }
 
@@ -570,5 +579,85 @@ func TestImportImage_RejectsMalformedPayload(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "parse image_import payload") {
 		t.Errorf("error %q should identify the payload as the problem", err.Error())
+	}
+}
+
+func TestOVAVMName_IncludesUniqueImageIDSuffix(t *testing.T) {
+	idA := uuid.MustParse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+	idB := uuid.MustParse("11111111-2222-3333-4444-555555555555")
+
+	gotA := ovaVMName("appliance.ova", idA)
+	gotB := ovaVMName("appliance.ova", idB)
+	if gotA == gotB {
+		t.Fatalf("same filename produced identical VM names %q; DuplicateName on re-upload", gotA)
+	}
+	if gotA != "appliance-aaaaaaaa" {
+		t.Errorf("ovaVMName(appliance.ova, aaaa…) = %q, want appliance-aaaaaaaa", gotA)
+	}
+	if gotB != "appliance-11111111" {
+		t.Errorf("ovaVMName(appliance.ova, 1111…) = %q, want appliance-11111111", gotB)
+	}
+
+	empty := ovaVMName("   ", idA)
+	if empty != "ova-aaaaaaaa" {
+		t.Errorf("empty filename = %q, want ova-aaaaaaaa", empty)
+	}
+}
+
+func TestImportImage_OVAHeadroomFailClosed(t *testing.T) {
+	payloadBytes := bytes.Repeat([]byte("ova"), 1000)
+	row := newImageRow(models.ImageKindOVA, "appliance.ova", models.ImageUploadUploaded)
+	row.ObjectKey = "crucible/" + row.ID.String() + "/appliance.ova"
+	db := &fakeImageDB{img: row}
+	vc := &fakeImageVC{freeBytes: int64(len(payloadBytes) - 1)}
+	objects := &fakeImageObjects{payload: payloadBytes, chunk: 64}
+
+	err := importImage(context.Background(), objects, vc, db, nil, nil, testImportConfig(), nil, ImageImportPayload{ImageID: row.ID})
+	if err == nil {
+		t.Fatal("importImage() = nil, want fail-closed when OVA datastore is short")
+	}
+	if !strings.Contains(err.Error(), "not enough free space") {
+		t.Errorf("error %q should name the headroom shortfall", err.Error())
+	}
+	if vc.importCalls != 0 {
+		t.Errorf("ImportOVA calls = %d, want 0 — must not start NFC when datastore is short", vc.importCalls)
+	}
+	if vc.lastFreeDS != testImportConfig().OVADatastore {
+		t.Errorf("free-space probe datastore = %q, want OVA datastore %q", vc.lastFreeDS, testImportConfig().OVADatastore)
+	}
+	if !db.errorCalled {
+		t.Error("SetImageUploadError was not called")
+	}
+}
+
+func TestImportImage_OVAHeadroomProbeErrorContinues(t *testing.T) {
+	row := newImageRow(models.ImageKindOVA, "appliance.ova", models.ImageUploadUploaded)
+	row.ObjectKey = "crucible/" + row.ID.String() + "/appliance.ova"
+	db := &fakeImageDB{img: row}
+	vc := &fakeImageVC{moref: "vm-9", freeBytesErr: errors.New("finder timeout")}
+	objects := &fakeImageObjects{payload: []byte("ova-bytes"), chunk: 4}
+
+	if err := importImage(context.Background(), objects, vc, db, nil, nil, testImportConfig(), nil, ImageImportPayload{ImageID: row.ID}); err != nil {
+		t.Fatalf("importImage: unexpected error after free-space probe failure: %v", err)
+	}
+	if vc.importCalls != 1 {
+		t.Errorf("ImportOVA calls = %d, want 1 — probe errors must not block import", vc.importCalls)
+	}
+}
+
+func TestImportImage_OVAWiredNetworkReachesImport(t *testing.T) {
+	row := newImageRow(models.ImageKindOVA, "appliance.ova", models.ImageUploadUploaded)
+	row.ObjectKey = "crucible/" + row.ID.String() + "/appliance.ova"
+	db := &fakeImageDB{img: row}
+	vc := &fakeImageVC{moref: "vm-8"}
+	objects := &fakeImageObjects{payload: []byte("ova-bytes"), chunk: 4}
+
+	cfg := testImportConfig()
+	cfg.OVANetwork = models.CanonicalStagingNetwork
+	if err := importImage(context.Background(), objects, vc, db, nil, nil, cfg, nil, ImageImportPayload{ImageID: row.ID}); err != nil {
+		t.Fatalf("importImage: unexpected error: %v", err)
+	}
+	if vc.lastOVA.Network != models.CanonicalStagingNetwork {
+		t.Errorf("ImportOVA network = %q, want wired %q", vc.lastOVA.Network, models.CanonicalStagingNetwork)
 	}
 }

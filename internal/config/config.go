@@ -98,9 +98,9 @@ type VaultConfig struct {
 
 // VCenterConfig holds vCenter connection settings.
 type VCenterConfig struct {
-	URL        string
-	User       string
-	Password   string
+	URL      string
+	User     string
+	Password string
 	// ClientCertPEM / ClientKeyPEM enable STS cert login (solution user).
 	// When both are non-empty they take precedence over User/Password.
 	ClientCertPEM []byte
@@ -119,8 +119,13 @@ type VCenterConfig struct {
 	// "/Example-Datacenter/vm/Templates"). Used by the admin folder-enumeration
 	// endpoint; not used by provisioning.
 	TemplatesFolder string
-	ResourcePools   []string
-	Hosts           []string
+	// OVANetwork is the portgroup ImportOVA maps every OVF network onto.
+	// Empty means the worker still falls back to models.CanonicalStagingNetwork
+	// (PG-VM-Lab) at import time so an unbuilt appliance never lands on a
+	// lab-reachable network.
+	OVANetwork    string
+	ResourcePools []string
+	Hosts         []string
 	// HostReservedMemoryMB maps each configured VCENTER_HOSTS entry to the
 	// minimum free memory that must remain after placing a new VM.
 	HostReservedMemoryMB map[string]int64
@@ -219,6 +224,7 @@ func Load() (*Config, error) {
 			ISOFolder:            getEnv("VCENTER_ISO_FOLDER", "ISOs"),
 			VMFolder:             getEnv("VCENTER_VM_FOLDER", ""),
 			TemplatesFolder:      getEnv("VCENTER_TEMPLATES_FOLDER", ""),
+			OVANetwork:           getEnv("VCENTER_OVA_NETWORK", ""),
 			ResourcePools:        splitEnv("VCENTER_RESOURCE_POOLS", ""),
 			Hosts:                vcenterHosts,
 			HostReservedMemoryMB: hostReservedMemoryMB,
