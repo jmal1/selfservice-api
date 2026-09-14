@@ -166,3 +166,25 @@ func TestVCenterPlacementReserveRejectsInvalidEntries(t *testing.T) {
 		})
 	}
 }
+
+func TestVCenterOVANetworkEmptyEnvStaysEmpty(t *testing.T) {
+	t.Setenv("VCENTER_OVA_NETWORK", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.VCenter.OVANetwork != "" {
+		t.Fatalf("VCenter.OVANetwork = %q, want empty so importImage still falls back to CanonicalStagingNetwork", cfg.VCenter.OVANetwork)
+	}
+}
+
+func TestVCenterOVANetworkLoadsFromEnvironment(t *testing.T) {
+	t.Setenv("VCENTER_OVA_NETWORK", "PG-VM-Lab")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.VCenter.OVANetwork != "PG-VM-Lab" {
+		t.Fatalf("VCenter.OVANetwork = %q, want PG-VM-Lab from VCENTER_OVA_NETWORK", cfg.VCenter.OVANetwork)
+	}
+}

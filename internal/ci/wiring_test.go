@@ -64,6 +64,7 @@ var requiredWiring = map[string][]struct {
 		{"startupWorkLeaseCatchup", "without startup catch-up, expire/network/health/idle waits a full ticker after deploy"},
 		{"worklease.TryRun", "work-lease gating must stay wired or every replica mutates OPNsense/vCenter"},
 		{"worklease.RunExclusive", "orphan/L1 passes must claim named leases for the whole mutating run"},
+		{"cfg.VCenter.OVANetwork", "without it Helm VCENTER_OVA_NETWORK never reaches ImageImportConfig and ImportOVA relies only on the in-job fallback"},
 	},
 	"cmd/crucible-runner/main.go": {
 		{"MaterializeActionLibrary", "without it the engine-generated action library is never written to disk, so every library action (http_get, port_open, ssh_exec, …) fails with exit 127 — the original defect, in which workflows appeared to run, the Job exited 0, and no action could possibly pass"},

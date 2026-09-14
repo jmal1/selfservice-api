@@ -565,6 +565,169 @@ func TestAdminDeleteImage_RefusesReferenced(t *testing.T) {
 	}
 }
 
+func TestAdminDeleteImage_UnreferencedOVADestroysVM(t *testing.T) {
+	id := uuid.New()
+	const moref = "vm-4242"
+	db := &fakeImageDB{
+		getImg: &models.ImageUpload{
+			ID:          id,
+			Filename:    "appliance.ova",
+			Kind:        models.ImageKindOVA,
+			Status:      models.ImageUploadImported,
+			ObjectKey:   "crucible/abc/appliance.ova",
+			VCenterVMID: moref,
+		},
+	}
+	store := &fakeImageStore{}
+	vc := &fakeVC{}
+	h := newImageHandler(db, store)
+	h.vc = vc
+
+	req := httptest.NewRequest(http.MethodDelete, "/admin/images/"+id.String(), nil)
+	req = withImageIDParam(req, id)
+	w := httptest.NewRecorder()
+	h.AdminDeleteImage(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d; want 204; body = %s", w.Code, w.Body.String())
+	}
+	if len(vc.gotCalls) != 1 || vc.gotCalls[0] != "destroy:"+moref {
+		t.Errorf("DestroyVM calls = %v; want exactly destroy:%s", vc.gotCalls, moref)
+	}
+	if store.removeCalls != 1 {
+		t.Errorf("store.Remove called %d time(s); want 1 after VM destroy", store.removeCalls)
+	}
+	if db.deleteCalls != 1 {
+		t.Errorf("DB.DeleteImageUpload called %d time(s); want 1", db.deleteCalls)
+	}
+}
+
+func TestAdminDeleteImage_ReferencedOVADoesNotDestroy(t *testing.T) {
+	id := uuid.New()
+	db := &fakeImageDB{
+		getImg: &models.ImageUpload{
+			ID:          id,
+			Filename:    "appliance.ova",
+			Kind:        models.ImageKindOVA,
+			Status:      models.ImageUploadImported,
+			ObjectKey:   "crucible/abc/appliance.ova",
+			VCenterVMID: "vm-4242",
+		},
+		refCount: 1,
+	}
+	store := &fakeImageStore{}
+	vc := &fakeVC{}
+	h := newImageHandler(db, store)
+	h.vc = vc
+
+	req := httptest.NewRequest(http.MethodDelete, "/admin/images/"+id.String(), nil)
+	req = withImageIDParam(req, id)
+	w := httptest.NewRecorder()
+	h.AdminDeleteImage(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d; want 409; body = %s", w.Code, w.Body.String())
+	}
+	if len(vc.gotCalls) != 0 {
+		t.Errorf("DestroyVM calls = %v; want none while templates still reference the image", vc.gotCalls)
+	}
+	if store.removeCalls != 0 || db.deleteCalls != 0 {
+		t.Errorf("remove=%d delete=%d; want 0/0 when referenced", store.removeCalls, db.deleteCalls)
+	}
+}
+
+func TestAdminDeleteImage_ISODoesNotDestroyVM(t *testing.T) {
+	id := uuid.New()
+	db := &fakeImageDB{
+		getImg: &models.ImageUpload{
+			ID:            id,
+			Filename:      "kali.iso",
+			Kind:          models.ImageKindISO,
+			Status:        models.ImageUploadImported,
+			ObjectKey:     "crucible/abc/kali.iso",
+			DatastorePath: "[NAS] ISOs/kali.iso",
+			VCenterVMID:   "vm-should-not-be-destroyed",
+		},
+	}
+	store := &fakeImageStore{}
+	vc := &fakeVC{}
+	h := newImageHandler(db, store)
+	h.vc = vc
+
+	req := httptest.NewRequest(http.MethodDelete, "/admin/images/"+id.String(), nil)
+	req = withImageIDParam(req, id)
+	w := httptest.NewRecorder()
+	h.AdminDeleteImage(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d; want 204; body = %s", w.Code, w.Body.String())
+	}
+	if len(vc.gotCalls) != 0 {
+		t.Errorf("DestroyVM calls = %v; ISO delete must not destroy a vCenter VM", vc.gotCalls)
+	}
+	if store.removeCalls != 1 || db.deleteCalls != 1 {
+		t.Errorf("remove=%d delete=%d; want 1/1 for an unreferenced ISO", store.removeCalls, db.deleteCalls)
+	}
+}
+
+func TestAdminDeleteImage_OVADestroyFailureKeepsRow(t *testing.T) {
+	id := uuid.New()
+	db := &fakeImageDB{
+		getImg: &models.ImageUpload{
+			ID:          id,
+			Filename:    "appliance.ova",
+			Kind:        models.ImageKindOVA,
+			Status:      models.ImageUploadImported,
+			ObjectKey:   "crucible/abc/appliance.ova",
+			VCenterVMID: "vm-4242",
+		},
+	}
+	store := &fakeImageStore{}
+	vc := &fakeVC{destroyErr: errors.New("vCenter busy")}
+	h := newImageHandler(db, store)
+	h.vc = vc
+
+	req := httptest.NewRequest(http.MethodDelete, "/admin/images/"+id.String(), nil)
+	req = withImageIDParam(req, id)
+	w := httptest.NewRecorder()
+	h.AdminDeleteImage(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d; want 500 when DestroyVM fails; body = %s", w.Code, w.Body.String())
+	}
+	if store.removeCalls != 0 || db.deleteCalls != 0 {
+		t.Errorf("remove=%d delete=%d; want 0/0 so a failed destroy leaves a recoverable row", store.removeCalls, db.deleteCalls)
+	}
+}
+
+func TestAdminDeleteImage_OVAWithoutVCenterFailsClosed(t *testing.T) {
+	id := uuid.New()
+	db := &fakeImageDB{
+		getImg: &models.ImageUpload{
+			ID:          id,
+			Filename:    "appliance.ova",
+			Kind:        models.ImageKindOVA,
+			Status:      models.ImageUploadImported,
+			ObjectKey:   "crucible/abc/appliance.ova",
+			VCenterVMID: "vm-4242",
+		},
+	}
+	store := &fakeImageStore{}
+	h := newImageHandler(db, store) // vc is nil
+
+	req := httptest.NewRequest(http.MethodDelete, "/admin/images/"+id.String(), nil)
+	req = withImageIDParam(req, id)
+	w := httptest.NewRecorder()
+	h.AdminDeleteImage(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d; want 503 when vCenter is unwired; body = %s", w.Code, w.Body.String())
+	}
+	if store.removeCalls != 0 || db.deleteCalls != 0 {
+		t.Errorf("remove=%d delete=%d; want 0/0 when the imported VM cannot be destroyed", store.removeCalls, db.deleteCalls)
+	}
+}
+
 // TestAdminCompleteImageUpload_StatMismatch verifies that when the object
 // store's Stat returns a different byte count from what was declared at
 // upload-create time, the handler sets status to "error" (not "uploaded")

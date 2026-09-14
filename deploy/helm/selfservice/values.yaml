@@ -246,9 +246,13 @@ vcenter:
   # /api/v1/admin/vcenter/templates-folder). Empty disables the endpoint.
   # NOTE: vCenter inventory paths are CASE-SENSITIVE — match the folder name exactly.
   templatesFolder: "/Example-Datacenter/vm/templates"
-  # Datastore that holds installer ISOs and OVAs uploaded through
-  # /admin/images, and the folder within it. Separate from
-  # `datastore` (which holds running VM disks).
+  # Portgroup ImportOVA maps every OVF network onto. Default is the isolated
+  # staging VLAN. The worker still falls back to PG-VM-Lab if this env is empty.
+  ovaNetwork: "PG-VM-Lab"
+  # Datastore that holds installer ISOs uploaded through /admin/images, and
+  # the folder within it. Separate from `datastore`, which holds running VM
+  # disks and imported OVA VMs (those VMs live in templatesFolder). OVAs are
+  # not files on isoDatastore.
   isoDatastore: "Example-ISO-Datastore"
   isoFolder: "ISOs"
   # vCenter credentials health probe (OP-1). Set healthPushgatewayURL to the

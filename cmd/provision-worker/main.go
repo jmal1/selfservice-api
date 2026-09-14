@@ -175,27 +175,24 @@ func main() {
 			if len(cfg.VCenter.ResourcePools) > 0 {
 				ovaPool = cfg.VCenter.ResourcePools[0]
 			}
+			importCfg := provisioner.ImageImportConfig{
+				ISODatastore:    cfg.VCenter.ISODatastore,
+				ISOFolder:       cfg.VCenter.ISOFolder,
+				OVAFolder:       cfg.VCenter.TemplatesFolder,
+				OVADatastore:    cfg.VCenter.Datastore,
+				OVAResourcePool: ovaPool,
+				OVANetwork:      cfg.VCenter.OVANetwork,
+			}
 			if pipeline != nil {
-				prov.EnableImageImport(objects, pipeline, provisioner.ImageImportConfig{
-					ISODatastore:    cfg.VCenter.ISODatastore,
-					ISOFolder:       cfg.VCenter.ISOFolder,
-					OVAFolder:       cfg.VCenter.TemplatesFolder,
-					OVADatastore:    cfg.VCenter.Datastore,
-					OVAResourcePool: ovaPool,
-				})
+				prov.EnableImageImport(objects, pipeline, importCfg)
 			} else {
-				prov.EnableImageImport(objects, nil, provisioner.ImageImportConfig{
-					ISODatastore:    cfg.VCenter.ISODatastore,
-					ISOFolder:       cfg.VCenter.ISOFolder,
-					OVAFolder:       cfg.VCenter.TemplatesFolder,
-					OVADatastore:    cfg.VCenter.Datastore,
-					OVAResourcePool: ovaPool,
-				})
+				prov.EnableImageImport(objects, nil, importCfg)
 			}
 			logger.Info("image_import enabled",
 				"endpoint", cfg.ObjectStore.Endpoint,
 				"bucket", cfg.ObjectStore.Bucket,
-				"iso_datastore", cfg.VCenter.ISODatastore)
+				"iso_datastore", cfg.VCenter.ISODatastore,
+				"ova_network", importCfg.OVANetwork)
 			// Note: stuck-upload reconciler is integrated into the main select
 			// loop below (stuckUploadTickerC) so it can be gated by IsLeader().
 		}
