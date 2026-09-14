@@ -204,6 +204,7 @@ func TestProductionGenericAndRawJobInsertionInventoryIsStable(t *testing.T) {
 	expectedGeneric := map[string]int{
 		"internal/api/handlers/images.go":           2,
 		"internal/api/handlers/templates_wizard.go": 1,
+		"internal/provisioner/image_reconcile.go":    1,
 	}
 	expectedRawSQL := map[string]int{
 		"internal/database/queries.go":                 2,
