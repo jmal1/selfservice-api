@@ -276,6 +276,10 @@ type fakeImageDB struct {
 	updateStatusFromExpected string // if set, the "from" arg must match
 	updateStatusCalls        int
 	updateStatusErr          error
+	resetRetryCalls          int
+	resetRetryErr            error
+	activeImportJob          bool
+	activeImportJobErr       error
 
 	// SetImageUploadUploaded
 	setUploadedCalls int
@@ -332,6 +336,19 @@ func (f *fakeImageDB) UpdateImageUploadStatus(_ context.Context, _ uuid.UUID, fr
 		return errors.New("unexpected from-status: got " + from + ", want " + f.updateStatusFromExpected)
 	}
 	return f.updateStatusErr
+}
+
+func (f *fakeImageDB) ResetImageUploadForRetry(_ context.Context, _ uuid.UUID) error {
+	f.resetRetryCalls++
+	if f.resetRetryErr == nil && f.getImg != nil {
+		f.getImg.Status = models.ImageUploadUploaded
+		f.getImg.ErrorMessage = ""
+	}
+	return f.resetRetryErr
+}
+
+func (f *fakeImageDB) HasActiveImageImportJob(_ context.Context, _ uuid.UUID) (bool, error) {
+	return f.activeImportJob, f.activeImportJobErr
 }
 
 func (f *fakeImageDB) SetImageUploadUploaded(_ context.Context, _ uuid.UUID, _ int64) error {
@@ -1505,8 +1522,37 @@ func TestAdminImportImage_RetryFromError(t *testing.T) {
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("status = %d; want 202 for retry from error; body = %s", w.Code, w.Body.String())
 	}
-	if db.updateStatusCalls != 1 {
-		t.Errorf("UpdateImageUploadStatus calls = %d; want 1 (reset error→uploaded)", db.updateStatusCalls)
+	if db.resetRetryCalls != 1 {
+		t.Errorf("ResetImageUploadForRetry calls = %d; want 1 (reset error→uploaded)", db.resetRetryCalls)
+	}
+	if errorImg.ErrorMessage != "" {
+		t.Errorf("error_message = %q; want cleared before enqueue", errorImg.ErrorMessage)
+	}
+}
+
+func TestAdminImportImage_RejectsActiveImportJob(t *testing.T) {
+	id := uuid.New()
+	db := &fakeImageDB{
+		getImg: &models.ImageUpload{
+			ID:        id,
+			Filename:  "mint.iso",
+			Kind:      models.ImageKindISO,
+			Status:    models.ImageUploadUploaded,
+			ObjectKey: "crucible/" + id.String() + "/mint.iso",
+		},
+		activeImportJob: true,
+	}
+	h := newImageHandler(db, &fakeImageStore{})
+
+	req := withImageIDParam(httptest.NewRequest(http.MethodPost, "/admin/images/"+id.String()+"/import", nil), id)
+	w := httptest.NewRecorder()
+	h.AdminImportImage(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d; want 409; body = %s", w.Code, w.Body.String())
+	}
+	if db.createdJobType != "" {
+		t.Fatalf("created job type = %q; want none while an import is active", db.createdJobType)
 	}
 }
 

@@ -2,11 +2,11 @@
 //
 // Background: image_uploads rows can sit in "uploading" or "importing"
 // status forever if the browser tab dies mid-upload or the import worker
-// crashes. Nothing in the normal job path notices because those rows have
-// no associated job to transition to a failed state. Each stuck row
-// occupies space on a MinIO host that has only ~85 GB free on its root
-// filesystem — the same filesystem the apt package cache uses when building
-// Linux templates. A silent leak here eventually breaks unrelated builds.
+// crashes. Orphaned importing rows are re-enqueued during the import retry
+// budget and marked terminal after it expires. Each stuck row occupies space
+// on a MinIO host that has only ~85 GB free on its root filesystem — the same
+// filesystem the apt package cache uses when building Linux templates. A
+// silent leak here eventually breaks unrelated builds.
 //
 // This reconciler runs on a configurable ticker in the provision-worker.
 // Each pass queries the count of rows in a non-terminal status older than a
@@ -19,17 +19,23 @@ package provisioner
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jmal1/selfservice-api/internal/database"
+	"github.com/jmal1/selfservice-api/internal/models"
 )
 
 // imageUploadsDB is the narrow database interface the stuck-upload reconciler
 // needs. *database.Queries satisfies it structurally via CountStuckImageUploads.
 type imageUploadsDB interface {
 	CountStuckImageUploads(ctx context.Context, olderThan time.Duration) (int, error)
+	ListOrphanImportingImages(ctx context.Context) ([]models.ImageUpload, error)
+	CreateJob(ctx context.Context, jobType string, payload []byte) (*models.Job, error)
+	SetImageUploadError(ctx context.Context, id uuid.UUID, msg string) error
 }
 
 // imageUploadsMetrics is the narrow metric interface used to publish the
@@ -86,6 +92,26 @@ func reconcileStuckUploads(
 		logger = slog.Default()
 	}
 	log := logger.With("component", "stuck_upload_reconciler")
+
+	orphans, err := db.ListOrphanImportingImages(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("list orphan importing images: %w", err)
+	}
+	now := time.Now()
+	for _, img := range orphans {
+		if !now.Before(img.UpdatedAt.Add(ImageImportRetryBudget)) {
+			msg := fmt.Sprintf("import abandoned after %s without an active job", ImageImportRetryBudget)
+			if err := db.SetImageUploadError(ctx, img.ID, msg); err != nil {
+				return 0, fmt.Errorf("mark orphan image %s errored: %w", img.ID, err)
+			}
+			continue
+		}
+		payload, _ := json.Marshal(ImageImportPayload{ImageID: img.ID})
+		if _, err := db.CreateJob(ctx, models.JobTypeImageImport, payload); err != nil {
+			return 0, fmt.Errorf("re-enqueue orphan image %s: %w", img.ID, err)
+		}
+		log.Info("re-enqueued orphan image import", "image_id", img.ID)
+	}
 
 	n, err := db.CountStuckImageUploads(ctx, staleThreshold)
 	if err != nil {

@@ -2,19 +2,44 @@ package provisioner
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/jmal1/selfservice-api/internal/models"
 )
 
 // fakeUploadDB implements imageUploadsDB for tests.
 type fakeUploadDB struct {
-	count int
-	err   error
+	count   int
+	err     error
+	orphans []models.ImageUpload
+	created []uuid.UUID
+	errored []uuid.UUID
 }
 
 func (f *fakeUploadDB) CountStuckImageUploads(_ context.Context, _ time.Duration) (int, error) {
 	return f.count, f.err
+}
+
+func (f *fakeUploadDB) ListOrphanImportingImages(_ context.Context) ([]models.ImageUpload, error) {
+	return f.orphans, nil
+}
+
+func (f *fakeUploadDB) CreateJob(_ context.Context, _ string, payload []byte) (*models.Job, error) {
+	var p ImageImportPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return nil, err
+	}
+	f.created = append(f.created, p.ImageID)
+	return &models.Job{ID: uuid.New()}, nil
+}
+
+func (f *fakeUploadDB) SetImageUploadError(_ context.Context, id uuid.UUID, _ string) error {
+	f.errored = append(f.errored, id)
+	return nil
 }
 
 // fakeUploadMetrics implements imageUploadsMetrics for tests. It records the
@@ -128,5 +153,26 @@ func TestReconcileStuckUploads_QueryErrorDoesNotPublish(t *testing.T) {
 	}
 	if m.pushes != 0 {
 		t.Errorf("Push must NOT be called on query error; called %d times — pushing a stale or zero gauge would clear a firing alert during a DB outage", m.pushes)
+	}
+}
+
+func TestReconcileStuckUploads_RepairsOrphanImports(t *testing.T) {
+	freshID := uuid.New()
+	expiredID := uuid.New()
+	db := &fakeUploadDB{
+		orphans: []models.ImageUpload{
+			{ID: freshID, Status: models.ImageUploadImporting, UpdatedAt: time.Now().Add(-30 * time.Minute)},
+			{ID: expiredID, Status: models.ImageUploadImporting, UpdatedAt: time.Now().Add(-2 * time.Hour)},
+		},
+	}
+
+	if _, err := reconcileStuckUploads(context.Background(), db, nil, 30*time.Minute, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(db.created) != 1 || db.created[0] != freshID {
+		t.Fatalf("re-enqueued images = %v; want [%s]", db.created, freshID)
+	}
+	if len(db.errored) != 1 || db.errored[0] != expiredID {
+		t.Fatalf("terminal images = %v; want [%s]", db.errored, expiredID)
 	}
 }
