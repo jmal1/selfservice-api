@@ -184,7 +184,7 @@ func TestClassifyError_ImageImportTransients(t *testing.T) {
 		errors.New("wait for NFC lease: temporary failure"),
 		errors.New(`upload "disk.vmdk": connection closed`),
 		database.ErrJobLeaseLost,
-		context.Canceled,
+		errors.Join(database.ErrJobLeaseLost, context.Canceled),
 	} {
 		if ok, _ := ClassifyError(err, models.JobTypeImageImport); !ok {
 			t.Errorf("ClassifyError(%q, image_import) = not retryable", err)
@@ -193,6 +193,7 @@ func TestClassifyError_ImageImportTransients(t *testing.T) {
 	for _, err := range []error{
 		errors.New("permission denied"),
 		errors.New("Permission to perform this operation was denied"),
+		context.Canceled,
 	} {
 		if ok, _ := ClassifyError(err, models.JobTypeImageImport); ok {
 			t.Errorf("ClassifyError(%q, image_import) = retryable; want terminal", err)

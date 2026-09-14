@@ -23,7 +23,6 @@
 package provisioner
 
 import (
-	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
@@ -141,7 +140,6 @@ func ClassifyError(err error, jobType string) (retryable bool, reason string) {
 	}
 	if jobType == models.JobTypeImageImport {
 		if errors.Is(err, database.ErrJobLeaseLost) ||
-			errors.Is(err, context.Canceled) ||
 			strings.Contains(lower, "timedout") ||
 			strings.Contains(lower, "operation timed out") ||
 			strings.Contains(lower, "wait for nfc") ||
