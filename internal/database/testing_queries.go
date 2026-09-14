@@ -289,7 +289,9 @@ func (q *Queries) GetRecentRunsForPod(ctx context.Context, podID uuid.UUID, limi
 	}
 	defer rows.Close()
 
-	var runs []models.Run
+	// Non-nil empty slice so respondJSON encodes [] not null — clients (and
+	// UI synthetics) treat a bare null as a contract break.
+	runs := make([]models.Run, 0)
 	for rows.Next() {
 		var r models.Run
 		if err := rows.Scan(&r.ID, &r.PodID, &r.PlaylistID, &r.TriggeredBy, &r.Status,
