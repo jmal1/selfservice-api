@@ -229,6 +229,46 @@ func TestHandleJobOutcome_RetryableReturnsPending(t *testing.T) {
 	}
 }
 
+func TestImageImportRetryUsesWallClockBudget(t *testing.T) {
+	cause := errors.New("Operation timed out")
+	t.Run("within budget retries despite max retries", func(t *testing.T) {
+		db := &fakeJobDB{}
+		job := &models.Job{
+			ID:         uuid.New(),
+			Type:       models.JobTypeImageImport,
+			RetryCount: 99,
+			MaxRetries: 3,
+			CreatedAt:  time.Now().Add(-30 * time.Minute),
+		}
+		if err := runLifecycle(context.Background(), db, NewPipelineMetrics("", "", nil), job, cause); err != nil {
+			t.Fatalf("result = %v; want retry scheduled", err)
+		}
+		if len(db.retried) != 1 {
+			t.Fatalf("retry records = %d; want 1", len(db.retried))
+		}
+	})
+
+	t.Run("past budget is terminal", func(t *testing.T) {
+		db := &fakeJobDB{}
+		job := &models.Job{
+			ID:         uuid.New(),
+			Type:       models.JobTypeImageImport,
+			RetryCount: 0,
+			MaxRetries: 99,
+			CreatedAt:  time.Now().Add(-ImageImportRetryBudget - time.Minute),
+		}
+		if err := runLifecycle(context.Background(), db, NewPipelineMetrics("", "", nil), job, cause); !errors.Is(err, cause) {
+			t.Fatalf("result = %v; want terminal cause", err)
+		}
+		if len(db.retried) != 0 {
+			t.Fatalf("retry records = %d; want 0", len(db.retried))
+		}
+		if len(db.statusesWithStatus(models.JobStatusFailed)) != 1 {
+			t.Fatal("past-budget import was not marked failed")
+		}
+	})
+}
+
 func TestTemplateProvisionFailureResultPreservesFirstAndCurrentFailures(t *testing.T) {
 	firstCause := errors.New("clone source VM: wait clone task: The virtual disk is either corrupted or not a supported format: first")
 	first := marshalTemplateProvisionFailure(nil, firstCause, 0, 3)

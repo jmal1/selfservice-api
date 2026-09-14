@@ -132,10 +132,12 @@ type imageDB interface {
 	ListImageUploads(ctx context.Context) ([]models.ImageUpload, error)
 	ListImageUploadsByStatus(ctx context.Context, statuses []string) ([]models.ImageUpload, error)
 	UpdateImageUploadStatus(ctx context.Context, id uuid.UUID, from, to string) error
+	ResetImageUploadForRetry(ctx context.Context, id uuid.UUID) error
 	SetImageUploadUploaded(ctx context.Context, id uuid.UUID, sizeBytes int64) error
 	SetImageUploadError(ctx context.Context, id uuid.UUID, msg string) error
 	DeleteImageUpload(ctx context.Context, id uuid.UUID) error
 	CountTemplatesReferencingImage(ctx context.Context, datastorePath, vcenterVMID string) (int, error)
+	HasActiveImageImportJob(ctx context.Context, imageID uuid.UUID) (bool, error)
 	CreateJob(ctx context.Context, jobType string, payload []byte) (*models.Job, error)
 }
 
@@ -417,9 +419,8 @@ func (h *Handler) AdminCompleteImageUpload(w http.ResponseWriter, r *http.Reques
 
 	// Auto-enqueue the image_import job. Both ISOs and OVAs are imported
 	// automatically so the instructor never has to take a separate "Import"
-	// step. The job is idempotent on the worker side (requires status==uploaded
-	// before doing any work), and the stale-check above already ensures we
-	// only reach this point once per upload.
+	// step. The stale-check above ensures we only reach this point once per
+	// upload; durable retries re-enter while the row remains importing.
 	//
 	// Failure to enqueue is logged but NOT fatal: the upload is safe in MinIO
 	// and the instructor can trigger import manually from /admin/images.
@@ -498,6 +499,19 @@ func (h *Handler) AdminImportImage(w http.ResponseWriter, r *http.Request) {
 		respondError(w, r, http.StatusInternalServerError, "invalid object key: key does not match expected prefix")
 		return
 	}
+	active, err := h.imgDB.HasActiveImageImportJob(r.Context(), imageID)
+	if err != nil {
+		h.logger.Error("check active image import job failed", "error", err, "id", imageID)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if active {
+		respondJSON(w, http.StatusConflict, map[string]any{
+			"error":   "import_already_active",
+			"message": "an image import job is already pending or running for this image",
+		})
+		return
+	}
 
 	// For error rows, reset to 'uploaded' so the import worker picks it up.
 	// The MinIO object is deliberately retained on failure (see image_jobs.go)
@@ -510,8 +524,7 @@ func (h *Handler) AdminImportImage(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		if err := h.imgDB.UpdateImageUploadStatus(r.Context(), imageID,
-			models.ImageUploadError, models.ImageUploadUploaded); err != nil {
+		if err := h.imgDB.ResetImageUploadForRetry(r.Context(), imageID); err != nil {
 			h.logger.Error("reset error row to uploaded failed", "error", err, "id", imageID)
 			respondError(w, r, http.StatusInternalServerError, "internal error")
 			return

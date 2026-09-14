@@ -27,6 +27,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/vmware/govmomi/nfc"
 	"github.com/vmware/govmomi/object"
@@ -145,12 +146,17 @@ func (c *Client) ImportOVA(ctx context.Context, p OVAImportParams) (string, erro
 	if err != nil {
 		return "", fmt.Errorf("import vApp: %w", err)
 	}
+	abortLease := func() {
+		abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		_ = lease.Abort(abortCtx, nil)
+	}
 
 	// From here on a VM shell exists; abort the lease on any error so we don't
 	// leave an orphan behind.
 	info, err := lease.Wait(ctx, spec.FileItem)
 	if err != nil {
-		_ = lease.Abort(ctx, nil)
+		abortLease()
 		return "", fmt.Errorf("wait for NFC lease: %w", err)
 	}
 
@@ -164,7 +170,7 @@ func (c *Client) ImportOVA(ctx context.Context, p OVAImportParams) (string, erro
 	defer updater.Done()
 
 	abort := func(cause error) (string, error) {
-		_ = lease.Abort(ctx, nil)
+		abortLease()
 		return "", cause
 	}
 

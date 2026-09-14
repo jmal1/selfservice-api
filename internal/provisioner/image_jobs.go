@@ -25,6 +25,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -109,6 +110,13 @@ const defaultISOFolder = "ISOs"
 // a bounded number of updates (one per 5% moved) instead of one per chunk.
 const importProgressStepPercent = 5
 
+// ImageImportRetryBudget bounds transparent retries from the durable job's
+// creation time. Retriable failures keep the image in importing until this
+// wall-clock budget expires.
+const ImageImportRetryBudget = time.Hour
+
+const imageImportTerminalWriteTimeout = 10 * time.Second
+
 // ImportImage is the job entrypoint for models.JobTypeImageImport. It unpacks
 // the payload and delegates to importImage with the Provisioner's wired
 // dependencies.
@@ -125,8 +133,13 @@ func (p *Provisioner) ImportImage(ctx context.Context, job *models.Job) error {
 	if err := json.Unmarshal(job.Payload, &payload); err != nil {
 		return fmt.Errorf("parse image_import payload: %w", err)
 	}
-	return importImage(ctx, p.objects, p.vc, p.db, p.pipeline, p.logger, p.imageCfg,
-		func(step, message string) { p.publishProgress(job.ID, step, message) }, payload)
+	createdAt := job.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
+	return importImageWithDeadline(ctx, p.objects, p.vc, p.db, p.pipeline, p.logger, p.imageCfg,
+		func(step, message string) { p.publishProgress(job.ID, step, message) }, payload,
+		createdAt.Add(ImageImportRetryBudget))
 }
 
 // importImage streams the staged object for payload.ImageID out of the object
@@ -135,9 +148,8 @@ func (p *Provisioner) ImportImage(ctx context.Context, job *models.Job) error {
 // is a thin wrapper over it.
 //
 // Contract highlights (each is covered by image_jobs_test.go):
-//   - Requires status == uploaded. Any other status errors out BEFORE any
-//     object-store or vCenter call, so a double-dispatch / retry race can
-//     never re-import or corrupt an in-flight/finished row.
+//   - Accepts uploaded for a first attempt and importing for durable retry
+//     re-entry. Other states fail before object-store or vCenter work.
 //   - Computes the SHA-256 while streaming (io.TeeReader), never buffering the
 //     whole image — these are multi-GB files and the worker has little disk.
 //   - On success: marks imported (recording checksum + placement) and THEN
@@ -146,8 +158,8 @@ func (p *Provisioner) ImportImage(ctx context.Context, job *models.Job) error {
 //     apt-cacher-ng, so leaving imported objects would eventually break every
 //     Linux template build. A delete failure is logged, not fatal — the
 //     import already succeeded and a leaked object is the lesser problem.
-//   - On failure: marks error with the cause and leaves the object in place so
-//     a retry stays cheap.
+//   - On retriable failure: leaves the row importing and the object staged.
+//     Terminal failures mark error with a detached, bounded database context.
 //
 // progress may be nil; when set it is called with a coarse step name and a
 // human-readable message suitable for p.publishProgress.
@@ -161,6 +173,24 @@ func importImage(
 	cfg ImageImportConfig,
 	progress func(step, message string),
 	payload ImageImportPayload,
+) error {
+	return importImageWithDeadline(
+		ctx, objects, vc, db, metrics, logger, cfg, progress, payload,
+		time.Now().Add(ImageImportRetryBudget),
+	)
+}
+
+func importImageWithDeadline(
+	ctx context.Context,
+	objects imageObjectStore,
+	vc imageImportVCenter,
+	db imageImportDB,
+	metrics pipelineMetricsSink,
+	logger *slog.Logger,
+	cfg ImageImportConfig,
+	progress func(step, message string),
+	payload ImageImportPayload,
+	retryDeadline time.Time,
 ) error {
 	if logger == nil {
 		logger = slog.Default()
@@ -190,17 +220,19 @@ func importImage(
 	if img == nil {
 		return fmt.Errorf("image %s not found", payload.ImageID)
 	}
-	if img.Status != models.ImageUploadUploaded {
-		return fmt.Errorf("image %s is in status %q, expected %q; refusing to import",
-			payload.ImageID, img.Status, models.ImageUploadUploaded)
+	if img.Status != models.ImageUploadUploaded && img.Status != models.ImageUploadImporting {
+		return fmt.Errorf("image %s is in status %q, expected %q or %q; refusing to import",
+			payload.ImageID, img.Status, models.ImageUploadUploaded, models.ImageUploadImporting)
 	}
 
 	// Commit to importing. The guarded transition also closes the race: if a
 	// concurrent worker already advanced the row, this returns stale and we
 	// stop without touching vCenter.
-	if err := db.UpdateImageUploadStatus(ctx, payload.ImageID,
-		models.ImageUploadUploaded, models.ImageUploadImporting); err != nil {
-		return fmt.Errorf("transition image %s to importing: %w", payload.ImageID, err)
+	if img.Status == models.ImageUploadUploaded {
+		if err := db.UpdateImageUploadStatus(ctx, payload.ImageID,
+			models.ImageUploadUploaded, models.ImageUploadImporting); err != nil {
+			return fmt.Errorf("transition image %s to importing: %w", payload.ImageID, err)
+		}
 	}
 
 	kind := strings.ToLower(strings.TrimSpace(payload.Kind))
@@ -218,10 +250,26 @@ func importImage(
 
 	start := time.Now()
 
-	// fail marks the row errored, records the error metric, and returns the
-	// cause. It deliberately does NOT remove the object (retry must stay cheap).
+	// fail leaves retriable failures in importing while the durable job remains
+	// inside its wall-clock retry budget. Terminal writes use a detached context
+	// so lease cancellation cannot strand the row in importing.
 	fail := func(cause error) error {
-		if serr := db.SetImageUploadError(ctx, payload.ImageID, cause.Error()); serr != nil {
+		if errors.Is(cause, context.Canceled) && errors.Is(context.Cause(ctx), database.ErrJobLeaseLost) {
+			cause = fmt.Errorf("%w: %v", database.ErrJobLeaseLost, cause)
+		}
+		retryable, _ := ClassifyError(cause, models.JobTypeImageImport)
+		if retryable && !retryDeadline.IsZero() && time.Now().Before(retryDeadline) {
+			if metrics != nil {
+				metrics.RecordImageImport(kind, MetricResultError, time.Since(start), 0)
+			}
+			return cause
+		}
+		if retryable && !retryDeadline.IsZero() {
+			cause = fmt.Errorf("import timed out after %s of retries: %w", ImageImportRetryBudget, cause)
+		}
+		writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), imageImportTerminalWriteTimeout)
+		defer cancel()
+		if serr := db.SetImageUploadError(writeCtx, payload.ImageID, cause.Error()); serr != nil {
 			log.Error("failed to mark image errored", "error", serr, "cause", cause)
 		}
 		if metrics != nil {

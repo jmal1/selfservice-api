@@ -508,8 +508,7 @@ enqueued automatically — you do not need to take any further action. The ISO
 will appear in the wizard picker with the status `Importing…` until the import
 finishes, then it will become selectable.
 
-If the import fails (shown in the image list as an error with a message), click
-**Retry import** to re-run the import without re-uploading the file.
+Transient vCenter and NFC failures retry automatically with durable backoff for approximately one hour; the image remains `Importing…` between attempts, and the worker repairs an orphaned import job after a restart. If the import reaches a permanent error or exhausts that budget, click **Retry import** to clear the prior error and run the import again without re-uploading the file. A retry request is refused while another import job for the same image is still pending or running.
 
 OVAs are imported into vCenter's Templates folder as ready-to-clone VMs and are
 **not** ISO install media. Disks land on the VM datastore (`vcenter.datastore`),

@@ -117,6 +117,73 @@ func (q *Queries) UpdateImageUploadStatus(ctx context.Context, id uuid.UUID, fro
 	return nil
 }
 
+// ResetImageUploadForRetry atomically returns a terminal import failure to
+// uploaded and clears the stale instructor-facing error.
+func (q *Queries) ResetImageUploadForRetry(ctx context.Context, id uuid.UUID) error {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE image_uploads
+		SET status = $2, error_message = '', updated_at = now()
+		WHERE id = $1 AND status = $3
+	`, id, models.ImageUploadUploaded, models.ImageUploadError)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: expected status %q", ErrImageUploadStale, models.ImageUploadError)
+	}
+	return nil
+}
+
+// HasActiveImageImportJob reports whether an import for imageID is pending
+// (including a future next_attempt_at), claimed, or in progress.
+func (q *Queries) HasActiveImageImportJob(ctx context.Context, imageID uuid.UUID) (bool, error) {
+	var active bool
+	err := q.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM jobs
+			WHERE type = $1
+			  AND status IN ($2, $3, $4)
+			  AND payload->>'image_id' = $5
+		)
+	`, models.JobTypeImageImport, models.JobStatusPending, models.JobStatusClaimed,
+		models.JobStatusInProgress, imageID.String()).Scan(&active)
+	return active, err
+}
+
+// ListOrphanImportingImages returns rows whose import status has no durable
+// pending or executing image_import job.
+func (q *Queries) ListOrphanImportingImages(ctx context.Context) ([]models.ImageUpload, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT `+imageUploadSelectCols+`
+		FROM image_uploads i
+		WHERE i.status = $1
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM jobs j
+			WHERE j.type = $2
+			  AND j.status IN ($3, $4, $5)
+			  AND j.payload->>'image_id' = i.id::text
+		  )
+		ORDER BY i.updated_at
+	`, models.ImageUploadImporting, models.JobTypeImageImport,
+		models.JobStatusPending, models.JobStatusClaimed, models.JobStatusInProgress)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []models.ImageUpload
+	for rows.Next() {
+		var img models.ImageUpload
+		if err := scanImageUpload(rows, &img); err != nil {
+			return nil, err
+		}
+		out = append(out, img)
+	}
+	return out, rows.Err()
+}
+
 // SetImageUploadUploaded records the real object size + multipart upload
 // id confirmed by Stat() and moves the row to `uploaded`.
 func (q *Queries) SetImageUploadUploaded(ctx context.Context, id uuid.UUID, sizeBytes int64) error {

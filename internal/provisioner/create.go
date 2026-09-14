@@ -337,7 +337,11 @@ func processJobLifecycle(
 		retryable = true
 		reason = RetryReasonCleanup
 	}
-	if retryable && (cleanupOnly || job.RetryCount < job.MaxRetries) {
+	retryAvailable := cleanupOnly || job.RetryCount < job.MaxRetries
+	if job.Type == models.JobTypeImageImport && !cleanupOnly {
+		retryAvailable = imageImportRetryWithinBudget(job, time.Now())
+	}
+	if retryable && retryAvailable {
 		var (
 			nextAt   time.Time
 			schedErr error
@@ -366,6 +370,12 @@ func processJobLifecycle(
 					"Retry %d/%d scheduled for %s (reason: %s)",
 					job.RetryCount+1, job.MaxRetries, nextAt.Format(time.RFC3339), reason,
 				)
+				if job.Type == models.JobTypeImageImport {
+					message = fmt.Sprintf(
+						"Import retry scheduled for %s within 1h budget (reason: %s)",
+						nextAt.Format(time.RFC3339), reason,
+					)
+				}
 				if cleanupOnly {
 					message = fmt.Sprintf(
 						"Cleanup retry %d scheduled for %s; it will remain pending until resolved",
@@ -388,7 +398,7 @@ func processJobLifecycle(
 	}
 
 	// Terminal failure.
-	retryExhausted := retryable && !cleanupOnly && job.RetryCount >= job.MaxRetries
+	retryExhausted := retryable && !cleanupOnly && !retryAvailable
 	if retryExhausted && job.Type != models.JobTypeTemplateProvision {
 		if pipeline != nil {
 			pipeline.RecordJobRetryExhausted(job.Type)

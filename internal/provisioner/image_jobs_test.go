@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -151,6 +152,7 @@ type fakeImageDB struct {
 	importedChecksum string
 	errorCalled      bool
 	errorMsg         string
+	errorContextErr  error
 }
 
 func (f *fakeImageDB) GetImageUploadByID(_ context.Context, _ uuid.UUID) (*models.ImageUpload, error) {
@@ -185,9 +187,10 @@ func (f *fakeImageDB) SetImageUploadImported(_ context.Context, _ uuid.UUID, dat
 	return nil
 }
 
-func (f *fakeImageDB) SetImageUploadError(_ context.Context, _ uuid.UUID, msg string) error {
+func (f *fakeImageDB) SetImageUploadError(ctx context.Context, _ uuid.UUID, msg string) error {
 	f.errorCalled = true
 	f.errorMsg = msg
+	f.errorContextErr = ctx.Err()
 	if f.img != nil {
 		f.img.Status = models.ImageUploadError
 		f.img.ErrorMessage = msg
@@ -320,6 +323,116 @@ func TestImportImage_OVAHappyPath(t *testing.T) {
 	}
 }
 
+func TestImportImage_ImportingReentrySucceeds(t *testing.T) {
+	row := newImageRow(models.ImageKindISO, "retry.iso", models.ImageUploadImporting)
+	row.ObjectKey = "crucible/" + row.ID.String() + "/retry.iso"
+	db := &fakeImageDB{img: row}
+
+	err := importImageWithDeadline(
+		context.Background(),
+		&fakeImageObjects{payload: []byte("iso")},
+		&fakeImageVC{},
+		db,
+		nil,
+		nil,
+		testImportConfig(),
+		nil,
+		ImageImportPayload{ImageID: row.ID},
+		time.Now().Add(ImageImportRetryBudget),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(db.transitions) != 0 {
+		t.Fatalf("retry re-entry transitions = %v; want none", db.transitions)
+	}
+	if row.Status != models.ImageUploadImported {
+		t.Fatalf("status = %q; want imported", row.Status)
+	}
+}
+
+func TestImportImage_RetriableFailureLeavesImporting(t *testing.T) {
+	row := newImageRow(models.ImageKindOVA, "retry.ova", models.ImageUploadImporting)
+	row.ObjectKey = "crucible/" + row.ID.String() + "/retry.ova"
+	db := &fakeImageDB{img: row}
+
+	err := importImageWithDeadline(
+		context.Background(),
+		&fakeImageObjects{payload: []byte("ova")},
+		&fakeImageVC{importErr: errors.New(`upload "disk.vmdk": operation timed out`)},
+		db,
+		nil,
+		nil,
+		testImportConfig(),
+		nil,
+		ImageImportPayload{ImageID: row.ID},
+		time.Now().Add(ImageImportRetryBudget),
+	)
+	if err == nil {
+		t.Fatal("expected retriable import error")
+	}
+	if db.errorCalled {
+		t.Fatal("SetImageUploadError called for retriable failure within budget")
+	}
+	if row.Status != models.ImageUploadImporting {
+		t.Fatalf("status = %q; want importing", row.Status)
+	}
+}
+
+func TestImportImage_RetryBudgetExpiryMarksError(t *testing.T) {
+	row := newImageRow(models.ImageKindOVA, "expired.ova", models.ImageUploadImporting)
+	row.ObjectKey = "crucible/" + row.ID.String() + "/expired.ova"
+	db := &fakeImageDB{img: row}
+
+	err := importImageWithDeadline(
+		context.Background(),
+		&fakeImageObjects{payload: []byte("ova")},
+		&fakeImageVC{importErr: errors.New("Operation timed out")},
+		db,
+		nil,
+		nil,
+		testImportConfig(),
+		nil,
+		ImageImportPayload{ImageID: row.ID},
+		time.Now().Add(-time.Second),
+	)
+	if err == nil {
+		t.Fatal("expected terminal budget error")
+	}
+	if !db.errorCalled || !strings.Contains(db.errorMsg, "import timed out after 1h") {
+		t.Fatalf("terminal error message = %q; want one-hour retry budget context", db.errorMsg)
+	}
+}
+
+func TestImportImage_TerminalFailureUsesDetachedContext(t *testing.T) {
+	row := newImageRow(models.ImageKindISO, "broken.iso", models.ImageUploadImporting)
+	db := &fakeImageDB{img: row}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := importImageWithDeadline(
+		ctx,
+		&fakeImageObjects{},
+		&fakeImageVC{},
+		db,
+		nil,
+		nil,
+		testImportConfig(),
+		nil,
+		ImageImportPayload{ImageID: row.ID},
+		time.Now().Add(ImageImportRetryBudget),
+	)
+	if err == nil {
+		t.Fatal("expected terminal validation error")
+	}
+	if !db.errorCalled {
+		t.Fatal("SetImageUploadError was not called")
+	}
+	if db.errorContextErr != nil {
+		t.Fatalf("terminal write context error = %v; want detached context", db.errorContextErr)
+	}
+}
+
 // TestImportImage_OVADefaultsToStagingNetwork pins the second reason OVA
 // import could never work in production: the worker wiring never set
 // OVANetwork, and ImportOVA hard-fails any OVA that declares a network when
@@ -427,11 +540,11 @@ func TestImportImage_FailureKeepsObject(t *testing.T) {
 		t.Fatal("expected error when the datastore upload fails, got nil")
 	}
 
-	if db.img.Status != models.ImageUploadError {
-		t.Errorf("status = %q, want %q", db.img.Status, models.ImageUploadError)
+	if db.img.Status != models.ImageUploadImporting {
+		t.Errorf("status = %q, want %q", db.img.Status, models.ImageUploadImporting)
 	}
-	if !db.errorCalled || db.errorMsg == "" {
-		t.Errorf("expected a non-empty error_message; errorCalled=%v msg=%q", db.errorCalled, db.errorMsg)
+	if db.errorCalled {
+		t.Errorf("SetImageUploadError called for retriable APD failure; msg=%q", db.errorMsg)
 	}
 
 	// The MinIO object must be kept so a retry stays cheap.

@@ -787,6 +787,7 @@ Browser upload → MinIO staging → auto-import job → vCenter
 After `POST /api/v1/admin/images/{id}/complete` finalises the multipart upload and the byte count is confirmed, the API **automatically enqueues an `image_import` job**. Instructors do not need to take any further action after uploading.
 
 - The import job is enqueued at upload completion, not on a delay.
+- Transient vCenter/NFC timeouts, connection loss, and worker lease loss are retried transparently with durable backoff for up to one hour from the job's creation. The image remains `importing` between attempts; an orphaned `importing` row is re-enqueued while it is within the same recovery window and becomes `error` after the window expires.
 - If the job enqueue fails (e.g. NATS is temporarily down), the upload is still safe in MinIO. The instructor can trigger import manually via `POST /api/v1/admin/images/{id}/import`.
 - Completing the same upload twice (client retry) is safe: if the row is already past `uploaded`, the second complete returns 200 without re-enqueuing.
 
@@ -844,7 +845,7 @@ Deleting an unreferenced OVA image destroys the exact imported VM (`vcenter_vm_i
 
 ### 15.5 Error retry
 
-If an import fails (`status=error`), the MinIO object is retained so retry is cheap. The instructor can retry via `POST /api/v1/admin/images/{id}/import` without re-uploading the file. The API resets the status from `error` → `uploaded` and enqueues a fresh import job.
+If an import reaches a deterministic failure or exhausts its approximately one-hour automatic retry budget (`status=error`), the MinIO object is retained so retry is cheap. The instructor can retry via `POST /api/v1/admin/images/{id}/import` without re-uploading the file. The API clears the prior error, resets the status from `error` → `uploaded`, and enqueues a fresh import job; it returns `409` instead when an import job for that image is already pending or running.
 
 ### 15.6 ISO provision outcomes and staging-VM recovery
 

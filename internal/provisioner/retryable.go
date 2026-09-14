@@ -23,6 +23,7 @@
 package provisioner
 
 import (
+	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
@@ -49,6 +50,13 @@ var errVMPlacementCapacityRelease = errors.New("VM placement capacity release un
 func jobRetryAvailable(job *models.Job, jobErr error) bool {
 	retryable, _ := ClassifyError(jobErr, job.Type)
 	return retryable && job.RetryCount < job.MaxRetries
+}
+
+func imageImportRetryWithinBudget(job *models.Job, now time.Time) bool {
+	return job != nil &&
+		job.Type == models.JobTypeImageImport &&
+		!job.CreatedAt.IsZero() &&
+		now.Before(job.CreatedAt.Add(ImageImportRetryBudget))
 }
 
 // deterministicPhrases are substrings that identify errors that will never
@@ -80,6 +88,9 @@ var deterministicPhrases = []string{
 	"template_id not found",
 	// Permanent vCenter login rejection — not a stale session.
 	"incorrect user name or password",
+	// Permanent vCenter authorization rejection.
+	"permission denied",
+	"Permission to perform this operation was denied",
 }
 
 // ClassifyError reports whether jobErr is safe to retry, and if so,
@@ -120,11 +131,22 @@ func ClassifyError(err error, jobType string) (retryable bool, reason string) {
 		return false, ""
 	}
 	s := err.Error()
+	lower := strings.ToLower(s)
 
 	// Deterministic failures: check first and never retry.
 	for _, phrase := range deterministicPhrases {
-		if strings.Contains(s, phrase) {
+		if strings.Contains(lower, strings.ToLower(phrase)) {
 			return false, ""
+		}
+	}
+	if jobType == models.JobTypeImageImport {
+		if errors.Is(err, database.ErrJobLeaseLost) ||
+			errors.Is(err, context.Canceled) ||
+			strings.Contains(lower, "timedout") ||
+			strings.Contains(lower, "operation timed out") ||
+			strings.Contains(lower, "wait for nfc") ||
+			strings.Contains(lower, `upload "`) {
+			return true, RetryReasonTimeout
 		}
 	}
 	if errors.Is(err, vcenter.ErrPlacementValidationUnavailable) {
