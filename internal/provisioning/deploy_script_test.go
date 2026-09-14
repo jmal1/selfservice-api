@@ -5211,7 +5211,7 @@ func TestDeployScriptsAreExecutable(t *testing.T) {
 	}
 }
 
-func TestProductionPushBuildsCompleteImageMatrix(t *testing.T) {
+func TestImageMatrixPathFiltersPushAndShared(t *testing.T) {
 	requirePOSIXShell(t)
 	script := filepath.Join("..", "..", ".github", "scripts", "compute-image-matrix.sh")
 	workflow, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "ci.yaml"))
@@ -5231,10 +5231,13 @@ func TestProductionPushBuildsCompleteImageMatrix(t *testing.T) {
 	if pushStart < 0 || pullRequestStart <= pushStart {
 		t.Fatal("could not locate push and pull_request workflow triggers")
 	}
+	// Workflow still runs on every main push; the matrix may be empty for
+	// docs-only commits. Do not reintroduce paths-ignore that skips the job.
 	if strings.Contains(string(workflow)[pushStart:pullRequestStart], "paths-ignore:") {
-		t.Fatal("main pushes can still skip the complete image workflow")
+		t.Fatal("main pushes must not paths-ignore the image workflow")
 	}
 	all := `["api-gateway","provision-worker","crucible-engine","synthetic-api-monitor","crucible-runner"]`
+	alpine := `["api-gateway","provision-worker","crucible-engine","synthetic-api-monitor"]`
 	for _, test := range []struct {
 		name    string
 		event   string
@@ -5242,16 +5245,34 @@ func TestProductionPushBuildsCompleteImageMatrix(t *testing.T) {
 		want    string
 	}{
 		{
-			name:    "partial main change still publishes all deployment images",
+			name:    "push path-filters like PRs",
 			event:   "push",
 			changes: `["api-gateway","go-tests"]`,
-			want:    all,
+			want:    `["api-gateway"]`,
 		},
 		{
-			name:    "empty main matrix still publishes all deployment images",
+			name:    "empty push matrix publishes no images",
 			event:   "push",
 			changes: `[]`,
-			want:    all,
+			want:    `[]`,
+		},
+		{
+			name:    "shared forces Alpine only, not Kali",
+			event:   "push",
+			changes: `["shared","go-tests"]`,
+			want:    alpine,
+		},
+		{
+			name:    "shared plus runner channel includes Kali",
+			event:   "push",
+			changes: `["shared","crucible-runner"]`,
+			want:    `["api-gateway","provision-worker","crucible-engine","synthetic-api-monitor","crucible-runner"]`,
+		},
+		{
+			name:    "runner-only rebuilds Kali alone",
+			event:   "push",
+			changes: `["crucible-runner"]`,
+			want:    `["crucible-runner"]`,
 		},
 		{
 			name:    "pull request remains selective",
@@ -5266,7 +5287,7 @@ func TestProductionPushBuildsCompleteImageMatrix(t *testing.T) {
 				t.Fatalf("matrix helper failed: %v\n%s", err, output)
 			}
 			if strings.TrimSpace(string(output)) != test.want {
-				t.Fatalf("matrix = %q, want %q", output, test.want)
+				t.Fatalf("matrix = %q, want %q", strings.TrimSpace(string(output)), test.want)
 			}
 		})
 	}
