@@ -30,17 +30,19 @@ type ProvisioningConfig struct {
 }
 
 // ObjectStoreConfig holds the S3/MinIO settings used to stage browser-uploaded
-// installer images before they are imported into vCenter. Uploads are handed to
-// the browser as presigned URLs, so Endpoint must be the address the *browser*
-// can reach (and, because Crucible is served over HTTPS, it must itself be
-// HTTPS or the browser blocks the request as mixed content).
+// installer images before they are imported into vCenter.
+//
+// Endpoint is the API/worker reachability address (lab Traefik).
+// PublicEndpoint, when set, is the browser-facing HTTPS host used only for
+// SigV4-presigned PUT URLs (must be HTTPS or the browser blocks mixed content).
 type ObjectStoreConfig struct {
-	Endpoint  string
-	AccessKey string
-	SecretKey string
-	Bucket    string
-	Prefix    string
-	UseSSL    bool
+	Endpoint       string
+	PublicEndpoint string
+	AccessKey      string
+	SecretKey      string
+	Bucket         string
+	Prefix         string
+	UseSSL         bool
 }
 
 type ServerConfig struct {
@@ -243,12 +245,13 @@ func Load() (*Config, error) {
 			SSHHostKey:       getEnv("OPNSENSE_SSH_HOST_KEY", ""),
 		},
 		ObjectStore: ObjectStoreConfig{
-			Endpoint:  getEnv("OBJECTSTORE_ENDPOINT", ""),
-			AccessKey: getEnv("OBJECTSTORE_ACCESS_KEY", ""),
-			SecretKey: getEnv("OBJECTSTORE_SECRET_KEY", ""),
-			Bucket:    getEnv("OBJECTSTORE_BUCKET", "isos"),
-			Prefix:    getEnv("OBJECTSTORE_PREFIX", "crucible"),
-			UseSSL:    getEnvBool("OBJECTSTORE_USE_SSL", true),
+			Endpoint:       getEnv("OBJECTSTORE_ENDPOINT", ""),
+			PublicEndpoint: getEnv("OBJECTSTORE_PUBLIC_ENDPOINT", ""),
+			AccessKey:      getEnv("OBJECTSTORE_ACCESS_KEY", ""),
+			SecretKey:      getEnv("OBJECTSTORE_SECRET_KEY", ""),
+			Bucket:         getEnv("OBJECTSTORE_BUCKET", "isos"),
+			Prefix:         getEnv("OBJECTSTORE_PREFIX", "crucible"),
+			UseSSL:         getEnvBool("OBJECTSTORE_USE_SSL", true),
 		},
 		Provisioning: ProvisioningConfig{
 			Enabled:             provisioningEnabled,

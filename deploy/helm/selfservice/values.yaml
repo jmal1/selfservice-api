@@ -208,9 +208,13 @@ secrets:
 # endpoint MUST be https: the Crucible UI is served over TLS, so a
 # plain-http presigned PUT is blocked by the browser as mixed content.
 # Production endpoint/topology lives in private crucible-deploy.
+# endpoint = API/worker (lab Traefik). publicEndpoint = browser SigV4 host.
 objectstore:
   enabled: true
   endpoint: "https://s3.example.test"
+  # Browser-facing HTTPS host for SigV4-presigned multipart PUTs. Empty keeps
+  # legacy single-endpoint behaviour (presigns use endpoint).
+  publicEndpoint: ""
   # The bucket is "isos"; Crucible namespaces its objects under the "crucible/"
   # prefix below, which is also the boundary the service-account policy enforces.
   bucket: "isos"

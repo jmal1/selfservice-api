@@ -162,14 +162,18 @@ spec:
             - name: ENGINE_HEALTH_URL
               value: "http://{{ .Release.Name }}-engine.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.engine.port | default 8081 }}/healthz"
             {{- if .Values.objectstore.enabled }}
-            # Staging store for browser-uploaded installer images. The endpoint
-            # must be the address the *browser* can reach, because presigned PUT
-            # URLs are SigV4-signed for this exact host.
+            # Staging store for browser-uploaded installer images.
+            # OBJECTSTORE_ENDPOINT is the API/worker address (lab Traefik).
+            # OBJECTSTORE_PUBLIC_ENDPOINT is the browser SigV4 host (public Caddy).
             #
             # useSSL is deliberately NOT piped through `default`: Helm treats
             # false as empty, so `default true` would silently force TLS back on.
             - name: OBJECTSTORE_ENDPOINT
               value: {{ .Values.objectstore.endpoint | quote }}
+            {{- if .Values.objectstore.publicEndpoint }}
+            - name: OBJECTSTORE_PUBLIC_ENDPOINT
+              value: {{ .Values.objectstore.publicEndpoint | quote }}
+            {{- end }}
             - name: OBJECTSTORE_BUCKET
               value: {{ .Values.objectstore.bucket | quote }}
             - name: OBJECTSTORE_PREFIX

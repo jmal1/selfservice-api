@@ -35,24 +35,27 @@ const defaultPresignTTL = MaxPresignTTL
 // Config holds the connection settings for the object store.
 type Config struct {
 	Endpoint  string // e.g. "https://s3.example.test" — may include scheme
-	AccessKey string
-	SecretKey string
-	Bucket    string
-	Prefix    string // e.g. "crucible"
-	UseSSL    bool
+	// PublicEndpoint, when set, is the host used only for SigV4-presigned
+	// browser URLs (e.g. https://s3.jmal.io). Create/Complete/Get stay on
+	// Endpoint so workers and the API keep using the lab Traefik VIP.
+	PublicEndpoint string
+	AccessKey      string
+	SecretKey      string
+	Bucket         string
+	Prefix         string // e.g. "crucible"
+	UseSSL         bool
 }
 
 // Client is a thin wrapper around a minio.Core scoped to a single bucket and
 // key prefix.
 type Client struct {
-	core   *minio.Core
-	bucket string
-	prefix string
-
-	// endpoint and useSSL record the values actually handed to minio-go after
-	// scheme resolution. They are retained primarily for introspection/testing.
-	endpoint string
-	useSSL   bool
+	core       *minio.Core
+	presign    *minio.Core // equals core when PublicEndpoint is empty
+	bucket     string
+	prefix     string
+	endpoint   string
+	presignURL string // bare host used for browser URLs; empty when same as endpoint
+	useSSL     bool
 }
 
 // New validates cfg and constructs a Client. It returns a clear error when a
@@ -72,22 +75,41 @@ func New(cfg Config) (*Client, error) {
 	}
 
 	endpoint, useSSL := resolveEndpoint(cfg.Endpoint, cfg.UseSSL)
+	creds := credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, "")
 
 	core, err := minio.NewCore(endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),
+		Creds:  creds,
 		Secure: useSSL,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("objectstore: init client: %w", err)
 	}
 
-	return &Client{
+	c := &Client{
 		core:     core,
+		presign:  core,
 		bucket:   cfg.Bucket,
 		prefix:   cfg.Prefix,
 		endpoint: endpoint,
 		useSSL:   useSSL,
-	}, nil
+	}
+
+	if pub := strings.TrimSpace(cfg.PublicEndpoint); pub != "" {
+		pubHost, pubSSL := resolveEndpoint(pub, true)
+		if pubHost != endpoint {
+			presignCore, perr := minio.NewCore(pubHost, &minio.Options{
+				Creds:  creds,
+				Secure: pubSSL,
+			})
+			if perr != nil {
+				return nil, fmt.Errorf("objectstore: init public presign client: %w", perr)
+			}
+			c.presign = presignCore
+			c.presignURL = pubHost
+		}
+	}
+
+	return c, nil
 }
 
 // resolveEndpoint strips a leading http(s):// scheme (deriving UseSSL from it)
@@ -162,7 +184,7 @@ func cleanSegments(parts []string) []string {
 
 // PresignPut returns a presigned PUT URL for a single-part upload.
 func (c *Client) PresignPut(ctx context.Context, key string, ttl time.Duration) (string, error) {
-	u, err := c.core.PresignedPutObject(ctx, c.bucket, key, clampPresignTTL(ttl))
+	u, err := c.presign.PresignedPutObject(ctx, c.bucket, key, clampPresignTTL(ttl))
 	if err != nil {
 		return "", fmt.Errorf("objectstore: presign put %q: %w", key, err)
 	}
@@ -178,6 +200,8 @@ func (c *Client) PresignMultipart(ctx context.Context, key string, parts int, tt
 	}
 	ttl = clampPresignTTL(ttl)
 
+	// CreateMultipart runs on the internal endpoint; part URLs are signed for
+	// the public host when PublicEndpoint is configured.
 	uploadID, err = c.core.NewMultipartUpload(ctx, c.bucket, key, minio.PutObjectOptions{})
 	if err != nil {
 		return "", nil, fmt.Errorf("objectstore: start multipart %q: %w", key, err)
@@ -189,7 +213,7 @@ func (c *Client) PresignMultipart(ctx context.Context, key string, parts int, tt
 		params.Set("uploadId", uploadID)
 		params.Set("partNumber", strconv.Itoa(part))
 
-		u, perr := c.core.Presign(ctx, http.MethodPut, c.bucket, key, ttl, params)
+		u, perr := c.presign.Presign(ctx, http.MethodPut, c.bucket, key, ttl, params)
 		if perr != nil {
 			// Best-effort cleanup so a partial failure doesn't leave an
 			// in-flight upload consuming storage on the space-constrained host.
