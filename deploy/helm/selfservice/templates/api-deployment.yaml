@@ -97,6 +97,8 @@ spec:
               value: {{ .Values.api.provisioningPushgatewayURL | quote }}
             - name: PROVISIONING_PUSHGATEWAY_JOB
               value: {{ .Values.api.provisioningPushgatewayJob | quote }}
+            - name: PROMETHEUS_URL
+              value: {{ .Values.api.prometheusURL | default "" | quote }}
             # vCenter credentials for console access
             - name: VCENTER_URL
               value: {{ .Values.vcenter.url | quote }}

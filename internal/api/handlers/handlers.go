@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"path"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -94,6 +95,9 @@ type Handler struct {
 	provisioningConfigured bool
 	provisioningEnabled    bool
 	provisioningMetrics    provisioningAdmissionMetrics
+
+	prometheusURL string
+	promHTTP      *http.Client
 }
 
 type jobCreatedPublisher interface {
@@ -165,6 +169,16 @@ func NewHandler(db *database.Queries, events *events.Client, vc VCenterConsole, 
 		logger:          logger,
 		allowedOrigins:  allowedOrigins,
 	}
+}
+
+// WithPrometheusURL wires the optional instructor cluster-usage PromQL proxy.
+// Empty leaves GET /admin/cluster-usage available=false. Always call from main.
+func (h *Handler) WithPrometheusURL(raw string) *Handler {
+	h.prometheusURL = strings.TrimRight(strings.TrimSpace(raw), "/")
+	if h.prometheusURL != "" && h.promHTTP == nil {
+		h.promHTTP = &http.Client{Timeout: 8 * time.Second}
+	}
+	return h
 }
 
 // WithProvisioningAdmission configures the API maintenance gate. When this
@@ -292,6 +306,7 @@ func (h *Handler) WithProvisionDB(db provisionDB) *Handler {
 // — see Handler.runsStore() and WithRunsDB.
 type runsListDB interface {
 	ListAllRunsFiltered(ctx context.Context, filter database.RunsListFilter) ([]models.Run, error)
+	ListRunsForUser(ctx context.Context, userID uuid.UUID, since time.Time) ([]models.Run, error)
 }
 
 // runsStore returns the runsListDB in use. h.runsDB is non-nil only in

@@ -36,6 +36,9 @@ api:
   pipelinePushgatewayJob: "crucible_pipeline_api"
   provisioningPushgatewayURL: "http://pushgateway.observability:9091"
   provisioningPushgatewayJob: "crucible_provisioning_admission"
+  # In-cluster Prometheus HTTP API for instructor host CPU/RAM history.
+  # Empty hides the 7-day graph (SQL allocation gauges still render).
+  prometheusURL: "http://prometheus-server.observability.svc:80"
   resources:
     requests:
       cpu: 100m

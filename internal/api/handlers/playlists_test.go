@@ -37,12 +37,20 @@ import (
 
 type fakeRunsDB struct {
 	receivedFilter database.RunsListFilter
+	receivedUserID uuid.UUID
+	receivedSince  time.Time
 	runs           []models.Run
 	err            error
 }
 
 func (f *fakeRunsDB) ListAllRunsFiltered(_ context.Context, filter database.RunsListFilter) ([]models.Run, error) {
 	f.receivedFilter = filter
+	return f.runs, f.err
+}
+
+func (f *fakeRunsDB) ListRunsForUser(_ context.Context, userID uuid.UUID, since time.Time) ([]models.Run, error) {
+	f.receivedUserID = userID
+	f.receivedSince = since
 	return f.runs, f.err
 }
 

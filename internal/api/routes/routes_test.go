@@ -210,6 +210,7 @@ func TestAdministrativeResourceRoutesAreRegistered(t *testing.T) {
 		"GET /api/v1/admin/playlists/{playlistID}",
 		"PUT /api/v1/admin/playlists/{playlistID}",
 		"DELETE /api/v1/admin/playlists/{playlistID}",
+		"GET /api/v1/admin/cluster-usage",
 	}
 	for _, route := range want {
 		if !found[route] {
@@ -226,6 +227,7 @@ func TestAdministrativeResourceRoutesRequireInstructorRole(t *testing.T) {
 		path   string
 	}{
 		{method: http.MethodGet, path: "/api/v1/admin/jobs"},
+		{method: http.MethodGet, path: "/api/v1/admin/cluster-usage"},
 		{method: http.MethodPatch, path: "/api/v1/admin/users/" + uuid.NewString() + "/quotas"},
 		{method: http.MethodPost, path: "/api/v1/admin/blueprints/reorder"},
 		{method: http.MethodPost, path: "/api/v1/admin/pods/" + uuid.NewString() + "/extend"},
@@ -303,6 +305,7 @@ func TestAdminRunsRouteRegistered(t *testing.T) {
 	want := []string{
 		"GET /api/v1/admin/runs",
 		"GET /api/v1/admin/runs/{runID}",
+		"GET /api/v1/runs",
 	}
 	for _, w := range want {
 		if !found[w] {

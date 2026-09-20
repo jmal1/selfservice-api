@@ -106,6 +106,7 @@ func main() {
 
 	// Create handlers and router
 	handler := handlers.NewHandler(queries, natsClient, vcClient, logger, cfg.Server.AllowedOrigins)
+	handler.WithPrometheusURL(cfg.Server.PrometheusURL)
 	admissionMetrics := handlers.NewProvisioningAdmissionMetrics(
 		os.Getenv("PROVISIONING_PUSHGATEWAY_URL"),
 		os.Getenv("PROVISIONING_PUSHGATEWAY_JOB"),

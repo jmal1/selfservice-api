@@ -1,10 +1,10 @@
-# Testing and Feedback
+# Vulnerability Assessments
 
 Some labs include instructor-provided playlists that check your work and show feedback.
 
 ## Run a playlist
 
-1. Open your active lab and select **Testing**.
+1. Open your active lab and select **Run Vulnerability Assessments**.
 2. Review the playlists shown for that lab. Only playlists assigned to the lab are available.
 3. Select a playlist and choose **Run**.
 4. Wait for the run to move from queued or running to a completed result.
@@ -13,7 +13,7 @@ Some labs include instructor-provided playlists that check your work and show fe
 
 ## Read your results
 
-1. Open **Recent Results** from the Testing view.
+1. Open **Recent Runs** from the Vulnerability Assessments view, or open **Current Operations** from the sidebar for recent runs across your labs.
 2. Select a completed run to review its pass/fail summary and student-facing feedback.
 3. Fix the issue described in the feedback, then run the playlist again when you are ready.
 

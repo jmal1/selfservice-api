@@ -363,6 +363,8 @@ func TestChartWiresEveryProvisioningControl(t *testing.T) {
 			"PROVISIONING_ENABLED",
 			"PROVISIONING_PUSHGATEWAY_URL",
 			"PROVISIONING_PUSHGATEWAY_JOB",
+			"PROMETHEUS_URL",
+			".Values.api.prometheusURL",
 			"VCENTER_DATASTORE",
 			"VCENTER_RESOURCE_POOLS",
 			"VCENTER_HOSTS",

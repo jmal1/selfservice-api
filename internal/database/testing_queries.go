@@ -306,6 +306,33 @@ func (q *Queries) GetRecentRunsForPod(ctx context.Context, podID uuid.UUID, limi
 	return runs, nil
 }
 
+// ListRunsForUser returns in-progress runs plus recently completed runs for one caller.
+func (q *Queries) ListRunsForUser(ctx context.Context, userID uuid.UUID, since time.Time) ([]models.Run, error) {
+	rows, err := q.pool.Query(ctx, runAttributionSelect+`
+		WHERE r.triggered_by = $1
+		  AND (
+		    r.status IN ('pending', 'provisioning', 'running')
+		    OR COALESCE(r.completed_at, r.created_at) >= $2
+		  )
+		ORDER BY r.created_at DESC
+		LIMIT 50
+	`, userID, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	runs := make([]models.Run, 0)
+	for rows.Next() {
+		var r models.Run
+		if err := scanRunAttribution(rows.Scan, &r); err != nil {
+			return nil, err
+		}
+		runs = append(runs, r)
+	}
+	return runs, rows.Err()
+}
+
 // GetRunsForPod returns all runs for a pod.
 func (q *Queries) GetRunsForPod(ctx context.Context, podID uuid.UUID) ([]models.Run, error) {
 	return q.GetRecentRunsForPod(ctx, podID, 100)

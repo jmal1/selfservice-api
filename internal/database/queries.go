@@ -720,6 +720,28 @@ func getResourceUsage(ctx context.Context, querier jobRowQuerier, userID uuid.UU
 	return &usage, err
 }
 
+// ClusterAllocated is the lab-wide vCPU/RAM/pod tally used by instructor capacity gauges.
+type ClusterAllocated struct {
+	VCPUs int
+	RAMMB int
+	Pods  int
+}
+
+// GetClusterAllocatedUsage sums resources on pods that are not destroyed or errored.
+func (q *Queries) GetClusterAllocatedUsage(ctx context.Context) (ClusterAllocated, error) {
+	var out ClusterAllocated
+	err := q.pool.QueryRow(ctx, `
+		SELECT
+			COALESCE(SUM(pv.vcpus), 0),
+			COALESCE(SUM(pv.ram_mb), 0),
+			COUNT(DISTINCT p.id)
+		FROM pods p
+		LEFT JOIN pod_vms pv ON p.id = pv.pod_id AND pv.status NOT IN ('deleted', 'error')
+		WHERE p.status NOT IN ('destroyed', 'error')
+	`).Scan(&out.VCPUs, &out.RAMMB, &out.Pods)
+	return out, err
+}
+
 // CheckoutVLAN atomically reserves a random available VLAN from the pool.
 // hostScope filters VLANs by host compatibility: "all" for any host, "switch1" for esxi1/esxi2 only.
 // Pass empty string to accept any VLAN regardless of scope.

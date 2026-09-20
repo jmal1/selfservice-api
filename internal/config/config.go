@@ -49,6 +49,9 @@ type ServerConfig struct {
 	Host           string
 	Port           int
 	AllowedOrigins []string
+	// PrometheusURL is the in-cluster Prometheus HTTP API used by the
+	// instructor cluster-usage proxy. Empty disables host CPU/RAM history.
+	PrometheusURL string
 }
 
 type DatabaseConfig struct {
@@ -187,6 +190,7 @@ func Load() (*Config, error) {
 			Host:           getEnv("SERVER_HOST", "0.0.0.0"),
 			Port:           getEnvInt("SERVER_PORT", 8080),
 			AllowedOrigins: splitEnv("ALLOWED_ORIGINS", "https://crucible.example.test"),
+			PrometheusURL:  getEnv("PROMETHEUS_URL", ""),
 		},
 		Database: DatabaseConfig{
 			Host:            getEnv("DB_HOST", "localhost"),
