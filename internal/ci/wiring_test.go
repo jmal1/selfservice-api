@@ -43,6 +43,7 @@ var requiredWiring = map[string][]struct {
 		{"WithVCenterISOs", "without it the template wizard's ISO picker is permanently empty"},
 		{"WithProvisioningAdmission", "without it PROVISIONING_ENABLED is parsed but new pod and VM requests remain admitted during maintenance"},
 		{"NewProvisioningAdmissionMetrics", "without it maintenance state and rejection counters are absent from Pushgateway"},
+		{"WithPrometheusURL", "without it PROMETHEUS_URL is parsed but instructor cluster-usage never queries Prometheus"},
 	},
 	"internal/api/routes/routes.go": {
 		{"r.Use(h.ProvisioningAdmission)", "the admission gate must run after authentication but before AuditRequests can touch the database"},

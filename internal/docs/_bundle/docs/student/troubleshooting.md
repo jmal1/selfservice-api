@@ -8,7 +8,7 @@ Use these checks for common lab access problems before requesting help.
 2. Complete the Authentik multi-factor prompt and confirm your device clock is accurate.
 3. If the prompt loops, try a private browser window or clear the site's sign-in cookies.
 
-**Expected result:** You return to the Crucible Dashboard with your account visible.
+**Expected result:** You return to **My Labs** with your account visible.
 
 ## Provisioning problems
 

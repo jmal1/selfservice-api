@@ -269,8 +269,8 @@
     {
       "path": "docs/student/connecting.md",
       "title": "Connecting to Your VM",
-      "size": 2372,
-      "sha256": "0a10b74c5623ca7d1d8c293497122995832bde603b2fb704634561c29080b0cc",
+      "size": 2406,
+      "sha256": "5d347498c9b9f7a000baa869349578648267e1534893ad4cb15c58ce9b7d261e",
       "is_markdown": true,
       "links_out": [
         "docs/student/troubleshooting.md"
@@ -280,8 +280,8 @@
     {
       "path": "docs/student/labs.md",
       "title": "Creating and Managing Labs",
-      "size": 1908,
-      "sha256": "59579b4d6d1e31037a65f774c4746acfa87ad3ecde514f0ef94a2094b36cfd2f",
+      "size": 2122,
+      "sha256": "00ab8dc15119bc4762478aadf781ff0e7c74b42b451f654b0b055caee804367f",
       "is_markdown": true,
       "links_out": [
         "docs/student/snapshots.md"
@@ -291,8 +291,8 @@
     {
       "path": "docs/student/overview.md",
       "title": "Getting Started",
-      "size": 963,
-      "sha256": "7567c1f8e54b5e1f1611e11a0021362dc7b9cc40ae304f2d164df38f5d905e85",
+      "size": 1107,
+      "sha256": "8015edeb7949c08f7da0a1a17bd0ef2ac4ddfcea4d79ca1d65dddd125b5b82cf",
       "is_markdown": true,
       "links_out": [
         "docs/student/connecting.md",
@@ -311,25 +311,25 @@
     },
     {
       "path": "docs/student/testing.md",
-      "title": "Testing and Feedback",
-      "size": 1052,
-      "sha256": "ba3f1bc9e8ed65da3b2f239fad549b56d5f2c30fda5433453b0a07d9079bcb07",
+      "title": "Vulnerability Assessments",
+      "size": 1176,
+      "sha256": "2b584c998692a89aefb0bbc6b310dfdf33228c027d7cc2d03b173dd079612747",
       "is_markdown": true,
       "from_seed": false
     },
     {
       "path": "docs/student/troubleshooting.md",
       "title": "Troubleshooting",
-      "size": 1932,
-      "sha256": "f13980927f7d2ca0ee7b267c35494c45b05311061dda05239081eee7c8d231fc",
+      "size": 1921,
+      "sha256": "736c686345986ddc3551423985fbf3233179e479184c4e65d7420ec027a48468",
       "is_markdown": true,
       "from_seed": false
     },
     {
       "path": "internal/api/routes/routes.go",
       "title": "routes.go (Go)",
-      "size": 15502,
-      "sha256": "f39f3e475fd6e5dfc10b3383c7fc551bbc072bcafc70eabe68c58345bdfc827b",
+      "size": 15583,
+      "sha256": "7bb5115891e0eaf0d1d7fb2fdbd7a64bfc0c122ce58383eea7a6cbc50c2e84bf",
       "is_markdown": false,
       "from_seed": false
     },
@@ -438,5 +438,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 745247
+  "total_bytes": 745833
 }

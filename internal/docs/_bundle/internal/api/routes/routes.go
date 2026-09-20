@@ -140,6 +140,7 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 			// Jobs
 			r.Get("/jobs", h.ListMyJobs)
 			r.Get("/jobs/{jobID}/status", h.GetJobStatus)
+			r.Get("/runs", h.ListMyRuns)
 
 			// Wiki — instructor + admin authoring reference. Embedded bundle
 			// is built by cmd/wiki-bundler (see make wiki-bundle). Gated to
@@ -362,6 +363,7 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 				// Testing runs (admin view)
 				r.Get("/runs", h.AdminListRuns)
 				r.Get("/runs/{runID}", h.AdminGetRun)
+				r.Get("/cluster-usage", h.AdminClusterUsage)
 			})
 		})
 	}) // close r.Group for Logger/Compress
