@@ -2064,7 +2064,7 @@ func TestDeployScriptMigrationContiguityIsLoadBearing(t *testing.T) {
 		t.Fatal(err)
 	}
 	const correct = "local inventory base raw name direction version expected max_version=0"
-	const sabotaged = "local inventory base raw name direction version expected max_version=43"
+	const sabotaged = "local inventory base raw name direction version expected max_version=44"
 	if strings.Count(string(source), correct) != 1 {
 		t.Fatal("migration contiguity sequence initializer is not unique")
 	}
@@ -2090,7 +2090,7 @@ func TestDeployScriptMigrationPairingIsLoadBearing(t *testing.T) {
 		t.Fatal(err)
 	}
 	const correct = `find "$migration_dir" -maxdepth 1 -type f -name '*.sql' -printf '%f\n' |`
-	const sabotaged = `{ find "$migration_dir" -maxdepth 1 -type f -name '*.sql' -printf '%f\n'; printf '000043_orphan.down.sql\n'; } |`
+	const sabotaged = `{ find "$migration_dir" -maxdepth 1 -type f -name '*.sql' -printf '%f\n'; printf '000044_orphan.down.sql\n'; } |`
 	if strings.Count(string(source), correct) != 1 {
 		t.Fatal("migration file enumeration command is not unique")
 	}
@@ -6784,7 +6784,7 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 		gitRemoteSHA:              testSourceSHA,
 		gitRemoteURL:              "git@github.com:jmal1/selfservice-api.git",
 		commitVerified:            true,
-		migrationState:            "1:42:false",
+		migrationState:            "1:43:false",
 		provisioningJobs:          "0",
 		syntheticQuotaState:       "1:0",
 		syntheticUserID:           testSyntheticUserID,

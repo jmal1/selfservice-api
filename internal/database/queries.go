@@ -743,7 +743,9 @@ func (q *Queries) GetClusterAllocatedUsage(ctx context.Context) (ClusterAllocate
 }
 
 // CheckoutVLAN atomically reserves a random available VLAN from the pool.
-// hostScope filters VLANs by host compatibility: "all" for any host, "switch1" for esxi1/esxi2 only.
+// hostScope filters VLANs by host compatibility. Live pod_create uses "all".
+// "switch1" remains a valid admin label for rare pin cases but is no longer
+// required: both Sodola switches trunk the Crucible pod VLAN range.
 // Pass empty string to accept any VLAN regardless of scope.
 func (q *Queries) CheckoutVLAN(ctx context.Context, tx pgx.Tx, podID uuid.UUID, hostScope string) (int, string, error) {
 	var vlanTag int
