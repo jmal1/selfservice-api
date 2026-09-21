@@ -125,7 +125,8 @@ type IdleSuspendCandidate struct {
 
 // ListRunningPodVMsForIdleEval returns running pod_vms that belong to active
 // pods and have a vCenter reference. These are the candidates the idle
-// evaluator inspects on each tick.
+// evaluator inspects on each tick. Owner role is not filtered: instructor and
+// admin pods consume the same host resources as student pods when left idle.
 //
 // last_activity_at is COALESCEd to created_at deliberately. A NULL here means
 // "no activity has ever been recorded", which the evaluator reads as infinitely
@@ -141,10 +142,8 @@ func (q *Queries) ListRunningPodVMsForIdleEval(ctx context.Context) ([]IdleSuspe
 		       pv.display_name, COALESCE(pv.last_activity_at, pv.created_at)
 		FROM pod_vms pv
 		JOIN pods p ON pv.pod_id = p.id
-		JOIN users u ON u.id = p.owner_id
 		WHERE pv.status = 'running'
 		  AND p.status = 'active'
-		  AND u.role = 'student'
 		  AND pv.vcenter_vm_id IS NOT NULL AND pv.vcenter_vm_id <> ''
 	`)
 	if err != nil {
@@ -171,11 +170,9 @@ func (q *Queries) IdleSuspendCandidateStillEligible(ctx context.Context, podVMID
 			SELECT 1
 			FROM pod_vms pv
 			JOIN pods p ON p.id = pv.pod_id
-			JOIN users u ON u.id = p.owner_id
 			WHERE pv.id = $1
 			  AND pv.status = 'running'
 			  AND p.status = 'active'
-			  AND u.role = 'student'
 		)
 	`, podVMID).Scan(&eligible)
 	return eligible, err

@@ -13,7 +13,7 @@ Create a lab from the templates or blueprints your instructor has shared with yo
 ## Understand your limits
 
 - A new lab expires after 5 days. **Extend** sets its expiration to 5 days from the time you extend it, and each lab can be extended at most twice. Extend appears on the list when the lab is close to expiring; it is always available after you open the lab.
-- Student labs automatically suspend after 2 hours without activity. A lab that remains suspended for 5 days is destroyed.
+- Labs automatically suspend after 2 hours without activity, for every owner role. A lab that remains suspended for 5 days is destroyed.
 - Your total quota is 2 labs (pods), 4 vCPUs, and 8 GB of RAM. Open **Quotas** to see current use.
 - Each VM keeps its protected original snapshot plus one replaceable snapshot that you create.
 
