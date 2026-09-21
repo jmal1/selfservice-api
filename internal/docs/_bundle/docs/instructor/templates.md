@@ -83,14 +83,16 @@ Anything not listed, **leave blank** — the wizard fills in sensible defaults.
 | I want to build… | Source type | ISO install mode | Username | Password | Everything else |
 |------------------|-------------|------------------|----------|----------|-----------------|
 | A copy of an existing lab template (most common) | **Clone an existing Crucible template** | — | leave blank | leave blank | leave blank |
+| An already-imported OVA (skip-generalize checked) | **OVF / imported OVA** | — | login baked into the OVA (prefer `student` / `Student`) | real password baked into the OVA | leave blank |
 | Ubuntu Server from scratch | **ISO install** | `cloudinit_cidata` | `student` | `REPLACE_WITH_BUILD_PASSWORD` | leave blank |
 | Kali or Debian from scratch | **ISO install** | `debian_preseed` | `student` | `REPLACE_WITH_BUILD_PASSWORD` | leave blank |
 | Windows from scratch | **ISO install** | `windows_autounattend` | `Student` | `REPLACE_WITH_BUILD_PASSWORD` | leave blank |
 | A desktop OS I want to click through myself | **ISO install** | `manual` | leave blank | leave blank | leave blank |
 
 The **standard build password** for this lab is `REPLACE_WITH_BUILD_PASSWORD`. Use it wherever
-the wizard asks you to make up a password, unless your teacher tells you
-otherwise. See
+the wizard asks you to make up a password for a **customized** build, unless your teacher tells you
+otherwise. For skip-generalize OVF/OVA, use the password already inside the image instead — students
+see that value on the pod page. See
 [The standard build login](#the-standard-build-login-studentchangeme123) for
 what this password is and is not.
 
@@ -141,15 +143,27 @@ Starting size for the build VM. Students can bump CPU/RAM later within their quo
 
 ### Field reference — Guest credentials (bottom of the form)
 
-These are the **username and password the wizard uses to log in and clean the
-VM** during Generalize.
+**When "Image is already generalized" is checked** (default for OVF/OVA): these
+are the login **already baked into the image**. Crucible does **not** rewrite
+them — students see these exact values on the pod page after launch. They must
+match the OVA (or source VM) or students cannot log in.
+
+| Field | What to type | If you leave it blank |
+|-------|--------------|-----------------------|
+| **Default username** | The account inside the image. Prefer `student` (Linux) or `Student` (Windows) so lab tooling stays consistent. | Students have no working login shown on the pod page. |
+| **Default password** | The real password already set in the image — not a placeholder. | Same: blank credentials lock students out. |
+
+**When generalize runs** (ISO builds, customized clones, or you unchecked
+skip-generalize): these are the **username and password the wizard uses to log
+in and clean the VM** during Generalize. Students still get a
+**randomly-generated** password on the pod page — this is not that password.
 
 | Field | What to type | If you leave it blank |
 |-------|--------------|-----------------------|
 | **Default username** | The account you'll log in as. For a **Linux** template this **must be** `student`. For Windows, `Student`. | For "Clone an existing Crucible template", it's copied from the source template. For an ISO build, the account you created during install is used. |
 | **Default password** | The standard build password `REPLACE_WITH_BUILD_PASSWORD` | Same fallback as above. |
 
-> [!warning] For **Linux** templates the username has to be exactly `student`.
+> [!warning] For **Linux** templates that customize each clone, the username has to be exactly `student`.
 > Crucible gives every student pod its own password by setting it on the account
 > named `student`. If your account is called `ubuntu` or `admin`, students get a
 > password on an account they're never told about and **can't log in**. The
@@ -208,11 +222,18 @@ This is the **build login** — the account *you* use to log into the VM in the
 console while you set it up. It is a shared, well-known convention so anyone on
 the team can pick up a half-built template.
 
-This is **not** the password students get. When a student launches a pod,
-Crucible generates a **brand-new random password just for them** and shows it
-on their pod page. `REPLACE_WITH_BUILD_PASSWORD` only ever lives on the build VM and is
-replaced on every student copy. Never tell a student that their password is
+For templates that **customize each clone**, this is **not** the password
+students get. When a student launches a pod, Crucible generates a **brand-new
+random password just for them** and shows it on their pod page.
+`REPLACE_WITH_BUILD_PASSWORD` only ever lives on the build VM and is replaced on
+every student copy. Never tell a student that their password is
 `REPLACE_WITH_BUILD_PASSWORD`; theirs is different.
+
+**Exception — skip-generalize OVF/OVA (or other already-prepared appliances):**
+Crucible does not rewrite the guest login. Put the username/password **baked
+into the OVA** in **Default username / Default password**. Students see those
+exact values on the pod page. Do not leave them blank and do not use a
+placeholder.
 
 When do you type it vs. leave things blank?
 
@@ -220,7 +241,10 @@ When do you type it vs. leave things blank?
   The template you cloned already has working credentials and they carry over.
 - **Building from an ISO:** type `Student`/`REPLACE_WITH_BUILD_PASSWORD` in the **Unattended
   install** boxes so the installer creates that account.
-- **Any template where you're unsure what the login is:** set the **Default
+- **OVF / imported OVA with skip-generalize checked:** type the real baked-in
+  login from the appliance (prefer `student` / `Student` naming when you control
+  the image).
+- **Any customized template where you're unsure what the login is:** set the **Default
   username / Default password** at the bottom to `Student`/`REPLACE_WITH_BUILD_PASSWORD` so the
   wizard has something real to log in with during Generalize.
 
@@ -519,6 +543,9 @@ reason and a retry path. Author a template with `source_type=ovf` and that
 moref. The wizard defaults `skip_generalize=true` when the source is OVF/OVA
 (prepared appliance — skip sysprep/cloud-init clean; **Verify still runs**).
 Publish still requires the existing `ready` → `verifying` → `active` smoke gate.
+With skip-generalize checked, fill **Default username / Default password** with
+the login already inside the OVA — those are the credentials students see on the
+pod page (Crucible does not generate a replacement password for that path).
 
 If the import fails (shown in the image list as an error with a message), click
 **Retry import** to re-run the import without re-uploading the file. Deleting an

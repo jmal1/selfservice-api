@@ -64,23 +64,28 @@ Key facts from that guide you may rely on:
 | Student wants… | Source type | ISO mode | Username | Password |
 |----------------|-------------|----------|----------|----------|
 | A copy of a template that already works | Clone an existing Crucible template | — | blank | blank |
-| An already-imported OVA | OVF / imported OVA (`source_ref` = moref) | — | blank | blank |
+| An already-imported OVA | OVF / imported OVA (`source_ref` = moref; leave skip-generalize checked) | — | login baked into the OVA (prefer `student` / `Student`) | real password baked into the OVA (students see this) |
 | Ubuntu Server from scratch | ISO install | `cloudinit_cidata` | `student` | `REPLACE_WITH_BUILD_PASSWORD` |
 | Kali / Debian from scratch | ISO install | `debian_preseed` | `student` | `REPLACE_WITH_BUILD_PASSWORD` |
 | Windows from scratch | ISO install | `windows_autounattend` | `Student` | `REPLACE_WITH_BUILD_PASSWORD` |
 | A desktop OS they'll click through | ISO install | `manual` | blank | blank |
 
-Everything not in the recipe: tell them to **leave it blank**.
+Everything not in the recipe: tell them to **leave it blank** — except OVF/OVA guest credentials, which must match the image.
 
 ## Rules of thumb (state these to the student when relevant)
 
 - **Linux username must be exactly `student`.** Crucible sets each student's
   password on the account named `student`. If it's `ubuntu` or `admin`, students
   can't log in and Publish will block the template. This is the #1 mistake.
-- **`REPLACE_WITH_BUILD_PASSWORD` is the *build* password, not the student's password.** Every
-  student pod gets its own random password shown on their pod page. `REPLACE_WITH_BUILD_PASSWORD`
-  only lets *them* log into the VM they're building. Never tell a student their
-  pod password is `REPLACE_WITH_BUILD_PASSWORD`.
+- **`REPLACE_WITH_BUILD_PASSWORD` is the *build* password, not the student's password**
+  for customized clones. Every student pod gets its own random password shown on
+  their pod page. `REPLACE_WITH_BUILD_PASSWORD` only lets *them* log into the VM
+  they're building. Never tell a student their pod password is
+  `REPLACE_WITH_BUILD_PASSWORD`.
+- **Skip-generalize OVF/OVA is different:** Crucible does not rewrite the guest
+  login. Put the username/password already inside the OVA in Default username /
+  Default password — students see those exact values. Do not leave them blank
+  and do not use a placeholder.
 - **Don't leave the ISO password blank** — always set `REPLACE_WITH_BUILD_PASSWORD` there, even
   though most other ISO fields can be blank.
 - If they picked an ISO but don't see it in the dropdown, tell them to upload it
