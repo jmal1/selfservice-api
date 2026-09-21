@@ -41,9 +41,12 @@ func PodExtend(role string) (time.Duration, error) {
 	}
 }
 
-// IdleSuspendApplies is true only for student-owned pods.
-func IdleSuspendApplies(role string) bool {
-	return role == RoleStudent
+// IdleSuspendApplies reports whether idle auto-suspend applies to pods owned by
+// this role. The role argument is retained for call-site compatibility; every
+// owner role is subject to inactivity suspension because idle VMs hold the same
+// host RAM regardless of who owns them.
+func IdleSuspendApplies(_ string) bool {
+	return true
 }
 
 // NewExpiresAt returns a non-nil expires_at for known roles.
