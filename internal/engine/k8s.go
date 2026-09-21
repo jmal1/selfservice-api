@@ -41,8 +41,11 @@ type K8sClient struct {
 type K8sConfig struct {
 	Namespace   string // K8s namespace for runner resources (default: selfservice)
 	RunnerImage string // Container image for the runner (default: ghcr.io/jmal1/selfservice-crucible-runner:latest)
-	RunnerNode  string // Node selector for runner pods (default: k3sv03)
-	TrunkNIC    string // Host NIC carrying the pod VLAN trunk (default: ens224)
+	// RunnerNode selects where assessment Jobs land.
+	// "pool" (or empty) → label node-role.kubernetes.io/runner=true across the runner pool.
+	// Any other value → kubernetes.io/hostname pin (emergency single-node fallback).
+	RunnerNode string
+	TrunkNIC   string // Host NIC carrying the pod VLAN trunk (default: ens224)
 	EngineURL   string // Internal URL for runner callbacks
 
 	// MaxConcurrentRunners caps simultaneous crucible-runner Jobs (active).
@@ -94,6 +97,20 @@ const (
 	runnerRangeStartHost = 251
 	runnerRangeEndHost   = 254
 )
+
+// runnerPoolLabel is the node label Multus and the image warmer already use.
+// Jobs must share it so assessments can land on any trunk-proven runner node.
+const runnerPoolLabel = "node-role.kubernetes.io/runner"
+
+// runnerNodeSelector returns the Job nodeSelector for RunnerNode.
+// "pool" or empty selects the labeled runner pool; any other value pins by hostname.
+func runnerNodeSelector(runnerNode string) map[string]string {
+	n := strings.TrimSpace(runnerNode)
+	if n == "" || strings.EqualFold(n, "pool") {
+		return map[string]string{runnerPoolLabel: "true"}
+	}
+	return map[string]string{"kubernetes.io/hostname": n}
+}
 
 // imagePullSecretRefs converts secret names into LocalObjectReferences,
 // returning nil for an empty list so the pod spec stays unchanged when no
@@ -283,9 +300,7 @@ func (k *K8sClient) ProvisionRunner(ctx context.Context, spec RunnerSpec) (*Prov
 							Effect:   corev1.TaintEffectNoSchedule,
 						},
 					},
-					NodeSelector: map[string]string{
-						"kubernetes.io/hostname": k.runnerNode,
-					},
+					NodeSelector: runnerNodeSelector(k.runnerNode),
 					Containers: []corev1.Container{
 						{
 							Name:  "runner",
