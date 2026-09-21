@@ -4,6 +4,7 @@
     "docs/instructor/templates.md",
     "docs/instructor/os-recipes.md",
     "docs/instructor/playlists.md",
+    "docs/instructor/student-password-recovery.md",
     "AGENTS.md",
     "docs/ai-prompts/build-workflow.md",
     "docs/ai-prompts/create-a-template.md",
@@ -157,8 +158,8 @@
     {
       "path": "docs/instructor/overview.md",
       "title": "Crucible for Instructors — Overview",
-      "size": 8687,
-      "sha256": "9722632626a5a171e1f178c18d15bfc6a1054a8b1c36a4c54bb4d0e748228784",
+      "size": 8788,
+      "sha256": "24334204d8bba27a4e72d9281ddaba6154597fca4f367122fada177c8f3f87a9",
       "is_markdown": true,
       "links_out": [
         "AGENTS.md",
@@ -170,6 +171,7 @@
         "docs/instructor/playlists.md",
         "docs/instructor/runner-environment.md",
         "docs/instructor/runner-environment.md",
+        "docs/instructor/student-password-recovery.md",
         "docs/instructor/templates.md",
         "docs/instructor/troubleshooting.md",
         "docs/instructor/workflows.md",
@@ -206,6 +208,14 @@
         "internal/runnertools/tools.txt"
       ],
       "from_seed": false
+    },
+    {
+      "path": "docs/instructor/student-password-recovery.md",
+      "title": "Student password recovery (Authentik)",
+      "size": 1862,
+      "sha256": "e5babe0b010a39f5b4bd404a7016673e5e9c7e3b940382c3ef331ca283bc18e5",
+      "is_markdown": true,
+      "from_seed": true
     },
     {
       "path": "docs/instructor/templates.md",
@@ -291,13 +301,15 @@
     {
       "path": "docs/student/overview.md",
       "title": "Getting Started",
-      "size": 1107,
-      "sha256": "8015edeb7949c08f7da0a1a17bd0ef2ac4ddfcea4d79ca1d65dddd125b5b82cf",
+      "size": 1351,
+      "sha256": "ea114f73639f296eaa67602cf2c10147215ad64da046266195158f40df5b2e60",
       "is_markdown": true,
       "links_out": [
         "docs/student/connecting.md",
         "docs/student/labs.md",
-        "docs/student/testing.md"
+        "docs/student/testing.md",
+        "docs/student/troubleshooting.md",
+        "docs/student/troubleshooting.md"
       ],
       "from_seed": false
     },
@@ -320,8 +332,8 @@
     {
       "path": "docs/student/troubleshooting.md",
       "title": "Troubleshooting",
-      "size": 1921,
-      "sha256": "736c686345986ddc3551423985fbf3233179e479184c4e65d7420ec027a48468",
+      "size": 2335,
+      "sha256": "8627d74407f52560725a17d6925dc153bcb4f9f96233524350ec55b14c0c3fe2",
       "is_markdown": true,
       "from_seed": false
     },
@@ -360,16 +372,16 @@
     {
       "path": "internal/engine/engine.go",
       "title": "engine.go (Go)",
-      "size": 17740,
-      "sha256": "78721d8bc41842601387e2c7aec2c12d094c0b53bd02fda551a0e4c2f919788d",
+      "size": 18661,
+      "sha256": "c0a1ce9c1e8fe984adaaa044726e6500e9bfaae4fc454712243623add0f1bb20",
       "is_markdown": false,
       "from_seed": false
     },
     {
       "path": "internal/engine/queries.go",
       "title": "queries.go (Go)",
-      "size": 17754,
-      "sha256": "c7c1c744e04d397ef70c3e46acdd606186780693d2bac998e770db0cbb9eae4b",
+      "size": 18413,
+      "sha256": "6b22abb36eb46d46e8af136e9457146c1e32c24d84b91fdd24174f68b45452e4",
       "is_markdown": false,
       "from_seed": false
     },
@@ -438,5 +450,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 745833
+  "total_bytes": 750034
 }

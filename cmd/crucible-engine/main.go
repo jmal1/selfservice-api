@@ -66,6 +66,9 @@ func main() {
 		RunnerNode:  getEnv("RUNNER_NODE", "k3sv03"),
 		TrunkNIC:    getEnv("RUNNER_TRUNK_NIC", "ens224"),
 		EngineURL:   getEnv("ENGINE_CALLBACK_URL", "http://crucible-engine.selfservice.svc.cluster.local:8081"),
+		// Global concurrent assessment runner Jobs. Class-scale default 14.
+		// Zero (explicit env MAX_CONCURRENT_RUNNERS=0) disables the gate.
+		MaxConcurrentRunners: getEnvInt("MAX_CONCURRENT_RUNNERS", 14),
 		// Crucible's GHCR packages are private, so the runner Job needs the same
 		// pull secret every Helm-managed workload gets. Defaulted rather than
 		// left empty: an unset value here fails at pull time with a 401 that

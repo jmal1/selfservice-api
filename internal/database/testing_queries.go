@@ -185,6 +185,16 @@ func (q *Queries) HasActiveRun(ctx context.Context, podID uuid.UUID) (bool, erro
 	return count > 0, err
 }
 
+// CountActiveRuns returns how many runs are pending, provisioning, or running cluster-wide.
+func (q *Queries) CountActiveRuns(ctx context.Context) (int, error) {
+	var count int
+	err := q.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM runs
+		WHERE status IN ('pending', 'provisioning', 'running')
+	`).Scan(&count)
+	return count, err
+}
+
 // CountRecentRuns counts runs triggered by a user on a pod within a time window.
 func (q *Queries) CountRecentRuns(ctx context.Context, podID, userID uuid.UUID, window time.Duration) (int, error) {
 	var count int

@@ -12,8 +12,17 @@ import (
 const (
 	clusterUsageWindow = 7 * 24 * time.Hour
 	clusterUsageStep   = time.Hour
-	promCPUQuery       = `100 * sum(vmware_host_cpu_usage) / clamp_min(sum(vmware_host_cpu_max), 1)`
-	promRAMQuery       = `100 * sum(vmware_host_memory_usage) / clamp_min(sum(vmware_host_memory_max), 1)`
+	promCPUUsageQuery  = `sum(vmware_host_cpu_usage)`
+	promCPUMaxQuery    = `sum(vmware_host_cpu_max)`
+	promRAMUsageQuery  = `sum(vmware_host_memory_usage)`
+	promRAMMaxQuery    = `sum(vmware_host_memory_max)`
+)
+
+// Deprecated PromQL kept only for test name stability in older comments;
+// absolute series are preferred. Percent is derived from absolute gauges.
+const (
+	promCPUQuery = `100 * sum(vmware_host_cpu_usage) / clamp_min(sum(vmware_host_cpu_max), 1)`
+	promRAMQuery = `100 * sum(vmware_host_memory_usage) / clamp_min(sum(vmware_host_memory_max), 1)`
 )
 
 type clusterUsagePoint struct {
@@ -22,19 +31,25 @@ type clusterUsagePoint struct {
 }
 
 type clusterUsageResponse struct {
-	Available      bool               `json:"available"`
-	CPUPercent     *float64           `json:"cpu_percent"`
-	RAMPercent     *float64           `json:"ram_percent"`
-	Series         clusterUsageSeries `json:"series"`
-	AllocatedVCPUs int                `json:"allocated_vcpus"`
-	AllocatedRAMMB int                `json:"allocated_ram_mb"`
-	ActivePods     int                `json:"active_pods"`
-	Message        string             `json:"message,omitempty"`
+	Available        bool               `json:"available"`
+	CPUPercent       *float64           `json:"cpu_percent"`
+	RAMPercent       *float64           `json:"ram_percent"`
+	HostCPUUsageMHz  *float64           `json:"host_cpu_usage_mhz"`
+	HostCPUMaxMHz    *float64           `json:"host_cpu_max_mhz"`
+	HostRAMUsageMB   *float64           `json:"host_ram_usage_mb"`
+	HostRAMMaxMB     *float64           `json:"host_ram_max_mb"`
+	Series           clusterUsageSeries `json:"series"`
+	AllocatedVCPUs   int                `json:"allocated_vcpus"`
+	AllocatedRAMMB   int                `json:"allocated_ram_mb"`
+	ActivePods       int                `json:"active_pods"`
+	Message          string             `json:"message,omitempty"`
 }
 
 type clusterUsageSeries struct {
-	CPU []clusterUsagePoint `json:"cpu"`
-	RAM []clusterUsagePoint `json:"ram"`
+	CPU        []clusterUsagePoint `json:"cpu"`
+	RAM        []clusterUsagePoint `json:"ram"`
+	CPUUsageMHz []clusterUsagePoint `json:"cpu_usage_mhz"`
+	RAMUsageMB  []clusterUsagePoint `json:"ram_usage_mb"`
 }
 
 type promAPIResponse struct {
@@ -55,14 +70,18 @@ type promRangeResult []struct {
 }
 
 // AdminClusterUsage returns SQL allocation gauges plus optional 7-day host
-// CPU/RAM history from Prometheus. The client query string is ignored; PromQL
-// is fixed in this handler. Empty or failed Prometheus still returns 200 with
-// available=false so the UI can keep the SQL gauges.
+// CPU/RAM history from Prometheus. Absolute host totals (MHz / MB) are
+// included so the instructor overview can show used/max, not only percent.
+// The client query string is ignored; PromQL is fixed in this handler. Empty
+// or failed Prometheus still returns 200 with available=false so the UI can
+// keep the SQL gauges.
 func (h *Handler) AdminClusterUsage(w http.ResponseWriter, r *http.Request) {
 	out := clusterUsageResponse{
 		Series: clusterUsageSeries{
-			CPU: []clusterUsagePoint{},
-			RAM: []clusterUsagePoint{},
+			CPU:         []clusterUsagePoint{},
+			RAM:         []clusterUsagePoint{},
+			CPUUsageMHz: []clusterUsagePoint{},
+			RAMUsageMB:  []clusterUsagePoint{},
 		},
 	}
 	if h.db != nil {
@@ -84,30 +103,60 @@ func (h *Handler) AdminClusterUsage(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now()
 	start := now.Add(-clusterUsageWindow)
-	cpuNow, errCPU := h.promInstant(r, promCPUQuery)
-	ramNow, errRAM := h.promInstant(r, promRAMQuery)
-	cpuSeries, errCPURange := h.promRange(r, promCPUQuery, start, now)
-	ramSeries, errRAMRange := h.promRange(r, promRAMQuery, start, now)
-	if errCPU != nil || errRAM != nil || errCPURange != nil || errRAMRange != nil {
+	cpuUsage, errCPUUsage := h.promInstant(r, promCPUUsageQuery)
+	cpuMax, errCPUMax := h.promInstant(r, promCPUMaxQuery)
+	ramUsage, errRAMUsage := h.promInstant(r, promRAMUsageQuery)
+	ramMax, errRAMMax := h.promInstant(r, promRAMMaxQuery)
+	cpuSeriesAbs, errCPURange := h.promRange(r, promCPUUsageQuery, start, now)
+	ramSeriesAbs, errRAMRange := h.promRange(r, promRAMUsageQuery, start, now)
+	if errCPUUsage != nil || errCPUMax != nil || errRAMUsage != nil || errRAMMax != nil ||
+		errCPURange != nil || errRAMRange != nil {
 		h.logger.Error("prometheus cluster usage failed",
-			"cpu_instant", errCPU, "ram_instant", errRAM,
+			"cpu_usage", errCPUUsage, "cpu_max", errCPUMax,
+			"ram_usage", errRAMUsage, "ram_max", errRAMMax,
 			"cpu_range", errCPURange, "ram_range", errRAMRange)
 		out.Message = "Capacity history unavailable"
 		respondJSON(w, http.StatusOK, out)
 		return
 	}
-	if len(cpuSeries) == 0 && len(ramSeries) == 0 && cpuNow == nil && ramNow == nil {
+	if len(cpuSeriesAbs) == 0 && len(ramSeriesAbs) == 0 &&
+		cpuUsage == nil && cpuMax == nil && ramUsage == nil && ramMax == nil {
 		out.Message = "Capacity history unavailable"
 		respondJSON(w, http.StatusOK, out)
 		return
 	}
 
 	out.Available = true
-	out.CPUPercent = cpuNow
-	out.RAMPercent = ramNow
-	out.Series.CPU = cpuSeries
-	out.Series.RAM = ramSeries
+	out.HostCPUUsageMHz = cpuUsage
+	out.HostCPUMaxMHz = cpuMax
+	out.HostRAMUsageMB = ramUsage
+	out.HostRAMMaxMB = ramMax
+	out.CPUPercent = percentOf(cpuUsage, cpuMax)
+	out.RAMPercent = percentOf(ramUsage, ramMax)
+	out.Series.CPUUsageMHz = cpuSeriesAbs
+	out.Series.RAMUsageMB = ramSeriesAbs
+	out.Series.CPU = percentSeries(cpuSeriesAbs, cpuMax)
+	out.Series.RAM = percentSeries(ramSeriesAbs, ramMax)
 	respondJSON(w, http.StatusOK, out)
+}
+
+func percentOf(usage, max *float64) *float64 {
+	if usage == nil || max == nil || *max <= 0 {
+		return nil
+	}
+	v := 100 * (*usage) / (*max)
+	return &v
+}
+
+func percentSeries(abs []clusterUsagePoint, max *float64) []clusterUsagePoint {
+	out := make([]clusterUsagePoint, 0, len(abs))
+	if max == nil || *max <= 0 {
+		return out
+	}
+	for _, p := range abs {
+		out = append(out, clusterUsagePoint{T: p.T, V: 100 * p.V / *max})
+	}
+	return out
 }
 
 func (h *Handler) promInstant(r *http.Request, query string) (*float64, error) {

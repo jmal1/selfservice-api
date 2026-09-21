@@ -98,6 +98,8 @@ spec:
               value: {{ .Values.engine.runnerNode | default "k3sv03" | quote }}
             - name: RUNNER_TRUNK_NIC
               value: {{ .Values.engine.trunkNIC | default "ens34" | quote }}
+            - name: MAX_CONCURRENT_RUNNERS
+              value: {{ .Values.engine.maxConcurrentRunners | default 14 | quote }}
             {{- if .Values.imagePullSecrets }}
             # The runner Job's pod spec is built in Go, not by Helm, so it does
             # not inherit the imagePullSecrets every other workload gets from
