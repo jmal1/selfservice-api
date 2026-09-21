@@ -290,8 +290,8 @@
     {
       "path": "docs/student/labs.md",
       "title": "Creating and Managing Labs",
-      "size": 2122,
-      "sha256": "00ab8dc15119bc4762478aadf781ff0e7c74b42b451f654b0b055caee804367f",
+      "size": 2136,
+      "sha256": "0b55073e7a6bfd3c12ec58fbe84a90bd8af922d13d6c5e220882bacaa412b124",
       "is_markdown": true,
       "links_out": [
         "docs/student/snapshots.md"
@@ -450,5 +450,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 750034
+  "total_bytes": 750048
 }
