@@ -10,6 +10,12 @@ Use these checks for common lab access problems before requesting help.
 
 **Expected result:** You return to **My Labs** with your account visible.
 
+## Forgot password or locked out of Authentik
+
+Talk to your instructor. They can create a one-time recovery link (or set a temporary password) in Authentik. Do not email passwords in plain text, and never share multi-factor codes. After you reset, sign in again from the Crucible sign-in page.
+
+**Expected result:** You receive a recovery link from your instructor, set a new password, and return to **My Labs**.
+
 ## Provisioning problems
 
 1. Open **My Labs** and refresh the lab status after a few minutes.

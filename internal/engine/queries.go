@@ -60,6 +60,23 @@ func (q *Queries) ClaimPendingRun(ctx context.Context, engineID string) (*models
 	return &run, nil
 }
 
+// RequeueClaimedRun returns a provisioning claim to pending so another
+// ProcessPendingRuns tick can pick it up. Used when runner capacity is full.
+func (q *Queries) RequeueClaimedRun(ctx context.Context, runID uuid.UUID) error {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE runs
+		SET status = $2, started_at = NULL, error_message = NULL, updated_at = NOW()
+		WHERE id = $1 AND status = $3
+	`, runID, models.RunStatusPending, models.RunStatusProvisioning)
+	if err != nil {
+		return fmt.Errorf("requeue claimed run: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("requeue claimed run: run %s not in provisioning state", runID)
+	}
+	return nil
+}
+
 // UpdateRunStatus updates the status of a run.
 func (q *Queries) UpdateRunStatus(ctx context.Context, runID uuid.UUID, status string, errorMsg *string) error {
 	var completedAt *time.Time

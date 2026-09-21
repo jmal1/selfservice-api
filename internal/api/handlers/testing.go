@@ -160,6 +160,18 @@ func (h *Handler) CreateTestingRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	const maxConcurrentRuns = 14
+	activeRuns, err := h.db.CountActiveRuns(r.Context())
+	if err != nil {
+		respondError(w, r, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if activeRuns >= maxConcurrentRuns {
+		w.Header().Set("Retry-After", "60")
+		respondError(w, r, http.StatusServiceUnavailable, "assessment system at capacity. Try again shortly.")
+		return
+	}
+
 	// Rate limit: 3 runs per hour
 	recentCount, err := h.db.CountRecentRuns(r.Context(), podID, userID, 1*time.Hour)
 	if err != nil {

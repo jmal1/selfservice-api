@@ -302,6 +302,10 @@ engine:
   # workflow starts. CrucibleRunnerProvisionSlow alerts well before this trips.
   # See internal/engine/k8s.go.
   runnerActiveDeadlineSeconds: 900
+  # Global cap on simultaneous crucible-runner Jobs (pending+running). Class
+  # stampede protection: ~14 fits one runner node with 1 CPU / 1Gi limits
+  # without starving Flannel/Multus. Set 0 to disable the gate.
+  maxConcurrentRunners: 14
   # Keeps runnerImage resident on runnerNode so a student's assessment never
   # pays the cold pull, and so kubelet image GC cannot silently evict it.
   # Costs one idle `sleep infinity` pod on the runner node. See

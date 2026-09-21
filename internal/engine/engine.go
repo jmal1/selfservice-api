@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -112,6 +113,18 @@ func (e *Engine) ProcessPendingRuns(ctx context.Context) {
 		e.publishRunEvent(run.PodID.String(), run.ID.String(), "provisioning", "Run claimed, provisioning runner")
 
 		if err := e.executeRun(ctx, run); err != nil {
+			if errors.Is(err, ErrRunnerAtCapacity) {
+				e.logger.Info("runner at capacity; requeueing run", "run_id", run.ID)
+				if rqErr := e.queries.RequeueClaimedRun(ctx, run.ID); rqErr != nil {
+					e.logger.Error("failed to requeue run at capacity", "run_id", run.ID, "error", rqErr)
+					errMsg := err.Error()
+					_ = e.queries.UpdateRunStatus(ctx, run.ID, models.RunStatusFailed, &errMsg)
+					e.publishRunEvent(run.PodID.String(), run.ID.String(), "failed", errMsg)
+					return
+				}
+				e.publishRunEvent(run.PodID.String(), run.ID.String(), "pending", "Waiting for assessment runner capacity")
+				return // stop claiming more while the node is full
+			}
 			e.logger.Error("run execution failed", "run_id", run.ID, "error", err)
 			errMsg := err.Error()
 			_ = e.queries.UpdateRunStatus(ctx, run.ID, models.RunStatusFailed, &errMsg)
@@ -122,6 +135,14 @@ func (e *Engine) ProcessPendingRuns(ctx context.Context) {
 
 // executeRun handles the full lifecycle of a single run.
 func (e *Engine) executeRun(ctx context.Context, run *models.Run) error {
+	// Fail closed on capacity BEFORE any run mutation so ProcessPendingRuns
+	// can requeue a still-provisioning claim without orphaning workflow_results.
+	if e.k8s != nil {
+		if err := e.k8s.ensureRunnerCapacity(ctx); err != nil {
+			return err
+		}
+	}
+
 	// Load workflows for this run's playlist
 	if run.PlaylistID == nil {
 		return fmt.Errorf("run %s has no playlist", run.ID)

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"testing"
@@ -228,5 +229,39 @@ func TestDeleteRunnerPod(t *testing.T) {
 	})
 	if len(pods.Items) != 0 {
 		t.Error("expected pod to be deleted")
+	}
+}
+
+func TestProvisionRunner_AtCapacity(t *testing.T) {
+	active := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "crucible-runner-busy",
+			Namespace: "test-ns",
+			Labels:    map[string]string{"app": "crucible-runner"},
+		},
+		Status: batchv1.JobStatus{}, // no CompletionTime, Failed=0 → active
+	}
+	clientset := fake.NewSimpleClientset(active)
+	scheme := runtime.NewScheme()
+	dynClient := dynamicfake.NewSimpleDynamicClient(scheme)
+
+	cfg := testK8sConfig()
+	cfg.MaxConcurrentRunners = 1
+	k8s := NewK8sClientFromClients(clientset, dynClient, cfg, testLogger())
+
+	_, err := k8s.ProvisionRunner(context.Background(), RunnerSpec{
+		RunID:         "abcd1234-5678-9012-3456-789012345678",
+		CallbackToken: "tok",
+		EngineURL:     cfg.EngineURL,
+		VLANTag:       105,
+		Workflows:     []runner.WorkflowDef{{Slug: "wf", Name: "W", Script: "true", TimeoutSeconds: 30}},
+		Target:        runner.TargetConfig{IP: "10.100.5.10", OS: "linux"},
+		Pod:           runner.PodConfig{Subnet: "10.100.5.0/24", Index: 1},
+	})
+	if err == nil {
+		t.Fatal("expected capacity error, got nil")
+	}
+	if !errors.Is(err, ErrRunnerAtCapacity) {
+		t.Fatalf("error = %v, want ErrRunnerAtCapacity", err)
 	}
 }

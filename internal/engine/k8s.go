@@ -25,15 +25,16 @@ import (
 
 // K8sClient wraps the Kubernetes client for runner pod lifecycle management.
 type K8sClient struct {
-	clientset        kubernetes.Interface
-	dynamicClient    dynamic.Interface
-	namespace        string
-	runnerImage      string
-	runnerNode       string
-	trunkNIC         string
-	imagePullSecrets []string
-	metrics          *RunnerMetrics
-	logger           *slog.Logger
+	clientset          kubernetes.Interface
+	dynamicClient      dynamic.Interface
+	namespace          string
+	runnerImage        string
+	runnerNode         string
+	trunkNIC           string
+	maxConcurrent      int
+	imagePullSecrets   []string
+	metrics            *RunnerMetrics
+	logger             *slog.Logger
 }
 
 // K8sConfig holds configuration for the K8s runner provisioner.
@@ -44,6 +45,10 @@ type K8sConfig struct {
 	TrunkNIC    string // Host NIC carrying the pod VLAN trunk (default: ens224)
 	EngineURL   string // Internal URL for runner callbacks
 
+	// MaxConcurrentRunners caps simultaneous crucible-runner Jobs (active).
+	// Zero disables the cap. Class-scale default is 14.
+	MaxConcurrentRunners int
+
 	// ImagePullSecrets names the dockerconfigjson Secrets used to pull
 	// RunnerImage. Every Crucible GHCR package is private, so without this the
 	// kubelet falls back to an anonymous token request and the pull fails with
@@ -52,6 +57,9 @@ type K8sConfig struct {
 	// be passed through explicitly.
 	ImagePullSecrets []string
 }
+
+// ErrRunnerAtCapacity is returned when MaxConcurrentRunners active Jobs already exist.
+var ErrRunnerAtCapacity = fmt.Errorf("assessment runner capacity reached")
 
 // runnerActiveDeadlineSeconds is the hard kill deadline for a runner Job.
 //
@@ -130,6 +138,7 @@ func NewK8sClient(cfg K8sConfig, logger *slog.Logger) (*K8sClient, error) {
 		runnerImage:      cfg.RunnerImage,
 		runnerNode:       cfg.RunnerNode,
 		trunkNIC:         cfg.TrunkNIC,
+		maxConcurrent:    cfg.MaxConcurrentRunners,
 		imagePullSecrets: cfg.ImagePullSecrets,
 		logger:           logger,
 	}, nil
@@ -144,6 +153,7 @@ func NewK8sClientFromClients(clientset kubernetes.Interface, dynClient dynamic.I
 		runnerImage:      cfg.RunnerImage,
 		runnerNode:       cfg.RunnerNode,
 		trunkNIC:         cfg.TrunkNIC,
+		maxConcurrent:    cfg.MaxConcurrentRunners,
 		imagePullSecrets: cfg.ImagePullSecrets,
 		logger:           logger,
 	}
@@ -186,6 +196,12 @@ func (k *K8sClient) ProvisionRunner(ctx context.Context, spec RunnerSpec) (*Prov
 	start := time.Now()
 	resourceName := fmt.Sprintf("crucible-runner-%s", spec.RunID[:8])
 	nadName := fmt.Sprintf("pod-vlan-%d", spec.VLANTag)
+
+	if k.maxConcurrent > 0 {
+		if err := k.ensureRunnerCapacity(ctx); err != nil {
+			return nil, err
+		}
+	}
 
 	// 1. Ensure NetworkAttachmentDefinition exists for this VLAN
 	if err := k.ensureNAD(ctx, nadName, spec.VLANTag); err != nil {
@@ -275,13 +291,16 @@ func (k *K8sClient) ProvisionRunner(ctx context.Context, spec RunnerSpec) (*Prov
 							Name:  "runner",
 							Image: k.runnerImage,
 							Resources: corev1.ResourceRequirements{
+								// Requests size scheduling density; limits bound a hung
+								// assessment so one Job cannot monopolize a runner node
+								// (noisy-neighbor protection for class stampede).
 								Requests: corev1.ResourceList{
 									corev1.ResourceCPU:    resource.MustParse("500m"),
 									corev1.ResourceMemory: resource.MustParse("512Mi"),
 								},
 								Limits: corev1.ResourceList{
-									corev1.ResourceCPU:    resource.MustParse("2"),
-									corev1.ResourceMemory: resource.MustParse("2Gi"),
+									corev1.ResourceCPU:    resource.MustParse("1"),
+									corev1.ResourceMemory: resource.MustParse("1Gi"),
 								},
 							},
 							VolumeMounts: []corev1.VolumeMount{
@@ -597,6 +616,44 @@ func (k *K8sClient) CleanupOrphanedRunners(ctx context.Context) (int, error) {
 	}
 	return cleaned, nil
 }
+
+// countActiveRunnerJobs counts assessment runner Jobs that are still active
+// (have pods running / not yet completed or failed). Used for the global
+// concurrency gate before ProvisionRunner.
+func (k *K8sClient) countActiveRunnerJobs(ctx context.Context) (int, error) {
+	jobs, err := k.clientset.BatchV1().Jobs(k.namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: "app=crucible-runner",
+	})
+	if err != nil {
+		return 0, fmt.Errorf("list active runner jobs: %w", err)
+	}
+	active := 0
+	for _, job := range jobs.Items {
+		// Same liveness test as CleanupOrphanedRunners: still running when
+		// CompletionTime is unset and Failed is zero.
+		if job.Status.CompletionTime == nil && job.Status.Failed == 0 {
+			active++
+		}
+	}
+	return active, nil
+}
+
+// ensureRunnerCapacity returns ErrRunnerAtCapacity when the configured
+// MaxConcurrentRunners active Jobs already exist. Zero maxConcurrent disables.
+func (k *K8sClient) ensureRunnerCapacity(ctx context.Context) error {
+	if k.maxConcurrent <= 0 {
+		return nil
+	}
+	active, err := k.countActiveRunnerJobs(ctx)
+	if err != nil {
+		return fmt.Errorf("count active runners: %w", err)
+	}
+	if active >= k.maxConcurrent {
+		return fmt.Errorf("%w: %d/%d", ErrRunnerAtCapacity, active, k.maxConcurrent)
+	}
+	return nil
+}
+
 func (k *K8sClient) DeleteRunnerPod(ctx context.Context, jobName string) error {
 	// List pods owned by this job
 	pods, err := k.clientset.CoreV1().Pods(k.namespace).List(ctx, metav1.ListOptions{
