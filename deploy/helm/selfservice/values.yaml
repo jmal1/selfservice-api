@@ -295,7 +295,8 @@ natsURL: "nats://selfservice-nats:4222"
 engine:
   port: 8081
   runnerImage: "ghcr.io/jmal1/selfservice-crucible-runner:latest"
-  runnerNode: "example-node"
+  # "pool" → node-role.kubernetes.io/runner=true (multi-node). Hostname pins one node.
+  runnerNode: "pool"
   trunkNIC: "ens224"
   # Hard kill for a runner Job, in seconds. Raised from the original 600
   # to accommodate a cold Kali image pull on the runner node before the

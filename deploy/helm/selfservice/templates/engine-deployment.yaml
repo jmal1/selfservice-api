@@ -95,7 +95,7 @@ spec:
             - name: RUNNER_IMAGE
               value: {{ .Values.engine.runnerImage | default "ghcr.io/jmal1/selfservice-crucible-runner:latest" | quote }}
             - name: RUNNER_NODE
-              value: {{ .Values.engine.runnerNode | default "k3sv03" | quote }}
+              value: {{ .Values.engine.runnerNode | default "pool" | quote }}
             - name: RUNNER_TRUNK_NIC
               value: {{ .Values.engine.trunkNIC | default "ens34" | quote }}
             - name: MAX_CONCURRENT_RUNNERS

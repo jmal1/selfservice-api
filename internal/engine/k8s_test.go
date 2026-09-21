@@ -72,7 +72,7 @@ func TestProvisionRunner_CreatesJobAndSecret(t *testing.T) {
 		t.Fatalf("get job: %v", err)
 	}
 
-	// Check job spec
+	// Check job spec — explicit hostname pin still works for emergency fallback
 	if job.Spec.Template.Spec.NodeSelector["kubernetes.io/hostname"] != "test-node" {
 		t.Error("job not scheduled on correct node")
 	}
@@ -113,6 +113,21 @@ func TestProvisionRunner_CreatesJobAndSecret(t *testing.T) {
 	// Verify labels
 	if job.Labels["forge.crucible/run-id"] != "abcd1234-5678-9012-3456-789012345678" {
 		t.Error("job missing run-id label")
+	}
+}
+
+func TestRunnerNodeSelector_PoolVsHostname(t *testing.T) {
+	pool := runnerNodeSelector("pool")
+	if pool[runnerPoolLabel] != "true" || len(pool) != 1 {
+		t.Fatalf("pool selector = %#v, want {%s:true}", pool, runnerPoolLabel)
+	}
+	empty := runnerNodeSelector("")
+	if empty[runnerPoolLabel] != "true" {
+		t.Fatalf("empty selector = %#v, want pool label", empty)
+	}
+	pin := runnerNodeSelector("k3sv03")
+	if pin["kubernetes.io/hostname"] != "k3sv03" || len(pin) != 1 {
+		t.Fatalf("hostname pin = %#v", pin)
 	}
 }
 

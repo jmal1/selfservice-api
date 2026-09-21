@@ -54,8 +54,15 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- /* "pool" (or empty) spreads warmer pods across every labeled runner node. */ -}}
+      {{- $runnerNode := .Values.engine.runnerNode | default "k3sv03" }}
+      {{- if or (eq $runnerNode "pool") (eq $runnerNode "") }}
       nodeSelector:
-        kubernetes.io/hostname: {{ .Values.engine.runnerNode | quote }}
+        node-role.kubernetes.io/runner: "true"
+      {{- else }}
+      nodeSelector:
+        kubernetes.io/hostname: {{ $runnerNode | quote }}
+      {{- end }}
       tolerations:
         - key: role
           operator: Equal

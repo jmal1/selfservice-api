@@ -63,7 +63,7 @@ func main() {
 	k8sCfg := engine.K8sConfig{
 		Namespace:   getEnv("ENGINE_NAMESPACE", "selfservice"),
 		RunnerImage: getEnv("RUNNER_IMAGE", "ghcr.io/jmal1/selfservice-crucible-runner:latest"),
-		RunnerNode:  getEnv("RUNNER_NODE", "k3sv03"),
+		RunnerNode:  getEnv("RUNNER_NODE", "pool"),
 		TrunkNIC:    getEnv("RUNNER_TRUNK_NIC", "ens224"),
 		EngineURL:   getEnv("ENGINE_CALLBACK_URL", "http://crucible-engine.selfservice.svc.cluster.local:8081"),
 		// Global concurrent assessment runner Jobs. Class-scale default 14.
