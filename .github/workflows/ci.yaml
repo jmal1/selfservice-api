@@ -26,8 +26,9 @@ jobs:
   # `changes` runs dorny/paths-filter against the diff and produces two
   # outputs the rest of the workflow keys off:
   #   - components: JSON array of matrix components that have to rebuild.
-  #     Every main push builds all five so the exact merge commit has a complete
-  #     full-SHA deployment image set; pull requests remain path-filtered.
+  #     Main pushes and pull requests both path-filter. The shared channel
+  #     forces Alpine images only; Kali (crucible-runner) rebuilds only on
+  #     its own channel (see compute-image-matrix.sh / Crucible#51).
   #   - run_tests: 'true' if any Go source / module file changed.
   # See .github/path-filters.yaml for the actual path lists.
   changes:
