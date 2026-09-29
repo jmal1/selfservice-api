@@ -173,7 +173,8 @@ func TestPlanParts(t *testing.T) {
 		{"exactly one part size", ImagePartSizeBytes, ImagePartSizeBytes, 1},
 		{"one byte over rolls to two", ImagePartSizeBytes + 1, ImagePartSizeBytes, 2},
 		{"12 GiB at 64 MiB parts", 12 * gib, ImagePartSizeBytes, 192},
-		{"16 GiB cap at 64 MiB parts", 16 * gib, ImagePartSizeBytes, 256},
+		{"16 GiB at 64 MiB parts", 16 * gib, ImagePartSizeBytes, 256},
+		{"32 GiB cap at 64 MiB parts", 32 * gib, ImagePartSizeBytes, 512},
 		{"zero size still gets a part", 0, ImagePartSizeBytes, 1},
 		{"negative size still gets a part", -5, ImagePartSizeBytes, 1},
 		{"zero part size falls back to default", 12 * gib, 0, 192},
@@ -226,15 +227,23 @@ func TestValidateImageUploadSize(t *testing.T) {
 	}
 }
 
-// Phase 0 finding P0-4: MinIO sits on stagingv01's root filesystem with
-// ~85 GB free, shared with apt-cacher-ng. This guards the cap against
-// being casually raised back to the originally-planned 32 GiB.
+// Phase 0 finding P0-4: MinIO sits on stagingv01's root filesystem,
+// shared with apt-cacher-ng. The per-file cap is 32 GiB. The 48 GiB
+// staging budget is the disk ceiling and stays there until MinIO has a
+// dedicated volume. One upload must still fit inside that budget.
 func TestMaxImageUploadBytes_RespectsStagingDiskCeiling(t *testing.T) {
-	const sixteenGiB = 16 << 30
-	if MaxImageUploadBytes != sixteenGiB {
-		t.Fatalf("upload cap is %d; expected 16 GiB (%d). MinIO shares an ~85 GB root "+
-			"filesystem with apt-cacher-ng on stagingv01 — raising this needs a dedicated volume first",
-			MaxImageUploadBytes, sixteenGiB)
+	const thirtyTwoGiB = 32 << 30
+	const fortyEightGiB = 48 << 30
+	if MaxImageUploadBytes != thirtyTwoGiB {
+		t.Fatalf("upload cap is %d; expected 32 GiB (%d)", MaxImageUploadBytes, thirtyTwoGiB)
+	}
+	if ImageStagingBudgetBytes != fortyEightGiB {
+		t.Fatalf("staging budget is %d; expected 48 GiB (%d). MinIO shares stagingv01's "+
+			"root filesystem with apt-cacher-ng — raising the budget needs a dedicated volume first",
+			ImageStagingBudgetBytes, fortyEightGiB)
+	}
+	if MaxImageUploadBytes > ImageStagingBudgetBytes {
+		t.Fatalf("per-file cap %d exceeds staging budget %d", MaxImageUploadBytes, ImageStagingBudgetBytes)
 	}
 }
 
@@ -477,8 +486,7 @@ func TestAdminCreateImageUpload_RejectsOversize(t *testing.T) {
 	store := &fakeImageStore{}
 	h := newImageHandler(db, store)
 
-	// MaxImageUploadBytes is 16 GiB; send 16 GiB + 1 byte.
-	body := `{"filename":"big.iso","size_bytes":17179869185}`
+	body := `{"filename":"big.iso","size_bytes":` + strconv.FormatInt(MaxImageUploadBytes+1, 10) + `}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/images", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()

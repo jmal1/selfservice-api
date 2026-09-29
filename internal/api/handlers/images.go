@@ -52,15 +52,16 @@ import (
 // Deliberately short: a leaked URL is a write primitive into the bucket.
 const PresignTTLSeconds = 15 * 60
 
-// MaxImageUploadBytes caps a single upload at 16 GiB.
+// MaxImageUploadBytes caps a single upload at 32 GiB.
 //
 // Phase 0 finding P0-4: MinIO's data directory lives on stagingv01's
-// ROOT filesystem with only ~85 GB free and no dedicated volume. The
-// same filesystem hosts apt-cacher-ng, which every Linux template build
-// depends on — so filling it has a blast radius well beyond uploads.
-// 16 GiB is large enough for any Windows Server or Kali installer while
-// leaving headroom for concurrent uploads.
-const MaxImageUploadBytes int64 = 16 << 30
+// root filesystem, shared with apt-cacher-ng, and there is no dedicated
+// volume. The disk ceiling is ImageStagingBudgetBytes (48 GiB), which
+// leaves the headroom that finding required. One 32 GiB object fits in
+// that budget; a second max-size upload is refused until import deletes
+// the staged object. Do not raise this above the budget, and do not
+// raise the budget without a dedicated volume.
+const MaxImageUploadBytes int64 = 32 << 30
 
 // ImageStagingBudgetBytes caps the TOTAL size of objects Crucible keeps
 // staged in MinIO at any one time.
@@ -76,7 +77,7 @@ const ImageStagingBudgetBytes int64 = 48 << 30
 
 // ImagePartSizeBytes is the multipart chunk size. S3 requires >= 5 MiB
 // for all but the final part; 64 MiB keeps the part count reasonable for
-// a 16 GiB object (256 parts) while staying small enough that a failed
+// a 32 GiB object (512 parts) while staying small enough that a failed
 // part is cheap to retry.
 const ImagePartSizeBytes int64 = 64 << 20
 
@@ -1043,8 +1044,8 @@ func ValidateImageUploadSize(sizeBytes int64) (int, error) {
 	}
 	if sizeBytes > MaxImageUploadBytes {
 		return http.StatusRequestEntityTooLarge, fmt.Errorf(
-			"file is %d bytes; the maximum upload size is %d bytes (16 GiB)",
-			sizeBytes, MaxImageUploadBytes)
+			"file is %d bytes; the maximum upload size is %d bytes (%d GiB)",
+			sizeBytes, MaxImageUploadBytes, MaxImageUploadBytes>>30)
 	}
 	return http.StatusOK, nil
 }
