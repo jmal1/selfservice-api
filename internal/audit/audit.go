@@ -123,7 +123,7 @@ func Log(ctx context.Context, db *database.Queries, action string, opts ...Optio
 		Action:       action,
 		ResourceType: e.resourceType,
 		ResourceID:   e.resourceID,
-		Details:      detailsJSON,
+		Details:      json.RawMessage(detailsJSON),
 		IPAddress:    ipPtr,
 	})
 	if err != nil {

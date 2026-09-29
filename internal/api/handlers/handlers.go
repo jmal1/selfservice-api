@@ -2164,8 +2164,11 @@ func (h *Handler) AdminSearchAuditLog(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 
 	filter := database.AuditLogFilter{
-		Action:       q.Get("action"),
-		ResourceType: q.Get("resource_type"),
+		Actions:        q["action"],
+		ExcludeActions: q["exclude_action"],
+		Actor:          q.Get("actor"),
+		Query:          strings.TrimSpace(q.Get("q")),
+		ResourceType:   q.Get("resource_type"),
 	}
 
 	if p := q.Get("page"); p != "" {
@@ -2175,14 +2178,20 @@ func (h *Handler) AdminSearchAuditLog(w http.ResponseWriter, r *http.Request) {
 		fmt.Sscanf(pp, "%d", &filter.PerPage)
 	}
 	if uid := q.Get("user_id"); uid != "" {
-		if id, err := uuid.Parse(uid); err == nil {
-			filter.UserID = &id
+		id, err := uuid.Parse(uid)
+		if err != nil {
+			respondError(w, r, http.StatusBadRequest, "user_id must be a UUID")
+			return
 		}
+		filter.UserID = &id
 	}
 	if rid := q.Get("resource_id"); rid != "" {
-		if id, err := uuid.Parse(rid); err == nil {
-			filter.ResourceID = &id
+		id, err := uuid.Parse(rid)
+		if err != nil {
+			respondError(w, r, http.StatusBadRequest, "resource_id must be a UUID")
+			return
 		}
+		filter.ResourceID = &id
 	}
 	if s := q.Get("since"); s != "" {
 		if t, err := time.Parse(time.RFC3339, s); err == nil {
@@ -2197,6 +2206,11 @@ func (h *Handler) AdminSearchAuditLog(w http.ResponseWriter, r *http.Request) {
 
 	page, err := h.db.ListAuditLogPaginated(r.Context(), filter)
 	if err != nil {
+		var filterErr *database.AuditFilterError
+		if errors.As(err, &filterErr) {
+			respondError(w, r, http.StatusBadRequest, filterErr.Error())
+			return
+		}
 		h.logger.Error("admin search audit log failed", "error", err)
 		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
