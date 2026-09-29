@@ -2,6 +2,7 @@ package provisioner
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -245,28 +246,53 @@ func TestRefusalGuard3_AssessmentRunInFlight(t *testing.T) {
 	}
 }
 
-// TestRefusalGuard4_ToolsNotRunning verifies that a VM with VMware Tools
-// not running is never suspended. Absent signal must not be read as idle.
-func TestRefusalGuard4_ToolsNotRunning(t *testing.T) {
+// TestRefusalGuard4_ToolsDownWithinTimeout verifies that Tools not running
+// does not suspend a VM whose activity clock is still inside the timeout.
+// A guest that was just used, or is still booting, stays up.
+func TestRefusalGuard4_ToolsDownWithinTimeout(t *testing.T) {
 	const moref = "vm-guard4"
-	c := makeCandidate(moref, pastTime(8*time.Hour))
+	c := makeCandidate(moref, pastTime(30*time.Minute))
 
 	db := newFakeDB()
 	db.candidates = []database.IdleSuspendCandidate{c}
 
 	vc := newFakeVC()
-	vc.toolsRunning[moref] = false // Tools not running
-	vc.perfSamples[moref] = idleSample()
+	vc.toolsRunning[moref] = false
 
 	counts, err := evaluateIdleVMs(context.Background(), vc, db, nil, IdleEvaluatorConfig{DryRun: false})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(vc.suspendedMorefs) != 0 {
-		t.Errorf("VM should NOT be suspended when Tools is not running; got: %v", vc.suspendedMorefs)
+		t.Errorf("VM should NOT be suspended while Tools is down and the activity clock is fresh; got: %v", vc.suspendedMorefs)
 	}
 	if counts.ToolsMissing != 1 {
 		t.Errorf("expected ToolsMissing=1, got %d", counts.ToolsMissing)
+	}
+}
+
+// TestToolsDownPastTimeoutSuspends verifies that a VM with Tools stopped and
+// no console activity past the idle timeout is suspended. CPU and network
+// cannot be read, so they are not required.
+func TestToolsDownPastTimeoutSuspends(t *testing.T) {
+	const moref = "vm-tools-down-idle"
+	c := makeCandidate(moref, pastTime(8*time.Hour))
+
+	db := newFakeDB()
+	db.candidates = []database.IdleSuspendCandidate{c}
+
+	vc := newFakeVC()
+	vc.toolsRunning[moref] = false
+
+	counts, err := evaluateIdleVMs(context.Background(), vc, db, nil, IdleEvaluatorConfig{DryRun: false})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if counts.Suspended != 1 || vc.suspendedMorefs[moref] != 1 {
+		t.Fatalf("expected the tools-down VM to be suspended, Suspended=%d morefs=%v", counts.Suspended, vc.suspendedMorefs)
+	}
+	if !strings.Contains(db.suspended[c.PodVMID], "VMware Tools is not running") {
+		t.Errorf("suspend reason = %q, want tools-down text", db.suspended[c.PodVMID])
 	}
 }
 
@@ -670,7 +696,7 @@ func TestEvaluatorHandlesPartialToolsStatusResult(t *testing.T) {
 	// Simulate the result of the FIXED QueryVMToolsStatusBulk: returns Tools=true
 	// for the alive VM; the deleted VM is absent from the map (not an error).
 	vc.toolsRunning[aliveMoref] = true
-	// deadMoref intentionally absent — absent = Tools-not-running (guard 4)
+	// deadMoref intentionally absent — a missing vCenter object is not suspended.
 
 	vc.perfSamples[aliveMoref] = idleSample()
 	// No perf sample for deadMoref; it never passes guard 4 anyway.

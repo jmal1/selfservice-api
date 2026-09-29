@@ -4,34 +4,33 @@
 // inspects every running pod VM and suspends those that have been idle for
 // longer than the configured threshold (default 6 hours).
 //
-// "Idle" requires BOTH signals (explicit product requirement):
-//   - No active Crucible console session: last_activity_at is older than the
-//     threshold (or NULL, meaning no console or high-utilisation activity was
-//     ever recorded). A heartbeat alone is insufficient because an open-but-idle
-//     desktop session keeps the console signal permanently "active"; the CPU
-//     signal is required to catch that case.
-//   - Low vCenter utilisation NOW: cpu.usage.average < cpuIdleThreshold AND
-//     net.usage.average < netIdleThreshold in the latest real-time sample.
-//     The CPU/net signal is insufficient alone because a compiling VM (high CPU,
-//     no console) must not be suspended; but a student reading docs with the
-//     console open (low CPU, active console) must also not be suspended.
+// "Idle" means last_activity_at is older than the timeout. Console heartbeats
+// and above-threshold CPU or network each refresh that clock. When VMware
+// Tools is running, the latest sample must also be under the CPU and network
+// thresholds: a compiling VM (high CPU, no console) must not be suspended, and
+// a student reading docs with the console open (low CPU, fresh heartbeat)
+// must not be suspended either.
 //
-// The 6-hour "sustained" requirement is implemented through last_activity_at:
-// the evaluator updates that timestamp whenever it observes above-threshold
-// utilisation, so a VM is only suspended when last_activity_at has been
-// untouched for the full threshold duration, meaning BOTH signals have been
-// consistently idle throughout that window.
+// Tools not running is not a permanent veto. CPU and network cannot be read,
+// so those signals are skipped, and the VM still suspends once the activity
+// clock is older than the timeout. A moref missing from the tools result is a
+// deleted VM and is never suspended.
+//
+// The sustained-idle requirement is last_activity_at itself: the evaluator
+// updates it whenever it observes above-threshold utilisation, so a VM is
+// suspended only after that timestamp has been untouched for the full timeout.
 //
 // Safety defaults:
 //   - Dry-run mode is ON by default (WORKER_IDLE_EVALUATOR_DRY_RUN=true).
 //     The evaluator logs decisions but makes zero vCenter mutations until an
 //     operator explicitly sets WORKER_IDLE_EVALUATOR_DRY_RUN=false after
 //     validating the decisions on live data.
-//   - Four hard refusal guards block suspension even when both signals are idle:
+//   - Refusal guards block suspension even when the clock says idle:
 //     1. VM has an active job in flight.
 //     2. Pod is provisioning or destroying.
 //     3. An assessment run is in flight targeting this VM.
-//     4. VMware Tools is not running — absent signal ≠ idle.
+//     4. Tools status is absent from the vCenter result (deleted moref).
+//     5. No activity timestamp has been recorded.
 package provisioner
 
 import (
@@ -143,7 +142,7 @@ type IdleEvaluatorConfig struct {
 type IdleEvalCounts struct {
 	Candidates    int // running pod VMs examined
 	Skipped       int // skipped for missing moref or bulk-query error
-	ToolsMissing  int // Tools not running — not idle (guard 4)
+	ToolsMissing  int // Tools status absent, or Tools down while the idle clock is still fresh
 	PerfMissing   int // no perf data — not idle (guard 4 variant)
 	ActivityFresh int // last_activity_at within threshold — not idle
 	// ActivityUnknown counts VMs with no activity timestamp at all. These are
@@ -227,32 +226,44 @@ func evaluateIdleVMs(
 
 		vmLog := log.With("vm", c.DisplayName, "vm_id", c.PodVMID, "moref", c.VCenterVMID)
 
-		// Guard 4: VMware Tools must be running. Absent signal ≠ idle.
-		if running, ok := toolsRunning[c.VCenterVMID]; !ok || !running {
-			vmLog.Debug("idle-eval: skip — VMware Tools not running or not found")
+		// A moref missing from the tools result is a deleted VM. Do not suspend
+		// an object vCenter did not return.
+		toolsUp, toolsKnown := toolsRunning[c.VCenterVMID]
+		if !toolsKnown {
+			vmLog.Debug("idle-eval: skip — VMware Tools status absent")
 			counts.ToolsMissing++
 			continue
 		}
 
-		// Guard 4 (variant): performance data must be present.
-		perf, ok := perfSamples[c.VCenterVMID]
-		if !ok || !perf.Valid {
-			vmLog.Debug("idle-eval: skip — no perf data available")
-			counts.PerfMissing++
-			continue
-		}
-
-		// If utilisation is above threshold, touch last_activity_at so the
-		// idle clock is reset — this VM is actively working.
-		if perf.CPUUsage >= cpuIdleThreshold || perf.NetUsage >= netIdleThreshold {
-			if terr := db.TouchVMActivityAt(ctx, c.PodVMID, now); terr != nil {
-				vmLog.Warn("idle-eval: failed to update activity timestamp", "error", terr)
-				counts.Errors++
+		var (
+			perf     vcenter.VMPerfSample
+			havePerf bool
+		)
+		if toolsUp {
+			// Performance data is required only while Tools can report it.
+			sample, sampleOK := perfSamples[c.VCenterVMID]
+			if !sampleOK || !sample.Valid {
+				vmLog.Debug("idle-eval: skip — no perf data available")
+				counts.PerfMissing++
+				continue
 			}
-			vmLog.Debug("idle-eval: not idle — utilisation above threshold",
-				"cpu_usage", perf.CPUUsage, "net_usage", perf.NetUsage)
-			counts.ActivityFresh++
-			continue
+			perf = sample
+			havePerf = true
+
+			// Above-threshold utilisation refreshes last_activity_at so the
+			// idle clock restarts — this VM is actively working.
+			if perf.CPUUsage >= cpuIdleThreshold || perf.NetUsage >= netIdleThreshold {
+				if terr := db.TouchVMActivityAt(ctx, c.PodVMID, now); terr != nil {
+					vmLog.Warn("idle-eval: failed to update activity timestamp", "error", terr)
+					counts.Errors++
+				}
+				vmLog.Debug("idle-eval: not idle — utilisation above threshold",
+					"cpu_usage", perf.CPUUsage, "net_usage", perf.NetUsage)
+				counts.ActivityFresh++
+				continue
+			}
+		} else {
+			vmLog.Debug("idle-eval: VMware Tools not running; using the activity clock only")
 		}
 
 		// Resolve idle timeout for this pod (per-pod override or global default).
@@ -279,16 +290,23 @@ func evaluateIdleVMs(
 			continue
 		}
 
-		// Check last_activity_at freshness.
+		// Check last_activity_at freshness. Tools-down VMs stay in ToolsMissing
+		// until this clock expires, so a pass summary still shows why they
+		// were held.
 		if now.Sub(*c.LastActivityAt) < threshold {
+			if !toolsUp {
+				vmLog.Debug("idle-eval: skip — Tools not running and last_activity_at within threshold",
+					"last_activity_at", c.LastActivityAt, "threshold", threshold)
+				counts.ToolsMissing++
+				continue
+			}
 			vmLog.Debug("idle-eval: not idle — last_activity_at within threshold",
 				"last_activity_at", c.LastActivityAt, "threshold", threshold)
 			counts.ActivityFresh++
 			continue
 		}
 
-		// Both signals indicate idle and the threshold has been exceeded.
-		// Apply refusal guards before acting.
+		// The activity clock has expired. Apply refusal guards before acting.
 
 		// Guard 2: pod must be active (not provisioning or destroying).
 		if c.PodStatus != models.PodStatusActive {
@@ -321,16 +339,23 @@ func evaluateIdleVMs(
 
 		// All guards passed. Build the suspend reason. LastActivityAt is
 		// guaranteed non-nil here: guard 5 refuses any VM without a clock.
-		reason := fmt.Sprintf("idle: no console activity and low CPU/net for %s (threshold %s)",
-			now.Sub(*c.LastActivityAt).Round(time.Minute), threshold)
+		idleFor := now.Sub(*c.LastActivityAt).Round(time.Minute)
+		reason := fmt.Sprintf("idle: no console activity and low CPU/net for %s (threshold %s)", idleFor, threshold)
+		if !toolsUp {
+			reason = fmt.Sprintf("idle: no console activity for %s and VMware Tools is not running (threshold %s)", idleFor, threshold)
+		}
+		logArgs := []any{
+			"reason", reason,
+			"tools_running", toolsUp,
+			"last_activity_at", c.LastActivityAt,
+			"threshold_seconds", timeoutSecs,
+		}
+		if havePerf {
+			logArgs = append(logArgs, "cpu_usage", perf.CPUUsage, "net_usage", perf.NetUsage)
+		}
 
 		if cfg.DryRun {
-			vmLog.Info("idle-eval: DRY-RUN — would suspend",
-				"reason", reason,
-				"cpu_usage", perf.CPUUsage,
-				"net_usage", perf.NetUsage,
-				"last_activity_at", c.LastActivityAt,
-				"threshold_seconds", timeoutSecs)
+			vmLog.Info("idle-eval: DRY-RUN — would suspend", logArgs...)
 			counts.Suspended++
 			if cfg.Pusher != nil {
 				cfg.Pusher.RecordSuspend("dry_run")
@@ -338,11 +363,7 @@ func evaluateIdleVMs(
 			continue
 		}
 
-		vmLog.Info("idle-eval: suspending VM",
-			"reason", reason,
-			"cpu_usage", perf.CPUUsage,
-			"net_usage", perf.NetUsage,
-			"last_activity_at", c.LastActivityAt)
+		vmLog.Info("idle-eval: suspending VM", logArgs...)
 
 		stillEligible, eligibilityErr := db.IdleSuspendCandidateStillEligible(ctx, c.PodVMID)
 		if eligibilityErr != nil || !stillEligible {
