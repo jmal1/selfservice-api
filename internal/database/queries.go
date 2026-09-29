@@ -3181,16 +3181,52 @@ func (q *Queries) ListActiveSessions(ctx context.Context) ([]ActiveSession, erro
 
 // --- Paginated Audit Log ---
 
+// AuditFilterError is a rejected audit-log search. Handlers map it to HTTP 400.
+type AuditFilterError struct {
+	msg string
+}
+
+func (e *AuditFilterError) Error() string { return e.msg }
+
+func invalidAuditFilter(msg string) error {
+	return &AuditFilterError{msg: msg}
+}
+
 // AuditLogFilter holds optional query filters for listing audit entries.
+// Action is a single prefix kept for callers that set the field directly.
+// Actions is the OR of prefixes from repeated action query params.
+// ExcludeActions drops exact action names (the page uses this for api.request).
+// Actor is "", "all", "human", "synthetic", or "system".
+// Query matches display name, email, username, and the details JSON text.
 type AuditLogFilter struct {
-	Page         int
-	PerPage      int
-	Action       string // prefix match (e.g. "pod" matches "pod.create", "pod.delete")
-	UserID       *uuid.UUID
-	ResourceType string
-	ResourceID   *uuid.UUID
-	Since        *time.Time
-	Until        *time.Time
+	Page           int
+	PerPage        int
+	Action         string
+	Actions        []string
+	ExcludeActions []string
+	Actor          string
+	Query          string
+	UserID         *uuid.UUID
+	ResourceType   string
+	ResourceID     *uuid.UUID
+	Since          *time.Time
+	Until          *time.Time
+}
+
+// Validate rejects actor values and filter sizes the search endpoint must not run.
+func (f AuditLogFilter) Validate() error {
+	switch f.Actor {
+	case "", "all", "human", "synthetic", "system":
+	default:
+		return invalidAuditFilter("actor must be human, synthetic, system, or all")
+	}
+	if countNonEmpty(f.Actions) > 8 || countNonEmpty(f.ExcludeActions) > 8 {
+		return invalidAuditFilter("too many action filters")
+	}
+	if len(strings.TrimSpace(f.Query)) > 200 {
+		return invalidAuditFilter("search is too long")
+	}
+	return nil
 }
 
 // AuditLogPage holds a page of audit entries plus total count.
@@ -3201,25 +3237,67 @@ type AuditLogPage struct {
 	PerPage int               `json:"per_page"`
 }
 
-// ListAuditLogPaginated returns a filtered, paginated audit log.
-func (q *Queries) ListAuditLogPaginated(ctx context.Context, f AuditLogFilter) (*AuditLogPage, error) {
-	if f.Page < 1 {
-		f.Page = 1
-	}
-	if f.PerPage < 1 || f.PerPage > 100 {
-		f.PerPage = 50
+// auditLogWhere builds the shared WHERE clause for the count and page queries.
+// Monitor accounts are the username prefix "synthetic" (synthetic and synthetic-instructor).
+// Human keeps every other attributed row, including a user_id whose user row is gone.
+func auditLogWhere(f AuditLogFilter) (string, []any, error) {
+	if err := f.Validate(); err != nil {
+		return "", nil, err
 	}
 
-	// Build WHERE clauses dynamically
 	where := "WHERE 1=1"
 	args := []any{}
 	argIdx := 1
 
+	prefixes := make([]string, 0, len(f.Actions)+1)
 	if f.Action != "" {
-		where += fmt.Sprintf(" AND a.action LIKE $%d", argIdx)
-		args = append(args, f.Action+"%")
+		prefixes = append(prefixes, f.Action)
+	}
+	for _, action := range f.Actions {
+		if action != "" {
+			prefixes = append(prefixes, action)
+		}
+	}
+	if len(prefixes) > 0 {
+		parts := make([]string, 0, len(prefixes))
+		for _, prefix := range prefixes {
+			parts = append(parts, fmt.Sprintf("a.action LIKE $%d ESCAPE '\\'", argIdx))
+			args = append(args, likePrefix(prefix))
+			argIdx++
+		}
+		where += " AND (" + strings.Join(parts, " OR ") + ")"
+	}
+
+	for _, action := range f.ExcludeActions {
+		if action == "" {
+			continue
+		}
+		where += fmt.Sprintf(" AND a.action <> $%d", argIdx)
+		args = append(args, action)
 		argIdx++
 	}
+
+	switch f.Actor {
+	case "", "all":
+	case "human":
+		where += " AND a.user_id IS NOT NULL AND (u.username IS NULL OR u.username NOT LIKE 'synthetic%')"
+	case "synthetic":
+		where += " AND u.username LIKE 'synthetic%'"
+	case "system":
+		where += " AND a.user_id IS NULL"
+	}
+
+	if q := strings.TrimSpace(f.Query); q != "" {
+		where += fmt.Sprintf(` AND (
+			COALESCE(u.display_name, '') ILIKE $%d ESCAPE '\'
+			OR COALESCE(u.email, '') ILIKE $%d ESCAPE '\'
+			OR COALESCE(u.username, '') ILIKE $%d ESCAPE '\'
+			OR COALESCE(a.details::text, '') ILIKE $%d ESCAPE '\'
+		)`, argIdx, argIdx, argIdx, argIdx)
+		args = append(args, likeContains(q))
+		argIdx++
+	}
+
 	if f.UserID != nil {
 		where += fmt.Sprintf(" AND a.user_id = $%d", argIdx)
 		args = append(args, *f.UserID)
@@ -3243,18 +3321,57 @@ func (q *Queries) ListAuditLogPaginated(ctx context.Context, f AuditLogFilter) (
 	if f.Until != nil {
 		where += fmt.Sprintf(" AND a.created_at <= $%d", argIdx)
 		args = append(args, *f.Until)
-		argIdx++
 	}
 
-	// Count total
+	return where, args, nil
+}
+
+func likePrefix(s string) string {
+	return escapeLike(s) + "%"
+}
+
+func likeContains(s string) string {
+	return "%" + escapeLike(s) + "%"
+}
+
+func escapeLike(s string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
+}
+
+func countNonEmpty(values []string) int {
+	n := 0
+	for _, v := range values {
+		if v != "" {
+			n++
+		}
+	}
+	return n
+}
+
+// ListAuditLogPaginated returns a filtered, paginated audit log.
+func (q *Queries) ListAuditLogPaginated(ctx context.Context, f AuditLogFilter) (*AuditLogPage, error) {
+	if f.Page < 1 {
+		f.Page = 1
+	}
+	if f.PerPage < 1 || f.PerPage > 100 {
+		f.PerPage = 50
+	}
+
+	where, args, err := auditLogWhere(f)
+	if err != nil {
+		return nil, err
+	}
+
+	// Count total. The join is required whenever actor or q refers to users.
 	var total int64
-	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM audit_log a %s", where)
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM audit_log a LEFT JOIN users u ON a.user_id = u.id %s", where)
 	if err := q.pool.QueryRow(ctx, countQuery, args...).Scan(&total); err != nil {
 		return nil, err
 	}
 
 	// Fetch page
 	offset := (f.Page - 1) * f.PerPage
+	argIdx := len(args) + 1
 	dataQuery := fmt.Sprintf(`
 		SELECT a.id, a.user_id, u.display_name, u.email,
 		       a.action, a.resource_type, a.resource_id, a.details,
