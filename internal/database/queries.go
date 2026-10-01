@@ -780,7 +780,7 @@ func getResourceUsage(ctx context.Context, querier jobRowQuerier, userID uuid.UU
 			COALESCE(SUM(pv.vcpus), 0),
 			COALESCE(SUM(pv.ram_mb), 0),
 			COALESCE(SUM(pv.disk_gb), 0),
-			COUNT(DISTINCT p.id)
+			COUNT(DISTINCT p.id) FILTER (WHERE p.network_mode = 'isolated')
 		FROM pods p
 		LEFT JOIN pod_vms pv ON p.id = pv.pod_id AND pv.status NOT IN ('deleted', 'error')
 		WHERE p.owner_id = $1 AND p.status NOT IN ('destroyed', 'error')
@@ -836,6 +836,7 @@ func (q *Queries) CheckoutVLAN(ctx context.Context, tx pgx.Tx, podID uuid.UUID, 
 	}
 
 	query += `
+			AND vlan_tag NOT BETWEEN 347 AND 355
 			ORDER BY RANDOM()
 			LIMIT 1
 			FOR UPDATE SKIP LOCKED
@@ -1179,11 +1180,11 @@ func (q *Queries) CreatePod(ctx context.Context, tx pgx.Tx, pod *models.Pod) err
 func (q *Queries) GetPodByID(ctx context.Context, id uuid.UUID) (*models.Pod, error) {
 	var p models.Pod
 	err := q.pool.QueryRow(ctx, `
-		SELECT id, owner_id, name, salt, vlan_id, subnet, status,
+		SELECT id, owner_id, name, salt, vlan_id, subnet, network_mode, shared_network_id, status,
 		       error_message, expires_at, blueprint_id, allow_vm_additions, created_at, updated_at
 		FROM pods WHERE id = $1
 	`, id).Scan(
-		&p.ID, &p.OwnerID, &p.Name, &p.Salt, &p.VLANID, &p.Subnet, &p.Status,
+		&p.ID, &p.OwnerID, &p.Name, &p.Salt, &p.VLANID, &p.Subnet, &p.NetworkMode, &p.SharedNetworkID, &p.Status,
 		&p.ErrorMessage, &p.ExpiresAt, &p.BlueprintID, &p.AllowVMAdditions, &p.CreatedAt, &p.UpdatedAt,
 	)
 	if err == pgx.ErrNoRows {
@@ -1244,7 +1245,7 @@ func (q *Queries) GetPodByID(ctx context.Context, id uuid.UUID) (*models.Pod, er
 // ListPodsByOwner returns all non-destroyed pods for a user (with VMs and owner).
 func (q *Queries) ListPodsByOwner(ctx context.Context, ownerID uuid.UUID) ([]models.Pod, error) {
 	rows, err := q.pool.Query(ctx, `
-		SELECT p.id, p.owner_id, p.name, p.salt, p.vlan_id, p.subnet, p.status,
+		SELECT p.id, p.owner_id, p.name, p.salt, p.vlan_id, p.subnet, p.network_mode, p.shared_network_id, p.status,
 		       p.error_message, p.expires_at, p.blueprint_id, p.allow_vm_additions, p.created_at, p.updated_at,
 		       u.id, u.username, u.email, COALESCE(u.display_name, ''), u.role
 		FROM pods p
@@ -1262,7 +1263,7 @@ func (q *Queries) ListPodsByOwner(ctx context.Context, ownerID uuid.UUID) ([]mod
 		var p models.Pod
 		var owner models.User
 		if err := rows.Scan(
-			&p.ID, &p.OwnerID, &p.Name, &p.Salt, &p.VLANID, &p.Subnet, &p.Status,
+			&p.ID, &p.OwnerID, &p.Name, &p.Salt, &p.VLANID, &p.Subnet, &p.NetworkMode, &p.SharedNetworkID, &p.Status,
 			&p.ErrorMessage, &p.ExpiresAt, &p.BlueprintID, &p.AllowVMAdditions, &p.CreatedAt, &p.UpdatedAt,
 			&owner.ID, &owner.Username, &owner.Email, &owner.DisplayName, &owner.Role,
 		); err != nil {
@@ -1290,7 +1291,7 @@ func (q *Queries) ListPodsByOwner(ctx context.Context, ownerID uuid.UUID) ([]mod
 // ListAllPods returns all non-destroyed pods (admin, with owner info).
 func (q *Queries) ListAllPods(ctx context.Context) ([]models.Pod, error) {
 	rows, err := q.pool.Query(ctx, `
-		SELECT p.id, p.owner_id, p.name, p.salt, p.vlan_id, p.subnet, p.status,
+		SELECT p.id, p.owner_id, p.name, p.salt, p.vlan_id, p.subnet, p.network_mode, p.shared_network_id, p.status,
 		       p.error_message, p.expires_at, p.blueprint_id, p.allow_vm_additions, p.created_at, p.updated_at,
 		       u.id, u.username, u.email, COALESCE(u.display_name, ''), u.role
 		FROM pods p
@@ -1308,7 +1309,7 @@ func (q *Queries) ListAllPods(ctx context.Context) ([]models.Pod, error) {
 		var p models.Pod
 		var owner models.User
 		if err := rows.Scan(
-			&p.ID, &p.OwnerID, &p.Name, &p.Salt, &p.VLANID, &p.Subnet, &p.Status,
+			&p.ID, &p.OwnerID, &p.Name, &p.Salt, &p.VLANID, &p.Subnet, &p.NetworkMode, &p.SharedNetworkID, &p.Status,
 			&p.ErrorMessage, &p.ExpiresAt, &p.BlueprintID, &p.AllowVMAdditions, &p.CreatedAt, &p.UpdatedAt,
 			&owner.ID, &owner.Username, &owner.Email, &owner.DisplayName, &owner.Role,
 		); err != nil {
@@ -1580,7 +1581,8 @@ const claimJobSQL = `
 		      'template_revalidate',
 		      'template_health_confirm',
 		      'template_replica_build',
-		      'image_import'
+		      'image_import',
+		      'shared_network_provision'
 		    )
 		    OR (
 		      type IN (
@@ -1592,7 +1594,8 @@ const claimJobSQL = `
 		        'template_revalidate',
 		        'template_health_confirm',
 		        'template_replica_build',
-		        'image_import'
+		        'image_import',
+		        'shared_network_provision'
 		      )
 		      AND payload->>'cleanup_only' = 'true'
 		    )

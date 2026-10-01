@@ -35,6 +35,7 @@ func validateMaintenanceClaimSQL(query string) error {
 		"TEMPLATE_HEALTH_CONFIRM",
 		"TEMPLATE_REPLICA_BUILD",
 		"IMAGE_IMPORT",
+		"SHARED_NETWORK_PROVISION",
 	} {
 		if strings.Count(sql, "'"+jobType+"'") != 2 {
 			return fmt.Errorf("withheld job type %s must appear in both claim predicates", jobType)

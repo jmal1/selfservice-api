@@ -177,6 +177,7 @@ func TestAdministrativeResourceRoutesAreRegistered(t *testing.T) {
 		"POST /api/v1/admin/vlans",
 		"PATCH /api/v1/admin/vlans/{vlanID}",
 		"DELETE /api/v1/admin/vlans/{vlanID}",
+		"POST /api/v1/admin/shared-networks/provision",
 		"GET /api/v1/admin/blueprints",
 		"POST /api/v1/admin/blueprints",
 		"PUT /api/v1/admin/blueprints/{blueprintID}",

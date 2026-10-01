@@ -15,12 +15,14 @@ const (
 	provisioningRoutePodCreate       = "pod_create"
 	provisioningRouteBlueprintDeploy = "blueprint_deploy"
 	provisioningRouteVMAdd           = "vm_add"
+	provisioningRouteSingleVM        = "single_vm"
 )
 
 var provisioningRoutes = []string{
 	provisioningRouteBlueprintDeploy,
 	provisioningRoutePodCreate,
 	provisioningRouteVMAdd,
+	provisioningRouteSingleVM,
 }
 
 // ProvisioningStatusResponse is the stable UI-facing maintenance contract.
@@ -66,6 +68,8 @@ func provisioningRoute(r *http.Request) (string, bool) {
 	case len(parts) == 5 && parts[0] == "api" && parts[1] == "v1" &&
 		parts[2] == "pods" && parts[4] == "vms":
 		return provisioningRouteVMAdd, true
+	case len(parts) == 3 && parts[0] == "api" && parts[1] == "v1" && parts[2] == "single-vms":
+		return provisioningRouteSingleVM, true
 	default:
 		return "", false
 	}

@@ -437,6 +437,8 @@ type Pod struct {
 	Salt                string     `json:"salt" db:"salt"`
 	VLANID              int        `json:"vlan_id" db:"vlan_id"`
 	Subnet              string     `json:"subnet" db:"subnet"`
+	NetworkMode         string     `json:"network_mode" db:"network_mode"`
+	SharedNetworkID     *uuid.UUID `json:"shared_network_id,omitempty" db:"shared_network_id"`
 	Status              string     `json:"status" db:"status"`
 	ErrorMessage        *string    `json:"error_message,omitempty" db:"error_message"`
 	ExpiresAt           *time.Time `json:"expires_at,omitempty" db:"expires_at"`
@@ -665,6 +667,9 @@ const (
 	// OVAs are deployed via OVF import into the Templates folder. Payload
 	// is provisioner.ImageImportPayload.
 	JobTypeImageImport = "image_import"
+	// JobTypeSharedNetworkProvision builds the nine Single VM stripes once.
+	// A student deploy does not enqueue this job.
+	JobTypeSharedNetworkProvision = "shared_network_provision"
 
 	// JobTypeVMSuspend saves a VM's state to disk and parks it, freeing
 	// cluster resources. The VM can be resumed via a normal vm_start job

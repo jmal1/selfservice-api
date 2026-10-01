@@ -790,11 +790,11 @@ func (q *Queries) PreparePodDestroy(
 
 	pod := &models.Pod{ID: podID}
 	if err := tx.QueryRow(ctx, `
-		SELECT status, vlan_id, subnet
+		SELECT status, vlan_id, subnet, network_mode
 		FROM pods
 		WHERE id = $1
 		FOR UPDATE
-	`, podID).Scan(&pod.Status, &pod.VLANID, &pod.Subnet); err != nil {
+	`, podID).Scan(&pod.Status, &pod.VLANID, &pod.Subnet, &pod.NetworkMode); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, fmt.Errorf("lock pod %s for destroy preparation: %w", podID, ErrPodNotFound)
 		}

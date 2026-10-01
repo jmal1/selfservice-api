@@ -91,6 +91,22 @@ func validContentFilterConfig() ContentFilterConfig {
 	}
 }
 
+func TestContentFilterSourcesAcceptTheSharedPrefix(t *testing.T) {
+	cfg := validContentFilterConfig()
+	cfg.SourceNetwork = "10.100.0.0/16,10.110.0.0/16"
+	if err := validateContentFilterConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg.SourceNetwork = "10.110.0.0/16"
+	if err := validateContentFilterConfig(cfg); err == nil {
+		t.Fatal("shared prefix alone was accepted")
+	}
+	cfg.SourceNetwork = "10.200.0.0/16"
+	if err := validateContentFilterConfig(cfg); err == nil {
+		t.Fatal("unexpected prefix was accepted")
+	}
+}
+
 func TestDesiredContentFilterRules_AreGlobalQuickAndPrecedeInterfacePasses(t *testing.T) {
 	rules := desiredContentFilterRules(validContentFilterConfig())
 	if len(rules) != 7+len(contentFilterBypassPorts)+3 {

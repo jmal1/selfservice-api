@@ -185,6 +185,8 @@ func (p *Provisioner) ProcessJob(ctx context.Context, job *models.Job) error {
 		switch job.Type {
 		case models.JobTypePodCreate:
 			return p.CreatePod(ctx, job)
+		case models.JobTypeSharedNetworkProvision:
+			return p.ProvisionSharedNetworks(ctx)
 		case models.JobTypePodDestroy:
 			return p.DestroyPod(ctx, job)
 		case models.JobTypeVMStart:
@@ -1324,7 +1326,7 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr er
 	octet := vlanTag - 100
 	subnet := pod.Subnet
 	gateway := fmt.Sprintf("10.100.%d.1/24", octet)
-	pgName := fmt.Sprintf("Pod-VLAN%d", vlanTag)
+	pgName, mutateNetwork := models.PodCreateNetwork(pod.NetworkMode, vlanTag)
 	if stopped, err := p.stopPodCreateIfStale(ctx, job, pod.ID, payload.VMs, rb, "admission"); err != nil {
 		return err
 	} else if stopped {
@@ -1379,223 +1381,228 @@ func (p *Provisioner) CreatePod(ctx context.Context, job *models.Job) (retErr er
 	placementsByVM := placementPlanByPodVM(placements)
 	targetHosts := selectedPlacementHosts(placements)
 
-	// --- Step 2: Create VLAN on OPNsense ---
-	p.publishProgress(job.ID, "vlan_create", fmt.Sprintf("Creating VLAN %d on OPNsense", vlanTag))
+	// Shared pods are placed on a stripe that already exists. This block is the
+	// isolated path only: it creates the VLAN, interface, DHCP, firewall, and
+	// port group. A shared create must not enter it.
+	if mutateNetwork {
+		// --- Step 2: Create VLAN on OPNsense ---
+		p.publishProgress(job.ID, "vlan_create", fmt.Sprintf("Creating VLAN %d on OPNsense", vlanTag))
 
-	// Idempotency: check if VLAN already exists
-	existing, _ := p.opn.GetVLANByTag(ctx, vlanTag)
-	var vlanUUID string
-	vlanPreexisting := false
-	if existing != nil {
-		vlanUUID = existing.UUID
-		vlanPreexisting = true
-		p.logger.Info("VLAN already exists", "tag", vlanTag, "uuid", vlanUUID)
-	} else {
-		vlanUUID, err = p.opn.CreateVLAN(ctx, "vmx1", vlanTag, fmt.Sprintf("Pod-VLAN%d", vlanTag))
-		if err != nil {
-			return fmt.Errorf("create VLAN: %w", err)
+		// Idempotency: check if VLAN already exists
+		existing, _ := p.opn.GetVLANByTag(ctx, vlanTag)
+		var vlanUUID string
+		vlanPreexisting := false
+		if existing != nil {
+			vlanUUID = existing.UUID
+			vlanPreexisting = true
+			p.logger.Info("VLAN already exists", "tag", vlanTag, "uuid", vlanUUID)
+		} else {
+			vlanUUID, err = p.opn.CreateVLAN(ctx, "vmx1", vlanTag, fmt.Sprintf("Pod-VLAN%d", vlanTag))
+			if err != nil {
+				return fmt.Errorf("create VLAN: %w", err)
+			}
 		}
-	}
 
-	preexStr := "false"
-	if vlanPreexisting {
-		preexStr = "true"
-	}
-	if err := rb.Record(ctx, "vlan_create", map[string]string{"uuid": vlanUUID, "preexisting": preexStr}); err != nil {
-		return err
-	}
-	if stopped, err := p.stopPodCreateIfStale(ctx, job, pod.ID, payload.VMs, rb, "vlan_create"); err != nil {
-		return err
-	} else if stopped {
-		return nil
-	}
-
-	if err := p.opn.ReconfigureVLANs(ctx); err != nil {
-		return p.failPodCreateWithCleanup(ctx, job, payload, rb, "reconfigure VLANs", fmt.Errorf("reconfigure VLANs: %w", err))
-	}
-
-	// --- Step 3: Assign OPNsense interface via SSH ---
-	p.publishProgress(job.ID, "interface_assign", "Assigning OPNsense interface via SSH")
-
-	ifName, err := p.opnSSH.AssignInterface(ctx, vlanTag, gateway)
-	if err != nil {
-		return p.failPodCreateWithCleanup(ctx, job, payload, rb, "assign interface", fmt.Errorf("assign interface: %w", err))
-	}
-
-	if err := rb.Record(ctx, "interface_assign", map[string]interface{}{"if_name": ifName, "vlan_tag": vlanTag}); err != nil {
-		return err
-	}
-	if stopped, err := p.stopPodCreateIfStale(ctx, job, pod.ID, payload.VMs, rb, "interface_assign"); err != nil {
-		return err
-	} else if stopped {
-		return nil
-	}
-
-	// --- Step 4: Create DHCP subnet ---
-	p.publishProgress(job.ID, "dhcp_create", fmt.Sprintf("Creating DHCP subnet %s", subnet))
-
-	existingDHCP, _ := p.opn.GetDHCPSubnetByNetwork(ctx, subnet)
-	var dhcpUUID string
-	dhcpPreexisting := false
-	if existingDHCP != nil {
-		dhcpUUID = existingDHCP.UUID
-		dhcpPreexisting = true
-		p.logger.Info("DHCP subnet already exists", "subnet", subnet, "uuid", dhcpUUID)
-	} else {
-		poolRange := fmt.Sprintf("10.100.%d.10-10.100.%d.250", octet, octet)
-		dhcpUUID, err = p.opn.CreateDHCPSubnet(ctx, subnet, poolRange, gateway)
-		if err != nil {
-			return p.failPodCreateWithCleanup(ctx, job, payload, rb, "create DHCP", fmt.Errorf("create DHCP: %w", err))
+		preexStr := "false"
+		if vlanPreexisting {
+			preexStr = "true"
 		}
-	}
-
-	dhcpPreexStr := "false"
-	if dhcpPreexisting {
-		dhcpPreexStr = "true"
-	}
-	if err := rb.Record(ctx, "dhcp_create", map[string]string{"uuid": dhcpUUID, "preexisting": dhcpPreexStr}); err != nil {
-		return err
-	}
-	if stopped, err := p.stopPodCreateIfStale(ctx, job, pod.ID, payload.VMs, rb, "dhcp_create"); err != nil {
-		return err
-	} else if stopped {
-		return nil
-	}
-
-	// Add the OPNsense interface to Kea's listened interfaces BEFORE reconfigure.
-	// ReconfigureDHCP regenerates config and restarts Kea, so the interface must
-	// be in the config before that happens.
-	if err := p.opn.AddDHCPInterface(ctx, ifName); err != nil {
-		return p.failPodCreateWithCleanup(
-			ctx,
-			job,
-			payload,
-			rb,
-			"add DHCP interface",
-			fmt.Errorf("add DHCP interface %s: %w", ifName, err),
-		)
-	}
-
-	// Wait for interface to fully stabilize before restarting Kea.
-	// The VLAN interface needs time after interface_configure() to be kernel-ready.
-	time.Sleep(2 * time.Second)
-
-	if err := p.opn.ReconfigureDHCP(ctx); err != nil {
-		return p.failPodCreateWithCleanup(ctx, job, payload, rb, "reconfigure DHCP", fmt.Errorf("reconfigure DHCP: %w", err))
-	}
-
-	// --- Step 4b: Create firewall rule to allow pod traffic ---
-	p.publishProgress(job.ID, "firewall_create", "Creating firewall rule for pod network")
-
-	fwRuleUUID, fwRuleCreated, err := ensurePodFirewallRule(
-		ctx,
-		p.opn,
-		int(vlanTag),
-		ifName,
-		subnet,
-		defaultMaxFirewallRules,
-		defaultFirewallCleanupLimit,
-	)
-	if fwRuleCreated {
-		if err := rb.Record(ctx, "firewall_create", map[string]string{"uuid": fwRuleUUID}); err != nil {
+		if err := rb.Record(ctx, "vlan_create", map[string]string{"uuid": vlanUUID, "preexisting": preexStr}); err != nil {
 			return err
 		}
-		if stopped, err := p.stopPodCreateIfStale(ctx, job, pod.ID, payload.VMs, rb, "firewall_create"); err != nil {
+		if stopped, err := p.stopPodCreateIfStale(ctx, job, pod.ID, payload.VMs, rb, "vlan_create"); err != nil {
 			return err
 		} else if stopped {
 			return nil
 		}
-	}
-	if err != nil {
-		return p.failPodCreateWithCleanup(ctx, job, payload, rb, "ensure firewall rule", fmt.Errorf("ensure firewall rule: %w", err))
-	}
 
-	// --- Step 5: Create port groups only on selected ESXi hosts ---
-	p.publishProgress(job.ID, "portgroup_create", fmt.Sprintf("Creating port group %s on selected hosts", pgName))
+		if err := p.opn.ReconfigureVLANs(ctx); err != nil {
+			return p.failPodCreateWithCleanup(ctx, job, payload, rb, "reconfigure VLANs", fmt.Errorf("reconfigure VLANs: %w", err))
+		}
 
-	err = p.db.WithVCenterPortGroupMutationLock(ctx, func(lockCtx context.Context) error {
-		var (
-			receipt    *vcenter.PortGroupReceipt
-			receiptRaw json.RawMessage
+		// --- Step 3: Assign OPNsense interface via SSH ---
+		p.publishProgress(job.ID, "interface_assign", "Assigning OPNsense interface via SSH")
+
+		ifName, err := p.opnSSH.AssignInterface(ctx, vlanTag, gateway)
+		if err != nil {
+			return p.failPodCreateWithCleanup(ctx, job, payload, rb, "assign interface", fmt.Errorf("assign interface: %w", err))
+		}
+
+		if err := rb.Record(ctx, "interface_assign", map[string]interface{}{"if_name": ifName, "vlan_tag": vlanTag}); err != nil {
+			return err
+		}
+		if stopped, err := p.stopPodCreateIfStale(ctx, job, pod.ID, payload.VMs, rb, "interface_assign"); err != nil {
+			return err
+		} else if stopped {
+			return nil
+		}
+
+		// --- Step 4: Create DHCP subnet ---
+		p.publishProgress(job.ID, "dhcp_create", fmt.Sprintf("Creating DHCP subnet %s", subnet))
+
+		existingDHCP, _ := p.opn.GetDHCPSubnetByNetwork(ctx, subnet)
+		var dhcpUUID string
+		dhcpPreexisting := false
+		if existingDHCP != nil {
+			dhcpUUID = existingDHCP.UUID
+			dhcpPreexisting = true
+			p.logger.Info("DHCP subnet already exists", "subnet", subnet, "uuid", dhcpUUID)
+		} else {
+			poolRange := fmt.Sprintf("10.100.%d.10-10.100.%d.250", octet, octet)
+			dhcpUUID, err = p.opn.CreateDHCPSubnet(ctx, subnet, poolRange, gateway)
+			if err != nil {
+				return p.failPodCreateWithCleanup(ctx, job, payload, rb, "create DHCP", fmt.Errorf("create DHCP: %w", err))
+			}
+		}
+
+		dhcpPreexStr := "false"
+		if dhcpPreexisting {
+			dhcpPreexStr = "true"
+		}
+		if err := rb.Record(ctx, "dhcp_create", map[string]string{"uuid": dhcpUUID, "preexisting": dhcpPreexStr}); err != nil {
+			return err
+		}
+		if stopped, err := p.stopPodCreateIfStale(ctx, job, pod.ID, payload.VMs, rb, "dhcp_create"); err != nil {
+			return err
+		} else if stopped {
+			return nil
+		}
+
+		// Add the OPNsense interface to Kea's listened interfaces BEFORE reconfigure.
+		// ReconfigureDHCP regenerates config and restarts Kea, so the interface must
+		// be in the config before that happens.
+		if err := p.opn.AddDHCPInterface(ctx, ifName); err != nil {
+			return p.failPodCreateWithCleanup(
+				ctx,
+				job,
+				payload,
+				rb,
+				"add DHCP interface",
+				fmt.Errorf("add DHCP interface %s: %w", ifName, err),
+			)
+		}
+
+		// Wait for interface to fully stabilize before restarting Kea.
+		// The VLAN interface needs time after interface_configure() to be kernel-ready.
+		time.Sleep(2 * time.Second)
+
+		if err := p.opn.ReconfigureDHCP(ctx); err != nil {
+			return p.failPodCreateWithCleanup(ctx, job, payload, rb, "reconfigure DHCP", fmt.Errorf("reconfigure DHCP: %w", err))
+		}
+
+		// --- Step 4b: Create firewall rule to allow pod traffic ---
+		p.publishProgress(job.ID, "firewall_create", "Creating firewall rule for pod network")
+
+		fwRuleUUID, fwRuleCreated, err := ensurePodFirewallRule(
+			ctx,
+			p.opn,
+			int(vlanTag),
+			ifName,
+			subnet,
+			defaultMaxFirewallRules,
+			defaultFirewallCleanupLimit,
 		)
-		record, receiptErr := p.db.GetPodPortGroupReceipt(lockCtx, pod.ID)
-		switch {
-		case receiptErr == nil:
-			var persisted vcenter.PortGroupReceipt
-			if err := json.Unmarshal(record.Receipt, &persisted); err != nil {
-				return fmt.Errorf("decode durable pod port group receipt: %w", err)
+		if fwRuleCreated {
+			if err := rb.Record(ctx, "firewall_create", map[string]string{"uuid": fwRuleUUID}); err != nil {
+				return err
 			}
-			if record.RemovedAt != nil {
-				return fmt.Errorf("%w: pod %s port group ownership was already removed", database.ErrPortGroupReceiptConflict, pod.ID)
+			if stopped, err := p.stopPodCreateIfStale(ctx, job, pod.ID, payload.VMs, rb, "firewall_create"); err != nil {
+				return err
+			} else if stopped {
+				return nil
 			}
-			receipt = &persisted
-			receiptWithKeys, keyErr := vcenter.PortGroupReceiptWithKeys(persisted, record.Keys)
-			if keyErr != nil {
-				return keyErr
+		}
+		if err != nil {
+			return p.failPodCreateWithCleanup(ctx, job, payload, rb, "ensure firewall rule", fmt.Errorf("ensure firewall rule: %w", err))
+		}
+
+		// --- Step 5: Create port groups only on selected ESXi hosts ---
+		p.publishProgress(job.ID, "portgroup_create", fmt.Sprintf("Creating port group %s on selected hosts", pgName))
+
+		err = p.db.WithVCenterPortGroupMutationLock(ctx, func(lockCtx context.Context) error {
+			var (
+				receipt    *vcenter.PortGroupReceipt
+				receiptRaw json.RawMessage
+			)
+			record, receiptErr := p.db.GetPodPortGroupReceipt(lockCtx, pod.ID)
+			switch {
+			case receiptErr == nil:
+				var persisted vcenter.PortGroupReceipt
+				if err := json.Unmarshal(record.Receipt, &persisted); err != nil {
+					return fmt.Errorf("decode durable pod port group receipt: %w", err)
+				}
+				if record.RemovedAt != nil {
+					return fmt.Errorf("%w: pod %s port group ownership was already removed", database.ErrPortGroupReceiptConflict, pod.ID)
+				}
+				receipt = &persisted
+				receiptWithKeys, keyErr := vcenter.PortGroupReceiptWithKeys(persisted, record.Keys)
+				if keyErr != nil {
+					return keyErr
+				}
+				receipt = &receiptWithKeys
+				receiptRaw = record.Receipt
+			case errors.Is(receiptErr, database.ErrPortGroupReceiptNotFound):
+				planned, planErr := p.vc.PlanPortGroupMutationForHosts(lockCtx, pgName, vlanTag, targetHosts)
+				if planErr != nil {
+					return fmt.Errorf("plan port group mutation: %w", planErr)
+				}
+				receipt = &planned
+				raw, marshalErr := json.Marshal(planned)
+				if marshalErr != nil {
+					return fmt.Errorf("marshal port group receipt: %w", marshalErr)
+				}
+				if persistErr := p.db.PersistPodPortGroupReceipt(
+					lockCtx,
+					job.ID,
+					workerID,
+					pod.ID,
+					raw,
+				); persistErr != nil {
+					return fmt.Errorf("persist durable pod port group receipt: %w", persistErr)
+				}
+				receiptRaw = raw
+			default:
+				return receiptErr
 			}
-			receipt = &receiptWithKeys
-			receiptRaw = record.Receipt
-		case errors.Is(receiptErr, database.ErrPortGroupReceiptNotFound):
-			planned, planErr := p.vc.PlanPortGroupMutationForHosts(lockCtx, pgName, vlanTag, targetHosts)
-			if planErr != nil {
-				return fmt.Errorf("plan port group mutation: %w", planErr)
+			if _, scopeErr := validatePortGroupReceiptScope(*receipt, pgName, vlanTag, targetHosts); scopeErr != nil {
+				return scopeErr
 			}
-			receipt = &planned
-			raw, marshalErr := json.Marshal(planned)
-			if marshalErr != nil {
-				return fmt.Errorf("marshal port group receipt: %w", marshalErr)
+			// The independent ledger survives rollback checkpoints; the rollback
+			// step drives compensation progress for this job.
+			if recordErr := rb.Record(lockCtx, "portgroup_create", *receipt); recordErr != nil {
+				return fmt.Errorf("persist port group rollback step: %w", recordErr)
 			}
-			if persistErr := p.db.PersistPodPortGroupReceipt(
+			if beginErr := p.db.BeginPodPortGroupMutation(
 				lockCtx,
 				job.ID,
 				workerID,
 				pod.ID,
-				raw,
-			); persistErr != nil {
-				return fmt.Errorf("persist durable pod port group receipt: %w", persistErr)
+				receiptRaw,
+			); beginErr != nil {
+				return fmt.Errorf("persist port group mutation intent: %w", beginErr)
 			}
-			receiptRaw = raw
-		default:
-			return receiptErr
-		}
-		if _, scopeErr := validatePortGroupReceiptScope(*receipt, pgName, vlanTag, targetHosts); scopeErr != nil {
-			return scopeErr
-		}
-		// The independent ledger survives rollback checkpoints; the rollback
-		// step drives compensation progress for this job.
-		if recordErr := rb.Record(lockCtx, "portgroup_create", *receipt); recordErr != nil {
-			return fmt.Errorf("persist port group rollback step: %w", recordErr)
-		}
-		if beginErr := p.db.BeginPodPortGroupMutation(
-			lockCtx,
-			job.ID,
-			workerID,
-			pod.ID,
-			receiptRaw,
-		); beginErr != nil {
-			return fmt.Errorf("persist port group mutation intent: %w", beginErr)
-		}
-		if err := p.vc.ApplyPortGroupMutation(lockCtx, *receipt); err != nil {
-			return err
-		}
-		keys, err := p.vc.CapturePortGroupKeys(lockCtx, *receipt)
+			if err := p.vc.ApplyPortGroupMutation(lockCtx, *receipt); err != nil {
+				return err
+			}
+			keys, err := p.vc.CapturePortGroupKeys(lockCtx, *receipt)
+			if err != nil {
+				return fmt.Errorf("capture stable port group identities: %w", err)
+			}
+			if err := p.db.PersistPodPortGroupKeys(lockCtx, pod.ID, receiptRaw, keys); err != nil {
+				return fmt.Errorf("persist stable port group identities: %w", err)
+			}
+			return nil
+		})
 		if err != nil {
-			return fmt.Errorf("capture stable port group identities: %w", err)
+			return p.failPodCreateWithCleanup(ctx, job, payload, rb, "create port groups", fmt.Errorf("create port groups: %w", err))
 		}
-		if err := p.db.PersistPodPortGroupKeys(lockCtx, pod.ID, receiptRaw, keys); err != nil {
-			return fmt.Errorf("persist stable port group identities: %w", err)
+		if stopped, err := p.stopPodCreateIfStale(ctx, job, pod.ID, payload.VMs, rb, "portgroup_create"); err != nil {
+			return err
+		} else if stopped {
+			return nil
 		}
-		return nil
-	})
-	if err != nil {
-		return p.failPodCreateWithCleanup(ctx, job, payload, rb, "create port groups", fmt.Errorf("create port groups: %w", err))
-	}
-	if stopped, err := p.stopPodCreateIfStale(ctx, job, pod.ID, payload.VMs, rb, "portgroup_create"); err != nil {
-		return err
-	} else if stopped {
-		return nil
-	}
 
+	}
 	// --- Step 6: Clone VMs ---
 	var clonedVMs []int // indices of successfully cloned VMs
 	for i, vmSpec := range payload.VMs {

@@ -129,8 +129,8 @@
     {
       "path": "docs/instructor/labs-access.md",
       "title": "Isolated labs and Single VM access",
-      "size": 1383,
-      "sha256": "4ff17fe7de093c46666812ab60eea381c3ab730aa48cc1f93eeb855139a7833b",
+      "size": 2099,
+      "sha256": "50e186e8c17d76a1aacffa5e9c9f537442110ab75a420729edf58f11a082f092",
       "is_markdown": true,
       "from_seed": true
     },
@@ -349,8 +349,8 @@
     {
       "path": "internal/api/routes/routes.go",
       "title": "routes.go (Go)",
-      "size": 15642,
-      "sha256": "29aba07f808ee447757c0454c34a11044dc5979124f067807821fff38b17ee98",
+      "size": 15800,
+      "sha256": "47cfa9ee419f622dfc35d665819a6341f915aca9628caa6496f576ebaab265de",
       "is_markdown": false,
       "from_seed": false
     },
@@ -459,5 +459,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 754295
+  "total_bytes": 755169
 }

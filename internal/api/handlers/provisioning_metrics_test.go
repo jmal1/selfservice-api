@@ -21,6 +21,7 @@ func TestProvisioningAdmissionMetricsExposeBoundedRoutes(t *testing.T) {
 		`crucible_provisioning_admission_rejected_total{route="pod_create"} 1`,
 		`crucible_provisioning_admission_rejected_total{route="blueprint_deploy"} 0`,
 		`crucible_provisioning_admission_rejected_total{route="vm_add"} 0`,
+		`crucible_provisioning_admission_rejected_total{route="single_vm"} 0`,
 	} {
 		if !strings.Contains(body, fragment) {
 			t.Errorf("metrics body missing %q:\n%s", fragment, body)

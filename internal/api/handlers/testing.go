@@ -95,6 +95,9 @@ func (h *Handler) CreateTestingRun(w http.ResponseWriter, r *http.Request) {
 		respondError(w, r, http.StatusForbidden, "not your pod")
 		return
 	}
+	if rejectSharedAssessment(w, r, pod) {
+		return
+	}
 
 	// Parse request
 	var req struct {

@@ -2,7 +2,7 @@
 //
 // The evaluator runs on a ticker in the provision-worker. On each tick it
 // inspects every running pod VM and suspends those that have been idle for
-// longer than the configured threshold (default 6 hours).
+// longer than the configured threshold (default 2 hours).
 //
 // "Idle" means last_activity_at is older than the timeout. Console heartbeats
 // and above-threshold CPU or network each refresh that clock. When VMware
@@ -269,8 +269,8 @@ func evaluateIdleVMs(
 		// Resolve idle timeout for this pod (per-pod override or global default).
 		timeoutSecs, terr := db.GetIdleTimeoutSeconds(ctx, c.PodID)
 		if terr != nil {
-			vmLog.Warn("idle-eval: failed to get idle timeout; using default 6h", "error", terr)
-			timeoutSecs = 21600
+			vmLog.Warn("idle-eval: failed to get idle timeout; using default 2h", "error", terr)
+			timeoutSecs = models.DefaultIdleTimeoutSeconds
 		}
 		threshold := time.Duration(timeoutSecs) * time.Second
 
