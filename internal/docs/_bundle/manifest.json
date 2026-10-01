@@ -129,8 +129,8 @@
     {
       "path": "docs/instructor/labs-access.md",
       "title": "Isolated labs and Single VM access",
-      "size": 2099,
-      "sha256": "50e186e8c17d76a1aacffa5e9c9f537442110ab75a420729edf58f11a082f092",
+      "size": 2342,
+      "sha256": "5c3088f729728378e9aef33cb77b84c418a9ae5991181deb7aeb285ff58a3798",
       "is_markdown": true,
       "from_seed": true
     },
@@ -381,16 +381,16 @@
     {
       "path": "internal/engine/engine.go",
       "title": "engine.go (Go)",
-      "size": 18661,
-      "sha256": "c0a1ce9c1e8fe984adaaa044726e6500e9bfaae4fc454712243623add0f1bb20",
+      "size": 19089,
+      "sha256": "773f9e37194d27cd053c683b4a955607cd0fa372e14402cebe2353d74c2bcde7",
       "is_markdown": false,
       "from_seed": false
     },
     {
       "path": "internal/engine/queries.go",
       "title": "queries.go (Go)",
-      "size": 18413,
-      "sha256": "6b22abb36eb46d46e8af136e9457146c1e32c24d84b91fdd24174f68b45452e4",
+      "size": 19520,
+      "sha256": "c812a464ccdbb7eac297531996c4b432aa2599f8a8e3c5c6a7f55b32edafef46",
       "is_markdown": false,
       "from_seed": false
     },
@@ -459,5 +459,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 755169
+  "total_bytes": 756947
 }

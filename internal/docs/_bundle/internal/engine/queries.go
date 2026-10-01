@@ -91,7 +91,44 @@ func (q *Queries) UpdateRunStatus(ctx context.Context, runID uuid.UUID, status s
 		SET status = $2, error_message = $3, completed_at = $4, updated_at = NOW()
 		WHERE id = $1
 	`, runID, status, errorMsg, completedAt)
+	if err != nil {
+		return err
+	}
+	if completedAt != nil {
+		_, err = q.pool.Exec(ctx, `
+			UPDATE runner_ip_leases
+			SET released_at = NOW()
+			WHERE run_id = $1 AND released_at IS NULL
+		`, runID)
+	}
 	return err
+}
+
+// GetPodNetworkMode reads pods.network_mode. An empty result is treated as isolated.
+func (q *Queries) GetPodNetworkMode(ctx context.Context, podID uuid.UUID) (string, error) {
+	var mode string
+	err := q.pool.QueryRow(ctx, `SELECT network_mode FROM pods WHERE id = $1`, podID).Scan(&mode)
+	if err != nil {
+		return "", fmt.Errorf("get pod network mode: %w", err)
+	}
+	if mode == "" {
+		return models.NetworkModeIsolated, nil
+	}
+	return mode, nil
+}
+
+// ActiveRunnerLease returns the address reserved for a shared-network run.
+func (q *Queries) ActiveRunnerLease(ctx context.Context, runID uuid.UUID) (ip, cidr string, err error) {
+	err = q.pool.QueryRow(ctx, `
+		SELECT l.ip, n.cidr
+		FROM runner_ip_leases l
+		JOIN shared_networks n ON n.id = l.shared_network_id
+		WHERE l.run_id = $1 AND l.released_at IS NULL
+	`, runID).Scan(&ip, &cidr)
+	if err != nil {
+		return "", "", err
+	}
+	return ip, cidr, nil
 }
 
 // UpdateRunCounts updates the pass/fail counts on a run.
