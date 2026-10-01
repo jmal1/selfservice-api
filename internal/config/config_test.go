@@ -19,6 +19,9 @@ func TestProvisioningConfigDefaultsEnabled(t *testing.T) {
 	if !cfg.Provisioning.WorkerClaimsEnabled {
 		t.Error("Provisioning.WorkerClaimsEnabled = false, want backward-compatible default true")
 	}
+	if cfg.Provisioning.LabsRequireGrant {
+		t.Error("Provisioning.LabsRequireGrant = true, want default false")
+	}
 }
 
 func TestFailClosedTopologyDefaults(t *testing.T) {
@@ -81,8 +84,19 @@ func TestOPNsenseSSHHostKeyLoadsFromEnvironment(t *testing.T) {
 	}
 }
 
+func TestLabsRequireGrantExplicitTrue(t *testing.T) {
+	t.Setenv("LABS_REQUIRE_GRANT", "true")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.Provisioning.LabsRequireGrant {
+		t.Fatal("LabsRequireGrant = false, want true")
+	}
+}
+
 func TestProvisioningConfigRejectsInvalidBoolean(t *testing.T) {
-	for _, key := range []string{"PROVISIONING_ENABLED", "WORKER_PROVISIONING_CLAIMS_ENABLED"} {
+	for _, key := range []string{"PROVISIONING_ENABLED", "WORKER_PROVISIONING_CLAIMS_ENABLED", "LABS_REQUIRE_GRANT"} {
 		t.Run(key, func(t *testing.T) {
 			t.Setenv("PROVISIONING_ENABLED", "true")
 			t.Setenv("WORKER_PROVISIONING_CLAIMS_ENABLED", "true")

@@ -93,6 +93,8 @@ spec:
               value: {{ .Values.natsURL | quote }}
             - name: PROVISIONING_ENABLED
               value: {{ .Values.provisioning.enabled | quote }}
+            - name: LABS_REQUIRE_GRANT
+              value: {{ .Values.admission.labsRequireGrant | quote }}
             - name: PROVISIONING_PUSHGATEWAY_URL
               value: {{ .Values.api.provisioningPushgatewayURL | quote }}
             - name: PROVISIONING_PUSHGATEWAY_JOB

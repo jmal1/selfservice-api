@@ -71,6 +71,7 @@ jobs:
             fi
           }
           assert_env PROVISIONING_ENABLED true
+          assert_env LABS_REQUIRE_GRANT false
           assert_env SYNTHETIC_PROVISIONING_EXPECTED_ENABLED true
           assert_env SYNTHETIC_RUNNER_EXPECTED_ENABLED true
           assert_env SYNTHETIC_LIFECYCLE_ENABLED true
@@ -124,6 +125,7 @@ jobs:
             fi
           }
           assert_env PROVISIONING_ENABLED true
+          assert_env LABS_REQUIRE_GRANT false
           assert_env SYNTHETIC_PROVISIONING_EXPECTED_ENABLED true
           assert_env SYNTHETIC_RUNNER_EXPECTED_ENABLED true
           assert_env SYNTHETIC_LIFECYCLE_ENABLED true

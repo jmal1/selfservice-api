@@ -114,6 +114,8 @@ func main() {
 		cfg.Provisioning.Enabled,
 	)
 	handler.WithProvisioningAdmission(cfg.Provisioning.Enabled, admissionMetrics)
+	handler.WithLabsRequireGrant(cfg.Provisioning.LabsRequireGrant)
+	logger.Info("labs require grant configured", "enabled", cfg.Provisioning.LabsRequireGrant)
 	go admissionMetrics.RunPusher(ctx, 30*time.Second, logger)
 	logger.Info("provisioning admission configured", "enabled", cfg.Provisioning.Enabled)
 	if vc, ok := vcClient.(*vcenter.Client); ok && vc != nil && cfg.VCenter.TemplatesFolder != "" {

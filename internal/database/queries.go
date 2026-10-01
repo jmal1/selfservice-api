@@ -71,6 +71,7 @@ const BlueprintPinOrderClause = `ORDER BY b.pinned DESC, ` +
 // is_internal. Migration 000029 added visibility. Migration 000030 added
 // pinning support (pinned, pin_order, pinned_at, pinned_by). Migration 000036
 // added guest_credentials_verified_at. Migration 000039 added skip_generalize.
+// Migration 000044 added single_vm_only.
 const templateSelectCols = `id, name, vcenter_template, os_type, default_vcpus, default_ram_mb,
 		default_disk_gb, min_vcpus, min_ram_mb, COALESCE(description, ''), COALESCE(icon_url, ''),
 		default_username, default_password, kind, assign_ip, is_active,
@@ -81,7 +82,7 @@ const templateSelectCols = `id, name, vcenter_template, os_type, default_vcpus, 
 		trust_tier, last_validated_at, last_validation_result,
 		pinned, pin_order, pinned_at, pinned_by,
 		guest_credentials_verified_at,
-		skip_generalize`
+		skip_generalize, single_vm_only`
 
 // scanTemplate populates t from a row whose columns are in templateSelectCols
 // order. Centralizes the column ordering so adding a column in the future
@@ -99,6 +100,7 @@ func scanTemplate(row pgx.Row, t *models.Template) error {
 		&t.Pinned, &t.PinOrder, &t.PinnedAt, &t.PinnedBy,
 		&t.GuestCredentialsVerifiedAt,
 		&t.SkipGeneralize,
+		&t.SingleVMOnly,
 	)
 }
 
@@ -125,11 +127,11 @@ func (q *Queries) GetUserBySub(ctx context.Context, sub string) (*models.User, e
 	var u models.User
 	err := q.pool.QueryRow(ctx, `
 		SELECT id, oidc_sub, username, email, COALESCE(display_name, ''), role,
-		       max_vcpus, max_ram_mb, max_pods, is_active, created_at, updated_at
+		       max_vcpus, max_ram_mb, max_pods, labs_enabled, max_single_vms, is_active, created_at, updated_at
 		FROM users WHERE oidc_sub = $1
 	`, sub).Scan(
 		&u.ID, &u.OIDCSub, &u.Username, &u.Email, &u.DisplayName, &u.Role,
-		&u.MaxVCPUs, &u.MaxRAMMB, &u.MaxPods, &u.IsActive, &u.CreatedAt, &u.UpdatedAt,
+		&u.MaxVCPUs, &u.MaxRAMMB, &u.MaxPods, &u.LabsEnabled, &u.MaxSingleVMs, &u.IsActive, &u.CreatedAt, &u.UpdatedAt,
 	)
 	if err == pgx.ErrNoRows {
 		return nil, nil
@@ -142,11 +144,11 @@ func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (*models.User, 
 	var u models.User
 	err := q.pool.QueryRow(ctx, `
 		SELECT id, oidc_sub, username, email, COALESCE(display_name, ''), role,
-		       max_vcpus, max_ram_mb, max_pods, is_active, created_at, updated_at
+		       max_vcpus, max_ram_mb, max_pods, labs_enabled, max_single_vms, is_active, created_at, updated_at
 		FROM users WHERE id = $1
 	`, id).Scan(
 		&u.ID, &u.OIDCSub, &u.Username, &u.Email, &u.DisplayName, &u.Role,
-		&u.MaxVCPUs, &u.MaxRAMMB, &u.MaxPods, &u.IsActive, &u.CreatedAt, &u.UpdatedAt,
+		&u.MaxVCPUs, &u.MaxRAMMB, &u.MaxPods, &u.LabsEnabled, &u.MaxSingleVMs, &u.IsActive, &u.CreatedAt, &u.UpdatedAt,
 	)
 	if err == pgx.ErrNoRows {
 		return nil, nil
@@ -160,12 +162,12 @@ func (q *Queries) GetUserByIDForUpdate(ctx context.Context, tx pgx.Tx, id uuid.U
 	var u models.User
 	err := tx.QueryRow(ctx, `
 		SELECT id, oidc_sub, username, email, COALESCE(display_name, ''), role,
-		       max_vcpus, max_ram_mb, max_pods, is_active, created_at, updated_at
+		       max_vcpus, max_ram_mb, max_pods, labs_enabled, max_single_vms, is_active, created_at, updated_at
 		FROM users WHERE id = $1
 		FOR UPDATE
 	`, id).Scan(
 		&u.ID, &u.OIDCSub, &u.Username, &u.Email, &u.DisplayName, &u.Role,
-		&u.MaxVCPUs, &u.MaxRAMMB, &u.MaxPods, &u.IsActive, &u.CreatedAt, &u.UpdatedAt,
+		&u.MaxVCPUs, &u.MaxRAMMB, &u.MaxPods, &u.LabsEnabled, &u.MaxSingleVMs, &u.IsActive, &u.CreatedAt, &u.UpdatedAt,
 	)
 	if err == pgx.ErrNoRows {
 		return nil, nil
@@ -177,7 +179,7 @@ func (q *Queries) GetUserByIDForUpdate(ctx context.Context, tx pgx.Tx, id uuid.U
 func (q *Queries) ListUsers(ctx context.Context) ([]models.User, error) {
 	rows, err := q.pool.Query(ctx, `
 		SELECT id, oidc_sub, username, email, COALESCE(display_name, ''), role,
-		       max_vcpus, max_ram_mb, max_pods, is_active, created_at, updated_at
+		       max_vcpus, max_ram_mb, max_pods, labs_enabled, max_single_vms, is_active, created_at, updated_at
 		FROM users ORDER BY username
 	`)
 	if err != nil {
@@ -190,7 +192,7 @@ func (q *Queries) ListUsers(ctx context.Context) ([]models.User, error) {
 		var u models.User
 		if err := rows.Scan(
 			&u.ID, &u.OIDCSub, &u.Username, &u.Email, &u.DisplayName, &u.Role,
-			&u.MaxVCPUs, &u.MaxRAMMB, &u.MaxPods, &u.IsActive, &u.CreatedAt, &u.UpdatedAt,
+			&u.MaxVCPUs, &u.MaxRAMMB, &u.MaxPods, &u.LabsEnabled, &u.MaxSingleVMs, &u.IsActive, &u.CreatedAt, &u.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -226,6 +228,72 @@ func (q *Queries) UpdateUserQuotas(ctx context.Context, id uuid.UUID, req models
 
 	_, err := q.pool.Exec(ctx, query, args...)
 	return err
+}
+
+// UpdateUserAccess replaces a student's lab grant and Single VM cap.
+// The role predicate keeps a login upsert or a stale id from changing an
+// instructor or admin row.
+func (q *Queries) UpdateUserAccess(ctx context.Context, id uuid.UUID, labsEnabled bool, maxSingleVMs int) (bool, error) {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE users
+		SET labs_enabled = $2, max_single_vms = $3, updated_at = now()
+		WHERE id = $1 AND role = 'student'
+	`, id, labsEnabled, maxSingleVMs)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// SingleVMOnlyTemplateNames returns the names of the given templates that
+// are marked single_vm_only. An empty id list does not touch the database.
+func (q *Queries) SingleVMOnlyTemplateNames(ctx context.Context, ids []uuid.UUID) ([]string, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	rows, err := q.pool.Query(ctx, `
+		SELECT name FROM templates
+		WHERE id = ANY($1::uuid[]) AND single_vm_only
+		ORDER BY name
+	`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
+}
+
+// BlueprintNamesUsingTemplate returns active blueprint names that still
+// reference the template. Inactive blueprints do not block single_vm_only.
+func (q *Queries) BlueprintNamesUsingTemplate(ctx context.Context, templateID uuid.UUID) ([]string, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT DISTINCT b.name
+		FROM blueprints b
+		JOIN blueprint_vms bv ON bv.blueprint_id = b.id
+		WHERE bv.template_id = $1 AND b.is_active
+		ORDER BY b.name
+	`, templateID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
 }
 
 // --- Templates ---
@@ -464,6 +532,7 @@ func (q *Queries) UpdateTemplate(ctx context.Context, id uuid.UUID, req models.U
 			kind = COALESCE($11, kind),
 			assign_ip = COALESCE($12, assign_ip),
 			visibility = COALESCE($14, visibility),
+			single_vm_only = COALESCE($15, single_vm_only),
 			guest_credentials_verified_at = CASE
 			    WHEN $9::text IS NOT NULL
 			      OR $10::text IS NOT NULL
@@ -475,7 +544,7 @@ func (q *Queries) UpdateTemplate(ctx context.Context, id uuid.UUID, req models.U
 		  AND ($13::timestamptz IS NULL OR updated_at = $13)
 		RETURNING `+templateSelectCols+`
 	`, id, req.Name, req.Description, req.IconURL, req.DefaultVCPUs, req.DefaultRAMMB, req.DefaultDiskGB, req.IsActive,
-		req.DefaultUsername, req.DefaultPassword, req.Kind, req.AssignIP, req.ExpectedUpdatedAt, req.Visibility,
+		req.DefaultUsername, req.DefaultPassword, req.Kind, req.AssignIP, req.ExpectedUpdatedAt, req.Visibility, req.SingleVMOnly,
 	), &t)
 	if err == pgx.ErrNoRows {
 		// Distinguish missing-row from version-mismatch. If the caller

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -129,6 +130,9 @@ func (h *Handler) DeployBlueprint(w http.ResponseWriter, r *http.Request) {
 		respondError(w, r, http.StatusInternalServerError, "user not found")
 		return
 	}
+	if h.rejectIsolatedLabs(w, r, user) {
+		return
+	}
 
 	// Resolve templates for all blueprint VMs and calculate total resources
 	templates, err := h.db.ListTemplatesForUser(r.Context(), userID, role)
@@ -163,6 +167,9 @@ func (h *Handler) DeployBlueprint(w http.ResponseWriter, r *http.Request) {
 		// Defense in depth: ensure students cannot use instructor_only templates
 		if role == models.RoleStudent && tmpl.Visibility == "instructor_only" {
 			respondError(w, r, http.StatusForbidden, fmt.Sprintf("template %s not accessible", bv.TemplateID))
+			return
+		}
+		if h.rejectSingleVMOnly(w, r, []*models.Template{tmpl}) {
 			return
 		}
 
@@ -385,6 +392,17 @@ func (h *Handler) AdminListBlueprints(w http.ResponseWriter, r *http.Request) {
 }
 
 // AdminCreateBlueprint creates a new blueprint.
+func (h *Handler) singleVMOnlyBlueprintSave(ctx context.Context, ids []uuid.UUID) (int, string, error) {
+	names, err := h.db.SingleVMOnlyTemplateNames(ctx, ids)
+	if err != nil {
+		return 0, "", err
+	}
+	if len(names) == 0 {
+		return 0, "", nil
+	}
+	return http.StatusConflict, singleVMOnlyMessage(names), nil
+}
+
 func (h *Handler) AdminCreateBlueprint(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name             string `json:"name"`
@@ -432,6 +450,15 @@ func (h *Handler) AdminCreateBlueprint(w http.ResponseWriter, r *http.Request) {
 			BootOrder:   v.BootOrder,
 			Quantity:    qty,
 		})
+	}
+
+	if status, msg, err := h.singleVMOnlyBlueprintSave(r.Context(), templateIDs(bp.VMs)); err != nil {
+		h.logger.Error("single vm only check failed", "error", err)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
+		return
+	} else if status != 0 {
+		respondError(w, r, status, msg)
+		return
 	}
 
 	if err := h.db.CreateBlueprint(r.Context(), bp); err != nil {
@@ -512,6 +539,15 @@ func (h *Handler) AdminUpdateBlueprint(w http.ResponseWriter, r *http.Request) {
 			BootOrder:   v.BootOrder,
 			Quantity:    qty,
 		})
+	}
+
+	if status, msg, err := h.singleVMOnlyBlueprintSave(r.Context(), templateIDs(bp.VMs)); err != nil {
+		h.logger.Error("single vm only check failed", "error", err)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
+		return
+	} else if status != 0 {
+		respondError(w, r, status, msg)
+		return
 	}
 
 	if err := h.db.UpdateBlueprint(r.Context(), bp); err != nil {

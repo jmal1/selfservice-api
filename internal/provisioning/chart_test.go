@@ -332,6 +332,7 @@ func TestFullFleetOverlayRendersApprovedFinalState(t *testing.T) {
 		"replicaCount.worker":                     "4",
 		"provisioning.enabled":                    "true",
 		"provisioning.workerClaimsEnabled":        "true",
+		"admission.labsRequireGrant":              "false",
 		"vcenter.insecure":                        "false",
 		"vcenter.hosts":                           "esxi1.example.test,esxi2.example.test,host3.example.test,host4.example.test,host5.example.test",
 		"vcenter.resourcePools":                   "/Example-Datacenter/host/AMD-Cluster/Resources/Student-VMs,/Example-Datacenter/host/Intel-Cluster/Resources/Student-VMs",
@@ -361,6 +362,8 @@ func TestChartWiresEveryProvisioningControl(t *testing.T) {
 	files := map[string][]string{
 		"api-deployment.yaml": {
 			"PROVISIONING_ENABLED",
+			"LABS_REQUIRE_GRANT",
+			".Values.admission.labsRequireGrant",
 			"PROVISIONING_PUSHGATEWAY_URL",
 			"PROVISIONING_PUSHGATEWAY_JOB",
 			"PROMETHEUS_URL",
