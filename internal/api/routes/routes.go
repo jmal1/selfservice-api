@@ -90,6 +90,9 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 
 			r.Get("/provisioning/status", h.GetProvisioningStatus)
 
+			r.Get("/single-vms", h.ListSingleVMs)
+			r.Post("/single-vms", h.CreateSingleVM)
+
 			// Pods
 			r.Route("/pods", func(r chi.Router) {
 				r.Get("/", h.ListPods)
@@ -300,6 +303,7 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 				r.Post("/vlans", h.AdminAddVLAN)
 				r.Patch("/vlans/{vlanID}", h.AdminUpdateVLAN)
 				r.Delete("/vlans/{vlanID}", h.AdminRemoveVLAN)
+				r.Post("/shared-networks/provision", h.AdminProvisionSharedNetworks)
 
 				// Blueprints
 				r.Get("/blueprints", h.AdminListBlueprints)

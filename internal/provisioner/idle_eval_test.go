@@ -75,7 +75,7 @@ func newFakeDB() *fakeIdleDB {
 		activityTouched:    map[uuid.UUID]time.Time{},
 		activeJob:          map[uuid.UUID]bool{},
 		inFlightRun:        map[uuid.UUID]bool{},
-		idleTimeoutSeconds: 21600, // 6h default
+		idleTimeoutSeconds: 7200, // 2h default
 		podIdleOverride:    map[uuid.UUID]int{},
 	}
 }

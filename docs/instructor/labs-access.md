@@ -27,3 +27,15 @@ Login does not overwrite `labs_enabled` or `max_single_vms`. A student's
 Single VM cap is `max_single_vms` (default 1, maximum 3), also edited on the
 Users page. Instructors and admins cannot be given this grant; they already
 have labs.
+
+A Single VM is a pod with `network_mode=shared` on one of nine stripes,
+VLAN tags 347–355, in `10.110.0.0/16`. Those tags are not in the isolated
+pool. The nine networks are built by one instructor job,
+`POST /api/v1/admin/shared-networks/provision`, before any student deploy.
+`POST /api/v1/single-vms` only places a VM on a stripe that is already
+active and has fewer than 16 VMs. It does not create a VLAN. If the stripes
+are not ready, or all 144 slots are full, the request returns 409.
+Assessments on a shared pod return 409 until the runner can lease an
+address on that stripe. A Single VM does not count toward `max_pods`.
+Lab VMs and Single VMs both suspend after the same idle window, which is
+2 hours.

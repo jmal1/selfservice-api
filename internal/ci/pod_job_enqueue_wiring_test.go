@@ -16,6 +16,7 @@ var expectedSerializedPodJobProducerInventory = map[string][]string{
 	"pod_create": {
 		"internal/api/handlers/handlers.go:CreatePodCreateJobTx",
 		"internal/api/handlers/blueprints.go:CreatePodCreateJobTx",
+		"internal/api/handlers/single_vm.go:CreatePodCreateJobTx",
 	},
 	"pod_destroy": {
 		"internal/api/handlers/handlers.go:CreatePodDestroyJob",
@@ -44,6 +45,9 @@ var expectedSerializedBoundaryCalls = map[string]map[string]int{
 		"ExtendPod":            2,
 	},
 	"internal/api/handlers/blueprints.go": {
+		"CreatePodCreateJobTx": 1,
+	},
+	"internal/api/handlers/single_vm.go": {
 		"CreatePodCreateJobTx": 1,
 	},
 	"internal/api/handlers/snapshots.go": {
@@ -203,8 +207,9 @@ func TestProductionGenericAndRawJobInsertionInventoryIsStable(t *testing.T) {
 	insertJobsPattern := regexp.MustCompile(`(?is)\binsert\s+into\s+jobs\b`)
 	expectedGeneric := map[string]int{
 		"internal/api/handlers/images.go":           2,
+		"internal/api/handlers/single_vm.go":        1,
 		"internal/api/handlers/templates_wizard.go": 1,
-		"internal/provisioner/image_reconcile.go":    1,
+		"internal/provisioner/image_reconcile.go":   1,
 	}
 	expectedRawSQL := map[string]int{
 		"internal/database/queries.go":                 2,

@@ -58,8 +58,8 @@ func validateContentFilterConfig(cfg ContentFilterConfig) error {
 	if !cfg.Enabled {
 		return nil
 	}
-	if canonicalField(cfg.SourceNetwork) != "10.100.0.0/16" {
-		return fmt.Errorf("content filter source network must be 10.100.0.0/16, got %q", cfg.SourceNetwork)
+	if err := validateContentFilterSources(cfg.SourceNetwork); err != nil {
+		return err
 	}
 	if err := validateContentFilterFeedBaseURL(cfg.CategoryFeedBaseURL); err != nil {
 		return err
@@ -68,6 +68,29 @@ func validateContentFilterConfig(cfg ContentFilterConfig) error {
 		if !validPolicyDomain(domain) {
 			return fmt.Errorf("invalid permanent allowlist domain %q", domain)
 		}
+	}
+	return nil
+}
+
+func validateContentFilterSources(value string) error {
+	allowed := map[string]bool{
+		"10.100.0.0/16": true,
+		"10.110.0.0/16": true,
+	}
+	parts := strings.Split(canonicalField(value), ",")
+	if len(parts) == 0 || (len(parts) == 1 && parts[0] == "") {
+		return fmt.Errorf("content filter source network must include 10.100.0.0/16")
+	}
+	seen := map[string]bool{}
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if !allowed[part] || seen[part] {
+			return fmt.Errorf("content filter source network must be 10.100.0.0/16 or 10.100.0.0/16,10.110.0.0/16, got %q", value)
+		}
+		seen[part] = true
+	}
+	if !seen["10.100.0.0/16"] {
+		return fmt.Errorf("content filter source network must include 10.100.0.0/16, got %q", value)
 	}
 	return nil
 }

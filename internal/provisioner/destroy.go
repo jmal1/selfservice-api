@@ -102,6 +102,10 @@ func (p *Provisioner) DestroyPod(ctx context.Context, job *models.Job) error {
 		}
 	}
 
+	if pod.NetworkMode == models.NetworkModeShared {
+		return p.finishSharedPodDestroy(ctx, pod.ID, job.ID, claimOwner, errors)
+	}
+
 	// --- Step 3: Delete only port groups owned by the durable create receipt ---
 	p.publishProgress(job.ID, "portgroup_delete", fmt.Sprintf("Deleting port group %s", pgName))
 	receiptRecord, err := p.db.GetPodPortGroupReceipt(ctx, pod.ID)
