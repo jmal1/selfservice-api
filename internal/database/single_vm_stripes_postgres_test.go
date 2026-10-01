@@ -39,8 +39,8 @@ func TestSharedStripesAssignWithoutCreatingAVLAN(t *testing.T) {
 	owner := uuid.New()
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO users (id, oidc_sub, username, email, role, max_single_vms)
-		VALUES ($1, $1, $1, $2, 'student', 3)
-	`, owner, owner.String()+"@example.invalid"); err != nil {
+		VALUES ($1, $2, $2, $3, 'student', 3)
+	`, owner, owner.String(), owner.String()+"@example.invalid"); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
