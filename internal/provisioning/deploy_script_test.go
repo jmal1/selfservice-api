@@ -2056,6 +2056,32 @@ func TestDeployScriptSyntheticQuotaIdentityIsLoadBearing(t *testing.T) {
 	}
 }
 
+func nextUnusedMigrationVersion(t *testing.T) int {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join("..", "..", "internal", "database", "migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	maxVersion := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if len(name) < 6 {
+			continue
+		}
+		version, err := strconv.Atoi(name[:6])
+		if err != nil {
+			continue
+		}
+		if version > maxVersion {
+			maxVersion = version
+		}
+	}
+	if maxVersion == 0 {
+		t.Fatal("no database migrations found")
+	}
+	return maxVersion + 1
+}
+
 func TestDeployScriptMigrationContiguityIsLoadBearing(t *testing.T) {
 	requirePOSIXShell(t)
 	deployPath := filepath.Join("..", "..", "deploy", "scripts", "deploy.sh")
@@ -2064,7 +2090,7 @@ func TestDeployScriptMigrationContiguityIsLoadBearing(t *testing.T) {
 		t.Fatal(err)
 	}
 	const correct = "local inventory base raw name direction version expected max_version=0"
-	const sabotaged = "local inventory base raw name direction version expected max_version=44"
+	sabotaged := fmt.Sprintf("local inventory base raw name direction version expected max_version=%d", nextUnusedMigrationVersion(t))
 	if strings.Count(string(source), correct) != 1 {
 		t.Fatal("migration contiguity sequence initializer is not unique")
 	}
@@ -2090,7 +2116,7 @@ func TestDeployScriptMigrationPairingIsLoadBearing(t *testing.T) {
 		t.Fatal(err)
 	}
 	const correct = `find "$migration_dir" -maxdepth 1 -type f -name '*.sql' -printf '%f\n' |`
-	const sabotaged = `{ find "$migration_dir" -maxdepth 1 -type f -name '*.sql' -printf '%f\n'; printf '000044_orphan.down.sql\n'; } |`
+	sabotaged := fmt.Sprintf("{ find \"$migration_dir\" -maxdepth 1 -type f -name '*.sql' -printf '%%f\\n'; printf '%06d_orphan.down.sql\\n'; } |", nextUnusedMigrationVersion(t))
 	if strings.Count(string(source), correct) != 1 {
 		t.Fatal("migration file enumeration command is not unique")
 	}
