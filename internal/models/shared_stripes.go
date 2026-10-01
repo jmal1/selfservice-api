@@ -54,6 +54,18 @@ func stripeForTag(tag int) Stripe {
 	}
 }
 
+// RunnerAddresses lists the fourteen runner addresses on this stripe, from
+// offset .2 through .15. Student DHCP starts at .16.
+func (s Stripe) RunnerAddresses() []string {
+	first := netip.MustParseAddr(s.RunnerFirst)
+	last := netip.MustParseAddr(s.RunnerLast)
+	out := make([]string, 0, SharedRunnerSlots)
+	for ip := first; ip.Compare(last) <= 0; ip = ip.Next() {
+		out = append(out, ip.String())
+	}
+	return out
+}
+
 func addHosts(addr netip.Addr, n int) netip.Addr {
 	b := addr.As4()
 	v := uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])

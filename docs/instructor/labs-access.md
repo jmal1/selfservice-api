@@ -35,7 +35,11 @@ pool. The nine networks are built by one instructor job,
 `POST /api/v1/single-vms` only places a VM on a stripe that is already
 active and has fewer than 16 VMs. It does not create a VLAN. If the stripes
 are not ready, or all 144 slots are full, the request returns 409.
-Assessments on a shared pod return 409 until the runner can lease an
-address on that stripe. A Single VM does not count toward `max_pods`.
+A shared assessment reserves one of the fourteen runner addresses on that
+stripe (`.2` through `.15`) and attaches the runner with a static address
+on the stripe's `/26`. It does not use the isolated `10.100.0.0/16`
+host-local range. If every runner address on the stripe is in use, the
+request returns 503 and does not start a runner. A Single VM does not count
+toward `max_pods`.
 Lab VMs and Single VMs both suspend after the same idle window, which is
 2 hours.

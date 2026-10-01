@@ -13,6 +13,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/jmal1/selfservice-api/internal/runner"
 )
 
 func nadGVRForTest() schema.GroupVersionResource {
@@ -361,5 +363,47 @@ func TestEnsureNAD_NoPointlessUpdateWhenAlreadyCorrect(t *testing.T) {
 		if a.GetVerb() == "update" {
 			t.Error("ensureNAD issued an Update for a config that only differs in key order/whitespace")
 		}
+	}
+}
+
+func TestProvisionRunner_SharedStripeUsesStaticAddress(t *testing.T) {
+	cfg := testK8sConfig()
+	k8s, dynClient := newNADTestClient(t, cfg)
+	result, err := k8s.ProvisionRunner(context.Background(), RunnerSpec{
+		RunID:         "abcd1234-5678-9012-3456-789012345678",
+		CallbackToken: "callback-token-abc",
+		EngineURL:     cfg.EngineURL,
+		VLANTag:       347,
+		SharedIP:      "10.110.0.2",
+		SharedCIDR:    "10.110.0.0/26",
+		Workflows:     []runner.WorkflowDef{{Slug: "test-wf", Name: "Test", Script: "echo hello", TimeoutSeconds: 60}},
+		Target:        runner.TargetConfig{IP: "10.110.0.20", OS: "linux", Username: "student", Password: "pass"},
+		Pod:           runner.PodConfig{Subnet: "10.110.0.0/26", Index: 347},
+	})
+	if err != nil {
+		t.Fatalf("ProvisionRunner: %v", err)
+	}
+	if result.NADName != "shared-vlan-347" {
+		t.Fatalf("NAD = %s", result.NADName)
+	}
+	cfgMap := readNADConfig(t, dynClient, cfg.Namespace, result.NADName)
+	ipam := cfgMap["ipam"].(map[string]any)
+	if ipam["type"] != "static" {
+		t.Fatalf("ipam = %#v", ipam)
+	}
+	if _, ok := ipam["ranges"]; ok {
+		t.Fatal("shared NAD uses host-local ranges")
+	}
+	raw, _ := json.Marshal(cfgMap)
+	if strings.Contains(string(raw), "10.100.") {
+		t.Fatalf("shared NAD leaked an isolated address: %s", raw)
+	}
+	job, err := k8s.clientset.BatchV1().Jobs(cfg.Namespace).Get(context.Background(), result.JobName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	annotation := job.Spec.Template.Annotations["k8s.v1.cni.cncf.io/networks"]
+	if annotation != `[{"ips":["10.110.0.2/26"],"name":"shared-vlan-347"}]` {
+		t.Fatalf("annotation = %s", annotation)
 	}
 }

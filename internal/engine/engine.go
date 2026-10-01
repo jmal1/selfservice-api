@@ -239,6 +239,17 @@ func (e *Engine) executeRun(ctx context.Context, run *models.Run) error {
 		if err != nil {
 			return fmt.Errorf("get pod VLAN tag: %w", err)
 		}
+		networkMode, err := e.queries.GetPodNetworkMode(ctx, run.PodID)
+		if err != nil {
+			return fmt.Errorf("get pod network mode: %w", err)
+		}
+		var sharedIP, sharedCIDR string
+		if networkMode == models.NetworkModeShared {
+			sharedIP, sharedCIDR, err = e.queries.ActiveRunnerLease(ctx, run.ID)
+			if err != nil {
+				return fmt.Errorf("runner lease: %w", err)
+			}
+		}
 
 		// Build WorkflowDefs only for kali-mode workflows; vmware_tools were
 		// already dispatched above.
@@ -295,6 +306,8 @@ func (e *Engine) executeRun(ctx context.Context, run *models.Run) error {
 			CallbackToken: run.CallbackToken,
 			EngineURL:     e.engineURL,
 			VLANTag:       vlanTag,
+			SharedIP:      sharedIP,
+			SharedCIDR:    sharedCIDR,
 			Workflows:     wfDefs,
 			Target:        target,
 			Pod:           pod,

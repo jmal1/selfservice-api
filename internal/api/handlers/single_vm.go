@@ -16,8 +16,6 @@ import (
 	"github.com/jmal1/selfservice-api/internal/models"
 )
 
-const sharedAssessmentUnavailable = "Assessments on a Single VM are not available yet."
-
 type createSingleVMRequest struct {
 	TemplateID uuid.UUID `json:"template_id"`
 	Name       string    `json:"name"`
@@ -236,12 +234,4 @@ func (h *Handler) AdminProvisionSharedNetworks(w http.ResponseWriter, r *http.Re
 		}
 	}
 	respondJSON(w, http.StatusAccepted, map[string]any{"job_id": job.ID})
-}
-
-func rejectSharedAssessment(w http.ResponseWriter, r *http.Request, pod *models.Pod) bool {
-	if pod == nil || pod.NetworkMode != models.NetworkModeShared {
-		return false
-	}
-	respondError(w, r, http.StatusConflict, sharedAssessmentUnavailable)
-	return true
 }

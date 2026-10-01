@@ -435,7 +435,13 @@ func (q *Queries) UpdateRunStatus(ctx context.Context, runID uuid.UUID, status s
 		UPDATE runs SET status = $2, error_message = $3, completed_at = $4, updated_at = NOW()
 		WHERE id = $1
 	`, runID, status, errorMsg, completedAt)
-	return err
+	if err != nil {
+		return err
+	}
+	if completedAt != nil {
+		return q.ReleaseRunnerLease(ctx, runID)
+	}
+	return nil
 }
 
 // ListAllRuns returns all runs (admin view).

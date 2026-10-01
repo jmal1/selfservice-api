@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,21 +22,22 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
+	"github.com/jmal1/selfservice-api/internal/models"
 	"github.com/jmal1/selfservice-api/internal/runner"
 )
 
 // K8sClient wraps the Kubernetes client for runner pod lifecycle management.
 type K8sClient struct {
-	clientset          kubernetes.Interface
-	dynamicClient      dynamic.Interface
-	namespace          string
-	runnerImage        string
-	runnerNode         string
-	trunkNIC           string
-	maxConcurrent      int
-	imagePullSecrets   []string
-	metrics            *RunnerMetrics
-	logger             *slog.Logger
+	clientset        kubernetes.Interface
+	dynamicClient    dynamic.Interface
+	namespace        string
+	runnerImage      string
+	runnerNode       string
+	trunkNIC         string
+	maxConcurrent    int
+	imagePullSecrets []string
+	metrics          *RunnerMetrics
+	logger           *slog.Logger
 }
 
 // K8sConfig holds configuration for the K8s runner provisioner.
@@ -46,7 +49,7 @@ type K8sConfig struct {
 	// Any other value → kubernetes.io/hostname pin (emergency single-node fallback).
 	RunnerNode string
 	TrunkNIC   string // Host NIC carrying the pod VLAN trunk (default: ens224)
-	EngineURL   string // Internal URL for runner callbacks
+	EngineURL  string // Internal URL for runner callbacks
 
 	// MaxConcurrentRunners caps simultaneous crucible-runner Jobs (active).
 	// Zero disables the cap. Class-scale default is 14.
@@ -197,9 +200,13 @@ type RunnerSpec struct {
 	CallbackToken string
 	EngineURL     string
 	VLANTag       int
-	Workflows     []runner.WorkflowDef
-	Target        runner.TargetConfig
-	Pod           runner.PodConfig
+	// SharedIP and SharedCIDR place the runner on a pre-built 10.110 stripe.
+	// Both empty keeps the isolated host-local NAD.
+	SharedIP   string
+	SharedCIDR string
+	Workflows  []runner.WorkflowDef
+	Target     runner.TargetConfig
+	Pod        runner.PodConfig
 
 	// ActionLibrary is the generated bash function library (see
 	// buildActionLibrary). Empty is legal and simply means no library actions
@@ -213,6 +220,18 @@ func (k *K8sClient) ProvisionRunner(ctx context.Context, spec RunnerSpec) (*Prov
 	start := time.Now()
 	resourceName := fmt.Sprintf("crucible-runner-%s", spec.RunID[:8])
 	nadName := fmt.Sprintf("pod-vlan-%d", spec.VLANTag)
+	networkAnnotation := nadName
+	if spec.SharedIP != "" || spec.SharedCIDR != "" {
+		if spec.SharedIP == "" || spec.SharedCIDR == "" {
+			return nil, fmt.Errorf("shared runner requires both an address and a prefix")
+		}
+		nadName = fmt.Sprintf("shared-vlan-%d", spec.VLANTag)
+		annotation, err := sharedNetworkAnnotation(nadName, spec.SharedIP, spec.SharedCIDR)
+		if err != nil {
+			return nil, err
+		}
+		networkAnnotation = annotation
+	}
 
 	if k.maxConcurrent > 0 {
 		if err := k.ensureRunnerCapacity(ctx); err != nil {
@@ -221,7 +240,7 @@ func (k *K8sClient) ProvisionRunner(ctx context.Context, spec RunnerSpec) (*Prov
 	}
 
 	// 1. Ensure NetworkAttachmentDefinition exists for this VLAN
-	if err := k.ensureNAD(ctx, nadName, spec.VLANTag); err != nil {
+	if err := k.ensureRunnerNAD(ctx, nadName, spec); err != nil {
 		return nil, fmt.Errorf("ensure NAD: %w", err)
 	}
 
@@ -286,7 +305,7 @@ func (k *K8sClient) ProvisionRunner(ctx context.Context, spec RunnerSpec) (*Prov
 						"forge.crucible/run-id": spec.RunID,
 					},
 					Annotations: map[string]string{
-						"k8s.v1.cni.cncf.io/networks": nadName,
+						"k8s.v1.cni.cncf.io/networks": networkAnnotation,
 					},
 				},
 				Spec: corev1.PodSpec{
@@ -400,16 +419,30 @@ func (k *K8sClient) ProvisionRunner(ctx context.Context, spec RunnerSpec) (*Prov
 // shipping the macvlan->vlan correction below, pod-vlan-119 still carried the
 // broken untagged config and would have kept putting the runner on the wrong
 // network indefinitely.
+func (k *K8sClient) ensureRunnerNAD(ctx context.Context, name string, spec RunnerSpec) error {
+	if spec.SharedIP != "" {
+		configJSON, err := k.nadConfigJSONShared(spec.VLANTag, spec.SharedCIDR)
+		if err != nil {
+			return err
+		}
+		return k.reconcileNAD(ctx, name, spec.VLANTag, configJSON)
+	}
+	return k.ensureNAD(ctx, name, spec.VLANTag)
+}
+
 func (k *K8sClient) ensureNAD(ctx context.Context, name string, vlanTag int) error {
+	configJSON, err := k.nadConfigJSON(vlanTag)
+	if err != nil {
+		return err
+	}
+	return k.reconcileNAD(ctx, name, vlanTag, configJSON)
+}
+
+func (k *K8sClient) reconcileNAD(ctx context.Context, name string, vlanTag int, configJSON string) error {
 	nadGVR := schema.GroupVersionResource{
 		Group:    "k8s.cni.cncf.io",
 		Version:  "v1",
 		Resource: "network-attachment-definitions",
-	}
-
-	configJSON, err := k.nadConfigJSON(vlanTag)
-	if err != nil {
-		return err
 	}
 
 	existing, err := k.dynamicClient.Resource(nadGVR).Namespace(k.namespace).Get(ctx, name, metav1.GetOptions{})
@@ -560,6 +593,57 @@ func (k *K8sClient) nadConfigJSON(vlanTag int) (string, error) {
 		return "", fmt.Errorf("marshal NAD config: %w", err)
 	}
 	return string(configJSON), nil
+}
+
+// nadConfigJSONShared attaches a runner to a pre-built stripe. The address is
+// per pod, via the Multus annotation, so the NAD itself has no host-local range
+// and no 10.100 subnet. No routes: a gateway here would steal the cluster default.
+func (k *K8sClient) nadConfigJSONShared(vlanTag int, cidr string) (string, error) {
+	if vlanTag < models.SharedVLANTagFirst || vlanTag > models.SharedVLANTagLast {
+		return "", fmt.Errorf("vlan tag %d is outside the shared stripe range", vlanTag)
+	}
+	prefix, err := netip.ParsePrefix(cidr)
+	if err != nil || !prefix.IsValid() || prefix.Bits() != 26 {
+		return "", fmt.Errorf("shared runner prefix %q is not a /26", cidr)
+	}
+	space, err := netip.ParsePrefix(models.SharedAddressCIDR)
+	if err != nil || !space.Contains(prefix.Addr()) {
+		return "", fmt.Errorf("shared runner prefix %q is outside %s", cidr, models.SharedAddressCIDR)
+	}
+	nadConfig := map[string]any{
+		"cniVersion": "0.3.1",
+		"type":       "vlan",
+		"master":     k.trunkNIC,
+		"vlanId":     vlanTag,
+		"ipam": map[string]any{
+			"type": "static",
+		},
+	}
+	configJSON, err := json.Marshal(nadConfig)
+	if err != nil {
+		return "", fmt.Errorf("marshal NAD config: %w", err)
+	}
+	return string(configJSON), nil
+}
+
+func sharedNetworkAnnotation(nadName, ip, cidr string) (string, error) {
+	prefix, err := netip.ParsePrefix(cidr)
+	if err != nil {
+		return "", fmt.Errorf("shared runner prefix: %w", err)
+	}
+	addr, err := netip.ParseAddr(ip)
+	if err != nil || !prefix.Contains(addr) {
+		return "", fmt.Errorf("runner address %s is outside %s", ip, cidr)
+	}
+	payload := []map[string]any{{
+		"name": nadName,
+		"ips":  []string{ip + "/" + strconv.Itoa(prefix.Bits())},
+	}}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
 }
 
 // CleanupRunner deletes the K8s Secret and Job for a completed run.

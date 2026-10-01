@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/middleware"
 	"github.com/jmal1/selfservice-api/internal/models"
 	events "github.com/jmal1/selfservice-api/internal/nats"
@@ -95,10 +96,6 @@ func (h *Handler) CreateTestingRun(w http.ResponseWriter, r *http.Request) {
 		respondError(w, r, http.StatusForbidden, "not your pod")
 		return
 	}
-	if rejectSharedAssessment(w, r, pod) {
-		return
-	}
-
 	// Parse request
 	var req struct {
 		PlaylistID    *uuid.UUID  `json:"playlist_id"`
@@ -209,6 +206,26 @@ func (h *Handler) CreateTestingRun(w http.ResponseWriter, r *http.Request) {
 		h.logger.Error("failed to create run", "error", err)
 		respondError(w, r, http.StatusInternalServerError, "failed to create run")
 		return
+	}
+	if pod.NetworkMode == models.NetworkModeShared {
+		if pod.SharedNetworkID == nil {
+			errMsg := "Single VM network is not ready"
+			_ = h.db.UpdateRunStatus(r.Context(), run.ID, models.RunStatusFailed, &errMsg)
+			respondError(w, r, http.StatusConflict, errMsg)
+			return
+		}
+		if _, err := h.db.LeaseRunnerIP(r.Context(), *pod.SharedNetworkID, run.ID); err != nil {
+			errMsg := "could not reserve a runner address"
+			_ = h.db.UpdateRunStatus(r.Context(), run.ID, models.RunStatusFailed, &errMsg)
+			if errors.Is(err, database.ErrRunnerPoolExhausted) {
+				w.Header().Set("Retry-After", "60")
+				respondError(w, r, http.StatusServiceUnavailable, "Single VM assessment runners are all in use")
+				return
+			}
+			h.logger.Error("lease runner address failed", "run_id", run.ID, "error", err)
+			respondError(w, r, http.StatusInternalServerError, "internal error")
+			return
+		}
 	}
 
 	// Notify engine via NATS

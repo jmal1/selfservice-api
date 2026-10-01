@@ -14,6 +14,10 @@ func TestSharedStripesMatchTheAddressPlan(t *testing.T) {
 	if first.RunnerFirst != "10.110.0.2" || first.RunnerLast != "10.110.0.15" {
 		t.Fatalf("runners = %s-%s", first.RunnerFirst, first.RunnerLast)
 	}
+	addresses := first.RunnerAddresses()
+	if len(addresses) != SharedRunnerSlots || addresses[0] != "10.110.0.2" || addresses[len(addresses)-1] != "10.110.0.15" {
+		t.Fatalf("runner addresses = %v", addresses)
+	}
 	if first.DHCPStart != "10.110.0.16" || first.DHCPEnd != "10.110.0.47" || first.PortGroup != "Shared-VLAN347" {
 		t.Fatalf("dhcp/portgroup = %+v", first)
 	}
