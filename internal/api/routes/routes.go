@@ -254,6 +254,7 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 
 				r.Get("/users", h.AdminListUsers)
 				r.Patch("/users/{userID}/quotas", h.AdminUpdateQuotas)
+				r.Patch("/users/{userID}/access", h.AdminUpdateAccess)
 
 				// NOTE: /admin/templates/* is registered in a dedicated
 				// chi.Route block above (chi Mount owns the entire prefix).

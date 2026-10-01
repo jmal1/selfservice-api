@@ -21,12 +21,15 @@ type Config struct {
 	Provisioning ProvisioningConfig
 }
 
-// ProvisioningConfig holds the two independent maintenance controls. Enabled
+// ProvisioningConfig holds the independent admission controls. Enabled
 // governs API admission; WorkerClaimsEnabled governs whether workers may claim
 // pod_create and vm_add jobs. Both default to true for backward compatibility.
+// LabsRequireGrant defaults to false so merging the access columns does not
+// lock students out of isolated labs until a deploy sets it true.
 type ProvisioningConfig struct {
 	Enabled             bool
 	WorkerClaimsEnabled bool
+	LabsRequireGrant    bool
 }
 
 // ObjectStoreConfig holds the S3/MinIO settings used to stage browser-uploaded
@@ -170,6 +173,10 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	labsRequireGrant, err := getEnvBoolStrict("LABS_REQUIRE_GRANT", false)
+	if err != nil {
+		return nil, err
+	}
 	vcenterHosts, err := getEnvListStrict(
 		"VCENTER_HOSTS",
 		"",
@@ -260,6 +267,7 @@ func Load() (*Config, error) {
 		Provisioning: ProvisioningConfig{
 			Enabled:             provisioningEnabled,
 			WorkerClaimsEnabled: workerClaimsEnabled,
+			LabsRequireGrant:    labsRequireGrant,
 		},
 	}
 

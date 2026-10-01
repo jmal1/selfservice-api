@@ -5,6 +5,7 @@
     "docs/instructor/os-recipes.md",
     "docs/instructor/playlists.md",
     "docs/instructor/student-password-recovery.md",
+    "docs/instructor/labs-access.md",
     "AGENTS.md",
     "docs/ai-prompts/build-workflow.md",
     "docs/ai-prompts/create-a-template.md",
@@ -124,6 +125,14 @@
         "docs/instructor/runner-environment.md"
       ],
       "from_seed": false
+    },
+    {
+      "path": "docs/instructor/labs-access.md",
+      "title": "Isolated labs and Single VM access",
+      "size": 1383,
+      "sha256": "4ff17fe7de093c46666812ab60eea381c3ab730aa48cc1f93eeb855139a7833b",
+      "is_markdown": true,
+      "from_seed": true
     },
     {
       "path": "docs/instructor/os-recipes.md",
@@ -340,8 +349,8 @@
     {
       "path": "internal/api/routes/routes.go",
       "title": "routes.go (Go)",
-      "size": 15583,
-      "sha256": "7bb5115891e0eaf0d1d7fb2fdbd7a64bfc0c122ce58383eea7a6cbc50c2e84bf",
+      "size": 15642,
+      "sha256": "29aba07f808ee447757c0454c34a11044dc5979124f067807821fff38b17ee98",
       "is_markdown": false,
       "from_seed": false
     },
@@ -450,5 +459,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 752853
+  "total_bytes": 754295
 }

@@ -14,6 +14,10 @@ provisioning:
   enabled: true
   workerClaimsEnabled: true
 
+# Students keep isolated labs until a production deploy sets this true.
+admission:
+  labsRequireGrant: false
+
 image:
   api: ghcr.io/jmal1/selfservice-api-gateway
   worker: ghcr.io/jmal1/selfservice-provision-worker

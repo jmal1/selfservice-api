@@ -82,6 +82,18 @@ type UpdateTemplateRequest struct {
 	// recent GET so concurrent admin edits cannot silently overwrite
 	// each other.
 	ExpectedUpdatedAt *time.Time `json:"expected_updated_at,omitempty"`
+	// SingleVMOnly, when set, marks the template as Single VM only. Setting
+	// it true is refused while any active blueprint still references the
+	// template.
+	SingleVMOnly *bool `json:"single_vm_only,omitempty"`
+}
+
+// UpdateAccessRequest replaces a student's isolated-lab grant and Single VM cap.
+// Both fields are required. Instructors and admins are refused: they always
+// have labs, and this grant is a student attribute.
+type UpdateAccessRequest struct {
+	LabsEnabled  *bool `json:"labs_enabled"`
+	MaxSingleVMs *int  `json:"max_single_vms"`
 }
 
 // UpdateQuotaRequest is the admin API request to update user quotas.
@@ -142,9 +154,10 @@ type ResourceUsage struct {
 
 // MeResponse is returned by GET /auth/me.
 type MeResponse struct {
-	User          User          `json:"user"`
-	ResourceUsage ResourceUsage `json:"resource_usage"`
-	Limits        RoleLimits    `json:"limits"`
+	User             User          `json:"user"`
+	ResourceUsage    ResourceUsage `json:"resource_usage"`
+	Limits           RoleLimits    `json:"limits"`
+	LabsRequireGrant bool          `json:"labs_require_grant"`
 }
 
 // TemplateDependentVM represents a VM that depends on a template's base disk (linked clone).

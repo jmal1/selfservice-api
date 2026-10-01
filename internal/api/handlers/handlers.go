@@ -95,6 +95,7 @@ type Handler struct {
 	provisioningConfigured bool
 	provisioningEnabled    bool
 	provisioningMetrics    provisioningAdmissionMetrics
+	labsRequireGrant       bool
 
 	prometheusURL string
 	promHTTP      *http.Client
@@ -527,6 +528,9 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 		respondError(w, r, http.StatusInternalServerError, "user not found")
 		return
 	}
+	if h.rejectIsolatedLabs(w, r, user) {
+		return
+	}
 
 	// Check quotas
 	usage, err := h.db.GetResourceUsage(r.Context(), userID)
@@ -569,6 +573,9 @@ func (h *Handler) CreatePod(w http.ResponseWriter, r *http.Request) {
 		// Defense in depth: ensure students cannot use instructor_only templates
 		if role == models.RoleStudent && found.Visibility == "instructor_only" {
 			respondError(w, r, http.StatusForbidden, "template not found or not accessible: "+vm.TemplateID.String())
+			return
+		}
+		if h.rejectSingleVMOnly(w, r, []*models.Template{found}) {
 			return
 		}
 
@@ -1214,11 +1221,17 @@ func (h *Handler) AddVM(w http.ResponseWriter, r *http.Request) {
 		respondError(w, r, http.StatusBadRequest, "template not found or not accessible")
 		return
 	}
+	if h.rejectSingleVMOnly(w, r, []*models.Template{found}) {
+		return
+	}
 
 	// Check quotas
 	user, err := h.db.GetUserByID(r.Context(), userID)
 	if err != nil || user == nil {
 		respondError(w, r, http.StatusInternalServerError, "user not found")
+		return
+	}
+	if h.rejectIsolatedLabs(w, r, user) {
 		return
 	}
 	usage, err := h.db.GetResourceUsage(r.Context(), userID)
@@ -1660,9 +1673,10 @@ func (h *Handler) GetMe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respondJSON(w, http.StatusOK, models.MeResponse{
-		User:          *user,
-		ResourceUsage: *usage,
-		Limits:        limits,
+		User:             *user,
+		ResourceUsage:    *usage,
+		Limits:           limits,
+		LabsRequireGrant: h.labsRequireGrant,
 	})
 }
 
@@ -1699,6 +1713,59 @@ func (h *Handler) AdminUpdateQuotas(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// AdminUpdateAccess sets a student's isolated-lab grant and Single VM cap.
+func (h *Handler) AdminUpdateAccess(w http.ResponseWriter, r *http.Request) {
+	userID, err := uuid.Parse(chi.URLParam(r, "userID"))
+	if err != nil {
+		respondError(w, r, http.StatusBadRequest, "invalid user id")
+		return
+	}
+
+	var req models.UpdateAccessRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, r, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.LabsEnabled == nil || req.MaxSingleVMs == nil {
+		respondError(w, r, http.StatusBadRequest, "labs_enabled and max_single_vms are required")
+		return
+	}
+
+	user, err := h.db.GetUserByID(r.Context(), userID)
+	if err != nil {
+		h.logger.Error("load user for access update failed", "error", err)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if user == nil {
+		respondError(w, r, http.StatusNotFound, "user not found")
+		return
+	}
+	if status, msg := accessPatchError(user.Role, *req.MaxSingleVMs); status != 0 {
+		respondError(w, r, status, msg)
+		return
+	}
+
+	updated, err := h.db.UpdateUserAccess(r.Context(), userID, *req.LabsEnabled, *req.MaxSingleVMs)
+	if err != nil {
+		h.logger.Error("update user access failed", "error", err)
+		respondError(w, r, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if !updated {
+		respondError(w, r, http.StatusConflict, "user is not a student")
+		return
+	}
+
+	audit.Log(r.Context(), h.db, "user.access",
+		audit.Resource("user", userID),
+		audit.IP(r.RemoteAddr),
+		audit.Detail("labs_enabled", *req.LabsEnabled),
+		audit.Detail("max_single_vms", *req.MaxSingleVMs),
+	)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1772,6 +1839,26 @@ func (h *Handler) AdminUpdateTemplate(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
+	}
+	if req.SingleVMOnly != nil && *req.SingleVMOnly {
+		current, err := h.db.GetTemplateByID(r.Context(), templateID)
+		if err != nil {
+			h.logger.Error("load template for single vm only check failed", "error", err)
+			respondError(w, r, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if current != nil {
+			names, err := h.db.BlueprintNamesUsingTemplate(r.Context(), templateID)
+			if err != nil {
+				h.logger.Error("list blueprint refs failed", "error", err)
+				respondError(w, r, http.StatusInternalServerError, "internal error")
+				return
+			}
+			if len(names) > 0 {
+				respondError(w, r, http.StatusConflict, blueprintSingleVMOnlyMessage(current.Name, names))
+				return
+			}
+		}
 	}
 
 	tmpl, err := h.db.UpdateTemplate(r.Context(), templateID, req)

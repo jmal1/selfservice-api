@@ -10,18 +10,20 @@ import (
 
 // User represents a portal user, synced from OIDC claims on login.
 type User struct {
-	ID          uuid.UUID `json:"id" db:"id"`
-	OIDCSub     string    `json:"oidc_sub" db:"oidc_sub"`
-	Username    string    `json:"username" db:"username"`
-	Email       string    `json:"email" db:"email"`
-	DisplayName string    `json:"display_name" db:"display_name"`
-	Role        string    `json:"role" db:"role"`
-	MaxVCPUs    int       `json:"max_vcpus" db:"max_vcpus"`
-	MaxRAMMB    int       `json:"max_ram_mb" db:"max_ram_mb"`
-	MaxPods     int       `json:"max_pods" db:"max_pods"`
-	IsActive    bool      `json:"is_active" db:"is_active"`
-	CreatedAt   time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at" db:"updated_at"`
+	ID           uuid.UUID `json:"id" db:"id"`
+	OIDCSub      string    `json:"oidc_sub" db:"oidc_sub"`
+	Username     string    `json:"username" db:"username"`
+	Email        string    `json:"email" db:"email"`
+	DisplayName  string    `json:"display_name" db:"display_name"`
+	Role         string    `json:"role" db:"role"`
+	MaxVCPUs     int       `json:"max_vcpus" db:"max_vcpus"`
+	MaxRAMMB     int       `json:"max_ram_mb" db:"max_ram_mb"`
+	MaxPods      int       `json:"max_pods" db:"max_pods"`
+	LabsEnabled  bool      `json:"labs_enabled" db:"labs_enabled"`
+	MaxSingleVMs int       `json:"max_single_vms" db:"max_single_vms"`
+	IsActive     bool      `json:"is_active" db:"is_active"`
+	CreatedAt    time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at" db:"updated_at"`
 }
 
 // Template represents a VM template available for provisioning.
@@ -72,6 +74,10 @@ type Template struct {
 	// GuestOps generalize scripts. Publish is unchanged: ready → verifying
 	// → active. Migration 000039. Default false.
 	SkipGeneralize bool `json:"skip_generalize" db:"skip_generalize"`
+	// SingleVMOnly, when true, refuses blueprint membership and isolated pod
+	// create, blueprint deploy, and VM add. Single VM create still accepts
+	// the template. Migration 000044. Default false.
+	SingleVMOnly bool `json:"single_vm_only" db:"single_vm_only"`
 	// UnattendMode drives ISO-install automation (migration 000023). Only
 	// meaningful when SourceType == TemplateSourceISO. See the
 	// models.UnattendMode* constants and internal/unattend.

@@ -18,6 +18,9 @@ provisioning:
   enabled: true
   workerClaimsEnabled: true
 
+admission:
+  labsRequireGrant: false
+
 vcenter:
   # Placeholder host allowlist and pools. Replace from private crucible-deploy.
   hosts: "esxi1.example.test,esxi2.example.test,host3.example.test,host4.example.test,host5.example.test"

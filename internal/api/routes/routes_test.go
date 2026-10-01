@@ -171,6 +171,7 @@ func TestAdministrativeResourceRoutesAreRegistered(t *testing.T) {
 		"GET /api/v1/admin/audit/search",
 		"GET /api/v1/admin/sessions",
 		"PATCH /api/v1/admin/users/{userID}/quotas",
+		"PATCH /api/v1/admin/users/{userID}/access",
 		"GET /api/v1/admin/jobs",
 		"GET /api/v1/admin/vlans",
 		"POST /api/v1/admin/vlans",
