@@ -44,3 +44,5 @@ request returns 503 and does not start a runner. A Single VM does not count
 toward `max_pods`.
 Lab VMs and Single VMs both suspend after the same idle window, which is
 2 hours.
+
+Granted students see [Creating and Managing Labs](../student/labs.md). Students without the grant do not.

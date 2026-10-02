@@ -1,13 +1,13 @@
 # Connecting to Your VM
 
-Connect only to the VM IP address and credentials displayed for **your own** lab in Crucible.
+Connect only to the VM IP address and credentials displayed for **your own** VM in Crucible.
 
 ## Use the browser console
 
-1. Open your lab in **My Labs**, select **Open**, then select **Connect** on the VM.
+1. Open the VM from **Single VM**, then select **Connect**.
 2. Select the console option and wait for the browser console to open.
-3. Sign in with the username and password shown in the console helper (or on the lab card) for that VM. The console page shows credentials so you can copy them while logging in.
-4. If the console shows a **Network** helper (legacy / non-generalized images, or templates that manage their own networking), configure the guest NIC for DHCP on the listed lab VLAN and subnet. When Crucible has already observed an address, use that IP.
+3. Sign in with the username and password shown in the console helper for that VM. The console page shows credentials so you can copy them while logging in.
+4. If the console shows a **Network** helper, configure the guest NIC for DHCP on the VLAN and subnet listed there. When Crucible has already observed an address, use that IP.
 
 **Expected result:** You see and can use that VM's desktop or terminal in the browser.
 
@@ -15,9 +15,9 @@ Connect only to the VM IP address and credentials displayed for **your own** lab
 
 1. Install the NetBird desktop app from the [official download page](https://netbird.io/download/).
 2. Open NetBird. If it asks for a custom or self-hosted server, enter `https://netbird.jmal.io`.
-3. Select **Connect**. In the browser, authorize with your course Authentik account and complete multi-factor authentication.
+3. Select **Connect**. In the browser, authorize with your course Authentik account.
 4. Return to NetBird and confirm that it shows **Connected**.
-5. In Crucible, copy the IP address shown for the VM you own. Do not use an IP address from another lab.
+5. In Crucible, copy the IP address shown for the VM you own. Do not use an IP address from another VM.
 
 **Expected result:** Your device can reach your own VM address through the VPN.
 
@@ -38,6 +38,4 @@ If you cannot authorize or connect, ask your instructor for help before continui
 2. Open Remote Desktop Connection and enter the IP address shown for your Windows VM.
 3. Sign in with the username and password shown in Crucible for that VM.
 
-**Expected result:** You see the desktop of your own Windows VM.
-
-SSH and RDP depend on the guest service being enabled and allowed by that VM's firewall. If a connection fails, use the browser console to check the guest service, then read [Troubleshooting](troubleshooting.md).
+**Expected result:** You see the Windows desktop of your own VM.
