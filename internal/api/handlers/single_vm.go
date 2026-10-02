@@ -123,7 +123,7 @@ func (h *Handler) CreateSingleVM(w http.ResponseWriter, r *http.Request) {
 		respondError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
-	if owned >= user.MaxSingleVMs {
+	if singleVMLimitReached(user.Role, owned, user.MaxSingleVMs) {
 		respondError(w, r, http.StatusConflict, "Single VM limit reached")
 		return
 	}

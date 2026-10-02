@@ -5,10 +5,11 @@ them. The grant is a column on the user, `labs_enabled`, edited from the
 admin Users page. It is not an Authentik group. Instructors and admins
 always have labs.
 
-`labs_enabled` defaults to false. The API only enforces it when
+`labs_enabled` defaults to false. The API enforces it when
 `LABS_REQUIRE_GRANT` is true. The Helm value `admission.labsRequireGrant`
-defaults to false, so merging this change does not lock students out. The
-cutover deploy is what turns the gate on.
+defaults to true, so a normal student does not get isolated labs until an
+instructor grants them. Instructors and admins are not subject to the
+Single VM cap.
 
 `GET /api/v1/auth/me` returns the student's `labs_enabled` on the user and
 `labs_require_grant` for the process. The UI hides Labs and Deploy when the

@@ -159,3 +159,18 @@ func TestAccessPatchError(t *testing.T) {
 		})
 	}
 }
+
+func TestSingleVMLimitReached(t *testing.T) {
+	if singleVMLimitReached(models.RoleStudent, 1, 1) != true {
+		t.Fatal("student at the cap was allowed another Single VM")
+	}
+	if singleVMLimitReached(models.RoleStudent, 0, 1) {
+		t.Fatal("student under the cap was refused")
+	}
+	if singleVMLimitReached(models.RoleInstructor, 5, 1) {
+		t.Fatal("instructor was capped")
+	}
+	if singleVMLimitReached(models.RoleAdmin, 5, 1) {
+		t.Fatal("admin was capped")
+	}
+}

@@ -700,7 +700,7 @@ var DefaultQuotas = map[string]struct {
 	MaxRAMMB int
 	MaxPods  int
 }{
-	RoleStudent:    {MaxVCPUs: 4, MaxRAMMB: 8192, MaxPods: 2},
+	RoleStudent:    {MaxVCPUs: 4, MaxRAMMB: 4096, MaxPods: 2},
 	RoleInstructor: {MaxVCPUs: 8, MaxRAMMB: 16384, MaxPods: 3},
 	RoleAdmin:      {MaxVCPUs: 999, MaxRAMMB: 999999, MaxPods: 999},
 }
