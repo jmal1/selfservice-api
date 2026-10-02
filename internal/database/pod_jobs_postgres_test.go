@@ -630,6 +630,85 @@ func TestPreparePodDestroyPostgresRejectsLostVLANOwnership(t *testing.T) {
 	}
 }
 
+func markSharedStripe(t *testing.T, fixture *podJobsPostgresFixture) {
+	t.Helper()
+	ctx := context.Background()
+	var networkID uuid.UUID
+	if err := fixture.pool.QueryRow(ctx, `
+		INSERT INTO shared_networks (
+			vlan_tag, cidr, gateway, portgroup_name, dhcp_start, dhcp_end, runner_first, runner_last, status
+		) VALUES (
+			347, '10.110.0.0/26', '10.110.0.1', 'Shared-VLAN347', '10.110.0.16', '10.110.0.47', '10.110.0.2', '10.110.0.15', 'active'
+		) RETURNING id
+	`).Scan(&networkID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_, _ = fixture.pool.Exec(cleanupCtx, `
+			UPDATE pods SET network_mode = 'isolated', shared_network_id = NULL WHERE id = $1
+		`, fixture.podID)
+		_, _ = fixture.pool.Exec(cleanupCtx, `DELETE FROM shared_networks WHERE id = $1`, networkID)
+	})
+	if _, err := fixture.pool.Exec(ctx, `
+		UPDATE pods
+		SET network_mode = 'shared', shared_network_id = $2, vlan_id = 347, subnet = '10.110.0.0/26'
+		WHERE id = $1
+	`, fixture.podID, networkID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPreparePodDestroyPostgresAllowsSharedStripeWithoutPoolOwnership(t *testing.T) {
+	fixture := newPodJobsPostgresFixture(t, models.PodStatusActive)
+	ctx := context.Background()
+	markSharedStripe(t, fixture)
+	jobID := uuid.New()
+	claimOwner := "worker-" + uuid.NewString()
+	if _, err := fixture.pool.Exec(ctx, `
+		INSERT INTO jobs (id, type, payload, status, claimed_by, claimed_at)
+		VALUES ($1, 'pod_destroy', jsonb_build_object('pod_id', $2::text), 'in_progress', $3, now())
+	`, jobID, fixture.podID, claimOwner); err != nil {
+		t.Fatal(err)
+	}
+
+	pod, err := fixture.queries.PreparePodDestroy(ctx, fixture.podID, jobID, claimOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pod.Status != models.PodStatusDestroying {
+		t.Fatalf("prepared status = %q, want destroying", pod.Status)
+	}
+	var poolOwned bool
+	if err := fixture.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM vlan_pool WHERE pod_id = $1)`, fixture.podID).Scan(&poolOwned); err != nil {
+		t.Fatal(err)
+	}
+	if poolOwned {
+		t.Fatal("shared destroy claimed a vlan_pool row")
+	}
+}
+
+func TestCreatePodDestroyJobPostgresRequeuesSharedPodWithoutPoolOwnership(t *testing.T) {
+	fixture := newPodJobsPostgresFixture(t, models.PodStatusActive)
+	ctx := context.Background()
+	markSharedStripe(t, fixture)
+	if _, err := fixture.pool.Exec(ctx, `
+		INSERT INTO jobs (id, type, payload, status)
+		VALUES ($1, 'pod_destroy', jsonb_build_object('pod_id', $2::text), 'failed')
+	`, uuid.New(), fixture.podID); err != nil {
+		t.Fatal(err)
+	}
+
+	job, created, err := fixture.queries.CreatePodDestroyJob(ctx, fixture.podID, podDestroyPayload(t, fixture.podID, "user"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created || job.Status != models.JobStatusPending {
+		t.Fatalf("requeue created=%v status=%s, want pending", created, job.Status)
+	}
+}
+
 func TestPreparePodDestroyPostgresTreatsDestroyedPodAsNoOpBeforeVLANRead(t *testing.T) {
 	fixture := newPodJobsPostgresFixture(t, models.PodStatusActive)
 	fixture.assignAvailableVLAN(t)

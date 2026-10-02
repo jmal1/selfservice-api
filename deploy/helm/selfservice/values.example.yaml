@@ -30,7 +30,7 @@ vcenter:
 
 synthetic:
   suspend: false
-  schedule: "*/12 * * * *"
+  schedule: "*/15 * * * *"
   provisioningExpectedEnabled: true
   lifecycle:
     enabled: true

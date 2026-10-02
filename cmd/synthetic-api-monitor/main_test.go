@@ -891,8 +891,8 @@ func TestPodLifecycleRetry_WorstCaseDerivedFromHelmValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("synthetic.schedule=%q: %v", scheduleExpression, err)
 	}
-	if cronJob != 12*time.Minute {
-		t.Fatalf("main synthetic schedule interval=%s, want 12m", cronJob)
+	if cronJob != 15*time.Minute {
+		t.Fatalf("main synthetic schedule interval=%s, want 15m", cronJob)
 	}
 	if wc >= cronJob {
 		t.Errorf(
@@ -904,8 +904,8 @@ func TestPodLifecycleRetry_WorstCaseDerivedFromHelmValues(t *testing.T) {
 			eff.ReadyTimeout, eff.DestroyTimeout, attempts, eff.RetryBackoff,
 		)
 	}
-	if margin := cronJob - wc; margin != 90*time.Second {
-		t.Fatalf("pod_lifecycle schedule margin=%s, want 90s", margin)
+	if margin := cronJob - wc; margin != 4*time.Minute+30*time.Second {
+		t.Fatalf("pod_lifecycle schedule margin=%s, want 4m30s", margin)
 	}
 }
 

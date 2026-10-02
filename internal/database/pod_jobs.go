@@ -460,16 +460,16 @@ func (q *Queries) createPodDestroyJob(
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	var status string
+	var status, networkMode string
 	var vlanTag int
 	var subnet string
 	var expired bool
 	if err := tx.QueryRow(ctx, `
-		SELECT status, vlan_id, subnet, expires_at IS NOT NULL AND expires_at < now()
+		SELECT status, vlan_id, subnet, network_mode, expires_at IS NOT NULL AND expires_at < now()
 		FROM pods
 		WHERE id = $1
 		FOR UPDATE
-	`, podID).Scan(&status, &vlanTag, &subnet, &expired); err != nil {
+	`, podID).Scan(&status, &vlanTag, &subnet, &networkMode, &expired); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, false, fmt.Errorf("lock pod %s for pod_destroy enqueue: %w", podID, ErrPodNotFound)
 		}
@@ -505,9 +505,13 @@ func (q *Queries) createPodDestroyJob(
 			if requirementErr != nil {
 				return nil, false, requirementErr
 			}
-			ownsResources, ownershipErr := podOwnsExactVLAN(ctx, tx, podID, vlanTag, subnet)
-			if ownershipErr != nil {
-				return nil, false, ownershipErr
+			ownsResources := true
+			if !destroySkipsVLANOwnership(networkMode) {
+				var ownershipErr error
+				ownsResources, ownershipErr = podOwnsExactVLAN(ctx, tx, podID, vlanTag, subnet)
+				if ownershipErr != nil {
+					return nil, false, ownershipErr
+				}
 			}
 			if required && ownsResources {
 				if err := rejectPodDestroyWithNonterminalMutator(ctx, tx, podID, requirement, exclusion); err != nil {
@@ -578,7 +582,7 @@ func (q *Queries) createPodDestroyJob(
 	if !required {
 		return nil, false, fmt.Errorf("pod %s no longer satisfies pod_destroy requirement: %w", podID, ErrPodDestroyNotNeeded)
 	}
-	if requirement == podDestroyIfFailed {
+	if requirement == podDestroyIfFailed && !destroySkipsVLANOwnership(networkMode) {
 		ownsResources, ownershipErr := podOwnsExactVLAN(ctx, tx, podID, vlanTag, subnet)
 		if ownershipErr != nil {
 			return nil, false, ownershipErr
@@ -747,6 +751,13 @@ func podDestroyRequirementSatisfied(
 	}
 }
 
+// destroySkipsVLANOwnership is true for a Single VM. Its stripe is
+// pre-provisioned and shared, so vlan_pool.pod_id never points at the pod.
+// Treating that as "ownership lost" blocks delete and every later requeue.
+func destroySkipsVLANOwnership(networkMode string) bool {
+	return networkMode == models.NetworkModeShared
+}
+
 func podOwnsExactVLAN(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -822,12 +833,14 @@ func (q *Queries) PreparePodDestroy(
 		return nil, fmt.Errorf("pod %s authoritative destroy job is %s, not %s: %w", podID, authoritativeID, jobID, ErrPodDestroyJobObsolete)
 	}
 
-	ownsResources, err := podOwnsExactVLAN(ctx, tx, podID, pod.VLANID, pod.Subnet)
-	if err != nil {
-		return nil, err
-	}
-	if !ownsResources {
-		return nil, fmt.Errorf("pod %s VLAN %d/%s: %w", podID, pod.VLANID, pod.Subnet, ErrPodDestroyOwnershipLost)
+	if !destroySkipsVLANOwnership(pod.NetworkMode) {
+		ownsResources, err := podOwnsExactVLAN(ctx, tx, podID, pod.VLANID, pod.Subnet)
+		if err != nil {
+			return nil, err
+		}
+		if !ownsResources {
+			return nil, fmt.Errorf("pod %s VLAN %d/%s: %w", podID, pod.VLANID, pod.Subnet, ErrPodDestroyOwnershipLost)
+		}
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE pods
