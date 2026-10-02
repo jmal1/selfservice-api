@@ -32,7 +32,8 @@ INSERT INTO users (
     max_vcpus,
     max_ram_mb,
     max_pods,
-    is_active
+    is_active,
+    labs_enabled
 ) VALUES (
     'synthetic-monitor-no-oidc',           -- fake sub; synthetic auth bypasses Authentik
     'synthetic',
@@ -42,9 +43,11 @@ INSERT INTO users (
     3,
     3072,
     3,
-    true
+    true,
+    true                                    -- this student is the lab-path canary; other students stay ungated
 ) ON CONFLICT DO UPDATE SET
     max_vcpus = GREATEST(users.max_vcpus, EXCLUDED.max_vcpus),
     max_ram_mb = GREATEST(users.max_ram_mb, EXCLUDED.max_ram_mb),
     max_pods = GREATEST(users.max_pods, EXCLUDED.max_pods),
+    labs_enabled = true,
     updated_at = now();
