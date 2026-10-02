@@ -63,6 +63,9 @@ func TestSyntheticMonitorQuotaSourcesPreserveNoopHeadroom(t *testing.T) {
 	if !strings.Contains(string(bootstrap), "ON CONFLICT DO UPDATE SET") {
 		t.Fatal("synthetic bootstrap must repair quotas on re-run")
 	}
+	if !strings.Contains(string(bootstrap), "labs_enabled = true") {
+		t.Fatal("synthetic bootstrap must keep labs enabled so pod_lifecycle and runner_smoke can create isolated labs")
+	}
 
 	migration, err := os.ReadFile(cases[1].path)
 	if err != nil {
