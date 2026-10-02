@@ -4,7 +4,7 @@ Snapshots save a point-in-time state for one VM so you can return to it after an
 
 ## Create a named snapshot
 
-1. Open your lab, choose a VM, and open its snapshots.
+1. Open your VM and open its snapshots.
 2. Select **Create Snapshot**.
 3. Enter a short, specific name and an optional description of what you want to preserve.
 4. Wait for the snapshot job to finish before making the next major change.
@@ -26,6 +26,6 @@ Snapshots save a point-in-time state for one VM so you can return to it after an
 2. Open snapshots and choose **Restore Initial Snapshot**.
 3. Wait for the restore job, then start the VM.
 
-**Expected result:** The VM returns to its original lab state. This removes work made since the lab was created, including work preserved only in later snapshots.
+**Expected result:** The VM returns to the state it had when it was created. This removes work made since then, including work preserved only in later snapshots.
 
 You can delete a named snapshot you no longer need. The initial snapshot is protected and cannot be deleted.

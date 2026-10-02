@@ -11,8 +11,11 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 
 	"github.com/jmal1/selfservice-api/internal/docs"
+	"github.com/jmal1/selfservice-api/internal/middleware"
+	"github.com/jmal1/selfservice-api/internal/models"
 )
 
 // docsBundle is loaded lazily on first request to avoid impacting
@@ -90,12 +93,18 @@ func (h *Handler) StudentGuideIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	labsOpen, err := h.studentGuideLabsOpen(r)
+	if err != nil {
+		h.logger.Error("student guide labs lookup failed", "error", err)
+		http.Error(w, "student guide not available", http.StatusServiceUnavailable)
+		return
+	}
 	allEntries := b.ListPrefix(studentGuidePrefix)
 	entries := make([]docs.ManifestEntry, 0, len(allEntries))
 	var totalBytes int64
 	foundOverview := false
 	for _, entry := range allEntries {
-		if !entry.IsMarkdown {
+		if !entry.IsMarkdown || (studentGuideRequiresLabs(entry.Path) && !labsOpen) {
 			continue
 		}
 		entries = append(entries, entry)
@@ -149,7 +158,50 @@ func (h *Handler) StudentGuidePage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "student guide page not found", http.StatusNotFound)
 		return
 	}
+	if studentGuideRequiresLabs(entry.Path) {
+		labsOpen, labsErr := h.studentGuideLabsOpen(r)
+		if labsErr != nil {
+			h.logger.Error("student guide labs lookup failed", "error", labsErr)
+			http.Error(w, "student guide not available", http.StatusServiceUnavailable)
+			return
+		}
+		if !labsOpen {
+			http.Error(w, "student guide page not found", http.StatusNotFound)
+			return
+		}
+	}
 	h.serveBundleEntry(w, r, b, entry, false)
+}
+
+func studentGuideRequiresLabs(path string) bool {
+	switch path {
+	case studentGuidePrefix + "labs.md", studentGuidePrefix + "testing.md":
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *Handler) studentGuideLabsOpen(r *http.Request) (bool, error) {
+	role := middleware.RoleFromContext(r.Context())
+	if role == models.RoleInstructor || role == models.RoleAdmin || !h.labsRequireGrant {
+		return true, nil
+	}
+	if h.db == nil {
+		return false, nil
+	}
+	userID := middleware.UserIDFromContext(r.Context())
+	if userID == uuid.Nil {
+		return false, nil
+	}
+	user, err := h.db.GetUserByID(r.Context(), userID)
+	if err != nil {
+		return false, err
+	}
+	if user == nil {
+		return false, nil
+	}
+	return !isolatedLabsDeniedFor(user.Role, user.LabsEnabled, h.labsRequireGrant), nil
 }
 
 // normalizeStudentGuidePath accepts only a canonical relative docs/student

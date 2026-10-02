@@ -1,32 +1,32 @@
 # Troubleshooting
 
-Use these checks for common lab access problems before requesting help.
+Use these checks before requesting help.
 
 ## Sign-in problems
 
 1. Start again from the Crucible sign-in page.
-2. Complete the Authentik multi-factor prompt and confirm your device clock is accurate.
+2. Complete the Authentik prompt and confirm your device clock is accurate.
 3. If the prompt loops, try a private browser window or clear the site's sign-in cookies.
 
-**Expected result:** You return to **My Labs** with your account visible.
+**Expected result:** You return to **Single VM** with your account visible.
 
 ## Forgot password or locked out of Authentik
 
 Talk to your instructor. They can create a one-time recovery link (or set a temporary password) in Authentik. Do not email passwords in plain text, and never share multi-factor codes. After you reset, sign in again from the Crucible sign-in page.
 
-**Expected result:** You receive a recovery link from your instructor, set a new password, and return to **My Labs**.
+**Expected result:** You receive a recovery link from your instructor, set a new password, and return to **Single VM**.
 
 ## Provisioning problems
 
-1. Open **My Labs** and refresh the lab status after a few minutes.
+1. Open **Single VM** and refresh the status after a few minutes.
 2. Read any message shown with the deployment status.
-3. Do not delete the lab unless you want a fresh lab and are willing to lose its current work.
+3. Do not delete the VM unless you want a new one and are willing to lose its current work.
 
-**Expected result:** The lab becomes active, or you have a status message to share with support.
+**Expected result:** The VM becomes active, or you have a status message to share with support.
 
 ## Browser console problems
 
-1. Confirm the VM is running, then reopen the console from that VM's card.
+1. Confirm the VM is running, then reopen the console from that VM.
 2. Refresh the browser and try again.
 3. If the console opens but sign-in fails, use only the username and password displayed for that VM.
 
@@ -44,4 +44,4 @@ Talk to your instructor. They can create a one-time recovery link (or set a temp
 
 ## Request help
 
-Include your Crucible username, lab and VM name, the VM IP displayed for your VM, the time and time zone, the action you took, the exact visible error, and a screenshot if possible. Never include your password, multi-factor code, or other secret in a support request.
+Include your Crucible username, the VM name, the VM IP displayed for your VM, the time and time zone, the action you took, the exact visible error, and a screenshot if possible. Never include your password, multi-factor code, or other secret in a support request.

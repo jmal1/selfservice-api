@@ -6,6 +6,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/jmal1/selfservice-api/internal/middleware"
+	"github.com/jmal1/selfservice-api/internal/models"
 )
 
 func TestStudentGuideIndex_ReturnsOnlyStudentManifest(t *testing.T) {
@@ -144,5 +147,61 @@ func TestStudentGuidePage_ETag304(t *testing.T) {
 	h.StudentGuidePage(rec2, req2)
 	if rec2.Code != http.StatusNotModified {
 		t.Errorf("status: want 304, got %d", rec2.Code)
+	}
+}
+
+func TestStudentGuideIndex_HidesLabPagesWithoutGrant(t *testing.T) {
+	h := newTestHandlerForWiki(t).WithLabsRequireGrant(true)
+	rec := httptest.NewRecorder()
+	h.StudentGuideIndex(rec, httptest.NewRequest(http.MethodGet, "/api/v1/student-guide/index", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: want 200, got %d", rec.Code)
+	}
+	var manifest struct {
+		Files []struct {
+			Path string `json:"path"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Files) != 4 {
+		t.Fatalf("files = %d, want 4", len(manifest.Files))
+	}
+	for _, file := range manifest.Files {
+		if studentGuideRequiresLabs(file.Path) {
+			t.Errorf("lab page %s leaked without a grant", file.Path)
+		}
+	}
+}
+
+func TestStudentGuidePage_HidesLabPageWithoutGrant(t *testing.T) {
+	h := newTestHandlerForWiki(t).WithLabsRequireGrant(true)
+	req := withChiParam(
+		httptest.NewRequest(http.MethodGet, "/api/v1/student-guide/page/docs/student/labs.md", nil),
+		"*",
+		studentGuidePrefix+"labs.md",
+	)
+	rec := httptest.NewRecorder()
+	h.StudentGuidePage(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status: want 404, got %d", rec.Code)
+	}
+}
+
+func TestStudentGuideIndex_KeepsLabPagesForInstructor(t *testing.T) {
+	h := newTestHandlerForWiki(t).WithLabsRequireGrant(true)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/student-guide/index", nil)
+	req = req.WithContext(middleware.WithRole(req.Context(), models.RoleInstructor))
+	rec := httptest.NewRecorder()
+	h.StudentGuideIndex(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: want 200, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), studentGuidePrefix+"labs.md") {
+		t.Fatal("instructor index omitted the labs page")
+	}
+	if !strings.Contains(rec.Body.String(), studentGuidePrefix+"testing.md") {
+		t.Fatal("instructor index omitted assessments")
 	}
 }

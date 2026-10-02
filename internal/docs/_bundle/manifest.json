@@ -129,9 +129,12 @@
     {
       "path": "docs/instructor/labs-access.md",
       "title": "Isolated labs and Single VM access",
-      "size": 2380,
-      "sha256": "ca408d56003c4b7d68fae6dbb76ce5a6fa4f9bc6bd62bd951913b4179f294c95",
+      "size": 2487,
+      "sha256": "83c9a9d278112734d250df92eca0f66235a91836e0ae0cc593371af3d67ac0dd",
       "is_markdown": true,
+      "links_out": [
+        "docs/student/labs.md"
+      ],
       "from_seed": true
     },
     {
@@ -288,35 +291,32 @@
     {
       "path": "docs/student/connecting.md",
       "title": "Connecting to Your VM",
-      "size": 2406,
-      "sha256": "5d347498c9b9f7a000baa869349578648267e1534893ad4cb15c58ce9b7d261e",
+      "size": 2024,
+      "sha256": "7d2cb51bbb003de30fb164e646d0de5aefb1226378054d74b619ed19987930e0",
       "is_markdown": true,
-      "links_out": [
-        "docs/student/troubleshooting.md"
-      ],
       "from_seed": false
     },
     {
       "path": "docs/student/labs.md",
       "title": "Creating and Managing Labs",
-      "size": 2136,
-      "sha256": "0b55073e7a6bfd3c12ec58fbe84a90bd8af922d13d6c5e220882bacaa412b124",
+      "size": 2234,
+      "sha256": "68215b5d305c29d65d81de9003bf21a92950b0624e2481ca05b4ba7ef7183ba7",
       "is_markdown": true,
       "links_out": [
-        "docs/student/snapshots.md"
+        "docs/student/snapshots.md",
+        "docs/student/testing.md"
       ],
       "from_seed": false
     },
     {
       "path": "docs/student/overview.md",
       "title": "Getting Started",
-      "size": 1351,
-      "sha256": "ea114f73639f296eaa67602cf2c10147215ad64da046266195158f40df5b2e60",
+      "size": 1913,
+      "sha256": "4afa69bfd2770c9f39dd251a6ed3cc803bbe7eb284f3129203d61e61cbee9744",
       "is_markdown": true,
       "links_out": [
         "docs/student/connecting.md",
-        "docs/student/labs.md",
-        "docs/student/testing.md",
+        "docs/student/snapshots.md",
         "docs/student/troubleshooting.md",
         "docs/student/troubleshooting.md"
       ],
@@ -325,8 +325,8 @@
     {
       "path": "docs/student/snapshots.md",
       "title": "Snapshots and Recovery",
-      "size": 1551,
-      "sha256": "f93c129459a5e07831ce5778db3c7992e9cd62ca8237ab41c5512bf8bbb2b1d3",
+      "size": 1535,
+      "sha256": "da45e30d98f3de709f8ba0b397da81764471806357f887bab987cac341219441",
       "is_markdown": true,
       "from_seed": false
     },
@@ -341,8 +341,8 @@
     {
       "path": "docs/student/troubleshooting.md",
       "title": "Troubleshooting",
-      "size": 2335,
-      "sha256": "8627d74407f52560725a17d6925dc153bcb4f9f96233524350ec55b14c0c3fe2",
+      "size": 2278,
+      "sha256": "171a160237d313d275fd278b04473549780c056973c693dc42332c9a9ca76bb7",
       "is_markdown": true,
       "from_seed": false
     },
@@ -459,5 +459,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 756985
+  "total_bytes": 757297
 }
