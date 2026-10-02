@@ -86,6 +86,18 @@ func blueprintSingleVMOnlyMessage(templateName string, blueprints []string) stri
 
 // accessPatchError reports why a student-access patch must be refused.
 // A zero status means the patch is allowed.
+// singleVMLimitReached reports whether a student is already at their cap.
+// Instructors and admins are not capped; the users page does not edit a limit
+// for those roles.
+func singleVMLimitReached(role string, owned, limit int) bool {
+	switch role {
+	case models.RoleInstructor, models.RoleAdmin:
+		return false
+	default:
+		return owned >= limit
+	}
+}
+
 func accessPatchError(role string, maxSingleVMs int) (int, string) {
 	switch role {
 	case models.RoleInstructor, models.RoleAdmin:

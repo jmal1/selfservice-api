@@ -24,8 +24,8 @@ type Config struct {
 // ProvisioningConfig holds the independent admission controls. Enabled
 // governs API admission; WorkerClaimsEnabled governs whether workers may claim
 // pod_create and vm_add jobs. Both default to true for backward compatibility.
-// LabsRequireGrant defaults to false so merging the access columns does not
-// lock students out of isolated labs until a deploy sets it true.
+// LabsRequireGrant defaults to false only when the environment variable is
+// unset. The Helm chart sets it true, so students need an explicit grant.
 type ProvisioningConfig struct {
 	Enabled             bool
 	WorkerClaimsEnabled bool

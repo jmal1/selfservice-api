@@ -159,6 +159,7 @@ func TestChartProvisioningDefaultsRemainCompatible(t *testing.T) {
 	for path, want := range map[string]string{
 		"provisioning.enabled":                  "true",
 		"provisioning.workerClaimsEnabled":      "true",
+		"admission.labsRequireGrant":            "true",
 		"synthetic.provisioningExpectedEnabled": "true",
 		"synthetic.suspend":                     "false",
 		"synthetic.runner.suspend":              "false",

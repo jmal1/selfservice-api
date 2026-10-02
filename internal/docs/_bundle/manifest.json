@@ -129,8 +129,8 @@
     {
       "path": "docs/instructor/labs-access.md",
       "title": "Isolated labs and Single VM access",
-      "size": 2342,
-      "sha256": "5c3088f729728378e9aef33cb77b84c418a9ae5991181deb7aeb285ff58a3798",
+      "size": 2380,
+      "sha256": "ca408d56003c4b7d68fae6dbb76ce5a6fa4f9bc6bd62bd951913b4179f294c95",
       "is_markdown": true,
       "from_seed": true
     },
@@ -459,5 +459,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 756947
+  "total_bytes": 756985
 }

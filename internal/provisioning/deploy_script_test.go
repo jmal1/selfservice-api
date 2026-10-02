@@ -6810,7 +6810,7 @@ func newDeployScriptEnvironment(t *testing.T, live, candidate string) *deployScr
 		gitRemoteSHA:              testSourceSHA,
 		gitRemoteURL:              "git@github.com:jmal1/selfservice-api.git",
 		commitVerified:            true,
-		migrationState:            "1:45:false",
+		migrationState:            "1:46:false",
 		provisioningJobs:          "0",
 		syntheticQuotaState:       "1:0",
 		syntheticUserID:           testSyntheticUserID,
