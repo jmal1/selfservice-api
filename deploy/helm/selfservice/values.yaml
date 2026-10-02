@@ -347,9 +347,9 @@ synthetic:
   provisioningExpectedEnabled: true
   image: ghcr.io/jmal1/selfservice-synthetic-api-monitor
   imageTag: ""  # defaults to .Values.image.tag
-  # The lifecycle-enabled monitor can consume 10m30s. A 12-minute cadence
-  # leaves 90 seconds before concurrencyPolicy=Forbid would skip the next run.
-  schedule: "*/12 * * * *"
+  # The lifecycle-enabled monitor can consume 10m30s. A 15-minute cadence
+  # leaves 4m30s before concurrencyPolicy=Forbid would skip the next run.
+  schedule: "*/15 * * * *"
   baseURL: "https://crucible.example.test"
   pushgatewayURL: "http://pushgateway.observability:9091"
   job: "crucible_synthetic_api"
@@ -394,7 +394,7 @@ synthetic:
     # pod_lifecycle run was 125.2 s; 150 s adds a 20% margin. Worst-case
     # cycle time with 2 attempts, 60 s per-attempt overhead, and 30 s backoff:
     #   2 × (150 s + 90 s + 60 s) + 30 s = 630 s = 10 m 30 s.
-    # The */12 schedule leaves 90 s before the next run.
+    # The */15 schedule leaves 4m30s before the next run.
     # TestPodLifecycleRetry_WorstCaseDerivedFromHelmValues enforces this.
     readyTimeout: "150s"
     destroyTimeout: "90s"
