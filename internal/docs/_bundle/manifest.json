@@ -6,6 +6,7 @@
     "docs/instructor/playlists.md",
     "docs/instructor/student-password-recovery.md",
     "docs/instructor/labs-access.md",
+    "docs/instructor/briefings.md",
     "AGENTS.md",
     "docs/ai-prompts/build-workflow.md",
     "docs/ai-prompts/create-a-template.md",
@@ -114,6 +115,14 @@
       "from_seed": false
     },
     {
+      "path": "docs/instructor/briefings.md",
+      "title": "Lab Briefings",
+      "size": 4242,
+      "sha256": "ee74c266be42556113023adbedcc08a66794d3ef8ff381df1f6dac511a47ae60",
+      "is_markdown": true,
+      "from_seed": true
+    },
+    {
       "path": "docs/instructor/glossary.md",
       "title": "Glossary",
       "size": 5133,
@@ -170,14 +179,15 @@
     {
       "path": "docs/instructor/overview.md",
       "title": "Crucible for Instructors — Overview",
-      "size": 8788,
-      "sha256": "24334204d8bba27a4e72d9281ddaba6154597fca4f367122fada177c8f3f87a9",
+      "size": 8878,
+      "sha256": "e8d38e8d76ad15c51c501d6d8e21949ac5fa9f3cc30f96035d5dd9e3d182d8f1",
       "is_markdown": true,
       "links_out": [
         "AGENTS.md",
         "AGENTS.md",
         "AGENTS.md",
         "docs/instructor/actions.md",
+        "docs/instructor/briefings.md",
         "docs/instructor/glossary.md",
         "docs/instructor/os-recipes.md",
         "docs/instructor/playlists.md",
@@ -232,10 +242,11 @@
     {
       "path": "docs/instructor/templates.md",
       "title": "Building a Template",
-      "size": 69970,
-      "sha256": "08c5a66c11ed4f6e7a18b1e1abfaa7cab63f486e5a7be088ee2811243dd6d748",
+      "size": 70067,
+      "sha256": "c26e76a4c21768e63d028e0cfd01dcd68ceeee9878cfd7589a918afe268f6a26",
       "is_markdown": true,
       "links_out": [
+        "docs/instructor/briefings.md",
         "docs/instructor/glossary.md",
         "docs/instructor/os-recipes.md",
         "docs/instructor/overview.md",
@@ -349,8 +360,8 @@
     {
       "path": "internal/api/routes/routes.go",
       "title": "routes.go (Go)",
-      "size": 15800,
-      "sha256": "47cfa9ee419f622dfc35d665819a6341f915aca9628caa6496f576ebaab265de",
+      "size": 17201,
+      "sha256": "934b78f7b80a73f5ac3f375c94598aa4b2bc652e79515baf0d9e6f2ae70d7e14",
       "is_markdown": false,
       "from_seed": false
     },
@@ -459,5 +470,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 757297
+  "total_bytes": 763127
 }

@@ -17,6 +17,7 @@ WIKI_SEEDS    := \
 	docs/instructor/playlists.md \
 	docs/instructor/student-password-recovery.md \
 	docs/instructor/labs-access.md \
+	docs/instructor/briefings.md \
 	AGENTS.md \
 	docs/ai-prompts/build-workflow.md \
 	docs/ai-prompts/create-a-template.md \
