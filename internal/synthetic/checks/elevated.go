@@ -77,6 +77,12 @@ func Elevated(cfg ElevatedConfig) []synthetic.Check {
 // this one watches server-side import work.
 const importPipelineStallThreshold = 2 * time.Hour
 
+// imageLibraryMaxBytes is how much of GET /admin/images the library checks buffer.
+// 4 KiB truncated a healthy catalog mid-object, so image_list_contract reported
+// "unexpected end of JSON input" for a 200 array. 1 MiB covers the metadata list;
+// the objects themselves are not in this response.
+const imageLibraryMaxBytes = 1 << 20
+
 // imageImportPipelineHealthy asserts that no uploaded image is sitting in a
 // failed or stalled state.
 //
@@ -114,7 +120,7 @@ func imageImportPipelineHealthy(cfg ElevatedConfig) synthetic.Check {
 				return 0, err
 			}
 			defer resp.Body.Close()
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 65536))
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, imageLibraryMaxBytes))
 
 			if resp.StatusCode != http.StatusOK {
 				return resp.StatusCode, fmt.Errorf(
@@ -426,7 +432,7 @@ func imageListContract(cfg ElevatedConfig) synthetic.Check {
 				return 0, err
 			}
 			defer resp.Body.Close()
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, imageLibraryMaxBytes))
 
 			switch resp.StatusCode {
 			case http.StatusOK:
