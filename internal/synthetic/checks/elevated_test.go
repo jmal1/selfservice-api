@@ -2,6 +2,7 @@ package checks
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -109,6 +110,30 @@ func TestImageListContract_Happy(t *testing.T) {
 		if _, err := elevatedFor(t, srv.URL, "image_list_contract").Run(context.Background(), nil); err != nil {
 			t.Errorf("body %s: %v", body, err)
 		}
+	}
+}
+
+// TestImageListContract_LargeCatalog pins the read ceiling above the old 4 KiB
+// cap. A real library of a few multi-GB images exceeds that and used to fail
+// unmarshal with "unexpected end of JSON input" even though the API returned 200.
+func TestImageListContract_LargeCatalog(t *testing.T) {
+	var b strings.Builder
+	b.WriteByte('[')
+	for i := 0; i < 40; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `{"id":"%d","filename":"Week-%d-Lab-Linux.ova","kind":"ova","size_bytes":3604869120,"checksum_sha256":"%064d","status":"imported"}`, i, i, i)
+	}
+	b.WriteByte(']')
+	if b.Len() <= 4096 {
+		t.Fatalf("fixture is %d bytes, want a catalog larger than the old 4 KiB cap", b.Len())
+	}
+	srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
+		"/api/v1/admin/images": func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(b.String())) },
+	})
+	if _, err := elevatedFor(t, srv.URL, "image_list_contract").Run(context.Background(), nil); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -439,8 +464,8 @@ func TestOVACatalogReachable_FailsOnSelectableEntryWithNoRef(t *testing.T) {
 
 func TestOVACatalogReachable_FailsOnShapeDrift(t *testing.T) {
 	for _, body := range []string{
-		`{"source_type":"ovf"}`,                  // no 'ovas' key at all
-		`{"ovas":[]}`,                            // no source_type
+		`{"source_type":"ovf"}`,                     // no 'ovas' key at all
+		`{"ovas":[]}`,                               // no source_type
 		`{"ovas":[],"source_type":"clone_vcenter"}`, // wrong source_type
 	} {
 		if _, err := elevatedFor(t, ovasServing(t, http.StatusOK, body), "ova_catalog_reachable").
