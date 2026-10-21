@@ -53,6 +53,11 @@ func newNeverAppliedCreateFixture(t *testing.T, status string) *neverAppliedCrea
 		SELECT vlan_tag, subnet
 		FROM vlan_pool
 		WHERE pod_id IS NULL
+		  -- Parallel tests free a pool row before deleting their live pod.
+		  AND NOT EXISTS (
+		    SELECT 1 FROM pods p
+		    WHERE p.vlan_id = vlan_pool.vlan_tag AND p.status <> 'destroyed' AND p.network_mode = 'isolated'
+		  )
 		ORDER BY id
 		FOR UPDATE SKIP LOCKED
 		LIMIT 1
