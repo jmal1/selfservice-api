@@ -57,6 +57,10 @@ type CreateTemplateRequest struct {
 	Visibility *string `json:"visibility,omitempty" validate:"omitempty,oneof=public instructor_only"`
 }
 
+// TemplateDescriptionMaxBytes caps a template description. It is a short
+// pre-provision summary; long-form lab content belongs in a briefing.
+const TemplateDescriptionMaxBytes = 16384
+
 // UpdateTemplateRequest is the admin API request to update a template.
 type UpdateTemplateRequest struct {
 	Name            *string `json:"name,omitempty" validate:"omitempty,min=1,max=128"`
