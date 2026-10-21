@@ -169,6 +169,7 @@ func main() {
 			logger.Error("object store init failed — image upload disabled", "error", err)
 		} else {
 			handler.WithImageStore(objects)
+			handler.WithBriefingAssetStore(objects)
 			if pipeline != nil {
 				handler.WithPipelineMetrics(pipeline)
 				go pipeline.RunPusher(ctx, 30*time.Second, logger)

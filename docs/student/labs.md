@@ -26,6 +26,16 @@ This page is only for accounts that have been granted labs. Create a lab from th
 
 **Expected result:** The selected VM reaches the requested power state.
 
+## Read your lab briefing
+
+If your instructor wrote a briefing for the lab, it appears in a **Briefing** card on the lab page after the lab is created. The same applies to a Single VM. A lab built from a blueprint can show several tabs: **Lab** for the whole exercise and one tab for each kind of VM.
+
+1. Select **Expand** to read the whole briefing on the lab page.
+2. Select **Open in new window** to keep the briefing beside the VM console. Selecting it again brings the same window forward. If your browser blocks the popup, select **Open in new tab** instead.
+3. Select **Copy** on a command block to copy it, then paste it into the VM console.
+
+**Expected result:** You can read the briefing while you work in the VM. Your instructor can update it during the lab; reload the page to see the latest version.
+
 ## Watch expiration and remove a lab
 
 1. Check the expiration time shown on your lab.

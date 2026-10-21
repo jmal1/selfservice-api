@@ -136,6 +136,10 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 			// Templates
 			r.Get("/templates", h.ListTemplates)
 
+			// Lab briefing images: readable by any signed-in user, because
+			// students see them in published briefings. Upload is under /admin.
+			r.Get("/briefing-assets/{sha256}", h.GetBriefingAsset)
+
 			// Blueprints
 			r.Route("/blueprints", func(r chi.Router) {
 				r.Get("/", h.ListBlueprints)
@@ -326,6 +330,9 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 				r.Post("/blueprints/{id}/pin", h.AdminSetBlueprintPin)
 				r.Delete("/blueprints/{id}/pin", h.AdminUnpinBlueprint)
 				r.Post("/blueprints/reorder", h.AdminReorderBlueprints)
+
+				// Lab briefing image upload (raw body, <= 5 MiB, raster only).
+				r.Post("/briefing-assets", h.AdminUploadBriefingAsset)
 
 				// Lab briefings. Mirrors the /admin/templates/{templateID}/briefing routes.
 				r.Get("/blueprints/{blueprintID}/briefing", h.AdminGetBriefing)

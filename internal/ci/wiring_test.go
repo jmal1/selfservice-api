@@ -40,6 +40,7 @@ var requiredWiring = map[string][]struct {
 }{
 	"cmd/api-gateway/main.go": {
 		{"WithImageStore", "without it every /admin/images route answers 503 and image upload is dead in prod"},
+		{"WithBriefingAssetStore", "without it lab briefing image upload and every briefing image answer 503"},
 		{"WithVCenterISOs", "without it the template wizard's ISO picker is permanently empty"},
 		{"WithProvisioningAdmission", "without it PROVISIONING_ENABLED is parsed but new pod and VM requests remain admitted during maintenance"},
 		{"WithLabsRequireGrant", "without it LABS_REQUIRE_GRANT is parsed but students keep isolated labs after the cutover flag is set"},

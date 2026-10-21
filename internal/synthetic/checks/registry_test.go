@@ -273,6 +273,7 @@ func TestAll_StableNames(t *testing.T) {
 		"content_filter_policy":              true,
 		"briefing_admin_rbac":                true,
 		"briefing_pod_contract":              true,
+		"briefing_asset_rbac":                true,
 	}
 	for _, c := range All() {
 		if !wantNames[c.Name()] {
@@ -305,7 +306,7 @@ func TestAll_HasFriendlyMetadata(t *testing.T) {
 func TestReadOnly_OmitsMutatingRBACProbes(t *testing.T) {
 	for _, check := range ReadOnly() {
 		switch check.Name() {
-		case "image_upload_rbac", "template_pin_rbac":
+		case "image_upload_rbac", "template_pin_rbac", "briefing_asset_rbac":
 			t.Errorf("read-only maintenance registry includes mutating check %q", check.Name())
 		}
 	}
