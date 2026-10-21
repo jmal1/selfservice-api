@@ -261,6 +261,16 @@ func (c *Client) Open(ctx context.Context, key string) (io.ReadCloser, int64, er
 	return rc, info.Size, nil
 }
 
+// Put uploads a small object in a single PUT. It is used for server-side
+// writes (lab briefing images); large browser uploads stay on the presigned
+// multipart path.
+func (c *Client) Put(ctx context.Context, key string, data io.Reader, size int64, contentType string) error {
+	if _, err := c.core.PutObject(ctx, c.bucket, key, data, size, "", "", minio.PutObjectOptions{ContentType: contentType}); err != nil {
+		return fmt.Errorf("objectstore: put %q: %w", key, err)
+	}
+	return nil
+}
+
 // Remove deletes key from the bucket.
 func (c *Client) Remove(ctx context.Context, key string) error {
 	if err := c.core.RemoveObject(ctx, c.bucket, key, minio.RemoveObjectOptions{}); err != nil {

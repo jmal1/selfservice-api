@@ -419,6 +419,7 @@ func All() []synthetic.Check {
 		TemplateReplicaBuildStatusRBAC,
 		BriefingAdminRBAC,
 		BriefingPodContract,
+		BriefingAssetRBAC,
 		TemplatePinRBAC,
 		ContentFilterPolicy(ContentFilterPolicyConfig{}),
 	}

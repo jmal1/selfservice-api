@@ -117,8 +117,8 @@
     {
       "path": "docs/instructor/briefings.md",
       "title": "Lab Briefings",
-      "size": 5208,
-      "sha256": "dbeafffe7f5b226e6e3c139bce5ceb91aa1fdde7a0bb520697c4001c26d19395",
+      "size": 5803,
+      "sha256": "f635e801a35cba67464f46680f3dd3474c760e56789320876954c48241595762",
       "is_markdown": true,
       "from_seed": true
     },
@@ -310,8 +310,8 @@
     {
       "path": "docs/student/labs.md",
       "title": "Creating and Managing Labs",
-      "size": 2234,
-      "sha256": "68215b5d305c29d65d81de9003bf21a92950b0624e2481ca05b4ba7ef7183ba7",
+      "size": 3048,
+      "sha256": "2a4552a63550cbb35e4c1a8e0d96b017a2ea123aa4b68b86646f0edbe81fe1aa",
       "is_markdown": true,
       "links_out": [
         "docs/student/snapshots.md",
@@ -360,8 +360,8 @@
     {
       "path": "internal/api/routes/routes.go",
       "title": "routes.go (Go)",
-      "size": 17201,
-      "sha256": "934b78f7b80a73f5ac3f375c94598aa4b2bc652e79515baf0d9e6f2ae70d7e14",
+      "size": 17527,
+      "sha256": "82582b1eb8e6ea8a57e1ca7eb54d43d19e19e1e775107ff627cb8613fff81548",
       "is_markdown": false,
       "from_seed": false
     },
@@ -470,5 +470,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 764093
+  "total_bytes": 765828
 }

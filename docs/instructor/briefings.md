@@ -15,6 +15,7 @@ Open **Admin → Templates** (or **Admin → Blueprints**) and click **Briefing*
 - **History** lists every revision. **Compare** shows a side-by-side diff of that revision against the editor, **Restore** copies it to a new revision, and **Publish** on an older revision rolls back.
 - If someone else saved while you were editing, saving shows a diff of their revision against yours. Choose **Overwrite with mine** to save your text on top of theirs, or **Discard mine** to load theirs.
 - Unsaved edits survive a reload in the same browser tab, but they are not a revision until you save.
+- **Images:** paste or drop a PNG, JPEG, GIF or WebP image into the editor, or use **Insert image**. It uploads (5 MiB maximum) and inserts `![image](/api/v1/briefing-assets/<sha256>)` at the cursor. SVG is refused. Images are stored once per unique file, and any signed-in user who has the link can view them, so never put secrets in an image.
 
 ## Who sees what
 
@@ -64,8 +65,11 @@ All instructor routes require the instructor role. `{owner}` is either `template
 | POST | `/api/v1/admin/{owner}/briefing/revisions/{rev}/restore` | | `201` with the new head revision (not published) |
 | POST | `/api/v1/admin/{owner}/briefing/publish` | `{"revision": 3}` | The updated briefing summary |
 | POST | `/api/v1/admin/{owner}/briefing/unpublish` | | The updated briefing summary |
+| POST | `/api/v1/admin/briefing-assets` | Raw image bytes (PNG, JPEG, GIF or WebP, max 5 MiB) | `201` with `sha256` and `url`; `415` for other types including SVG |
 
 `base_revision` is required on every save. Use `0` for the first save.
+
+Any signed-in user can fetch an image with `GET /api/v1/briefing-assets/{sha256}`.
 
 Students and instructors read a pod's published briefings with `GET /api/v1/pods/{podID}/briefing`. It returns `{"sections": [...]}`, with an empty list when nothing is published. Only the pod's owner and instructors can call it.
 

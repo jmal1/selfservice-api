@@ -315,3 +315,40 @@ func (q *Queries) ListPodBriefingSections(ctx context.Context, podID uuid.UUID) 
 	}
 	return sections, rows.Err()
 }
+
+// BriefingAsset is an uploaded briefing image, addressed by its SHA-256.
+type BriefingAsset struct {
+	SHA256      string
+	ContentType string
+	SizeBytes   int64
+}
+
+// RecordBriefingAsset stores asset metadata. Re-uploading identical bytes is
+// a no-op, so the call is idempotent.
+func (q *Queries) RecordBriefingAsset(ctx context.Context, a BriefingAsset, uploadedBy uuid.UUID) error {
+	var by *uuid.UUID
+	if uploadedBy != uuid.Nil {
+		by = &uploadedBy
+	}
+	_, err := q.pool.Exec(ctx, `
+		INSERT INTO briefing_assets (sha256, content_type, size_bytes, uploaded_by)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (sha256) DO NOTHING
+	`, a.SHA256, a.ContentType, a.SizeBytes, by)
+	return err
+}
+
+// GetBriefingAsset returns the asset's metadata, or nil when it is unknown.
+func (q *Queries) GetBriefingAsset(ctx context.Context, sha string) (*BriefingAsset, error) {
+	a := BriefingAsset{SHA256: sha}
+	err := q.pool.QueryRow(ctx, `
+		SELECT content_type, size_bytes FROM briefing_assets WHERE sha256 = $1
+	`, sha).Scan(&a.ContentType, &a.SizeBytes)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &a, nil
+}

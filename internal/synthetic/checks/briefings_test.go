@@ -54,3 +54,25 @@ func TestBriefingPodContract(t *testing.T) {
 		}
 	}
 }
+
+func TestBriefingAssetRBAC(t *testing.T) {
+	const asset = "/api/v1/briefing-assets/0000000000000000000000000000000000000000000000000000000000000000"
+	for _, tc := range []struct {
+		name           string
+		upload, lookup int
+		wantOK         bool
+	}{
+		{"locked upload, readable route", 403, 404, true},
+		{"upload open", 400, 404, false},
+		{"read route missing for students", 403, 403, false},
+	} {
+		srv := newFakeAPI(t, map[string]func(http.ResponseWriter, *http.Request){
+			"/api/v1/admin/briefing-assets": respond(tc.upload, `{}`),
+			asset:                           respond(tc.lookup, `{}`),
+		})
+		_, err := BriefingAssetRBAC.Run(context.Background(), synthetic.NewClient(srv.URL, ""))
+		if (err == nil) != tc.wantOK {
+			t.Errorf("%s: err=%v, want pass=%v", tc.name, err, tc.wantOK)
+		}
+	}
+}

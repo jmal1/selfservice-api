@@ -52,6 +52,10 @@ type Handler struct {
 	isoDatastore string             // which datastore to browse for ISOs
 	isoCache     *isoDatastoreCache // 5-minute ISO listing cache
 
+	// briefingAssets stores lab briefing images (same bucket, under
+	// crucible/briefings/). Set via WithBriefingAssetStore; nil => 503.
+	briefingAssets BriefingAssetStore
+
 	// templates is an optional override for database.Queries.ListTemplatesForUser.
 	// nil means the default h.db is used. For testing, this can be set to a fake
 	// implementation. See templateStore() accessor.
