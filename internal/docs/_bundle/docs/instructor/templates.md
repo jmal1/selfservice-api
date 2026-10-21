@@ -1219,5 +1219,6 @@ In **Admin → Templates** or **Admin → Blueprints**, you'll see a **Pin** ico
 ## Related pages
 
 - [overview.md](overview.md) — How templates fit into pods, blueprints, playlists
+- [briefings.md](briefings.md) — Versioned Markdown briefings students read after provisioning
 - [glossary.md](glossary.md) — Definitions of `template`, `blueprint`, `pod`, etc.
 - [troubleshooting.md](troubleshooting.md) — Common provisioning failures

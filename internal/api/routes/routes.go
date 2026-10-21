@@ -120,6 +120,9 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 				// Pod expiration
 				r.Post("/{podID}/extend", h.ExtendPod)
 
+				// Published lab briefings: pod owner or any instructor.
+				r.Get("/{podID}/briefing", h.GetPodBriefing)
+
 				// Testing (assessments)
 				r.Route("/{podID}/testing", func(r chi.Router) {
 					r.Get("/", h.GetTestingDashboard)
@@ -227,6 +230,15 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 				r.Post("/{id}/pin", h.AdminSetTemplatePin)
 				r.Delete("/{id}/pin", h.AdminUnpinTemplate)
 				r.Post("/reorder", h.AdminReorderTemplates)
+
+				// Lab briefings (versioned Markdown). Mirrored under /admin/blueprints.
+				r.Get("/{templateID}/briefing", h.AdminGetBriefing)
+				r.Get("/{templateID}/briefing/revisions", h.AdminListBriefingRevisions)
+				r.Post("/{templateID}/briefing/revisions", h.AdminSaveBriefingRevision)
+				r.Get("/{templateID}/briefing/revisions/{rev}", h.AdminGetBriefingRevision)
+				r.Post("/{templateID}/briefing/revisions/{rev}/restore", h.AdminRestoreBriefingRevision)
+				r.Post("/{templateID}/briefing/publish", h.AdminPublishBriefing)
+				r.Post("/{templateID}/briefing/unpublish", h.AdminUnpublishBriefing)
 			})
 
 			// Admin routes.
@@ -314,6 +326,15 @@ func Setup(h *handlers.Handler, authProvider *auth.Provider, db *database.Querie
 				r.Post("/blueprints/{id}/pin", h.AdminSetBlueprintPin)
 				r.Delete("/blueprints/{id}/pin", h.AdminUnpinBlueprint)
 				r.Post("/blueprints/reorder", h.AdminReorderBlueprints)
+
+				// Lab briefings. Mirrors the /admin/templates/{templateID}/briefing routes.
+				r.Get("/blueprints/{blueprintID}/briefing", h.AdminGetBriefing)
+				r.Get("/blueprints/{blueprintID}/briefing/revisions", h.AdminListBriefingRevisions)
+				r.Post("/blueprints/{blueprintID}/briefing/revisions", h.AdminSaveBriefingRevision)
+				r.Get("/blueprints/{blueprintID}/briefing/revisions/{rev}", h.AdminGetBriefingRevision)
+				r.Post("/blueprints/{blueprintID}/briefing/revisions/{rev}/restore", h.AdminRestoreBriefingRevision)
+				r.Post("/blueprints/{blueprintID}/briefing/publish", h.AdminPublishBriefing)
+				r.Post("/blueprints/{blueprintID}/briefing/unpublish", h.AdminUnpublishBriefing)
 
 				// Admin pod management
 				r.Post("/pods/{podID}/extend", h.AdminExtendPod)

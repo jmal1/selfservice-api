@@ -178,6 +178,7 @@ Submit via the admin UI Workflows page, or via the lifecycle endpoints
 | Understand what's available to your script at runtime | [Runner Environment](runner-environment.md) |
 | Add a reusable check to the library | [Building Actions](actions.md) |
 | Bundle workflows into a graded lab | [Building Playlists](playlists.md) |
+| Write the briefing students read after they provision | [Lab Briefings](briefings.md) |
 | Reset a student's Authentik password | [Student password recovery](student-password-recovery.md) |
 | Figure out why a workflow keeps failing | [Troubleshooting](troubleshooting.md) |
 | Look up a term | [Glossary](glossary.md) |

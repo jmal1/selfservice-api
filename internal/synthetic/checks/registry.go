@@ -417,6 +417,8 @@ func All() []synthetic.Check {
 		ImageUploadRBAC,
 		TemplateHealthStatusRBAC,
 		TemplateReplicaBuildStatusRBAC,
+		BriefingAdminRBAC,
+		BriefingPodContract,
 		TemplatePinRBAC,
 		ContentFilterPolicy(ContentFilterPolicyConfig{}),
 	}
@@ -440,6 +442,8 @@ func ReadOnly() []synthetic.Check {
 		StudentGuideIndex,
 		TemplateHealthStatusRBAC,
 		TemplateReplicaBuildStatusRBAC,
+		BriefingAdminRBAC,
+		BriefingPodContract,
 		ContentFilterPolicy(ContentFilterPolicyConfig{}),
 	}
 }
