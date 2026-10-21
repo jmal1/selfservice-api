@@ -3,7 +3,18 @@
 A **briefing** is a Markdown write-up for a lab: the scenario, the objectives, the rules of engagement, and any commands students should start with. You attach one briefing to a **template** (including a Single VM template) or to a **blueprint**. Students see it only **after they provision** a pod that uses it.
 
 > [!note]
-> This page describes the API that stores briefings. The **Briefing** tab in the template and blueprint editors, and the student briefing view on the pod page, ship in follow-up UI releases. Until then, briefings can be authored only through the API calls below.
+> Students cannot see briefings in the UI yet: the student view on the pod page ships in a follow-up release. You can already write, save and publish them, and they will appear for students as soon as that release is out.
+
+## Writing a briefing
+
+Open **Admin → Templates** (or **Admin → Blueprints**) and click **Briefing** on the row. A Single VM template uses the same Templates page.
+
+- Write Markdown on the left; the right side previews exactly what students will see, using the same renderer.
+- **Save revision** (or **Ctrl+S**) stores a new revision with an optional message. It does not change what students see.
+- **Publish revision N** shows the saved revision to students. **Unpublish** hides the briefing.
+- **History** lists every revision. **Compare** shows a side-by-side diff of that revision against the editor, **Restore** copies it to a new revision, and **Publish** on an older revision rolls back.
+- If someone else saved while you were editing, saving shows a diff of their revision against yours. Choose **Overwrite with mine** to save your text on top of theirs, or **Discard mine** to load theirs.
+- Unsaved edits survive a reload in the same browser tab, but they are not a revision until you save.
 
 ## Who sees what
 
