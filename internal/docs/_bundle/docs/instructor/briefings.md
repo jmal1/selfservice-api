@@ -3,7 +3,7 @@
 A **briefing** is a Markdown write-up for a lab: the scenario, the objectives, the rules of engagement, and any commands students should start with. You attach one briefing to a **template** (including a Single VM template) or to a **blueprint**. Students see it only **after they provision** a pod that uses it.
 
 > [!note]
-> Students cannot see briefings in the UI yet: the student view on the pod page ships in a follow-up release. You can already write, save and publish them, and they will appear for students as soon as that release is out.
+> Students see the published briefing in a **Briefing** card on their lab or Single VM page, and can open it in a new window beside the VM console or in a new tab. See "Read your lab briefing" in the [Student Guide](../student/labs.md).
 
 ## Writing a briefing
 

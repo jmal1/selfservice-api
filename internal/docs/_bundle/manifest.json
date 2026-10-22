@@ -117,9 +117,12 @@
     {
       "path": "docs/instructor/briefings.md",
       "title": "Lab Briefings",
-      "size": 5902,
-      "sha256": "661198232afaf9f51b249dfa6501ddef4e275bc184a8eb89541d4059544a0071",
+      "size": 5917,
+      "sha256": "29704b6ceade6498468282802ae8957c4d2c4d08233a8059af49e585513ff64b",
       "is_markdown": true,
+      "links_out": [
+        "docs/student/labs.md"
+      ],
       "from_seed": true
     },
     {
@@ -471,5 +474,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 766107
+  "total_bytes": 766122
 }
