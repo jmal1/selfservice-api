@@ -117,8 +117,8 @@
     {
       "path": "docs/instructor/briefings.md",
       "title": "Lab Briefings",
-      "size": 5818,
-      "sha256": "cea8cb994ef7b98e1683ec480f1030a8ba516c359a138c50f63a822c2abb79f0",
+      "size": 5917,
+      "sha256": "29704b6ceade6498468282802ae8957c4d2c4d08233a8059af49e585513ff64b",
       "is_markdown": true,
       "links_out": [
         "docs/student/labs.md"
@@ -245,10 +245,11 @@
     {
       "path": "docs/instructor/templates.md",
       "title": "Building a Template",
-      "size": 70067,
-      "sha256": "c26e76a4c21768e63d028e0cfd01dcd68ceeee9878cfd7589a918afe268f6a26",
+      "size": 70247,
+      "sha256": "2524c3fecb6b19c10d3f58eabc52fc2f659bc538f4cb0e6f2faa0f466084edf3",
       "is_markdown": true,
       "links_out": [
+        "docs/instructor/briefings.md",
         "docs/instructor/briefings.md",
         "docs/instructor/glossary.md",
         "docs/instructor/os-recipes.md",
@@ -473,5 +474,5 @@
       "from_seed": false
     }
   ],
-  "total_bytes": 765843
+  "total_bytes": 766122
 }

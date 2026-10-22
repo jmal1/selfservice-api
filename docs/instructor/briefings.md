@@ -27,7 +27,7 @@ Open **Admin → Templates** (or **Admin → Blueprints**) and click **Briefing*
 
 A pod can show several briefings. The blueprint briefing comes first, then one briefing per distinct template in the pod. A template briefing lists the pod's VMs that were cloned from it.
 
-Before provisioning, students see only the template or blueprint **description**. There is no preview of the briefing in the catalog.
+Before provisioning, students see only the template or blueprint **description**. There is no preview of the briefing in the catalog. Keep the description a short summary (at most 16 KiB) and put the lab walkthrough in the briefing.
 
 Instructors can read the briefing of any student's pod, so you see exactly what the student sees.
 

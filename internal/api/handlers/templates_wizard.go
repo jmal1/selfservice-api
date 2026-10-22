@@ -169,6 +169,10 @@ func (h *Handler) AdminCreateTemplateDraft(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "name and os_type are required", http.StatusBadRequest)
 		return
 	}
+	if code, msg := templateDescriptionError(req.Description); code != 0 {
+		http.Error(w, msg, code)
+		return
+	}
 	if req.SourceType == "" {
 		http.Error(w, "source_type is required (clone_template, clone_vcenter, iso, or ovf)", http.StatusBadRequest)
 		return

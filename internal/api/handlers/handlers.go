@@ -1787,13 +1787,17 @@ func (h *Handler) AdminListTemplates(w http.ResponseWriter, r *http.Request) {
 // AdminCreateTemplate creates a new template.
 func (h *Handler) AdminCreateTemplate(w http.ResponseWriter, r *http.Request) {
 	var req models.CreateTemplateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, templateRequestMaxBytes)).Decode(&req); err != nil {
 		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
 	if req.Name == "" || req.VCenterTemplate == "" || req.OSType == "" {
 		respondError(w, r, http.StatusBadRequest, "name, vcenter_template, and os_type are required")
+		return
+	}
+	if code, msg := templateDescriptionError(req.Description); code != 0 {
+		respondError(w, r, code, msg)
 		return
 	}
 
@@ -1840,9 +1844,25 @@ func (h *Handler) AdminUpdateTemplate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req models.UpdateTemplateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, templateRequestMaxBytes)).Decode(&req); err != nil {
 		respondError(w, r, http.StatusBadRequest, "invalid request body")
 		return
+	}
+	if req.Description != nil {
+		if code, msg := templateDescriptionError(*req.Description); code != 0 {
+			// The UI echoes the stored description on every save, so a legacy
+			// over-cap description must not block edits to other fields.
+			current, err := h.db.GetTemplateByID(r.Context(), templateID)
+			if err != nil {
+				h.logger.Error("load template for description check failed", "error", err)
+				respondError(w, r, http.StatusInternalServerError, "internal error")
+				return
+			}
+			if current == nil || current.Description != *req.Description {
+				respondError(w, r, code, msg)
+				return
+			}
+		}
 	}
 	if req.SingleVMOnly != nil && *req.SingleVMOnly {
 		current, err := h.db.GetTemplateByID(r.Context(), templateID)
@@ -1880,8 +1900,28 @@ func (h *Handler) AdminUpdateTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	audit.Log(r.Context(), h.db, "template.update",
+		audit.Resource("template", tmpl.ID),
+		audit.FromRequest(r),
+		audit.Detail("name", tmpl.Name),
+		audit.Detail("description_set", req.Description != nil),
+	)
 	h.invalidateTemplatesFolderCache()
 	respondJSON(w, http.StatusOK, tmpl)
+}
+
+// templateRequestMaxBytes bounds create/update bodies. JSON escaping can
+// double the description, so allow headroom for it plus the other fields.
+const templateRequestMaxBytes = 2*models.TemplateDescriptionMaxBytes + 16384
+
+// templateDescriptionError returns a non-zero status and message when desc
+// is too long. No UTF-8 check: encoding/json already replaces invalid bytes.
+func templateDescriptionError(desc string) (int, string) {
+	if len(desc) > models.TemplateDescriptionMaxBytes {
+		return http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("description is larger than %d KiB; put long-form content in the briefing", models.TemplateDescriptionMaxBytes/1024)
+	}
+	return 0, ""
 }
 
 // AdminDeleteTemplate deletes a template and (if it has a staging or
