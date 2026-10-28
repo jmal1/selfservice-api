@@ -12,6 +12,7 @@ type portGroupReceiptWiring struct {
 	destroy    string
 	database   string
 	portgroups string
+	closer     string
 }
 
 func validatePortGroupReceiptWiring(src portGroupReceiptWiring) error {
@@ -61,6 +62,18 @@ func validatePortGroupReceiptWiring(src portGroupReceiptWiring) error {
 			return errors.New("destroy is missing exact keyed cleanup or tombstone completion")
 		}
 	}
+	if !strings.Contains(src.create, "closeAbsentApplyingReceipt(ctx, podID, record, receipt)") ||
+		!strings.Contains(src.destroy, "closeAbsentApplyingReceipt(ctx, pod.ID, receiptRecord, receipt)") ||
+		!strings.Contains(src.destroy, "!absentClosed") {
+		return errors.New("create rollback and destroy must close verified-absent applying receipts before keyed cleanup")
+	}
+	lock := strings.Index(src.closer, "WithVCenterPortGroupMutationLock(")
+	absent := strings.Index(src.closer, "OwnedPortGroupsAbsent(lockCtx")
+	mark := strings.Index(src.closer, "MarkPodPortGroupAbsentRemoved(lockCtx")
+	if lock < 0 || absent < 0 || mark < 0 || lock > absent || absent > mark ||
+		!strings.Contains(src.closer, "len(record.Keys) > 0") {
+		return errors.New("absent receipt close must verify absence under the mutation lock before tombstoning, and never for keyed receipts")
+	}
 	if strings.Contains(src.create, "case database.PodPortGroupReceiptLegacy") ||
 		strings.Contains(src.destroy, "receiptRecord.State == database.PodPortGroupReceiptLegacy") {
 		return errors.New("legacy receipt state must not reach inventory-based key capture or deletion")
@@ -93,6 +106,7 @@ func TestPortGroupReceiptWiringRejectsSabotage(t *testing.T) {
 		destroy:    read("destroy.go"),
 		database:   read("../database/portgroup_receipts.go"),
 		portgroups: read("../vcenter/portgroups.go"),
+		closer:     read("portgroup_receipt_close.go"),
 	}
 	if err := validatePortGroupReceiptWiring(src); err != nil {
 		t.Fatal(err)
@@ -138,6 +152,15 @@ func TestPortGroupReceiptWiringRejectsSabotage(t *testing.T) {
 		1,
 	)
 	sabotages["legacy-inventory-adoption"] = sabotaged
+	sabotaged = src
+	sabotaged.closer = strings.Replace(src.closer, "OwnedPortGroupsAbsent(lockCtx", "AssumePortGroupsAbsent(lockCtx", 1)
+	sabotages["absent-close-without-verification"] = sabotaged
+	sabotaged = src
+	sabotaged.closer = strings.Replace(src.closer, "len(record.Keys) > 0", "false", 1)
+	sabotages["absent-close-on-keyed-receipt"] = sabotaged
+	sabotaged = src
+	sabotaged.destroy = strings.Replace(src.destroy, "closeAbsentApplyingReceipt(ctx, pod.ID, receiptRecord, receipt)", "skipAbsentClose()", 1)
+	sabotages["destroy-cannot-close-absent-receipt"] = sabotaged
 
 	for name, candidate := range sabotages {
 		t.Run(name, func(t *testing.T) {

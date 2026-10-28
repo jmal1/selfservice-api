@@ -117,6 +117,65 @@ func TestPortGroupPartialCreateCompensatesOnlyCreatedHosts(t *testing.T) {
 	})
 }
 
+// Reproduces jmal1/Crucible#78: compensation removes every owned group before
+// any key is bound, so keyed cleanup can never prove ownership. The absence
+// check must say "nothing left" here and "still present" after a full apply.
+func TestOwnedPortGroupsAbsentAfterCompensatedPartialCreate(t *testing.T) {
+	withSimulator(t, func(ctx context.Context, c *Client, _ *vim25.Client) {
+		enableVCSimPortGroupKeys(c)
+		host1, host2 := twoHostsInResourcePool(t, ctx, c, simResourcePool)
+		setAllowedHosts(c, host1, host2)
+		ns2 := networkSystemMoref(t, ctx, c, host2)
+
+		receipt, err := c.PlanPortGroupMutation(ctx, "Pod-VLAN409", 409)
+		if err != nil {
+			t.Fatal(err)
+		}
+		absent, err := c.OwnedPortGroupsAbsent(ctx, receipt)
+		if err != nil || !absent {
+			t.Fatalf("before apply: absent=%v err=%v, want true", absent, err)
+		}
+
+		original := c.client.RoundTripper
+		c.client.RoundTripper = &portGroupMutationRecorder{next: original, failAddReceiver: ns2}
+		if err := c.ApplyPortGroupMutation(ctx, receipt); err == nil {
+			t.Fatal("ApplyPortGroupMutation succeeded after the second host AddPortGroup failed")
+		}
+		c.client.RoundTripper = original
+
+		if _, err := c.CapturePortGroupKeys(ctx, receipt); err == nil {
+			t.Fatal("keyed capture accepted an unkeyed absent receipt; the #78 trap no longer reproduces")
+		}
+		absent, err = c.OwnedPortGroupsAbsent(ctx, receipt)
+		if err != nil || !absent {
+			t.Fatalf("after compensation: absent=%v err=%v, want true", absent, err)
+		}
+
+		live, err := c.PlanPortGroupMutationForHosts(ctx, "Pod-VLAN410", 410, []string{host2.MoRef})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.ApplyPortGroupMutation(ctx, live); err != nil {
+			t.Fatal(err)
+		}
+		absent, err = c.OwnedPortGroupsAbsent(ctx, live)
+		if err != nil || absent {
+			t.Fatalf("after full apply: absent=%v err=%v, want false", absent, err)
+		}
+		keys, err := c.CapturePortGroupKeys(ctx, live)
+		if err != nil {
+			t.Fatal(err)
+		}
+		live, err = PortGroupReceiptWithKeys(live, keys)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.DeletePortGroupMutation(ctx, live); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
 func TestPortGroupMutationTouchesOnlySelectedTargetHosts(t *testing.T) {
 	withSimulator(t, func(ctx context.Context, c *Client, _ *vim25.Client) {
 		enableVCSimPortGroupKeys(c)

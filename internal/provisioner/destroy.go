@@ -147,7 +147,15 @@ func (p *Provisioner) DestroyPod(ctx context.Context, job *models.Job) error {
 				return p.failPodDestroyManual(ctx, pod.ID, errors)
 			}
 		}
-		if receiptRecord.RemovedAt == nil && receiptRecord.State != database.PodPortGroupReceiptPlanned {
+		absentClosed, closeErr := p.closeAbsentApplyingReceipt(ctx, pod.ID, receiptRecord, receipt)
+		if closeErr != nil {
+			errors = append(errors, fmt.Errorf("close absent port group receipt: %w", closeErr))
+			if portGroupReceiptRequiresManualCleanup(closeErr) {
+				return p.failPodDestroyManual(ctx, pod.ID, errors)
+			}
+			return p.failPodDestroy(ctx, pod.ID, errors)
+		}
+		if receiptRecord.RemovedAt == nil && receiptRecord.State != database.PodPortGroupReceiptPlanned && !absentClosed {
 			receipt, err = vcenter.PortGroupReceiptWithKeys(receipt, receiptRecord.Keys)
 			if err != nil {
 				errors = append(errors, fmt.Errorf("load stable port group identities: %w", err))

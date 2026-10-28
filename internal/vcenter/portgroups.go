@@ -189,6 +189,41 @@ func (c *Client) CapturePortGroupKeys(
 	return keys, nil
 }
 
+// OwnedPortGroupsAbsent reports whether every portgroup the receipt owns is
+// gone from its exact host identities. Preexisting groups are not owned and
+// must still be present, matching CapturePortGroupKeys. Callers hold the
+// portgroup mutation lock so the answer cannot race a concurrent create.
+func (c *Client) OwnedPortGroupsAbsent(
+	ctx context.Context,
+	receipt PortGroupReceipt,
+) (bool, error) {
+	if err := c.ensureConnected(ctx); err != nil {
+		return false, err
+	}
+	observed, err := c.validatePortGroupReceipt(ctx, receipt)
+	if err != nil {
+		return false, err
+	}
+	for _, host := range receipt.Hosts {
+		present := observed[host.HostMoRef].Key != ""
+		if host.Preexisting {
+			if !present {
+				return false, fmt.Errorf(
+					"preexisting port group %q disappeared from %s (%s)",
+					receipt.Name,
+					host.HostName,
+					host.HostMoRef,
+				)
+			}
+			continue
+		}
+		if present {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 func PortGroupReceiptWithKeys(
 	receipt PortGroupReceipt,
 	keys map[string]string,
