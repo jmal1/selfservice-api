@@ -156,7 +156,7 @@ func (c *Client) SamplePodVMPerf(ctx context.Context, morefs []string) (map[stri
 	return result, nil
 }
 
-// vmPropertyRetriever is the narrow interface used by QueryVMToolsStatusBulk
+// vmPropertyRetriever is the narrow interface used by QueryVMIdleStateBulk
 // for both the bulk and per-moref fallback retrieval steps.
 // property.DefaultCollector satisfies it. Tests inject a fake to exercise the
 // deleted-VM fallback path without a full govmomi simulator.
@@ -164,9 +164,15 @@ type vmPropertyRetriever interface {
 	Retrieve(ctx context.Context, objs []types.ManagedObjectReference, ps []string, dst interface{}) error
 }
 
-// QueryVMToolsStatusBulk fetches guest.toolsRunningStatus for all morefs in a
-// SINGLE PropertyCollector Retrieve call. Returns a map from MoRef value to
-// true (Tools running) or false (Tools not running or not installed).
+// VMIdleState is the per-VM state the idle evaluator reads in one bulk call.
+type VMIdleState struct {
+	ToolsRunning bool // false when Tools is not running or not installed
+	PowerState   types.VirtualMachinePowerState
+}
+
+// QueryVMIdleStateBulk fetches guest.toolsRunningStatus and runtime.powerState
+// for all morefs in a SINGLE PropertyCollector Retrieve call, keyed by MoRef
+// value.
 //
 // A moref absent from the result (e.g. VM deleted between the DB query and the
 // vCenter call) is treated by callers as Tools-not-running.
@@ -175,9 +181,9 @@ type vmPropertyRetriever interface {
 // the function falls back to per-moref retrieval and omits the deleted refs
 // from the result rather than returning an error. Only genuine non-deleted
 // failures (auth errors, network problems, etc.) are propagated as errors.
-func (c *Client) QueryVMToolsStatusBulk(ctx context.Context, morefs []string) (map[string]bool, error) {
+func (c *Client) QueryVMIdleStateBulk(ctx context.Context, morefs []string) (map[string]VMIdleState, error) {
 	if len(morefs) == 0 {
-		return map[string]bool{}, nil
+		return map[string]VMIdleState{}, nil
 	}
 	if err := c.ensureConnected(ctx); err != nil {
 		return nil, err
@@ -189,19 +195,19 @@ func (c *Client) QueryVMToolsStatusBulk(ctx context.Context, morefs []string) (m
 	}
 
 	// withRetry handles session expiry (NotAuthenticated). Deleted-object
-	// errors are not retryable and pass through; retrieveVMToolsStatus handles
+	// errors are not retryable and pass through; retrieveVMIdleState handles
 	// them in the fallback path.
-	var result map[string]bool
+	var result map[string]VMIdleState
 	retryErr := c.withRetry(ctx, "query VM tools status bulk", func() error {
 		pc := property.DefaultCollector(c.client.Client)
 		var err error
-		result, err = retrieveVMToolsStatus(ctx, refs, pc, c.logger)
+		result, err = retrieveVMIdleState(ctx, refs, pc, c.logger)
 		return err
 	})
 	return result, retryErr
 }
 
-// retrieveVMToolsStatus is the testable implementation behind QueryVMToolsStatusBulk.
+// retrieveVMIdleState is the testable implementation behind QueryVMIdleStateBulk.
 //
 // Fast path: issues a single bulk Retrieve over all refs (one PropertyCollector
 // round-trip). If that succeeds, returns immediately without a fallback.
@@ -212,17 +218,17 @@ func (c *Client) QueryVMToolsStatusBulk(ctx context.Context, morefs []string) (m
 // silently omitted from the result (absent = treated as Tools-not-running by
 // callers). Any non-deleted error is returned immediately as a hard failure so
 // genuine problems (auth, connectivity) still surface.
-func retrieveVMToolsStatus(
+func retrieveVMIdleState(
 	ctx context.Context,
 	refs []types.ManagedObjectReference,
 	retr vmPropertyRetriever,
 	logger *slog.Logger,
-) (map[string]bool, error) {
+) (map[string]VMIdleState, error) {
 	// Fast path: single bulk Retrieve (one PropertyCollector round-trip).
 	var vms []mo.VirtualMachine
-	err := retr.Retrieve(ctx, refs, []string{"guest.toolsRunningStatus"}, &vms)
+	err := retr.Retrieve(ctx, refs, vmIdleStateProps, &vms)
 	if err == nil {
-		return vmToolsStatusMap(vms), nil
+		return vmIdleStateMap(vms), nil
 	}
 	if !isAlreadyDeletedErr(err) {
 		// Hard failure — auth error, connection error, etc. Surface it.
@@ -234,22 +240,20 @@ func retrieveVMToolsStatus(
 	logger.Warn("bulk VM tools status query: encountered deleted VM reference, falling back to per-moref",
 		"total_refs", len(refs))
 
-	result := make(map[string]bool, len(refs))
+	result := make(map[string]VMIdleState, len(refs))
 	skipped := 0
 	for _, ref := range refs {
 		var single []mo.VirtualMachine
 		if perErr := retr.Retrieve(ctx, []types.ManagedObjectReference{ref},
-			[]string{"guest.toolsRunningStatus"}, &single); perErr != nil {
+			vmIdleStateProps, &single); perErr != nil {
 			if isAlreadyDeletedErr(perErr) {
 				skipped++
 				continue
 			}
 			return nil, fmt.Errorf("bulk tools status query: %w", perErr)
 		}
-		for i := range single {
-			running := single[i].Guest != nil &&
-				single[i].Guest.ToolsRunningStatus == string(types.VirtualMachineToolsRunningStatusGuestToolsRunning)
-			result[single[i].Self.Value] = running
+		for ref, state := range vmIdleStateMap(single) {
+			result[ref] = state
 		}
 	}
 	logger.Warn("bulk VM tools status fallback complete",
@@ -257,13 +261,17 @@ func retrieveVMToolsStatus(
 	return result, nil
 }
 
-// vmToolsStatusMap builds a moref-value→running map from a []mo.VirtualMachine slice.
-func vmToolsStatusMap(vms []mo.VirtualMachine) map[string]bool {
-	result := make(map[string]bool, len(vms))
+var vmIdleStateProps = []string{"guest.toolsRunningStatus", "runtime.powerState"}
+
+// vmIdleStateMap builds a moref-value→state map from a []mo.VirtualMachine slice.
+func vmIdleStateMap(vms []mo.VirtualMachine) map[string]VMIdleState {
+	result := make(map[string]VMIdleState, len(vms))
 	for i := range vms {
-		running := vms[i].Guest != nil &&
-			vms[i].Guest.ToolsRunningStatus == string(types.VirtualMachineToolsRunningStatusGuestToolsRunning)
-		result[vms[i].Self.Value] = running
+		result[vms[i].Self.Value] = VMIdleState{
+			ToolsRunning: vms[i].Guest != nil &&
+				vms[i].Guest.ToolsRunningStatus == string(types.VirtualMachineToolsRunningStatusGuestToolsRunning),
+			PowerState: vms[i].Runtime.PowerState,
+		}
 	}
 	return result
 }
