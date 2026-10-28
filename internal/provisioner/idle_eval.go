@@ -115,6 +115,7 @@ type idleEvalDB interface {
 	IdleSuspendCandidateStillEligible(ctx context.Context, podVMID uuid.UUID) (bool, error)
 	TouchVMActivityAt(ctx context.Context, id uuid.UUID, t time.Time) error
 	SetVMSuspended(ctx context.Context, id uuid.UUID, t time.Time, reason string) error
+	UpdatePodVMStatusFrom(ctx context.Context, id uuid.UUID, fromStatuses []string, status string) (bool, error)
 	GetIdleTimeoutSeconds(ctx context.Context, podID uuid.UUID) (int, error)
 	HasActiveJobForVM(ctx context.Context, podVMID uuid.UUID) (bool, error)
 	HasInFlightRunForVM(ctx context.Context, podVMID uuid.UUID) (bool, error)
@@ -154,7 +155,11 @@ type IdleEvalCounts struct {
 	RefusedPod      int // pod provisioning/destroying (guard 2)
 	RefusedRun      int // assessment run in flight (guard 3)
 	Suspended       int // suspended (or would-be suspended in dry-run)
-	Errors          int // DB or vCenter error during processing
+	// AlreadyOff counts VMs vCenter reported as already powered off when the
+	// suspend was attempted (e.g. after a host outage). Not an error: the DB
+	// row is reconciled to stopped instead.
+	AlreadyOff int
+	Errors     int // DB or vCenter error during processing
 }
 
 // EvaluateIdleVMs is the Provisioner-bound entry point. The provision-worker
@@ -372,6 +377,20 @@ func evaluateIdleVMs(
 			continue
 		}
 		if serr := vc.SuspendVM(ctx, c.VCenterVMID); serr != nil {
+			if isPoweredOffStateErr(serr) {
+				// The VM went down outside Crucible (host outage, guest
+				// shutdown) while the DB still says running. Nothing to
+				// suspend; reconcile the row so the next pass skips it.
+				vmLog.Warn("idle-eval: VM already powered off in vCenter; marking stopped", "error", serr)
+				if _, uerr := db.UpdatePodVMStatusFrom(ctx, c.PodVMID,
+					[]string{models.VMStatusRunning}, models.VMStatusStopped); uerr != nil {
+					vmLog.Error("idle-eval: reconcile to stopped failed", "error", uerr)
+					counts.Errors++
+					continue
+				}
+				counts.AlreadyOff++
+				continue
+			}
 			vmLog.Error("idle-eval: SuspendVM failed", "error", serr)
 			counts.Errors++
 			if cfg.Pusher != nil {
@@ -407,8 +426,18 @@ func evaluateIdleVMs(
 		"perf_missing", counts.PerfMissing,
 		"activity_fresh", counts.ActivityFresh,
 		"activity_unknown", counts.ActivityUnknown,
+		"already_off", counts.AlreadyOff,
 		"errors", counts.Errors,
 	)
 
 	return counts, nil
+}
+
+// isPoweredOffStateErr matches the vSphere InvalidPowerState fault for a VM
+// that is powered off, e.g. "The attempted operation cannot be performed in
+// the current state (Powered off)." Deliberately narrower than
+// isAlreadyPoweredOffErr: a bare InvalidPowerState could be another state, and
+// this result rewrites the DB row to stopped.
+func isPoweredOffStateErr(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "current state (powered off)")
 }

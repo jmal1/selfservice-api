@@ -2,6 +2,7 @@ package provisioner
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -67,6 +68,8 @@ type fakeIdleDB struct {
 	idleTimeoutSeconds int
 	// podIdleOverride overrides per pod: podID → timeoutSeconds.
 	podIdleOverride map[uuid.UUID]int
+	// statusSet records UpdatePodVMStatusFrom calls (vmID → new status).
+	statusSet map[uuid.UUID]string
 }
 
 func newFakeDB() *fakeIdleDB {
@@ -77,6 +80,7 @@ func newFakeDB() *fakeIdleDB {
 		inFlightRun:        map[uuid.UUID]bool{},
 		idleTimeoutSeconds: 7200, // 2h default
 		podIdleOverride:    map[uuid.UUID]int{},
+		statusSet:          map[uuid.UUID]string{},
 	}
 }
 
@@ -96,6 +100,11 @@ func (f *fakeIdleDB) TouchVMActivityAt(_ context.Context, id uuid.UUID, t time.T
 func (f *fakeIdleDB) SetVMSuspended(_ context.Context, id uuid.UUID, _ time.Time, reason string) error {
 	f.suspended[id] = reason
 	return nil
+}
+
+func (f *fakeIdleDB) UpdatePodVMStatusFrom(_ context.Context, id uuid.UUID, _ []string, status string) (bool, error) {
+	f.statusSet[id] = status
+	return true, nil
 }
 
 func (f *fakeIdleDB) GetIdleTimeoutSeconds(_ context.Context, podID uuid.UUID) (int, error) {
@@ -760,5 +769,47 @@ func TestNilActivityTimestampIsNeverSuspended(t *testing.T) {
 	}
 	if vc.suspendedMorefs[moref] != 0 {
 		t.Errorf("SuspendVM must not be called for a VM with no activity clock, got %d calls", vc.suspendedMorefs[moref])
+	}
+}
+
+// TestSuspend_AlreadyPoweredOffIsNotAnError covers the 2026-10-27 incident:
+// VMs went down with esxi3 while the DB still said running, so every pass
+// hit InvalidPowerState and fired CrucibleVMSuspendFailing. The VM must be
+// reconciled to stopped and must not count as an error.
+func TestSuspend_AlreadyPoweredOffIsNotAnError(t *testing.T) {
+	const moref = "vm-49856"
+	c := makeCandidate(moref, pastTime(7*time.Hour))
+
+	db := newFakeDB()
+	db.candidates = []database.IdleSuspendCandidate{c}
+
+	vc := newFakeVC()
+	vc.toolsRunning[moref] = false // powered-off VMs report Tools not running
+	vc.suspendErr = errors.New("suspend vm-49856: ServerFaultCode: The attempted operation cannot be performed in the current state (Powered off).")
+
+	counts, err := evaluateIdleVMs(context.Background(), vc, db, nil, IdleEvaluatorConfig{DryRun: false})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if counts.Errors != 0 {
+		t.Errorf("already-powered-off VM must not count as an error, got errors=%d", counts.Errors)
+	}
+	if counts.AlreadyOff != 1 {
+		t.Errorf("expected AlreadyOff=1, got %d", counts.AlreadyOff)
+	}
+	if got := db.statusSet[c.PodVMID]; got != models.VMStatusStopped {
+		t.Errorf("expected DB status reconciled to %q, got %q", models.VMStatusStopped, got)
+	}
+	if _, suspended := db.suspended[c.PodVMID]; suspended {
+		t.Error("SetVMSuspended must not be called for a powered-off VM")
+	}
+
+	// Any other suspend failure is still an error and leaves the row alone.
+	db2 := newFakeDB()
+	db2.candidates = []database.IdleSuspendCandidate{makeCandidate(moref, pastTime(7*time.Hour))}
+	vc.suspendErr = errors.New("InvalidPowerState: current state (Suspended)")
+	counts, _ = evaluateIdleVMs(context.Background(), vc, db2, nil, IdleEvaluatorConfig{DryRun: false})
+	if counts.Errors != 1 || counts.AlreadyOff != 0 || len(db2.statusSet) != 0 {
+		t.Errorf("non-powered-off fault: want errors=1 already_off=0 no status write, got %+v statusSet=%v", counts, db2.statusSet)
 	}
 }
