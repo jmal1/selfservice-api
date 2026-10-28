@@ -78,8 +78,11 @@ func (c *Client) PlanPortGroupMutationForHosts(
 		targets[moref] = struct{}{}
 	}
 	receipt := PortGroupReceipt{Name: pgName, VLANID: vlanID}
+	// Decide once: matched targets are deleted below, and an emptied map must
+	// not turn into "every remaining host" (jmal1/Crucible#77).
+	filterTargets := len(targets) > 0
 	for _, identity := range allowed {
-		if len(targets) > 0 {
+		if filterTargets {
 			if _, selected := targets[identity.MoRef]; !selected {
 				continue
 			}
