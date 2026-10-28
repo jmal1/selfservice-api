@@ -354,3 +354,65 @@ func TestPodPortGroupReceiptPostgresMissingReceiptFailsClosed(t *testing.T) {
 		t.Fatalf("missing receipt error = %v, want ErrPortGroupReceiptNotFound", err)
 	}
 }
+
+// jmal1/Crucible#78: an applying receipt with no bound keys must be closable
+// once its owned portgroups are verified absent, without opening a path for
+// keyed or active receipts to skip exact deletion.
+func TestPodPortGroupReceiptAbsentApplyingCloses(t *testing.T) {
+	fixture := newPlacementPostgresFixture(t, 1)
+	ctx := context.Background()
+	receipt := portGroupReceiptJSON(t, "Pod-VLAN3997", 3997)
+	if err := fixture.queries.PersistPodPortGroupReceipt(ctx, fixture.jobID, fixture.workerID, fixture.podID, receipt); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.queries.BeginPodPortGroupMutation(ctx, fixture.jobID, fixture.workerID, fixture.podID, receipt); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.queries.MarkPodPortGroupRemoved(ctx, fixture.podID, receipt); !errors.Is(err, ErrPortGroupReceiptConflict) {
+		t.Fatalf("keyed removal of applying receipt error = %v, want ErrPortGroupReceiptConflict", err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `
+		UPDATE pod_portgroup_receipts
+		SET state = 'removed', removed_at = now(),
+		    portgroup_keys = jsonb_build_object('host-1002', 'key-vim.host.PortGroup-42')
+		WHERE pod_id = $1
+	`, fixture.podID); err == nil {
+		t.Fatal("database closed an applying receipt while binding a key")
+	}
+	if err := fixture.queries.MarkPodPortGroupAbsentRemoved(ctx, fixture.podID, receipt); err != nil {
+		t.Fatal(err)
+	}
+	record, err := fixture.queries.GetPodPortGroupReceipt(ctx, fixture.podID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.State != PodPortGroupReceiptRemoved || record.RemovedAt == nil || len(record.Keys) != 0 {
+		t.Fatalf("absent-closed receipt = %+v", record)
+	}
+	if err := fixture.queries.MarkPodPortGroupAbsentRemoved(ctx, fixture.podID, receipt); !errors.Is(err, ErrPortGroupReceiptConflict) {
+		t.Fatalf("repeat absent close error = %v, want ErrPortGroupReceiptConflict", err)
+	}
+}
+
+func TestPodPortGroupReceiptAbsentCloseRejectsActive(t *testing.T) {
+	fixture := newPlacementPostgresFixture(t, 1)
+	ctx := context.Background()
+	receipt := portGroupReceiptJSON(t, "Pod-VLAN3996", 3996)
+	if err := fixture.queries.PersistPodPortGroupReceipt(ctx, fixture.jobID, fixture.workerID, fixture.podID, receipt); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.queries.BeginPodPortGroupMutation(ctx, fixture.jobID, fixture.workerID, fixture.podID, receipt); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.queries.PersistPodPortGroupKeys(ctx, fixture.podID, receipt, map[string]string{"host-1002": "key-vim.host.PortGroup-42"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.queries.MarkPodPortGroupAbsentRemoved(ctx, fixture.podID, receipt); !errors.Is(err, ErrPortGroupReceiptConflict) {
+		t.Fatalf("absent close of active receipt error = %v, want ErrPortGroupReceiptConflict", err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `
+		UPDATE pod_portgroup_receipts SET state = 'applying' WHERE pod_id = $1
+	`, fixture.podID); err == nil {
+		t.Fatal("database moved an active receipt back to applying")
+	}
+}

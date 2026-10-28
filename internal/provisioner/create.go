@@ -640,6 +640,9 @@ func (p *Provisioner) newPodCreateRollbackEngine(
 		default:
 			return fmt.Errorf("invalid durable port group receipt state %q", record.State)
 		}
+		if closed, err := p.closeAbsentApplyingReceipt(ctx, podID, record, receipt); err != nil || closed {
+			return err
+		}
 		receipt, err = vcenter.PortGroupReceiptWithKeys(receipt, record.Keys)
 		if err != nil {
 			return err

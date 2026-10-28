@@ -266,3 +266,31 @@ func (q *Queries) MarkPodPortGroupRemoved(
 	}
 	return nil
 }
+
+// MarkPodPortGroupAbsentRemoved closes an applying receipt that never bound a
+// stable key, after the caller verified under the portgroup mutation lock that
+// every owned portgroup is absent. Create compensation removes what it added
+// before keys are bound, so there is nothing left for a keyed delete to prove.
+func (q *Queries) MarkPodPortGroupAbsentRemoved(
+	ctx context.Context,
+	podID uuid.UUID,
+	receipt json.RawMessage,
+) error {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE pod_portgroup_receipts
+		SET state = 'removed',
+		    removed_at = clock_timestamp()
+		WHERE pod_id = $1
+		  AND receipt = $2::jsonb
+		  AND state = 'applying'
+		  AND portgroup_keys = '{}'::jsonb
+		  AND removed_at IS NULL
+	`, podID, receipt)
+	if err != nil {
+		return fmt.Errorf("mark absent pod port group removed: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("%w for pod %s while recording absent removal", ErrPortGroupReceiptConflict, podID)
+	}
+	return nil
+}
