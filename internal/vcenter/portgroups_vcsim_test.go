@@ -176,6 +176,33 @@ func TestOwnedPortGroupsAbsentAfterCompensatedPartialCreate(t *testing.T) {
 	})
 }
 
+// jmal1/Crucible#77: selecting a host that is not last in VCENTER_HOSTS must
+// not pull every later host into the receipt; one unreachable later host then
+// failed every isolated create.
+func TestPortGroupPlanSelectingEarlierHostExcludesLaterHosts(t *testing.T) {
+	withSimulator(t, func(ctx context.Context, c *Client, _ *vim25.Client) {
+		enableVCSimPortGroupKeys(c)
+		host1, host2 := twoHostsInResourcePool(t, ctx, c, simResourcePool)
+		setAllowedHosts(c, host1, host2)
+
+		receipt, err := c.PlanPortGroupMutationForHosts(ctx, "Pod-VLAN411", 411, []string{host1.MoRef})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(receipt.Hosts) != 1 || receipt.Hosts[0].HostMoRef != host1.MoRef {
+			t.Fatalf("receipt hosts = %+v, want only %s", receipt.Hosts, host1.MoRef)
+		}
+
+		all, err := c.PlanPortGroupMutation(ctx, "Pod-VLAN412", 412)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(all.Hosts) != 2 {
+			t.Fatalf("untargeted receipt hosts = %d, want every allowed host", len(all.Hosts))
+		}
+	})
+}
+
 func TestPortGroupMutationTouchesOnlySelectedTargetHosts(t *testing.T) {
 	withSimulator(t, func(ctx context.Context, c *Client, _ *vim25.Client) {
 		enableVCSimPortGroupKeys(c)
