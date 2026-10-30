@@ -2,11 +2,13 @@ package provisioner
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/vmware/govmomi/vim25/types"
 
 	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/models"
@@ -19,8 +21,10 @@ import (
 type fakeIdleVC struct {
 	// suspendedMorefs records every SuspendVM call (moref → count).
 	suspendedMorefs map[string]int
-	// toolsRunning is returned by QueryVMToolsStatusBulk (moref → running).
+	// toolsRunning is returned by QueryVMIdleStateBulk (moref → running).
 	toolsRunning map[string]bool
+	// powerState overrides the default poweredOn for a moref in toolsRunning.
+	powerState map[string]types.VirtualMachinePowerState
 	// perfSamples is returned by SamplePodVMPerf (moref → sample).
 	perfSamples map[string]vcenter.VMPerfSample
 	// suspendErr, if set, SuspendVM returns this.
@@ -31,6 +35,7 @@ func newFakeVC() *fakeIdleVC {
 	return &fakeIdleVC{
 		suspendedMorefs: map[string]int{},
 		toolsRunning:    map[string]bool{},
+		powerState:      map[string]types.VirtualMachinePowerState{},
 		perfSamples:     map[string]vcenter.VMPerfSample{},
 	}
 }
@@ -47,8 +52,16 @@ func (f *fakeIdleVC) SamplePodVMPerf(_ context.Context, _ []string) (map[string]
 	return f.perfSamples, nil
 }
 
-func (f *fakeIdleVC) QueryVMToolsStatusBulk(_ context.Context, _ []string) (map[string]bool, error) {
-	return f.toolsRunning, nil
+func (f *fakeIdleVC) QueryVMIdleStateBulk(_ context.Context, _ []string) (map[string]vcenter.VMIdleState, error) {
+	out := make(map[string]vcenter.VMIdleState, len(f.toolsRunning))
+	for moref, running := range f.toolsRunning {
+		ps := types.VirtualMachinePowerStatePoweredOn
+		if override, ok := f.powerState[moref]; ok {
+			ps = override
+		}
+		out[moref] = vcenter.VMIdleState{ToolsRunning: running, PowerState: ps}
+	}
+	return out, nil
 }
 
 // fakeIdleDB is a test double for idleEvalDB.
@@ -67,6 +80,8 @@ type fakeIdleDB struct {
 	idleTimeoutSeconds int
 	// podIdleOverride overrides per pod: podID → timeoutSeconds.
 	podIdleOverride map[uuid.UUID]int
+	// statusSynced records UpdatePodVMStatusFrom calls (vmID → new status).
+	statusSynced map[uuid.UUID]string
 }
 
 func newFakeDB() *fakeIdleDB {
@@ -77,6 +92,7 @@ func newFakeDB() *fakeIdleDB {
 		inFlightRun:        map[uuid.UUID]bool{},
 		idleTimeoutSeconds: 7200, // 2h default
 		podIdleOverride:    map[uuid.UUID]int{},
+		statusSynced:       map[uuid.UUID]string{},
 	}
 }
 
@@ -96,6 +112,11 @@ func (f *fakeIdleDB) TouchVMActivityAt(_ context.Context, id uuid.UUID, t time.T
 func (f *fakeIdleDB) SetVMSuspended(_ context.Context, id uuid.UUID, _ time.Time, reason string) error {
 	f.suspended[id] = reason
 	return nil
+}
+
+func (f *fakeIdleDB) UpdatePodVMStatusFrom(_ context.Context, id uuid.UUID, _ []string, status string) (bool, error) {
+	f.statusSynced[id] = status
+	return true, nil
 }
 
 func (f *fakeIdleDB) GetIdleTimeoutSeconds(_ context.Context, podID uuid.UUID) (int, error) {
@@ -672,12 +693,12 @@ func TestParseDryRunEnv_UnrecognisedBranch(t *testing.T) {
 // test for the idle-evaluator bulk-query bug (production: "skipping all VMs
 // this tick").
 //
-// Before the fix: QueryVMToolsStatusBulk returned an error when any moref was
+// Before the fix: QueryVMIdleStateBulk returned an error when any moref was
 // deleted, causing the evaluator to skip every VM for the tick. After the fix:
 // the bulk query returns a partial map (deleted VMs absent), and the evaluator
 // evaluates the VMs that are present.
 //
-// This test injects the result that the FIXED QueryVMToolsStatusBulk produces:
+// This test injects the result that the FIXED QueryVMIdleStateBulk produces:
 // the alive VM is in the tools map; the stale/deleted moref is absent. The
 // evaluator must process the alive VM and skip the absent one as ToolsMissing.
 func TestEvaluatorHandlesPartialToolsStatusResult(t *testing.T) {
@@ -693,7 +714,7 @@ func TestEvaluatorHandlesPartialToolsStatusResult(t *testing.T) {
 	db.candidates = []database.IdleSuspendCandidate{aliveCandidate, deadCandidate}
 
 	vc := newFakeVC()
-	// Simulate the result of the FIXED QueryVMToolsStatusBulk: returns Tools=true
+	// Simulate the result of the FIXED QueryVMIdleStateBulk: returns Tools=true
 	// for the alive VM; the deleted VM is absent from the map (not an error).
 	vc.toolsRunning[aliveMoref] = true
 	// deadMoref intentionally absent — a missing vCenter object is not suspended.
@@ -703,7 +724,7 @@ func TestEvaluatorHandlesPartialToolsStatusResult(t *testing.T) {
 
 	counts, err := evaluateIdleVMs(context.Background(), vc, db, nil, IdleEvaluatorConfig{DryRun: false})
 	if err != nil {
-		t.Fatalf("evaluator must not fail when QueryVMToolsStatusBulk returns a partial result: %v", err)
+		t.Fatalf("evaluator must not fail when QueryVMIdleStateBulk returns a partial result: %v", err)
 	}
 
 	// The tick must complete and evaluate the surviving VM.
@@ -760,5 +781,85 @@ func TestNilActivityTimestampIsNeverSuspended(t *testing.T) {
 	}
 	if vc.suspendedMorefs[moref] != 0 {
 		t.Errorf("SuspendVM must not be called for a VM with no activity clock, got %d calls", vc.suspendedMorefs[moref])
+	}
+}
+
+// TestEvaluateIdleVMs_SyncsGuestShutdownVM is the regression for the
+// CrucibleVMSuspendFailing false positive on 2026-10-28: rows still marked
+// running for VMs a student shut down from inside the guest. vCenter refused
+// every SuspendVM ("cannot be performed in the current state (Powered off)").
+// The evaluator must sync the row without calling SuspendVM, whether or not
+// the idle clock has expired.
+func TestEvaluateIdleVMs_SyncsGuestShutdownVM(t *testing.T) {
+	cases := []struct {
+		name string
+		ps   types.VirtualMachinePowerState
+		want string
+		ago  time.Duration
+	}{
+		{"powered off, clock expired", types.VirtualMachinePowerStatePoweredOff, models.VMStatusStopped, 3 * time.Hour},
+		{"powered off, clock fresh", types.VirtualMachinePowerStatePoweredOff, models.VMStatusStopped, time.Minute},
+		{"suspended in vCenter", types.VirtualMachinePowerStateSuspended, models.VMStatusSuspended, 3 * time.Hour},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			vc := newFakeVC()
+			db := newFakeDB()
+			c := makeCandidate("vm-off", pastTime(tc.ago))
+			db.candidates = []database.IdleSuspendCandidate{c}
+			vc.toolsRunning["vm-off"] = false
+			vc.powerState["vm-off"] = tc.ps
+			vc.suspendErr = errors.New("SuspendVM must not be called for a non-running VM")
+
+			counts, err := evaluateIdleVMs(context.Background(), vc, db, nil, IdleEvaluatorConfig{})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := db.statusSynced[c.PodVMID]; got != tc.want {
+				t.Errorf("synced status = %q, want %q", got, tc.want)
+			}
+			if counts.PowerSynced != 1 || counts.Errors != 0 || counts.Suspended != 0 {
+				t.Errorf("counts = %+v, want PowerSynced=1 Errors=0 Suspended=0", counts)
+			}
+		})
+	}
+}
+
+// TestEvaluateIdleVMs_PowerSyncWaitsForActiveJob guards the race with a
+// vm_start in flight: syncing to stopped then would overwrite the start.
+func TestEvaluateIdleVMs_PowerSyncWaitsForActiveJob(t *testing.T) {
+	vc := newFakeVC()
+	db := newFakeDB()
+	c := makeCandidate("vm-off", pastTime(3*time.Hour))
+	db.candidates = []database.IdleSuspendCandidate{c}
+	db.activeJob[c.PodVMID] = true
+	vc.toolsRunning["vm-off"] = false
+	vc.powerState["vm-off"] = types.VirtualMachinePowerStatePoweredOff
+
+	counts, _ := evaluateIdleVMs(context.Background(), vc, db, nil, IdleEvaluatorConfig{})
+	if len(db.statusSynced) != 0 {
+		t.Errorf("status must not be synced while a job is active, got %v", db.statusSynced)
+	}
+	if counts.RefusedJob != 1 {
+		t.Errorf("RefusedJob = %d, want 1", counts.RefusedJob)
+	}
+}
+
+// TestEvaluateIdleVMs_PowerSyncDryRunWritesNothing keeps dry-run free of
+// mutations for the sync path too.
+func TestEvaluateIdleVMs_PowerSyncDryRunWritesNothing(t *testing.T) {
+	vc := newFakeVC()
+	db := newFakeDB()
+	c := makeCandidate("vm-off", pastTime(3*time.Hour))
+	db.candidates = []database.IdleSuspendCandidate{c}
+	vc.toolsRunning["vm-off"] = false
+	vc.powerState["vm-off"] = types.VirtualMachinePowerStatePoweredOff
+
+	counts, _ := evaluateIdleVMs(context.Background(), vc, db, nil, IdleEvaluatorConfig{DryRun: true})
+	if len(db.statusSynced) != 0 {
+		t.Errorf("dry-run must not write status, got %v", db.statusSynced)
+	}
+	if counts.PowerSynced != 1 {
+		t.Errorf("dry-run PowerSynced = %d, want 1", counts.PowerSynced)
 	}
 }

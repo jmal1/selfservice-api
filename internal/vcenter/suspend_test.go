@@ -1,7 +1,7 @@
 package vcenter
 
-// Unit tests for retrieveVMToolsStatus (the testable inner implementation of
-// QueryVMToolsStatusBulk). These tests use a fake vmPropertyRetriever so no
+// Unit tests for retrieveVMIdleState (the testable inner implementation of
+// QueryVMIdleStateBulk). These tests use a fake vmPropertyRetriever so no
 // govmomi simulator is needed; the fake injects specific error/result shapes to
 // exercise each branch.
 //
@@ -26,7 +26,7 @@ import (
 )
 
 // fakeToolsRetriever is a test double for vmPropertyRetriever used in
-// retrieveVMToolsStatus unit tests. It records every Retrieve call and returns
+// retrieveVMIdleState unit tests. It records every Retrieve call and returns
 // configurable errors or tools-status results.
 type fakeToolsRetriever struct {
 	// calls accumulates the moref-value slices from each Retrieve invocation
@@ -44,6 +44,9 @@ type fakeToolsRetriever struct {
 	// omitting a VM (which callers treat as Tools-not-running).
 	tools map[string]bool
 
+	// powerState overrides the default poweredOn for a moref in tools.
+	powerState map[string]types.VirtualMachinePowerState
+
 	// genericErr, if non-nil, is returned on every Retrieve call regardless
 	// of moref — for testing non-deleted hard failures (e.g. auth).
 	genericErr error
@@ -53,6 +56,7 @@ func newFakeToolsRetriever() *fakeToolsRetriever {
 	return &fakeToolsRetriever{
 		deletedMorefs: map[string]bool{},
 		tools:         map[string]bool{},
+		powerState:    map[string]types.VirtualMachinePowerState{},
 	}
 }
 
@@ -93,6 +97,10 @@ func (f *fakeToolsRetriever) Retrieve(
 		}
 		vm := mo.VirtualMachine{}
 		vm.Self = obj
+		vm.Runtime.PowerState = types.VirtualMachinePowerStatePoweredOn
+		if ps, ok := f.powerState[obj.Value]; ok {
+			vm.Runtime.PowerState = ps
+		}
 		vm.Guest = &types.GuestInfo{}
 		if running {
 			vm.Guest.ToolsRunningStatus = string(types.VirtualMachineToolsRunningStatusGuestToolsRunning)
@@ -119,7 +127,7 @@ func TestRetrieveVMToolsStatus_NoDeletions(t *testing.T) {
 	retr.tools["vm-1"] = true
 	retr.tools["vm-2"] = false
 
-	result, err := retrieveVMToolsStatus(context.Background(), refs, retr, slog.Default())
+	result, err := retrieveVMIdleState(context.Background(), refs, retr, slog.Default())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -131,10 +139,10 @@ func TestRetrieveVMToolsStatus_NoDeletions(t *testing.T) {
 	if len(retr.calls[0]) != 2 {
 		t.Errorf("bulk call should cover all 2 refs, got %d", len(retr.calls[0]))
 	}
-	if !result["vm-1"] {
+	if !result["vm-1"].ToolsRunning {
 		t.Error("vm-1 should have Tools running=true")
 	}
-	if result["vm-2"] {
+	if result["vm-2"].ToolsRunning {
 		t.Error("vm-2 should have Tools running=false")
 	}
 }
@@ -155,7 +163,7 @@ func TestRetrieveVMToolsStatus_OneDeletedVM(t *testing.T) {
 	retr.tools["vm-alive"] = true
 	retr.deletedMorefs["vm-dead"] = true // simulates deleted VM in vCenter
 
-	result, err := retrieveVMToolsStatus(context.Background(), refs, retr, slog.Default())
+	result, err := retrieveVMIdleState(context.Background(), refs, retr, slog.Default())
 	if err != nil {
 		t.Fatalf("one deleted moref must not return an error (got: %v); "+
 			"this is the production bug — a deleted VM was disabling auto-suspend for all VMs", err)
@@ -166,7 +174,7 @@ func TestRetrieveVMToolsStatus_OneDeletedVM(t *testing.T) {
 		t.Errorf("expected %d Retrieve calls (1 bulk + 2 per-moref), got %d",
 			wantCalls, len(retr.calls))
 	}
-	if !result["vm-alive"] {
+	if !result["vm-alive"].ToolsRunning {
 		t.Error("vm-alive should be present in result with Tools running=true")
 	}
 	if _, present := result["vm-dead"]; present {
@@ -186,7 +194,7 @@ func TestRetrieveVMToolsStatus_AllDeleted(t *testing.T) {
 	retr.deletedMorefs["vm-gone-1"] = true
 	retr.deletedMorefs["vm-gone-2"] = true
 
-	result, err := retrieveVMToolsStatus(context.Background(), refs, retr, slog.Default())
+	result, err := retrieveVMIdleState(context.Background(), refs, retr, slog.Default())
 	if err != nil {
 		t.Fatalf("all-deleted batch must not return an error, got: %v", err)
 	}
@@ -206,9 +214,33 @@ func TestRetrieveVMToolsStatus_HardFailure(t *testing.T) {
 	retr := newFakeToolsRetriever()
 	retr.genericErr = errors.New("ServerFaultCode: NotAuthenticated")
 
-	_, err := retrieveVMToolsStatus(context.Background(), refs, retr, slog.Default())
+	_, err := retrieveVMIdleState(context.Background(), refs, retr, slog.Default())
 	if err == nil {
 		t.Fatal("a non-deleted hard failure must propagate as an error, not return nil; " +
 			"the fix must not silently swallow real failures")
+	}
+}
+
+// TestRetrieveVMIdleState_ReportsPowerState proves the bulk call returns
+// runtime.powerState, which the idle evaluator uses to sync guest-shutdown VMs.
+func TestRetrieveVMIdleState_ReportsPowerState(t *testing.T) {
+	refs := []types.ManagedObjectReference{
+		{Type: "VirtualMachine", Value: "vm-on"},
+		{Type: "VirtualMachine", Value: "vm-off"},
+	}
+	retr := newFakeToolsRetriever()
+	retr.tools["vm-on"] = true
+	retr.tools["vm-off"] = false
+	retr.powerState["vm-off"] = types.VirtualMachinePowerStatePoweredOff
+
+	result, err := retrieveVMIdleState(context.Background(), refs, retr, slog.Default())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := result["vm-on"].PowerState; got != types.VirtualMachinePowerStatePoweredOn {
+		t.Errorf("vm-on power state = %q, want poweredOn", got)
+	}
+	if got := result["vm-off"].PowerState; got != types.VirtualMachinePowerStatePoweredOff {
+		t.Errorf("vm-off power state = %q, want poweredOff", got)
 	}
 }

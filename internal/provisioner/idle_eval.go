@@ -16,6 +16,11 @@
 // clock is older than the timeout. A moref missing from the tools result is a
 // deleted VM and is never suspended.
 //
+// A running row whose VM vCenter reports poweredOff or suspended (a guest
+// shutdown, or a vCenter-side action) is synced to stopped/suspended instead
+// of being suspended, so it leaves the candidate set rather than failing
+// SuspendVM every tick.
+//
 // The sustained-idle requirement is last_activity_at itself: the evaluator
 // updates it whenever it observes above-threshold utilisation, so a VM is
 // suspended only after that timestamp has been untouched for the full timeout.
@@ -41,6 +46,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/vmware/govmomi/vim25/types"
 
 	"github.com/jmal1/selfservice-api/internal/database"
 	"github.com/jmal1/selfservice-api/internal/models"
@@ -106,7 +112,7 @@ const (
 type idleEvalVCenter interface {
 	SuspendVM(ctx context.Context, moref string) error
 	SamplePodVMPerf(ctx context.Context, morefs []string) (map[string]vcenter.VMPerfSample, error)
-	QueryVMToolsStatusBulk(ctx context.Context, morefs []string) (map[string]bool, error)
+	QueryVMIdleStateBulk(ctx context.Context, morefs []string) (map[string]vcenter.VMIdleState, error)
 }
 
 // idleEvalDB is the database interface the idle evaluator needs.
@@ -115,6 +121,7 @@ type idleEvalDB interface {
 	IdleSuspendCandidateStillEligible(ctx context.Context, podVMID uuid.UUID) (bool, error)
 	TouchVMActivityAt(ctx context.Context, id uuid.UUID, t time.Time) error
 	SetVMSuspended(ctx context.Context, id uuid.UUID, t time.Time, reason string) error
+	UpdatePodVMStatusFrom(ctx context.Context, id uuid.UUID, fromStatuses []string, status string) (bool, error)
 	GetIdleTimeoutSeconds(ctx context.Context, podID uuid.UUID) (int, error)
 	HasActiveJobForVM(ctx context.Context, podVMID uuid.UUID) (bool, error)
 	HasInFlightRunForVM(ctx context.Context, podVMID uuid.UUID) (bool, error)
@@ -154,6 +161,7 @@ type IdleEvalCounts struct {
 	RefusedPod      int // pod provisioning/destroying (guard 2)
 	RefusedRun      int // assessment run in flight (guard 3)
 	Suspended       int // suspended (or would-be suspended in dry-run)
+	PowerSynced     int // running row synced to vCenter's poweredOff/suspended state
 	Errors          int // DB or vCenter error during processing
 }
 
@@ -200,8 +208,8 @@ func evaluateIdleVMs(
 		return counts, nil
 	}
 
-	// Batched bulk call 1: VMware Tools status for all morefs (one PropertyCollector request).
-	toolsRunning, err := vc.QueryVMToolsStatusBulk(ctx, morefs)
+	// Batched bulk call 1: Tools and power state for all morefs (one PropertyCollector request).
+	vmStates, err := vc.QueryVMIdleStateBulk(ctx, morefs)
 	if err != nil {
 		log.Error("bulk tools status query failed; skipping all VMs this tick", "error", err)
 		counts.Skipped += len(morefs)
@@ -228,10 +236,16 @@ func evaluateIdleVMs(
 
 		// A moref missing from the tools result is a deleted VM. Do not suspend
 		// an object vCenter did not return.
-		toolsUp, toolsKnown := toolsRunning[c.VCenterVMID]
+		state, toolsKnown := vmStates[c.VCenterVMID]
 		if !toolsKnown {
 			vmLog.Debug("idle-eval: skip — VMware Tools status absent")
 			counts.ToolsMissing++
+			continue
+		}
+		toolsUp := state.ToolsRunning
+
+		if synced, ok := syncedVMStatus(state.PowerState); ok {
+			syncPowerState(ctx, db, vmLog, cfg, c.PodVMID, state.PowerState, synced, &counts)
 			continue
 		}
 
@@ -407,8 +421,59 @@ func evaluateIdleVMs(
 		"perf_missing", counts.PerfMissing,
 		"activity_fresh", counts.ActivityFresh,
 		"activity_unknown", counts.ActivityUnknown,
+		"power_synced", counts.PowerSynced,
 		"errors", counts.Errors,
 	)
 
 	return counts, nil
+}
+
+// syncedVMStatus maps a non-running vCenter power state to the pod_vms status
+// it implies. ok is false for poweredOn (and anything unrecognised).
+func syncedVMStatus(ps types.VirtualMachinePowerState) (string, bool) {
+	switch ps {
+	case types.VirtualMachinePowerStatePoweredOff:
+		return models.VMStatusStopped, true
+	case types.VirtualMachinePowerStateSuspended:
+		return models.VMStatusSuspended, true
+	}
+	return "", false
+}
+
+// syncPowerState moves a running row to the status vCenter reports. It skips
+// while a job targets the VM, because a vm_start in flight would otherwise be
+// overwritten, and only transitions from running so a concurrent write wins.
+func syncPowerState(
+	ctx context.Context,
+	db idleEvalDB,
+	vmLog *slog.Logger,
+	cfg IdleEvaluatorConfig,
+	podVMID uuid.UUID,
+	ps types.VirtualMachinePowerState,
+	status string,
+	counts *IdleEvalCounts,
+) {
+	if hasJob, err := db.HasActiveJobForVM(ctx, podVMID); err != nil {
+		vmLog.Warn("idle-eval: active-job check failed; not syncing power state", "error", err)
+		counts.Errors++
+		return
+	} else if hasJob {
+		counts.RefusedJob++
+		return
+	}
+	if cfg.DryRun {
+		vmLog.Info("idle-eval: DRY-RUN — would sync status to vCenter power state", "power_state", ps, "status", status)
+		counts.PowerSynced++
+		return
+	}
+	changed, err := db.UpdatePodVMStatusFrom(ctx, podVMID, []string{models.VMStatusRunning}, status)
+	if err != nil {
+		vmLog.Error("idle-eval: power-state sync failed", "error", err)
+		counts.Errors++
+		return
+	}
+	if changed {
+		vmLog.Info("idle-eval: synced status to vCenter power state", "power_state", ps, "status", status)
+		counts.PowerSynced++
+	}
 }
